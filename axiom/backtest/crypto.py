@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 import math
 from typing import Any, Mapping, Sequence
 
-from axiom.domain import MarketType, OHLCVBar, Side, SimulationQuality, ensure_utc
+from axiom.domain import MarketType, OHLCVBar, Side, SimulationQuality, parse_timestamp
 from axiom.metrics import calculate_crypto_metrics
 from axiom.portfolio import OrderRequest, Portfolio
 from axiom.strategy import StrategyDefinition, evaluate_signal, validate_strategy
@@ -27,7 +27,7 @@ def _bar_field(bar: Any, name: str, default: float = 0.0) -> float:
 
 def _bar_time(bar: Any, default: datetime) -> datetime:
     value = bar.get("timestamp", default) if isinstance(bar, Mapping) else getattr(bar, "timestamp", default)
-    return ensure_utc(value) if isinstance(value, datetime) else default
+    return parse_timestamp(value) or default
 
 
 def _quality(bars: Sequence[Any]) -> SimulationQuality:
@@ -60,11 +60,13 @@ class CryptoBacktester:
     def run(
         self, bars: Sequence[OHLCVBar | Mapping[str, Any]], strategy: StrategyDefinition | Mapping[str, Any] | str,
         *, symbol: str | None = None, initial_cash: float | None = None,
+        warmup: Sequence[OHLCVBar | Mapping[str, Any]] = (),
     ) -> BacktestResult:
         definition = validate_strategy(strategy)
         if definition.market_type is not MarketType.CRYPTO_SPOT:
             raise ValueError("CryptoBacktester requires a crypto_spot strategy")
         rows = sorted(list(bars), key=lambda item: _bar_time(item, datetime.min.replace(tzinfo=timezone.utc)))
+        warmup_rows = sorted(list(warmup), key=lambda item: _bar_time(item, datetime.min.replace(tzinfo=timezone.utc)))
         asset = symbol or self.symbol
         portfolio = Portfolio(self.initial_cash if initial_cash is None else initial_cash)
         curve: list[dict[str, Any]] = []
@@ -74,9 +76,13 @@ class CryptoBacktester:
             timestamp = _bar_time(bar, datetime.min.replace(tzinfo=timezone.utc))
             opening = _bar_field(bar, "open")
             closing = _bar_field(bar, "close", opening)
-            if index > 0 and opening > 0:
-                # The signal only sees bars strictly before this execution bar.
-                score = evaluate_signal(definition, rows[:index])
+            if opening <= 0 or closing <= 0:
+                continue
+            if index > 0 or warmup_rows:
+                # The signal sees only prior bars plus explicitly supplied
+                # pre-window warmup; the execution bar is never included.
+                signal_history = [*warmup_rows, *rows[:index]]
+                score = evaluate_signal(definition, signal_history)
                 current = portfolio.get_position(asset)
                 current_quantity = current.quantity if current else 0.0
                 if score > 0:

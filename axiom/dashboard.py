@@ -18,7 +18,7 @@ from urllib.parse import urlparse
 from .domain import ensure_utc, to_record
 
 
-_ENDPOINTS = ("overview", "research", "crypto", "prediction", "evolution", "risk", "system")
+_ENDPOINTS = ("overview", "research", "crypto", "prediction", "evolution", "risk", "system", "dataset-health")
 
 
 def _jsonable(value: Any) -> Any:
@@ -47,9 +47,9 @@ def _candidate_record(candidate: Any) -> dict[str, Any]:
         "lineage": list(getattr(candidate, "lineage", ())),
         "score": getattr(candidate, "score", None),
         "train_score": getattr(candidate, "train_score", None),
+        "validation_score": getattr(candidate, "validation_score", None),
         "holdout_score": getattr(candidate, "holdout_score", None),
         "rejected": getattr(candidate, "rejected", False),
-        "rejection_reason": getattr(candidate, "rejection_reason", ""),
         "strategy": strategy_record,
     }
 
@@ -65,6 +65,7 @@ class DashboardData:
         prediction_provider: Any | None = None,
         evolution: Any | None = None,
         risk: Any | None = None,
+        store: Any | None = None,
     ) -> None:
         self._data = dict(data or {})
         self.tracker = tracker
@@ -72,6 +73,7 @@ class DashboardData:
         self.prediction_provider = prediction_provider
         self.evolution = evolution
         self.risk = risk
+        self.store = store
 
     def _configured(self, name: str) -> Any:
         if name in self._data:
@@ -158,11 +160,34 @@ class DashboardData:
             return status()
         return source
 
+    def dataset_health(self) -> Any:
+        configured = self._configured("dataset-health")
+        if configured is not None:
+            return configured
+        if self.store is None:
+            return {
+                "grade": "F",
+                "markets": 0,
+                "snapshots": 0,
+                "trades": 0,
+                "collection_errors": 0,
+                "stale_markets": [],
+                "gaps": [],
+                "live_execution": False,
+            }
+        health = getattr(self.store, "polymarket_health", None)
+        if not callable(health):
+            return {"grade": "F", "error": "store has no polymarket health method", "live_execution": False}
+        return health()
     def system(self) -> dict[str, Any]:
         configured = self._configured("system")
         if configured is not None:
-            return dict(configured) if isinstance(configured, Mapping) else configured
-        return {"service": "axiom-dashboard", "status": "ok", "offline": True, "live_execution": False, "endpoints": list(_ENDPOINTS)}
+            result = dict(configured) if isinstance(configured, Mapping) else {"value": configured}
+        else:
+            result = {"service": "axiom-dashboard", "status": "ok", "offline": True, "live_execution": False}
+        result["dataset_health"] = self.dataset_health()
+        result["endpoints"] = list(_ENDPOINTS)
+        return result
 
     def overview(self) -> dict[str, Any]:
         configured = self._configured("overview")
@@ -195,6 +220,8 @@ class DashboardData:
             return self.risk_data()
         if endpoint == "system":
             return self.system()
+        if endpoint == "dataset-health":
+            return self.dataset_health()
         raise KeyError(endpoint)
 
 
@@ -237,7 +264,7 @@ def _dashboard_html() -> str:
   <main>
     <section class="grid">
       <article class="panel"><h2>Experiments</h2><div id="experiment-count" class="metric">—</div><p class="muted">tracked records</p></article>
-      <article class="panel"><h2>Data health</h2><div id="data-health" class="metric">—</div><p class="muted">persisted artifacts</p></article>
+      <article class="panel"><h2>Data health</h2><div id="data-health" class="metric">—</div><p class="muted">collector grade</p></article>
       <article class="panel"><h2>Risk state</h2><div id="risk-state" class="metric">—</div><p class="muted">pre-trade gate</p></article>
       <article class="panel"><h2>Execution</h2><div class="metric">Paper only</div><p class="muted">no broker credentials or order route</p></article>
     </section>
@@ -251,12 +278,13 @@ def _dashboard_html() -> str:
     </section>
     <section class="grid">
       <article class="panel"><h2>Experiment provenance</h2><div id="experiments">Loading…</div></article>
+      <article class="panel"><h2>Dataset health detail</h2><pre id="dataset-health-detail">Loading…</pre></article>
       <article class="panel"><h2>Risk and system health</h2><pre id="risk">Loading…</pre><pre id="system">Loading…</pre></article>
     </section>
     <p class="muted">JSON endpoints: <span id="links"></span></p>
   </main>
   <script>
-    const names = ["overview", "research", "crypto", "prediction", "evolution", "risk", "system"];
+    const names = ["overview", "research", "crypto", "prediction", "evolution", "risk", "system", "dataset-health"];
     const $ = (id) => document.getElementById(id);
     const safe = (value) => String(value ?? "—").replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[char]));
     const show = (id, value) => { $(id).textContent = JSON.stringify(value, null, 2); };
@@ -298,17 +326,18 @@ def _dashboard_html() -> str:
     }
     async function load() {
       try {
-        const values = await Promise.all(names.map((name) => fetch(`/api/${name}`, { cache: "no-store" }).then((response) => response.json())));
+        const values = await Promise.all(names.map((name) => fetch(`/api/${name}`, { cache: "no-store" }).then(async (response) => { if (!response.ok) throw new Error(`${name} HTTP ${response.status}`); return response.json(); })));
         const data = Object.fromEntries(names.map((name, index) => [name, values[index]]));
         $("status").innerHTML = "<span class='status'>Ready · read-only</span>";
         $("experiment-count").textContent = String(data.overview?.experiment_count ?? ((data.research?.experiments || []).length || 0));
-        $("data-health").textContent = String(data.crypto?.available === false ? "offline" : "available");
+        $("data-health").textContent = String(data["dataset-health"]?.grade ?? "F");
         $("risk-state").textContent = data.risk?.allowed === false ? "blocked" : "allowed";
         renderResearch(data.research);
         renderPrediction(data.prediction);
         show("crypto", data.crypto);
         show("evolution", data.evolution);
         show("risk", data.risk);
+        show("dataset-health-detail", data["dataset-health"]);
         show("system", data.system);
         $("links").innerHTML = names.map((name) => `<a href="/api/${name}">${name}</a>`).join(" · ");
       } catch (error) {

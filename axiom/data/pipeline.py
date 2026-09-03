@@ -13,6 +13,7 @@ from ..domain import (
     SettlementState,
     SimulationQuality,
     ensure_utc,
+    parse_timestamp,
     to_record,
 )
 from ..evaluation import dataset_version
@@ -67,14 +68,20 @@ class MarketDataPipeline:
         version: str | None = None,
         metadata: Mapping[str, Any] | None = None,
     ) -> IngestionReport:
-        bars = tuple(provider.historical_ohlcv(symbol, start=start, end=end, interval=interval))
+        errors: list[str] = []
+        try:
+            bars = tuple(provider.historical_ohlcv(symbol, start=start, end=end, interval=interval))
+        except Exception as exc:
+            bars = ()
+            errors.append(f"historical data error: {exc}")
         resolved_version = version or dataset_version(bars)
         quality = _provider_quality(provider, SimulationQuality.MEDIUM if bars else SimulationQuality.LOW)
         dataset_id = f"crypto:{symbol.replace('/', '').replace('-', '').upper()}"
         try:
             instrument = provider.metadata(symbol)
-        except Exception:
+        except Exception as exc:
             instrument = None
+            errors.append(f"metadata error: {exc}")
         payload_metadata = {
             "provider": getattr(provider, "provider_name", provider.__class__.__name__),
             "symbol": symbol,
@@ -83,16 +90,17 @@ class MarketDataPipeline:
             "instrument_metadata_available": instrument is not None,
             **dict(metadata or {}),
         }
-        with self.store.transaction():
-            self.store.save_dataset(
-                dataset_id,
-                resolved_version,
-                bars,
-                metadata=payload_metadata,
-                quality=quality,
-            )
-            if bars:
-                self.store.save_bars(symbol, bars, dataset_id=dataset_id, dataset_version=resolved_version)
+        if not errors or bars:
+            with self.store.transaction():
+                self.store.save_dataset(
+                    dataset_id,
+                    resolved_version,
+                    bars,
+                    metadata=payload_metadata,
+                    quality=quality,
+                )
+                if bars:
+                    self.store.save_bars(symbol, bars, dataset_id=dataset_id, dataset_version=resolved_version)
         return IngestionReport(
             dataset_id,
             resolved_version,
@@ -102,6 +110,7 @@ class MarketDataPipeline:
             quality,
             bars[0].timestamp if bars else None,
             bars[-1].timestamp if bars else None,
+            tuple(errors),
         )
 
     def ingest_prediction(
@@ -118,7 +127,12 @@ class MarketDataPipeline:
         reports: list[IngestionReport] = []
         provider_name = str(getattr(provider, "provider_name", provider.__class__.__name__))
         for market_id in market_ids:
-            market = provider.market(str(market_id))
+            try:
+                market = provider.market(str(market_id))
+                market_error: str | None = None
+            except Exception as exc:
+                market = None
+                market_error = f"market lookup error: {exc}"
             if market is None:
                 reports.append(
                     IngestionReport(
@@ -128,43 +142,56 @@ class MarketDataPipeline:
                         MarketType.PREDICTION,
                         0,
                         SimulationQuality.LOW,
-                        errors=("market metadata unavailable",),
+                        errors=(market_error or "market metadata unavailable",),
                     )
                 )
                 continue
-            history = tuple(provider.price_history(market.market_id, start=start, end=end))
+            try:
+                history = tuple(provider.price_history(market.market_id, start=start, end=end))
+                history_error: str | None = None
+            except Exception as exc:
+                history = ()
+                history_error = f"price history error: {exc}"
             snapshots = tuple(_historical_snapshots(market, history))
-            raw_records: Sequence[Any] = history or (market,)
-            resolved_version = version_prefix or dataset_version(raw_records)
+            resolved_version = version_prefix or dataset_version(
+                history or ({"market_id": market.market_id, "timestamp": market.timestamp},)
+            )
             quality = _provider_quality(
                 provider,
                 SimulationQuality.LOW
-                if not history or not all(_has_depth(item) for item in snapshots)
+                if not snapshots or not history or not all(_has_depth(item) for item in snapshots)
                 else SimulationQuality.MEDIUM,
             )
             dataset_id = f"prediction:{market.market_id}"
-            with self.store.transaction():
-                self.store.save_dataset(
-                    dataset_id,
-                    resolved_version,
-                    raw_records,
-                    metadata={
-                        "provider": provider_name,
-                        "market_id": market.market_id,
-                        "question": market.question,
-                        "resolution_criteria": market.resolution_criteria,
-                        "expiry": market.expiry,
-                        "historical_order_book": all(_has_depth(item) for item in snapshots),
-                    },
-                    quality=quality,
-                )
-                if snapshots:
-                    self.store.save_prediction_snapshots(
-                        market.market_id,
-                        snapshots,
-                        dataset_id=dataset_id,
-                        dataset_version=resolved_version,
+            errors = tuple(item for item in (history_error, "price history unavailable" if not history else None) if item)
+            if history_error is None:
+                with self.store.transaction():
+                    self.store.save_dataset(
+                        dataset_id,
+                        resolved_version,
+                        history,
+                        metadata={
+                            "provider": provider_name,
+                            "market_id": market.market_id,
+                            "question": market.question,
+                            "resolution_criteria": market.resolution_criteria,
+                            "rules": market.resolution_criteria,
+                            "expiry": market.expiry,
+                            "settlement": market.settlement.value,
+                            "yes_token_id": market.yes_token_id,
+                            "no_token_id": market.no_token_id,
+                            "historical_order_book": bool(snapshots and all(item.order_book is not None for item in snapshots)),
+                            "research_quality": "ORDER_BOOK_SIMULATED" if any(item.order_book is not None for item in snapshots) else "PRICE_PROXY",
+                        },
+                        quality=quality,
                     )
+                    if snapshots:
+                        self.store.save_prediction_snapshots(
+                            market.market_id,
+                            snapshots,
+                            dataset_id=dataset_id,
+                            dataset_version=resolved_version,
+                        )
             reports.append(
                 IngestionReport(
                     dataset_id,
@@ -175,9 +202,20 @@ class MarketDataPipeline:
                     quality,
                     snapshots[0].timestamp if snapshots else market.timestamp,
                     snapshots[-1].timestamp if snapshots else market.timestamp,
+                    errors,
                 )
             )
         return tuple(reports)
+
+
+def _provider_quality(provider: Any, fallback: SimulationQuality) -> SimulationQuality:
+    value = getattr(provider, "simulation_quality", None)
+    if isinstance(value, SimulationQuality):
+        return value
+    try:
+        return SimulationQuality(str(value)) if value is not None else fallback
+    except ValueError:
+        return fallback
 
 
 def _finite_float(value: Any) -> float | None:
@@ -197,24 +235,17 @@ def _nonnegative_float(value: Any) -> float | None:
     return number if number is not None and number >= 0 else None
 
 
-def _provider_quality(provider: Any, fallback: SimulationQuality) -> SimulationQuality:
-    value = getattr(provider, "simulation_quality", None)
-    if isinstance(value, SimulationQuality):
-        return value
-    try:
-        return SimulationQuality(str(value)) if value is not None else fallback
-    except ValueError:
-        return fallback
-
 def _has_depth(snapshot: PredictionMarketSnapshot) -> bool:
     if not isinstance(snapshot, PredictionMarketSnapshot):
         return False
     if snapshot.order_book is not None:
         return bool(snapshot.order_book.bids and snapshot.order_book.asks)
-    return (
-        snapshot.yes_bid is not None
-        and snapshot.yes_ask is not None
-        and snapshot.yes_bid <= snapshot.yes_ask
+    return any(
+        bid is not None and ask is not None and bid <= ask
+        for bid, ask in (
+            (snapshot.yes_bid, snapshot.yes_ask),
+            (snapshot.no_bid, snapshot.no_ask),
+        )
     )
 def _book_from_value(value: Any, timestamp: datetime) -> OrderBookSnapshot | None:
     if isinstance(value, OrderBookSnapshot):
@@ -242,15 +273,15 @@ def _book_from_value(value: Any, timestamp: datetime) -> OrderBookSnapshot | Non
     if not bids and not asks:
         return None
     raw_timestamp = value.get("timestamp", timestamp)
-    if isinstance(raw_timestamp, str):
-        from ..data._http import parse_timestamp
-
-        raw_timestamp = parse_timestamp(raw_timestamp) or timestamp
-    if not isinstance(raw_timestamp, datetime):
-        raw_timestamp = timestamp
+    parsed_timestamp = parse_timestamp(raw_timestamp) or timestamp
     try:
-        return OrderBookSnapshot(ensure_utc(raw_timestamp), bids, asks)
-    except ValueError:
+        return OrderBookSnapshot(
+            parsed_timestamp,
+            bids,
+            asks,
+            token_id=value.get("token_id"),
+        )
+    except (TypeError, ValueError):
         return None
 
 
@@ -258,17 +289,20 @@ def _historical_snapshots(
     market: PredictionMarketSnapshot,
     history: Sequence[Mapping[str, Any]],
 ) -> Iterable[PredictionMarketSnapshot]:
+    terminal_states = {
+        SettlementState.RESOLVED_YES,
+        SettlementState.RESOLVED_NO,
+        SettlementState.VOID,
+    }
+    valid_points: list[tuple[Mapping[str, Any], datetime]] = []
     for point in history:
         if not isinstance(point, Mapping):
             continue
-        timestamp = point.get("timestamp", market.timestamp)
-        if isinstance(timestamp, str):
-            from ..data._http import parse_timestamp
-
-            timestamp = parse_timestamp(timestamp) or market.timestamp
-        if not isinstance(timestamp, datetime):
-            timestamp = market.timestamp
-        timestamp = ensure_utc(timestamp)
+        timestamp = parse_timestamp(point.get("timestamp", point.get("t")))
+        if timestamp is not None:
+            valid_points.append((point, timestamp))
+    valid_points.sort(key=lambda item: item[1])
+    for index, (point, timestamp) in enumerate(valid_points):
         yes_mid = _price01(point.get("price", point.get("yes_mid")))
         yes_bid = _price01(point.get("yes_bid"))
         yes_ask = _price01(point.get("yes_ask"))
@@ -287,7 +321,22 @@ def _historical_snapshots(
             no_bid = no_ask = None
         raw_book = point.get("order_book", point.get("book"))
         order_book = _book_from_value(raw_book, timestamp)
-        # Never copy a current resolution label into an earlier price point.
+        state = SettlementState.OPEN
+        raw_state = point.get("settlement")
+        try:
+            candidate_state = SettlementState(str(raw_state)) if raw_state is not None else SettlementState.OPEN
+        except ValueError:
+            candidate_state = SettlementState.UNKNOWN
+        if candidate_state in terminal_states:
+            state = candidate_state
+        elif (
+            index == len(valid_points) - 1
+            and market.settlement in terminal_states
+            and timestamp >= market.timestamp
+        ):
+            # Resolution is observable only at the source's resolution
+            # timestamp, never copied backward into prior price points.
+            state = market.settlement
         yield PredictionMarketSnapshot(
             timestamp=timestamp,
             market_id=market.market_id,
@@ -301,12 +350,14 @@ def _historical_snapshots(
             volume=_nonnegative_float(point.get("volume")),
             liquidity=_nonnegative_float(point.get("liquidity")),
             expiry=market.expiry,
-            settlement=SettlementState.OPEN,
+            settlement=state,
             resolution_criteria=market.resolution_criteria,
             category=market.category,
             tags=market.tags,
             order_book=order_book,
             source=str(point.get("source", market.source)),
+            yes_token_id=market.yes_token_id,
+            no_token_id=market.no_token_id,
         )
 
 

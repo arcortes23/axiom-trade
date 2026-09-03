@@ -177,10 +177,18 @@ class ExperimentTracker:
         if self.store is None:
             return
         payload = record.to_record()
-        # Keep compatibility with common AxiomStore APIs without importing a
-        # concrete store (which may be configured by another package slice).
+        save_experiment = getattr(self.store, "save_experiment", None)
+        if callable(save_experiment):
+            try:
+                save_experiment(record.experiment_id, payload, strategy_id=record.strategy_id)
+            except ValueError:
+                loader = getattr(self.store, "load_experiment", None)
+                existing = loader(record.experiment_id) if callable(loader) else None
+                if existing != payload:
+                    raise
+            return
+        # Keep compatibility with lightweight store adapters.
         for method_name, args in (
-            ("save_experiment", (record,)),
             ("record_experiment", (record,)),
             ("put_experiment", (record.experiment_id, payload)),
             ("put", ("experiments", record.experiment_id, payload)),
@@ -193,11 +201,7 @@ class ExperimentTracker:
             try:
                 method(*args)
             except TypeError:
-                # Some stores use a keyword payload or accept the value only.
-                try:
-                    method(record.experiment_id, payload)
-                except (TypeError, AttributeError, KeyError):
-                    continue
+                method(record.experiment_id, payload)
             return
 
     def track(
@@ -299,7 +303,7 @@ class ExperimentTracker:
             parent_ids=tuple(dict.fromkeys((*record.parent_ids, record.experiment_id))),
             rejected=True,
             rejection_reason=reason,
-            created_at=stamp,
+            created_at=record.created_at,
             updated_at=stamp,
         )
         self._persist(replacement)

@@ -36,6 +36,14 @@ class SimulationQuality(str, Enum):
     MEDIUM = "MEDIUM"
     LOW = "LOW"
 
+
+class ResearchQuality(str, Enum):
+    """Evidence class for prediction-market research workflows."""
+
+    PRICE_PROXY = "PRICE_PROXY"
+    ORDER_BOOK_SIMULATED = "ORDER_BOOK_SIMULATED"
+    PAPER_FORWARD = "PAPER_FORWARD"
+
 @dataclass(frozen=True, slots=True)
 class InstrumentMetadata:
     symbol: str
@@ -95,12 +103,14 @@ class OHLCVBar:
         if self.spread is not None:
             spread = float(self.spread)
             if not math.isfinite(spread) or spread < 0:
-                raise ValueError("spread must be finite and non-negative")
+                raise ValueError("OHLCV spread must be finite and non-negative")
             object.__setattr__(self, "spread", spread)
         if self.trades is not None:
-            if int(self.trades) != self.trades or self.trades < 0:
-                raise ValueError("trades must be a non-negative integer")
-            object.__setattr__(self, "trades", int(self.trades))
+            trades = int(self.trades)
+            if trades < 0:
+                raise ValueError("OHLCV trades must be non-negative")
+            object.__setattr__(self, "trades", trades)
+
 
 @dataclass(frozen=True, slots=True)
 class TradePrint:
@@ -108,6 +118,9 @@ class TradePrint:
     price: float
     size: float
     side: Side | None = None
+    trade_id: str | None = None
+    market_id: str | None = None
+    token_id: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "timestamp", ensure_utc(self.timestamp))
@@ -118,6 +131,13 @@ class TradePrint:
             object.__setattr__(self, "side", Side(str(self.side)))
         object.__setattr__(self, "price", price)
         object.__setattr__(self, "size", size)
+        for name in ("trade_id", "market_id", "token_id"):
+            value = getattr(self, name)
+            if value is not None:
+                normalized = str(value).strip()
+                if not normalized:
+                    raise ValueError(f"{name} must be non-empty when provided")
+                object.__setattr__(self, name, normalized)
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,6 +157,7 @@ class OrderBookSnapshot:
     timestamp: datetime
     bids: tuple[OrderBookLevel, ...]
     asks: tuple[OrderBookLevel, ...]
+    token_id: str | None = None
     def __post_init__(self) -> None:
         bids, asks = tuple(self.bids), tuple(self.asks)
         if not all(isinstance(level, OrderBookLevel) for level in (*bids, *asks)):
@@ -146,6 +167,11 @@ class OrderBookSnapshot:
         asks = tuple(sorted(asks, key=lambda level: level.price))
         if bids and asks and bids[0].price > asks[0].price:
             raise ValueError("order-book bid cannot exceed ask")
+        if self.token_id is not None:
+            token_id = str(self.token_id).strip()
+            if not token_id:
+                raise ValueError("token_id must be non-empty when provided")
+            object.__setattr__(self, "token_id", token_id)
         object.__setattr__(self, "bids", bids)
         object.__setattr__(self, "asks", asks)
 
@@ -164,18 +190,44 @@ class OrderBookSnapshot:
             return None
         return (self.best_bid + self.best_ask) / 2.0
 
-    def executable_price(self, side: Side, quantity: float) -> tuple[float, float]:
-        """Return VWAP and filled quantity by walking displayed depth."""
+    def executable_price(
+        self,
+        side: Side,
+        quantity: float,
+        *,
+        limit_price: float | None = None,
+        price_multiplier: float = 1.0,
+    ) -> tuple[float, float]:
+        """Return raw VWAP and filled quantity by walking displayed depth.
+
+        ``limit_price`` is checked against the post-slippage level price when
+        ``price_multiplier`` is supplied. A limit order therefore cannot fill
+        from a level that is only acceptable after averaging across worse
+        levels or before adverse slippage.
+        """
         if not isinstance(side, Side):
             side = Side(str(side))
         quantity = float(quantity)
         if not math.isfinite(quantity) or quantity < 0:
             raise ValueError("order-book quantity must be finite and non-negative")
+        price_multiplier = float(price_multiplier)
+        if not math.isfinite(price_multiplier) or price_multiplier <= 0:
+            raise ValueError("price_multiplier must be finite and positive")
+        if limit_price is not None:
+            limit_price = float(limit_price)
+            if not math.isfinite(limit_price) or limit_price < 0:
+                raise ValueError("limit_price must be finite and non-negative")
         levels: Sequence[OrderBookLevel] = self.asks if side is Side.BUY else self.bids
         remaining = quantity
         notional = 0.0
         filled = 0.0
         for level in levels:
+            adjusted_price = level.price * price_multiplier
+            if limit_price is not None:
+                if side is Side.BUY and adjusted_price > limit_price + 1e-12:
+                    break
+                if side is Side.SELL and adjusted_price < limit_price - 1e-12:
+                    break
             take = min(remaining, level.size)
             notional += take * level.price
             filled += take
@@ -239,6 +291,8 @@ class PredictionMarketSnapshot:
     tags: tuple[str, ...] = ()
     order_book: OrderBookSnapshot | None = None
     source: str = ""
+    yes_token_id: str | None = None
+    no_token_id: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "timestamp", ensure_utc(self.timestamp))
@@ -272,6 +326,25 @@ class PredictionMarketSnapshot:
         object.__setattr__(self, "tags", tuple(str(tag) for tag in self.tags))
         if self.order_book is not None and not isinstance(self.order_book, OrderBookSnapshot):
             raise TypeError("order_book must be an OrderBookSnapshot")
+        for name in ("yes_token_id", "no_token_id"):
+            value = getattr(self, name)
+            if value is not None:
+                normalized = str(value).strip()
+                if not normalized:
+                    raise ValueError(f"{name} must be non-empty when provided")
+                object.__setattr__(self, name, normalized)
+
+    @property
+    def yes_spread(self) -> float | None:
+        if self.yes_bid is None or self.yes_ask is None:
+            return None
+        return self.yes_ask - self.yes_bid
+
+    @property
+    def no_spread(self) -> float | None:
+        if self.no_bid is None or self.no_ask is None:
+            return None
+        return self.no_ask - self.no_bid
 
     @property
     def time_to_expiry_seconds(self) -> float | None:
@@ -367,6 +440,34 @@ def ensure_utc(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=timezone.utc)
     return value.astimezone(timezone.utc)
+def parse_timestamp(value: Any) -> datetime | None:
+    """Parse common UTC timestamps without silently accepting invalid values."""
+    if isinstance(value, datetime):
+        return ensure_utc(value)
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        number = float(value)
+        if not math.isfinite(number):
+            return None
+        if abs(number) >= 100_000_000_000:
+            number /= 1000.0
+        try:
+            return datetime.fromtimestamp(number, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        try:
+            return ensure_utc(datetime.fromisoformat(text))
+        except ValueError:
+            try:
+                return parse_timestamp(float(text))
+            except ValueError:
+                return None
+    return None
 
 
 def to_record(value: Any) -> dict[str, Any]:

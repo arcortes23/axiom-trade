@@ -20,13 +20,24 @@ from .domain import (
     OrderBookLevel,
     OrderBookSnapshot,
     PredictionMarketSnapshot,
+    ResolvedContract,
+    SettlementState,
     Side,
     SimulationQuality,
     ensure_utc,
+    parse_timestamp,
     utc_now,
 )
 
 
+
+
+def _finite_number(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
 class LiveExecutionDisabled(RuntimeError):
     """Raised for every attempt to enable real-money execution."""
 def _complement_book(book: OrderBookSnapshot) -> OrderBookSnapshot:
@@ -215,32 +226,55 @@ class PaperTrader:
     def _approved(self, order: PaperOrder, context: Mapping[str, Any]) -> bool:
         if self.risk is None:
             return True
+        kwargs = {
+            "price": context.get("risk_price", order.reference_price),
+            "quantity": order.quantity,
+            "strategy_id": order.strategy_id,
+            "group": context.get("group"),
+            "liquidity": context.get("liquidity"),
+            "spread": context.get("spread"),
+            "expected_loss": context.get("expected_loss"),
+            "cvar": context.get("cvar"),
+            "timestamp": order.requested_at,
+        }
+
+        def invoke(method: Any) -> Any:
+            try:
+                signature = inspect.signature(method)
+                parameters = tuple(signature.parameters.values())
+            except (TypeError, ValueError):
+                parameters = ()
+            accepts_kwargs = any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters)
+            named = {
+                parameter.name
+                for parameter in parameters
+                if parameter.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+            }
+            if accepts_kwargs:
+                return method(order, **kwargs)
+            filtered = {name: value for name, value in kwargs.items() if name in named}
+            if filtered:
+                return method(order, **filtered)
+            positional = tuple(
+                parameter
+                for parameter in parameters
+                if parameter.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+            )
+            return method(order, context) if len(positional) >= 2 else method(order)
         checker = getattr(self.risk, "check_order", None)
         if callable(checker):
             try:
-                result = checker(
-                    order,
-                    price=context.get("risk_price", order.reference_price),
-                    quantity=order.quantity,
-                    strategy_id=order.strategy_id,
-                    liquidity=context.get("liquidity"),
-                    spread=context.get("spread"),
-                    expected_loss=context.get("expected_loss"),
-                    cvar=context.get("cvar"),
-                    timestamp=order.requested_at,
-                )
-            except TypeError:
-                result = checker(order)
-            return bool(result)
+                return bool(invoke(checker))
+            except Exception:
+                return False
         for name in ("approve", "check", "allows"):
             method = getattr(self.risk, name, None)
             if not callable(method):
                 continue
             try:
-                result = method(order, context)
-            except TypeError:
-                result = method(order)
-            return bool(result)
+                return bool(invoke(method))
+            except Exception:
+                return False
         return True
 
     def _notify_risk(self, fill: Fill, context: Mapping[str, Any]) -> None:
@@ -250,9 +284,40 @@ class PaperTrader:
         if not callable(method):
             return
         try:
+            signature = inspect.signature(method)
+            parameters = tuple(signature.parameters.values())
+            accepts_kwargs = any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters)
+            accepts_group = accepts_kwargs or any(
+                parameter.name == "group"
+                and parameter.kind
+                in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+                for parameter in parameters
+            )
+        except (TypeError, ValueError):
+            accepts_group = True
+        if accepts_group:
             method(fill, group=context.get("group"))
-        except TypeError:
+        else:
             method(fill)
+
+    def _update_risk_equity(self, context: Mapping[str, Any], timestamp: datetime) -> bool:
+        if self.risk is None or self.portfolio is None:
+            return True
+        updater = getattr(self.risk, "update_equity", None)
+        equity_method = getattr(self.portfolio, "equity", None)
+        if not callable(updater) or not callable(equity_method):
+            return True
+        prices = context.get("mark_prices")
+        try:
+            if isinstance(prices, Mapping):
+                equity = equity_method(prices)
+            else:
+                equity = equity_method()
+            updater(float(equity), timestamp=ensure_utc(timestamp))
+        except Exception:
+            # A risk update failure must not create a false approval path.
+            return False
+        return True
 
     def _notify_portfolio(self, fill: Fill) -> None:
         if self.portfolio is None:
@@ -314,6 +379,7 @@ class PaperTrader:
         symbol: str,
         observation: Any,
         book: OrderBookSnapshot | None,
+        no_book: OrderBookSnapshot | None = None,
         timestamp: datetime,
         reference: float,
         quantity: float | None = None,
@@ -325,12 +391,28 @@ class PaperTrader:
         liquidity = value("liquidity")
         initial_bid = book.best_bid if book is not None else value("yes_bid", value("bid"))
         initial_ask = book.best_ask if book is not None else value("yes_ask", value("ask"))
-        initial_spread = (
-            float(initial_ask) - float(initial_bid)
-            if initial_bid is not None and initial_ask is not None
-            else None
-        )
+        bid_number = _finite_number(initial_bid)
+        ask_number = _finite_number(initial_ask)
+        initial_spread = ask_number - bid_number if bid_number is not None and ask_number is not None else None
         expected = value("model_probability", value("predicted_probability"))
+        if self.market_type is MarketType.PREDICTION:
+            yes_mark = _finite_number(value("yes_mid", reference))
+            if yes_mark is None:
+                yes_mark = _finite_number(reference)
+            no_mark = _finite_number(value("no_mid"))
+            if no_mark is None and yes_mark is not None and 0.0 <= yes_mark <= 1.0:
+                no_mark = 1.0 - yes_mark
+            mark_prices: dict[str, float] = {}
+            if yes_mark is not None and 0.0 <= yes_mark <= 1.0:
+                mark_prices[symbol] = yes_mark
+            if no_mark is not None and 0.0 <= no_mark <= 1.0:
+                mark_prices[f"{symbol}|no"] = no_mark
+        else:
+            raw_mark = value("last", value("close", reference))
+            mark = _finite_number(raw_mark)
+            if mark is None:
+                mark = _finite_number(reference)
+            mark_prices = {symbol: mark} if mark is not None and mark >= 0.0 else {}
         context: dict[str, Any] = {
             "market_type": self.market_type.value,
             "symbol": symbol,
@@ -340,39 +422,82 @@ class PaperTrader:
             "liquidity": liquidity,
             "spread": initial_spread,
             "reference_price": reference,
+            "mark_prices": mark_prices,
             "model_probability": expected,
             "expected_loss": value("expected_loss"),
             "paper": True,
         }
+        if not self._update_risk_equity(context, timestamp):
+            return None
+        if self.market_type is MarketType.PREDICTION:
+            raw_state = value("settlement", SettlementState.OPEN)
+            try:
+                state = raw_state if isinstance(raw_state, SettlementState) else SettlementState(str(raw_state))
+            except ValueError:
+                state = SettlementState.UNKNOWN
+            if state in {
+                SettlementState.RESOLVED_YES,
+                SettlementState.RESOLVED_NO,
+                SettlementState.VOID,
+            }:
+                if self.portfolio is not None and market_id:
+                    try:
+                        self.portfolio.resolve(
+                            ResolvedContract(
+                                market_id,
+                                state,
+                                timestamp,
+                                str(value("resolution_criteria", "")),
+                            )
+                        )
+                    except (TypeError, ValueError):
+                        return None
+                    if not self._update_risk_equity(context, timestamp):
+                        return None
+                return None
         signal = self._strategy_signal(observation, context)
         normalized = self._normalize_signal(signal)
         if normalized is None:
             return None
         side, indicated_quantity = normalized
         outcome = self._signal_outcome(signal) if self.market_type is MarketType.PREDICTION else None
+        execution_book = book
+        if execution_book is None and outcome is None:
+            side_quote = initial_ask if side is Side.BUY else initial_bid
+            if side_quote is not None:
+                try:
+                    reference = float(side_quote)
+                except (TypeError, ValueError):
+                    return None
         try:
             execution_reference = float(reference)
         except (TypeError, ValueError):
             return None
         if not math.isfinite(execution_reference) or execution_reference <= 0:
             return None
-        execution_book = book
+        no_bid = value("no_bid")
+        no_ask = value("no_ask")
+        no_mid = value("no_mid")
         if outcome == "no":
-            raw_no_book = value("no_order_book")
+            raw_no_book = no_book or value("no_order_book")
             execution_book = raw_no_book if isinstance(raw_no_book, OrderBookSnapshot) else None
             if execution_book is None and isinstance(book, OrderBookSnapshot):
                 execution_book = _complement_book(book)
-            no_bid = value("no_bid")
-            no_ask = value("no_ask")
             yes_mid = value("yes_mid")
             yes_bid = value("yes_bid")
             yes_ask = value("yes_ask")
-            if no_mid is None and yes_mid is not None and 0.0 < float(yes_mid) < 1.0:
-                no_mid = 1.0 - float(yes_mid)
-            if no_ask is None and yes_bid is not None and 0.0 < float(yes_bid) < 1.0:
-                no_ask = 1.0 - float(yes_bid)
-            if no_bid is None and yes_ask is not None and 0.0 < float(yes_ask) < 1.0:
-                no_bid = 1.0 - float(yes_ask)
+            try:
+                yes_mid_value = float(yes_mid) if yes_mid is not None else None
+            except (TypeError, ValueError):
+                yes_mid_value = None
+            if no_mid is None and yes_mid_value is not None and 0.0 < yes_mid_value < 1.0:
+                no_mid = 1.0 - yes_mid_value
+            yes_bid_value = _finite_number(yes_bid)
+            yes_ask_value = _finite_number(yes_ask)
+            if no_ask is None and yes_bid_value is not None and 0.0 < yes_bid_value < 1.0:
+                no_ask = 1.0 - yes_bid_value
+            if no_bid is None and yes_ask_value is not None and 0.0 < yes_ask_value < 1.0:
+                no_bid = 1.0 - yes_ask_value
             quote = no_ask if side is Side.BUY else no_bid
             if quote is None:
                 quote = no_mid
@@ -383,6 +508,21 @@ class PaperTrader:
                     return None
                 if not math.isfinite(execution_reference) or execution_reference <= 0:
                     return None
+        elif execution_book is None:
+            side_quote = initial_ask if side is Side.BUY else initial_bid
+            if side_quote is not None:
+                try:
+                    execution_reference = float(side_quote)
+                except (TypeError, ValueError):
+                    return None
+        if self.market_type is MarketType.PREDICTION and execution_reference > 1.0:
+            return None
+        if execution_book is not None:
+            executable_reference = execution_book.best_ask if side is Side.BUY else execution_book.best_bid
+            if executable_reference is not None and executable_reference > 0:
+                execution_reference = float(executable_reference)
+        if self.market_type is MarketType.PREDICTION and execution_reference > 1.0:
+            return None
         if execution_book is not None:
             book_bid = execution_book.best_bid
             book_ask = execution_book.best_ask
@@ -421,13 +561,18 @@ class PaperTrader:
         if self.portfolio is not None:
             if side is Side.BUY:
                 cash = getattr(self.portfolio, "cash", None)
-                if cash is not None and math.isfinite(float(cash)):
+                try:
+                    cash_value = float(cash) if cash is not None else None
+                except (TypeError, ValueError):
+                    cash_value = None
+                if cash_value is not None and math.isfinite(cash_value):
+                    cost_factor = (1.0 + self.config.fee_rate) * (1.0 + self.config.slippage_bps / 10000.0)
                     if execution_book is not None:
                         cash_price, available = execution_book.executable_price(side, quantity)
-                        if cash_price > 0:
-                            quantity = min(quantity, available, float(cash) / (cash_price * (1.0 + self.config.fee_rate) * (1.0 + self.config.slippage_bps / 10000.0)))
-                    elif risk_price > 0:
-                        quantity = min(quantity, float(cash) / (risk_price * (1.0 + self.config.fee_rate) * (1.0 + self.config.slippage_bps / 10000.0)))
+                        if cash_price > 0 and cost_factor > 0:
+                            quantity = min(quantity, available, cash_value / (cash_price * cost_factor))
+                    elif risk_price > 0 and cost_factor > 0:
+                        quantity = min(quantity, cash_value / (risk_price * cost_factor))
             elif hasattr(self.portfolio, "get_position"):
                 try:
                     position = self.portfolio.get_position(symbol, outcome=outcome)
@@ -435,6 +580,35 @@ class PaperTrader:
                     position = self.portfolio.get_position(symbol)
                 available = float(getattr(position, "quantity", 0.0)) if position is not None else 0.0
                 quantity = min(quantity, max(0.0, available))
+        if execution_book is not None:
+            slippage_factor = 1.0 + (self.config.slippage_bps / 10000.0) * (1.0 if side is Side.BUY else -1.0)
+            if not math.isfinite(slippage_factor) or slippage_factor <= 0:
+                return None
+            try:
+                projected_price, projected_quantity = execution_book.executable_price(
+                    side,
+                    quantity,
+                    price_multiplier=slippage_factor,
+                )
+            except (TypeError, ValueError):
+                return None
+            if projected_quantity <= 0 or projected_price <= 0:
+                return None
+            quantity = min(quantity, projected_quantity)
+            if quantity <= 0:
+                return None
+            if quantity < projected_quantity:
+                projected_price, projected_quantity = execution_book.executable_price(
+                    side,
+                    quantity,
+                    price_multiplier=slippage_factor,
+                )
+            if projected_quantity <= 0 or projected_price <= 0:
+                return None
+            execution_reference = projected_price
+            risk_price = projected_price * slippage_factor
+            context["reference_price"] = execution_reference
+            context["risk_price"] = risk_price
         if quantity <= 0 or not math.isfinite(quantity):
             return None
         order = PaperOrder(
@@ -462,6 +636,13 @@ class PaperTrader:
             return None
         direction = 1.0 if side is Side.BUY else -1.0
         price *= 1.0 + direction * self.config.slippage_bps / 10000.0
+        if (
+            price <= 0
+            or not math.isfinite(price)
+            or self.market_type is MarketType.PREDICTION
+            and price > 1.0 + 1e-12
+        ):
+            return None
         fill = self._make_fill(
             symbol=symbol,
             side=side,
@@ -476,6 +657,7 @@ class PaperTrader:
         )
         self._fills.append(fill)
         self._notify_portfolio(fill)
+        self._update_risk_equity(context, timestamp)
         self._notify_risk(fill, context)
         return fill
 
@@ -498,68 +680,131 @@ class CryptoPaperTrader(PaperTrader):
         if start is None and end is None:
             fill = self.run_once(symbol, quantity=quantity)
             return (fill,) if fill else ()
-        bars = self.provider.historical_ohlcv(symbol, start=start, end=end, interval=interval)
-        for bar in bars:
-            reference = float(bar.close)
-            self._run_observation(symbol=symbol, observation=bar, book=None, timestamp=bar.timestamp, reference=reference, quantity=quantity)
+        bars = tuple(self.provider.historical_ohlcv(symbol, start=start, end=end, interval=interval))
+        for index in range(1, len(bars)):
+            signal_bar = bars[index - 1]
+            execution_bar = bars[index]
+            if isinstance(execution_bar, Mapping):
+                raw_open = execution_bar.get("open")
+                raw_timestamp = execution_bar.get("timestamp")
+            else:
+                raw_open = getattr(execution_bar, "open", None)
+                raw_timestamp = getattr(execution_bar, "timestamp", None)
+            opening = _finite_number(raw_open)
+            stamp = parse_timestamp(raw_timestamp)
+            if opening is None or opening <= 0 or stamp is None:
+                continue
+            self._run_observation(
+                symbol=symbol,
+                observation=signal_bar,
+                book=None,
+                timestamp=stamp,
+                reference=opening,
+                quantity=quantity,
+            )
         return self.fills
 
 
 class PredictionPaperTrader(PaperTrader):
     market_type = MarketType.PREDICTION
-
     def run_once(self, market_id: str, *, quantity: float | None = None, timestamp: datetime | None = None) -> Fill | None:
         market: PredictionMarketSnapshot | None = self.provider.market(market_id)
         if market is None:
             return None
-        book = self.provider.order_book(market_id, depth=self.config.depth) or market.order_book
+        try:
+            books = self.provider.order_books(market_id, depth=self.config.depth)
+        except (AttributeError, TypeError):
+            books = {}
+        book = books.get("yes") if isinstance(books, Mapping) else None
+        no_book = books.get("no") if isinstance(books, Mapping) else None
+        book = book if isinstance(book, OrderBookSnapshot) else market.order_book
+        if not isinstance(no_book, OrderBookSnapshot):
+            no_book = None
         reference = market.yes_mid
         if reference is None:
             reference = market.yes_ask if market.yes_ask is not None else market.yes_bid
         if reference is None:
+            reference = market.no_mid
+        if reference is None:
+            reference = market.no_ask if market.no_ask is not None else market.no_bid
+        if reference is None:
             return None
         stamp = ensure_utc(timestamp or market.timestamp)
-        return self._run_observation(symbol=market_id, observation=market, book=book, timestamp=stamp, reference=float(reference), quantity=quantity, market_id=market_id)
+        if book is not None and book.timestamp > stamp:
+            book = None
+        if no_book is not None and no_book.timestamp > stamp:
+            no_book = None
+        return self._run_observation(
+            symbol=market_id,
+            observation=market,
+            book=book,
+            no_book=no_book,
+            timestamp=stamp,
+            reference=float(reference),
+            quantity=quantity,
+            market_id=market_id,
+        )
 
     step = run_once
 
     def run(self, market_id: str, start: datetime | None = None, end: datetime | None = None, *, quantity: float | None = None) -> tuple[Fill, ...]:
-        # Price histories are mappings and may not have an order book, so they
-        # are fed to the strategy as observations while using a market snapshot
-        # for the instrument metadata and timestamp fallback.
-        if start is None and end is None:
-            fill = self.run_once(market_id, quantity=quantity)
-            return (fill,) if fill else ()
         market = self.provider.market(market_id)
         if market is None:
             return self.fills
-        for point in self.provider.price_history(market_id, start=start, end=end):
-            stamp = point.get("timestamp", market.timestamp) if isinstance(point, Mapping) else market.timestamp
-            if isinstance(stamp, str):
-                try:
-                    stamp = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
-                except ValueError:
-                    stamp = market.timestamp
-            if not isinstance(stamp, datetime):
-                stamp = market.timestamp
-            stamp = ensure_utc(stamp)
-            price = point.get("yes_mid", point.get("price", market.yes_mid)) if isinstance(point, Mapping) else market.yes_mid
+        raw_points = tuple(self.provider.price_history(market_id, start=start, end=end))
+        points: list[tuple[Mapping[str, Any], datetime]] = []
+        for point in raw_points:
+            if not isinstance(point, Mapping):
+                continue
+            stamp = parse_timestamp(point.get("timestamp", point.get("t")))
+            if stamp is None:
+                continue
+            points.append((point, stamp))
+        points.sort(key=lambda item: item[1])
+        terminal_state = market.settlement if market.settlement in {
+            SettlementState.RESOLVED_YES,
+            SettlementState.RESOLVED_NO,
+            SettlementState.VOID,
+        } else None
+        for index, (point, stamp) in enumerate(points):
+            price = point.get("yes_mid", point.get("price", market.yes_mid))
             try:
                 price = float(price)
             except (TypeError, ValueError):
                 continue
             if not math.isfinite(price) or price <= 0:
                 continue
-            self._run_observation(symbol=market_id, observation=point, book=None, timestamp=stamp, reference=price, quantity=quantity, market_id=market_id)
+            observation = dict(point)
+            observation.setdefault("timestamp", stamp)
+            observation.setdefault("yes_mid", price)
+            observation.setdefault("expiry", market.expiry)
+            observation.setdefault("resolution_criteria", market.resolution_criteria)
+            observation.setdefault("yes_bid", market.yes_bid)
+            observation.setdefault("yes_ask", market.yes_ask)
+            observation.setdefault("no_bid", market.no_bid)
+            observation.setdefault("no_ask", market.no_ask)
+            observation.setdefault("no_mid", market.no_mid)
+            observation.setdefault("liquidity", market.liquidity)
+            if "settlement" not in observation:
+                resolution_visible = (
+                    terminal_state is not None
+                    and (index == len(points) - 1 or market.expiry is not None and stamp >= market.expiry)
+                )
+                observation["settlement"] = terminal_state.value if resolution_visible else SettlementState.OPEN.value
+            self._run_observation(
+                symbol=market_id,
+                observation=observation,
+                book=None,
+                timestamp=stamp,
+                reference=price,
+                quantity=quantity,
+                market_id=market_id,
+            )
         return self.fills
 
 
-class CryptoPaperOrchestrator(CryptoPaperTrader):
-    pass
-
-
-class PredictionPaperOrchestrator(PredictionPaperTrader):
-    pass
+CryptoPaperOrchestrator = CryptoPaperTrader
+PredictionPaperOrchestrator = PredictionPaperTrader
 
 
 PaperCryptoTrader = CryptoPaperTrader

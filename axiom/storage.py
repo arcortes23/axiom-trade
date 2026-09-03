@@ -29,10 +29,12 @@ from .domain import (
     OrderBookLevel,
     OrderBookSnapshot,
     PredictionMarketSnapshot,
+    TradePrint,
     ResolvedContract,
     SettlementState,
     Side,
     ensure_utc,
+    parse_timestamp,
     to_record,
     utc_now,
 )
@@ -154,6 +156,64 @@ class AxiomStore:
                     report_id TEXT PRIMARY KEY,
                     experiment_id TEXT,
                     payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS polymarket_markets (
+                    market_id TEXT NOT NULL,
+                    observed_at TEXT NOT NULL,
+                    metadata_hash TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (market_id, observed_at, metadata_hash)
+                );
+                CREATE INDEX IF NOT EXISTS idx_polymarket_markets_observed
+                    ON polymarket_markets(market_id, observed_at);
+                CREATE TABLE IF NOT EXISTS polymarket_snapshots (
+                    snapshot_id TEXT PRIMARY KEY,
+                    market_id TEXT NOT NULL,
+                    source_timestamp TEXT NOT NULL,
+                    observed_at TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    quality TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_polymarket_snapshots_market_time
+                    ON polymarket_snapshots(market_id, source_timestamp, observed_at);
+                CREATE TABLE IF NOT EXISTS polymarket_trades (
+                    trade_key TEXT PRIMARY KEY,
+                    market_id TEXT NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_polymarket_trades_market_time
+                    ON polymarket_trades(market_id, timestamp);
+                CREATE TABLE IF NOT EXISTS collector_state (
+                    collector_name TEXT PRIMARY KEY,
+                    state_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS collection_errors (
+                    error_id TEXT PRIMARY KEY,
+                    market_id TEXT,
+                    observed_at TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    detail TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_collection_errors_market_time
+                    ON collection_errors(market_id, observed_at);
+                CREATE TABLE IF NOT EXISTS forward_tests (
+                    experiment_id TEXT PRIMARY KEY,
+                    strategy_hash TEXT NOT NULL,
+                    model_hash TEXT NOT NULL,
+                    config_json TEXT NOT NULL,
+                    start_timestamp TEXT NOT NULL,
+                    bankroll REAL NOT NULL,
+                    allowed_markets_json TEXT NOT NULL,
+                    risk_limits_json TEXT NOT NULL,
+                    quality TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
                 """
@@ -483,6 +543,407 @@ class AxiomStore:
 
     def load_prediction_snapshots(self, key: str, **kwargs: Any) -> list[PredictionMarketSnapshot]:
         return [item for item in self.load_snapshots(key, kind="prediction", **kwargs) if isinstance(item, PredictionMarketSnapshot)]
+    # Continuous Polymarket collection --------------------------------
+    def save_polymarket_market_metadata(
+        self,
+        market_id: str,
+        payload: Any,
+        *,
+        observed_at: datetime,
+        metadata_hash: str | None = None,
+    ) -> bool:
+        identifier = str(market_id).strip()
+        if not identifier:
+            raise ValueError("market_id is required")
+        observed = _iso(observed_at)
+        payload_json = _dump(payload)
+        digest = str(metadata_hash or hashlib.sha256(payload_json.encode("utf-8")).hexdigest())
+        with self._write_context():
+            existing = self._conn.execute(
+                "SELECT 1 FROM polymarket_markets WHERE market_id=? AND metadata_hash=? LIMIT 1",
+                (identifier, digest),
+            ).fetchone()
+            if existing is not None:
+                return False
+            self._conn.execute(
+                "INSERT INTO polymarket_markets(market_id,observed_at,metadata_hash,payload_json,created_at) VALUES (?,?,?,?,?)",
+                (identifier, observed, digest, payload_json, _now_iso()),
+            )
+        return True
+
+    def save_polymarket_snapshot(
+        self,
+        snapshot_id: str,
+        market_id: str,
+        source_timestamp: datetime,
+        observed_at: datetime,
+        payload: Any,
+        *,
+        quality: Any = "ORDER_BOOK_SIMULATED",
+    ) -> bool:
+        identifier = str(market_id).strip()
+        if not identifier:
+            raise ValueError("market_id is required")
+        snapshot_key = str(snapshot_id).strip()
+        if not snapshot_key:
+            raise ValueError("snapshot_id is required")
+        source = _iso(source_timestamp)
+        observed = _iso(observed_at)
+        payload_json = _dump(payload)
+        quality_value = _enum_value(quality) or "ORDER_BOOK_SIMULATED"
+        with self._write_context():
+            cursor = self._conn.execute(
+                "INSERT OR IGNORE INTO polymarket_snapshots(snapshot_id,market_id,source_timestamp,observed_at,payload_json,quality,created_at) VALUES (?,?,?,?,?,?,?)",
+                (snapshot_key, identifier, source, observed, payload_json, quality_value, _now_iso()),
+            )
+        return cursor.rowcount > 0
+
+    def save_polymarket_trade(
+        self,
+        market_id: str,
+        trade: TradePrint | Mapping[str, Any],
+        *,
+        trade_key: str | None = None,
+    ) -> bool:
+        identifier = str(market_id).strip()
+        if not identifier:
+            raise ValueError("market_id is required")
+        payload_json = _dump(trade)
+        if isinstance(trade, TradePrint):
+            timestamp = trade.timestamp
+            supplied_key = trade.trade_id
+        elif isinstance(trade, Mapping):
+            timestamp = _parse_datetime(trade.get("timestamp")) or _parse_datetime(trade.get("time"))
+            if timestamp is None:
+                raise ValueError("trade timestamp is required")
+            supplied_key = trade.get("trade_id", trade.get("id"))
+        else:
+            raise TypeError("trade must be TradePrint or mapping")
+        supplied_key_text = str(trade_key).strip() if trade_key is not None else ""
+        if trade_key is not None and not supplied_key_text:
+            raise ValueError("trade key is required")
+        if trade_key is not None:
+            key = f"{identifier}|{supplied_key_text}"
+        elif supplied_key:
+            key = f"{identifier}|{str(supplied_key).strip()}"
+        else:
+            key = hashlib.sha256(_dump({"market_id": identifier, "trade": trade}).encode("utf-8")).hexdigest()
+        if not key:
+            raise ValueError("trade key is required")
+        with self._write_context():
+            cursor = self._conn.execute(
+                "INSERT OR IGNORE INTO polymarket_trades(trade_key,market_id,timestamp,payload_json,created_at) VALUES (?,?,?,?,?)",
+                (key, identifier, _iso(timestamp), payload_json, _now_iso()),
+            )
+        return cursor.rowcount > 0
+
+    def load_polymarket_snapshots(
+        self,
+        market_id: str | None = None,
+        *,
+        start: datetime | None = None,
+        end: datetime | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        values: list[Any] = []
+        if market_id is not None:
+            clauses.append("market_id=?")
+            values.append(str(market_id))
+        if start is not None:
+            clauses.append("observed_at>=?")
+            values.append(_iso(start))
+        if end is not None:
+            clauses.append("observed_at<=?")
+            values.append(_iso(end))
+        query = "SELECT snapshot_id,market_id,source_timestamp,observed_at,payload_json,quality FROM polymarket_snapshots"
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY observed_at,market_id,source_timestamp"
+        if limit is not None:
+            if limit < 0:
+                raise ValueError("limit must be non-negative")
+            query += " LIMIT ?"
+            values.append(int(limit))
+        with self._lock:
+            rows = self._conn.execute(query, values).fetchall()
+        return [
+            {
+                "snapshot_id": row["snapshot_id"],
+                "market_id": row["market_id"],
+                "source_timestamp": _parse_datetime(row["source_timestamp"]),
+                "observed_at": _parse_datetime(row["observed_at"]),
+                "payload": _load(row["payload_json"]),
+                "quality": row["quality"],
+            }
+            for row in rows
+        ]
+
+    def load_polymarket_trades(
+        self,
+        market_id: str | None = None,
+        *,
+        start: datetime | None = None,
+        end: datetime | None = None,
+    ) -> list[TradePrint | Mapping[str, Any]]:
+        clauses: list[str] = []
+        values: list[Any] = []
+        if market_id is not None:
+            clauses.append("market_id=?")
+            values.append(str(market_id))
+        if start is not None:
+            clauses.append("timestamp>=?")
+            values.append(_iso(start))
+        if end is not None:
+            clauses.append("timestamp<=?")
+            values.append(_iso(end))
+        query = "SELECT payload_json FROM polymarket_trades"
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY timestamp,trade_key"
+        with self._lock:
+            rows = self._conn.execute(query, values).fetchall()
+        result: list[TradePrint | Mapping[str, Any]] = []
+        for row in rows:
+            payload = _load(row["payload_json"])
+            try:
+                result.append(_trade_from_record(payload))
+            except (KeyError, TypeError, ValueError):
+                result.append(payload)
+        return result
+
+    def tracked_polymarket_markets(self) -> list[str]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT market_id FROM polymarket_markets UNION SELECT market_id FROM polymarket_snapshots ORDER BY market_id"
+            ).fetchall()
+        return [str(row["market_id"]) for row in rows]
+
+    def get_collector_state(self, collector_name: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT state_json FROM collector_state WHERE collector_name=?", (str(collector_name),)
+            ).fetchone()
+        return _load(row["state_json"]) if row else None
+
+    def set_collector_state(self, collector_name: str, state: Mapping[str, Any]) -> None:
+        with self._write_context():
+            self._conn.execute(
+                "INSERT INTO collector_state(collector_name,state_json,updated_at) VALUES (?,?,?) "
+                "ON CONFLICT(collector_name) DO UPDATE SET state_json=excluded.state_json,updated_at=excluded.updated_at",
+                (str(collector_name), _dump(dict(state)), _now_iso()),
+            )
+
+    def save_collection_error(
+        self,
+        market_id: str | None,
+        observed_at: datetime,
+        kind: str,
+        detail: str,
+        payload: Any = None,
+    ) -> str:
+        body = {"market_id": market_id, "kind": str(kind), "detail": str(detail), "payload": payload}
+        error_id = hashlib.sha256(_dump(body | {"observed_at": _iso(observed_at)}).encode("utf-8")).hexdigest()
+        with self._write_context():
+            self._conn.execute(
+                "INSERT OR IGNORE INTO collection_errors(error_id,market_id,observed_at,kind,detail,payload_json,created_at) VALUES (?,?,?,?,?,?,?)",
+                (error_id, str(market_id) if market_id is not None else None, _iso(observed_at), str(kind), str(detail), _dump(payload), _now_iso()),
+            )
+        return error_id
+
+    def list_collection_errors(self, market_id: str | None = None) -> list[dict[str, Any]]:
+        query = "SELECT error_id,market_id,observed_at,kind,detail,payload_json FROM collection_errors"
+        values: tuple[Any, ...] = ()
+        if market_id is not None:
+            query += " WHERE market_id=?"
+            values = (str(market_id),)
+        query += " ORDER BY observed_at,error_id"
+        with self._lock:
+            rows = self._conn.execute(query, values).fetchall()
+        return [
+            {
+                "error_id": row["error_id"],
+                "market_id": row["market_id"],
+                "observed_at": _parse_datetime(row["observed_at"]),
+                "kind": row["kind"],
+                "detail": row["detail"],
+                "payload": _load(row["payload_json"]),
+            }
+            for row in rows
+        ]
+
+    def save_forward_test(self, experiment_id: str, spec: Mapping[str, Any]) -> bool:
+        identifier = str(experiment_id).strip()
+        if not identifier:
+            raise ValueError("experiment_id is required")
+        strategy_hash = str(spec.get("strategy_hash", "")).strip()
+        model_hash = str(spec.get("model_hash", "")).strip()
+        if not strategy_hash or not model_hash:
+            raise ValueError("frozen forward tests require strategy_hash and model_hash")
+        start_timestamp = _parse_datetime(spec.get("start_timestamp"))
+        if start_timestamp is None:
+            raise ValueError("frozen forward test start_timestamp is required")
+        bankroll = float(spec.get("bankroll", 0.0))
+        if bankroll <= 0:
+            raise ValueError("frozen forward test bankroll must be positive")
+        config_json = _dump(spec.get("config", {}))
+        allowed_json = _dump(spec.get("allowed_markets", []))
+        limits_json = _dump(spec.get("risk_limits", {}))
+        quality = _enum_value(spec.get("quality")) or "PAPER_FORWARD"
+        values = (
+            identifier,
+            strategy_hash,
+            model_hash,
+            config_json,
+            _iso(start_timestamp),
+            bankroll,
+            allowed_json,
+            limits_json,
+            quality,
+            _now_iso(),
+        )
+        with self._write_context():
+            row = self._conn.execute("SELECT * FROM forward_tests WHERE experiment_id=?", (identifier,)).fetchone()
+            if row is not None:
+                immutable = (
+                    row["strategy_hash"],
+                    row["model_hash"],
+                    row["config_json"],
+                    row["start_timestamp"],
+                    float(row["bankroll"]),
+                    row["allowed_markets_json"],
+                    row["risk_limits_json"],
+                    row["quality"],
+                )
+                if immutable != values[1:9]:
+                    raise ValueError(f"forward test is frozen: {identifier}")
+                return False
+            self._conn.execute(
+                "INSERT INTO forward_tests(experiment_id,strategy_hash,model_hash,config_json,start_timestamp,bankroll,allowed_markets_json,risk_limits_json,quality,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                values,
+            )
+        return True
+
+    def load_forward_tests(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute("SELECT * FROM forward_tests ORDER BY start_timestamp,experiment_id").fetchall()
+        return [
+            {
+                "experiment_id": row["experiment_id"],
+                "strategy_hash": row["strategy_hash"],
+                "model_hash": row["model_hash"],
+                "config": _load(row["config_json"]),
+                "start_timestamp": _parse_datetime(row["start_timestamp"]),
+                "bankroll": float(row["bankroll"]),
+                "allowed_markets": _load(row["allowed_markets_json"]),
+                "risk_limits": _load(row["risk_limits_json"]),
+                "quality": row["quality"],
+                "created_at": _parse_datetime(row["created_at"]),
+            }
+            for row in rows
+        ]
+
+    def polymarket_health(
+        self,
+        *,
+        expected_interval_seconds: float = 60.0,
+        stale_after_seconds: float | None = None,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        expected = float(expected_interval_seconds)
+        if not expected > 0:
+            raise ValueError("expected_interval_seconds must be positive")
+        stale_after = float(stale_after_seconds if stale_after_seconds is not None else expected * 3.0)
+        if stale_after <= 0:
+            raise ValueError("stale_after_seconds must be positive")
+        current = ensure_utc(now or utc_now())
+        with self._lock:
+            snapshot_rows = self._conn.execute(
+                "SELECT market_id,observed_at,payload_json FROM polymarket_snapshots ORDER BY market_id,observed_at"
+            ).fetchall()
+            market_count = int(
+                self._conn.execute(
+                    "SELECT COUNT(*) AS n FROM (SELECT market_id FROM polymarket_markets UNION SELECT market_id FROM polymarket_snapshots)"
+                ).fetchone()["n"]
+            )
+            trade_count = int(self._conn.execute("SELECT COUNT(*) AS n FROM polymarket_trades").fetchone()["n"])
+            metadata_count = int(self._conn.execute("SELECT COUNT(*) AS n FROM polymarket_markets").fetchone()["n"])
+            error_count = int(self._conn.execute("SELECT COUNT(*) AS n FROM collection_errors").fetchone()["n"])
+            malformed_count = int(
+                self._conn.execute(
+                    "SELECT COUNT(*) AS n FROM collection_errors WHERE lower(kind) LIKE '%malform%' OR lower(kind) LIKE '%parse%'"
+                ).fetchone()["n"]
+            )
+        observations: dict[str, list[datetime]] = {}
+        latest_payload: dict[str, Mapping[str, Any]] = {}
+        for row in snapshot_rows:
+            timestamp = _parse_datetime(row["observed_at"])
+            if timestamp is None:
+                continue
+            market = str(row["market_id"])
+            observations.setdefault(market, []).append(timestamp)
+            latest_payload[market] = _load(row["payload_json"])
+        gaps: list[dict[str, Any]] = []
+        latest_by_market: dict[str, datetime] = {}
+        for market, stamps in observations.items():
+            stamps.sort()
+            latest_by_market[market] = stamps[-1]
+            for previous, current_stamp in zip(stamps, stamps[1:]):
+                gap_seconds = (current_stamp - previous).total_seconds()
+                if gap_seconds > expected * 1.5:
+                    missing = max(1, int(round(gap_seconds / expected)) - 1)
+                    gaps.append(
+                        {
+                            "market_id": market,
+                            "from": previous.isoformat(),
+                            "to": current_stamp.isoformat(),
+                            "seconds": gap_seconds,
+                            "missing_intervals": missing,
+                        }
+                    )
+        stale_markets = sorted(
+            market for market, stamp in latest_by_market.items() if (current - stamp).total_seconds() > stale_after
+        )
+        resolved_markets = 0
+        for payload in latest_payload.values():
+            snapshot = payload.get("snapshot") if isinstance(payload, Mapping) else None
+            settlement = snapshot.get("settlement") if isinstance(snapshot, Mapping) else None
+            if str(settlement) in {
+                SettlementState.RESOLVED_YES.value,
+                SettlementState.RESOLVED_NO.value,
+                SettlementState.VOID.value,
+            }:
+                resolved_markets += 1
+        snapshot_count = len(snapshot_rows)
+        if snapshot_count == 0:
+            grade = "F"
+        elif malformed_count or (observations and len(stale_markets) / max(1, len(observations)) > 0.5):
+            grade = "D"
+        elif stale_markets or gaps:
+            grade = "C"
+        elif error_count:
+            grade = "B"
+        else:
+            grade = "A"
+        storage_bytes = _storage_bytes(self._conn, self.path)
+        latest = max(latest_by_market.values(), default=None)
+        return {
+            "grade": grade,
+            "markets": market_count,
+            "markets_with_snapshots": len(observations),
+            "resolved_markets": resolved_markets,
+            "snapshots": snapshot_count,
+            "trades": trade_count,
+            "metadata_records": metadata_count,
+            "collection_errors": error_count,
+            "malformed_records": malformed_count,
+            "stale_markets": stale_markets,
+            "gaps": gaps,
+            "latest_observed_at": latest.isoformat() if latest else None,
+            "expected_interval_seconds": expected,
+            "stale_after_seconds": stale_after,
+            "storage_bytes": storage_bytes,
+        }
 
     # Strategy and experiment artifacts -------------------------------
     def save_strategy(self, strategy_id: str, strategy: Any, *, version: str = "1") -> None:
@@ -661,7 +1122,20 @@ class AxiomStore:
         """Return persisted record counts and latest artifact timestamps."""
         with self._lock:
             result: dict[str, Any] = {}
-            for table, label in (("datasets", "datasets"), ("bars", "bars"), ("snapshots", "snapshots"), ("strategies", "strategies"), ("experiments", "experiments"), ("fills", "fills"), ("reports", "reports")):
+            for table, label in (
+                ("datasets", "datasets"),
+                ("bars", "bars"),
+                ("snapshots", "snapshots"),
+                ("strategies", "strategies"),
+                ("experiments", "experiments"),
+                ("fills", "fills"),
+                ("reports", "reports"),
+                ("polymarket_markets", "polymarket_metadata"),
+                ("polymarket_snapshots", "polymarket_snapshots"),
+                ("polymarket_trades", "polymarket_trades"),
+                ("collection_errors", "collection_errors"),
+                ("forward_tests", "forward_tests"),
+            ):
                 result[label] = int(self._conn.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()["n"])
             for table, label in (("datasets", "latest_dataset"), ("experiments", "latest_experiment"), ("reports", "latest_report")):
                 row = self._conn.execute(f"SELECT created_at FROM {table} ORDER BY created_at DESC LIMIT 1").fetchone()
@@ -723,12 +1197,7 @@ def _iso(value: datetime) -> str:
 
 
 def _parse_datetime(value: Any) -> datetime | None:
-    if value is None:
-        return None
-    try:
-        return ensure_utc(datetime.fromisoformat(str(value).replace("Z", "+00:00")))
-    except (TypeError, ValueError):
-        return None
+    return parse_timestamp(value)
 
 
 def _bar_from_record(record: Mapping[str, Any]) -> OHLCVBar:
@@ -772,6 +1241,7 @@ def _book_from_record(record: Mapping[str, Any]) -> OrderBookSnapshot:
         timestamp=_parse_datetime(record.get("timestamp")) or datetime.fromtimestamp(0, tz=timezone.utc),
         bids=_level_records(record.get("bids")),
         asks=_level_records(record.get("asks")),
+        token_id=record.get("token_id"),
     )
 
 
@@ -809,8 +1279,9 @@ def _snapshot_from_record(kind: str, record: Mapping[str, Any]) -> Any:
             tags=tuple(str(item) for item in record.get("tags", ())),
             order_book=_book_from_record(order_book) if isinstance(order_book, Mapping) else None,
             source=str(record.get("source", "")),
+            yes_token_id=record.get("yes_token_id"),
+            no_token_id=record.get("no_token_id"),
         )
-    return record
 
 
 def _settlement(value: Any) -> SettlementState:
@@ -849,6 +1320,35 @@ def _fill_from_record(record: Mapping[str, Any]) -> Fill:
         executable_probability=_optional_float(record.get("executable_probability")),
         metadata=record.get("metadata", {}),
     )
+def _trade_from_record(record: Mapping[str, Any]) -> TradePrint:
+    raw_side = record.get("side")
+    try:
+        side = Side(str(raw_side)) if raw_side is not None else None
+    except ValueError:
+        side = None
+    return TradePrint(
+        timestamp=_parse_datetime(record.get("timestamp")) or datetime.fromtimestamp(0, tz=timezone.utc),
+        price=float(record["price"]),
+        size=float(record.get("size", record.get("quantity"))),
+        side=side,
+        trade_id=record.get("trade_id"),
+        market_id=record.get("market_id"),
+        token_id=record.get("token_id"),
+    )
+
+
+def _storage_bytes(connection: sqlite3.Connection, path: str) -> int:
+    if path not in {":memory:", ""} and not path.startswith("file:"):
+        try:
+            return int(Path(path).expanduser().stat().st_size)
+        except OSError:
+            pass
+    try:
+        page_count = int(connection.execute("PRAGMA page_count").fetchone()[0])
+        page_size = int(connection.execute("PRAGMA page_size").fetchone()[0])
+        return page_count * page_size
+    except sqlite3.Error:
+        return 0
 
 
 __all__ = ["AxiomStore"]

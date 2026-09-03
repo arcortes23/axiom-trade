@@ -19,6 +19,8 @@ from ..domain import (
     OrderBookSnapshot,
     PredictionMarketSnapshot,
     SettlementState,
+    Side,
+    TradePrint,
     ensure_utc,
     utc_now,
 )
@@ -129,18 +131,42 @@ class PolymarketAdapter(PredictionMarketDataProvider):
                 stamp, price = parse_timestamp(point[0]), as_float(point[1])
             else:
                 continue
-            if stamp is not None and price is not None:
-                result.append({"timestamp": stamp, "price": price})
+            if stamp is not None and price is not None and 0.0 <= price <= 1.0:
+                result.append({"timestamp": stamp, "price": price, "token_id": token_id})
         result.sort(key=lambda item: item["timestamp"])
         return result
 
-    def order_book(self, market_id: str, depth: int = 20) -> OrderBookSnapshot | None:
+    def token_ids(self, market_id: str) -> Mapping[str, str]:
+        """Return normalized YES/NO CLOB token identifiers from Gamma metadata."""
+        identifier = str(market_id)
+        raw = self._raw_cache.get(identifier)
+        if raw is None:
+            self.market(identifier)
+            raw = self._raw_cache.get(identifier, {})
+        tokens = decode_jsonish(raw.get("clobTokenIds", raw.get("clob_token_ids", raw.get("tokens", []))))
+        outcomes = decode_jsonish(raw.get("outcomes", []))
+        if isinstance(tokens, Mapping):
+            return {
+                str(outcome).strip().lower(): str(token)
+                for outcome, token in tokens.items()
+                if str(outcome).strip().lower() in {"yes", "no"} and token
+            }
+        if not isinstance(tokens, (list, tuple)):
+            return {}
+        result: dict[str, str] = {}
+        if isinstance(outcomes, (list, tuple)):
+            for index, outcome in enumerate(outcomes):
+                if index < len(tokens) and str(outcome).strip().lower() in {"yes", "no"} and tokens[index]:
+                    result[str(outcome).strip().lower()] = str(tokens[index])
+        if len(tokens) >= 2:
+            result.setdefault("yes", str(tokens[0]))
+            result.setdefault("no", str(tokens[1]))
+        return result
+
+    def order_book_for_token(self, token_id: str, depth: int = 20) -> OrderBookSnapshot | None:
         if depth <= 0:
             raise ValueError("depth must be positive")
-        token_id = self._yes_token(market_id)
-        if token_id is None:
-            return None
-        payload = self._clob_get("/book", token_id=token_id)
+        payload = self._clob_get("/book", token_id=str(token_id))
         if not isinstance(payload, Mapping):
             return None
         bids = self._levels(payload.get("bids"), reverse=True, depth=depth)
@@ -150,7 +176,83 @@ class PolymarketAdapter(PredictionMarketDataProvider):
         timestamp = parse_timestamp(
             payload.get("timestamp", payload.get("ts", payload.get("time")))
         ) or utc_now()
-        return OrderBookSnapshot(timestamp=timestamp, bids=tuple(bids), asks=tuple(asks))
+        try:
+            return OrderBookSnapshot(timestamp=timestamp, bids=tuple(bids), asks=tuple(asks), token_id=str(token_id))
+        except ValueError:
+            return None
+
+    def order_book(self, market_id: str, depth: int = 20) -> OrderBookSnapshot | None:
+        token_id = self._yes_token(market_id)
+        return self.order_book_for_token(token_id, depth=depth) if token_id else None
+
+    def order_books(self, market_id: str, depth: int = 20) -> Mapping[str, OrderBookSnapshot]:
+        tokens = self.token_ids(market_id)
+        result: dict[str, OrderBookSnapshot] = {}
+        for outcome in ("yes", "no"):
+            token = tokens.get(outcome)
+            if token:
+                book = self.order_book_for_token(token, depth=depth)
+                if book is not None:
+                    result[outcome] = book
+        return result
+
+    def trades(
+        self,
+        market_id: str,
+        start: datetime | None = None,
+        end: datetime | None = None,
+    ) -> Sequence[TradePrint]:
+        """Fetch public CLOB trades when the endpoint exposes them."""
+        params: dict[str, Any] = {"market": str(market_id), "limit": 100}
+        result: list[TradePrint] = []
+        seen: set[str] = set()
+        for _ in range(100):
+            previous_cursor = params.get("cursor")
+            payload = self._clob_get("/trades", **params)
+            cursor = None
+            if isinstance(payload, Mapping):
+                rows = payload.get("data", payload.get("trades", []))
+                cursor = payload.get("next_cursor", payload.get("nextCursor"))
+            else:
+                rows = payload
+            if not isinstance(rows, list):
+                break
+            for row in rows:
+                if not isinstance(row, Mapping):
+                    continue
+                stamp = parse_timestamp(row.get("timestamp", row.get("ts", row.get("time"))))
+                price = as_float(row.get("price", row.get("p")))
+                size = as_float(row.get("size", row.get("amount", row.get("q"))))
+                if stamp is None or price is None or size is None or price <= 0 or size <= 0:
+                    continue
+                if start is not None and stamp < ensure_utc(start):
+                    continue
+                if end is not None and stamp > ensure_utc(end):
+                    continue
+                token = row.get("asset_id", row.get("token_id", row.get("assetId")))
+                trade_id = row.get("id", row.get("trade_id", row.get("tradeId")))
+                identity = str(trade_id or f"{stamp.isoformat()}|{price}|{size}|{token or ''}")
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                side_value = str(row.get("side", "")).strip().lower()
+                side = Side(side_value) if side_value in {"buy", "sell"} else None
+                result.append(
+                    TradePrint(
+                        stamp,
+                        price,
+                        size,
+                        side,
+                        trade_id=identity,
+                        market_id=str(market_id),
+                        token_id=str(token) if token is not None else None,
+                    )
+                )
+            if not cursor or not rows or str(cursor) == str(previous_cursor):
+                break
+            params["cursor"] = str(cursor)
+        result.sort(key=lambda item: item.timestamp)
+        return result
 
     @staticmethod
     def _levels(value: Any, *, reverse: bool, depth: int) -> list[OrderBookLevel]:
@@ -195,6 +297,8 @@ class PolymarketAdapter(PredictionMarketDataProvider):
                 "outcomes": decode_jsonish(raw.get("outcomes", [])),
                 "clob_token_ids": decode_jsonish(raw.get("clobTokenIds", raw.get("clob_token_ids", []))),
                 "condition_id": raw.get("conditionId", raw.get("condition_id")),
+                "yes_token_id": self.token_ids(snapshot.market_id).get("yes"),
+                "no_token_id": self.token_ids(snapshot.market_id).get("no"),
             },
         )
 
@@ -204,25 +308,11 @@ class PolymarketAdapter(PredictionMarketDataProvider):
             self._raw_cache[str(identifier)] = payload
 
     def _yes_token(self, market_id: str) -> str | None:
-        raw = self._raw_cache.get(str(market_id))
-        if raw is None:
-            snapshot = self.market(market_id)
-            if snapshot is None:
-                return None
-            raw = self._raw_cache.get(str(market_id), {})
-        tokens = decode_jsonish(raw.get("clobTokenIds", raw.get("clob_token_ids", raw.get("tokens", []))))
-        outcomes = decode_jsonish(raw.get("outcomes", []))
-        if isinstance(tokens, Mapping):
-            token = tokens.get("Yes", tokens.get("yes"))
-            return str(token) if token else None
-        if not isinstance(tokens, (list, tuple)) or not tokens:
-            # Some fixture payloads use the token itself as the market id.
-            return str(market_id) if str(market_id) else None
-        if isinstance(outcomes, (list, tuple)):
-            for index, outcome in enumerate(outcomes):
-                if str(outcome).strip().lower() == "yes" and index < len(tokens):
-                    return str(tokens[index])
-        return str(tokens[0])
+        tokens = self.token_ids(market_id)
+        if tokens.get("yes"):
+            return tokens["yes"]
+        # Some fixture payloads use the token itself as the market id.
+        return str(market_id) if str(market_id) else None
 
     def _snapshot(self, raw: Mapping[str, Any]) -> PredictionMarketSnapshot | None:
         identifier = raw.get("id", raw.get("market_id", raw.get("conditionId")))
@@ -270,6 +360,7 @@ class PolymarketAdapter(PredictionMarketDataProvider):
             "resolutionCriteria",
             raw.get("resolution_criteria", raw.get("rules", raw.get("description", ""))),
         )
+        tokens = self.token_ids(identifier)
         return PredictionMarketSnapshot(
             timestamp=timestamp,
             market_id=identifier,
@@ -288,6 +379,8 @@ class PolymarketAdapter(PredictionMarketDataProvider):
             category=str(raw["category"]) if raw.get("category") is not None else None,
             tags=_tags(raw.get("tags", raw.get("tag", []))),
             source=self.provider_name,
+            yes_token_id=tokens.get("yes"),
+            no_token_id=tokens.get("no"),
         )
 
 
@@ -295,7 +388,6 @@ def _boolish(value: Any) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "y", "closed", "resolved"}
     return bool(value)
-
 
 def _first_float(raw: Mapping[str, Any], *keys: str) -> float | None:
     for key in keys:

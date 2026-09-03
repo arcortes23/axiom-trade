@@ -16,7 +16,7 @@ import math
 from types import MappingProxyType
 from typing import Any, Iterable, Mapping, Sequence
 
-from .domain import ensure_utc
+from .domain import ensure_utc, parse_timestamp
 
 
 _EPSILON = 1e-12
@@ -51,9 +51,10 @@ def _timestamp(row: Any, key: str = "timestamp") -> datetime:
         raise ValueError(f"dataset row has no {key!r} timestamp")
     if isinstance(value, date) and not isinstance(value, datetime):
         value = datetime.combine(value, datetime.min.time(), tzinfo=timezone.utc)
-    if not isinstance(value, datetime):
-        raise TypeError(f"dataset timestamp must be datetime, got {type(value).__name__}")
-    return ensure_utc(value)
+    timestamp = parse_timestamp(value)
+    if timestamp is None:
+        raise TypeError(f"dataset timestamp is invalid: {value!r}")
+    return timestamp
 
 
 def _version(row: Any) -> str | None:
@@ -343,7 +344,6 @@ def _score(value: Any, metric: str) -> float:
         return 0.0
     return result if math.isfinite(result) else 0.0
 
-
 def degradation_penalty(
     train: Any,
     validation: Any,
@@ -355,23 +355,30 @@ def degradation_penalty(
     holdout_weight: float = 1.0,
     overfit_weight: float = 1.0,
 ) -> float:
-    """Quantify train-to-validation and validation-to-holdout degradation.
+    """Return bounded, additive degradation components.
 
-    The penalty is zero when performance does not degrade.  For minimization
-    metrics, lower values are better and the comparisons are inverted.
+    The denominator is a stable score scale rather than the validation score
+    itself.  A validation score near zero therefore cannot turn a modest
+    absolute miss into an unbounded penalty.
     """
     if direction not in {"max", "min"}:
         raise ValueError("direction must be 'max' or 'min'")
+    weights = (float(validation_weight), float(holdout_weight), float(overfit_weight))
+    if not all(math.isfinite(weight) and weight >= 0 for weight in weights):
+        raise ValueError("penalty weights must be finite and non-negative")
     train_score, validation_score, holdout_score = (_score(value, metric) for value in (train, validation, holdout))
+    scale = max(1.0, abs(train_score), abs(validation_score), abs(holdout_score))
     if direction == "max":
-        first_drop = max(0.0, train_score - validation_score) / max(abs(train_score), _EPSILON)
-        second_drop = max(0.0, validation_score - holdout_score) / max(abs(validation_score), _EPSILON)
-        overfit = max(0.0, train_score - validation_score) / max(abs(train_score), _EPSILON)
+        train_validation = max(0.0, train_score - validation_score) / scale
+        validation_holdout = max(0.0, validation_score - holdout_score) / scale
     else:
-        first_drop = max(0.0, validation_score - train_score) / max(abs(train_score), _EPSILON)
-        second_drop = max(0.0, holdout_score - validation_score) / max(abs(validation_score), _EPSILON)
-        overfit = first_drop
-    return max(0.0, float(validation_weight) * first_drop + float(holdout_weight) * second_drop + float(overfit_weight) * overfit)
+        train_validation = max(0.0, validation_score - train_score) / scale
+        validation_holdout = max(0.0, holdout_score - validation_score) / scale
+    return (
+        weights[0] * train_validation
+        + weights[1] * validation_holdout
+        + weights[2] * train_validation
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -383,6 +390,7 @@ class EvaluationResult:
     overfit_penalty: float
     fitness: float
     metric: str = "fitness"
+    holdout_degradation: float = 0.0
 
     @property
     def penalty(self) -> float:
@@ -399,29 +407,55 @@ def evaluate_scores(
     degradation_weight: float = 1.0,
     overfit_weight: float = 1.0,
 ) -> EvaluationResult:
-    """Score three result mappings and apply explicit degradation penalties."""
+    """Evaluate train/validation and report holdout without selecting on it.
+
+    ``fitness`` is a validation-only selection score.  The locked holdout is
+    retained for post-selection reporting through ``holdout_score`` and
+    ``holdout_degradation``.
+    """
     train_score, validation_score, holdout_score = (_score(value, metric) for value in (train, validation, holdout))
     degradation = degradation_penalty(
         train_score,
         validation_score,
-        holdout_score,
+        validation_score,
         direction=direction,
         validation_weight=degradation_weight,
-        holdout_weight=degradation_weight,
+        holdout_weight=0.0,
         overfit_weight=0.0,
     )
     overfit = degradation_penalty(
         train_score,
         validation_score,
-        holdout_score,
+        validation_score,
         direction=direction,
         validation_weight=0.0,
         holdout_weight=0.0,
         overfit_weight=overfit_weight,
     )
-    base = holdout_score
-    fitness = base - degradation - overfit if direction == "max" else base + degradation + overfit
-    return EvaluationResult(train_score, validation_score, holdout_score, degradation, overfit, fitness, metric)
+    holdout_degradation = degradation_penalty(
+        train_score,
+        validation_score,
+        holdout_score,
+        direction=direction,
+        validation_weight=0.0,
+        holdout_weight=degradation_weight,
+        overfit_weight=0.0,
+    )
+    fitness = (
+        validation_score - degradation - overfit
+        if direction == "max"
+        else -validation_score - degradation - overfit
+    )
+    return EvaluationResult(
+        train_score,
+        validation_score,
+        holdout_score,
+        degradation,
+        overfit,
+        fitness,
+        metric,
+        holdout_degradation,
+    )
 
 
 apply_penalties = evaluate_scores

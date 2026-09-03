@@ -7,8 +7,17 @@ import math
 from typing import Any, Mapping, Sequence
 
 from axiom.domain import (
-    MarketType, OrderBookLevel, OrderBookSnapshot, PredictionMarketSnapshot, ResolvedContract, SettlementState, Side,
-    SimulationQuality, ensure_utc,
+    MarketType,
+    OrderBookLevel,
+    OrderBookSnapshot,
+    PredictionMarketSnapshot,
+    ResolvedContract,
+    ResearchQuality,
+    SettlementState,
+    Side,
+    SimulationQuality,
+    ensure_utc,
+    parse_timestamp,
 )
 from axiom.metrics import calculate_prediction_metrics
 from axiom.portfolio import OrderRequest, Portfolio
@@ -22,7 +31,7 @@ def _value(item: Any, name: str, default: Any = None) -> Any:
 
 def _time(item: Any) -> datetime:
     stamp = _value(item, "timestamp", datetime.min.replace(tzinfo=timezone.utc))
-    return ensure_utc(stamp) if isinstance(stamp, datetime) else datetime.min.replace(tzinfo=timezone.utc)
+    return parse_timestamp(stamp) or datetime.min.replace(tzinfo=timezone.utc)
 
 
 def _number(item: Any, name: str, default: float = 0.0) -> float:
@@ -33,10 +42,22 @@ def _number(item: Any, name: str, default: float = 0.0) -> float:
     return value if math.isfinite(value) else default
 
 
+def _probability(item: Any, name: str, default: float = 0.0) -> float:
+    value = _number(item, name, default)
+    return value if 0.0 <= value <= 1.0 else default
+
+
 def _quality(snapshots: Sequence[Any]) -> SimulationQuality:
     if len(snapshots) < 3:
         return SimulationQuality.LOW
-    executable = sum(1 for snap in snapshots if _number(snap, "yes_ask", 0.0) > 0 and _number(snap, "yes_bid", 0.0) > 0)
+    executable = sum(
+        1
+        for snap in snapshots
+        if (
+            (_number(snap, "yes_ask", 0.0) > 0 and _number(snap, "yes_bid", 0.0) > 0)
+            or (_number(snap, "no_ask", 0.0) > 0 and _number(snap, "no_bid", 0.0) > 0)
+        )
+    )
     liquidity = sum(1 for snap in snapshots if _number(snap, "liquidity", 0.0) > 0)
     if executable < len(snapshots) // 2:
         return SimulationQuality.LOW
@@ -52,6 +73,45 @@ def _complement_book(book: OrderBookSnapshot) -> OrderBookSnapshot:
     bids = tuple(OrderBookLevel(1.0 - level.price, level.size) for level in book.asks)
     asks = tuple(OrderBookLevel(1.0 - level.price, level.size) for level in book.bids)
     return OrderBookSnapshot(book.timestamp, bids=bids, asks=asks)
+
+
+def _coerce_book(value: Any, fallback_timestamp: datetime) -> OrderBookSnapshot | None:
+    if isinstance(value, OrderBookSnapshot):
+        return value
+    if not isinstance(value, Mapping):
+        return None
+    def levels(raw: Any, *, reverse: bool) -> tuple[OrderBookLevel, ...]:
+        if not isinstance(raw, (list, tuple)):
+            return ()
+        result: list[OrderBookLevel] = []
+        for item in raw:
+            if isinstance(item, Mapping):
+                price, size = item.get("price", item.get("p")), item.get("size", item.get("quantity", item.get("q")))
+            elif isinstance(item, (list, tuple)) and len(item) >= 2:
+                price, size = item[0], item[1]
+            else:
+                continue
+            try:
+                parsed_price, parsed_size = float(price), float(size)
+                if not math.isfinite(parsed_price) or not 0.0 <= parsed_price <= 1.0:
+                    continue
+                result.append(OrderBookLevel(parsed_price, parsed_size))
+            except (TypeError, ValueError):
+                continue
+        return tuple(sorted(result, key=lambda level: level.price, reverse=reverse))
+    bids = levels(value.get("bids"), reverse=True)
+    asks = levels(value.get("asks"), reverse=False)
+    if not bids and not asks:
+        return None
+    try:
+        return OrderBookSnapshot(
+            parse_timestamp(value.get("timestamp")) or fallback_timestamp,
+            bids=bids,
+            asks=asks,
+            token_id=value.get("token_id"),
+        )
+    except (TypeError, ValueError):
+        return None
 
 
 
@@ -77,6 +137,7 @@ class PredictionMarketBacktester:
         self, snapshots: Sequence[PredictionMarketSnapshot | Mapping[str, Any]], strategy: StrategyDefinition | Mapping[str, Any] | str,
         *, resolutions: Mapping[str, ResolvedContract] | Sequence[ResolvedContract] | None = None,
         initial_cash: float | None = None,
+        research_quality: ResearchQuality | str | None = None,
     ) -> BacktestResult:
         definition = validate_strategy(strategy)
         if definition.market_type is not MarketType.PREDICTION:
@@ -105,8 +166,12 @@ class PredictionMarketBacktester:
                 observed_outcomes[market_id] = contract.outcome.value
                 resolved_now = True
             elif contract is None and (
-                state in {SettlementState.RESOLVED_YES, SettlementState.RESOLVED_NO}
-                or state in {"resolved_yes", "resolved_no"}
+                state in {
+                    SettlementState.RESOLVED_YES,
+                    SettlementState.RESOLVED_NO,
+                    SettlementState.VOID,
+                }
+                or state in {"resolved_yes", "resolved_no", "void"}
             ):
                 outcome = state if isinstance(state, SettlementState) else SettlementState(state)
                 portfolio.resolve(
@@ -117,6 +182,8 @@ class PredictionMarketBacktester:
                         str(_value(snapshot, "resolution_criteria", "")),
                     )
                 )
+                if outcome is not SettlementState.UNKNOWN:
+                    observed_outcomes[market_id] = outcome.value
                 resolved_now = True
             effective_state = (
                 SettlementState.OPEN
@@ -128,9 +195,9 @@ class PredictionMarketBacktester:
             if isinstance(snapshot, Mapping):
                 context.update(snapshot)
             score = evaluate_signal(definition, context)
-            current = portfolio.get_position(market_id)
-            current_quantity = current.quantity if current else 0.0
             outcome = "yes" if score > 0 else "no"
+            current = portfolio.get_position(market_id, outcome=outcome)
+            current_quantity = current.quantity if current else 0.0
             model_probability = _value(snapshot, "model_probability")
             try:
                 model_probability = float(model_probability)
@@ -140,17 +207,22 @@ class PredictionMarketBacktester:
             except (TypeError, ValueError):
                 trade_probability = None
             ask_name = "yes_ask" if score > 0 else "no_ask"
-            ask = _number(snapshot, ask_name, 0.0)
+            ask = _probability(snapshot, ask_name, 0.0)
             if score < 0 and ask <= 0:
-                yes_bid = _number(snapshot, "yes_bid", 0.0)
+                yes_bid = _probability(snapshot, "yes_bid", 0.0)
                 ask = 1.0 - yes_bid if 0.0 < yes_bid < 1.0 else 0.0
-            book_name = "order_book" if outcome == "yes" else "no_order_book"
-            raw_book = _value(snapshot, book_name)
-            order_book = raw_book if isinstance(raw_book, OrderBookSnapshot) else None
+            if outcome == "yes":
+                raw_book = _value(snapshot, "order_book", _value(snapshot, "yes_order_book"))
+            else:
+                raw_book = _value(snapshot, "no_order_book")
+            order_book = _coerce_book(raw_book, timestamp)
             if outcome == "no" and order_book is None:
-                yes_book = _value(snapshot, "order_book")
-                if isinstance(yes_book, OrderBookSnapshot):
+                yes_book = _coerce_book(_value(snapshot, "order_book", _value(snapshot, "yes_order_book")), timestamp)
+                if yes_book is not None:
                     order_book = _complement_book(yes_book)
+            if order_book is not None and order_book.timestamp > timestamp:
+                # A future-captured book cannot be used to fill an earlier quote.
+                order_book = None
             if order_book is not None and order_book.best_ask is not None:
                 ask = order_book.best_ask
             if (
@@ -180,13 +252,16 @@ class PredictionMarketBacktester:
                         fee_bps=self.fee_bps,
                         slippage_bps=self.slippage_bps,
                     )
-            yes_mid = _number(snapshot, "yes_mid", _number(snapshot, "yes_ask", 0.0))
-            no_mid = _number(snapshot, "no_mid", _number(snapshot, "no_ask", 0.0))
+            yes_mid = _probability(snapshot, "yes_mid", _probability(snapshot, "yes_ask", 0.0))
+            no_mid = _probability(snapshot, "no_mid", _probability(snapshot, "no_ask", 0.0))
             if no_mid <= 0 and 0.0 < yes_mid < 1.0:
                 no_mid = 1.0 - yes_mid
             prices = {market_id: yes_mid, f"{market_id}|no": no_mid}
             equity = portfolio.equity(prices)
-            quality = SimulationQuality.HIGH if _number(snapshot, "liquidity", 0.0) > 0 and _number(snapshot, "yes_bid", 0.0) > 0 else SimulationQuality.MEDIUM
+            quality = SimulationQuality.HIGH if _number(snapshot, "liquidity", 0.0) > 0 and (
+                (_probability(snapshot, "yes_bid", 0.0) > 0 and _probability(snapshot, "yes_ask", 0.0) > 0)
+                or (_probability(snapshot, "no_bid", 0.0) > 0 and _probability(snapshot, "no_ask", 0.0) > 0)
+            ) else SimulationQuality.MEDIUM
             labels.append(quality)
             curve.append({"timestamp": timestamp, "equity": equity, "cash": portfolio.cash, "market_id": market_id, "quality": quality.value})
         outcomes = dict(observed_outcomes)
@@ -210,7 +285,25 @@ class PredictionMarketBacktester:
             probabilities=probability_records,
             initial_equity=portfolio.initial_cash,
         )
-        return BacktestResult(tuple(curve), tuple(portfolio.fills), _quality(rows), metrics, unresolved, outcomes, tuple(labels))
+        if research_quality is None:
+            has_order_book = any(
+                _coerce_book(_value(row, "order_book", _value(row, "yes_order_book")), _time(row)) is not None
+                or _coerce_book(_value(row, "no_order_book"), _time(row)) is not None
+                for row in rows
+            )
+            resolved_quality = ResearchQuality.ORDER_BOOK_SIMULATED if has_order_book else ResearchQuality.PRICE_PROXY
+        else:
+            resolved_quality = research_quality if isinstance(research_quality, ResearchQuality) else ResearchQuality(str(research_quality))
+        return BacktestResult(
+            tuple(curve),
+            tuple(portfolio.fills),
+            _quality(rows),
+            metrics,
+            unresolved,
+            outcomes,
+            tuple(labels),
+            resolved_quality,
+        )
 
     simulate = run
 

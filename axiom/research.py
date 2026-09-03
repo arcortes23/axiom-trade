@@ -9,14 +9,19 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import json
+import math
 from statistics import mean
 from typing import Any, Iterable, Mapping, Sequence
 
+from .attribution import fitness_attribution
 from .backtest import CryptoBacktester
+from .benchmarks import crypto_benchmarks, prediction_benchmarks
 from .data import BinanceAdapter, PolymarketAdapter
-from .domain import MarketType, PredictionMarketSnapshot, SettlementState, SimulationQuality, to_record
+from .domain import MarketType, PredictionMarketSnapshot, ResearchQuality, SettlementState, SimulationQuality, parse_timestamp, to_record
 from .evaluation import evaluate_scores, split_dataset
+from .metrics import calibration_at_horizons
 from .regime import RegimeEngine
+from .robustness import bootstrap_confidence_interval, minimum_sample_check
 from .storage import AxiomStore
 from .strategy import validate_strategy
 from .tracking import ExperimentTracker
@@ -94,23 +99,28 @@ def run_crypto_research(
 
     split, version = _chronological_split(bars)
     base["dataset_version"] = version
+    base["benchmarks"] = [item.as_record() for item in crypto_benchmarks(bars, initial_cash=initial_cash, fee_bps=10.0, slippage_bps=5.0, symbol=symbol)]
+    dataset_id = f"crypto:{symbol.replace('/', '').replace('-', '').upper()}"
     if store is not None:
         try:
+            existing = store.load_dataset_record(dataset_id, version)
             with store.transaction():
-                store.save_dataset(
-                    f"crypto:{symbol.replace('/', '').replace('-', '').upper()}",
-                    version,
-                    bars,
-                    metadata={
-                        "provider": base["provider"],
-                        "instrument": symbol,
-                        "interval": "1d",
-                        "instrument_metadata": base["instrument_metadata"],
-                        "instrument_metadata_available": base["instrument_metadata_available"],
-                    },
-                    quality=_research_quality(provider, SimulationQuality.MEDIUM),
-                )
-                store.save_bars(symbol, bars, dataset_id=f"crypto:{symbol.replace('/', '').replace('-', '').upper()}", dataset_version=version)
+                if existing is None:
+                    store.save_dataset(
+                        dataset_id,
+                        version,
+                        bars,
+                        metadata={
+                            "provider": base["provider"],
+                            "instrument": symbol,
+                            "interval": "1d",
+                            "instrument_metadata": base["instrument_metadata"],
+                            "instrument_metadata_available": base["instrument_metadata_available"],
+                        },
+                        quality=_research_quality(provider, SimulationQuality.MEDIUM),
+                    )
+                if not store.load_bars(symbol, dataset_id=dataset_id, dataset_version=version):
+                    store.save_bars(symbol, bars, dataset_id=dataset_id, dataset_version=version)
         except ValueError as exc:
             errors.append(str(exc))
 
@@ -137,14 +147,19 @@ def run_crypto_research(
             }
         )
         results = []
-        for partition in (split.train, split.validation, split.holdout):
+        partitions = (
+            (split.train, ()),
+            (split.validation, split.train),
+            (split.holdout, (*split.train, *split.validation)),
+        )
+        for partition, warmup in partitions:
             result = CryptoBacktester(
                 initial_cash=initial_cash,
                 fee_bps=10.0,
                 slippage_bps=5.0,
                 allocation=0.50,
                 symbol=symbol,
-            ).run(partition, definition, symbol=symbol)
+            ).run(partition, definition, symbol=symbol, warmup=warmup)
             results.append(result)
         scores = [result.metrics.get("total_return", 0.0) for result in results]
         evaluation = evaluate_scores(
@@ -154,6 +169,17 @@ def run_crypto_research(
             metric="total_return",
         )
         experiment_quality = _min_quality(source_quality, results[2].quality)
+        validation_sample = minimum_sample_check(
+            len(split.validation),
+            min_observations=10,
+            trades=results[1].trades,
+            min_trades=2,
+        )
+        rejection_reason = None
+        if evaluation.fitness <= 0:
+            rejection_reason = "non-positive validation selection fitness"
+        elif not validation_sample["passed"]:
+            rejection_reason = "insufficient validation sample"
         record = tracker.track(
             definition.id,
             str(definition.version),
@@ -171,11 +197,13 @@ def run_crypto_research(
                 "holdout_total_return": scores[2],
                 "train_fills": float(results[0].trades),
                 "validation_fills": float(results[1].trades),
+                "holdout_fills": float(results[2].trades),
                 "quality": experiment_quality.value,
+                "selection_basis": "validation_only",
             },
             fitness=evaluation.fitness,
-            rejected=evaluation.fitness <= 0,
-            rejection_reason="non-positive locked-holdout fitness" if evaluation.fitness <= 0 else None,
+            rejected=rejection_reason is not None,
+            rejection_reason=rejection_reason,
             created_at=bars[-1].timestamp,
         )
         experiments.append(
@@ -191,8 +219,20 @@ def run_crypto_research(
                     "validation_score": evaluation.validation_score,
                     "holdout_score": evaluation.holdout_score,
                     "degradation": evaluation.degradation,
+                    "holdout_degradation": evaluation.holdout_degradation,
                     "overfit_penalty": evaluation.overfit_penalty,
                     "fitness": evaluation.fitness,
+                    "selection_basis": "validation_only",
+                    "attribution": fitness_attribution(
+                        {"total_return": scores[0]},
+                        {"total_return": scores[1]},
+                        {"total_return": scores[2]},
+                        metric="total_return",
+                    ),
+                },
+                "robustness": {
+                    "minimum_sample": validation_sample,
+                    "validation_score_ci": bootstrap_confidence_interval([scores[1]], resamples=256, seed=0),
                 },
                 "rejected": record.rejected,
                 "rejection_reason": record.rejection_reason,
@@ -201,11 +241,16 @@ def run_crypto_research(
     base["experiments"] = experiments
     base["simulation_quality"] = _min_quality(
         source_quality,
-        min((SimulationQuality(item["quality"]) for item in experiments), key=lambda item: _quality_rank(item.value), default=SimulationQuality.LOW),
+        min(
+            (SimulationQuality(item["quality"]) for item in experiments),
+            key=lambda item: _quality_rank(item.value),
+            default=SimulationQuality.LOW,
+        ),
     ).value
     base["limitations"] = [
         "Binance OHLCV does not provide historical order-book depth in this workflow.",
         "Next-bar OHLCV execution is an approximation; results are not a live-profit claim.",
+        "Candidate selection and rejection use validation only; locked holdout values are report-only.",
     ]
     return base
 
@@ -233,8 +278,11 @@ def run_prediction_research(
         "markets_with_history": 0,
         "independent_resolved_markets": 0,
         "simulation_quality": SimulationQuality.LOW.value,
+        "research_quality": ResearchQuality.PRICE_PROXY.value,
+        "historical_order_books_available": False,
         "price_buckets": _empty_buckets(),
-        "calibration": {"observations": 0, "brier": 0.0, "log_loss": 0.0, "ece": 0.0},
+        "multi_horizon_calibration": {},
+        "benchmarks": [],
         "liquidity": {"observations": 0, "mean_absolute_error": 0.0},
         "time_to_resolution": {"observations": 0, "mean_roi": 0.0},
         "repricing": {"markets": 0, "mean_reversion_fraction": 0.0},
@@ -243,48 +291,96 @@ def run_prediction_research(
     }
     buckets = _empty_buckets()
     calibration: list[tuple[float, float]] = []
+    calibration_horizon_rows: list[dict[str, Any]] = []
+    benchmark_rows: list[dict[str, Any]] = []
     liquidity_errors: list[float] = []
     time_rois: list[tuple[float, float]] = []
     repricing_scores: list[float] = []
     markets_with_history = 0
     resolved_count = 0
+    has_historical_books = False
     for market in markets:
         if not isinstance(market, PredictionMarketSnapshot):
             continue
         try:
-            history = tuple(provider.price_history(market.market_id))
+            raw_history = tuple(provider.price_history(market.market_id))
         except Exception as exc:
             errors.append(f"{market.market_id}: history error: {exc}")
             continue
+        timed_history: list[tuple[datetime, Mapping[str, Any]]] = []
+        for point in raw_history:
+            if not isinstance(point, Mapping):
+                continue
+            stamp = _point_timestamp(point)
+            if stamp is not None:
+                timed_history.append((stamp, point))
+        timed_history.sort(key=lambda item: item[0])
+        history = tuple(point for _, point in timed_history)
         if not history:
+            if raw_history:
+                errors.append(f"{market.market_id}: no valid timestamped history")
             continue
         markets_with_history += 1
+        market_has_books = any(_has_historical_book(point) for point in history)
+        has_historical_books = has_historical_books or market_has_books
         if store is not None:
             version = _content_version(history)
+            dataset_id = f"prediction:{market.market_id}"
             try:
-                store.save_dataset(
-                    f"prediction:{market.market_id}",
-                    version,
-                    history,
-                    metadata={
-                        "provider": base["provider"],
-                        "market_id": market.market_id,
-                        "question": market.question,
-                        "resolution_criteria": market.resolution_criteria,
-                        "historical_order_book": False,
-                    },
-                    quality=SimulationQuality.LOW,
-                )
+                if store.load_dataset_record(dataset_id, version) is None:
+                    store.save_dataset(
+                        dataset_id,
+                        version,
+                        history,
+                        metadata={
+                            "provider": base["provider"],
+                            "market_id": market.market_id,
+                            "question": market.question,
+                            "resolution_criteria": market.resolution_criteria,
+                            "rules": market.resolution_criteria,
+                            "expiry": market.expiry,
+                            "settlement": market.settlement.value,
+                            "yes_token_id": market.yes_token_id,
+                            "no_token_id": market.no_token_id,
+                            "historical_order_book": market_has_books,
+                        },
+                        quality=SimulationQuality.LOW,
+                    )
             except ValueError as exc:
                 errors.append(str(exc))
         outcome = _binary_outcome(market.settlement)
-        prices = [_price(point) for point in history]
-        prices = [price for price in prices if price is not None and 0.0 <= price <= 1.0]
+        price_rows = [
+            (point, price)
+            for point in history
+            if (price := _price(point)) is not None and 0.0 <= price <= 1.0
+        ]
+        prices = [price for _, price in price_rows]
         if not prices:
             continue
         if outcome is None:
             continue
         resolved_count += 1
+        benchmark_rows.extend(
+            {
+                "timestamp": _point_timestamp(point),
+                "market_id": market.market_id,
+                "yes_mid": price,
+                "outcome": outcome,
+                "settlement": market.settlement.value,
+            }
+            for point, price in price_rows
+        )
+        calibration_horizon_rows.extend(
+            {
+                "timestamp": _point_timestamp(point),
+                "expiry": market.expiry,
+                "market_id": market.market_id,
+                "probability": price,
+                "outcome": outcome,
+            }
+            for point, price in price_rows
+            if _point_timestamp(point) is not None and market.expiry is not None
+        )
         last_price = prices[-1]
         calibration.append((last_price, outcome))
         for price in prices:
@@ -297,8 +393,17 @@ def run_prediction_research(
             item["wins"] += 1 if outcome else 0
             item["mean_price_sum"] += price
             item["roi_sum"] += ((outcome - price) / price) if price > 0 else 0.0
-        if market.liquidity is not None:
-            liquidity_errors.append(abs(last_price - outcome))
+        observed_liquidity = (
+            history[-1].get("liquidity")
+            if isinstance(history[-1], Mapping)
+            else None
+        )
+        if observed_liquidity is not None:
+            try:
+                if math.isfinite(float(observed_liquidity)):
+                    liquidity_errors.append(abs(last_price - outcome))
+            except (TypeError, ValueError):
+                pass
         if market.expiry is not None:
             stamp = _point_timestamp(history[-1])
             if stamp is not None:
@@ -329,6 +434,15 @@ def run_prediction_research(
         "log_loss": log_loss(calibration_records),
         "ece": expected_calibration_error(calibration_records),
     }
+    base["multi_horizon_calibration"] = calibration_at_horizons(calibration_horizon_rows)
+    base["benchmarks"] = [item.as_record() for item in prediction_benchmarks(benchmark_rows)]
+    base["historical_order_books_available"] = has_historical_books
+    # This workflow computes price-history baselines only; merely storing a
+    # book is not an executable simulation result.
+    base["research_quality"] = ResearchQuality.PRICE_PROXY.value
+    base["simulation_quality"] = (
+        SimulationQuality.MEDIUM.value if markets_with_history else SimulationQuality.LOW.value
+    )
     base["liquidity"] = {
         "observations": len(liquidity_errors),
         "mean_absolute_error": mean(liquidity_errors) if liquidity_errors else 0.0,
@@ -364,10 +478,11 @@ def run_prediction_research(
     }
     base["errors"] = errors
     base["limitations"] = [
-        "Public Polymarket histories are price-only for this workflow; historical spread/depth and fills are unavailable.",
+        "Public Polymarket histories are price-only unless a source supplies timestamped depth; this report labels such samples PRICE_PROXY.",
         "Resolved samples are selected from the provider catalog and may be small or non-independent.",
         "Market price is used only as a calibration baseline; no LLM opinion is used as a probability model.",
         "Bucket ROI is descriptive and does not establish executable profitability.",
+        "Historical order-book execution requires timestamped books; current books are never backfilled into history.",
     ]
     return base
 
@@ -417,10 +532,17 @@ def _content_version(rows: Iterable[Any]) -> str:
 def _regime_labels(bars: Sequence[Any]) -> list[str]:
     return [regime.state.value for regime in RegimeEngine().detect_crypto(bars).regimes]
 
-
 def _empty_buckets() -> dict[str, dict[str, Any]]:
     return {
-        label: {"lower": lower, "upper": upper, "count": 0, "resolved_count": 0, "wins": 0, "mean_price_sum": 0.0, "roi_sum": 0.0}
+        label: {
+            "lower": lower,
+            "upper": upper,
+            "count": 0,
+            "resolved_count": 0,
+            "wins": 0,
+            "mean_price_sum": 0.0,
+            "roi_sum": 0.0,
+        }
         for label, lower, upper in _BUCKETS
     }
 
@@ -430,6 +552,7 @@ def _bucket_for(price: float) -> str | None:
         if lower <= price < upper or (label == "50-100c" and price <= upper):
             return label
     return None
+
 
 
 def _binary_outcome(state: SettlementState) -> float | None:
@@ -461,8 +584,6 @@ def _research_quality(provider: Any, fallback: SimulationQuality) -> SimulationQ
 
 def _min_quality(left: SimulationQuality, right: SimulationQuality) -> SimulationQuality:
     return left if _quality_rank(left.value) <= _quality_rank(right.value) else right
-
-
 def _time_bucket(seconds: float) -> str:
     if seconds < 86_400.0:
         return "under_1d"
@@ -473,25 +594,27 @@ def _time_bucket(seconds: float) -> str:
     return "over_30d"
 
 
+
 def _price(point: Any) -> float | None:
     value = point.get("price", point.get("yes_mid")) if isinstance(point, Mapping) else None
     try:
-        return float(value) if value is not None else None
+        number = float(value) if value is not None else None
     except (TypeError, ValueError):
         return None
+    return number if number is not None and math.isfinite(number) and 0.0 <= number <= 1.0 else None
 
 
 def _point_timestamp(point: Any) -> datetime | None:
-    value = point.get("timestamp") if isinstance(point, Mapping) else None
-    if isinstance(value, datetime):
-        return value.astimezone(timezone.utc) if value.tzinfo else value.replace(tzinfo=timezone.utc)
-    if isinstance(value, str):
-        try:
-            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-            return parsed.astimezone(timezone.utc) if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
-        except ValueError:
-            return None
-    return None
+    if not isinstance(point, Mapping):
+        return None
+    return parse_timestamp(point.get("timestamp", point.get("t")))
+
+
+def _has_historical_book(point: Mapping[str, Any]) -> bool:
+    raw = point.get("order_book", point.get("book"))
+    if not isinstance(raw, Mapping):
+        return hasattr(raw, "bids") and hasattr(raw, "asks") and bool(raw.bids) and bool(raw.asks)
+    return bool(raw.get("bids")) and bool(raw.get("asks"))
 
 
 def _jsonable(value: Any) -> Any:

@@ -28,7 +28,7 @@ class RiskLimits:
     max_spread: float | None = None
     crash_threshold: float | None = None
     cooldown_seconds: float = 0.0
-    max_position_fraction: float | None = 0.05
+    max_position_fraction: float | None = None
     kelly_fraction: float = 0.25
     max_cvar: float | None = None
 
@@ -174,9 +174,11 @@ class RiskEngine:
     def set_cooldown(self, seconds: float | None = None, *, until: datetime | None = None, now: datetime | None = None) -> None:
         if until is not None:
             self.cooldown_until = ensure_utc(until)
-        else:
-            duration = self.limits.cooldown_seconds if seconds is None else max(0.0, float(seconds))
-            self.cooldown_until = ensure_utc(now or utc_now()) + timedelta(seconds=duration)
+            return
+        duration = self.limits.cooldown_seconds if seconds is None else float(seconds)
+        if not math.isfinite(duration) or duration < 0:
+            raise ValueError("cooldown seconds must be finite and non-negative")
+        self.cooldown_until = ensure_utc(now or utc_now()) + timedelta(seconds=duration)
 
     def update_equity(self, equity: float, *, timestamp: datetime | None = None) -> RiskDecision:
         value = float(equity)
@@ -204,22 +206,68 @@ class RiskEngine:
         return RiskDecision(not reasons, tuple(reasons), checks={"max_loss": "max_loss" not in reasons, "max_drawdown": "max_drawdown" not in reasons, "max_daily_loss": "max_daily_loss" not in reasons})
 
     @staticmethod
-    def _order_parts(order: Any, price: float | None, quantity: float | None, symbol: str | None, strategy_id: str | None, group: str | None) -> tuple[str, Side, float, str, str | None, str | None]:
+    def _order_parts(
+        order: Any,
+        price: float | None,
+        quantity: float | None,
+        symbol: str | None,
+        strategy_id: str | None,
+        group: str | None,
+    ) -> tuple[str, Side, float, str, str | None, str | None, str | None]:
         if isinstance(order, Mapping):
             name = str(order.get("symbol", symbol or ""))
             side_value = order.get("side", Side.BUY)
             side = side_value if isinstance(side_value, Side) else Side(str(side_value))
             qty = float(order.get("quantity", quantity or 0.0))
-            px = float(order.get("price", price or 0.0))
             strategy = order.get("strategy_id", strategy_id)
-            return name, side, qty, str(order.get("group", group or "")), str(strategy) if strategy else None, str(order.get("market_type", "")) or None
+            market_type_value = order.get("market_type", "")
+            market_type = getattr(market_type_value, "value", str(market_type_value))
+            return (
+                name,
+                side,
+                qty,
+                str(order.get("group", group or "")),
+                str(strategy) if strategy else None,
+                str(market_type) or None,
+                str(order.get("outcome", "")).strip().lower() or None,
+            )
         name = str(getattr(order, "symbol", symbol or ""))
         side_value = getattr(order, "side", Side.BUY)
         side = side_value if isinstance(side_value, Side) else Side(str(side_value))
         qty = float(getattr(order, "quantity", quantity or 0.0))
-        px = float(price if price is not None else getattr(order, "price", 0.0))
         strategy = strategy_id or getattr(order, "strategy_id", None)
-        return name, side, qty, str(group or ""), str(strategy) if strategy else None, str(getattr(order, "market_type", "")) or None
+        market_type_value = getattr(order, "market_type", "")
+        market_type = getattr(market_type_value, "value", str(market_type_value))
+        return (
+            name,
+            side,
+            qty,
+            str(group or ""),
+            str(strategy) if strategy else None,
+            str(market_type) or None,
+            str(getattr(order, "outcome", "")).strip().lower() or None,
+        )
+    @staticmethod
+    def _scope_key(name: str | None, market_type: str | None, outcome: str | None) -> str | None:
+        if not name:
+            return None
+        if market_type == MarketType.PREDICTION.value and outcome in {"yes", "no"}:
+            return f"{name}|{outcome}"
+        return name
+    @staticmethod
+    def _projected_scoped_exposure(exposures: Mapping[str, float], key: str, signed_delta: float) -> float:
+        if key.endswith("|yes") or key.endswith("|no"):
+            base = key.rsplit("|", 1)[0]
+            current = exposures.get(key, 0.0)
+            gross = sum(
+                abs(value)
+                for scoped_key, value in exposures.items()
+                if scoped_key == base or scoped_key.startswith(f"{base}|")
+            )
+            return gross - abs(current) + abs(current + signed_delta)
+        return abs(exposures.get(key, 0.0) + signed_delta)
+
+
 
     def check_order(
         self,
@@ -239,8 +287,11 @@ class RiskEngine:
     ) -> RiskDecision:
         """Check an order against every active limit; no strategy override exists."""
         now = ensure_utc(timestamp or utc_now())
-        name, side, qty, group_name, strategy, _ = self._order_parts(order, price, quantity, symbol, strategy_id, group)
+        name, side, qty, group_name, strategy, market_type, outcome = self._order_parts(order, price, quantity, symbol, strategy_id, group)
+        exposure_key = f"{name}|{outcome}" if market_type == MarketType.PREDICTION.value and outcome in {"yes", "no"} else name
         group_name = group_name or self.correlation_groups.get(name, "")
+        strategy_key = self._scope_key(strategy, market_type, outcome)
+        group_key = self._scope_key(group_name, market_type, outcome)
         px = float(price if price is not None else getattr(order, "price", 0.0) or (order.get("price", 0.0) if isinstance(order, Mapping) else 0.0))
         notional = abs(qty * px)
         reasons: list[str] = []
@@ -254,20 +305,24 @@ class RiskEngine:
         if self.limits.max_order_notional is not None and notional > self.limits.max_order_notional:
             reasons.append("max_order_notional")
         signed_delta = notional if side is Side.BUY else -notional
-        current_market = self._market_signed.get(name, 0.0)
+        current_market = self._market_signed.get(exposure_key, 0.0)
         projected_market_signed = current_market + signed_delta
         projected_market = abs(projected_market_signed)
         if self.limits.max_market_exposure is not None and projected_market > self.limits.max_market_exposure:
             reasons.append("max_market_exposure")
+        if self.limits.max_position_fraction is not None:
+            position_cap = max(0.0, self.equity) * self.limits.max_position_fraction
+            if projected_market > position_cap:
+                reasons.append("max_position_fraction")
         projected_account = self.account_exposure - abs(current_market) + projected_market
         if self.limits.max_account_exposure is not None and projected_account > self.limits.max_account_exposure:
             reasons.append("max_account_exposure")
-        if strategy and self.limits.max_strategy_exposure is not None:
-            projected_strategy = abs(self._strategy_signed.get(strategy, 0.0) + signed_delta)
+        if strategy_key and self.limits.max_strategy_exposure is not None:
+            projected_strategy = self._projected_scoped_exposure(self._strategy_signed, strategy_key, signed_delta)
             if projected_strategy > self.limits.max_strategy_exposure:
                 reasons.append("max_strategy_exposure")
-        if group_name and self.limits.max_group_exposure is not None:
-            projected_group = abs(self._group_signed.get(group_name, 0.0) + signed_delta)
+        if group_key and self.limits.max_group_exposure is not None:
+            projected_group = self._projected_scoped_exposure(self._group_signed, group_key, signed_delta)
             if projected_group > self.limits.max_group_exposure:
                 reasons.append("max_group_exposure")
         if self.limits.min_liquidity is not None and (liquidity is None or liquidity < self.limits.min_liquidity):
@@ -301,7 +356,7 @@ class RiskEngine:
         loss_check = self._loss_decision(now)
         reasons.extend(reason for reason in loss_check.reasons if reason not in reasons)
         checks.update(loss_check.checks)
-        for key in ("emergency_kill_switch", "cooldown", "max_order_notional", "max_market_exposure", "max_account_exposure", "max_strategy_exposure", "max_group_exposure", "min_liquidity", "max_spread", "crash", "max_expected_loss"):
+        for key in ("emergency_kill_switch", "cooldown", "max_order_notional", "max_market_exposure", "max_position_fraction", "max_account_exposure", "max_strategy_exposure", "max_group_exposure", "min_liquidity", "max_spread", "crash", "max_expected_loss"):
             checks[key] = key not in reasons
         checks["cvar"] = "invalid_cvar" not in reasons
         checks["max_cvar"] = not any(reason in reasons for reason in ("cvar_required", "max_cvar"))
@@ -312,17 +367,21 @@ class RiskEngine:
     def record_fill(self, fill: Fill, *, group: str | None = None) -> None:
         notional = abs(fill.quantity * fill.price)
         sign = 1.0 if fill.side is Side.BUY else -1.0
-        key = fill.symbol
+        outcome = str(fill.metadata.get("outcome", "")).strip().lower()
+        market_type = fill.market_type.value
+        key = self._scope_key(fill.market_id or fill.symbol, market_type, outcome) or fill.symbol
         self._market_signed[key] = self._market_signed.get(key, 0.0) + sign * notional
         self.market_exposure[key] = abs(self._market_signed[key])
         self.account_exposure = sum(abs(value) for value in self._market_signed.values())
         if fill.strategy_id:
-            self._strategy_signed[fill.strategy_id] = self._strategy_signed.get(fill.strategy_id, 0.0) + sign * notional
-            self.strategy_exposure[fill.strategy_id] = abs(self._strategy_signed[fill.strategy_id])
-        group_name = group or str(fill.metadata.get("group", "")) or self.correlation_groups.get(key, "")
-        if group_name:
-            self._group_signed[group_name] = self._group_signed.get(group_name, 0.0) + sign * notional
-            self.group_exposure[group_name] = abs(self._group_signed[group_name])
+            strategy_key = self._scope_key(fill.strategy_id, market_type, outcome) or fill.strategy_id
+            self._strategy_signed[strategy_key] = self._strategy_signed.get(strategy_key, 0.0) + sign * notional
+            self.strategy_exposure[strategy_key] = abs(self._strategy_signed[strategy_key])
+        group_name = group or str(fill.metadata.get("group", "")) or self.correlation_groups.get(fill.symbol, "")
+        group_key = self._scope_key(group_name, market_type, outcome)
+        if group_key:
+            self._group_signed[group_key] = self._group_signed.get(group_key, 0.0) + sign * notional
+            self.group_exposure[group_key] = abs(self._group_signed[group_key])
         self._last_prices[key] = fill.price
     def update_cvar(
         self,

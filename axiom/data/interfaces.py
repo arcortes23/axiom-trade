@@ -91,5 +91,19 @@ class PredictionMarketDataProvider(ABC):
     def metadata(self, market_id: str) -> InstrumentMetadata | None:
         """Return exact question, rules, tags, expiry and settlement metadata."""
 
+    def trades(
+        self,
+        market_id: str,
+        start: datetime | None = None,
+        end: datetime | None = None,
+    ) -> Sequence[TradePrint]:
+        """Return public prediction-market trade prints when available."""
+        return ()
+
+    def order_books(self, market_id: str, depth: int = 20) -> Mapping[str, OrderBookSnapshot]:
+        """Return token-labelled books; providers may override for YES and NO."""
+        book = self.order_book(market_id, depth=depth)
+        return {"yes": book} if book is not None else {}
+
 
 __all__ = ["CryptoMarketDataProvider", "PredictionMarketDataProvider"]

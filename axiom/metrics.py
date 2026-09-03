@@ -1,12 +1,13 @@
 """Pure, dependency-free performance and probability metrics."""
 from __future__ import annotations
-
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 import math
 from statistics import mean, pstdev
 from typing import Any, Iterable, Mapping, Sequence
 
-from .domain import Fill
+from .domain import Fill, parse_timestamp
+
 
 
 def _equities(data: Iterable[Any]) -> list[float]:
@@ -24,6 +25,16 @@ def _equities(data: Iterable[Any]) -> list[float]:
 
 def _returns(equity: Sequence[float]) -> list[float]:
     return [current / previous - 1.0 for previous, current in zip(equity, equity[1:]) if previous not in (0, None)]
+def _finite_values(values: Iterable[float]) -> list[float]:
+    result: list[float] = []
+    for value in values:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(number):
+            result.append(number)
+    return result
 
 
 def max_drawdown(equity_curve: Iterable[Any]) -> float:
@@ -35,8 +46,6 @@ def max_drawdown(equity_curve: Iterable[Any]) -> float:
         peak = max(peak, value)
         drawdown = max(drawdown, (peak - value) / peak if peak > 0 else 0.0)
     return drawdown
-
-
 def drawdown_series(equity_curve: Iterable[Any]) -> list[float]:
     values = _equities(equity_curve)
     peak, output = 0.0, []
@@ -47,19 +56,33 @@ def drawdown_series(equity_curve: Iterable[Any]) -> list[float]:
 
 
 def sharpe_ratio(returns: Iterable[float], *, periods_per_year: float = 252.0, risk_free: float = 0.0) -> float:
-    values = [float(value) for value in returns if math.isfinite(float(value))]
+    try:
+        periods = float(periods_per_year)
+        risk_free_value = float(risk_free)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("periods_per_year and risk_free must be numeric") from exc
+    if not math.isfinite(periods) or periods <= 0 or not math.isfinite(risk_free_value):
+        raise ValueError("periods_per_year must be finite and positive; risk_free must be finite")
+    values = _finite_values(returns)
     if len(values) < 2:
         return 0.0
-    excess = [value - risk_free / periods_per_year for value in values]
+    excess = [value - risk_free_value / periods for value in values]
     deviation = pstdev(excess)
-    return mean(excess) / deviation * math.sqrt(periods_per_year) if deviation > 0 else 0.0
+    return mean(excess) / deviation * math.sqrt(periods) if deviation > 0 else 0.0
 
 
 def sortino_ratio(returns: Iterable[float], *, periods_per_year: float = 252.0, target: float = 0.0) -> float:
-    values = [float(value) for value in returns if math.isfinite(float(value))]
-    downside = [min(0.0, value - target) for value in values]
+    try:
+        periods = float(periods_per_year)
+        target_value = float(target)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("periods_per_year and target must be numeric") from exc
+    if not math.isfinite(periods) or periods <= 0 or not math.isfinite(target_value):
+        raise ValueError("periods_per_year must be finite and positive; target must be finite")
+    values = _finite_values(returns)
+    downside = [min(0.0, value - target_value) for value in values]
     deviation = math.sqrt(mean(value * value for value in downside)) if downside else 0.0
-    return (mean(values) - target) / deviation * math.sqrt(periods_per_year) if deviation > 0 else 0.0
+    return (mean(values) - target_value) / deviation * math.sqrt(periods) if deviation > 0 else 0.0
 def conditional_value_at_risk(
     returns: Iterable[float],
     *,
@@ -94,14 +117,18 @@ expected_shortfall = conditional_value_at_risk
 
 
 def _closed_trade_pnls(fills: Sequence[Fill]) -> list[float]:
-    lots: dict[str, list[list[float]]] = {}
+    lots: dict[tuple[str, str, str | None], list[list[float]]] = {}
     realized: list[float] = []
     for item in fills:
+        outcome = None
+        if item.market_type.value == "prediction":
+            outcome = str(item.metadata.get("outcome", "yes")).strip().lower() or "yes"
+        lot_key = (item.symbol, item.market_type.value, outcome)
         if item.side.value == "buy":
-            lots.setdefault(item.symbol, []).append([item.quantity, item.price, item.fees])
+            lots.setdefault(lot_key, []).append([item.quantity, item.price, item.fees])
             continue
         remaining = item.quantity
-        symbol_lots = lots.setdefault(item.symbol, [])
+        symbol_lots = lots.setdefault(lot_key, [])
         while remaining > 1e-12 and symbol_lots:
             lot_quantity, lot_price, lot_fees = symbol_lots[0]
             matched = min(remaining, lot_quantity)
@@ -118,7 +145,7 @@ def _closed_trade_pnls(fills: Sequence[Fill]) -> list[float]:
 
 
 def profit_factor(trade_pnls: Iterable[float]) -> float:
-    values = [float(value) for value in trade_pnls if math.isfinite(float(value))]
+    values = _finite_values(trade_pnls)
     gains = sum(value for value in values if value > 0)
     losses = -sum(value for value in values if value < 0)
     return gains / losses if losses > 0 else 0.0
@@ -126,8 +153,8 @@ def profit_factor(trade_pnls: Iterable[float]) -> float:
 
 def longest_losing_streak(trade_pnls: Iterable[float]) -> int:
     longest = current = 0
-    for value in trade_pnls:
-        if float(value) < 0:
+    for value in _finite_values(trade_pnls):
+        if value < 0:
             current += 1
             longest = max(longest, current)
         else:
@@ -191,12 +218,25 @@ def _probability_outcome(item: Any) -> tuple[float, float] | None:
     else:
         return None
     try:
-        p, y = float(probability), float(outcome)
+        p = float(probability)
     except (TypeError, ValueError):
         return None
-    if not math.isfinite(p) or not math.isfinite(y):
+    if isinstance(outcome, str):
+        normalized = outcome.strip().lower()
+        if normalized in {"1", "true", "yes", "y", "resolved_yes"}:
+            y = 1.0
+        elif normalized in {"0", "false", "no", "n", "resolved_no"}:
+            y = 0.0
+        else:
+            return None
+    else:
+        try:
+            y = float(outcome)
+        except (TypeError, ValueError):
+            return None
+    if not math.isfinite(p) or not 0.0 <= p <= 1.0 or not math.isfinite(y) or y not in {0.0, 1.0}:
         return None
-    return max(0.0, min(1.0, p)), 1.0 if y else 0.0
+    return p, y
 
 
 def brier_score(predictions: Iterable[Any]) -> float:
@@ -206,16 +246,26 @@ def brier_score(predictions: Iterable[Any]) -> float:
 
 
 def log_loss(predictions: Iterable[Any], *, epsilon: float = 1e-15) -> float:
+    try:
+        epsilon_value = float(epsilon)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("epsilon must be numeric and in (0, 0.5)") from exc
+    if not math.isfinite(epsilon_value) or not 0.0 < epsilon_value < 0.5:
+        raise ValueError("epsilon must be numeric and in (0, 0.5)")
     values = [_probability_outcome(item) for item in predictions]
     values = [item for item in values if item is not None]
     if not values:
         return 0.0
-    return -mean(outcome * math.log(max(epsilon, min(1 - epsilon, probability))) + (1 - outcome) * math.log(max(epsilon, min(1 - epsilon, 1 - probability))) for probability, outcome in values)
+    return -mean(
+        outcome * math.log(max(epsilon_value, min(1 - epsilon_value, probability)))
+        + (1 - outcome) * math.log(max(epsilon_value, min(1 - epsilon_value, 1 - probability)))
+        for probability, outcome in values
+    )
 
 
 def calibration_buckets(predictions: Iterable[Any], *, bins: int = 10) -> list[dict[str, float]]:
-    if bins < 1:
-        raise ValueError("bins must be positive")
+    if not isinstance(bins, int) or isinstance(bins, bool) or bins < 1:
+        raise ValueError("bins must be a positive integer")
     result = [{"lower": index / bins, "upper": (index + 1) / bins, "count": 0.0, "mean_probability": 0.0, "frequency": 0.0, "gap": 0.0} for index in range(bins)]
     grouped: list[list[tuple[float, float]]] = [[] for _ in range(bins)]
     for item in predictions:
@@ -240,6 +290,90 @@ def expected_calibration_error(predictions: Iterable[Any], *, bins: int = 10) ->
 # Common abbreviations/aliases.
 ece = expected_calibration_error
 calibration_error = expected_calibration_error
+def calibration_at_horizons(
+    records: Iterable[Any],
+    *,
+    horizons: Mapping[str, timedelta | int | float] | Sequence[tuple[str, timedelta | int | float]] | None = None,
+    bins: int = 10,
+) -> dict[str, dict[str, float | int | str | None]]:
+    """Measure forecast calibration at fixed pre-expiry horizons.
+
+    Each input row must provide ``timestamp``, ``expiry``, a probability, and a
+    terminal binary outcome (or a terminal ``settlement`` value).  For each
+    market and horizon, only the latest forecast at or before
+    ``expiry - horizon`` is selected.  Unsupported horizons report zero
+    observations rather than borrowing a nearer timestamp.
+    """
+    if horizons is None:
+        horizon_items: list[tuple[str, timedelta | int | float]] = [
+            ("1d", timedelta(days=1)),
+            ("7d", timedelta(days=7)),
+            ("30d", timedelta(days=30)),
+        ]
+    elif isinstance(horizons, Mapping):
+        horizon_items = [(str(label), value) for label, value in horizons.items()]
+    else:
+        horizon_items = [(str(label), value) for label, value in horizons]
+    normalized: list[tuple[str, timedelta]] = []
+    for label, value in horizon_items:
+        if isinstance(value, timedelta):
+            delta = value
+        else:
+            try:
+                delta = timedelta(seconds=float(value))
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(f"invalid horizon {label!r}") from exc
+        if delta <= timedelta(0):
+            raise ValueError(f"horizon {label!r} must be positive")
+        normalized.append((label, delta))
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for index, item in enumerate(records):
+        if not isinstance(item, Mapping):
+            continue
+        stamp = parse_timestamp(item.get("timestamp"))
+        expiry = parse_timestamp(item.get("expiry"))
+        if stamp is None or expiry is None:
+            continue
+        parsed = _probability_outcome(
+            {
+                "probability": item.get("probability", item.get("p", item.get("forecast"))),
+                "outcome": item.get(
+                    "outcome",
+                    item.get("actual", item.get("y", item.get("settlement"))),
+                ),
+            }
+        )
+        if parsed is None:
+            continue
+        probability, outcome = parsed
+        market_id = str(item.get("market_id", item.get("key", index)))
+        grouped.setdefault(market_id, []).append(
+            {"timestamp": stamp, "expiry": expiry, "probability": probability, "outcome": outcome}
+        )
+    result: dict[str, dict[str, float | int | str | None]] = {}
+    for label, delta in normalized:
+        selected: list[dict[str, float]] = []
+        for rows in grouped.values():
+            eligible = [
+                row
+                for row in rows
+                if row["timestamp"] <= row["expiry"] - delta
+            ]
+            if not eligible:
+                continue
+            selected.append(max(eligible, key=lambda row: row["timestamp"]))
+        observations = [
+            {"probability": row["probability"], "outcome": row["outcome"]}
+            for row in selected
+        ]
+        result[label] = {
+            "horizon_seconds": int(delta.total_seconds()),
+            "count": len(observations),
+            "brier": brier_score(observations),
+            "log_loss": log_loss(observations),
+            "ece": expected_calibration_error(observations, bins=bins),
+        }
+    return result
 
 
 def expected_value(
@@ -377,7 +511,7 @@ ece_score = expected_calibration_error
 __all__ = [
     "brier",
     "brier_score",
-    "calibration_buckets",
+    "calibration_at_horizons",
     "calibration_error",
     "calculate_crypto_metrics",
     "calculate_prediction_metrics",

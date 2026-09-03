@@ -19,6 +19,7 @@ class EvolutionCandidate:
     generation: int = 0
     score: float | None = None
     train_score: float | None = None
+    validation_score: float | None = None
     holdout_score: float | None = None
     rejected: bool = False
     rejection_reason: str = ""
@@ -140,19 +141,33 @@ class EvolutionEngine:
         values = [float(value) for value in scores]
         return sum(values) / len(values) if values else 0.0
 
-    def score_candidate(self, candidate: EvolutionCandidate, observations: Sequence[Any] | None = None, *, outcomes: Sequence[float] | None = None, score: float | None = None) -> float:
-        if score is not None:
-            value = float(score)
-        elif observations is None:
-            value = candidate.score if candidate.score is not None else 0.0
+    def _score_rows(
+        self,
+        candidate: EvolutionCandidate,
+        observations: Sequence[Any],
+        outcomes: Sequence[float] | None = None,
+    ) -> float:
+        signals = [evaluate_signal(candidate.strategy, observation) for observation in observations]
+        if outcomes is not None:
+            if len(outcomes) != len(signals):
+                raise ValueError("observations and outcomes must have equal lengths")
+            values = (signal * (1.0 if float(outcome) > 0 else -1.0) for signal, outcome in zip(signals, outcomes))
         else:
-            signals = [evaluate_signal(candidate.strategy, observation) for observation in observations]
-            if outcomes is not None:
-                if len(outcomes) != len(signals):
-                    raise ValueError("observations and outcomes must have equal lengths")
-                value = self._score_values(signal * (1.0 if float(outcome) > 0 else -1.0) for signal, outcome in zip(signals, outcomes))
-            else:
-                value = self._score_values(abs(signal) for signal in signals)
+            values = (abs(signal) for signal in signals)
+        return self._score_values(values)
+
+    def score_candidate(
+        self,
+        candidate: EvolutionCandidate,
+        observations: Sequence[Any] | None = None,
+        *,
+        outcomes: Sequence[float] | None = None,
+        score: float | None = None,
+    ) -> float:
+        value = float(score) if score is not None else (
+            candidate.score if observations is None and candidate.score is not None
+            else self._score_rows(candidate, observations or (), outcomes)
+        )
         if not math.isfinite(float(value)):
             raise ValueError("candidate score must be finite")
         candidate.score = float(value)
@@ -198,35 +213,79 @@ class EvolutionEngine:
         observations: Sequence[Any] | None = None,
         *,
         outcomes: Sequence[float] | None = None,
+        validation: Sequence[Any] | None = None,
+        validation_outcomes: Sequence[float] | None = None,
         holdout: Sequence[Any] | None = None,
+        holdout_outcomes: Sequence[float] | None = None,
     ) -> EvolutionResult:
         if not self.population:
             self.initialize()
         self.generation += 1
         holdout_candidates: list[EvolutionCandidate] = []
         if observations is not None:
-            if holdout is None:
-                train, isolated_holdout = self.split_holdout(observations)
-                train_outcomes = tuple(outcomes[: len(train)]) if outcomes is not None else None
-                holdout_outcomes = tuple(outcomes[len(train) : len(train) + len(isolated_holdout)]) if outcomes is not None else None
+            train = tuple(observations)
+            validation_rows: tuple[Any, ...] = ()
+            isolated_holdout: tuple[Any, ...]
+            train_outcomes: tuple[float, ...] | None = None
+            validation_labels: tuple[float, ...] | None = None
+            isolated_holdout_labels: tuple[float, ...] | None = None
+            supplied_outcomes = tuple(outcomes) if outcomes is not None else None
+            if validation is not None:
+                validation_rows = tuple(validation)
+                isolated_holdout = tuple(holdout or ())
+                total = len(train) + len(validation_rows) + len(isolated_holdout)
+                if supplied_outcomes is not None:
+                    if len(supplied_outcomes) == total:
+                        train_outcomes = supplied_outcomes[: len(train)]
+                        validation_labels = supplied_outcomes[len(train) : len(train) + len(validation_rows)]
+                        isolated_holdout_labels = supplied_outcomes[len(train) + len(validation_rows) :]
+                    elif len(supplied_outcomes) == len(train):
+                        train_outcomes = supplied_outcomes
+                    else:
+                        raise ValueError("outcomes must match train rows or concatenated train/validation/holdout rows")
+                if validation_outcomes is not None:
+                    if len(validation_outcomes) != len(validation_rows):
+                        raise ValueError("validation and validation_outcomes must have equal lengths")
+                    validation_labels = tuple(validation_outcomes)
+                if holdout_outcomes is not None:
+                    if len(holdout_outcomes) != len(isolated_holdout):
+                        raise ValueError("holdout and holdout_outcomes must have equal lengths")
+                    isolated_holdout_labels = tuple(holdout_outcomes)
+            elif holdout is None:
+                train, isolated_holdout = self.split_holdout(train)
+                if supplied_outcomes is not None:
+                    if len(supplied_outcomes) != len(train) + len(isolated_holdout):
+                        raise ValueError("observations and outcomes must have equal lengths")
+                    train_outcomes = supplied_outcomes[: len(train)]
+                    isolated_holdout_labels = supplied_outcomes[len(train) :]
             else:
-                train = tuple(observations)
                 isolated_holdout = tuple(holdout)
-                train_outcomes = tuple(outcomes[: len(train)]) if outcomes is not None else None
-                if outcomes is not None and len(outcomes) >= len(train) + len(isolated_holdout):
-                    holdout_outcomes = tuple(outcomes[len(train) : len(train) + len(isolated_holdout)])
-                else:
-                    holdout_outcomes = tuple(outcomes[: len(isolated_holdout)]) if outcomes is not None else None
+                if supplied_outcomes is not None:
+                    if len(supplied_outcomes) == len(train) + len(isolated_holdout):
+                        train_outcomes = supplied_outcomes[: len(train)]
+                        isolated_holdout_labels = supplied_outcomes[len(train) :]
+                    elif len(supplied_outcomes) == len(train):
+                        train_outcomes = supplied_outcomes
+                    else:
+                        raise ValueError("outcomes must match train rows or concatenated train/holdout rows")
+                if holdout_outcomes is not None:
+                    if len(holdout_outcomes) != len(isolated_holdout):
+                        raise ValueError("holdout and holdout_outcomes must have equal lengths")
+                    isolated_holdout_labels = tuple(holdout_outcomes)
             for candidate in self.population:
                 self.score_candidate(candidate, train, outcomes=train_outcomes)
-            # Holdout candidates are detached value copies. Their scores are
-            # never used when ranking or mutating the research population.
+                candidate.validation_score = None
+                if validation_rows:
+                    candidate.validation_score = self._score_rows(candidate, validation_rows, validation_labels)
+                    # Selection and mutation use validation only; holdout is
+                    # evaluated on detached copies below.
+                    candidate.score = candidate.validation_score
             holdout_candidates = [
                 replace(candidate, holdout_score=None, lineage=tuple(candidate.lineage))
                 for candidate in self.population
             ]
             for candidate in holdout_candidates:
-                self._evaluate_holdout_rows(candidate, isolated_holdout, holdout_outcomes)
+                self._evaluate_holdout_rows(candidate, isolated_holdout, isolated_holdout_labels)
         ranked = sorted(
             (candidate for candidate in self.population if not candidate.rejected),
             key=lambda item: item.fitness,

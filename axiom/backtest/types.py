@@ -4,7 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from axiom.domain import Fill, SimulationQuality
+from axiom.domain import Fill, ResearchQuality, SimulationQuality
 
 
 @dataclass(frozen=True, slots=True)
@@ -16,6 +16,7 @@ class BacktestResult:
     unresolved: tuple[str, ...] = ()
     outcomes: dict[str, str] = field(default_factory=dict)
     quality_labels: tuple[SimulationQuality, ...] = ()
+    research_quality: ResearchQuality = ResearchQuality.PRICE_PROXY
 
     @property
     def final_equity(self) -> float:

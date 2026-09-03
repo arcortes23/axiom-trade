@@ -159,31 +159,64 @@ class BinanceAdapter(CryptoMarketDataProvider):
         end: datetime | None = None,
     ) -> Sequence[TradePrint]:
         symbol = self._normalize_symbol(symbol)
-        # /trades is the low-latency recent endpoint. /aggTrades supports an
-        # optional historical range while preserving the same public data.
-        path = "/api/v3/aggTrades" if start is not None or end is not None else "/api/v3/trades"
-        payload = self._get(
-            path,
-            symbol=symbol,
-            limit=1000,
-            startTime=_millis(start),
-            endTime=_millis(end),
-        )
-        if not isinstance(payload, list):
-            return []
+        historical = start is not None or end is not None
+        path = "/api/v3/aggTrades" if historical else "/api/v3/trades"
+        params: dict[str, Any] = {"symbol": symbol, "limit": 1000}
+        if start is not None:
+            params["startTime"] = _millis(start)
+        if end is not None:
+            params["endTime"] = _millis(end)
         result: list[TradePrint] = []
-        for row in payload:
-            if not isinstance(row, Mapping):
-                continue
-            timestamp = parse_timestamp(row.get("T", row.get("time")))
-            price = as_float(row.get("p", row.get("price")))
-            size = as_float(row.get("q", row.get("qty")))
-            if timestamp is None or price is None or size is None or price <= 0 or size <= 0:
-                continue
-            # Binance's buyer-maker flag identifies the aggressor side.
-            buyer_maker = _boolish(row.get("m", row.get("isBuyerMaker")))
-            side = Side.SELL if buyer_maker else Side.BUY
-            result.append(TradePrint(timestamp=timestamp, price=price, size=size, side=side))
+        seen: set[str] = set()
+        for _ in range(1000 if historical else 1):
+            payload = self._get(path, **params)
+            if not isinstance(payload, list) or not payload:
+                break
+            last_timestamp: datetime | None = None
+            last_id: int | None = None
+            for row in payload:
+                if not isinstance(row, Mapping):
+                    continue
+                timestamp = parse_timestamp(row.get("T", row.get("time")))
+                price = as_float(row.get("p", row.get("price")))
+                size = as_float(row.get("q", row.get("qty")))
+                if timestamp is None or price is None or size is None or price <= 0 or size <= 0:
+                    continue
+                trade_id_value = row.get("a", row.get("id"))
+                identity = str(trade_id_value) if trade_id_value is not None else f"{timestamp.isoformat()}|{price}|{size}"
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                buyer_maker = _boolish(row.get("m", row.get("isBuyerMaker")))
+                side = Side.SELL if buyer_maker else Side.BUY
+                result.append(
+                    TradePrint(
+                        timestamp=timestamp,
+                        price=price,
+                        size=size,
+                        side=side,
+                        trade_id=identity,
+                        market_id=symbol,
+                    )
+                )
+                last_timestamp = timestamp if last_timestamp is None or timestamp > last_timestamp else last_timestamp
+                try:
+                    row_id = int(trade_id_value) if trade_id_value is not None else None
+                except (TypeError, ValueError):
+                    row_id = None
+                if row_id is not None:
+                    last_id = row_id if last_id is None or row_id > last_id else last_id
+            if not historical or len(payload) < 1000:
+                break
+            if end is not None and last_timestamp is not None and last_timestamp >= ensure_utc(end):
+                break
+            if last_id is not None:
+                params["fromId"] = last_id + 1
+                params.pop("startTime", None)
+            elif last_timestamp is not None:
+                params["startTime"] = int(last_timestamp.timestamp() * 1000) + 1
+            else:
+                break
         result.sort(key=lambda trade: trade.timestamp)
         return result
 

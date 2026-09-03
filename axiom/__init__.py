@@ -16,6 +16,18 @@ from .domain import (
     SimulationQuality,
     TradePrint,
 )
+from .attribution import fitness_attribution
+from .benchmarks import BenchmarkResult, crypto_benchmarks, prediction_benchmarks
+from .collector import CollectionCycle, CollectorConfig, PolymarketCollector
+from .domain import ResearchQuality
+from .forward import ForwardTestRegistry, ForwardTestSpec
+from .opportunity import Opportunity, scan_opportunities
+from .robustness import (
+    bootstrap_confidence_interval,
+    minimum_sample_check,
+    multiple_testing_summary,
+    neighboring_parameter_stability,
+)
 from .storage import AxiomStore
 from .data import (
     BinanceAdapter,
@@ -34,9 +46,8 @@ from .strategy import StrategyDefinition, StrategyDSL, StrategySpec, StrategyVal
 from .portfolio import OrderRequest, OrderState, Portfolio, Position
 from .backtest import BacktestResult, CryptoBacktester, CryptoOHLCVBacktester, PredictionBacktester, PredictionMarketBacktester, PredictionMarketHistoricalSimulator
 from .metrics import (
-    brier_score,
     calibration_buckets,
-    calculate_crypto_metrics,
+    calibration_at_horizons,
     calculate_prediction_metrics,
     calmar_ratio,
     conditional_value_at_risk,
@@ -75,6 +86,17 @@ from .research import ResearchReport, run_crypto_research, run_initial_research,
 
 __all__ = [
     "AxiomStore",
+    "BenchmarkResult",
+    "CollectionCycle",
+    "CollectorConfig",
+    "ForwardTestRegistry",
+    "ForwardTestSpec",
+    "Opportunity",
+    "PolymarketCollector",
+    "ResearchQuality",
+    "bootstrap_confidence_interval",
+    "calibration_at_horizons",
+    "crypto_benchmarks",
     "BacktestResult",
     "BayesianBelief",
     "BetaBelief",
@@ -134,6 +156,12 @@ __all__ = [
     "ReportMessage",
     "ResearchReport",
     "run_crypto_research",
+    "fitness_attribution",
+    "minimum_sample_check",
+    "multiple_testing_summary",
+    "neighboring_parameter_stability",
+    "scan_opportunities",
+    "prediction_benchmarks",
     "run_initial_research",
     "run_prediction_research",
     "write_report",

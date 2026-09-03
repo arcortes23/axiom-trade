@@ -12,7 +12,7 @@ import math
 from statistics import mean, pstdev
 from typing import Any, Iterable, Mapping, Sequence
 
-from axiom.domain import MarketType, OHLCVBar, PredictionMarketSnapshot, SettlementState
+from axiom.domain import MarketType, OHLCVBar, PredictionMarketSnapshot, SettlementState, parse_timestamp
 from .dsl import StrategyDefinition, validate_strategy
 
 
@@ -197,9 +197,9 @@ def _time_to_expiry(item: Any) -> float | None:
         result = _number(value, math.nan)
         if math.isfinite(result):
             return result
-    timestamp = _snapshot_value(item, "timestamp")
-    expiry = _snapshot_value(item, "expiry")
-    if isinstance(timestamp, datetime) and isinstance(expiry, datetime):
+    timestamp = parse_timestamp(_snapshot_value(item, "timestamp"))
+    expiry = parse_timestamp(_snapshot_value(item, "expiry"))
+    if timestamp is not None and expiry is not None:
         return (expiry - timestamp).total_seconds()
     return None
 
@@ -210,7 +210,7 @@ def _prediction_signal(family: str, data: Any, params: Mapping[str, Any]) -> flo
         return 0.0
     current = snapshots[-1]
     market_p = _market_probability(current)
-    model_p = _model_probability(data, current, -1)
+    model_p = _model_probability(data, current, len(snapshots) - 1)
     edge = (model_p - market_p) if model_p is not None and market_p is not None else 0.0
     threshold = max(_number(params.get("threshold", params.get("min_edge", 0.0)), 0.0), 1e-12)
     if family == "probability_mispricing":
@@ -224,9 +224,15 @@ def _prediction_signal(family: str, data: Any, params: Mapping[str, Any]) -> flo
         if model_p >= 1.0 - tail and market_p < model_p:
             return _clip((market_p - model_p) / max(tail, 1e-12))
         return 0.0
-    history_market = [p for p in (_market_probability(s) for s in snapshots) if p is not None]
-    history_model = [_model_probability(data, s, i) for i, s in enumerate(snapshots)]
-    history_model = [p for p in history_model if p is not None]
+    history_market = [market for market in (_market_probability(s) for s in snapshots) if market is not None]
+    paired = []
+    for index, snapshot in enumerate(snapshots):
+        market = _market_probability(snapshot)
+        model = _model_probability(data, snapshot, index)
+        if market is not None and model is not None:
+            paired.append((model, market))
+    history_model = [model for model, _ in paired]
+    history_market_paired = [market for _, market in paired]
     if family == "mean_reversion":
         if len(history_market) < 2:
             return 0.0
@@ -243,9 +249,8 @@ def _prediction_signal(family: str, data: Any, params: Mapping[str, Any]) -> flo
             return 0.0
         return _clip(edge * max(0.0, min(1.0, seconds / horizon)) / max(threshold, 0.05))
     if family == "consistency":
-        if not history_model or not history_market:
+        if not history_model or not history_market_paired:
             return 0.0
-        paired = [(a, b) for a, b in zip(history_model, history_market)]
         average_edge = mean(a - b for a, b in paired)
         return _clip(average_edge / max(threshold, 0.05))
     if family == "cross_asset":

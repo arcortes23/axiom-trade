@@ -64,6 +64,8 @@ class OrderRequest:
             object.__setattr__(self, "side", Side(str(self.side)))
         if not isinstance(self.market_type, MarketType):
             object.__setattr__(self, "market_type", MarketType(str(self.market_type)))
+        if not isinstance(self.order_type, OrderType):
+            object.__setattr__(self, "order_type", OrderType(str(self.order_type)))
         quantity = float(self.quantity)
         if not math.isfinite(quantity) or quantity <= 0:
             raise ValueError("order quantity must be finite and positive")
@@ -73,6 +75,8 @@ class OrderRequest:
             if not math.isfinite(limit_price) or limit_price <= 0:
                 raise ValueError("limit_price must be finite and positive")
             object.__setattr__(self, "limit_price", limit_price)
+        if self.order_type is OrderType.LIMIT and self.limit_price is None:
+            raise ValueError("limit orders require limit_price")
         if self.outcome is not None:
             outcome = str(self.outcome).strip().lower()
             if self.market_type is MarketType.PREDICTION and outcome not in {"yes", "no"}:
@@ -119,15 +123,17 @@ class Portfolio:
         self.total_fees = 0.0
         self.total_slippage = 0.0
         self._settled_markets: set[str] = set()
-
     @staticmethod
     def _position_key(symbol: str, market_type: MarketType, outcome: str | None) -> str:
-        if market_type is MarketType.PREDICTION and outcome:
-            return symbol if outcome.lower() in {"yes", "y"} else f"{symbol}|{outcome.lower()}"
+        if market_type is MarketType.PREDICTION:
+            normalized = (outcome or "yes").lower()
+            if normalized not in {"yes", "no"}:
+                raise ValueError("prediction position outcome must be yes or no")
+            return f"{symbol}|{normalized}"
         return symbol
 
     def get_position(self, symbol: str, *, outcome: str | None = None) -> Position | None:
-        if outcome:
+        if outcome is not None:
             return self.positions.get(self._position_key(symbol, MarketType.PREDICTION, outcome))
         direct = self.positions.get(symbol)
         if direct is not None:
@@ -236,13 +242,26 @@ class Portfolio:
         order = self.submit_order(request, order_id=order_id)
         requested_quantity = order.remaining_quantity if existing_order else request.quantity
         quantity = min(requested_quantity, available_quantity) if available_quantity is not None else requested_quantity
+        if request.side is Side.SELL:
+            position = self.get_position(
+                request.symbol,
+                outcome=request.outcome if request.market_type is MarketType.PREDICTION else None,
+            )
+            quantity = min(quantity, max(0.0, position.quantity if position is not None else 0.0))
         if quantity <= 0:
             if order.remaining_quantity > 1e-12:
                 order.status = "cancelled"
             return None
         filled = quantity
+        slippage_factor = 1.0 + (slippage_bps / 10_000.0) * (1 if request.side is Side.BUY else -1)
+        limit_price = request.limit_price if request.order_type is OrderType.LIMIT else None
         if order_book is not None:
-            base_price, filled = order_book.executable_price(request.side, quantity)
+            base_price, filled = order_book.executable_price(
+                request.side,
+                quantity,
+                limit_price=limit_price,
+                price_multiplier=slippage_factor,
+            )
         elif price is not None:
             base_price = float(price)
         else:
@@ -256,25 +275,51 @@ class Portfolio:
         ):
             order.status = "cancelled"
             return None
-        if request.order_type is OrderType.LIMIT:
-            if request.limit_price is None:
-                raise ValueError("limit orders require limit_price")
-            if (request.side is Side.BUY and base_price > request.limit_price) or (request.side is Side.SELL and base_price < request.limit_price):
+        executed_price = base_price * slippage_factor
+        if (
+            not math.isfinite(executed_price)
+            or executed_price <= 0
+            or request.market_type is MarketType.PREDICTION
+            and executed_price > 1.0 + 1e-12
+        ):
+            order.status = "cancelled"
+            return None
+        if limit_price is not None:
+            violates_limit = (
+                request.side is Side.BUY and executed_price > limit_price + 1e-12
+            ) or (
+                request.side is Side.SELL and executed_price < limit_price - 1e-12
+            )
+            if violates_limit:
                 order.status = "cancelled"
                 return None
-        slippage_factor = 1.0 + (slippage_bps / 10_000.0) * (1 if request.side is Side.BUY else -1)
-        executed_price = base_price * slippage_factor
         if request.side is Side.BUY:
             affordable = self.cash / (executed_price * (1.0 + fee_bps / 10_000.0)) if executed_price > 0 else 0.0
             if filled > affordable:
                 if order_book is not None:
-                    base_price, filled = order_book.executable_price(request.side, affordable)
+                    base_price, filled = order_book.executable_price(
+                        request.side,
+                        affordable,
+                        limit_price=limit_price,
+                        price_multiplier=slippage_factor,
+                    )
                 else:
                     filled = affordable
                 if filled <= 0:
                     order.status = "cancelled"
                     return None
                 executed_price = base_price * slippage_factor
+                if (
+                    not math.isfinite(executed_price)
+                    or executed_price <= 0
+                    or request.market_type is MarketType.PREDICTION
+                    and executed_price > 1.0 + 1e-12
+                ):
+                    order.status = "cancelled"
+                    return None
+                if limit_price is not None and executed_price > limit_price + 1e-12:
+                    order.status = "cancelled"
+                    return None
                 affordable = self.cash / (executed_price * (1.0 + fee_bps / 10_000.0)) if executed_price > 0 else 0.0
                 filled = min(filled, affordable)
                 if filled <= 1e-12:
@@ -282,6 +327,12 @@ class Portfolio:
                     return None
         extra = dict(metadata or {})
         extra.setdefault("reference_price", base_price)
+        if order_book is not None:
+            best = order_book.best_ask if request.side is Side.BUY else order_book.best_bid
+            if best is not None and best > 0:
+                impact = (base_price / best - 1.0) if request.side is Side.BUY else (best / base_price - 1.0)
+                extra.setdefault("price_impact_bps", max(0.0, impact) * 10_000.0)
+            extra.setdefault("book_levels", len(order_book.asks if request.side is Side.BUY else order_book.bids))
         if request.outcome:
             extra.setdefault("outcome", request.outcome)
         fill = Fill(
@@ -307,6 +358,7 @@ class Portfolio:
             if value is not None:
                 position.mark(float(value))
         return self.equity()
+
     def resolve(self, contract: ResolvedContract) -> float:
         """Settle prediction positions once at binary payout or void refund."""
         if contract.market_id in self._settled_markets:
@@ -343,7 +395,7 @@ class Portfolio:
 
     settle = resolve
 
-    def gross_exposure(self, prices: Mapping[str, float] | None = None) -> float:
+    def gross_exposure(self, prices: Mapping[str, float] | Mapping[str, PredictionMarketSnapshot] | None = None) -> float:
         total = 0.0
         for key, position in self.positions.items():
             value = position.last_price
@@ -351,7 +403,9 @@ class Portfolio:
                 raw = prices.get(key)
                 if raw is None:
                     raw = prices.get(position.symbol)
-                if isinstance(raw, (int, float)):
+                if isinstance(raw, PredictionMarketSnapshot):
+                    value = raw.no_mid if (position.outcome or "yes").lower() == "no" else raw.yes_mid
+                elif isinstance(raw, (int, float)):
                     value = float(raw)
             total += abs(position.quantity * (value if value is not None else position.average_price))
         return total
@@ -362,7 +416,7 @@ class Portfolio:
     def realized_pnl(self) -> float:
         return sum(position.realized_pnl for position in self.positions.values())
 
-    def equity(self, prices: Mapping[str, float] | None = None) -> float:
+    def equity(self, prices: Mapping[str, float] | Mapping[str, PredictionMarketSnapshot] | None = None) -> float:
         if prices is not None:
             self.mark(prices)
         return self.cash + sum(position.quantity * (position.last_price if position.last_price is not None else position.average_price) for position in self.positions.values())

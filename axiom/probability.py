@@ -219,6 +219,9 @@ class ProbabilityModelRegistry:
         version = str(getattr(model, "version", "")).strip()
         if not version:
             raise ValueError("probability models require a version")
+        existing = self._models.get(version)
+        if existing is not None and existing != model:
+            raise ValueError(f"probability model version is already registered: {version}")
         self._models[version] = model
 
     def get(self, version: str) -> ProbabilityModel:

@@ -10,26 +10,36 @@ from urllib.parse import parse_qs, urlparse
 from urllib.request import urlopen
 
 from axiom.backtest import CryptoBacktester, PredictionMarketBacktester
-from axiom.data import BinanceAdapter, InMemoryCryptoProvider, MarketDataPipeline, SyntheticCryptoProvider, SyntheticPredictionProvider
+from axiom.benchmarks import crypto_benchmarks, prediction_benchmarks
+from axiom.collector import CollectorConfig, PolymarketCollector
 from axiom.dashboard import DashboardData, DashboardServer
+from axiom.data import BinanceAdapter, InMemoryCryptoProvider, InMemoryPredictionProvider, MarketDataPipeline, PolymarketAdapter, SyntheticCryptoProvider, SyntheticPredictionProvider
 from axiom.domain import (
     Fill,
+    InstrumentMetadata,
     MarketType,
     OHLCVBar,
     OrderBookLevel,
     OrderBookSnapshot,
+    OrderType,
+    PredictionMarketSnapshot,
     ResolvedContract,
+    ResearchQuality,
     SettlementState,
     Side,
+    TradePrint,
 )
 from axiom.evaluation import evaluate_scores, split_dataset, walk_forward_splits
 from axiom.evolution import EvolutionEngine
+from axiom.forward import ForwardTestRegistry
 from axiom.storage import AxiomStore
 from axiom.research import run_crypto_research, run_prediction_research
 from axiom.probability import BaseRateModel, BetaBelief, CryptoPriceTargetModel, ProbabilityModelRegistry
 from axiom.hermes import CandidateMessage, Hermes, HermesPermissions, HermesValidationError
 from axiom.metrics import (
     brier_score,
+    calculate_crypto_metrics,
+    calibration_at_horizons,
     calibration_buckets,
     calculate_prediction_metrics,
     conditional_value_at_risk,
@@ -37,11 +47,13 @@ from axiom.metrics import (
     expected_value,
     log_loss,
 )
-from axiom.paper import CryptoPaperTrader, LiveExecutionDisabled, PaperTradingConfig
-from axiom.portfolio import OrderRequest, Portfolio
-from axiom.regime import RegimeEngine, RegimeState
 from axiom.risk import RiskEngine, RiskLimits, fractional_kelly_size
-from axiom.strategy import StrategyValidationError, validate_strategy
+from axiom.regime import RegimeEngine, RegimeState
+from axiom.robustness import bootstrap_confidence_interval, minimum_sample_check, multiple_testing_summary, neighboring_parameter_stability
+from axiom.opportunity import scan_opportunities
+from axiom.paper import CryptoPaperTrader, LiveExecutionDisabled, PaperTradingConfig, PredictionPaperTrader
+from axiom.portfolio import OrderRequest, Portfolio
+from axiom.strategy import StrategyValidationError, evaluate_signal, validate_strategy
 
 
 UTC = timezone.utc
@@ -166,6 +178,17 @@ class StrategyAndAccountingTests(unittest.TestCase):
         self.assertEqual(portfolio.resolve(ResolvedContract("market-1", SettlementState.RESOLVED_YES, T0, "exact rule")), 0.0)
         self.assertEqual(portfolio.get_position("market-1", outcome="yes").quantity, 0.0)  # type: ignore[union-attr]
 
+    def test_metric_lots_do_not_cross_prediction_outcomes(self) -> None:
+        fills = (
+            fill("m", Side.BUY, 1.0, 0.90, market_type=MarketType.PREDICTION, order_id="no-buy", metadata={"outcome": "no"}),
+            fill("m", Side.BUY, 1.0, 0.10, market_type=MarketType.PREDICTION, order_id="yes-buy", metadata={"outcome": "yes"}),
+            fill("m", Side.SELL, 1.0, 0.20, market_type=MarketType.PREDICTION, order_id="yes-sell", metadata={"outcome": "yes"}),
+        )
+        metrics = calculate_crypto_metrics([{"equity": 1.0}], fills=fills, initial_equity=1.0)
+        self.assertEqual(metrics["closed_trades"], 1.0)
+        self.assertAlmostEqual(metrics["expectancy"], 0.10)
+
+
     def test_portfolio_guards_cash_shorts_and_partial_order_reuse(self) -> None:
         portfolio = Portfolio(10.0)
         request = OrderRequest("BTCUSDT", Side.BUY, 2.0)
@@ -245,6 +268,10 @@ class PredictionAndMetricsTests(unittest.TestCase):
         self.assertEqual(len(buckets), 10)
         self.assertEqual(buckets[7]["count"], 2.0)
         self.assertGreater(expected_calibration_error(observations), 0.0)
+        with self.assertRaises(ValueError):
+            log_loss(observations, epsilon=0.0)
+        with self.assertRaises(ValueError):
+            calibration_buckets(observations, bins=2.5)  # type: ignore[arg-type]
         metrics = calculate_prediction_metrics([100.0, 110.0], probabilities=observations, initial_equity=100.0)
         self.assertAlmostEqual(metrics["roi"], 0.1)
         self.assertIn("brier", metrics)
@@ -262,7 +289,7 @@ class PredictionAndMetricsTests(unittest.TestCase):
         self.assertTrue(result.fills)
         self.assertTrue(all(item.timestamp < T0 + timedelta(days=2) for item in result.fills))
         self.assertEqual(result.unresolved, ())
-        self.assertEqual(result.outcomes, {})
+        self.assertEqual(result.outcomes, {"m": "resolved_yes"})
 
 
     def test_prediction_edges_preserve_reference_and_complement_no_probability(self) -> None:
@@ -503,6 +530,8 @@ class DataEvaluationAndProductTests(unittest.TestCase):
             self.assertTrue(store.load_prediction_snapshots("synthetic-event-1"))
             crypto_research = run_crypto_research(SyntheticCryptoProvider(periods=30))
             self.assertEqual(len(crypto_research["experiments"]), 8)
+            self.assertEqual(crypto_research["experiments"][0]["evaluation"]["attribution"]["selection_basis"], "validation_only")
+            self.assertIn("holdout_score_report_only", crypto_research["experiments"][0]["evaluation"]["attribution"])
             prediction_research = run_prediction_research(SyntheticPredictionProvider(), market_limit=1)
             self.assertEqual(prediction_research["independent_resolved_markets"], 0)
 
@@ -551,6 +580,459 @@ class DataEvaluationAndProductTests(unittest.TestCase):
         with self.assertRaises(HermesValidationError):
             Hermes(HermesPermissions(execute_orders=True))
 
+
+class PhaseTwoQualityTests(unittest.TestCase):
+    def test_limit_order_stops_at_adverse_depth_and_requires_limit(self) -> None:
+        book = OrderBookSnapshot(
+            T0,
+            bids=(OrderBookLevel(0.20, 10.0),),
+            asks=(OrderBookLevel(0.40, 1.0), OrderBookLevel(0.60, 10.0)),
+        )
+        portfolio = Portfolio(10.0)
+        with self.assertRaises(ValueError):
+            OrderRequest("m", Side.BUY, 1.0, MarketType.PREDICTION, order_type=OrderType.LIMIT)
+        fill_result = portfolio.execute_order(
+            OrderRequest(
+                "m",
+                Side.BUY,
+                2.0,
+                MarketType.PREDICTION,
+                order_type=OrderType.LIMIT,
+                limit_price=0.50,
+                market_id="m",
+                outcome="yes",
+            ),
+            timestamp=T0,
+            order_book=book,
+            order_id="limited",
+        )
+        self.assertIsNotNone(fill_result)
+        assert fill_result is not None
+        self.assertAlmostEqual(fill_result.quantity, 1.0)
+        self.assertAlmostEqual(fill_result.price, 0.40)
+        self.assertEqual(portfolio.orders["limited"].status, "partially_filled")
+
+    def test_prediction_outcome_risk_exposure_does_not_net_yes_and_no(self) -> None:
+        risk = RiskEngine(RiskLimits(max_account_exposure=0.75), initial_equity=1.0)
+        risk.record_fill(
+            fill(
+                "m",
+                Side.BUY,
+                1.0,
+                0.40,
+                market_type=MarketType.PREDICTION,
+                market_id="m",
+                metadata={"outcome": "yes"},
+            )
+        )
+        risk.record_fill(
+            fill(
+                "m",
+                Side.BUY,
+                1.0,
+                0.40,
+                market_type=MarketType.PREDICTION,
+                market_id="m",
+                order_id="no",
+                metadata={"outcome": "no"},
+            )
+        )
+        self.assertAlmostEqual(risk.account_exposure, 0.80)
+        decision = risk.check_order(
+            OrderRequest(
+                "m",
+                Side.BUY,
+                1.0,
+                MarketType.PREDICTION,
+                market_id="m",
+                outcome="yes",
+            ),
+            price=0.40,
+        )
+        self.assertFalse(decision.allowed)
+    def test_prediction_group_and_strategy_caps_do_not_net_outcomes(self) -> None:
+        risk = RiskEngine(
+            RiskLimits(max_group_exposure=0.50, max_strategy_exposure=0.50),
+            initial_equity=1.0,
+        )
+        yes = OrderRequest("m", Side.BUY, 1.0, MarketType.PREDICTION, strategy_id="s", market_id="m", outcome="yes")
+        no = OrderRequest("m", Side.BUY, 1.0, MarketType.PREDICTION, strategy_id="s", market_id="m", outcome="no")
+        self.assertTrue(risk.check_order(yes, price=0.40, group="event").allowed)
+        risk.record_fill(fill("m", Side.BUY, 1.0, 0.40, market_type=MarketType.PREDICTION, market_id="m", strategy_id="s", metadata={"outcome": "yes", "group": "event"}))
+        decision = risk.check_order(no, price=0.40, group="event")
+        self.assertFalse(decision.allowed)
+        self.assertIn("max_group_exposure", decision.reasons)
+        self.assertIn("max_strategy_exposure", decision.reasons)
+
+
+    def test_backtests_do_not_use_future_rows_and_accept_string_timestamps(self) -> None:
+        rows = [
+            {
+                "timestamp": (T0 + timedelta(days=index)).isoformat(),
+                "market_id": "m",
+                "yes_mid": 0.20,
+                "yes_ask": 0.21,
+                "yes_bid": 0.19,
+                "model_probability": 0.80,
+                "settlement": "open",
+            }
+            for index in range(3)
+        ]
+        first = PredictionMarketBacktester(fee_bps=0.0, slippage_bps=0.0).run(rows, prediction_strategy())
+        changed = [dict(row) for row in rows]
+        changed[-1]["yes_ask"] = 0.90
+        changed[-1]["model_probability"] = 0.01
+        second = PredictionMarketBacktester(fee_bps=0.0, slippage_bps=0.0).run(changed, prediction_strategy())
+        self.assertTrue(first.fills and second.fills)
+        self.assertEqual(first.fills[0].timestamp, second.fills[0].timestamp)
+        self.assertAlmostEqual(first.fills[0].price, second.fills[0].price)
+        bars = [
+            OHLCVBar(T0, 100.0, 101.0, 99.0, 100.0, 10.0),
+            OHLCVBar(T0 + timedelta(days=1), 102.0, 103.0, 101.0, 102.0, 10.0),
+            OHLCVBar(T0 + timedelta(days=2), 104.0, 105.0, 103.0, 104.0, 10.0),
+        ]
+        crypto = CryptoBacktester(fee_bps=0.0, slippage_bps=0.0, allocation=0.5).run(bars, crypto_strategy("momentum", lookback=1, threshold=0.01))
+        self.assertTrue(crypto.equity_curve)
+
+        strategy = prediction_strategy("probability_mispricing", threshold=0.1)
+        current_snapshot = dict(rows[0])
+        current_snapshot.pop("model_probability")
+        current_snapshot["yes_mid"] = 0.5
+        current_only = {
+            "snapshots": [current_snapshot],
+            "probabilities": [0.2, 0.9],
+        }
+        self.assertLess(evaluate_signal(strategy, current_only), 0.0)
+    def test_multi_horizon_calibration_and_robustness_reject_invalid_inputs(self) -> None:
+        rows = [
+            {"market_id": "m", "timestamp": T0, "expiry": T0 + timedelta(days=30), "probability": 0.8, "outcome": 1},
+            {"market_id": "m", "timestamp": T0 + timedelta(days=2), "expiry": T0 + timedelta(days=30), "probability": 0.6, "outcome": 1},
+            {"market_id": "m", "timestamp": T0 + timedelta(days=29), "expiry": T0 + timedelta(days=30), "probability": 0.5, "outcome": 1},
+        ]
+        calibration = calibration_at_horizons(rows, horizons={"1d": timedelta(days=1), "7d": timedelta(days=7)})
+        self.assertEqual(calibration["1d"]["count"], 1)
+        self.assertAlmostEqual(calibration["1d"]["brier"], 0.25)
+        self.assertEqual(calibration["7d"]["count"], 1)
+        self.assertTrue(minimum_sample_check(2, min_observations=3)["passed"] is False)
+        multiple = multiple_testing_summary({"good": 0.01, "bad": "not-a-p", "edge": 0.20})
+        self.assertEqual(multiple["invalid_values"], 1)
+        interval = bootstrap_confidence_interval([1.0, 4.0], statistic="median", resamples=8, seed=2)
+        self.assertAlmostEqual(interval["estimate"], 2.5)
+        with self.assertRaises(ValueError):
+            bootstrap_confidence_interval([], statistic="unsupported")
+
+    def test_resolved_prediction_research_reports_fixed_horizons(self) -> None:
+        market = PredictionMarketSnapshot(
+            T0,
+            "resolved",
+            "Question",
+            yes_bid=0.40,
+            yes_ask=0.60,
+            yes_mid=0.50,
+            expiry=T0 + timedelta(days=30),
+            settlement=SettlementState.RESOLVED_YES,
+        )
+        provider = InMemoryPredictionProvider(
+            markets=[market],
+            histories={
+                "resolved": [
+                    {"timestamp": T0 + timedelta(days=29), "price": 0.80},
+                    {"timestamp": T0 + timedelta(days=1), "price": 0.30},
+                    {"timestamp": T0 + timedelta(days=20), "price": 0.60},
+                ]
+            },
+        )
+        report = run_prediction_research(provider, market_limit=1)
+        self.assertEqual(report["independent_resolved_markets"], 1)
+        self.assertEqual(report["research_quality"], ResearchQuality.PRICE_PROXY.value)
+        self.assertEqual(report["multi_horizon_calibration"]["1d"]["count"], 1)
+        self.assertEqual(report["multi_horizon_calibration"]["7d"]["count"], 1)
+        self.assertEqual(report["multi_horizon_calibration"]["30d"]["count"], 0)
+
+    def test_benchmarks_and_research_quality_labels_are_explicit(self) -> None:
+        bars = [
+            OHLCVBar(T0 + timedelta(days=index), 100.0 + index, 101.0 + index, 99.0 + index, 100.5 + index, 10.0)
+            for index in range(4)
+        ]
+        benchmark_names = {item.name for item in crypto_benchmarks(bars)}
+        self.assertEqual(benchmark_names, {"cash", "buy_hold", "dca"})
+        prediction = prediction_benchmarks(
+            [
+                {"yes_mid": 0.4, "probability": 0.7, "outcome": 1},
+                {"yes_mid": 0.6, "probability": 0.3, "outcome": 0},
+            ]
+        )
+        self.assertEqual({item.name for item in prediction}, {"market_mid", "constant_0.5", "model"})
+        book = OrderBookSnapshot(T0, (OrderBookLevel(0.20, 2.0),), (OrderBookLevel(0.30, 2.0),))
+        market_rows = [
+            {
+                "timestamp": T0,
+                "market_id": "m",
+                "yes_mid": 0.25,
+                "yes_bid": 0.20,
+                "yes_ask": 0.30,
+                "model_probability": 0.80,
+                "order_book": book,
+                "settlement": "open",
+            },
+            {
+                "timestamp": T0 + timedelta(days=1),
+                "market_id": "m",
+                "yes_mid": 0.25,
+                "yes_bid": 0.20,
+                "yes_ask": 0.30,
+                "model_probability": 0.80,
+                "order_book": book,
+                "settlement": "resolved_yes",
+            },
+        ]
+        result = PredictionMarketBacktester(fee_bps=0.0, slippage_bps=0.0).run(market_rows, prediction_strategy())
+        self.assertEqual(len(result.quality_labels), 2)
+        self.assertEqual(result.research_quality, ResearchQuality.ORDER_BOOK_SIMULATED)
+
+    def test_collector_is_resumable_immutable_and_health_aware(self) -> None:
+        class FakePredictionProvider:
+            provider_name = "fake-polymarket"
+
+            def markets(self, active: bool = True):
+                return [self.market("m")]
+
+            def market(self, market_id: str):
+                return PredictionMarketSnapshot(
+                    T0,
+                    "m",
+                    "Will event happen?",
+                    yes_bid=0.40,
+                    yes_ask=0.50,
+                    yes_mid=0.45,
+                    no_bid=0.50,
+                    no_ask=0.60,
+                    no_mid=0.55,
+                    expiry=T0 + timedelta(days=2),
+                    resolution_criteria="official result",
+                    yes_token_id="yes-token",
+                    no_token_id="no-token",
+                )
+
+            def price_history(self, market_id: str, start=None, end=None):
+                return ()
+
+            def order_book(self, market_id: str, depth: int = 20):
+                return self.order_books(market_id, depth)["yes"]
+
+            def order_books(self, market_id: str, depth: int = 20):
+                return {
+                    "yes": OrderBookSnapshot(T0, (OrderBookLevel(0.40, 10.0),), (OrderBookLevel(0.50, 10.0),), "yes-token"),
+                    "no": OrderBookSnapshot(T0, (OrderBookLevel(0.50, 10.0),), (OrderBookLevel(0.60, 10.0),), "no-token"),
+                }
+
+            def metadata(self, market_id: str):
+                return InstrumentMetadata(
+                    "m",
+                    MarketType.PREDICTION,
+                    provider="fake-polymarket",
+                    market_id="m",
+                    question="Will event happen?",
+                    resolution_criteria="official result",
+                    expiry=T0 + timedelta(days=2),
+                )
+
+            def trades(self, market_id: str, start=None, end=None):
+                return (TradePrint(T0, 0.50, 2.0, Side.BUY, trade_id="trade-1", market_id="m", token_id="yes-token"),)
+
+        with AxiomStore(":memory:") as store:
+            collector = PolymarketCollector(
+                FakePredictionProvider(),
+                store,
+                CollectorConfig(interval_seconds=60.0),
+                clock=lambda: T0,
+                sleep=lambda _seconds: None,
+            )
+            first = collector.collect_once(now=T0)
+            second = collector.collect_once(now=T0 + timedelta(seconds=60))
+            self.assertEqual((first.snapshots_inserted, second.snapshots_inserted, second.snapshot_duplicates), (1, 1, 0))
+            self.assertEqual(second.trades_inserted, 0)
+            self.assertEqual(second.trade_duplicates, 1)
+            self.assertEqual(len(store.load_polymarket_trades("m")), 1)
+            self.assertEqual(store.polymarket_health(now=T0 + timedelta(seconds=60))["metadata_records"], 1)
+            stored_snapshot = store.load_polymarket_snapshots("m")[0]
+            self.assertEqual(stored_snapshot["quality"], ResearchQuality.ORDER_BOOK_SIMULATED.value)
+            self.assertAlmostEqual(stored_snapshot["payload"]["quotes"]["yes_spread"], 0.10)
+            self.assertEqual(stored_snapshot["payload"]["depth"]["yes"]["ask_levels"], 1)
+            self.assertTrue(store.save_polymarket_market_metadata("m", {"rules": "changed"}, observed_at=T0))
+            self.assertEqual(store.polymarket_health(now=T0 + timedelta(seconds=60))["metadata_records"], 2)
+
+    def test_forward_registry_and_scanner_are_paper_only_and_frozen(self) -> None:
+        config = {"nested": {"value": 1}}
+        registry = ForwardTestRegistry()
+        spec = registry.freeze(
+            strategy={"id": "s", "version": 1},
+            model={"id": "m", "version": 1},
+            config=config,
+            start_timestamp=T0,
+            allowed_markets=("m",),
+        )
+        config["nested"]["value"] = 9
+        self.assertEqual(spec.config["nested"]["value"], 1)
+        with self.assertRaises(TypeError):
+            spec.config["nested"]["value"] = 2  # type: ignore[index]
+        with self.assertRaises(ValueError):
+            registry.freeze(
+                strategy={"id": "s", "version": 1},
+                model={"id": "m", "version": 1},
+                config={"nested": {"value": 2}},
+                start_timestamp=T0,
+                allowed_markets=("m",),
+                experiment_id=spec.experiment_id,
+            )
+        with AxiomStore(":memory:") as store:
+            persisted = ForwardTestRegistry(store)
+            persisted_spec = persisted.freeze(
+                strategy={"id": "s", "version": 1},
+                model={"id": "m", "version": 1},
+                config={"nested": {"value": 1}},
+                start_timestamp=T0,
+                allowed_markets=("m",),
+                experiment_id="persisted-forward",
+            )
+            self.assertEqual(ForwardTestRegistry(store).list()[0].as_record(), persisted_spec.as_record())
+        market = PredictionMarketSnapshot(
+            T0,
+            "m",
+            "Question",
+            yes_bid=0.20,
+            yes_ask=0.30,
+            yes_mid=0.25,
+            liquidity=10.0,
+            order_book=OrderBookSnapshot(T0, (OrderBookLevel(0.20, 10.0),), (OrderBookLevel(0.30, 10.0),)),
+        )
+        opportunities = scan_opportunities((market,), {"m": 0.80}, min_edge=0.1)
+        self.assertEqual(len(opportunities), 1)
+        self.assertEqual(opportunities[0].action, "PAPER_ONLY")
+
+    def test_dashboard_exposes_store_health_detail(self) -> None:
+        with AxiomStore(":memory:") as store:
+            server = DashboardServer(port=0, data=DashboardData(store=store))
+            server.start()
+            try:
+                assert server.url is not None
+                with urlopen(server.url + "/api/dataset-health", timeout=2) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+                self.assertEqual(response.status, 200)
+                self.assertEqual(payload["grade"], "F")
+            finally:
+                server.stop()
+    def test_pipeline_drops_invalid_timestamps_and_outage_datasets(self) -> None:
+        class InvalidHistoryProvider(SyntheticPredictionProvider):
+            def price_history(self, market_id: str, start=None, end=None):
+                return (
+                    {"timestamp": "not-a-timestamp", "price": 0.99},
+                    {"timestamp": T0.isoformat(), "price": 0.50},
+                )
+
+        class OutageProvider(SyntheticPredictionProvider):
+            def price_history(self, market_id: str, start=None, end=None):
+                raise RuntimeError("history unavailable")
+
+        with AxiomStore(":memory:") as store:
+            pipeline = MarketDataPipeline(store)
+            invalid = pipeline.ingest_prediction(InvalidHistoryProvider(), ["synthetic-event-1"])
+            self.assertEqual(invalid[0].records, 1)
+            self.assertEqual(invalid[0].quality.value, "LOW")
+            self.assertEqual(len(store.load_prediction_snapshots("synthetic-event-1")), 1)
+            outage = pipeline.ingest_prediction(OutageProvider(), ["synthetic-event-1"])
+            self.assertEqual(outage[0].records, 0)
+            self.assertTrue(outage[0].errors)
+            self.assertIsNone(store.load_dataset_record("prediction:synthetic-event-1", outage[0].dataset_version))
+
+    def test_paper_trader_sorts_history_and_filters_risk_kwargs(self) -> None:
+        class NarrowRisk:
+            def check_order(self, order, price, quantity):
+                return price > 0 and quantity > 0
+
+        class AlwaysBuy:
+            def signal(self, _context):
+                return {"side": "buy_yes", "quantity": 1.0}
+
+        crypto_trader = CryptoPaperTrader(
+            SyntheticCryptoProvider(periods=2),
+            AlwaysBuy(),
+            risk=NarrowRisk(),
+            portfolio=Portfolio(1_000_000.0),
+        )
+        self.assertIsNotNone(crypto_trader.run_once("BTCUSDT"))
+
+        market = PredictionMarketSnapshot(
+            T0,
+            "m",
+            "Question",
+            yes_bid=0.40,
+            yes_ask=0.60,
+            yes_mid=0.50,
+            no_bid=0.40,
+            no_ask=0.60,
+            no_mid=0.50,
+            expiry=T0 + timedelta(days=1),
+            settlement=SettlementState.RESOLVED_YES,
+            resolution_criteria="official result",
+        )
+        provider = InMemoryPredictionProvider(
+            markets=[market],
+            histories={
+                "m": [
+                    {"timestamp": T0 + timedelta(days=1), "price": 0.60},
+                    {"timestamp": T0, "price": 0.50},
+                ]
+            },
+        )
+        portfolio = Portfolio(100.0)
+        fills = PredictionPaperTrader(provider, AlwaysBuy(), portfolio=portfolio).run("m", start=T0, end=T0 + timedelta(days=1))
+        self.assertEqual(fills[0].timestamp, T0)
+        self.assertEqual(portfolio.get_position("m", outcome="yes").quantity, 0.0)  # type: ignore[union-attr]
+
+    def test_polymarket_trades_follow_cursor_after_short_page(self) -> None:
+        calls: list[str] = []
+
+        class Response:
+            def __init__(self, payload: object) -> None:
+                self.payload = json.dumps(payload).encode("utf-8")
+
+            def read(self) -> bytes:
+                return self.payload
+
+            def close(self) -> None:
+                return
+
+        def opener(request: object, timeout: float) -> Response:
+            del timeout
+            url = str(getattr(request, "full_url"))
+            calls.append(url)
+            cursor = parse_qs(urlparse(url).query).get("cursor")
+            row = {
+                "timestamp": int((T0 + timedelta(minutes=len(calls))).timestamp()),
+                "price": "0.50",
+                "size": "1.0",
+                "id": f"trade-{len(calls)}",
+                "side": "BUY",
+            }
+            return Response({"data": [row], "next_cursor": "next" if not cursor else None})
+
+        trades = PolymarketAdapter(opener=opener, timeout=1.0).trades("m")
+        self.assertEqual(len(trades), 2)
+        self.assertEqual(len(calls), 2)
+
+    def test_immutable_trade_keys_are_scoped_and_robustness_rejects_bad_counts(self) -> None:
+        trade = TradePrint(T0, 0.5, 1.0, trade_id="same")
+        with AxiomStore(":memory:") as store:
+            self.assertTrue(store.save_polymarket_trade("m1", trade, trade_key="manual"))
+            self.assertTrue(store.save_polymarket_trade("m2", trade, trade_key="manual"))
+            self.assertEqual(len(store.load_polymarket_trades()), 2)
+        with self.assertRaises(ValueError):
+            minimum_sample_check(-1)
+        with self.assertRaises(ValueError):
+            minimum_sample_check(1, trades=-1)
+        with self.assertRaises(ValueError):
+            neighboring_parameter_stability([1.0, 1.0], tolerance=float("nan"))
 
 if __name__ == "__main__":
     unittest.main()
