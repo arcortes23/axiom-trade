@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "axiom-platform"
+version = "0.1.0"
+description = "Deterministic quantitative market research and strategy evolution platform"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+axiom = "axiom.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["axiom*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

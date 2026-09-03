@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+.env
+reports/axiom.sqlite
+reports/*.sqlite-shm
+reports/*.sqlite-wal
+%TEMP%axiom-demo.json
