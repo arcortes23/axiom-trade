@@ -23,6 +23,12 @@ from .research_bus import DurableResearchBus, ResearchBusPermissionError, _valid
 from .strategy import evaluate_signal_record, load_strategy
 from .tracking import ExperimentTracker
 from .storage import AxiomStore
+from .bootstrap import (
+    BTC_HISTORY_START,
+    BTC_INTERVAL_SECONDS,
+    HistoricalBootstrapper,
+    run_btc_historical_research,
+)
 
 _SYNTHETIC_START = datetime(2024, 1, 1, tzinfo=timezone.utc)
 
@@ -144,6 +150,35 @@ def build_parser() -> argparse.ArgumentParser:
     historical.add_argument("--output", help="optional JSON report path")
     historical.add_argument("--markdown-output", help="optional Markdown report path")
     historical.add_argument("--db", help="optional SQLite artifact database path")
+    bootstrap = commands.add_parser("bootstrap-history", help="bootstrap resumable historical BTC and Polymarket datasets")
+    bootstrap.add_argument("--db", default="runtime-data/axiom_phase42.sqlite")
+    bootstrap.add_argument("--crypto", action="store_true", help="bootstrap BTC OHLCV")
+    bootstrap.add_argument("--polymarket", action="store_true", help="bootstrap resolved and closed Polymarket history")
+    bootstrap.add_argument("--all", action="store_true", help="bootstrap both sources")
+    bootstrap.add_argument("--resume", action="store_true", help="resume an incomplete staged bootstrap")
+    bootstrap.add_argument("--status", action="store_true", help="show catalog and staged state without network access")
+    bootstrap.add_argument("--full-15m", action="store_true", help="request BTC 15-minute history from the earliest configured date")
+    bootstrap.add_argument("--interval", action="append", choices=("1d", "4h", "1h", "15m"), default=[])
+    bootstrap.add_argument("--start")
+    bootstrap.add_argument("--end")
+    bootstrap.add_argument("--max-markets", type=int, default=1000)
+    bootstrap.add_argument("--timeout", type=float, default=10.0)
+    bootstrap.add_argument("--max-attempts", type=int, default=4)
+    bootstrap.add_argument("--backoff", type=float, default=0.5)
+    bootstrap.add_argument("--output")
+    catalog = commands.add_parser("dataset-catalog", help="list immutable historical and forward dataset catalog records")
+    catalog.add_argument("--db", default="runtime-data/axiom_phase42.sqlite")
+    catalog.add_argument("--source", choices=("HISTORICAL", "FORWARD_COLLECTED"))
+    catalog.add_argument("--status", action="store_true", help="include resumable bootstrap state")
+    btc_research = commands.add_parser("btc-research", help="run BTC historical walk-forward research from the catalog")
+    btc_research.add_argument("--db", default="runtime-data/axiom_phase42.sqlite")
+    btc_research.add_argument("--dataset")
+    btc_research.add_argument("--version")
+    btc_research.add_argument("--output")
+    btc_research.add_argument("--train-years", type=int, default=3)
+    btc_research.add_argument("--validation-years", type=int, default=1)
+    btc_research.add_argument("--holdout-years", type=int, default=1)
+    btc_research.add_argument("--step-years", type=int, default=1)
     collect = commands.add_parser("collect-data", help="collect immutable Polymarket metadata, books, and trades")
     collect.add_argument("--db", required=True, help="SQLite collection database path")
     collect.add_argument("--cycles", type=int, default=1, help="number of cycles; 0 runs continuously")
@@ -354,6 +389,67 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.markdown_output:
             write_report(report, args.markdown_output)
         print(json.dumps(payload, sort_keys=True, indent=2))
+        return 0
+    if args.command == "bootstrap-history":
+        with AxiomStore(args.db) as store:
+            bootstrapper = HistoricalBootstrapper(
+                store,
+                crypto_provider=BinanceAdapter(timeout=args.timeout),
+                prediction_provider=PolymarketAdapter(timeout=args.timeout),
+                max_attempts=args.max_attempts,
+                backoff=args.backoff,
+            )
+            if args.status:
+                payload = bootstrapper.status()
+            else:
+                start = _parse_cli_timestamp(args.start) or BTC_HISTORY_START
+                end = _parse_cli_timestamp(args.end)
+                if end is not None and end < start:
+                    raise ValueError("--end must be on or after --start")
+                selected_crypto = bool(args.crypto or args.all or not (args.crypto or args.polymarket or args.all))
+                selected_polymarket = bool(args.polymarket or args.all or not (args.crypto or args.polymarket or args.all))
+                payload = {}
+                if selected_crypto:
+                    payload["crypto"] = [
+                        item.as_record()
+                        for item in bootstrapper.bootstrap_crypto(
+                            intervals=args.interval or tuple(BTC_INTERVAL_SECONDS),
+                            start=start,
+                            end=end,
+                            full_15m=args.full_15m,
+                            resume=args.resume,
+                        )
+                    ]
+                if selected_polymarket:
+                    payload["polymarket"] = bootstrapper.bootstrap_polymarket(
+                        max_markets=args.max_markets,
+                        resume=args.resume,
+                    ).as_record()
+        if args.output:
+            Path(args.output).write_text(json.dumps(payload, sort_keys=True, indent=2, default=str), encoding="utf-8")
+        print(json.dumps(payload, sort_keys=True, indent=2, default=str))
+        return 0
+    if args.command == "dataset-catalog":
+        with AxiomStore(args.db) as store:
+            payload = {"catalog": store.list_dataset_catalog(source_type=args.source, limit=10_000)}
+            if args.status:
+                payload["bootstrap"] = store.list_dataset_bootstrap_states(limit=10_000)
+        print(json.dumps(payload, sort_keys=True, indent=2, default=str))
+        return 0
+    if args.command == "btc-research":
+        with AxiomStore(args.db) as store:
+            payload = run_btc_historical_research(
+                store,
+                dataset_id=args.dataset,
+                version=args.version,
+                train_years=args.train_years,
+                validation_years=args.validation_years,
+                holdout_years=args.holdout_years,
+                step_years=args.step_years,
+            )
+        if args.output:
+            Path(args.output).write_text(json.dumps(payload, sort_keys=True, indent=2, default=str), encoding="utf-8")
+        print(json.dumps(payload, sort_keys=True, indent=2, default=str))
         return 0
     if args.command == "collect-data":
         store = AxiomStore(args.db)

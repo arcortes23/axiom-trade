@@ -19,6 +19,7 @@ from typing import Any, Callable, Mapping, Sequence
 from .data._http import HTTPFetchError
 from .data.interfaces import PredictionMarketDataProvider
 from .domain import (
+    MarketType,
     OrderBookSnapshot,
     PredictionMarketSnapshot,
     ResearchQuality,
@@ -220,6 +221,46 @@ class PolymarketCollector:
             f"{self.config.collector_name}|{started.isoformat()}|{ended.isoformat()}|{_stable_payload(cycle_payload)}".encode("utf-8")
         ).hexdigest()
         self.store.save_collection_cycle(cycle_id, self.config.collector_name, cycle_payload, started_at=started, ended_at=ended)
+        try:
+            forward_snapshots = self.store.load_polymarket_snapshots(start=started, end=ended)
+            source_times = [
+                item.get("source_timestamp")
+                for item in forward_snapshots
+                if isinstance(item, Mapping) and item.get("source_timestamp") is not None
+            ]
+            source_times = [ensure_utc(item) for item in source_times]
+            forward_quality = (
+                ResearchQuality.ORDER_BOOK_SIMULATED.value
+                if any(str(item.get("quality", "")) == ResearchQuality.ORDER_BOOK_SIMULATED.value for item in forward_snapshots if isinstance(item, Mapping))
+                else ResearchQuality.PRICE_PROXY.value
+            )
+            self.store.save_dataset_catalog(
+                "Polymarket-forward-orderbook",
+                cycle_id,
+                provider=str(getattr(self.provider, "provider_name", self.provider.__class__.__name__)),
+                instrument="POLYMARKET",
+                market_type=MarketType.PREDICTION,
+                timeframe="live",
+                start_timestamp=min(source_times) if source_times else None,
+                end_timestamp=max(source_times) if source_times else None,
+                row_count=len(forward_snapshots),
+                completeness=1.0 if counters["errors"] == 0 else max(0.0, 1.0 - counters["errors"] / max(1, len(ids))),
+                missing_ranges=(),
+                quality=forward_quality,
+                source_type="FORWARD_COLLECTED",
+                snapshot_id=cycle_id,
+                metadata={
+                    "collector": self.config.collector_name,
+                    "cycle_id": cycle_id,
+                    "markets_seen": len(ids),
+                    "collection_cycle": cycle_payload,
+                    "live_execution": False,
+                },
+            )
+        except (AttributeError, TypeError, ValueError):
+            # Catalog publication must not turn a successfully persisted
+            # forward collection cycle into a failed collection.
+            pass
         self.store.set_collector_state(
             self.config.collector_name,
             {

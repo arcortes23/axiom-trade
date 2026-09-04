@@ -22,6 +22,7 @@ class RegimeState(str, Enum):
     TRENDING = "trending"
     RANGE_BOUND = "range_bound"
     NORMAL_VOLATILITY = "normal_volatility"
+    LOW_VOLATILITY = "low_volatility"
     HIGH_VOLATILITY = "high_volatility"
     EXTREME_VOLATILITY = "extreme_volatility"
     CRASH = "crash"
@@ -189,6 +190,7 @@ class RegimeEngine:
         elif volatility >= self.volatility_threshold:
             states.append(Regime(RegimeState.HIGH_VOLATILITY, MarketType.CRYPTO_SPOT, min(1.0, volatility / max(self.volatility_threshold, 1e-12)), {"volatility": volatility}))
         else:
+            states.append(Regime(RegimeState.LOW_VOLATILITY, MarketType.CRYPTO_SPOT, 1.0, {"volatility": volatility}))
             states.append(Regime(RegimeState.NORMAL_VOLATILITY, MarketType.CRYPTO_SPOT, 1.0, {"volatility": volatility}))
         if returns and returns[-1] <= -self.crash_threshold:
             states.append(Regime(RegimeState.CRASH, MarketType.CRYPTO_SPOT, min(1.0, abs(returns[-1]) / max(self.crash_threshold, 1e-12)), {"return": returns[-1]}))

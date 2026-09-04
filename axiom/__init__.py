@@ -97,6 +97,17 @@ from .lifecycle import CandidateLifecycle, CandidateLifecycleManager, CandidateS
 from .mutations import DeterministicMutationEngine, ExperimentBudget, MutationCandidate
 from .research_bus import DurableResearchBus, ResearchBusPermissionError, ResearchQueueItem, ResearchQueueStatus
 from .director import ProposalValidation, compact_report, research_summary, validate_hermes_proposal
+from .bootstrap import (
+    BTC_DATASET_IDS,
+    BTC_HISTORY_START,
+    BTC_INTERVAL_SECONDS,
+    BootstrapReport,
+    HistoricalBootstrapper,
+    POLYMARKET_DATASET_ID,
+    classify_market_category,
+    label_btc_regimes,
+    run_btc_historical_research,
+)
 from .research import ResearchReport, run_crypto_research, run_initial_research, run_prediction_research, write_report
 
 __all__ = [
@@ -253,6 +264,15 @@ __all__ = [
     "AutonomousResearchConfig",
     "AutonomousResearchError",
     "AutonomousResearchProcessor",
+    "BootstrapReport",
+    "HistoricalBootstrapper",
+    "BTC_DATASET_IDS",
+    "BTC_HISTORY_START",
+    "BTC_INTERVAL_SECONDS",
+    "POLYMARKET_DATASET_ID",
+    "classify_market_category",
+    "label_btc_regimes",
+    "run_btc_historical_research",
     "walk_forward_splits",
 ]
 

@@ -115,6 +115,64 @@ class AxiomStore:
                     created_at TEXT NOT NULL,
                     PRIMARY KEY (dataset_id, version)
                 );
+                CREATE TABLE IF NOT EXISTS dataset_catalog (
+                    dataset_id TEXT NOT NULL,
+                    dataset_version TEXT NOT NULL,
+                    provider TEXT NOT NULL,
+                    instrument TEXT NOT NULL,
+                    market_type TEXT NOT NULL,
+                    timeframe TEXT NOT NULL DEFAULT '',
+                    start_timestamp TEXT,
+                    end_timestamp TEXT,
+                    row_count INTEGER NOT NULL,
+                    completeness REAL NOT NULL,
+                    missing_ranges_json TEXT NOT NULL DEFAULT '[]',
+                    quality TEXT NOT NULL,
+                    source_type TEXT NOT NULL,
+                    snapshot_id TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
+                    PRIMARY KEY (dataset_id, dataset_version)
+                );
+                CREATE INDEX IF NOT EXISTS idx_dataset_catalog_source
+                    ON dataset_catalog(source_type, updated_at);
+                CREATE INDEX IF NOT EXISTS idx_dataset_catalog_instrument
+                    ON dataset_catalog(instrument, timeframe, updated_at);
+                CREATE TABLE IF NOT EXISTS dataset_bootstrap_state (
+                    dataset_id TEXT PRIMARY KEY,
+                    provider TEXT NOT NULL,
+                    instrument TEXT NOT NULL,
+                    market_type TEXT NOT NULL,
+                    timeframe TEXT NOT NULL,
+                    requested_start TEXT,
+                    requested_end TEXT,
+                    next_timestamp TEXT,
+                    base_version TEXT,
+                    status TEXT NOT NULL,
+                    payload_json TEXT NOT NULL DEFAULT '{}',
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS dataset_staging_bars (
+                    dataset_id TEXT NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (dataset_id, timestamp)
+                );
+                CREATE INDEX IF NOT EXISTS idx_dataset_staging_bars_time
+                    ON dataset_staging_bars(dataset_id, timestamp);
+                CREATE TABLE IF NOT EXISTS historical_regime_labels (
+                    dataset_id TEXT NOT NULL,
+                    dataset_version TEXT NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    labels_json TEXT NOT NULL,
+                    confidence_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (dataset_id, dataset_version, timestamp)
+                );
+                CREATE INDEX IF NOT EXISTS idx_historical_regimes_dataset
+                    ON historical_regime_labels(dataset_id, dataset_version, timestamp);
                 CREATE TABLE IF NOT EXISTS bars (
                     symbol TEXT NOT NULL,
                     timestamp TEXT NOT NULL,
@@ -520,7 +578,10 @@ class AxiomStore:
                     "SELECT payload_json FROM datasets WHERE dataset_id=? AND version=?",
                     (str(dataset_id), str(version)),
                 ).fetchone()
-        return _load(row["payload_json"]) if row else None
+        if row is not None:
+            return _load(row["payload_json"])
+        catalog = self.load_dataset_catalog(str(dataset_id), version)
+        return self._catalog_records(catalog) if catalog is not None else None
 
     def load_dataset_record(self, dataset_id: str, version: str | None = None) -> dict[str, Any] | None:
         """Return payload plus version, quality and metadata for dashboards."""
@@ -535,16 +596,30 @@ class AxiomStore:
                     "SELECT * FROM datasets WHERE dataset_id=? AND version=?",
                     (str(dataset_id), str(version)),
                 ).fetchone()
-        if row is None:
+        if row is not None:
+            return {
+                "dataset_id": row["dataset_id"],
+                "version": row["version"],
+                "records": _load(row["payload_json"]),
+                "metadata": _load(row["metadata_json"]),
+                "quality": row["quality"],
+                "created_at": _parse_datetime(row["created_at"]),
+            }
+        catalog = self.load_dataset_catalog(str(dataset_id), version)
+        if catalog is None:
             return None
         return {
-            "dataset_id": row["dataset_id"],
-            "version": row["version"],
-            "records": _load(row["payload_json"]),
-            "metadata": _load(row["metadata_json"]),
-            "quality": row["quality"],
-            "created_at": _parse_datetime(row["created_at"]),
+            "dataset_id": catalog["dataset_id"],
+            "version": catalog["dataset_version"],
+            "records": self._catalog_records(catalog),
+            "metadata": catalog["metadata"],
+            "quality": catalog["quality"],
+            "created_at": catalog["created_at"],
+            "updated_at": catalog["updated_at"],
+            "source_type": catalog["source_type"],
+            "snapshot_id": catalog["snapshot_id"],
         }
+
     def load_dataset_by_version(self, version: str) -> dict[str, Any] | None:
         """Return the unique immutable dataset record carrying ``version``."""
         with self._lock:
@@ -552,26 +627,423 @@ class AxiomStore:
                 "SELECT * FROM datasets WHERE version=? ORDER BY created_at DESC,dataset_id DESC",
                 (str(version),),
             ).fetchall()
-        if not rows:
+        if rows:
+            row = rows[0]
+            return {
+                "dataset_id": row["dataset_id"],
+                "version": row["version"],
+                "records": _load(row["payload_json"]),
+                "metadata": _load(row["metadata_json"]),
+                "quality": row["quality"],
+                "created_at": _parse_datetime(row["created_at"]),
+            }
+        with self._lock:
+            catalog_rows = self._conn.execute(
+                "SELECT * FROM dataset_catalog WHERE dataset_version=? ORDER BY updated_at DESC,dataset_id DESC",
+                (str(version),),
+            ).fetchall()
+        if not catalog_rows:
             return None
-        row = rows[0]
+        catalog = _dataset_catalog_record(catalog_rows[0])
         return {
-            "dataset_id": row["dataset_id"],
-            "version": row["version"],
-            "records": _load(row["payload_json"]),
-            "metadata": _load(row["metadata_json"]),
-            "quality": row["quality"],
-            "created_at": _parse_datetime(row["created_at"]),
+            "dataset_id": catalog["dataset_id"],
+            "version": catalog["dataset_version"],
+            "records": self._catalog_records(catalog),
+            "metadata": catalog["metadata"],
+            "quality": catalog["quality"],
+            "created_at": catalog["created_at"],
+            "updated_at": catalog["updated_at"],
+            "source_type": catalog["source_type"],
+            "snapshot_id": catalog["snapshot_id"],
         }
-
 
     def dataset_versions(self, dataset_id: str) -> list[str]:
         with self._lock:
             rows = self._conn.execute(
-                "SELECT version FROM datasets WHERE dataset_id=? ORDER BY created_at, version", (str(dataset_id),)
+                "SELECT version FROM datasets WHERE dataset_id=? "
+                "UNION SELECT dataset_version AS version FROM dataset_catalog WHERE dataset_id=? "
+                "ORDER BY version",
+                (str(dataset_id), str(dataset_id)),
             ).fetchall()
         return [str(row["version"]) for row in rows]
 
+    def save_dataset_catalog(
+        self,
+        dataset_id: str,
+        dataset_version: str,
+        *,
+        provider: str,
+        instrument: str,
+        market_type: Any,
+        timeframe: str = "",
+        start_timestamp: datetime | None = None,
+        end_timestamp: datetime | None = None,
+        row_count: int = 0,
+        completeness: float = 0.0,
+        missing_ranges: Iterable[Any] = (),
+        quality: Any = "UNKNOWN",
+        source_type: str,
+        snapshot_id: str,
+        metadata: Mapping[str, Any] | None = None,
+        created_at: datetime | None = None,
+        updated_at: datetime | None = None,
+    ) -> bool:
+        """Persist one immutable dataset snapshot in the operator catalog."""
+
+        identifier = str(dataset_id).strip()
+        version = str(dataset_version).strip()
+        provider_value = str(provider).strip()
+        instrument_value = str(instrument).strip()
+        market_value = _enum_value(market_type) or str(market_type).strip()
+        timeframe_value = str(timeframe).strip()
+        source_value = str(source_type).strip().upper()
+        snapshot_value = str(snapshot_id).strip()
+        if not identifier or not version or not provider_value or not instrument_value or not market_value:
+            raise ValueError("dataset catalog identity fields are required")
+        if source_value not in {"HISTORICAL", "FORWARD_COLLECTED"}:
+            raise ValueError("dataset source_type must be HISTORICAL or FORWARD_COLLECTED")
+        if not snapshot_value:
+            raise ValueError("dataset catalog snapshot_id is required")
+        if isinstance(row_count, bool) or not isinstance(row_count, int) or row_count < 0:
+            raise ValueError("dataset catalog row_count must be a non-negative integer")
+        completeness_value = float(completeness)
+        if not math.isfinite(completeness_value) or not 0.0 <= completeness_value <= 1.0:
+            raise ValueError("dataset catalog completeness must be in [0, 1]")
+        metadata_json = _dump(dict(metadata or {}))
+        missing_json = _dump(list(missing_ranges))
+        created_iso = _iso(created_at or utc_now())
+        updated_iso = _iso(updated_at or created_at or utc_now())
+        values = (
+            identifier,
+            version,
+            provider_value,
+            instrument_value,
+            market_value,
+            timeframe_value,
+            _iso(start_timestamp) if start_timestamp is not None else None,
+            _iso(end_timestamp) if end_timestamp is not None else None,
+            int(row_count),
+            completeness_value,
+            missing_json,
+            _enum_value(quality) or str(quality),
+            source_value,
+            snapshot_value,
+            created_iso,
+            updated_iso,
+            metadata_json,
+        )
+        with self._write_context():
+            existing = self._conn.execute(
+                "SELECT * FROM dataset_catalog WHERE dataset_id=? AND dataset_version=?",
+                (identifier, version),
+            ).fetchone()
+            if existing is not None:
+                immutable_columns = (
+                    "provider",
+                    "instrument",
+                    "market_type",
+                    "timeframe",
+                    "start_timestamp",
+                    "end_timestamp",
+                    "row_count",
+                    "completeness",
+                    "missing_ranges_json",
+                    "quality",
+                    "source_type",
+                    "snapshot_id",
+                    "metadata_json",
+                )
+                expected = tuple(values[index] for index in (2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 16))
+                actual = tuple(existing[column] for column in immutable_columns)
+                if actual != expected:
+                    raise ValueError(f"dataset catalog snapshot conflicts with stored payload: {identifier}/{version}")
+                return False
+            self._conn.execute(
+                "INSERT INTO dataset_catalog("
+                "dataset_id,dataset_version,provider,instrument,market_type,timeframe,"
+                "start_timestamp,end_timestamp,row_count,completeness,missing_ranges_json,"
+                "quality,source_type,snapshot_id,created_at,updated_at,metadata_json"
+                ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                values,
+            )
+        return True
+
+    def load_dataset_catalog(self, dataset_id: str, dataset_version: str | None = None) -> dict[str, Any] | None:
+        clauses = ["dataset_id=?"]
+        values: list[Any] = [str(dataset_id)]
+        if dataset_version is not None:
+            clauses.append("dataset_version=?")
+            values.append(str(dataset_version))
+        query = "SELECT * FROM dataset_catalog WHERE " + " AND ".join(clauses)
+        query += " ORDER BY updated_at DESC,dataset_version DESC LIMIT 1"
+        with self._lock:
+            row = self._conn.execute(query, values).fetchone()
+        return _dataset_catalog_record(row) if row is not None else None
+
+    def list_dataset_catalog(
+        self,
+        *,
+        source_type: str | None = None,
+        market_type: str | None = None,
+        limit: int | None = 1000,
+    ) -> list[dict[str, Any]]:
+        if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 0):
+            raise ValueError("limit must be a non-negative integer or None")
+        clauses: list[str] = []
+        values: list[Any] = []
+        if source_type is not None:
+            clauses.append("source_type=?")
+            values.append(str(source_type).strip().upper())
+        if market_type is not None:
+            clauses.append("market_type=?")
+            values.append(_enum_value(market_type) or str(market_type))
+        query = "SELECT * FROM dataset_catalog"
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY updated_at DESC,dataset_id,dataset_version"
+        if limit is not None:
+            query += " LIMIT ?"
+            values.append(int(limit))
+        with self._lock:
+            rows = self._conn.execute(query, values).fetchall()
+        return [_dataset_catalog_record(row) for row in rows]
+
+    def save_dataset_bootstrap_state(self, dataset_id: str, payload: Mapping[str, Any]) -> None:
+        identifier = str(dataset_id).strip()
+        if not identifier:
+            raise ValueError("dataset bootstrap state requires dataset_id")
+        body = dict(payload)
+        required = ("provider", "instrument", "market_type", "timeframe", "status")
+        if any(not str(body.get(name, "")).strip() for name in required):
+            raise ValueError("dataset bootstrap state is missing required fields")
+        with self._write_context():
+            self._conn.execute(
+                "INSERT INTO dataset_bootstrap_state("
+                "dataset_id,provider,instrument,market_type,timeframe,requested_start,requested_end,"
+                "next_timestamp,base_version,status,payload_json,updated_at"
+                ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(dataset_id) DO UPDATE SET "
+                "provider=excluded.provider,instrument=excluded.instrument,market_type=excluded.market_type,"
+                "timeframe=excluded.timeframe,requested_start=excluded.requested_start,requested_end=excluded.requested_end,"
+                "next_timestamp=excluded.next_timestamp,base_version=excluded.base_version,status=excluded.status,"
+                "payload_json=excluded.payload_json,updated_at=excluded.updated_at",
+                (
+                    identifier,
+                    str(body["provider"]),
+                    str(body["instrument"]),
+                    _enum_value(body["market_type"]) or str(body["market_type"]),
+                    str(body["timeframe"]),
+                    _iso(body["requested_start"]) if isinstance(body.get("requested_start"), datetime) else body.get("requested_start"),
+                    _iso(body["requested_end"]) if isinstance(body.get("requested_end"), datetime) else body.get("requested_end"),
+                    _iso(body["next_timestamp"]) if isinstance(body.get("next_timestamp"), datetime) else body.get("next_timestamp"),
+                    body.get("base_version"),
+                    str(body["status"]).upper(),
+                    _dump(body),
+                    _now_iso(),
+                ),
+            )
+
+    def load_dataset_bootstrap_state(self, dataset_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM dataset_bootstrap_state WHERE dataset_id=?",
+                (str(dataset_id),),
+            ).fetchone()
+        if row is None:
+            return None
+        payload = _load(row["payload_json"])
+        result = dict(payload) if isinstance(payload, Mapping) else {}
+        result.update(
+            {
+                "dataset_id": row["dataset_id"],
+                "provider": row["provider"],
+                "instrument": row["instrument"],
+                "market_type": row["market_type"],
+                "timeframe": row["timeframe"],
+                "requested_start": _parse_datetime(row["requested_start"]),
+                "requested_end": _parse_datetime(row["requested_end"]),
+                "next_timestamp": _parse_datetime(row["next_timestamp"]),
+                "base_version": row["base_version"],
+                "status": row["status"],
+                "updated_at": _parse_datetime(row["updated_at"]),
+            }
+        )
+        return result
+
+    def list_dataset_bootstrap_states(self, *, limit: int | None = 1000) -> list[dict[str, Any]]:
+        if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 0):
+            raise ValueError("limit must be a non-negative integer or None")
+        query = "SELECT dataset_id FROM dataset_bootstrap_state ORDER BY updated_at DESC"
+        values: list[Any] = []
+        if limit is not None:
+            query += " LIMIT ?"
+            values.append(int(limit))
+        with self._lock:
+            rows = self._conn.execute(query, values).fetchall()
+        return [
+            state
+            for row in rows
+            if (state := self.load_dataset_bootstrap_state(row["dataset_id"])) is not None
+        ]
+
+    def save_dataset_staging_bars(self, dataset_id: str, bars: Iterable[OHLCVBar]) -> dict[str, int]:
+        identifier = str(dataset_id).strip()
+        if not identifier:
+            raise ValueError("staging dataset_id is required")
+        normalized = []
+        for bar in bars:
+            if not isinstance(bar, OHLCVBar):
+                raise TypeError("save_dataset_staging_bars expects OHLCVBar records")
+            normalized.append((_iso(bar.timestamp), _dump(bar)))
+        inserted = duplicates = 0
+        with self._write_context():
+            for timestamp, payload_json in normalized:
+                existing = self._conn.execute(
+                    "SELECT payload_json FROM dataset_staging_bars WHERE dataset_id=? AND timestamp=?",
+                    (identifier, timestamp),
+                ).fetchone()
+                if existing is not None:
+                    if str(existing["payload_json"]) != payload_json:
+                        raise ValueError(f"staged bar conflicts with stored payload: {identifier}/{timestamp}")
+                    duplicates += 1
+                    continue
+                self._conn.execute(
+                    "INSERT INTO dataset_staging_bars(dataset_id,timestamp,payload_json,created_at) VALUES (?,?,?,?)",
+                    (identifier, timestamp, payload_json, _now_iso()),
+                )
+                inserted += 1
+        return {"inserted": inserted, "duplicates": duplicates}
+
+    def load_dataset_staging_bars(self, dataset_id: str, *, limit: int | None = None) -> list[OHLCVBar]:
+        if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 0):
+            raise ValueError("staging bar limit must be a non-negative integer or None")
+        query = "SELECT payload_json FROM dataset_staging_bars WHERE dataset_id=? ORDER BY timestamp"
+        values: list[Any] = [str(dataset_id)]
+        if limit is not None:
+            query += " LIMIT ?"
+            values.append(int(limit))
+        with self._lock:
+            rows = self._conn.execute(query, values).fetchall()
+        return [_bar_from_record(_load(row["payload_json"])) for row in rows]
+
+    def clear_dataset_staging_bars(self, dataset_id: str) -> int:
+        with self._write_context():
+            cursor = self._conn.execute(
+                "DELETE FROM dataset_staging_bars WHERE dataset_id=?",
+                (str(dataset_id),),
+            )
+        return int(cursor.rowcount)
+
+    def save_historical_regime_labels(
+        self,
+        dataset_id: str,
+        dataset_version: str,
+        labels: Iterable[Mapping[str, Any]],
+    ) -> int:
+        rows = []
+        for item in labels:
+            if not isinstance(item, Mapping):
+                raise TypeError("historical regime labels must be mappings")
+            timestamp = _parse_datetime(item.get("timestamp"))
+            if timestamp is None:
+                raise ValueError("historical regime label timestamp is required")
+            states = item.get("labels", ())
+            confidence = item.get("confidence", {})
+            rows.append(
+                (
+                    str(dataset_id),
+                    str(dataset_version),
+                    _iso(timestamp),
+                    _dump(list(states) if isinstance(states, (list, tuple, set)) else [str(states)]),
+                    _dump(dict(confidence) if isinstance(confidence, Mapping) else {}),
+                    _now_iso(),
+                )
+            )
+        self._insert_many(
+            "historical_regime_labels",
+            rows,
+            "dataset_id,dataset_version,timestamp",
+            ("dataset_id", "dataset_version", "timestamp", "labels_json", "confidence_json", "created_at"),
+        )
+        return len(rows)
+
+    def load_historical_regime_labels(
+        self,
+        dataset_id: str,
+        dataset_version: str,
+        *,
+        start: datetime | None = None,
+        end: datetime | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses = ["dataset_id=?", "dataset_version=?"]
+        values: list[Any] = [str(dataset_id), str(dataset_version)]
+        if start is not None:
+            clauses.append("timestamp>=?")
+            values.append(_iso(start))
+        if end is not None:
+            clauses.append("timestamp<=?")
+            values.append(_iso(end))
+        query = "SELECT timestamp,labels_json,confidence_json FROM historical_regime_labels WHERE " + " AND ".join(clauses)
+        query += " ORDER BY timestamp"
+        if limit is not None:
+            if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+                raise ValueError("regime label limit must be a non-negative integer")
+            query += " LIMIT ?"
+            values.append(int(limit))
+        with self._lock:
+            rows = self._conn.execute(query, values).fetchall()
+        return [
+            {
+                "timestamp": _parse_datetime(row["timestamp"]),
+                "labels": _load(row["labels_json"]),
+                "confidence": _load(row["confidence_json"]),
+            }
+            for row in rows
+        ]
+
+    def _catalog_records(self, catalog: Mapping[str, Any]) -> list[Any]:
+        market_type = str(catalog.get("market_type", "")).strip().lower()
+        dataset_id = str(catalog.get("dataset_id", ""))
+        version = str(catalog.get("dataset_version", catalog.get("version", "")))
+        instrument = str(catalog.get("instrument", ""))
+        if market_type == MarketType.CRYPTO_SPOT.value:
+            records = self.load_bars(
+                instrument,
+                dataset_id=dataset_id,
+                dataset_version=version,
+            )
+            if not records and "/" in instrument:
+                records = self.load_bars(
+                    instrument.replace("/", ""),
+                    dataset_id=dataset_id,
+                    dataset_version=version,
+                )
+            return records
+        metadata = catalog.get("metadata", {})
+        if isinstance(metadata, Mapping):
+            market_id = metadata.get("market_id")
+            if market_id:
+                rows = self.load_polymarket_snapshots(str(market_id), limit=None)
+                records: list[dict[str, Any]] = []
+                for row in rows:
+                    payload = row.get("payload", {}) if isinstance(row, Mapping) else {}
+                    if not isinstance(payload, Mapping) or str(payload.get("source_type", "")).upper() != "HISTORICAL":
+                        continue
+                    record = dict(payload)
+                    record.update(
+                        {
+                            "snapshot_id": row.get("snapshot_id"),
+                            "source_timestamp": row.get("source_timestamp"),
+                            "observed_at": row.get("observed_at"),
+                            "quality": row.get("quality"),
+                            "dataset_id": dataset_id,
+                            "dataset_version": version,
+                        }
+                    )
+                    records.append(record)
+                return records
+        return []
     # Canonical market records ----------------------------------------
     def save_bars(
         self,
@@ -3122,11 +3594,26 @@ class AxiomStore:
             count = self._conn.execute("SELECT COUNT(*) AS n FROM bars" + where, values).fetchone()["n"]
             snapshots = self._conn.execute("SELECT COUNT(*) AS n FROM snapshots").fetchone()["n"]
             datasets = self._conn.execute("SELECT COUNT(*) AS n FROM datasets").fetchone()["n"]
+            catalog_count = self._conn.execute("SELECT COUNT(*) AS n FROM dataset_catalog").fetchone()["n"]
+            historical_catalog_count = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM dataset_catalog WHERE source_type='HISTORICAL'"
+            ).fetchone()["n"]
+            forward_catalog_count = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM dataset_catalog WHERE source_type='FORWARD_COLLECTED'"
+            ).fetchone()["n"]
         quality = None
         if dataset_id is not None:
             record = self.load_dataset_record(dataset_id, version)
             quality = record.get("quality") if record else None
-        return {"bars": int(count), "snapshots": int(snapshots), "datasets": int(datasets), "quality": quality}
+        return {
+            "bars": int(count),
+            "snapshots": int(snapshots),
+            "datasets": int(datasets),
+            "dataset_catalog": int(catalog_count),
+            "historical_catalog": int(historical_catalog_count),
+            "forward_catalog": int(forward_catalog_count),
+            "quality": quality,
+        }
 
     def dashboard_summary(self) -> dict[str, Any]:
         """Return persisted record counts and latest artifact timestamps."""
@@ -3154,6 +3641,9 @@ class AxiomStore:
                 ("experiment_plans", "experiment_plans"),
                 ("experiment_budget", "experiment_budget"),
                 ("worker_state", "worker_state"),
+                ("dataset_catalog", "dataset_catalog"),
+                ("dataset_bootstrap_state", "dataset_bootstrap_state"),
+                ("historical_regime_labels", "historical_regime_labels"),
             ):
                 result[label] = int(self._conn.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()["n"])
 
@@ -3177,6 +3667,31 @@ class AxiomStore:
                 )
         except sqlite3.IntegrityError as exc:
             raise ValueError(f"duplicate immutable record in {table} ({key_columns})") from exc
+def _dataset_catalog_record(row: sqlite3.Row) -> dict[str, Any]:
+    metadata = _load(row["metadata_json"])
+    missing_ranges = _load(row["missing_ranges_json"])
+    return {
+        "dataset_id": row["dataset_id"],
+        "dataset_version": row["dataset_version"],
+        "version": row["dataset_version"],
+        "provider": row["provider"],
+        "instrument": row["instrument"],
+        "market_type": row["market_type"],
+        "timeframe": row["timeframe"],
+        "start_timestamp": _parse_datetime(row["start_timestamp"]),
+        "end_timestamp": _parse_datetime(row["end_timestamp"]),
+        "row_count": int(row["row_count"]),
+        "completeness": float(row["completeness"]),
+        "missing_ranges": missing_ranges if isinstance(missing_ranges, list) else [],
+        "quality": row["quality"],
+        "source_type": row["source_type"],
+        "snapshot_id": row["snapshot_id"],
+        "created_at": _parse_datetime(row["created_at"]),
+        "updated_at": _parse_datetime(row["updated_at"]),
+        "last_updated": _parse_datetime(row["updated_at"]),
+        "metadata": metadata if isinstance(metadata, Mapping) else {},
+    }
+
 def _research_queue_record(row: sqlite3.Row | None) -> dict[str, Any] | None:
     if row is None:
         return None
