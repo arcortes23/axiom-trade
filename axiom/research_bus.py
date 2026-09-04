@@ -87,24 +87,29 @@ class ResearchQueueItem:
 
 
 _ALLOWED_TYPES = frozenset({"hypothesis", "candidate", "report", "review_request", "experiment_result"})
-_FORBIDDEN_TOKENS = frozenset(
+_FORBIDDEN_FIELD_TOKENS = frozenset(
     {
         "credential",
-        "private_key",
+        "credentials",
+        "private",
         "secret",
-        "api_key",
+        "secrets",
         "password",
+        "passwords",
         "token",
+        "tokens",
         "cookie",
+        "cookies",
         "session",
-        "access_token",
-        "refresh_token",
+        "sessions",
         "authorization",
         "bearer",
         "oauth",
         "jwt",
         "order",
+        "orders",
         "account",
+        "accounts",
         "risk",
         "history",
         "frozen",
@@ -112,10 +117,35 @@ _FORBIDDEN_TOKENS = frozenset(
         "execution",
         "live",
         "withdraw",
+        "withdrawal",
+        "withdrawals",
+        "wallet",
+        "wallets",
     }
 )
-_FORBIDDEN_COMPACT_TOKENS = frozenset(token.replace("_", "") for token in _FORBIDDEN_TOKENS)
-_FORBIDDEN_EXACT_FIELDS = frozenset({"auth", "authentication"})
+_FORBIDDEN_EXACT_FIELDS = frozenset(
+    {
+        "auth",
+        "authentication",
+        "api_key",
+        "private_key",
+        "access_token",
+        "refresh_token",
+        "client_secret",
+        "order_id",
+        "place_order",
+        "submit_order",
+        "execute_order",
+        "live_execution",
+    }
+)
+
+
+def _is_forbidden_field(key: Any) -> bool:
+    normalized = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", str(key))
+    normalized = re.sub(r"[^A-Za-z0-9]+", "_", normalized).strip("_").lower()
+    tokens = frozenset(part for part in normalized.split("_") if part)
+    return normalized in _FORBIDDEN_EXACT_FIELDS or bool(tokens & _FORBIDDEN_FIELD_TOKENS)
 
 _MAX_PAYLOAD_BYTES = 16_384
 _MAX_PAYLOAD_DEPTH = 8
@@ -234,14 +264,7 @@ def _validate_payload(value: Mapping[str, Any]) -> dict[str, Any]:
                 key_text = str(key)
                 if len(key_text) > _MAX_STRING_LENGTH:
                     raise ValueError(f"research payload key is too long: {path}")
-                normalized = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", key_text)
-                normalized = re.sub(r"[^A-Za-z0-9]+", "_", normalized).strip("_").lower()
-                compact = normalized.replace("_", "")
-                if (
-                    normalized in _FORBIDDEN_EXACT_FIELDS
-                    or compact in {"auth", "authentication"}
-                    or any(token in normalized or token in compact for token in (*_FORBIDDEN_TOKENS, *_FORBIDDEN_COMPACT_TOKENS))
-                ):
+                if _is_forbidden_field(key_text):
                     raise ResearchBusPermissionError(f"Hermes research bus forbids field: {path}.{key}")
                 result[key_text] = walk(child, f"{path}.{key}", depth + 1)
             return result

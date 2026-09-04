@@ -144,7 +144,7 @@ _ALLOWED_FIELDS = frozenset(
     }
 )
 
-_FORBIDDEN_KEY_PARTS = frozenset(
+_FORBIDDEN_KEY_TOKENS = frozenset(
     {
         "python",
         "code",
@@ -155,18 +155,22 @@ _FORBIDDEN_KEY_PARTS = frozenset(
         "hook",
         "handler",
         "credential",
+        "credentials",
         "private",
-        "privatekey",
-        "apikey",
         "token",
+        "tokens",
         "oauth",
         "jwt",
         "password",
+        "passwords",
         "secret",
+        "secrets",
         "risk",
         "position",
         "wallet",
+        "wallets",
         "account",
+        "accounts",
         "balance",
         "signature",
         "signing",
@@ -176,9 +180,31 @@ _FORBIDDEN_KEY_PARTS = frozenset(
         "execute",
         "execution",
         "order",
+        "orders",
         "holdout",
         "history",
         "historical",
+        "withdraw",
+        "withdrawal",
+        "withdrawals",
+        "authorization",
+        "bearer",
+    }
+)
+_FORBIDDEN_EXACT_FIELDS = frozenset(
+    {
+        "auth",
+        "authentication",
+        "api_key",
+        "private_key",
+        "access_token",
+        "refresh_token",
+        "client_secret",
+        "order_id",
+        "place_order",
+        "submit_order",
+        "execute_order",
+        "live_execution",
     }
 )
 
@@ -188,10 +214,14 @@ def _normal_key(value: Any) -> str:
     return re.sub(r"[^A-Za-z0-9]+", "_", text).strip("_").lower()
 
 
-def _reject_forbidden_key(key: Any, path: str) -> None:
+def _is_forbidden_key(key: Any) -> bool:
     normalized = _normal_key(key)
-    compact = normalized.replace("_", "")
-    if any(part in normalized or part in compact for part in _FORBIDDEN_KEY_PARTS):
+    tokens = frozenset(part for part in normalized.split("_") if part)
+    return normalized in _FORBIDDEN_EXACT_FIELDS or bool(tokens & _FORBIDDEN_KEY_TOKENS)
+
+
+def _reject_forbidden_key(key: Any, path: str) -> None:
+    if _is_forbidden_key(key):
         raise ExperimentPlanError("UNSAFE_PLAN_FIELD", f"forbidden plan field {path}.{key}")
 
 
@@ -368,9 +398,7 @@ class ExperimentPlan:
             raise ExperimentPlanError("INVALID_PLAN", "experiment plan must be an object")
         unknown = set(str(key) for key in document) - _ALLOWED_FIELDS
         if unknown:
-            forbidden_unknown = sorted(
-                key for key in unknown if any(part in _normal_key(key).replace("_", "") for part in _FORBIDDEN_KEY_PARTS)
-            )
+            forbidden_unknown = sorted(key for key in unknown if _is_forbidden_key(key))
             if forbidden_unknown:
                 compact_unknown = " ".join(forbidden_unknown).lower()
                 if "holdout" in compact_unknown:
@@ -593,11 +621,7 @@ class ExperimentPlan:
     def from_proposal(cls, proposal: Mapping[str, Any]) -> "ExperimentPlan":
         if not isinstance(proposal, Mapping):
             raise ExperimentPlanError("INVALID_PLAN", "proposal must be an object")
-        unsafe_keys = sorted(
-            str(key)
-            for key in proposal
-            if any(part in _normal_key(key).replace("_", "") for part in _FORBIDDEN_KEY_PARTS)
-        )
+        unsafe_keys = sorted(str(key) for key in proposal if _is_forbidden_key(key))
         if unsafe_keys:
             compact = " ".join(unsafe_keys).lower()
             if "holdout" in compact:

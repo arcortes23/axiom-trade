@@ -15,7 +15,7 @@ from axiom.lifecycle import CandidateStage, PromotionCriteria
 from axiom.paper import LiveExecutionDisabled, PaperTradingConfig
 from axiom.paper_engine import run_forward_paper
 from axiom.research import ResearchReport, write_report
-from axiom.research_bus import DurableResearchBus, ResearchQueueStatus
+from axiom.research_bus import DurableResearchBus, ResearchBusPermissionError, ResearchQueueStatus
 from axiom.storage import AxiomStore
 
 
@@ -395,6 +395,54 @@ class Phase4AutonomousLoopTests(unittest.TestCase):
         )
         self.assertFalse(validation.accepted)
         self.assertIn("UNSAFE_PLAN_FIELD", validation.reasons)
+    def test_ordering_fields_are_safe_but_order_and_secret_fields_remain_forbidden(self) -> None:
+        safe_proposal = proposal("ordering-regression")
+        safe_proposal["experiment_plan"]["methodology"] = {
+            "ordering": "chronological",
+            "chronological_ordering": True,
+            "ordering_policy": "oldest_first",
+        }
+        plan = ExperimentPlan.from_proposal(safe_proposal)
+        self.assertEqual(plan.methodology["ordering"], "chronological")
+        self.assertEqual(plan.methodology["ordering_policy"], "oldest_first")
+        with AxiomStore(":memory:") as store:
+            item = DurableResearchBus(store).submit_hypothesis(safe_proposal)
+            self.assertEqual(item.payload["experiment_plan"]["methodology"]["ordering"], "chronological")
+            for forbidden_key in (
+                "order",
+                "order_id",
+                "orders",
+                "place_order",
+                "submit_order",
+                "execute_order",
+                "live_execution",
+                "execution",
+                "api_key",
+                "private_key",
+                "credential",
+                "wallet",
+                "account",
+                "withdraw",
+                "authorization",
+                "bearer",
+                "secret",
+                "password",
+            ):
+                with self.subTest(validator="research_bus", forbidden_key=forbidden_key):
+                    unsafe = proposal(f"bus-{forbidden_key}")
+                    unsafe["experiment_plan"]["methodology"] = {forbidden_key: "unsafe"}
+                    with self.assertRaises(ResearchBusPermissionError):
+                        DurableResearchBus(store).submit_hypothesis(unsafe)
+                with self.subTest(validator="experiment_plan", forbidden_key=forbidden_key):
+                    unsafe = proposal(f"plan-{forbidden_key}")
+                    unsafe["experiment_plan"]["methodology"] = {forbidden_key: "unsafe"}
+                    with self.assertRaises(ExperimentPlanError):
+                        ExperimentPlan.from_proposal(unsafe)
+        unsafe_holdout = proposal("plan-locked-holdout")
+        unsafe_holdout["experiment_plan"]["methodology"] = {"locked_holdout": "unsafe"}
+        with self.assertRaises(ExperimentPlanError):
+            ExperimentPlan.from_proposal(unsafe_holdout)
+
     def test_one_losing_forward_bet_does_not_trigger_performance_rejection(self) -> None:
         with AxiomStore(":memory:") as store:
             bus = DurableResearchBus(store)
