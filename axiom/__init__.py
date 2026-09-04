@@ -86,6 +86,13 @@ from .hermes import CandidateMessage, Hermes, HermesPermissions, HermesValidatio
 from .paper import CryptoPaperTrader, LiveExecutionDisabled, PaperTradingConfig, PredictionPaperTrader
 from .node import NodeConfig, ResearchNode
 from .paper_engine import ForwardPaperEngine, PaperEngineCycle, historical_replay_id, run_forward_paper, run_historical_replay
+from .experiment_plan import ExperimentPlan, ExperimentPlanError, PLAN_SCHEMA_VERSION
+from .autonomous import (
+    AutonomousQueueCycle,
+    AutonomousResearchConfig,
+    AutonomousResearchError,
+    AutonomousResearchProcessor,
+)
 from .lifecycle import CandidateLifecycle, CandidateLifecycleManager, CandidateStage, PromotionCriteria
 from .mutations import DeterministicMutationEngine, ExperimentBudget, MutationCandidate
 from .research_bus import DurableResearchBus, ResearchBusPermissionError, ResearchQueueItem, ResearchQueueStatus
@@ -237,6 +244,13 @@ __all__ = [
     "sortino_ratio",
     "split_dataset",
     "validate_strategy",
+    "ExperimentPlan",
+    "ExperimentPlanError",
+    "PLAN_SCHEMA_VERSION",
+    "AutonomousQueueCycle",
+    "AutonomousResearchConfig",
+    "AutonomousResearchError",
+    "AutonomousResearchProcessor",
     "walk_forward_splits",
 ]
 

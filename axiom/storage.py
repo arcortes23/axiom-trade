@@ -81,7 +81,7 @@ class AxiomStore:
             self._conn.execute(f"SAVEPOINT {savepoint}")
             try:
                 yield self
-            except Exception:
+            except BaseException:
                 self._conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
                 self._conn.execute(f"RELEASE SAVEPOINT {savepoint}")
                 raise
@@ -318,6 +318,20 @@ class AxiomStore:
                     created_at TEXT NOT NULL,
                     PRIMARY KEY (budget_id, reservation_key)
                 );
+                CREATE TABLE IF NOT EXISTS experiment_plans (
+                    plan_id TEXT PRIMARY KEY,
+                    hypothesis_id TEXT NOT NULL,
+                    plan_hash TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    result_json TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_experiment_plans_hypothesis
+                    ON experiment_plans(hypothesis_id, created_at);
+                CREATE INDEX IF NOT EXISTS idx_experiment_plans_status
+                    ON experiment_plans(status, updated_at);
                 CREATE TABLE IF NOT EXISTS worker_state (
                     worker_name TEXT PRIMARY KEY,
                     status TEXT NOT NULL,
@@ -503,6 +517,25 @@ class AxiomStore:
             "quality": row["quality"],
             "created_at": _parse_datetime(row["created_at"]),
         }
+    def load_dataset_by_version(self, version: str) -> dict[str, Any] | None:
+        """Return the unique immutable dataset record carrying ``version``."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM datasets WHERE version=? ORDER BY created_at DESC,dataset_id DESC",
+                (str(version),),
+            ).fetchall()
+        if not rows:
+            return None
+        row = rows[0]
+        return {
+            "dataset_id": row["dataset_id"],
+            "version": row["version"],
+            "records": _load(row["payload_json"]),
+            "metadata": _load(row["metadata_json"]),
+            "quality": row["quality"],
+            "created_at": _parse_datetime(row["created_at"]),
+        }
+
 
     def dataset_versions(self, dataset_id: str) -> list[str]:
         with self._lock:
@@ -1430,6 +1463,26 @@ class AxiomStore:
                 )
         except sqlite3.IntegrityError as exc:
             raise ValueError(f"strategy version already exists: {strategy_id}/{version}") from exc
+    def save_strategy_if_absent(self, strategy_id: str, strategy: Any, *, version: str = "1") -> bool:
+        """Persist a deterministic strategy exactly once."""
+        identifier, version_value = str(strategy_id), str(version)
+        payload = _dump(strategy)
+        with self._write_context():
+            cursor = self._conn.execute(
+                "INSERT OR IGNORE INTO strategies(strategy_id,version,payload_json,created_at) VALUES (?,?,?,?)",
+                (identifier, version_value, payload, _now_iso()),
+            )
+        if cursor.rowcount:
+            return True
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT payload_json FROM strategies WHERE strategy_id=? AND version=?",
+                (identifier, version_value),
+            ).fetchone()
+        if row is None or row["payload_json"] != payload:
+            raise ValueError(f"strategy version already exists with different payload: {identifier}/{version_value}")
+        return False
+
 
     def load_strategy(self, strategy_id: str, version: str | None = None) -> Any | None:
         with self._lock:
@@ -1468,6 +1521,32 @@ class AxiomStore:
                 )
         except sqlite3.IntegrityError as exc:
             raise ValueError(f"experiment already exists: {experiment_id}") from exc
+    def save_experiment_if_absent(
+        self,
+        experiment_id: str,
+        experiment: Any,
+        *,
+        strategy_id: str | None = None,
+    ) -> bool:
+        """Persist a deterministic experiment exactly once."""
+        identifier = str(experiment_id)
+        payload = _dump(experiment)
+        with self._write_context():
+            cursor = self._conn.execute(
+                "INSERT OR IGNORE INTO experiments(experiment_id,strategy_id,payload_json,created_at) VALUES (?,?,?,?)",
+                (identifier, strategy_id, payload, _now_iso()),
+            )
+        if cursor.rowcount:
+            return True
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT strategy_id,payload_json FROM experiments WHERE experiment_id=?",
+                (identifier,),
+            ).fetchone()
+        if row is None or row["payload_json"] != payload or row["strategy_id"] != strategy_id:
+            raise ValueError(f"experiment already exists with different payload: {identifier}")
+        return False
+
 
     def load_experiment(self, experiment_id: str) -> Any | None:
         with self._lock:
@@ -1490,6 +1569,112 @@ class AxiomStore:
             rows = self._conn.execute(query, values).fetchall()
         return [
             {"experiment_id": row["experiment_id"], "strategy_id": row["strategy_id"], "experiment": _load(row["payload_json"]), "created_at": _parse_datetime(row["created_at"])}
+            for row in rows
+        ]
+
+    def save_experiment_plan(
+        self,
+        plan_id: str,
+        plan: Any,
+        *,
+        hypothesis_id: str,
+        status: str = "PENDING",
+        result: Any | None = None,
+        plan_hash: str | None = None,
+        timestamp: datetime | None = None,
+    ) -> bool:
+        """Persist an immutable plan while allowing monotonic status updates."""
+        identifier = str(plan_id).strip()
+        hypothesis = str(hypothesis_id).strip()
+        if not identifier or not hypothesis:
+            raise ValueError("plan_id and hypothesis_id are required")
+        payload_json = _dump(plan)
+        resolved_hash = str(plan_hash or ("sha256:" + hashlib.sha256(payload_json.encode("utf-8")).hexdigest()))
+        result_json = _dump(result) if result is not None else None
+        stamp = _iso(timestamp or utc_now())
+        with self._write_context():
+            existing = self._conn.execute(
+                "SELECT hypothesis_id,plan_hash,payload_json,status,result_json FROM experiment_plans WHERE plan_id=?",
+                (identifier,),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    str(existing["hypothesis_id"]) != hypothesis
+                    or str(existing["plan_hash"]) != resolved_hash
+                    or str(existing["payload_json"]) != payload_json
+                ):
+                    raise ValueError(f"experiment plan already exists with different payload: {identifier}")
+                old_status = str(existing["status"])
+                terminal = {"COMPLETED", "REJECTED", "FAILED"}
+                next_status = old_status if old_status in terminal and status not in terminal else str(status)
+                next_result = result_json if result_json is not None else existing["result_json"]
+                self._conn.execute(
+                    "UPDATE experiment_plans SET status=?,result_json=?,updated_at=? WHERE plan_id=?",
+                    (next_status, next_result, stamp, identifier),
+                )
+                return False
+            self._conn.execute(
+                "INSERT INTO experiment_plans(plan_id,hypothesis_id,plan_hash,payload_json,status,result_json,created_at,updated_at) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (identifier, hypothesis, resolved_hash, payload_json, str(status), result_json, stamp, stamp),
+            )
+        return True
+
+    def load_experiment_plan(self, plan_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute("SELECT * FROM experiment_plans WHERE plan_id=?", (str(plan_id),)).fetchone()
+        if row is None:
+            return None
+        return {
+            "plan_id": row["plan_id"],
+            "hypothesis_id": row["hypothesis_id"],
+            "plan_hash": row["plan_hash"],
+            "plan": _load(row["payload_json"]),
+            "status": row["status"],
+            "result": _load(row["result_json"]) if row["result_json"] else None,
+            "created_at": _parse_datetime(row["created_at"]),
+            "updated_at": _parse_datetime(row["updated_at"]),
+        }
+
+    def list_experiment_plans(
+        self,
+        *,
+        hypothesis_id: str | None = None,
+        status: str | None = None,
+        limit: int | None = None,
+        newest_first: bool = True,
+    ) -> list[dict[str, Any]]:
+        if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 0):
+            raise ValueError("limit must be a non-negative integer or None")
+        query = "SELECT * FROM experiment_plans"
+        values: list[Any] = []
+        clauses: list[str] = []
+        if hypothesis_id is not None:
+            clauses.append("hypothesis_id=?")
+            values.append(str(hypothesis_id))
+        if status is not None:
+            clauses.append("status=?")
+            values.append(str(status))
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        direction = "DESC" if newest_first else "ASC"
+        query += f" ORDER BY updated_at {direction},plan_id {direction}"
+        if limit is not None:
+            query += " LIMIT ?"
+            values.append(int(limit))
+        with self._lock:
+            rows = self._conn.execute(query, values).fetchall()
+        return [
+            {
+                "plan_id": row["plan_id"],
+                "hypothesis_id": row["hypothesis_id"],
+                "plan_hash": row["plan_hash"],
+                "plan": _load(row["payload_json"]),
+                "status": row["status"],
+                "result": _load(row["result_json"]) if row["result_json"] else None,
+                "created_at": _parse_datetime(row["created_at"]),
+                "updated_at": _parse_datetime(row["updated_at"]),
+            }
             for row in rows
         ]
 
@@ -1830,6 +2015,54 @@ class AxiomStore:
             )
             claimed = self._conn.execute("SELECT * FROM research_queue WHERE item_id=?", (row["item_id"],)).fetchone()
         return _research_queue_record(claimed) if claimed else None
+    def record_research_queue_event(
+        self,
+        item_id: str,
+        to_status: str,
+        detail: Any | None = None,
+        *,
+        timestamp: datetime | None = None,
+    ) -> None:
+        """Append an auditable processing stage without changing lease state."""
+        current = ensure_utc(timestamp or utc_now())
+        stamp = current.isoformat()
+        with self._write_context():
+            row = self._conn.execute(
+                "SELECT status FROM research_queue WHERE item_id=?",
+                (str(item_id),),
+            ).fetchone()
+            if row is None:
+                raise KeyError(item_id)
+            event_id = "queue-event-" + hashlib.sha256(
+                _dump({"item_id": str(item_id), "to": str(to_status), "detail": detail, "at": stamp}).encode("utf-8")
+            ).hexdigest()
+            self._conn.execute(
+                "INSERT OR IGNORE INTO research_queue_events(item_id,event_id,from_status,to_status,detail,created_at) "
+                "VALUES (?,?,?,?,?,?)",
+                (str(item_id), event_id, str(row["status"]), str(to_status), _dump(detail or {}), stamp),
+            )
+
+    def list_research_queue_events(self, item_id: str, *, limit: int = 256) -> list[dict[str, Any]]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+            raise ValueError("limit must be a non-negative integer")
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT event_id,item_id,from_status,to_status,detail,created_at "
+                "FROM research_queue_events WHERE item_id=? ORDER BY created_at,event_id LIMIT ?",
+                (str(item_id), int(limit)),
+            ).fetchall()
+        return [
+            {
+                "event_id": row["event_id"],
+                "item_id": row["item_id"],
+                "from_status": row["from_status"],
+                "to_status": row["to_status"],
+                "detail": _load(row["detail"]) if row["detail"] else {},
+                "created_at": _parse_datetime(row["created_at"]),
+            }
+            for row in rows
+        ]
+
 
     def complete_research_item(
         self,
@@ -1983,7 +2216,7 @@ class AxiomStore:
                     raise ValueError(f"rejected candidate is terminal: {identifier}")
                 if from_stage is not None and current_stage != str(from_stage):
                     raise ValueError(f"stale candidate lifecycle writer: expected {from_stage}, found {current_stage}")
-                if str(stage) != "REJECTED" and stage_order.get(str(stage), -1) <= stage_order.get(current_stage, -1):
+                if str(stage) != "REJECTED" and stage_order.get(str(stage), -1) < stage_order.get(current_stage, -1):
                     raise ValueError(f"candidate lifecycle cannot regress: {current_stage} -> {stage}")
                 updated_cursor = self._conn.execute(
                     "UPDATE candidate_lifecycle SET stage=?,payload_json=?,updated_at=? "
@@ -2075,6 +2308,24 @@ class AxiomStore:
             }
             for row in rows
         ]
+    def candidate_lifecycle_funnel(self) -> dict[str, int]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT stage,COUNT(*) AS count FROM candidate_lifecycle GROUP BY stage ORDER BY stage"
+            ).fetchall()
+        return {str(row["stage"]): int(row["count"]) for row in rows}
+
+    def candidate_rejection_reasons(self, *, limit: int = 100) -> dict[str, int]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+            raise ValueError("limit must be a non-negative integer")
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT json_extract(payload_json,'$.rejection_reason') AS reason,COUNT(*) AS count "
+                "FROM candidate_lifecycle WHERE stage='REJECTED' GROUP BY reason ORDER BY count DESC,reason LIMIT ?",
+                (int(limit),),
+            ).fetchall()
+        return {str(row["reason"] or "unknown"): int(row["count"]) for row in rows}
+
 
     def save_paper_state(
         self,
@@ -2361,6 +2612,39 @@ class AxiomStore:
         if row is None:
             return None
         return {"budget_id": row["budget_id"], "budget": _load(row["payload_json"]), "updated_at": _parse_datetime(row["updated_at"])}
+    def count_experiment_budget_reservations(
+        self,
+        budget_id: str,
+        *,
+        since: datetime,
+        until: datetime | None = None,
+    ) -> int:
+        """Count durable experiment reservations in a bounded UTC window."""
+        start = ensure_utc(since).isoformat()
+        end = ensure_utc(until).isoformat() if until is not None else None
+        with self._lock:
+            if end is None:
+                row = self._conn.execute(
+                    "SELECT COUNT(*) AS n FROM experiment_budget_reservations "
+                    "WHERE budget_id=? AND created_at>=?",
+                    (str(budget_id), start),
+                ).fetchone()
+            else:
+                row = self._conn.execute(
+                    "SELECT COUNT(*) AS n FROM experiment_budget_reservations "
+                    "WHERE budget_id=? AND created_at>=? AND created_at<?",
+                    (str(budget_id), start, end),
+                ).fetchone()
+        return int(row["n"]) if row is not None else 0
+    def experiment_budget_reservation_exists(self, budget_id: str, reservation_key: str) -> bool:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM experiment_budget_reservations WHERE budget_id=? AND reservation_key=?",
+                (str(budget_id), str(reservation_key)),
+            ).fetchone()
+        return row is not None
+
+
     def reserve_experiment_budget(
         self,
         budget_id: str,
@@ -2646,6 +2930,7 @@ class AxiomStore:
                 ("paper_state", "paper_state"),
                 ("paper_observations", "paper_observations"),
                 ("opportunity_snapshots", "opportunity_snapshots"),
+                ("experiment_plans", "experiment_plans"),
                 ("experiment_budget", "experiment_budget"),
                 ("worker_state", "worker_state"),
             ):

@@ -134,6 +134,7 @@ _ENDPOINTS = (
     "paper",
     "opportunities",
     "queue",
+    "autonomous-research",
     "system",
     "status",
     "dataset-health",
@@ -229,6 +230,8 @@ class DashboardData:
                 "experiments": experiments,
                 "reports": summary.get("reports", []),
                 "candidates": summary.get("candidates", []),
+                "autonomous": summary.get("autonomous", {}),
+                "hermes": summary.get("hermes", {}),
                 "live_execution": False,
             }
         return {"experiments": [], "reports": [], "live_execution": False}
@@ -405,6 +408,33 @@ class DashboardData:
         if configured is not None:
             return configured
         return research_summary(self.store) if self.store is not None else {"live_execution": False, "gaps": ["no store"]}
+    def autonomous_research_data(self) -> Any:
+        configured = self._configured("autonomous-research")
+        if configured is not None:
+            return configured
+        if self.store is None:
+            return {
+                "hermes": {"submitted": 0, "accepted": 0, "rejected": 0, "pending": 0},
+                "plans": [],
+                "queue": {},
+                "lifecycle_funnel": {},
+                "rejection_reasons": {},
+                "accounting": {},
+                "budgets": None,
+                "live_execution": False,
+            }
+        summary = research_summary(self.store, limit=50)
+        autonomous = summary.get("autonomous", {}) if isinstance(summary, Mapping) else {}
+        return {
+            "hermes": summary.get("hermes", {}),
+            "plans": autonomous.get("plans", []),
+            "queue": autonomous.get("queue_items", []),
+            "lifecycle_funnel": autonomous.get("lifecycle_funnel", {}),
+            "rejection_reasons": autonomous.get("rejection_reasons", {}),
+            "accounting": autonomous.get("accounting", {}),
+            "budgets": autonomous.get("budget"),
+            "live_execution": False,
+        }
 
     def paper_data(self) -> Any:
         configured = self._configured("paper")
@@ -557,12 +587,15 @@ class DashboardData:
             status = "idle"
         else:
             status = "not_started"
+        summary = research_summary(self.store, limit=20)
         return {
             "status": status,
             "summary": self.store.dashboard_summary(),
             "workers": normalized_workers,
             "cycles": self.store.list_collection_cycles(limit=20),
             "queue": self.store.research_queue_stats(),
+            "autonomous": summary.get("autonomous", {}),
+            "hermes": summary.get("hermes", {}),
             "health_grade": health_grade or None,
             "live_execution": False,
         }
@@ -606,6 +639,8 @@ class DashboardData:
             return self.research()
         if endpoint == "research-summary":
             return self.research_summary_data()
+        if endpoint == "autonomous-research":
+            return self.autonomous_research_data()
         if endpoint == "crypto":
             return self.crypto()
         if endpoint == "prediction":
@@ -687,6 +722,7 @@ def _dashboard_html() -> str:
       <article class="panel"><h2>Paper forward</h2><pre id="paper">Loading…</pre></article>
       <article class="panel"><h2>Polymarket opportunities</h2><pre id="opportunities">Loading…</pre></article>
       <article class="panel"><h2>Research queue and node status</h2><pre id="queue">Loading…</pre><pre id="status-detail">Loading…</pre></article>
+      <article class="panel"><h2>Autonomous research loop</h2><pre id="autonomous-research">Loading…</pre></article>
     </section>
     <section class="grid">
       <article class="panel"><h2>Experiment provenance</h2><div id="experiments">Loading…</div></article>
@@ -696,7 +732,7 @@ def _dashboard_html() -> str:
     <p class="muted">JSON endpoints: <span id="links"></span></p>
   </main>
   <script>
-    const names = ["overview", "research", "research-summary", "crypto", "prediction", "evolution", "risk", "paper", "opportunities", "queue", "system", "status", "dataset-health", "evidence-maturity"];
+    const names = ["overview", "research", "research-summary", "autonomous-research", "crypto", "prediction", "evolution", "risk", "paper", "opportunities", "queue", "system", "status", "dataset-health", "evidence-maturity"];
     const $ = (id) => document.getElementById(id);
     const safe = (value) => String(value ?? "—").replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[char]));
     const show = (id, value) => { $(id).textContent = JSON.stringify(value, null, 2); };
@@ -752,6 +788,7 @@ def _dashboard_html() -> str:
         show("paper", data.paper);
         show("opportunities", data.opportunities);
         show("queue", data.queue);
+        show("autonomous-research", data["autonomous-research"]);
         show("status-detail", data.status);
         show("evidence-maturity", data["evidence-maturity"]);
         show("dataset-health-detail", data["dataset-health"]);

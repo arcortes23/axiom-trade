@@ -291,6 +291,40 @@ class CandidateLifecycleManager:
             raise RuntimeError("candidate rejection did not persist")
         return result
 
+    def record_evidence(
+        self,
+        candidate_id: str,
+        evidence: Mapping[str, Any],
+        *,
+        expected_stage: CandidateStage | str | None = None,
+        reason: str = "evidence updated",
+    ) -> CandidateLifecycle:
+        """Persist additional evidence without changing the lifecycle stage."""
+        current = self.get(candidate_id)
+        if current is None:
+            raise KeyError(candidate_id)
+        if current.stage is CandidateStage.REJECTED:
+            return current
+        if expected_stage is not None:
+            expected = expected_stage.value if isinstance(expected_stage, CandidateStage) else str(expected_stage)
+            if current.stage.value != expected:
+                raise RuntimeError(f"stale candidate lifecycle writer: expected {expected}, found {current.stage.value}")
+        body = dict(current.payload)
+        body.update(dict(evidence))
+        body.setdefault("candidate_id", str(candidate_id))
+        body.setdefault("holdout_used", False)
+        self.store.save_candidate_lifecycle(
+            str(candidate_id),
+            current.stage.value,
+            body,
+            from_stage=current.stage.value,
+            reason=reason,
+        )
+        result = self.get(str(candidate_id))
+        if result is None:
+            raise RuntimeError("candidate evidence update did not persist")
+        return result
+
     def events(self, candidate_id: str | None = None, *, limit: int = 100) -> list[dict[str, Any]]:
         return self.store.list_candidate_lifecycle_events(candidate_id, limit=limit)
 

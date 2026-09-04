@@ -1,6 +1,7 @@
 """Deterministic strategy mutations and persisted experiment budgets."""
 from __future__ import annotations
 from dataclasses import dataclass, field
+from datetime import datetime
 import hashlib
 import json
 import math
@@ -115,6 +116,7 @@ class DeterministicMutationEngine:
         family: str | None = None,
         provenance: Mapping[str, Any] | None = None,
         lineage: Sequence[str] = (),
+        timestamp: datetime | None = None,
     ) -> tuple[MutationCandidate, ...]:
         if isinstance(max_variants, bool) or not isinstance(max_variants, int) or max_variants < 0:
             raise ValueError("max_variants must be a non-negative integer")
@@ -165,6 +167,7 @@ class DeterministicMutationEngine:
                             per_family_limit=self.budget.per_family_limit,
                             family=family_name,
                             reservation_key=candidate_id,
+                            timestamp=timestamp,
                         )
                         next_budget = ExperimentBudget(**dict(reservation["budget"]))
                         evidence = {

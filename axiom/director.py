@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import re
@@ -38,7 +38,17 @@ def validate_hermes_proposal(proposal: Mapping[str, Any], *, max_bytes: int = 16
         return ProposalValidation(False, None, ("proposal must be a mapping",))
     try:
         normalized = _validate_payload(proposal)
-    except (ResearchBusPermissionError, TypeError, ValueError) as exc:
+    except ResearchBusPermissionError as exc:
+        message = str(exc)
+        lowered = message.lower()
+        if "holdout" in lowered:
+            code = "LOCKED_HOLDOUT_FORBIDDEN"
+        elif any(token in lowered for token in ("live", "execute", "execution")):
+            code = "LIVE_EXECUTION_FORBIDDEN"
+        else:
+            code = "UNSAFE_PROPOSAL_FIELD"
+        return ProposalValidation(False, None, (code, message))
+    except (TypeError, ValueError) as exc:
         return ProposalValidation(False, None, (str(exc),))
     if len(_canonical(normalized).encode("utf-8")) > max_bytes:
         reasons.append("proposal exceeds bounded size")
@@ -71,18 +81,30 @@ def validate_hermes_proposal(proposal: Mapping[str, Any], *, max_bytes: int = 16
             reasons.append("time_split must be chronological train-validation-holdout")
     if normalized.get("paper_only") is not True:
         reasons.append("paper_only must be true")
+    if not reasons:
+        from .experiment_plan import ExperimentPlan, ExperimentPlanError
+        plan_proposal = dict(normalized)
+        generated_id = "proposal-" + hashlib.sha256(_canonical(normalized).encode("utf-8")).hexdigest()[:24]
+        if not str(plan_proposal.get("proposal_id", "")).strip():
+            plan_proposal["proposal_id"] = generated_id
+        try:
+            ExperimentPlan.from_proposal(plan_proposal)
+        except ExperimentPlanError as exc:
+            reasons.extend((exc.reason, exc.detail))
     proposal_id = str(normalized.get("proposal_id", "")).strip() or None
     if proposal_id is None and not reasons:
         proposal_id = "proposal-" + hashlib.sha256(_canonical(normalized).encode("utf-8")).hexdigest()[:24]
     return ProposalValidation(not reasons, proposal_id, tuple(reasons), normalized if not reasons else None)
 def research_summary(store: AxiomStore, *, now: datetime | None = None, limit: int = 20) -> dict[str, Any]:
-    """Return a small, stable summary; raw market/database dumps are excluded."""
+    """Return compact, durable evidence for Hermes and the dashboard."""
     if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
         raise ValueError("limit must be a non-negative integer")
     health = store.polymarket_health(now=now)
     maturity = health.get("evidence_maturity")
     if not isinstance(maturity, Mapping):
         maturity = store.polymarket_evidence_maturity(now=now)
+    if not isinstance(maturity, Mapping):
+        maturity = {}
     candidates = store.load_candidate_lifecycle(limit=limit)
     candidates = candidates if isinstance(candidates, list) else []
     candidate_records: list[dict[str, Any]] = []
@@ -93,11 +115,14 @@ def research_summary(store: AxiomStore, *, now: datetime | None = None, limit: i
             {
                 "candidate_id": item.get("candidate_id"),
                 "stage": item.get("stage"),
-                "family": _compact(payload.get("family")),
+                "family": _compact(payload.get("experiment_family", payload.get("family"))),
+                "hypothesis_id": _compact(payload.get("hypothesis_id")),
+                "plan_id": _compact(payload.get("plan_id")),
                 "regimes": _compact(payload.get("regimes", payload.get("regime_count"))),
                 "stability": _compact(payload.get("stability", payload.get("regime_stability"))),
                 "rejection_reason": _compact(payload.get("rejection_reason")),
                 "lineage": _compact(payload.get("lineage", payload.get("parent_id"))),
+                "forward_test_id": _compact(payload.get("forward_test_id")),
             }
         )
     reports: list[dict[str, Any]] = []
@@ -109,9 +134,9 @@ def research_summary(store: AxiomStore, *, now: datetime | None = None, limit: i
             {
                 "report_id": item.get("report_id"),
                 "experiment_id": item.get("experiment_id"),
-                "quality": _compact(report.get("quality", report.get("research_quality"))),
-                "selection": _compact(report.get("selection", report.get("validation"))),
-                "errors": _compact(report.get("errors", ())),
+                "quality": _compact(report.get("quality", report.get("research_quality", report.get("data_quality")))),
+                "selection": _compact(report.get("selection", report.get("validation", report.get("selected_from_variants")))),
+                "errors": _compact(report.get("errors", report.get("rejected_reasons", ()))),
                 "calibration": _compact(report.get("calibration", report.get("calibration_summary"))),
                 "anomalies": _compact(report.get("anomalies", ())),
             }
@@ -127,16 +152,122 @@ def research_summary(store: AxiomStore, *, now: datetime | None = None, limit: i
                     "payload": _compact(payload),
                 }
             )
-    queue = store.research_queue_stats()
+    queue_stats = store.research_queue_stats()
+    queue_items = store.list_research_items(limit=max(32, limit))
+    all_queue_items = store.list_research_items(limit=10_000)
+    hypothesis_items = [
+        item for item in all_queue_items if str(item.get("item_type", "")).strip().lower() == "hypothesis"
+    ]
+    terminal_results = [
+        _compact(item.get("result"))
+        for item in hypothesis_items
+        if item.get("status") in {"COMPLETED", "REJECTED", "FAILED"} and isinstance(item.get("result"), Mapping)
+    ]
+    accepted = sum(
+        1
+        for item in hypothesis_items
+        if item.get("status") == "COMPLETED"
+        and isinstance(item.get("result"), Mapping)
+        and item["result"].get("accepted") is True
+    )
+    rejected = sum(1 for item in hypothesis_items if item.get("status") == "REJECTED")
+    pending = sum(1 for item in hypothesis_items if item.get("status") in {"PENDING", "TESTING"})
+    queue_worker = next(
+        (
+            item
+            for item in store.list_worker_states(limit=256)
+            if str(item.get("worker_name", "")) == "research-queue"
+        ),
+        None,
+    )
+    plans = store.list_experiment_plans(limit=limit)
+    all_plans = store.list_experiment_plans(limit=10_000)
+    plan_records = [
+        {
+            "plan_id": item.get("plan_id"),
+            "hypothesis_id": item.get("hypothesis_id"),
+            "plan_hash": item.get("plan_hash"),
+            "status": item.get("status"),
+            "variants_tested": _compact((item.get("result") or {}).get("variants_tested")) if isinstance(item.get("result"), Mapping) else None,
+            "selected_from_variants": _compact((item.get("result") or {}).get("selected_from_variants")) if isinstance(item.get("result"), Mapping) else None,
+        }
+        for item in plans
+    ]
+    budget = store.load_experiment_budget("autonomous")
+    accounting_now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    accounting_day = accounting_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    daily_reservations = store.count_experiment_budget_reservations(
+        "autonomous",
+        since=accounting_day,
+        until=accounting_day + timedelta(days=1),
+    )
+    all_candidates = store.load_candidate_lifecycle(limit=10_000)
+    all_candidates = all_candidates if isinstance(all_candidates, list) else []
+    family_accounting: dict[str, dict[str, Any]] = {}
+    dataset_reuse: dict[str, int] = {}
+    mutation_count = 0
+    generation_depth = 0
+    for item in all_candidates:
+        payload = item.get("payload", {}) if isinstance(item, Mapping) else {}
+        payload = payload if isinstance(payload, Mapping) else {}
+        family = str(payload.get("experiment_family", payload.get("family", "unknown")))
+        family_row = family_accounting.setdefault(
+            family,
+            {"candidates": 0, "variants": 0, "mutations": 0, "max_generation": 0},
+        )
+        family_row["candidates"] += 1
+        generation = int(payload.get("generation", 0)) if str(payload.get("generation", "")).lstrip("-").isdigit() else 0
+        generation_depth = max(generation_depth, generation)
+        family_row["max_generation"] = max(family_row["max_generation"], generation)
+        if generation == 0:
+            family_row["variants"] += 1
+        if payload.get("parent_id"):
+            mutation_count += 1
+            family_row["mutations"] += 1
+        dataset_version = str(payload.get("dataset_version", "")).strip()
+        if dataset_version:
+            dataset_reuse[dataset_version] = dataset_reuse.get(dataset_version, 0) + 1
+    variants_tested = 0
+    for item in all_plans:
+        result = item.get("result") if isinstance(item, Mapping) else None
+        if not isinstance(result, Mapping):
+            continue
+        value = result.get("variants_tested", 0)
+        try:
+            variants_tested += max(0, int(value))
+        except (TypeError, ValueError, OverflowError):
+            continue
+    forward_count = len(store.load_forward_tests(limit=10_000))
+    accounting = {
+        "by_family": family_accounting,
+        "variants_tested": variants_tested,
+        "mutations": mutation_count,
+        "max_generation": generation_depth,
+        "dataset_reuse": dict(sorted(dataset_reuse.items())),
+        "accounting_day": accounting_day.date().isoformat(),
+        "daily_reservations": daily_reservations,
+        "failed_queue_items": sum(1 for item in all_queue_items if item.get("status") == "FAILED"),
+        "forward_tests_registered": forward_count,
+        "selection_rule": "validation-only selection; no confidence pooling across variants or siblings",
+    }
+    funnel = store.candidate_lifecycle_funnel()
+    rejection_reasons = store.candidate_rejection_reasons(limit=max(1, limit))
+    for item in all_queue_items:
+        if item.get("status") not in {"REJECTED", "FAILED"}:
+            continue
+        result = item.get("result")
+        result = result if isinstance(result, Mapping) else {}
+        raw_reason = str(result.get("reason_code") or "").strip()
+        reason = raw_reason if re.fullmatch(r"[A-Z][A-Z0-9_]{2,63}", raw_reason) else "queue_rejection"
+        rejection_reasons[reason] = rejection_reasons.get(reason, 0) + 1
     gaps = []
     if maturity.get("grade") in {"F", "D"}:
         gaps.append("research evidence maturity below independent-data threshold")
-    if not candidates:
         gaps.append("no persisted candidate lifecycle")
     if not reports:
         gaps.append("no persisted research reports")
     return {
-        "as_of": (now.isoformat() if now is not None else health.get("evidence_maturity", {}).get("as_of")),
+        "as_of": (now.isoformat() if now is not None else (health.get("evidence_maturity") or {}).get("as_of")),
         "live_execution": False,
         "collector_health": {
             "grade": health.get("grade"),
@@ -149,7 +280,39 @@ def research_summary(store: AxiomStore, *, now: datetime | None = None, limit: i
         "candidates": candidate_records,
         "reports": reports,
         "paper_forward": paper_states,
-        "queue": queue,
+        "queue": queue_stats,
+        "hermes": {
+            "last_run": _compact(queue_worker.get("updated_at")) if isinstance(queue_worker, Mapping) else None,
+            "submitted": len(hypothesis_items),
+            "accepted": accepted,
+            "rejected": rejected,
+            "failed": sum(1 for item in hypothesis_items if item.get("status") == "FAILED"),
+            "pending": pending,
+            "latest_results": terminal_results[:limit],
+        },
+        "autonomous": {
+            "plans": plan_records,
+            "accounting": accounting,
+            "budget": _compact(budget),
+            "lifecycle_funnel": _compact(funnel),
+            "rejection_reasons": _compact(rejection_reasons),
+            "queue_items": [
+                {
+                    "item_id": item.get("item_id"),
+                    "item_type": item.get("item_type"),
+                    "status": item.get("status"),
+                    "attempts": item.get("attempts"),
+                    "last_error": _compact(item.get("last_error")),
+                    "events": [
+                        event.get("to_status")
+                        for event in store.list_research_queue_events(str(item.get("item_id")), limit=64)
+                    ]
+                    if item.get("item_id")
+                    else [],
+                }
+                for item in queue_items[:limit]
+            ],
+        },
         "gaps": gaps,
     }
 
@@ -163,6 +326,8 @@ def _compact(value: Any, *, depth: int = 0) -> Any:
         return [_compact(child, depth=depth + 1) for child in value[:32]]
     if isinstance(value, tuple):
         return [_compact(child, depth=depth + 1) for child in value[:32]]
+    if isinstance(value, datetime):
+        return value.isoformat()
     if isinstance(value, str):
         return value if len(value) <= 1024 else value[:1021] + "..."
     if isinstance(value, float) and not math.isfinite(value):

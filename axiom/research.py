@@ -58,6 +58,26 @@ class ResearchReport:
 
     def to_json(self) -> str:
         return json.dumps(self.to_dict(), sort_keys=True, indent=2)
+    def to_markdown(self) -> str:
+        """Render a concise human-readable report without embedding raw tables."""
+        lines = [
+            "# Axiom Research Report",
+            "",
+            f"Generated: {self.generated_at.astimezone(timezone.utc).isoformat()}",
+            "",
+            "## Crypto",
+            "",
+            _markdown_section(self.crypto),
+            "",
+            "## Prediction markets",
+            "",
+            _markdown_section(self.prediction),
+            "",
+            "## Limitations",
+            "",
+        ]
+        lines.extend(f"- {item}" for item in self.limitations) if self.limitations else lines.append("- None recorded.")
+        return "\n".join(lines).rstrip() + "\n"
 
 
 def run_crypto_research(
@@ -524,9 +544,58 @@ def run_initial_research(
 
 
 def write_report(report: ResearchReport | Mapping[str, Any], path: str) -> None:
-    payload = report.to_json() if isinstance(report, ResearchReport) else json.dumps(_jsonable(report), sort_keys=True, indent=2)
+    """Write JSON by default and real Markdown for ``.md`` paths."""
+    if str(path).lower().endswith((".md", ".markdown")):
+        payload = report.to_markdown() if isinstance(report, ResearchReport) else _markdown_document(report)
+        suffix = "" if payload.endswith("\n") else "\n"
+    else:
+        payload = report.to_json() if isinstance(report, ResearchReport) else json.dumps(_jsonable(report), sort_keys=True, indent=2)
+        suffix = "\n"
     with open(path, "w", encoding="utf-8") as handle:
-        handle.write(payload + "\n")
+        handle.write(payload + suffix)
+
+
+def _markdown_document(report: Mapping[str, Any]) -> str:
+    generated = report.get("generated_at", "unknown")
+    crypto = report.get("crypto", {})
+    prediction = report.get("prediction", {})
+    limitations = report.get("limitations", ())
+    lines = [
+        "# Axiom Research Report",
+        "",
+        f"Generated: {generated}",
+        "",
+        "## Crypto",
+        "",
+        _markdown_section(crypto),
+        "",
+        "## Prediction markets",
+        "",
+        _markdown_section(prediction),
+        "",
+        "## Limitations",
+        "",
+    ]
+    if isinstance(limitations, (list, tuple)) and limitations:
+        lines.extend(f"- {item}" for item in limitations)
+    else:
+        lines.append("- None recorded.")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _markdown_section(value: Any) -> str:
+    if not isinstance(value, Mapping):
+        return f"- {value}"
+    lines: list[str] = []
+    for key, item in list(value.items())[:32]:
+        if isinstance(item, Mapping):
+            summary = json.dumps(_jsonable(item), sort_keys=True, separators=(",", ":"))
+        elif isinstance(item, (list, tuple)):
+            summary = f"{len(item)} entries"
+        else:
+            summary = str(_jsonable(item))
+        lines.append(f"- **{key}:** {summary}")
+    return "\n".join(lines) if lines else "- No result recorded."
 
 
 def _chronological_split(rows: Sequence[Any]) -> tuple[Any, str]:

@@ -112,6 +112,12 @@ class HypothesisMessage:
     created_at: datetime = field(default_factory=utc_now)
     schema_version: str = "1"
     message_type: str = "hypothesis"
+    source: str = ""
+    tests: tuple[str, ...] = ()
+    dataset_version: str = ""
+    time_split: str = "train-validation-holdout"
+    paper_only: bool = True
+    experiment_plan: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "hypothesis_id", _required(self.hypothesis_id, "hypothesis_id"))
@@ -123,7 +129,21 @@ class HypothesisMessage:
             "parent_ids",
             tuple(_required(str(value), "parent_id") for value in _bounded_values(self.parent_ids, "parent_ids")),
         )
-        object.__setattr__(self, "assumptions", _mapping(self.assumptions, "assumptions"))
+        assumptions = _mapping(self.assumptions, "assumptions")
+        object.__setattr__(self, "assumptions", assumptions)
+        source = str(self.source).strip() or str(self.author).strip() or "hermes"
+        object.__setattr__(self, "source", source)
+        tests = self.tests or ("bounded chronological validation",)
+        tests = tuple(str(value).strip() for value in _bounded_values(tests, "tests", limit=16))
+        if not tests or any(not value for value in tests):
+            raise HermesValidationError("tests must contain bounded non-empty text")
+        object.__setattr__(self, "tests", tests)
+        dataset = str(self.dataset_version).strip() or str(assumptions.get("dataset_version", "")).strip() or "axiom-persisted-v1"
+        object.__setattr__(self, "dataset_version", _required(dataset, "dataset_version"))
+        object.__setattr__(self, "time_split", _required(self.time_split, "time_split"))
+        if self.paper_only is not True:
+            raise HermesValidationError("paper_only must be true")
+        object.__setattr__(self, "experiment_plan", _mapping(self.experiment_plan, "experiment_plan"))
         object.__setattr__(self, "created_at", ensure_utc(self.created_at))
         if self.message_type != "hypothesis":
             raise HermesValidationError("invalid hypothesis message_type")
@@ -136,6 +156,12 @@ class HypothesisMessage:
             "hypothesis_id": self.hypothesis_id,
             "statement": self.statement,
             "author": self.author,
+            "source": self.source,
+            "tests": list(self.tests),
+            "dataset_version": self.dataset_version,
+            "time_split": self.time_split,
+            "paper_only": self.paper_only,
+            "experiment_plan": _plain(self.experiment_plan),
             "strategy_id": self.strategy_id,
             "parent_ids": list(self.parent_ids),
             "assumptions": _plain(self.assumptions),

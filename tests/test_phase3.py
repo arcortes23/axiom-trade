@@ -732,7 +732,7 @@ class Phase3NodeDashboardTests(unittest.TestCase):
                 self.assertEqual(store.list_worker_states()[0]["status"], "idle")
                 queued = DurableResearchBus(store).get(submitted.item_id)
                 self.assertIsNotNone(queued)
-                self.assertEqual(queued.status, ResearchQueueStatus.PENDING)
+                self.assertEqual(queued.status, ResearchQueueStatus.REJECTED)
     def test_crypto_node_deduplicates_ticker_observations_before_execution(self) -> None:
         with AxiomStore(":memory:") as store:
             node = ResearchNode(

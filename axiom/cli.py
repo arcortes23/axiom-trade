@@ -142,6 +142,7 @@ def build_parser() -> argparse.ArgumentParser:
     historical.add_argument("--markets", type=int, default=20, help="maximum resolved prediction markets to inspect")
     historical.add_argument("--timeout", type=float, default=10.0)
     historical.add_argument("--output", help="optional JSON report path")
+    historical.add_argument("--markdown-output", help="optional Markdown report path")
     historical.add_argument("--db", help="optional SQLite artifact database path")
     collect = commands.add_parser("collect-data", help="collect immutable Polymarket metadata, books, and trades")
     collect.add_argument("--db", required=True, help="SQLite collection database path")
@@ -204,6 +205,16 @@ def build_parser() -> argparse.ArgumentParser:
     node_run.add_argument("--lock")
     node_run.add_argument("--crypto-source", choices=("public", "synthetic", "disabled"), default="public")
     node_run.add_argument("--crypto-symbol", default="BTC/USDT")
+    node_run.add_argument("--research-items", type=int, default=1, help="bounded queue items per node cycle")
+    node_run.add_argument("--research-lease", type=float, default=300.0, help="queue lease seconds")
+    node_run.add_argument("--experiment-total-limit", type=int, default=1000)
+    node_run.add_argument("--experiment-family-limit", type=int, default=250)
+    node_run.add_argument("--max-plan-variants", type=int, default=8)
+    node_run.add_argument("--max-children-per-parent", type=int, default=2)
+    node_run.add_argument("--max-generation-depth", type=int, default=2)
+    node_run.add_argument("--max-experiments-per-day", type=int, default=250)
+    node_run.add_argument("--disable-mutations", action="store_true")
+    node_run.add_argument("--disable-research", action="store_true")
     node_run.add_argument("--crypto-timeout", type=float, default=10.0)
     node_status = commands.add_parser("node-status", help="show persisted node status")
     node_status.add_argument("--db", required=True)
@@ -340,6 +351,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 store.close()
         if args.output:
             write_report(report, args.output)
+        if args.markdown_output:
+            write_report(report, args.markdown_output)
         print(json.dumps(payload, sort_keys=True, indent=2))
         return 0
     if args.command == "collect-data":
@@ -515,6 +528,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "research_queue": store.list_research_items(limit=100),
                 "queue_stats": store.research_queue_stats(),
                 "live_execution": False,
+                "experiment_plans": store.list_experiment_plans(limit=100),
+                "lifecycle_funnel": store.candidate_lifecycle_funnel(),
+                "rejection_reasons": store.candidate_rejection_reasons(),
             }
         print(json.dumps(payload, sort_keys=True, indent=2, default=str))
         return 0
@@ -535,6 +551,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 max_markets=args.max_markets,
                 crypto_symbol=args.crypto_symbol,
                 crypto_enabled=args.crypto_source != "disabled",
+                research_enabled=not args.disable_research,
+                research_max_items_per_cycle=args.research_items,
+                research_lease_seconds=args.research_lease,
+                experiment_total_limit=args.experiment_total_limit,
+                experiment_family_limit=args.experiment_family_limit,
+                max_plan_variants=args.max_plan_variants,
+                max_children_per_parent=args.max_children_per_parent,
+                max_generation_depth=args.max_generation_depth,
+                max_experiments_per_day=args.max_experiments_per_day,
+                mutation_enabled=not args.disable_mutations,
             ),
             crypto_provider=crypto_provider,
         )

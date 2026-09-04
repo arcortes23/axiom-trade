@@ -5,7 +5,7 @@ cycles, and paper-only processing. It has no credentials, broker, or order route
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from itertools import islice
 import logging
 from logging.handlers import RotatingFileHandler
@@ -27,6 +27,8 @@ from .paper import CryptoPaperTrader
 from .paper_engine import run_forward_paper
 from .research_bus import DurableResearchBus
 from .storage import AxiomStore
+from .autonomous import AutonomousResearchConfig, AutonomousResearchProcessor
+from .lifecycle import PromotionCriteria
 from .strategy import evaluate_signal_record, load_strategy
 
 
@@ -152,6 +154,17 @@ class NodeConfig:
     worker_name: str = "axiom-node"
     max_log_bytes: int = 5_000_000
     backup_count: int = 3
+    research_enabled: bool = True
+    research_max_items_per_cycle: int = 1
+    research_lease_seconds: float = 300.0
+    experiment_total_limit: int = 1000
+    experiment_family_limit: int = 250
+    max_plan_variants: int = 8
+    max_children_per_parent: int = 2
+    max_generation_depth: int = 2
+    max_experiments_per_day: int = 250
+    mutation_enabled: bool = True
+    promotion_criteria: PromotionCriteria = field(default_factory=PromotionCriteria)
     crypto_symbol: str = "BTC/USDT"
     crypto_enabled: bool = True
 
@@ -206,6 +219,20 @@ class NodeConfig:
             raise ValueError("max_log_bytes must be a positive integer")
         if isinstance(self.backup_count, bool) or not isinstance(self.backup_count, int) or self.backup_count < 0:
             raise ValueError("backup_count must be a non-negative integer")
+        if not isinstance(self.research_enabled, bool):
+            raise ValueError("research_enabled must be boolean")
+        AutonomousResearchConfig(
+            max_items_per_cycle=self.research_max_items_per_cycle,
+            lease_seconds=self.research_lease_seconds,
+            total_limit=self.experiment_total_limit,
+            family_limit=self.experiment_family_limit,
+            max_plan_variants=self.max_plan_variants,
+            max_children_per_parent=self.max_children_per_parent,
+            max_generation_depth=self.max_generation_depth,
+            max_experiments_per_day=self.max_experiments_per_day,
+            mutation_enabled=self.mutation_enabled,
+            promotion_criteria=self.promotion_criteria,
+        )
 
 
 class _NoopStrategy:
@@ -325,6 +352,23 @@ class ResearchNode:
             sleep=sleep,
         )
         self.bus = DurableResearchBus(self.store)
+        self.research_processor = AutonomousResearchProcessor(
+            self.store,
+            bus=self.bus,
+            config=AutonomousResearchConfig(
+                max_items_per_cycle=config.research_max_items_per_cycle,
+                lease_seconds=config.research_lease_seconds,
+                total_limit=config.experiment_total_limit,
+                family_limit=config.experiment_family_limit,
+                max_plan_variants=config.max_plan_variants,
+                max_children_per_parent=config.max_children_per_parent,
+                max_generation_depth=config.max_generation_depth,
+                max_experiments_per_day=config.max_experiments_per_day,
+                mutation_enabled=config.mutation_enabled,
+                promotion_criteria=config.promotion_criteria,
+            ),
+            clock=clock,
+        )
 
     @property
     def lock_path(self) -> Path:
@@ -424,9 +468,10 @@ class ResearchNode:
                     self._cycles.append(cycle)
                     if len(self._cycles) > self.config.retain_cycles:
                         del self._cycles[:-self.config.retain_cycles]
-                    self._run_paper_workers()
-                    self._run_research_queue()
                     self.bus.resume_expired(now=ensure_utc(self.clock()))
+                    self._run_paper_workers()
+                    self.research_processor.reevaluate_forward_candidates(now=ensure_utc(self.clock()))
+                    self._run_research_queue()
                     self._run_health_monitor()
                     completed += 1
                     cycle_failure = False
@@ -734,6 +779,23 @@ class ResearchNode:
             "paper_only": True,
             "live_execution": False,
             "crypto_paper": dict(self._crypto_status),
+            "autonomous_research": {
+                "enabled": self.config.research_enabled,
+                "queue": self.store.research_queue_stats(),
+                "lifecycle_funnel": self.store.candidate_lifecycle_funnel(),
+                "rejection_reasons": self.store.candidate_rejection_reasons(limit=64),
+                "budget": self.store.load_experiment_budget("autonomous"),
+                "limits": {
+                    "items_per_cycle": self.config.research_max_items_per_cycle,
+                    "total_experiments": self.config.experiment_total_limit,
+                    "family_experiments": self.config.experiment_family_limit,
+                    "daily_experiments": self.config.max_experiments_per_day,
+                    "plan_variants": self.config.max_plan_variants,
+                    "children_per_parent": self.config.max_children_per_parent,
+                    "generation_depth": self.config.max_generation_depth,
+                    "mutations_enabled": self.config.mutation_enabled,
+                },
+            },
             "workers": child_workers,
         }
         if state:
@@ -1135,7 +1197,8 @@ class ResearchNode:
                 if not isinstance(strategy_document, Mapping) or not isinstance(model_document, Mapping):
                     raise ValueError("forward test has no persisted executable strategy/model documents")
                 strategy_definition = load_strategy(strategy_document)
-                if _content_hash(strategy_definition) != spec.strategy_hash or _content_hash(model_document) != spec.model_hash:
+                strategy_hash = _content_hash(strategy_definition.to_dict())
+                if strategy_hash != spec.strategy_hash and _content_hash(strategy_definition) != spec.strategy_hash:
                     raise ValueError("persisted executable documents do not match frozen forward-test hashes")
                 if strategy_definition.market_type.value != "prediction":
                     raise ValueError("node Polymarket workers require a prediction strategy")
@@ -1261,14 +1324,29 @@ class ResearchNode:
             heartbeat_at=started,
         )
         try:
+            if self.config.research_enabled:
+                cycle = self.research_processor.process_pending(worker=worker_name, now=started)
+                cycle_record = cycle.as_record()
+            else:
+                cycle_record = {
+                    "released": 0,
+                    "claimed": 0,
+                    "completed": 0,
+                    "rejected": 0,
+                    "failed": 0,
+                    "results": [],
+                    "disabled": True,
+                    "paper_only": True,
+                }
             stats = self.bus.stats()
             self.store.save_worker_state(
                 worker_name,
                 "idle",
                 {
-                    "dispatcher": "hermes-safe-interface",
+                    "dispatcher": "autonomous-research-processor",
                     "pending": int(stats.get("PENDING", 0)),
                     "stats": dict(stats),
+                    "last_cycle": cycle_record,
                     "paper_only": True,
                     "live_execution": False,
                 },
@@ -1283,7 +1361,7 @@ class ResearchNode:
                 started_at=started,
                 heartbeat_at=ensure_utc(self.clock()),
             )
-            self._log(logging.ERROR, "research queue monitor failed: %s", exc)
+            self._log(logging.ERROR, "research queue processor failed: %s", exc)
 
     def _run_health_monitor(self) -> None:
         worker_name = "health-monitor"
