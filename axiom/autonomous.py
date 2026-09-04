@@ -335,11 +335,6 @@ class AutonomousResearchProcessor:
             plan = ExperimentPlan.from_proposal(validation.normalized or proposal)
         except ExperimentPlanError as exc:
             raise AutonomousResearchError(exc.reason, exc.detail) from exc
-        if plan.market_type is not MarketType.PREDICTION:
-            raise AutonomousResearchError(
-                "UNSUPPORTED_STRATEGY_FAMILY",
-                "autonomous forward worker currently supports prediction plans only",
-            )
         if plan.max_variants > self.config.max_plan_variants:
             raise AutonomousResearchError(
                 "EXPERIMENT_BUDGET_EXCEEDED",
@@ -634,11 +629,30 @@ class AutonomousResearchProcessor:
 
     def _load_split(self, plan: ExperimentPlan) -> tuple[list[Mapping[str, Any]], Any]:
         records: Any = None
-        if plan.dataset_id:
+        if plan.market_type is MarketType.CRYPTO_SPOT:
+            if not plan.dataset_id:
+                raise AutonomousResearchError(
+                    "INSUFFICIENT_DATA",
+                    "crypto_spot research requires a versioned dataset_id",
+                )
+            loader = getattr(self.store, "load_dataset_record", None)
+            if callable(loader):
+                record = loader(plan.dataset_id, plan.dataset_version)
+                if isinstance(record, Mapping):
+                    record_version = str(record.get("version", record.get("dataset_version", ""))).strip()
+                    if record_version and record_version != plan.dataset_version:
+                        raise AutonomousResearchError(
+                            "INSUFFICIENT_DATA",
+                            "dataset record version does not match the plan",
+                        )
+                    records = record.get("records")
+            if records is None:
+                records = self.store.load_dataset(plan.dataset_id, plan.dataset_version)
+        elif plan.dataset_id:
             records = self.store.load_dataset(plan.dataset_id, plan.dataset_version)
         if records is None:
             finder = getattr(self.store, "load_dataset_by_version", None)
-            if callable(finder):
+            if plan.market_type is not MarketType.CRYPTO_SPOT and callable(finder):
                 found = finder(plan.dataset_version)
                 if isinstance(found, Mapping):
                     records = found.get("records")
@@ -1012,16 +1026,30 @@ class AutonomousResearchProcessor:
             )
         if candidate.stage is CandidateStage.ROBUSTNESS_CHECKED:
             model_document = plan.model_for() or {"type": "deterministic"}
-            risk_snapshot = {"max_position_fraction": 0.05}
-            forward_config = {
-                "execution": "paper_only",
-                "live_execution": False,
-                "plan_id": plan.plan_id,
-                "dataset_id": plan.dataset_id,
-                "dataset_version": plan.dataset_version,
-                "strategy_document": strategy.to_dict(),
-                "model_document": dict(model_document),
-            }
+            if plan.market_type is MarketType.CRYPTO_SPOT:
+                # Crypto autonomous candidates are historical research only.
+                # They are deliberately never registered with ForwardTestRegistry.
+                risk_snapshot = {"execution_capability": "none", "max_position_fraction": 0.0}
+                forward_config = {
+                    "paper_only": True,
+                    "execution_capability": "none",
+                    "plan_id": plan.plan_id,
+                    "dataset_id": plan.dataset_id,
+                    "dataset_version": plan.dataset_version,
+                    "strategy_document": strategy.to_dict(),
+                    "model_document": dict(model_document),
+                }
+            else:
+                risk_snapshot = {"max_position_fraction": 0.05}
+                forward_config = {
+                    "execution": "paper_only",
+                    "live_execution": False,
+                    "plan_id": plan.plan_id,
+                    "dataset_id": plan.dataset_id,
+                    "dataset_version": plan.dataset_version,
+                    "strategy_document": strategy.to_dict(),
+                    "model_document": dict(model_document),
+                }
             config_hash = _hash_document({"config": forward_config, "risk_limits": risk_snapshot})
             candidate = self.lifecycle.advance(
                 candidate_id,
@@ -1038,6 +1066,7 @@ class AutonomousResearchProcessor:
                         "dataset_id": plan.dataset_id,
                         "dataset_version": plan.dataset_version,
                         "time_split": plan.methodology.get("time_split"),
+                        "universe": dict(plan.universe or {}),
                     },
                     "experiment_budget_lineage": {
                         "budget_id": plan.budget_id,
@@ -1047,6 +1076,17 @@ class AutonomousResearchProcessor:
                 },
                 reason="exact strategy, model, configuration, risk, and provenance frozen",
             )
+            if plan.market_type is MarketType.CRYPTO_SPOT:
+                return {
+                    "candidate_id": candidate_id,
+                    "stage": candidate.stage.value,
+                    "validation_expectancy": validation_expectancy,
+                    "variant_count": variant_count,
+                    "forward_test_id": None,
+                    "research_only": True,
+                    "execution_capability": "none",
+                    "paper_only": True,
+                }
             registry = ForwardTestRegistry(self.store)
             spec = registry.register_forward_test(
                 strategy=strategy.to_dict(),
@@ -1269,25 +1309,30 @@ class AutonomousResearchProcessor:
         mutations: Sequence[str],
     ) -> dict[str, Any]:
         rejected = [item for item in results if item.get("stage") == CandidateStage.REJECTED.value]
-        forward = [
-            item
-            for item in results
-            if item.get("stage") in {CandidateStage.PAPER_FORWARD.value, CandidateStage.PAPER_PROMOTABLE.value}
-        ]
+        selected_stages = (
+            {CandidateStage.FROZEN.value}
+            if plan.market_type is MarketType.CRYPTO_SPOT
+            else {CandidateStage.PAPER_FORWARD.value, CandidateStage.PAPER_PROMOTABLE.value}
+        )
+        selected = [item for item in results if item.get("stage") in selected_stages]
         reasons: dict[str, int] = {}
         for item in rejected:
             reason = str(item.get("reason", "rejected"))
             reasons[reason] = reasons.get(reason, 0) + 1
         return {
-            "accepted": bool(forward),
+            "accepted": bool(selected),
             "kind": "hypothesis",
             "hypothesis_id": plan.hypothesis_id,
             "plan_id": plan.plan_id,
             "plan_hash": plan.plan_hash,
-            "status": "accepted" if forward else "unsupported_by_validation",
+            "status": (
+                "accepted_research_only"
+                if plan.market_type is MarketType.CRYPTO_SPOT and selected
+                else "accepted" if selected else "unsupported_by_validation"
+            ),
             "variants_tested": len(results),
-            "selected_from_variants": len(forward),
-            "selected_candidate_ids": [item.get("candidate_id") for item in forward[:_MAX_QUEUE_RESULT_ITEMS]],
+            "selected_from_variants": len(selected),
+            "selected_candidate_ids": [item.get("candidate_id") for item in selected[:_MAX_QUEUE_RESULT_ITEMS]],
             "candidate_results": [
                 {
                     "candidate_id": item.get("candidate_id"),
@@ -1303,6 +1348,7 @@ class AutonomousResearchProcessor:
             "dataset_version": plan.dataset_version,
             "data_quality": "ORDER_BOOK_SIMULATED" if plan.market_type is MarketType.PREDICTION else "OHLCV_SIMULATED",
             "paper_only": True,
+            "research_only": plan.market_type is MarketType.CRYPTO_SPOT,
         }
 
     def _forward_evidence(self, record: Mapping[str, Any], now: datetime) -> dict[str, Any]:
@@ -1671,7 +1717,14 @@ def _normalize_hypothesis_payload(payload: Mapping[str, Any], item: ResearchQueu
     result.setdefault("proposal_id", hypothesis_id)
     result.setdefault("source", str(result.get("author", item.author or item.source or "hermes")) or "hermes")
     result.setdefault("tests", ["bounded chronological backtest and validation"])
-    result.setdefault("dataset_version", assumptions.get("dataset_version", "axiom-persisted-v1"))
+    market_type = result.get("market_type")
+    plan_value = result.get("experiment_plan")
+    if isinstance(plan_value, Mapping):
+        market_type = plan_value.get("market_type", market_type)
+    # Prediction proposals retain their historical compatibility default. A
+    # crypto proposal must state its immutable dataset version explicitly.
+    if str(market_type or "prediction").strip().lower() != MarketType.CRYPTO_SPOT.value:
+        result.setdefault("dataset_version", assumptions.get("dataset_version", "axiom-persisted-v1"))
     result.setdefault("time_split", "train-validation-holdout")
     result.setdefault("paper_only", True)
     if "experiment_plan" not in result and isinstance(assumptions.get("experiment_plan"), Mapping):

@@ -7,8 +7,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from itertools import islice
-import logging
+from datetime import datetime, timedelta
 from logging.handlers import RotatingFileHandler
+import logging
 import math
 import os
 from pathlib import Path
@@ -149,6 +150,7 @@ class NodeConfig:
     depth: int = 20
     max_markets: int = 100
     max_attempts: int = 3
+    max_provider_clock_skew_seconds: float = 5.0
     failure_cooldown_seconds: float = 30.0
     retain_cycles: int = 5
     worker_name: str = "axiom-node"
@@ -213,6 +215,9 @@ class NodeConfig:
             raise ValueError("max_attempts must be a positive integer")
         if not math.isfinite(cooldown) or cooldown < 0:
             raise ValueError("failure_cooldown_seconds must be finite and non-negative")
+        provider_clock_skew = float(self.max_provider_clock_skew_seconds)
+        if not math.isfinite(provider_clock_skew) or provider_clock_skew < 0:
+            raise ValueError("max_provider_clock_skew_seconds must be finite and non-negative")
         if isinstance(self.retain_cycles, bool) or not isinstance(self.retain_cycles, int) or self.retain_cycles <= 0:
             raise ValueError("retain_cycles must be a positive integer")
         if isinstance(self.max_log_bytes, bool) or not isinstance(self.max_log_bytes, int) or self.max_log_bytes <= 0:
@@ -346,6 +351,7 @@ class ResearchNode:
                 max_markets=config.max_markets,
                 max_attempts=config.max_attempts,
                 failure_cooldown_seconds=config.failure_cooldown_seconds,
+                max_provider_clock_skew_seconds=config.max_provider_clock_skew_seconds,
                 retain_cycles=config.retain_cycles,
             ),
             clock=clock,
@@ -1003,33 +1009,70 @@ class ResearchNode:
         )
         try:
             provider_errors: list[str] = []
+            degrading_reasons: list[str] = []
             markets: tuple[Any, ...] = ()
+            market_request_started_at = started
+            market_response_received_at = started
             for attempt in range(self.config.max_attempts):
                 call_error: str | None = None
                 call_retryable = False
+                market_request_started_at = ensure_utc(self.clock())
                 try:
                     try:
-                        markets = tuple(islice(iter(self.provider.markets(active=True, limit=self.config.max_markets)), self.config.max_markets))
+                        markets = tuple(
+                            islice(
+                                iter(self.provider.markets(active=True, limit=self.config.max_markets)),
+                                self.config.max_markets,
+                            )
+                        )
                     except TypeError:
+                        market_request_started_at = ensure_utc(self.clock())
                         markets = tuple(islice(self.provider.markets(active=True), self.config.max_markets))
                 except Exception as exc:
                     call_error = str(exc)
                     call_retryable = isinstance(exc, (OSError, TimeoutError))
                     markets = ()
+                finally:
+                    market_response_received_at = ensure_utc(self.clock())
                 transport_details, transport_retryable = _consume_provider_errors(self.provider, "market discovery")
                 provider_errors.extend(transport_details)
+                degrading_reasons.extend(transport_details)
                 if call_error:
-                    provider_errors.append(f"market discovery: {call_error}")
+                    detail = f"market discovery: {call_error}"
+                    provider_errors.append(detail)
+                    degrading_reasons.append(detail)
                 retryable = call_retryable or transport_retryable
                 if not retryable or attempt + 1 >= self.config.max_attempts:
                     break
-                self.sleep(max(0.0, min(float(self.config.failure_cooldown_seconds), 2.0 ** attempt)))
-            markets_retrieved_at = ensure_utc(self.clock())
+                self.sleep(max(0.0, min(float(self.config.failure_cooldown_seconds), 2.0**attempt)))
+            markets_retrieved_at = market_response_received_at
             opportunities_observed_at = markets_retrieved_at
             records: list[dict[str, Any]] = []
+            evidence_by_market: dict[str, dict[str, Any]] = {}
             probabilities: dict[str, float] = {}
             uncertainties: dict[str, float] = {}
             model_versions: set[str] = set()
+            max_skew = timedelta(seconds=float(self.config.max_provider_clock_skew_seconds))
+
+            def retrieval_evidence(
+                request_started_at: datetime,
+                source_timestamp: datetime | None,
+                response_received_at: datetime,
+            ) -> dict[str, Any]:
+                request_started = request_started_at.isoformat()
+                response_received = response_received_at.isoformat()
+                source = source_timestamp.isoformat() if source_timestamp is not None else None
+                return {
+                    "request_started_at": request_started,
+                    "source_timestamp": source,
+                    "provider_timestamp": source,
+                    "response_received_at": response_received,
+                    "request_window": {
+                        "started_at": request_started,
+                        "received_at": response_received,
+                    },
+                }
+
             for market in markets:
                 market_id = str(getattr(market, "market_id", "")).strip()
                 if not market_id:
@@ -1039,38 +1082,61 @@ class ResearchNode:
                     continue
                 record = dict(record)
                 market_timestamp = parse_timestamp(record.get("timestamp"))
-                if market_timestamp is not None and market_timestamp > markets_retrieved_at:
+                market_evidence = retrieval_evidence(
+                    market_request_started_at,
+                    market_timestamp,
+                    market_response_received_at,
+                )
+                market_allowed_until = market_response_received_at + max_skew
+                if market_timestamp is not None and market_timestamp > market_allowed_until:
+                    detail = "market timestamp is in the future"
+                    reason = f"{market_id}: {detail}"
                     self.store.save_collection_error(
                         market_id,
-                        started,
+                        market_response_received_at,
                         "future_observation",
-                        "market timestamp is in the future",
-                        {"timestamp": market_timestamp.isoformat()},
+                        detail,
+                        {
+                            **market_evidence,
+                            "timestamp": market_timestamp.isoformat(),
+                            "allowed_until": market_allowed_until.isoformat(),
+                        },
                     )
+                    degrading_reasons.append(reason)
                     continue
+
                 books: Any = {}
+                books_request_started_at = ensure_utc(self.clock())
+                books_response_received_at = books_request_started_at
                 for attempt in range(self.config.max_attempts):
-                    call_error: str | None = None
+                    call_error = None
                     call_retryable = False
+                    books_request_started_at = ensure_utc(self.clock())
                     try:
                         books = self.provider.order_books(market_id, depth=self.config.depth)
                     except Exception as exc:
                         call_error = str(exc)
                         call_retryable = isinstance(exc, (OSError, TimeoutError))
                         books = {}
+                    finally:
+                        books_response_received_at = ensure_utc(self.clock())
                     transport_details, transport_retryable = _consume_provider_errors(
                         self.provider,
                         f"order books {market_id}",
                     )
                     provider_errors.extend(transport_details)
+                    degrading_reasons.extend(transport_details)
                     if call_error:
-                        provider_errors.append(f"order books {market_id}: {call_error}")
+                        detail = f"order books {market_id}: {call_error}"
+                        provider_errors.append(detail)
+                        degrading_reasons.append(detail)
                     retryable = call_retryable or transport_retryable
                     if not retryable or attempt + 1 >= self.config.max_attempts:
                         break
-                    self.sleep(max(0.0, min(float(self.config.failure_cooldown_seconds), 2.0 ** attempt)))
-                books_retrieved_at = ensure_utc(self.clock())
-                opportunities_observed_at = max(opportunities_observed_at, books_retrieved_at)
+                    self.sleep(max(0.0, min(float(self.config.failure_cooldown_seconds), 2.0**attempt)))
+                opportunities_observed_at = max(opportunities_observed_at, books_response_received_at)
+                order_book_evidence: dict[str, dict[str, Any]] = {}
+                source_timestamps = [stamp for stamp in (market_timestamp,) if stamp is not None]
                 if isinstance(books, Mapping):
                     for outcome in ("yes", "no"):
                         book = books.get(outcome)
@@ -1082,16 +1148,50 @@ class ResearchNode:
                             if isinstance(book_record, Mapping)
                             else None
                         )
-                        if book_timestamp is not None and book_timestamp > books_retrieved_at:
+                        evidence = retrieval_evidence(
+                            books_request_started_at,
+                            book_timestamp,
+                            books_response_received_at,
+                        )
+                        order_book_evidence[outcome] = evidence
+                        book_allowed_until = books_response_received_at + max_skew
+                        if book_timestamp is not None and book_timestamp > book_allowed_until:
+                            detail = "order-book timestamp is in the future"
+                            reason = f"{market_id} {outcome}: {detail}"
                             self.store.save_collection_error(
                                 market_id,
-                                started,
+                                books_response_received_at,
                                 "future_order_book",
-                                "order-book timestamp is in the future",
-                                {"outcome": outcome, "timestamp": book_timestamp.isoformat()},
+                                detail,
+                                {
+                                    **evidence,
+                                    "outcome": outcome,
+                                    "timestamp": book_timestamp.isoformat(),
+                                    "allowed_until": book_allowed_until.isoformat(),
+                                },
                             )
+                            degrading_reasons.append(reason)
                             continue
-                        record[f"{outcome}_order_book"] = book_record
+                        if isinstance(book_record, Mapping):
+                            record[f"{outcome}_order_book"] = dict(book_record)
+                        if book_timestamp is not None:
+                            source_timestamps.append(book_timestamp)
+
+                source_timestamp = max(source_timestamps) if source_timestamps else None
+                if source_timestamp is not None:
+                    # The scanner must see the canonical latest provider time;
+                    # otherwise it intentionally discards a newer order book.
+                    record["timestamp"] = source_timestamp.isoformat()
+                evidence = {
+                    "market": market_evidence,
+                    "order_books": order_book_evidence,
+                    **retrieval_evidence(
+                        market_request_started_at,
+                        source_timestamp,
+                        books_response_received_at,
+                    ),
+                }
+                evidence_by_market[market_id] = evidence
                 if self.opportunity_model is None:
                     estimate = record.get("yes_mid")
                     if estimate is None:
@@ -1149,16 +1249,29 @@ class ResearchNode:
                 probabilities,
                 model_version=sorted(model_versions)[0] if model_versions else "market-price-baseline-v1",
             )
-            inserted = self.store.save_opportunity_snapshots(opportunities_observed_at, (item.as_record() for item in opportunities))
+            opportunity_records: list[dict[str, Any]] = []
+            for item in opportunities:
+                item_record = item.as_record()
+                evidence = evidence_by_market.get(item.market_id)
+                if isinstance(evidence, Mapping):
+                    item_record["evidence"] = dict(evidence)
+                    for key in ("request_started_at", "source_timestamp", "provider_timestamp", "response_received_at"):
+                        item_record[key] = evidence.get(key)
+                opportunity_records.append(item_record)
+            inserted = self.store.save_opportunity_snapshots(opportunities_observed_at, opportunity_records)
+            latest_reason = degrading_reasons[-1] if degrading_reasons else None
             self.store.save_worker_state(
                 worker_name,
-                "degraded" if provider_errors else "idle",
+                "degraded" if degrading_reasons else "idle",
                 {
                     "markets": len(records),
                     "opportunities": len(opportunities),
                     "inserted": inserted,
                     "model_versions": sorted(model_versions),
                     "provider_errors": provider_errors[-32:],
+                    "degrading_reason": latest_reason,
+                    "last_degrading_reason": latest_reason,
+                    "last_error": latest_reason,
                     "paper_only": True,
                     "live_execution": False,
                 },
@@ -1166,10 +1279,18 @@ class ResearchNode:
                 heartbeat_at=ensure_utc(self.clock()),
             )
         except Exception as exc:
+            reason = str(exc)
             self.store.save_worker_state(
                 worker_name,
                 "degraded",
-                {"error": str(exc), "paper_only": True, "live_execution": False},
+                {
+                    "error": reason,
+                    "last_error": reason,
+                    "degrading_reason": reason,
+                    "last_degrading_reason": reason,
+                    "paper_only": True,
+                    "live_execution": False,
+                },
                 started_at=started,
                 heartbeat_at=ensure_utc(self.clock()),
             )

@@ -1058,6 +1058,8 @@ class AxiomStore:
                     dataset_version=version,
                 )
             return records
+        if dataset_id == "Polymarket-historical" and market_type == MarketType.PREDICTION.value:
+            return self._aggregate_polymarket_catalog_records(catalog, version)
         metadata = catalog.get("metadata", {})
         if isinstance(metadata, Mapping):
             market_id = metadata.get("market_id")
@@ -1082,6 +1084,282 @@ class AxiomStore:
                     records.append(record)
                 return records
         return []
+
+    def _aggregate_polymarket_catalog_records(
+        self,
+        catalog: Mapping[str, Any],
+        aggregate_version: str,
+    ) -> list[dict[str, Any]]:
+        """Reconstruct an aggregate only from its exact immutable constituents.
+
+        The historical snapshot table predates dataset provenance columns.  Its
+        rows can therefore be used for an aggregate only after their content,
+        boundaries and count have been checked against the exact constituent
+        catalog/version.  Any ambiguity fails closed rather than selecting a
+        newer catalog or mixing forward observations into research input.
+        """
+        aggregate_metadata = catalog.get("metadata")
+        if not isinstance(aggregate_metadata, Mapping):
+            return []
+        market_versions = aggregate_metadata.get("market_versions")
+        if not isinstance(market_versions, Sequence) or isinstance(market_versions, (str, bytes)):
+            return []
+        aggregate_count = catalog.get("row_count")
+        if isinstance(aggregate_count, bool) or not isinstance(aggregate_count, int) or aggregate_count < 0:
+            return []
+        aggregate_start = _parse_datetime(catalog.get("start_timestamp"))
+        aggregate_end = _parse_datetime(catalog.get("end_timestamp"))
+        if aggregate_count and (aggregate_start is None or aggregate_end is None):
+            return []
+        if not aggregate_count and (aggregate_start is not None or aggregate_end is not None):
+            return []
+
+        all_records: list[dict[str, Any]] = []
+        seen_constituents: set[tuple[str, str]] = set()
+        constituent_ranges: list[tuple[datetime, datetime]] = []
+        for item in market_versions:
+            if not isinstance(item, Mapping):
+                return []
+            market_id = str(item.get("market_id", "")).strip()
+            constituent_id = str(item.get("dataset_id", f"prediction:{market_id}")).strip()
+            constituent_version = str(item.get("version", item.get("dataset_version", ""))).strip()
+            if (
+                not market_id
+                or not constituent_version
+                or constituent_id != f"prediction:{market_id}"
+                or (constituent_id, constituent_version) in seen_constituents
+            ):
+                return []
+            seen_constituents.add((constituent_id, constituent_version))
+            expected_count = item.get("records", item.get("row_count"))
+            if isinstance(expected_count, bool) or not isinstance(expected_count, int) or expected_count < 0:
+                return []
+
+            constituent = self.load_dataset_catalog(constituent_id, constituent_version)
+            if constituent is None or not self._valid_polymarket_constituent_catalog(
+                constituent, market_id, constituent_id, constituent_version, expected_count, item
+            ):
+                return []
+            constituent_records = self._load_exact_polymarket_constituent(
+                constituent, market_id, constituent_id, constituent_version
+            )
+            if constituent_records is None or len(constituent_records) != expected_count:
+                return []
+            if constituent_records:
+                first = _parse_datetime(constituent_records[0].get("source_timestamp"))
+                last = _parse_datetime(constituent_records[-1].get("source_timestamp"))
+                start = _parse_datetime(constituent.get("start_timestamp"))
+                end = _parse_datetime(constituent.get("end_timestamp"))
+                if first is None or last is None or start is None or end is None or first != start or last != end:
+                    return []
+                constituent_ranges.append((first, last))
+            elif constituent.get("start_timestamp") is not None or constituent.get("end_timestamp") is not None:
+                return []
+            all_records.extend(
+                self._with_polymarket_provenance(
+                    record,
+                    aggregate_dataset_id=str(catalog.get("dataset_id", "Polymarket-historical")),
+                    aggregate_dataset_version=aggregate_version,
+                    constituent_dataset_id=constituent_id,
+                    constituent_dataset_version=constituent_version,
+                    market_id=market_id,
+                    quality=str(constituent.get("quality") or "PRICE_PROXY"),
+                )
+                for record in constituent_records
+            )
+
+        if len(all_records) != aggregate_count:
+            return []
+        if all_records:
+            observed_starts = [bounds[0] for bounds in constituent_ranges]
+            observed_ends = [bounds[1] for bounds in constituent_ranges]
+            if (
+                not observed_starts
+                or aggregate_start != min(observed_starts)
+                or aggregate_end != max(observed_ends)
+            ):
+                return []
+        return all_records
+
+    @staticmethod
+    def _valid_polymarket_constituent_catalog(
+        constituent: Mapping[str, Any],
+        market_id: str,
+        constituent_id: str,
+        version: str,
+        expected_count: int,
+        aggregate_item: Mapping[str, Any],
+    ) -> bool:
+        if (
+            str(constituent.get("dataset_id", "")) != constituent_id
+            or str(constituent.get("dataset_version", "")) != version
+            or str(constituent.get("market_type", "")).strip().lower() != MarketType.PREDICTION.value
+            or str(constituent.get("source_type", "")).strip().upper() != "HISTORICAL"
+            or constituent.get("row_count") != expected_count
+        ):
+            return False
+        metadata = constituent.get("metadata")
+        if not isinstance(metadata, Mapping):
+            return False
+        if str(metadata.get("market_id", metadata.get("polymarket_key", ""))).strip() != market_id:
+            return False
+        for key in ("category", "question", "resolution_criteria", "settlement", "token_ids"):
+            if key in aggregate_item and key in metadata and aggregate_item[key] != metadata[key]:
+                return False
+        if "historical_order_book" in aggregate_item and "historical_order_book_available" in metadata:
+            if bool(aggregate_item["historical_order_book"]) != bool(metadata["historical_order_book_available"]):
+                return False
+        return True
+
+    def _load_exact_polymarket_constituent(
+        self,
+        constituent: Mapping[str, Any],
+        market_id: str,
+        constituent_id: str,
+        constituent_version: str,
+    ) -> list[dict[str, Any]] | None:
+        """Load a constituent by exact version, falling back only to checked legacy rows."""
+        with self._lock:
+            immutable = self._conn.execute(
+                "SELECT payload_json,metadata_json,quality FROM datasets "
+                "WHERE dataset_id=? AND version=?",
+                (constituent_id, constituent_version),
+            ).fetchone()
+        if immutable is not None:
+            try:
+                values = _load(immutable["payload_json"])
+                dataset_metadata = _load(immutable["metadata_json"])
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return None
+            if not isinstance(values, Sequence) or isinstance(values, (str, bytes, Mapping)):
+                return None
+            if isinstance(dataset_metadata, Mapping):
+                catalog_metadata = constituent.get("metadata")
+                if isinstance(catalog_metadata, Mapping):
+                    for key in ("market_id", "category", "question", "resolution_criteria", "settlement", "token_ids"):
+                        if key in dataset_metadata and key in catalog_metadata and dataset_metadata[key] != catalog_metadata[key]:
+                            return None
+            result: list[dict[str, Any]] = []
+            for value in values:
+                if not isinstance(value, Mapping):
+                    return None
+                if str(value.get("source_type", "HISTORICAL")).strip().upper() != "HISTORICAL":
+                    return None
+                if value.get("market_id") is not None and str(value["market_id"]).strip() != market_id:
+                    return None
+                record = dict(value)
+                timestamp = _parse_datetime(record.get("source_timestamp", record.get("timestamp", record.get("time"))))
+                if timestamp is None:
+                    return None
+                record["source_timestamp"] = timestamp
+                record.setdefault("market_id", market_id)
+                record["quality"] = record.get("quality") or immutable["quality"] or constituent.get("quality") or "PRICE_PROXY"
+                result.append(record)
+            result.sort(key=lambda value: (_parse_datetime(value["source_timestamp"]) or datetime.min.replace(tzinfo=timezone.utc), _dump(value)))
+            return result
+
+        rows = self.load_polymarket_snapshots(market_id, limit=None)
+        historical: list[dict[str, Any]] = []
+        for row in rows:
+            payload = row.get("payload") if isinstance(row, Mapping) else None
+            if not isinstance(payload, Mapping):
+                continue
+            if str(payload.get("source_type", "")).strip().upper() != "HISTORICAL":
+                continue
+            if payload.get("market_id") is not None and str(payload["market_id"]).strip() != market_id:
+                return None
+            source_timestamp = _parse_datetime(row.get("source_timestamp"))
+            if source_timestamp is None:
+                return None
+            payload_timestamp = _parse_datetime(payload.get("timestamp", payload.get("time")))
+            if payload_timestamp is not None and payload_timestamp != source_timestamp:
+                return None
+            historical.append(
+                {
+                    "payload": payload,
+                    "snapshot_id": row.get("snapshot_id"),
+                    "source_timestamp": source_timestamp,
+                    "observed_at": row.get("observed_at"),
+                    "quality": row.get("quality"),
+                }
+            )
+        if not historical:
+            return []
+        expected_start = _parse_datetime(constituent.get("start_timestamp"))
+        expected_end = _parse_datetime(constituent.get("end_timestamp"))
+        if expected_start is None or expected_end is None:
+            return None
+        if historical[0]["source_timestamp"] != expected_start or historical[-1]["source_timestamp"] != expected_end:
+            return None
+        if len(historical) != int(constituent.get("row_count", -1)):
+            return None
+
+        metadata = constituent.get("metadata")
+        token_default = market_id
+        if isinstance(metadata, Mapping):
+            token_ids = metadata.get("token_ids")
+            if isinstance(token_ids, Mapping):
+                token_default = str(token_ids.get("yes") or market_id)
+        identities: list[dict[str, Any]] = []
+        result = []
+        for row in historical:
+            payload = row["payload"]
+            price = payload.get("price", payload.get("p", payload.get("yes_mid", payload.get("value"))))
+            try:
+                price_value = float(price)
+            except (TypeError, ValueError):
+                return None
+            if not math.isfinite(price_value) or not 0.0 <= price_value <= 1.0:
+                return None
+            token_id = str(payload.get("token_id", payload.get("asset_id", token_default)) or token_default)
+            if not token_id:
+                return None
+            identity: dict[str, Any] = {
+                "timestamp": row["source_timestamp"],
+                "price": price_value,
+                "token_id": token_id,
+            }
+            order_book = payload.get("order_book", payload.get("book"))
+            if order_book is not None:
+                identity["order_book"] = order_book
+            identities.append(identity)
+            record = dict(payload)
+            record.setdefault("timestamp", row["source_timestamp"])
+            record.setdefault("yes_mid", price_value)
+            record["market_id"] = market_id
+            record["snapshot_id"] = row.get("snapshot_id")
+            record["source_timestamp"] = row["source_timestamp"]
+            record["observed_at"] = row.get("observed_at")
+            record["quality"] = row.get("quality") or payload.get("quality") or payload.get("research_quality") or constituent.get("quality") or "PRICE_PROXY"
+            result.append(record)
+        if "sha256:" + hashlib.sha256(_dump(identities).encode("utf-8")).hexdigest() != str(constituent.get("dataset_version", "")):
+            return None
+        return result
+
+    @staticmethod
+    def _with_polymarket_provenance(
+        record: Mapping[str, Any],
+        *,
+        aggregate_dataset_id: str,
+        aggregate_dataset_version: str,
+        constituent_dataset_id: str,
+        constituent_dataset_version: str,
+        market_id: str,
+        quality: str,
+    ) -> dict[str, Any]:
+        result = dict(record)
+        result.setdefault("market_id", market_id)
+        result.setdefault("source_timestamp", _parse_datetime(result.get("timestamp")))
+        result["aggregate_dataset_id"] = aggregate_dataset_id
+        result["aggregate_dataset_version"] = aggregate_dataset_version
+        result["constituent_dataset_id"] = constituent_dataset_id
+        result["constituent_dataset_version"] = constituent_dataset_version
+        result["dataset_id"] = aggregate_dataset_id
+        result["dataset_version"] = aggregate_dataset_version
+        result["quality"] = result.get("quality") or result.get("research_quality") or quality
+        if result.get("yes_mid") is None and result.get("price") is not None:
+            result["yes_mid"] = result["price"]
+        return result
     # Canonical market records ----------------------------------------
     def save_bars(
         self,

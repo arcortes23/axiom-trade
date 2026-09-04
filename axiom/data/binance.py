@@ -265,6 +265,47 @@ class BinanceAdapter(CryptoMarketDataProvider):
         levels.sort(key=lambda level: level.price, reverse=reverse)
         return levels[:depth]
 
+    def exchange_info(self, *, symbol: str | None = None) -> Mapping[str, Any] | None:
+        """Return public Spot exchange metadata without credentials."""
+        normalized = self._normalize_symbol(symbol) if symbol is not None else None
+        payload = self._get("/api/v3/exchangeInfo", symbol=normalized)
+        return payload if isinstance(payload, Mapping) else None
+
+    def exchange_symbols(self, *, quote_asset: str | None = None) -> tuple[Mapping[str, Any], ...] | None:
+        """Return public Binance symbol records, optionally narrowed by quote."""
+        payload = self.exchange_info()
+        if payload is None:
+            return None
+        records = payload.get("symbols")
+        if not isinstance(records, list):
+            return None
+        quote = str(quote_asset).strip().upper() if quote_asset is not None else None
+        return tuple(
+            dict(record)
+            for record in records
+            if isinstance(record, Mapping)
+            and (quote is None or str(record.get("quoteAsset", "")).upper() == quote)
+        )
+
+    def discover_spot_symbols(self, *, quote_asset: str = "USDT") -> tuple[str, ...] | None:
+        """Return currently tradable Spot symbols for a quote asset."""
+        records = self.exchange_symbols(quote_asset=quote_asset)
+        if records is None:
+            return None
+        symbols: list[str] = []
+        for record in records:
+            if str(record.get("status", "")).upper() != "TRADING":
+                continue
+            allowed = record.get("isSpotTradingAllowed")
+            if allowed is None:
+                permissions = record.get("permissions")
+                allowed = isinstance(permissions, (list, tuple, set)) and any(
+                    str(permission).upper() == "SPOT" for permission in permissions
+                )
+            if bool(allowed) and str(record.get("symbol", "")).strip():
+                symbols.append(str(record["symbol"]).upper())
+        return tuple(sorted(set(symbols)))
+
     def metadata(self, symbol: str) -> InstrumentMetadata | None:
         symbol = self._normalize_symbol(symbol)
         payload = self._get("/api/v3/exchangeInfo", symbol=symbol)

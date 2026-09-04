@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import math
-from statistics import mean
+from statistics import mean, median
 from typing import Any, Iterable, Mapping, Sequence
 
 from .attribution import fitness_attribution
@@ -30,6 +30,29 @@ from .tracking import ExperimentTracker
 
 
 _MAX_RESEARCH_RECORDS = 100_000
+_CRYPTO_FAMILY_NAMES: tuple[str, ...] = (
+    "dip",
+    "momentum",
+    "trend",
+    "mean_reversion",
+    "breakout",
+    "volatility",
+    "rsi",
+    "volume_filter",
+)
+
+
+def _canonical_symbol(symbol: Any) -> str:
+    return str(symbol).replace("/", "").replace("-", "").replace("_", "").strip().upper()
+
+
+def _strategy_id_prefix(symbol: str) -> str:
+    """Return the stable ``base-quote`` prefix used by deterministic strategies."""
+    normalized = _canonical_symbol(symbol)
+    for quote in ("USDT", "USDC", "BUSD", "USD", "BTC", "ETH"):
+        if normalized.endswith(quote) and len(normalized) > len(quote):
+            return f"{normalized[:-len(quote)].lower()}-{quote.lower()}"
+    return normalized.lower()
 _BUCKETS: tuple[tuple[str, float, float], ...] = (
     ("0-1c", 0.00, 0.01),
     ("1-2c", 0.01, 0.02),
@@ -89,8 +112,36 @@ def run_crypto_research(
     initial_cash: float = 10_000.0,
     store: AxiomStore | None = None,
     timeout: float = 10.0,
+    symbols: Sequence[str] | Mapping[str, Any] | None = None,
+    providers: Mapping[str, Any] | Sequence[Any] | Any | None = None,
+    symbol_providers: Mapping[str, Any] | None = None,
+    universe: Mapping[str, Any] | None = None,
+    universe_provenance: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Backtest the requested deterministic crypto families on BTC/USDT."""
+    """Backtest deterministic crypto families for one symbol.
+
+    The original single-symbol call remains the default.  Passing ``symbols``,
+    ``providers``/``symbol_providers``, and universe provenance delegates to the
+    additive multi-symbol orchestrator while retaining this stable entry point.
+    """
+    if symbols is not None or providers is not None or symbol_providers is not None:
+        requested_symbols: Sequence[str] | Mapping[str, Any]
+        if symbols is None:
+            requested_symbols = symbol_providers if symbol_providers is not None else providers if isinstance(providers, Mapping) else (symbol,)
+        else:
+            requested_symbols = symbols
+        return run_multi_symbol_crypto_research(
+            requested_symbols,
+            providers if symbol_providers is None else symbol_providers,
+            provider=provider,
+            universe=universe,
+            universe_provenance=universe_provenance,
+            start=start,
+            end=end,
+            initial_cash=initial_cash,
+            store=store,
+            timeout=timeout,
+        )
     provider = provider or BinanceAdapter(timeout=timeout)
     errors: list[str] = []
     try:
@@ -106,6 +157,11 @@ def run_crypto_research(
         instrument_metadata = None
         errors.append(f"crypto metadata error: {exc}")
     _consume_transport_errors(provider, errors, "crypto metadata")
+    coverage = {
+        "bars": len(bars),
+        "start": bars[0].timestamp.isoformat() if bars else None,
+        "end": bars[-1].timestamp.isoformat() if bars else None,
+    }
     base: dict[str, Any] = {
         "market_type": MarketType.CRYPTO_SPOT.value,
         "provider": str(getattr(provider, "provider_name", provider.__class__.__name__)),
@@ -113,11 +169,15 @@ def run_crypto_research(
         "instrument_metadata": to_record(instrument_metadata) if instrument_metadata is not None else None,
         "instrument_metadata_available": instrument_metadata is not None,
         "bars": len(bars),
+        "historical_coverage": coverage,
         "dataset_version": "",
         "simulation_quality": source_quality.value,
         "experiments": [],
+        "validation": {},
         "errors": errors,
     }
+    if universe_provenance is not None:
+        base["universe_provenance"] = _jsonable(dict(universe_provenance))
     if len(bars) < 6:
         base["limitations"] = ["fewer than six OHLCV bars; no train/validation/holdout result"]
         return base
@@ -168,7 +228,7 @@ def run_crypto_research(
                 "market_type": MarketType.CRYPTO_SPOT.value,
                 "family": family,
                 "parameters": parameters,
-                "strategy_id": f"btc-usdt-{family}",
+                "strategy_id": f"{_strategy_id_prefix(symbol)}-{family}",
             }
         )
         results = []
@@ -233,6 +293,7 @@ def run_crypto_research(
         )
         experiments.append(
             {
+                "family": family,
                 "strategy_id": definition.id,
                 "strategy_version": definition.version,
                 "quality": experiment_quality.value,
@@ -264,6 +325,16 @@ def run_crypto_research(
             }
         )
     base["experiments"] = experiments
+    base["validation"] = {
+        item["strategy_id"]: {
+            "score": item["evaluation"]["validation_score"],
+            "fitness": item["evaluation"]["fitness"],
+            "minimum_sample": item["robustness"]["minimum_sample"],
+            "rejected": item["rejected"],
+            "rejection_reason": item["rejection_reason"],
+        }
+        for item in experiments
+    }
     base["simulation_quality"] = _min_quality(
         source_quality,
         min(
@@ -278,6 +349,384 @@ def run_crypto_research(
         "Candidate selection and rejection use validation only; locked holdout values are report-only.",
     ]
     return base
+def run_multi_symbol_crypto_research(
+    symbols: Sequence[str] | Mapping[str, Any] | None = None,
+    providers: Mapping[str, Any] | Sequence[Any] | Any | None = None,
+    *,
+    provider: Any | None = None,
+    symbol_providers: Mapping[str, Any] | None = None,
+    universe: Mapping[str, Any] | None = None,
+    universe_provenance: Mapping[str, Any] | None = None,
+    universe_id: Any | None = None,
+    universe_version: Any | None = None,
+    methodology: Any | None = None,
+    survivorship_bias: Any | None = None,
+    start: datetime | None = None,
+    end: datetime | None = None,
+    initial_cash: float = 10_000.0,
+    store: AxiomStore | None = None,
+    timeout: float = 10.0,
+    max_symbols: int = 50,
+) -> dict[str, Any]:
+    """Run deterministic OHLCV research independently for every universe symbol.
+
+    ``symbols`` and ``providers`` are deliberately explicit.  A provider may be
+    shared for all symbols, or supplied as a symbol-keyed mapping.  A missing or
+    broken symbol is represented in the returned report rather than removed
+    from the denominator or converted into an aggregate average.
+    """
+    requested, provider_inputs = _research_symbol_inputs(symbols, providers, symbol_providers)
+    if isinstance(max_symbols, bool) or not isinstance(max_symbols, int) or not 1 <= max_symbols <= 50:
+        raise ValueError("max_symbols must be an integer from 1 to 50")
+    if len(requested) > max_symbols:
+        raise ValueError(f"crypto research universe exceeds max_symbols={max_symbols}")
+    provenance = _research_universe_provenance(
+        universe,
+        universe_provenance,
+        universe_id=universe_id,
+        universe_version=universe_version,
+        methodology=methodology,
+        survivorship_bias=survivorship_bias,
+    )
+    declared_symbols = provenance.get("selected_symbols", provenance.get("symbols"))
+    if isinstance(declared_symbols, Sequence) and not isinstance(declared_symbols, (str, bytes, bytearray)):
+        declared = {_canonical_symbol(item) for item in declared_symbols}
+        unexpected = sorted(symbol for symbol in requested if _canonical_symbol(symbol) not in declared)
+        if unexpected:
+            raise ValueError(f"symbols are not members of the declared universe: {unexpected}")
+    per_symbol: dict[str, dict[str, Any]] = {}
+    errors: list[str] = []
+    for symbol in requested:
+        symbol_provider = _provider_for_symbol(symbol, provider_inputs, provider)
+        if symbol_provider is None:
+            result = _failed_crypto_symbol_result(symbol, "no provider supplied for symbol")
+        else:
+            try:
+                result = run_crypto_research(
+                    symbol_provider,
+                    symbol=symbol,
+                    start=start,
+                    end=end,
+                    initial_cash=initial_cash,
+                    store=store,
+                    timeout=timeout,
+                    universe_provenance=provenance,
+                )
+            except Exception as exc:  # preserve one bad asset without aborting the universe
+                result = _failed_crypto_symbol_result(symbol, f"crypto research error: {exc}")
+        experiments = result.get("experiments", ())
+        result["status"] = "complete" if experiments else ("failed" if result.get("errors") else "insufficient_data")
+        result["symbol"] = symbol
+        result["metrics"] = {
+            str(item.get("strategy_id", "")): {
+                "train": item.get("train", {}),
+                "validation": item.get("validation", {}),
+                "holdout": item.get("holdout", {}),
+                "evaluation": item.get("evaluation", {}),
+            }
+            for item in experiments
+            if isinstance(item, Mapping)
+        }
+        result["surviving_families"] = sorted(
+            {str(item.get("family")) for item in experiments if isinstance(item, Mapping) and not item.get("rejected") and item.get("family")}
+        )
+        result["rejected_families"] = sorted(
+            {str(item.get("family")) for item in experiments if isinstance(item, Mapping) and item.get("rejected") and item.get("family")}
+        )
+        per_symbol[symbol] = result
+        for detail in result.get("errors", ()):
+            errors.append(f"{symbol}: {detail}")
+
+    family_summaries = _cross_sectional_family_summaries(requested, per_symbol)
+    coverage_by_symbol = {
+        symbol: dict(result.get("historical_coverage", {}))
+        for symbol, result in per_symbol.items()
+    }
+    starts = [item["start"] for item in coverage_by_symbol.values() if item.get("start")]
+    ends = [item["end"] for item in coverage_by_symbol.values() if item.get("end")]
+    symbols_with_data = [symbol for symbol, item in coverage_by_symbol.items() if item.get("bars", 0)]
+    all_experiments = [
+        {"symbol": symbol, **dict(experiment)}
+        for symbol in requested
+        for experiment in per_symbol[symbol].get("experiments", ())
+        if isinstance(experiment, Mapping)
+    ]
+    family_names = tuple(_CRYPTO_FAMILY_NAMES)
+    strategy_records = [
+        {
+            "family": family,
+            "version": 1,
+            "strategy_ids": [
+                str(experiment["strategy_id"])
+                for experiment in all_experiments
+                if experiment.get("family") == family
+            ],
+        }
+        for family in family_names
+    ]
+    failed_symbols = [symbol for symbol in requested if per_symbol[symbol].get("status") != "complete"]
+    report: dict[str, Any] = {
+        "market_type": MarketType.CRYPTO_SPOT.value,
+        "universe_id": provenance["universe_id"],
+        "universe_version": provenance["universe_version"],
+        "methodology": provenance["methodology"],
+        "survivorship_bias": provenance["survivorship_bias"],
+        "universe_provenance": _jsonable(provenance),
+        "universe": _jsonable(provenance),
+        "assets": [_asset_from_symbol(symbol) for symbol in requested],
+        "symbols": list(requested),
+        "assets_covered": [_asset_from_symbol(symbol) for symbol in requested],
+        "symbols_covered": list(requested),
+        "historical_coverage": {
+            "start": min(starts) if starts else None,
+            "end": max(ends) if ends else None,
+            "symbols_with_data": symbols_with_data,
+            "by_symbol": coverage_by_symbol,
+        },
+        "strategies": strategy_records,
+        "strategy_families": list(family_names),
+        "experiments": all_experiments,
+        "validation": {
+            symbol: dict(per_symbol[symbol].get("validation", {}))
+            for symbol in requested
+        },
+        "per_symbol": per_symbol,
+        "symbol_results": per_symbol,
+        "results": per_symbol,
+        "metrics": {
+            symbol: dict(per_symbol[symbol].get("metrics", {}))
+            for symbol in requested
+        },
+        "family_summaries": family_summaries,
+        "family_counts": family_summaries,
+        "cross_sectional": {
+            "family_summaries": family_summaries,
+            "family_counts": family_summaries,
+            "symbols_requested": len(requested),
+            "symbols_evaluated": len(requested) - len(failed_symbols),
+            "failed_symbols": failed_symbols,
+        },
+        "aggregate": {
+            "family_summaries": family_summaries,
+            "family_counts": family_summaries,
+            "failed_symbols": failed_symbols,
+        },
+        "surviving_families": sorted(family for family, item in family_summaries.items() if item["survivors"]),
+        "rejected_families": sorted(family for family, item in family_summaries.items() if item["rejects"]),
+        "failed_symbols": failed_symbols,
+        "bad_symbols": failed_symbols,
+        "errors": errors,
+        "live_execution": False,
+        "status": "complete" if not failed_symbols else ("failed" if len(failed_symbols) == len(requested) else "partial"),
+    }
+    return _jsonable(report)
+
+
+def _research_symbol_inputs(
+    symbols: Sequence[str] | Mapping[str, Any] | None,
+    providers: Mapping[str, Any] | Sequence[Any] | Any | None,
+    symbol_providers: Mapping[str, Any] | None,
+) -> tuple[tuple[str, ...], Mapping[str, Any] | Sequence[Any] | Any | None]:
+    supplied_mapping = symbols if isinstance(symbols, Mapping) else None
+    if supplied_mapping is not None:
+        if symbol_providers is None and providers is None:
+            providers = supplied_mapping
+        symbols = tuple(str(key) for key in supplied_mapping)
+    elif symbols is None:
+        if symbol_providers is not None:
+            symbols = tuple(str(key) for key in symbol_providers)
+        elif isinstance(providers, Mapping):
+            symbols = tuple(str(key) for key in providers)
+        else:
+            raise ValueError("symbols must be supplied for multi-symbol crypto research")
+    elif isinstance(symbols, str):
+        symbols = (symbols,)
+    original = tuple(str(item).strip() for item in symbols)
+    if not original or any(not item for item in original):
+        raise ValueError("symbols must contain non-empty values")
+    if symbol_providers is not None:
+        providers = symbol_providers
+    if isinstance(providers, Sequence) and not isinstance(providers, (str, bytes, bytearray)):
+        if len(providers) != len(original):
+            raise ValueError("provider sequence must match symbols")
+        providers = {symbol: item for symbol, item in zip(original, providers)}
+    requested = tuple(sorted(original, key=lambda item: (_canonical_symbol(item), item)))
+    canonical = [_canonical_symbol(item) for item in requested]
+    if len(set(canonical)) != len(canonical):
+        raise ValueError("symbols must not contain duplicates")
+    return requested, providers
+
+
+def _provider_for_symbol(
+    symbol: str,
+    providers: Mapping[str, Any] | Sequence[Any] | Any | None,
+    shared: Any | None,
+) -> Any | None:
+    if shared is not None:
+        return shared
+    if isinstance(providers, Mapping):
+        if symbol in providers:
+            return providers[symbol]
+        key = _canonical_symbol(symbol)
+        for candidate, value in providers.items():
+            if _canonical_symbol(candidate) == key:
+                return value
+        return None
+    if isinstance(providers, Sequence) and not isinstance(providers, (str, bytes, bytearray)):
+        return providers[0] if len(providers) == 1 else None
+    return providers
+
+
+def _research_universe_provenance(
+    universe: Mapping[str, Any] | None,
+    supplied: Mapping[str, Any] | None,
+    *,
+    universe_id: Any | None,
+    universe_version: Any | None,
+    methodology: Any | None,
+    survivorship_bias: Any | None,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for source in (universe, supplied):
+        if source is not None:
+            if not isinstance(source, Mapping):
+                raise TypeError("universe provenance must be a mapping")
+            result.update(dict(source))
+    nested = result.get("provenance")
+    if isinstance(nested, Mapping):
+        merged = dict(nested)
+        merged.update(result)
+        result = merged
+    def choose(explicit: Any | None, *keys: str, default: Any = None) -> Any:
+        if explicit is not None:
+            return explicit
+        for key in keys:
+            if key in result and result[key] not in (None, ""):
+                return result[key]
+        return default
+    resolved_id = choose(universe_id, "universe_id", "id")
+    resolved_version = choose(universe_version, "universe_version", "version", "snapshot_hash", "snapshot_version")
+    if resolved_id in (None, "") or resolved_version in (None, ""):
+        raise ValueError("versioned universe provenance requires universe_id and universe_version")
+    result["universe_id"] = resolved_id
+    result["universe_version"] = resolved_version
+    result["methodology"] = choose(methodology, "methodology", "method", "policy", default="unspecified")
+    result["survivorship_bias"] = choose(
+        survivorship_bias,
+        "survivorship_bias",
+        "survivorship",
+        default="unspecified",
+    )
+    return result
+
+
+def _failed_crypto_symbol_result(symbol: str, error: str) -> dict[str, Any]:
+    return {
+        "market_type": MarketType.CRYPTO_SPOT.value,
+        "provider": None,
+        "instrument": symbol,
+        "instrument_metadata": None,
+        "instrument_metadata_available": False,
+        "bars": 0,
+        "historical_coverage": {"bars": 0, "start": None, "end": None},
+        "dataset_version": "",
+        "simulation_quality": SimulationQuality.LOW.value,
+        "experiments": [],
+        "validation": {},
+        "errors": [error],
+        "limitations": [error],
+    }
+
+
+def _asset_from_symbol(symbol: str) -> str:
+    normalized = _canonical_symbol(symbol)
+    for quote in ("USDT", "USDC", "BUSD", "USD", "BTC", "ETH"):
+        if normalized.endswith(quote) and len(normalized) > len(quote):
+            return normalized[:-len(quote)]
+    return normalized
+
+
+def _distribution(values: Iterable[Any]) -> dict[str, Any]:
+    finite: list[float] = []
+    for value in values:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(number):
+            finite.append(number)
+    return {
+        "count": len(finite),
+        "values": finite,
+        "min": min(finite) if finite else None,
+        "max": max(finite) if finite else None,
+        "median": median(finite) if finite else None,
+    }
+
+
+def _cross_sectional_family_summaries(
+    symbols: Sequence[str],
+    per_symbol: Mapping[str, Mapping[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    output: dict[str, dict[str, Any]] = {}
+    for family in _CRYPTO_FAMILY_NAMES:
+        surviving_symbols: list[str] = []
+        rejected_symbols: list[str] = []
+        failed_symbols: list[str] = []
+        fitness: list[Any] = []
+        validation_returns: list[Any] = []
+        holdout_returns: list[Any] = []
+        evaluated = 0
+        for symbol in symbols:
+            experiments = [
+                item for item in per_symbol[symbol].get("experiments", ())
+                if isinstance(item, Mapping) and item.get("family") == family
+            ]
+            if not experiments:
+                failed_symbols.append(symbol)
+                continue
+            evaluated += 1
+            experiment = experiments[0]
+            if experiment.get("rejected"):
+                rejected_symbols.append(symbol)
+            else:
+                surviving_symbols.append(symbol)
+            evaluation = experiment.get("evaluation", {})
+            fitness.append(evaluation.get("fitness") if isinstance(evaluation, Mapping) else None)
+            validation = experiment.get("validation", {})
+            holdout = experiment.get("holdout", {})
+            validation_returns.append(validation.get("total_return") if isinstance(validation, Mapping) else None)
+            holdout_returns.append(holdout.get("total_return") if isinstance(holdout, Mapping) else None)
+        distributions = {
+            "fitness": _distribution(fitness),
+            "validation_total_return": _distribution(validation_returns),
+            "holdout_total_return": _distribution(holdout_returns),
+        }
+        output[family] = {
+            "family": family,
+            "symbols": list(symbols),
+            "symbol_count": len(symbols),
+            "evaluated": evaluated,
+            "survivors": len(surviving_symbols),
+            "rejects": len(rejected_symbols),
+            "failures": len(failed_symbols),
+            "survivor_count": len(surviving_symbols),
+            "reject_count": len(rejected_symbols),
+            "failed_count": len(failed_symbols),
+            "surviving_symbols": surviving_symbols,
+            "rejected_symbols": rejected_symbols,
+            "failed_symbols": failed_symbols,
+            "distribution": distributions,
+            "distributions": distributions,
+        }
+    return output
+
+# Explicit names used by integrations that describe the same additive API
+# either as a universe run or as a multi-symbol run.
+run_crypto_universe_research = run_multi_symbol_crypto_research
+run_crypto_research_multi = run_multi_symbol_crypto_research
+run_crypto_research_multi_symbol = run_multi_symbol_crypto_research
+
 
 
 def run_prediction_research(
@@ -742,4 +1191,14 @@ def _consume_transport_errors(provider: Any, errors: list[str], context: str) ->
         errors.append(f"{context}: {detail}")
 
 
-__all__ = ["ResearchReport", "run_crypto_research", "run_initial_research", "run_prediction_research", "write_report"]
+__all__ = [
+    "ResearchReport",
+    "run_crypto_research",
+    "run_multi_symbol_crypto_research",
+    "run_crypto_universe_research",
+    "run_crypto_research_multi",
+    "run_crypto_research_multi_symbol",
+    "run_initial_research",
+    "run_prediction_research",
+    "write_report",
+]

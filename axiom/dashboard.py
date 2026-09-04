@@ -130,6 +130,7 @@ _ENDPOINTS = (
     "research",
     "research-summary",
     "crypto",
+    "crypto-research",
     "btc-research",
     "prediction",
     "polymarket-research",
@@ -147,7 +148,7 @@ _ENDPOINTS = (
     "evidence-maturity",
     "strategy",
 )
-_V2_ENDPOINTS = ("datasets", "activity", "candidates", "polymarket", "hermes", "paper")
+_V2_ENDPOINTS = ("datasets", "activity", "candidates", "polymarket", "hermes", "crypto-research", "crypto", "paper")
 
 _DEFAULT_PAGE_SIZE = 25
 _PAGE_SIZE_OPTIONS = (10, 25, 50, 100)
@@ -223,6 +224,8 @@ def _pagination_params(query: Mapping[str, Any] | None = None) -> dict[str, Any]
         "item_id": first("item_id", "") or None,
         "record_type": first("record_type", "") or None,
         "dataset_version": first("dataset_version", "") or None,
+        "symbol": first("symbol", "") or None,
+        "universe_version": first("universe_version", "") or None,
     }
 
 
@@ -262,6 +265,107 @@ def _jsonable(value: Any) -> Any:
         return value.value
     return value
 
+
+def _bounded_value(value: Any, *, depth: int = 0) -> Any:
+    """Compact nested persisted values before putting them on a dashboard row."""
+    if depth >= 4:
+        return "<truncated>"
+    if isinstance(value, Mapping):
+        return {
+            str(key): _bounded_value(child, depth=depth + 1)
+            for key, child in islice(value.items(), 32)
+        }
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [_bounded_value(child, depth=depth + 1) for child in list(value)[:32]]
+    if isinstance(value, (datetime, date)):
+        return _jsonable(value)
+    if isinstance(value, str):
+        return value if len(value) <= 1024 else value[:1021] + "..."
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return _jsonable(value)
+
+
+def _nested_value(*sources: Mapping[str, Any], keys: tuple[str, ...]) -> Any:
+    for source in sources:
+        for key in keys:
+            value = source.get(key)
+            if value is not None and value != "":
+                return value
+    return None
+
+
+def _hermes_reason_code(row: Mapping[str, Any], result: Mapping[str, Any], payload: Mapping[str, Any]) -> str | None:
+    value = _nested_value(result, payload, row, keys=("reason_code", "rejection_code", "error_code"))
+    if value is None:
+        return None
+    return str(value).strip() or None
+
+
+def _hermes_human_reason(row: Mapping[str, Any], result: Mapping[str, Any], payload: Mapping[str, Any]) -> str | None:
+    value = _nested_value(
+        result,
+        payload,
+        row,
+        keys=("human_reason", "reason", "rejection_reason", "detail", "last_error", "error"),
+    )
+    if isinstance(value, Mapping):
+        value = value.get("message") or value.get("detail") or value.get("reason")
+    if value is None:
+        return None
+    return str(value).strip() or None
+
+
+def _hermes_row(item: Mapping[str, Any]) -> dict[str, Any]:
+    """Expose queue provenance without requiring callers to decode JSON payloads."""
+    payload = item.get("payload")
+    payload = payload if isinstance(payload, Mapping) else {}
+    result = item.get("result")
+    result = result if isinstance(result, Mapping) else {}
+    dataset_id = _nested_value(result, payload, keys=("dataset_id", "dataset", "data_id"))
+    dataset_version = _nested_value(
+        result,
+        payload,
+        keys=("dataset_version", "data_version", "version"),
+    )
+    family = _nested_value(
+        result,
+        payload,
+        keys=("family", "experiment_family", "strategy_family"),
+    )
+    reason_code = _hermes_reason_code(item, result, payload)
+    human_reason = _hermes_human_reason(item, result, payload)
+    timestamp = item.get("updated_at") or item.get("created_at")
+    row = {
+        "time": timestamp,
+        "created_at": item.get("created_at"),
+        "updated_at": item.get("updated_at"),
+        "item_id": item.get("item_id"),
+        "source": item.get("source"),
+        "status": item.get("status"),
+        "dataset_id": dataset_id,
+        "dataset_version": dataset_version,
+        "version": dataset_version,
+        "family": family,
+        "attempts": item.get("attempts", 0),
+        "reason_code": reason_code,
+        "last_error": item.get("last_error"),
+        "human_reason": human_reason,
+        "reason": human_reason,
+        "item_type": item.get("item_type"),
+        "payload": _bounded_value(payload),
+        "result": _bounded_value(result) if result else None,
+    }
+    # Preserve queue columns used by existing automation while replacing only
+    # unbounded nested values with compact representations.
+    for key, value in item.items():
+        if key not in row:
+            row[key] = _bounded_value(value)
+    return row
+
+
+def _is_terminal_hermes_status(value: Any) -> bool:
+    return str(value or "").upper() in {"ACCEPTED", "COMPLETED", "REJECTED", "FAILED"}
 
 def _candidate_record(candidate: Any) -> dict[str, Any]:
     strategy = getattr(candidate, "strategy", None)
@@ -687,7 +791,19 @@ class DashboardData:
 
     def paginate_research_queue(self, params: Mapping[str, Any] | None = None) -> dict[str, Any]:
         values = _pagination_params(params)
-        values["sort"] = values.get("sort") or "priority"
+        requested_sort = values.get("sort") or "priority"
+        # The storage paginator sorts on persisted columns.  Derived display
+        # columns use their closest stable provenance key, then expose their
+        # real values in each bounded row.
+        values["sort"] = {
+            "time": "updated_at",
+            "dataset_id": "item_id",
+            "dataset_version": "item_id",
+            "version": "item_id",
+            "family": "item_type",
+            "reason_code": "status",
+            "human_reason": "updated_at",
+        }.get(str(requested_sort).lower(), requested_sort)
         result = self._store_page(
             "paginate_research_queue",
             values,
@@ -698,16 +814,300 @@ class DashboardData:
             filter=values.get("filter"),
         )
         if result["items"] or callable(getattr(self.store, "paginate_research_queue", None)):
+            result["items"] = [
+                _hermes_row(item)
+                for item in result.get("items", [])
+                if isinstance(item, Mapping)
+            ]
             return result
         if self.store is None or not callable(getattr(self.store, "list_research_items", None)):
+            configured = self._configured("hermes")
+            if isinstance(configured, Mapping):
+                records = configured.get("items", configured.get("queue", []))
+                records = [item for item in records if isinstance(item, Mapping)] if isinstance(records, list) else []
+                needle = str(values.get("filter") or "").lower()
+                if values.get("status"):
+                    records = [item for item in records if str(item.get("status", "")).upper() == str(values["status"]).upper()]
+                if values.get("item_id"):
+                    records = [item for item in records if str(item.get("item_id")) == str(values["item_id"])]
+                if needle:
+                    records = [item for item in records if needle in json.dumps(_jsonable(item), sort_keys=True).lower()]
+                records = [_hermes_row(item) for item in records]
+                records.sort(key=lambda item: str(item.get("item_id", "")))
+                if values.get("direction") == "desc":
+                    records.reverse()
+                start = (values["page"] - 1) * values["page_size"]
+                return _page_result(records[start : start + values["page_size"]], page=values["page"], page_size=values["page_size"], total=len(records))
             return result
         limit = min(_MAX_SIZE_FALLBACK, values["page"] * values["page_size"])
         records = self.store.list_research_items(status=values.get("status"), limit=limit)
         needle = str(values.get("filter") or "").lower()
         if needle:
             records = [item for item in records if needle in json.dumps(_jsonable(item), sort_keys=True).lower()]
+        rows = [_hermes_row(item) for item in records if isinstance(item, Mapping)]
         offset = (values["page"] - 1) * values["page_size"]
-        return _page_result(records[offset : offset + values["page_size"]], page=values["page"], page_size=values["page_size"], total=len(records))
+        return _page_result(rows[offset : offset + values["page_size"]], page=values["page"], page_size=values["page_size"], total=len(rows))
+    def hermes_detail(self, item_id: str) -> dict[str, Any]:
+        """Return one queue item with human-readable, bounded evidence."""
+        identifier = str(item_id).strip()
+        item: Mapping[str, Any] | None = None
+        if self.store is not None and callable(getattr(self.store, "get_research_item", None)):
+            item = self.store.get_research_item(identifier)
+        if item is None:
+            page = self.paginate_research_queue(
+                {"page": 1, "page_size": 10, "item_id": identifier, "sort": "item_id", "direction": "asc"}
+            )
+            candidates = page.get("items", []) if isinstance(page, Mapping) else []
+            item = candidates[0] if candidates and isinstance(candidates[0], Mapping) else None
+        if item is None:
+            return {
+                "available": False,
+                "item_id": identifier,
+                "error": "Hermes item not found",
+                "live_execution": False,
+            }
+        row = _hermes_row(item)
+        payload = item.get("payload")
+        payload = payload if isinstance(payload, Mapping) else {}
+        result = item.get("result")
+        result = result if isinstance(result, Mapping) else {}
+        events: list[Any] = []
+        if self.store is not None and callable(getattr(self.store, "list_research_queue_events", None)):
+            events = self.store.list_research_queue_events(identifier, limit=64)
+        statement = _nested_value(result, payload, keys=("statement", "hypothesis", "thesis"))
+        tests = _nested_value(result, payload, keys=("tests", "validation_plan", "test_plan"))
+        plan = _nested_value(result, payload, keys=("plan", "experiment_plan", "plan_id"))
+        return {
+            "available": True,
+            "item_id": identifier,
+            "item": row,
+            # Keep the common page shape for clients that used the old detail
+            # endpoint, while making all evidence available by named fields.
+            "items": [row],
+            "page": 1,
+            "page_size": 1,
+            "total": 1,
+            "pages": 1,
+            "time": row.get("time"),
+            "source": row.get("source"),
+            "status": row.get("status"),
+            "dataset_id": row.get("dataset_id"),
+            "dataset_version": row.get("dataset_version"),
+            "family": row.get("family"),
+            "attempts": row.get("attempts", 0),
+            "reason_code": row.get("reason_code"),
+            "last_error": row.get("last_error"),
+            "human_reason": row.get("human_reason"),
+            "statement": _bounded_value(statement),
+            "tests": _bounded_value(tests),
+            "plan": _bounded_value(plan),
+            "lifecycle_events": [_bounded_value(event) for event in events[:64]],
+            "final_result": _bounded_value(result) if result else None,
+            "rejection": (
+                {
+                    "reason_code": row.get("reason_code"),
+                    "reason": row.get("human_reason"),
+                    "exact": row.get("human_reason") or row.get("last_error"),
+                }
+                if str(row.get("status", "")).upper() in {"REJECTED", "FAILED"}
+                else None
+            ),
+            "rejection_reason": row.get("human_reason") if str(row.get("status", "")).upper() in {"REJECTED", "FAILED"} else None,
+            "paper_only": True,
+            "live_execution": False,
+        }
+
+    @staticmethod
+    def _crypto_catalog_row(item: Mapping[str, Any]) -> dict[str, Any]:
+        metadata = item.get("metadata")
+        metadata = metadata if isinstance(metadata, Mapping) else {}
+        symbol = str(item.get("instrument") or item.get("symbol") or "").strip()
+        symbols = _nested_value(item, metadata, keys=("symbols", "symbol"))
+        if isinstance(symbols, str):
+            symbols = [symbols]
+        elif not isinstance(symbols, (list, tuple, set, frozenset)):
+            symbols = [symbol] if symbol else []
+        assets = _nested_value(item, metadata, keys=("assets", "asset"))
+        if isinstance(assets, str):
+            assets = [assets]
+        elif not isinstance(assets, (list, tuple, set, frozenset)):
+            assets = list(symbols)
+        universe_version = _nested_value(
+            item,
+            metadata,
+            keys=("universe_version", "universeVersion", "catalog_version"),
+        )
+        coverage = _nested_value(item, metadata, keys=("coverage", "coverage_summary"))
+        if not isinstance(coverage, Mapping):
+            coverage = {
+                "start": item.get("start_timestamp"),
+                "end": item.get("end_timestamp"),
+                "rows": item.get("row_count", 0),
+                "completeness": item.get("completeness", 0.0),
+                "missing_ranges": item.get("missing_ranges", []),
+            }
+        return {
+            **{str(key): _bounded_value(value) for key, value in item.items() if key != "metadata"},
+            "dataset_id": item.get("dataset_id"),
+            "dataset_version": item.get("dataset_version"),
+            "symbol": symbol,
+            "symbols": [_bounded_value(value) for value in list(symbols)[:32]],
+            "assets": [_bounded_value(value) for value in list(assets)[:32]],
+            "universe_version": universe_version,
+            "coverage": _bounded_value(coverage),
+            "strategies": _bounded_value(_nested_value(item, metadata, keys=("strategies", "strategy")) or []),
+            "experiments": _bounded_value(_nested_value(item, metadata, keys=("experiments", "experiment")) or []),
+            "validation": _bounded_value(_nested_value(item, metadata, keys=("validation", "validation_summary")) or {}),
+            "families": _bounded_value(_nested_value(item, metadata, keys=("families", "family")) or []),
+            "metadata": _bounded_value(metadata),
+        }
+
+    @staticmethod
+    def _crypto_report_row(item: Mapping[str, Any]) -> dict[str, Any] | None:
+        report = item.get("report")
+        report = report if isinstance(report, Mapping) else {}
+        text = json.dumps(_jsonable(report), sort_keys=True).lower()
+        is_crypto = (
+            "crypto" in text
+            or "btc_historical" in text
+            or str(item.get("experiment_id", "")).lower().startswith(("crypto", "btcusdt"))
+        )
+        if not is_crypto:
+            return None
+        return {
+            "report_id": item.get("report_id"),
+            "experiment_id": item.get("experiment_id"),
+            "created_at": item.get("created_at"),
+            "kind": report.get("kind", report.get("report_type")),
+            "report_type": report.get("report_type", report.get("kind")),
+            "universe_version": _nested_value(report, keys=("universe_version", "catalog_version")),
+            "assets": _bounded_value(report.get("assets", [])),
+            "symbols": _bounded_value(report.get("symbols", report.get("instruments", []))),
+            "coverage": _bounded_value(report.get("coverage", report.get("coverage_summary", {}))),
+            "strategies": _bounded_value(report.get("strategies", report.get("strategy", []))),
+            "experiments": _bounded_value(report.get("experiments", report.get("experiment", []))),
+            "validation": _bounded_value(report.get("validation", report.get("validation_summary", {}))),
+            "families": _bounded_value(report.get("families", report.get("family", []))),
+            "report": _bounded_value(report),
+        }
+
+    def paginate_crypto_research(self, params: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        """Page every persisted crypto catalog, with compact report context."""
+        values = _pagination_params(params)
+        values["sort"] = values.get("sort") or "updated_at"
+        requested_symbol = str(values.get("symbol") or "").strip()
+        configured = self._configured("crypto-research")
+        if isinstance(configured, Mapping) and self.store is None:
+            raw_catalogs = configured.get("catalogs", configured.get("catalog", []))
+            if not raw_catalogs:
+                raw_catalogs = list(configured.get("historical", [])) + list(configured.get("forward", []))
+            records = [
+                item for item in raw_catalogs
+                if isinstance(item, Mapping)
+                and str(item.get("market_type", "crypto_spot")).lower() == "crypto_spot"
+            ]
+            if requested_symbol:
+                needle = requested_symbol.replace("/", "").replace("-", "").upper()
+                records = [
+                    item for item in records
+                    if needle in str(item.get("instrument", item.get("symbol", ""))).replace("/", "").replace("-", "").upper()
+                ]
+            if values.get("filter"):
+                needle = str(values["filter"]).lower()
+                records = [item for item in records if needle in json.dumps(_jsonable(item), sort_keys=True).lower()]
+            records = [self._crypto_catalog_row(item) for item in records]
+            reverse = values["direction"] == "desc"
+            records.sort(key=lambda item: str(item.get(values["sort"], item.get("updated_at", ""))), reverse=reverse)
+            total = len(records)
+            start = (values["page"] - 1) * values["page_size"]
+            page_rows = records[start : start + values["page_size"]]
+            reports_raw = configured.get("reports", [])
+            reports = [
+                row for item in reports_raw if isinstance(item, Mapping)
+                for row in [self._crypto_report_row(item)]
+                if row is not None
+            ][:20]
+            return self._crypto_research_result(page_rows, reports, values, total=total)
+        result = self._store_page(
+            "paginate_dataset_catalog",
+            values,
+            source_type=values.get("source_type"),
+            market_type="crypto_spot",
+            instrument=requested_symbol or None,
+            filter=values.get("filter"),
+        )
+        rows = [
+            self._crypto_catalog_row(item)
+            for item in result.get("items", [])
+            if isinstance(item, Mapping)
+        ]
+        reports: list[dict[str, Any]] = []
+        if self.store is not None and callable(getattr(self.store, "list_reports", None)):
+            for item in self.store.list_reports(limit=100, newest_first=True):
+                if isinstance(item, Mapping):
+                    report_row = self._crypto_report_row(item)
+                    if report_row is not None:
+                        reports.append(report_row)
+                        if len(reports) >= 20:
+                            break
+        return self._crypto_research_result(rows, reports, values, total=int(result.get("total", len(rows))))
+
+    def _crypto_research_result(
+        self,
+        rows: list[dict[str, Any]],
+        reports: list[dict[str, Any]],
+        values: Mapping[str, Any],
+        *,
+        total: int,
+    ) -> dict[str, Any]:
+        symbols = sorted({str(symbol) for row in rows for symbol in row.get("symbols", []) if str(symbol).strip()})
+        assets = sorted({str(asset) for row in rows for asset in row.get("assets", []) if str(asset).strip()})
+        universe_versions = [row.get("universe_version") for row in rows if row.get("universe_version")]
+        universe_versions.extend(report.get("universe_version") for report in reports if report.get("universe_version"))
+        def collect(key: str) -> list[Any]:
+            values_out: list[Any] = []
+            for row in rows + reports:
+                value = row.get(key)
+                if isinstance(value, (list, tuple, set, frozenset)):
+                    values_out.extend(value)
+                elif value not in (None, "", {}):
+                    values_out.append(value)
+            unique: list[Any] = []
+            seen: set[str] = set()
+            for value in values_out:
+                marker = json.dumps(_jsonable(value), sort_keys=True, default=str)
+                if marker not in seen:
+                    seen.add(marker)
+                    unique.append(_bounded_value(value))
+            return unique[:64]
+        return {
+            **_page_result(rows, page=int(values["page"]), page_size=int(values["page_size"]), total=total),
+            "available": bool(total or reports),
+            "catalogs": rows,
+            "catalog": rows,
+            "reports": reports,
+            "universe_version": universe_versions[0] if universe_versions else None,
+            "universe_versions": list(dict.fromkeys(str(value) for value in universe_versions))[:32],
+            "assets": assets[:64],
+            "asset_count": len(assets),
+            "symbols": symbols[:64],
+            "symbol_count": len(symbols),
+            "coverage": collect("coverage"),
+            "strategies": collect("strategies"),
+            "experiments": collect("experiments"),
+            "validation": collect("validation"),
+            "families": collect("families"),
+            "paper_only": True,
+            "live_execution": False,
+        }
+
+    def crypto_research_detail(self, symbol: str) -> dict[str, Any]:
+        result = self.paginate_crypto_research(
+            {"page": 1, "page_size": _MAX_PAGE_SIZE, "symbol": unquote(str(symbol)), "sort": "dataset_id", "direction": "asc"}
+        )
+        result["selected_symbol"] = unquote(str(symbol))
+        return result
+
 
     def paginate_paper_records(self, params: Mapping[str, Any] | None = None) -> dict[str, Any]:
         values = _pagination_params(params)
@@ -783,15 +1183,18 @@ class DashboardData:
             return self.strategy_detail(identifier)
         if name.lower().startswith("hermes/"):
             identifier = unquote(name.split("/", 1)[1])
-            detail_params = dict(params or {})
-            detail_params["item_id"] = identifier
-            return self.paginate_research_queue(detail_params)
+            return self.hermes_detail(identifier)
+        if name.lower().startswith("crypto-research/"):
+            identifier = unquote(name.split("/", 1)[1])
+            return self.crypto_research_detail(identifier)
         handlers = {
             "datasets": self.paginate_dataset_catalog,
             "activity": self.paginate_research_activity,
             "candidates": self.paginate_candidate_lifecycle,
             "polymarket": self.paginate_polymarket_markets,
             "hermes": self.paginate_research_queue,
+            "crypto-research": self.paginate_crypto_research,
+            "crypto": self.paginate_crypto_research,
             "paper": self.paginate_paper_records,
         }
         handler = handlers.get(name.lower())
@@ -1420,6 +1823,35 @@ class DashboardData:
             "expectancy": _number_or_zero(portfolio.get("expectancy", 0.0)),
         }
 
+    def _latest_hermes_outcome(self) -> dict[str, Any] | None:
+        page = self.paginate_research_queue(
+            {"page": 1, "page_size": _MAX_PAGE_SIZE, "sort": "updated_at", "direction": "desc"}
+        )
+        rows = [
+            item for item in page.get("items", [])
+            if isinstance(item, Mapping) and _is_terminal_hermes_status(item.get("status"))
+        ]
+        if not rows:
+            return None
+        rows.sort(
+            key=lambda item: parse_timestamp(item.get("time") or item.get("updated_at") or item.get("created_at"))
+            or datetime.min.replace(tzinfo=datetime.now().astimezone().tzinfo),
+            reverse=True,
+        )
+        row = rows[0]
+        return {
+            "time": row.get("time"),
+            "item_id": row.get("item_id"),
+            "status": row.get("status"),
+            "reason_code": row.get("reason_code"),
+            "human_reason": row.get("human_reason"),
+            "dataset_id": row.get("dataset_id"),
+            "dataset_version": row.get("dataset_version"),
+            "family": row.get("family"),
+            "attempts": row.get("attempts", 0),
+            "live_execution": False,
+        }
+
     def operator_data(self) -> dict[str, Any]:
         configured = self._configured("operator")
         if configured is not None:
@@ -1448,6 +1880,8 @@ class DashboardData:
             "PAPER_PROMOTABLE": 0,
             "REJECTED": 0,
         }
+        crypto_research = self.paginate_crypto_research({"page": 1, "page_size": 50})
+        latest_hermes_outcome = self._latest_hermes_outcome()
         funnel = self.store.candidate_lifecycle_funnel() if self.store is not None else {}
         for key, value in funnel.items():
             stages[str(key)] = int(value)
@@ -1490,14 +1924,18 @@ class DashboardData:
             for item in unhealthy:
                 payload = item.get("payload", {})
                 if isinstance(payload, Mapping):
-                    node_reason = payload.get("last_error") or payload.get("error")
+                    node_reason = _nested_value(
+                        payload,
+                        keys=("last_error", "error", "reason", "degraded_reason", "latest_reason", "failure_reason"),
+                    )
                 if node_reason:
                     break
             if not node_reason and node_state in {"stale", "degraded"}:
                 node_reason = "Worker heartbeat, identity, lock ownership, or health grade is degraded."
             if not node_reason and status.get("health_grade"):
                 node_reason = f"Health monitor grade is {status['health_grade']}."
-        crypto_label = "READY" if catalogs.get("historical_count", 0) else ("UPDATING" if any(str(item.get("status")).upper() == "RUNNING" for item in btc_states) else "NOT INITIALIZED")
+        crypto_catalog_count = int(crypto_research.get("total", 0) or 0) if isinstance(crypto_research, Mapping) else 0
+        crypto_label = "READY" if crypto_catalog_count else ("UPDATING" if any(str(item.get("status")).upper() == "RUNNING" for item in btc_states) else "NOT INITIALIZED")
         polymarket_label = "READY" if catalogs.get("forward_count", 0) else ("UPDATING" if any(str(item.get("status")).upper() == "RUNNING" for item in forward_states) else "NOT INITIALIZED")
         hermes_workers = [
             str(item.get("status", "")).lower()
@@ -1534,15 +1972,21 @@ class DashboardData:
                 "experiments_run": int(count.get("experiments", 0)),
                 "active_hypotheses": int(hermes.get("pending", 0)),
                 "candidates_alive": sum(value for key, value in stages.items() if key != "REJECTED"),
+                "candidate_rejected": stages["REJECTED"],
+                "research_rejected": int(hermes.get("rejected", 0) or 0),
+                # Kept as an additive compatibility alias for existing clients.
                 "rejected": stages["REJECTED"],
                 "paper_forward": stages["PAPER_FORWARD"],
                 "paper_promotable": stages["PAPER_PROMOTABLE"],
+                "newest_hermes_outcome": latest_hermes_outcome,
             },
-            "coverage": overview_coverage,
+            "coverage": catalogs,
             "activity": activity_rows,
             "lifecycle_funnel": stages,
             "candidates": candidate_rows,
             "btc": self.btc_research_data(catalog_data=catalogs),
+            "crypto_research": crypto_research,
+            "hermes_latest_outcome": latest_hermes_outcome,
             "polymarket": self.polymarket_research_data(catalog_data=catalogs, current_data=polymarket_current),
             "paper_portfolio": paper,
             "hermes": hermes,
@@ -1556,7 +2000,7 @@ class DashboardData:
             "live_execution": False,
         }
 
-    def snapshot(self, endpoint: str) -> Any:
+    def snapshot(self, endpoint: str, params: Mapping[str, Any] | None = None) -> Any:
         raw_endpoint = endpoint.strip("/")
         endpoint = raw_endpoint.lower()
         if endpoint.startswith("strategy/"):
@@ -1573,6 +2017,8 @@ class DashboardData:
             return self.research_summary_data()
         if endpoint == "autonomous-research":
             return self.autonomous_research_data()
+        if endpoint == "crypto-research":
+            return self.paginate_crypto_research(params)
         if endpoint == "crypto":
             return self.crypto()
         if endpoint == "btc-research":
@@ -1645,7 +2091,7 @@ def _dashboard_html() -> str:
 <body>
   <header><div class="topbar"><div><div class="eyebrow">Read-only research operations</div><h1>AXIOM / operator console</h1><p class="subtitle">Historical evidence, forward observation, and paper lifecycle in one view.</p></div><div class="live-lock">Live trading <strong>Disabled</strong><br>Paper risk engine <strong>Active</strong></div></div>
     <nav aria-label="Research sections">
-      <button class="tab active" data-view="overview">Overview</button><button class="tab" data-view="datasets">DATASETS</button><button class="tab" data-view="activity">ACTIVITY</button><button class="tab" data-view="btc">BTC Research</button><button class="tab" data-view="polymarket">Polymarket</button><button class="tab" data-view="candidates">Candidates</button><button class="tab" data-view="hermes">Hermes</button><button class="tab" data-view="portfolio">Paper Portfolio</button><button class="tab" data-view="canary">REAL CANARY</button>
+      <button class="tab active" data-view="overview">Overview</button><button class="tab" data-view="datasets">DATASETS</button><button class="tab" data-view="activity">ACTIVITY</button><button class="tab" data-view="crypto">CRYPTO RESEARCH</button><button class="tab" data-view="polymarket">Polymarket</button><button class="tab" data-view="candidates">Candidates</button><button class="tab" data-view="hermes">Hermes</button><button class="tab" data-view="portfolio">Paper Portfolio</button><button class="tab" data-view="canary">REAL CANARY</button>
     </nav>
   </header>
   <main>
@@ -1659,7 +2105,7 @@ def _dashboard_html() -> str:
     </section>
     <section id="view-datasets" class="view"><article class="panel"><div class="section-title"><h2>DATASETS</h2><span id="dataset-total" class="muted"></span></div><div class="filters"><input id="datasets-filter" placeholder="Filter dataset, instrument, source" aria-label="Filter datasets"><select id="datasets-source"><option value="">All sources</option><option>HISTORICAL</option><option>FORWARD_COLLECTED</option></select><select id="datasets-size"><option>25</option><option>50</option><option>100</option></select></div><div id="datasets-table" class="scroll"></div><div id="datasets-pager" class="pager"></div></article><article id="dataset-detail" class="panel"></article></section>
     <section id="view-activity" class="view"><article class="panel"><div class="section-title"><h2>ACTIVITY</h2><span id="activity-total" class="muted"></span></div><div class="filters"><input id="activity-filter" placeholder="Filter activity" aria-label="Filter activity"><select id="activity-status"><option value="">All statuses</option><option>PENDING</option><option>RUNNING</option><option>COMPLETE</option><option>COMPLETED</option><option>ACCEPTED</option><option>FAILED</option><option>ERROR</option><option>REJECTED</option></select><select id="activity-size"><option>25</option><option>50</option><option>100</option></select></div><div id="activity-table" class="scroll"></div><div id="activity-pager" class="pager"></div></article></section>
-    <section id="view-btc" class="view"><article class="panel"><div class="section-title"><h2>BTC / USDT historical research</h2><span class="badge good">historical only</span></div><div id="btc-summary"></div><div id="btc-experiments" class="scroll"></div><div class="notice">Walk-forward results are deterministic and paper-only; no live execution path exists.</div></article></section>
+    <section id="view-crypto" class="view"><article class="panel"><div class="section-title"><h2>CRYPTO RESEARCH</h2><span class="badge good">historical and forward · paper-only</span></div><div class="filters"><input id="crypto-filter" placeholder="Filter crypto catalog, report, symbol" aria-label="Filter crypto research"><input id="crypto-symbol" placeholder="Symbol" aria-label="Filter crypto symbol"><select id="crypto-size"><option>25</option><option>50</option><option>100</option></select></div><div id="crypto-summary"></div><div id="crypto-table" class="scroll"></div><div id="crypto-pager" class="pager"></div><div id="crypto-detail"></div><div class="notice">All crypto catalogs and reports are bounded, versioned, and paper-only; no live execution path exists.</div></article></section>
     <section id="view-polymarket" class="view"><article class="panel"><div class="section-title"><h2>Polymarket opportunities</h2><span class="badge warn">price proxy unless timestamped depth exists</span></div><div class="filters"><input id="polymarket-filter" placeholder="Filter questions or markets" aria-label="Filter Polymarket"><select id="polymarket-category"><option value="">All categories</option></select><select id="polymarket-size"><option>25</option><option>50</option><option>100</option></select></div><div id="pm-summary"></div><div id="pm-markets" class="scroll"></div><div id="polymarket-pager" class="pager"></div><p class="page-note">Historical price history is separate from forward order-book observations. No historical depth, spread, fills, or executable quotes are fabricated.</p></article></section>
     <section id="view-candidates" class="view"><article class="panel"><div class="section-title"><h2>CANDIDATES</h2><span id="candidate-total" class="muted"></span></div><div class="filters"><input id="candidates-filter" placeholder="Filter strategy, family, market" aria-label="Filter candidates"><select id="candidates-stage"><option value="">All stages</option></select><select id="candidates-size"><option>25</option><option>50</option><option>100</option></select></div><div id="candidates-table" class="scroll"></div><div id="candidates-pager" class="pager"></div></article></section>
     <article id="candidate-detail" class="panel"><div class="section-title"><h2>Candidate detail</h2><span class="muted">historical → forward → lifecycle</span></div><div class="empty">Select a candidate to inspect evidence.</div></article>
@@ -1674,7 +2120,7 @@ def _dashboard_html() -> str:
     let params = new URLSearchParams(location.search); const state = { tab: params.get("tab") || "overview", page: Math.max(1,Number(params.get("page")||1)), page_size: [10,25,50,100].includes(Number(params.get("page_size"))) ? Number(params.get("page_size")) : 25, filter: params.get("filter") || "", sort: params.get("sort") || "", direction: params.get("direction") === "asc" ? "asc" : "desc", selected: params.get("selected") || "", expanded: params.get("expanded") === "1" };
     let operator = {}, current = {}, loadInFlight = false;
     function saveState(push=false) { const q=new URLSearchParams(); q.set("tab",state.tab); q.set("page",state.page); q.set("page_size",state.page_size); if(state.filter)q.set("filter",state.filter); if(state.sort)q.set("sort",state.sort); if(state.direction!=="desc")q.set("direction",state.direction); if(state.selected)q.set("selected",state.selected); if(state.expanded)q.set("expanded","1"); document.querySelectorAll("select.facet").forEach(el=>{if(el.value)q.set(el.dataset.param||el.id,el.value)}); (push?history.pushState:history.replaceState).call(history,{}, "", `${location.pathname}?${q}`); }
-    function activate(tab,push=true) { if(tab!==state.tab){state.selected="";state.expanded=false;state.filter="";state.sort="";state.direction="desc";state.page=1;} state.tab=tab; document.querySelectorAll(".tab").forEach(b=>b.classList.toggle("active",b.dataset.view===tab)); document.querySelectorAll(".view").forEach(v=>v.classList.toggle("active",v.id===`view-${tab}`)); saveState(push); if(tab!=="overview"&&tab!=="btc") loadPage(tab); }
+    function activate(tab,push=true) { if(tab!==state.tab){state.selected="";state.expanded=false;state.filter="";state.sort="";state.direction="desc";state.page=1;} state.tab=tab; document.querySelectorAll(".tab").forEach(b=>b.classList.toggle("active",b.dataset.view===tab)); document.querySelectorAll(".view").forEach(v=>v.classList.toggle("active",v.id===`view-${tab}`)); saveState(push); if(tab!=="overview"&&tab!=="canary") loadPage(tab); }
     function sortButton(key,label) { const active=state.sort===key, arrow=active?(state.direction==="asc"?" ▲":" ▼"):""; return `<button class="link sort" data-sort="${safe(key)}">${safe(label)}${arrow}</button>`; }
     function restoreFacets() { document.querySelectorAll("select.facet").forEach(el=>{const value=params.get(el.dataset.param||el.id);if(value!==null&&Array.from(el.options).some(o=>o.value===value))el.value=value;}); document.querySelectorAll('select[id$="-size"]').forEach(el=>{el.value=String(state.page_size);}); document.querySelectorAll(".filters input").forEach(el=>{el.value=state.filter;}); }
     function ensureFacets() { const specs={datasets:[["datasets-market","Market","market",["crypto_spot","prediction"]],["datasets-timeframe","Timeframe","timeframe",["1m","1h","1d","live"]],["datasets-quality","Quality","quality",["OHLCV","PRICE_PROXY","ORDER_BOOK_SIMULATED"]]],polymarket:[["polymarket-settlement","Settlement","settlement",["open","resolved_yes","resolved_no","void"]],["polymarket-quality","Quality","quality",["PRICE_PROXY","ORDER_BOOK_SIMULATED"]]]}; Object.entries(specs).forEach(([view,entries])=>{const host=document.querySelector(`#view-${view} .filters`);if(!host)return;entries.forEach(([id,label,param,options])=>{if($(id))return;const s=document.createElement("select");s.id=id;s.className="facet";s.dataset.param=param;s.innerHTML=`<option value="">All ${label.toLowerCase()}</option>${options.map(o=>`<option value="${safe(o)}">${safe(o)}</option>`).join("")}`;host.appendChild(s);});}); document.querySelectorAll(".filters select").forEach(el=>{el.classList.add("facet");if(el.id.endsWith("-size")){el.dataset.param="page_size";if(!Array.from(el.options).some(o=>o.value==="10")){const option=document.createElement("option");option.value="10";option.textContent="10";el.insertBefore(option,el.firstChild);}}else if(!el.dataset.param)el.dataset.param=el.id.includes("source")?"source_type":el.id.includes("stage")?"stage":el.id.includes("status")?"status":el.id.includes("category")?"category":el.id;}); restoreFacets(); }
@@ -1693,11 +2139,16 @@ def _dashboard_html() -> str:
     function renderHermes(data) { const h=operator.hermes||{}; $("hermes-summary").innerHTML=`<div class="three-col"><div class="key-value"><span class="key">Submitted</span><strong>${count(h.submitted)}</strong></div><div class="key-value"><span class="key">Accepted</span><strong>${count(h.accepted)}</strong></div><div class="key-value"><span class="key">Pending</span><strong>${count(h.pending)}</strong></div></div><p class="page-note">Hermes status reflects queue execution state, not integration availability. ${safe(h.reason||"")}</p>`; $("hermes-table").innerHTML=arr(data.items).length?`<table><thead><tr>${[["item_id","Item"],["item_type","Type"],["status","Status"],["created_at","Created"]].map(([k,l])=>`<th>${sortButton(k,l)}</th>`).join("")}</tr></thead><tbody>${arr(data.items).map(i=>`<tr><td><button class="link hermes-item" data-id="${encodeURIComponent(i.item_id||"")}">${safe(i.item_id)}</button></td><td>${safe(i.item_type)}</td><td><span class="badge ${statusClass(i.status)}">${safe(i.status)}</span></td><td>${safe(dateText(i.created_at||i.updated_at))}</td></tr>`).join("")}</tbody></table>`:empty("Hermes not initialized","Start the research node or submit a paper-only proposal."); pager("hermes",data); bindTable(); document.querySelectorAll(".hermes-item").forEach(b=>b.addEventListener("click",()=>loadHermes(decodeURIComponent(b.dataset.id)))); if(state.tab==="hermes"&&state.selected)loadHermes(state.selected,false); }
     async function loadCandidate(id,eventPage=1,persist=true) { state.selected=id; state.expanded=true; if(persist)saveState(true); try { const q=new URLSearchParams({page:String(eventPage),page_size:String(state.page_size)}),r=await fetch(`/api/v2/candidates/${encodeURIComponent(id)}/events?${q}`,{cache:"no-store"}),d=await r.json(); const markup=`<div class="key-value"><span class="key">Candidate</span><strong>${safe(id)}</strong></div>${arr(d.items).length?`<table><thead><tr><th>Time</th><th>Stage</th><th>Reason</th></tr></thead><tbody>${arr(d.items).map(i=>`<tr><td>${safe(dateText(i.created_at||i.timestamp))}</td><td><span class="badge">${safe(i.stage||i.to_stage)}</span></td><td>${safe(i.reason||i.message)}</td></tr>`).join("")}</tbody></table>`:empty("No lifecycle events","No persisted lifecycle evidence exists for this candidate.")}<div id="candidate-events-pager" class="pager"></div>`; $("detail").innerHTML=markup; if(state.tab==="candidates")$("dataset-detail").innerHTML=markup; if($("candidate-events-pager")){const total=Number(d.total)||0,page=Number(d.page)||1,size=Number(d.page_size)||state.page_size,pages=Number(d.pages)||0,start=total?(page-1)*size+1:0,end=Math.min(page*size,total); $("candidate-events-pager").innerHTML=`<span>Showing ${start}–${end} of ${total}</span><span><button data-page="${page-1}" ${page<=1?"disabled":""}>Previous</button> <button data-page="${page+1}" ${!pages||page>=pages?"disabled":""}>Next</button></span>`; $("candidate-events-pager").querySelectorAll("button").forEach(b=>b.addEventListener("click",()=>loadCandidate(id,Number(b.dataset.page),false)));} } catch(e) { $("detail").innerHTML=empty("Candidate detail unavailable",e.message); } }
     function renderPaper(data) { const p=operator.paper_portfolio||{}; $("portfolio-summary").innerHTML=`<div class="card-grid"><div class="panel"><div class="metric">${p.state_count?Number(p.total_equity||0).toFixed(2):"—"}</div><div class="metric-label">paper equity</div></div><div class="panel"><div class="metric">${p.state_count?Number(p.total_pnl||0).toFixed(2):"—"}</div><div class="metric-label">paper P/L</div></div><div class="panel"><div class="metric">${count(data.total)}</div><div class="metric-label">paper records</div></div><div class="panel"><div class="metric">${p.state_count?`${(Number(p.win_rate||0)*100).toFixed(1)}%`:"—"}</div><div class="metric-label">win rate</div></div></div>`; $("portfolio-states").innerHTML=arr(data.items).length?`<table><thead><tr><th>${sortButton("timestamp","Time")}</th><th>${sortButton("record_type","Type")}</th><th>Experiment</th><th>Market</th><th>Status</th><th>Details</th></tr></thead><tbody>${arr(data.items).map(i=>`<tr><td>${safe(dateText(i.timestamp||i.created_at||i.updated_at))}</td><td>${safe(i.record_type)}</td><td>${safe(i.experiment_id)}</td><td>${safe(i.market_id||i.symbol)}</td><td><span class="badge ${statusClass(i.status)}">${safe(i.status)}</span></td><td><details><summary>view</summary><pre>${safe(json(i))}</pre></details></td></tr>`).join("")}</tbody></table>`:empty("Waiting for PAPER_FORWARD","Paper portfolio initializes only after a candidate enters PAPER_FORWARD and observations are persisted."); pager("paper",data); bindTable(); }
-    async function loadPage(tab) { const endpoint={datasets:"datasets",activity:"activity",candidates:"candidates",polymarket:"polymarket",hermes:"hermes",portfolio:"paper"}[tab]; if(!endpoint)return; try { current=await fetchV2(endpoint); ({datasets:renderDatasets,activity:renderActivity,candidates:renderCandidates,polymarket:renderPolymarket,hermes:renderHermes,portfolio:renderPaper}[tab])(current); } catch(e) { const target={datasets:"datasets-table",activity:"activity-table",candidates:"candidates-table",polymarket:"pm-markets",hermes:"hermes-table",portfolio:"portfolio-states"}[tab]; if($(target))$(target).innerHTML=empty("Dashboard data unavailable",e.message); } }
+    async function loadPage(tab) { const endpoint={datasets:"datasets",activity:"activity",candidates:"candidates",polymarket:"polymarket",hermes:"hermes","crypto":"crypto-research",portfolio:"paper"}[tab]; if(!endpoint)return; try { current=await fetchV2(endpoint); ({datasets:renderDatasets,activity:renderActivity,candidates:renderCandidates,polymarket:renderPolymarket,hermes:renderHermes,crypto:renderCrypto,portfolio:renderPaper}[tab])(current); } catch(e) { const target={datasets:"datasets-table",activity:"activity-table",candidates:"candidates-table",polymarket:"pm-markets",hermes:"hermes-table",crypto:"crypto-table",portfolio:"portfolio-states"}[tab]; if($(target))$(target).innerHTML=empty("Dashboard data unavailable",e.message); } }
     function renderCanary(data) { const c=data.canary||{}; $("canary-summary").innerHTML=`<div class="card-grid"><div class="panel"><div class="metric">${safe(c.micro_live_canary||"DISARMED")}</div><div class="metric-label">Micro live canary</div></div><div class="panel"><div class="metric">${safe(c.candidate)}</div><div class="metric-label">Candidate · expires ${safe(c.expiry)}</div></div><div class="panel"><div class="metric">${count(c.today_orders)}</div><div class="metric-label">Today's orders</div></div><div class="panel"><div class="metric">$${Number(c.today_realized_pnl||0).toFixed(2)}</div><div class="metric-label">Today's realized P/L</div></div><div class="panel"><div class="metric">$${Number(c.total_exposure||0).toFixed(2)}</div><div class="metric-label">Total exposure · ${count(c.open_positions)} positions</div></div><div class="panel"><div class="metric">$${Number(c.daily_loss_budget_remaining||0).toFixed(2)}</div><div class="metric-label">Daily loss budget remaining</div></div></div>`; $("canary-trades").innerHTML=arr(c.trades).length?`<table><thead><tr><th>Time</th><th>Candidate</th><th>Market</th><th>Side</th><th>Notional</th><th>Paper expected price</th><th>Actual price</th><th>Difference</th><th>Status</th><th>P/L</th></tr></thead><tbody>${arr(c.trades).map(i=>`<tr><td>${safe(dateText(i.timestamp))}</td><td>${safe(i.candidate_id)}</td><td>${safe(i.market_id)}</td><td>${safe(i.side)}</td><td>${safe(i.requested_notional)}</td><td>${safe(i.paper_expected_price)}</td><td>${safe(i.actual_average_price)}</td><td>${safe(i.price_difference)}</td><td>${safe(i.status)}</td><td>${safe(i.realized_pnl)}</td></tr>`).join("")}</tbody></table>`:empty("No real canary trades","Arm an eligible candidate explicitly; paper research continues independently."); }
     function renderBtc(data) { const b=operator.btc||{},summary=b.catalog_summary||{},rows=arr(summary.latest_by_timeframe||summary.timeframes),fallback=arr(b.catalog),catalogRows=rows.length?rows:fallback; $("btc-summary").innerHTML=catalogRows.length?`<div class="three-col"><div class="key-value"><span class="key">Catalog timeframes</span><strong>${count(catalogRows.length)}</strong></div><div class="key-value"><span class="key">Rows observed</span><strong>${count(catalogRows.reduce((total,item)=>total+Number(item.row_count||0),0))}</strong></div><div class="key-value"><span class="key">Latest report</span><strong>${safe(dateText(b.latest_report?.created_at))}</strong></div></div>`:empty("BTC history not initialized","Run bootstrap-history --crypto, then btc-research."); $("btc-experiments").innerHTML=""; }
-    async function load() { if(loadInFlight)return; loadInFlight=true; try { const response=await fetch("/api/operator",{cache:"no-store"}); if(!response.ok)throw new Error(`operator HTTP ${response.status}`); operator=await response.json(); renderOverview(operator); renderBtc(operator); renderCanary(operator); if(!["overview","btc","canary"].includes(state.tab))await loadPage(state.tab); } catch(e) { $("component-grid").innerHTML=empty("Dashboard unavailable",e.message); } finally { loadInFlight=false; } }
+    async function loadCrypto(symbol,persist=true) { state.selected=symbol; state.expanded=true; if(persist)saveState(true); try { const response=await fetch(`/api/v2/crypto-research/${encodeURIComponent(symbol)}`,{cache:"no-store"}),data=await response.json(); $("crypto-detail").innerHTML=arr(data.items).length?`<details open><summary>Crypto detail · ${safe(symbol)}</summary><div class="three-col"><div class="key-value"><span class="key">Universe version</span><strong>${safe(data.universe_version)}</strong></div><div class="key-value"><span class="key">Strategies</span><strong>${count(arr(data.strategies).length)}</strong></div><div class="key-value"><span class="key">Families</span><strong>${count(arr(data.families).length)}</strong></div></div><pre>${safe(json({catalogs:data.items,reports:data.reports,validation:data.validation,coverage:data.coverage}))}</pre></details>`:empty("Crypto symbol unavailable","No catalog is persisted for this symbol."); } catch(e) { $("crypto-detail").innerHTML=empty("Crypto detail unavailable",e.message); } }
+    function renderCrypto(data) { const rows=arr(data.items),symbols=arr(data.symbols),summary={universe_version:data.universe_version,symbols:data.symbol_count??symbols.length,assets:data.asset_count??arr(data.assets).length,catalogs:data.total,reports:arr(data.reports).length}; $("crypto-summary").innerHTML=`<div class="three-col">${[["Universe version",summary.universe_version],["Symbols",summary.symbols],["Assets",summary.assets],["Catalogs",summary.catalogs],["Reports",summary.reports],["Families",arr(data.families).length]].map(([label,value])=>`<div class="key-value"><span class="key">${safe(label)}</span><strong>${safe(value)}</strong></div>`).join("")}</div>`; $("crypto-table").innerHTML=rows.length?`<table><thead><tr><th>Symbol</th><th>Dataset</th><th>Version</th><th>Source</th><th>Coverage</th><th>Strategies</th><th>Experiments</th><th>Validation</th><th>Families</th></tr></thead><tbody>${rows.map(i=>`<tr><td><button class="link crypto-symbol-row" data-symbol="${encodeURIComponent(i.symbol||"")}">${safe(i.symbol)}</button></td><td>${safe(i.dataset_id)}</td><td>${safe(i.dataset_version)}</td><td>${safe(i.source_type)}</td><td>${safe(json(i.coverage))}</td><td>${safe(json(i.strategies))}</td><td>${safe(json(i.experiments))}</td><td>${safe(json(i.validation))}</td><td>${safe(json(i.families))}</td></tr>`).join("")}</tbody></table>`:empty("No crypto catalogs","No crypto catalog or report has been persisted."); pager("crypto",data); document.querySelectorAll(".crypto-symbol-row").forEach(b=>b.addEventListener("click",()=>loadCrypto(decodeURIComponent(b.dataset.symbol)))); }
+    function renderOutcomeCards(data) { const cards=data.research_cards||{}, latest=data.hermes_latest_outcome||cards.newest_hermes_outcome||{}; $("research-cards").innerHTML=[["experiments_run","Experiments run"],["active_hypotheses","Active hypotheses"],["candidates_alive","Candidates alive"],["candidate_rejected","Candidate Rejected"],["research_rejected","Research Rejected"],["paper_forward","Paper forward"],["paper_promotable","Paper promotable"]].map(([key,label])=>`<article class="panel"><div class="metric">${count(cards[key])}</div><div class="metric-label">${label}</div></article>`).join("")+`<article class="panel"><div class="metric">${safe(latest.status||"—")}</div><div class="metric-label">Newest Hermes outcome · ${safe(latest.item_id||"none")}</div>${latest.human_reason?`<p class="page-note">${safe(latest.human_reason)}</p>`:""}</article>`; }
+    const _renderOverview=renderOverview; renderOverview=(data)=>{_renderOverview(data);renderOutcomeCards(data);};
+    async function load() { if(loadInFlight)return; loadInFlight=true; try { const response=await fetch("/api/operator",{cache:"no-store"}); if(!response.ok)throw new Error(`operator HTTP ${response.status}`); operator=await response.json(); renderOverview(operator); renderCrypto(operator.crypto_research||{}); renderCanary(operator); if(!["overview","crypto","canary"].includes(state.tab))await loadPage(state.tab); } catch(e) { $("component-grid").innerHTML=empty("Dashboard unavailable",e.message); } finally { loadInFlight=false; } }
     ensureFacets(); document.querySelectorAll(".tab").forEach(b=>b.addEventListener("click",()=>activate(b.dataset.view))); document.querySelectorAll("[data-link]").forEach(b=>b.addEventListener("click",e=>{e.preventDefault();activate(b.dataset.link)})); document.querySelectorAll(".filters input,.filters select").forEach(el=>el.addEventListener(el.tagName==="INPUT"?"input":"change",()=>{if(el.id.endsWith("-size")){const n=Number(el.value);if([10,25,50,100].includes(n)){state.page_size=n;document.querySelectorAll('select[id$="-size"]').forEach(s=>s.value=String(n));}} else if(el.id.includes("-filter"))state.filter=el.value;state.page=1;saveState(true);loadPage(state.tab)})); window.addEventListener("popstate",()=>{const q=new URLSearchParams(location.search),nextTab=q.get("tab")||"overview",changed=nextTab!==state.tab;params=q;state.tab=nextTab;state.page=Math.max(1,Number(q.get("page")||1));state.page_size=[10,25,50,100].includes(Number(q.get("page_size")))?Number(q.get("page_size")):25;state.filter=changed?"":q.get("filter")||"";state.sort=changed?"":q.get("sort")||"";state.direction=changed?"desc":q.get("direction")==="asc"?"asc":"desc";state.selected=changed?"":q.get("selected")||"";state.expanded=changed?false:q.get("expanded")==="1";restoreFacets();activate(state.tab,false)}); load(); activate(state.tab,false); const refreshHandle=setInterval(load,10000); window.addEventListener("beforeunload",()=>clearInterval(refreshHandle));
+    if($("crypto-symbol"))$("crypto-symbol").addEventListener("input",async()=>{const symbol=$("crypto-symbol").value.trim(),q=new URLSearchParams({page:"1",page_size:String(state.page_size),direction:state.direction});if(symbol)q.set("symbol",symbol);const response=await fetch(`/api/v2/crypto-research?${q}`,{cache:"no-store"});if(response.ok)renderCrypto(await response.json());});
     // setInterval(load, 10000) is the ten-second refresh contract.
   </script>
 </body>
@@ -1727,7 +2178,7 @@ class _DashboardHandler(BaseHTTPRequestHandler):
         query = parse_qs(parsed.query, keep_blank_values=True)
         if path.startswith("api/v2/"):
             endpoint = path[len("api/v2/") :]
-            allowed = endpoint.lower() in _V2_ENDPOINTS or endpoint.lower().startswith(("datasets/", "candidates/", "hermes/"))
+            allowed = endpoint.lower() in _V2_ENDPOINTS or endpoint.lower().startswith(("datasets/", "candidates/", "hermes/", "crypto-research/"))
             if allowed:
                 validation_error = _pagination_error(query)
                 if validation_error:
@@ -1746,7 +2197,7 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             try:
                 if dynamic_strategy:
                     endpoint = "strategy/" + unquote(endpoint.split("/", 1)[1])
-                self._send(200, self.server.dashboard_data.snapshot(endpoint))
+                self._send(200, self.server.dashboard_data.snapshot(endpoint, query))
             except Exception as exc:
                 self._send(503, {"error": "data unavailable", "detail": str(exc)})
             return

@@ -5,13 +5,12 @@ only contract that converts that intent into executable deterministic strategy
 variants; it never accepts Python, callbacks, credentials, or live controls.
 """
 from __future__ import annotations
-
-from dataclasses import dataclass, field
-from itertools import islice, product
+from dataclasses import dataclass
 import hashlib
 import json
 import math
 import re
+from itertools import islice, product
 from types import MappingProxyType
 from typing import Any, Mapping
 
@@ -128,6 +127,10 @@ _ALLOWED_FIELDS = frozenset(
         "dataset_selector",
         "dataset_id",
         "dataset_version",
+        "universe",
+        "universe_provenance",
+        "universe_version",
+        "universe_methodology",
         "methodology",
         "train_validation_methodology",
         "time_split",
@@ -336,6 +339,8 @@ def _parameter_values(value: Any, *, name: str) -> tuple[Any, ...]:
         if count < 1 or count > MAX_PARAMETER_VALUES:
             raise ExperimentPlanError("UNBOUNDED_PARAMETER_RANGE", f"{name} range has too many values")
         values = tuple(round(minimum + index * step, 12) for index in range(count))
+        if all(isinstance(value[field], int) and not isinstance(value[field], bool) for field in ("min", "max", "step")):
+            values = tuple(int(item) for item in values)
         return tuple(dict.fromkeys(values))
     values = value if isinstance(value, (list, tuple)) else (value,)
     if not values or len(values) > MAX_PARAMETER_VALUES:
@@ -362,6 +367,69 @@ def _target(value: Any, *, target_instrument: Any, market_ids: Any) -> dict[str,
     if market_ids is not None:
         result["market_ids"] = list(_string_list(market_ids, name="market_ids", limit=1000))
     return result
+def _crypto_universe(
+    raw: Mapping[str, Any],
+    selector: Mapping[str, Any],
+    methodology: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Normalize the explicit, bounded universe provenance for crypto plans."""
+    candidates = (
+        raw.get("universe"),
+        raw.get("universe_provenance"),
+        methodology.get("universe"),
+        methodology.get("universe_provenance"),
+        selector.get("universe"),
+        selector.get("universe_provenance"),
+    )
+    source = next((value for value in candidates if value is not None), None)
+    if not isinstance(source, Mapping):
+        raise ExperimentPlanError(
+            "INSUFFICIENT_DATA",
+            "crypto_spot plans require versioned universe provenance and methodology",
+        )
+    value = _as_mapping(source, name="universe")
+    version = value.get("universe_version", value.get("version"))
+    if not isinstance(version, str) or not version.strip():
+        raise ExperimentPlanError("INSUFFICIENT_DATA", "crypto universe_version is required")
+    if version.strip().lower() in {"latest", "current", "default", "unversioned"}:
+        raise ExperimentPlanError("INSUFFICIENT_DATA", "crypto universe_version must be immutable and versioned")
+    method = value.get("methodology", value.get("method", value.get("selection_method")))
+    if not isinstance(method, str) or not method.strip():
+        raise ExperimentPlanError("INSUFFICIENT_DATA", "crypto universe methodology is required")
+    instruments = value.get("instruments", value.get("symbols", value.get("assets")))
+    normalized_instruments = _string_list(instruments, name="universe.instruments", limit=1000)
+    if not normalized_instruments:
+        raise ExperimentPlanError("INSUFFICIENT_DATA", "crypto universe instruments are required")
+    allowed = {
+        "universe_id",
+        "universe_version",
+        "version",
+        "methodology",
+        "method",
+        "selection_method",
+        "instruments",
+        "symbols",
+        "assets",
+        "source",
+        "content_hash",
+    }
+    unknown = sorted(set(value) - allowed)
+    if unknown:
+        raise ExperimentPlanError("UNSAFE_PLAN_FIELD", f"unsupported universe fields: {unknown}")
+    result: dict[str, Any] = {
+        "universe_version": version.strip(),
+        "methodology": method.strip(),
+        "instruments": list(normalized_instruments),
+    }
+    if value.get("universe_id") is not None:
+        result["universe_id"] = str(value["universe_id"]).strip()
+    if value.get("source") is not None:
+        result["source"] = str(value["source"]).strip()
+    if value.get("content_hash") is not None:
+        result["content_hash"] = str(value["content_hash"]).strip()
+    return result
+
+
 
 
 @dataclass(frozen=True, slots=True)
@@ -389,6 +457,7 @@ class ExperimentPlan:
     paper_only: bool
     strategy_document: Mapping[str, Any] | None = None
     model_document: Mapping[str, Any] | None = None
+    universe: Mapping[str, Any] | None = None
 
     @classmethod
     def from_mapping(cls, document: Mapping[str, Any], *, hypothesis_id: str | None = None) -> "ExperimentPlan":
@@ -488,8 +557,17 @@ class ExperimentPlan:
         selector["dataset_version"] = str(selector["dataset_version"]).strip()
         if not selector.get("dataset_id") and target.get("dataset_id"):
             selector["dataset_id"] = str(target["dataset_id"])
+        if market_type is MarketType.CRYPTO_SPOT:
+            if not selector.get("dataset_id"):
+                raise ExperimentPlanError("INSUFFICIENT_DATA", "crypto_spot plans require an explicit dataset_id")
+            if selector["dataset_version"].lower() in {"latest", "current", "default", "unversioned"}:
+                raise ExperimentPlanError("INSUFFICIENT_DATA", "dataset_version must identify an immutable version")
 
         methodology = _as_mapping(raw.get("methodology", raw.get("train_validation_methodology")), name="methodology")
+        universe: dict[str, Any] | None = None
+        if market_type is MarketType.CRYPTO_SPOT:
+            universe = _crypto_universe(raw, selector, methodology)
+            methodology["universe"] = universe
         methodology["time_split"] = _time_split(raw.get("time_split", methodology.get("time_split", "train-validation-holdout")))
         metrics = _string_list(raw.get("metrics", ("expectancy", "drawdown", "trade_count", "sample_count")), name="metrics", limit=MAX_METRICS)
         if not metrics:
@@ -572,11 +650,14 @@ class ExperimentPlan:
             "paper_only": True,
             "strategy_document": dict(strategy_document) if strategy_document is not None else None,
             "model_document": dict(model_document) if model_document is not None else None,
+            "universe": universe,
         }
         if normalized["strategy_document"] is None:
             normalized.pop("strategy_document")
         if normalized["model_document"] is None:
             normalized.pop("model_document")
+        if normalized["universe"] is None:
+            normalized.pop("universe")
         plan_id = str(raw.get("plan_id", "")).strip()
         if not plan_id:
             plan_id = "plan-" + hashlib.sha256(_canonical(normalized).encode("utf-8")).hexdigest()[:24]
@@ -607,6 +688,7 @@ class ExperimentPlan:
             True,
             _freeze_json(strategy_document) if strategy_document is not None else None,
             _freeze_json(model_document) if model_document is not None else None,
+            _freeze_json(universe) if universe is not None else None,
         )
 
     @classmethod
@@ -718,6 +800,8 @@ class ExperimentPlan:
             result["strategy_document"] = _plain_json(self.strategy_document)
         if self.model_document is not None:
             result["model_document"] = _plain_json(self.model_document)
+        if self.universe is not None:
+            result["universe"] = _plain_json(self.universe)
         return result
 
     to_record = as_dict
