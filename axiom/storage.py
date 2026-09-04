@@ -298,6 +298,34 @@ class AxiomStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_paper_observations_experiment_time
                     ON paper_observations(experiment_id, timestamp);
+                CREATE TABLE IF NOT EXISTS paper_execution_events (
+                    event_id TEXT PRIMARY KEY,
+                    experiment_id TEXT NOT NULL,
+                    observation_id TEXT NOT NULL,
+                    market_id TEXT NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE (experiment_id, observation_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_paper_execution_events_experiment_time
+                    ON paper_execution_events(experiment_id, timestamp);
+                CREATE TABLE IF NOT EXISTS paper_bet_ledger (
+                    bet_id TEXT PRIMARY KEY,
+                    experiment_id TEXT NOT NULL,
+                    market_id TEXT NOT NULL,
+                    strategy_id TEXT NOT NULL,
+                    outcome TEXT NOT NULL,
+                    resolution TEXT NOT NULL,
+                    resolved_at TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE (experiment_id, market_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_paper_bet_ledger_experiment_time
+                    ON paper_bet_ledger(experiment_id, resolved_at);
                 CREATE TABLE IF NOT EXISTS opportunity_snapshots (
                     opportunity_id TEXT PRIMARY KEY,
                     observed_at TEXT NOT NULL,
@@ -2461,6 +2489,199 @@ class AxiomStore:
             }
             for row in rows
         ]
+    def save_paper_execution_event(
+        self,
+        event_id: str,
+        experiment_id: str,
+        observation_id: str,
+        market_id: str,
+        timestamp: datetime,
+        status: str,
+        payload: Any,
+    ) -> bool:
+        """Persist one idempotent paper execution outcome."""
+
+        identifier = str(event_id).strip()
+        experiment = str(experiment_id).strip()
+        observation = str(observation_id).strip()
+        market = str(market_id).strip()
+        outcome = str(status).strip().upper()
+        if not identifier or not experiment or not observation or not market or not outcome:
+            raise ValueError("paper execution event identifiers and status are required")
+        timestamp_iso = _iso(timestamp)
+        payload_json = _dump(payload)
+        with self._write_context():
+            existing = self._conn.execute(
+                "SELECT event_id,experiment_id,observation_id,market_id,timestamp,status,payload_json "
+                "FROM paper_execution_events WHERE event_id=? OR (experiment_id=? AND observation_id=?)",
+                (identifier, experiment, observation),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    str(existing["event_id"]) != identifier
+                    or str(existing["experiment_id"]) != experiment
+                    or str(existing["observation_id"]) != observation
+                    or str(existing["market_id"]) != market
+                    or str(existing["timestamp"]) != timestamp_iso
+                    or str(existing["status"]) != outcome
+                    or str(existing["payload_json"]) != payload_json
+                ):
+                    raise ValueError(f"paper execution event conflicts with stored payload: {identifier}")
+                return False
+            self._conn.execute(
+                "INSERT INTO paper_execution_events(event_id,experiment_id,observation_id,market_id,timestamp,status,payload_json,created_at) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (identifier, experiment, observation, market, timestamp_iso, outcome, payload_json, _now_iso()),
+            )
+        return True
+
+    def list_paper_execution_events(
+        self,
+        experiment_id: str,
+        *,
+        limit: int | None = 1000,
+    ) -> list[dict[str, Any]]:
+        if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 0):
+            raise ValueError("limit must be a non-negative integer or None")
+        query = "SELECT * FROM paper_execution_events WHERE experiment_id=? ORDER BY timestamp,observation_id"
+        values: list[Any] = [str(experiment_id)]
+        if limit is not None:
+            query += " LIMIT ?"
+            values.append(int(limit))
+        with self._lock:
+            rows = self._conn.execute(query, values).fetchall()
+        return [
+            {
+                "event_id": row["event_id"],
+                "experiment_id": row["experiment_id"],
+                "observation_id": row["observation_id"],
+                "market_id": row["market_id"],
+                "timestamp": _parse_datetime(row["timestamp"]),
+                "status": row["status"],
+                "payload": _load(row["payload_json"]),
+                "created_at": _parse_datetime(row["created_at"]),
+            }
+            for row in rows
+        ]
+
+    def save_paper_bet_ledger(
+        self,
+        bet_id: str,
+        experiment_id: str,
+        market_id: str,
+        strategy_id: str,
+        outcome: str,
+        resolution: str,
+        resolved_at: datetime,
+        payload: Any,
+    ) -> bool:
+        """Insert or idempotently refresh one resolved prediction bet."""
+
+        identifier = str(bet_id).strip()
+        experiment = str(experiment_id).strip()
+        market = str(market_id).strip()
+        strategy = str(strategy_id).strip()
+        outcome_value = str(outcome).strip().lower()
+        resolution_value = str(resolution).strip().lower()
+        if not identifier or not experiment or not market or not strategy or not outcome_value or not resolution_value:
+            raise ValueError("paper bet ledger identifiers and outcomes are required")
+        resolved_iso = _iso(resolved_at)
+        payload_json = _dump(payload)
+        stamp = _now_iso()
+        with self._write_context():
+            existing = self._conn.execute(
+                "SELECT bet_id,experiment_id,market_id,strategy_id,outcome,resolution,resolved_at,payload_json "
+                "FROM paper_bet_ledger WHERE bet_id=? OR (experiment_id=? AND market_id=?)",
+                (identifier, experiment, market),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    str(existing["bet_id"]) != identifier
+                    or str(existing["experiment_id"]) != experiment
+                    or str(existing["market_id"]) != market
+                    or str(existing["strategy_id"]) != strategy
+                    or str(existing["outcome"]) != outcome_value
+                    or str(existing["resolution"]) != resolution_value
+                    or str(existing["resolved_at"]) != resolved_iso
+                ):
+                    raise ValueError(f"paper bet ledger conflicts with stored position: {identifier}")
+                if str(existing["payload_json"]) == payload_json:
+                    return False
+                self._conn.execute(
+                    "UPDATE paper_bet_ledger SET payload_json=?,updated_at=? WHERE bet_id=?",
+                    (payload_json, stamp, identifier),
+                )
+                return False
+            self._conn.execute(
+                "INSERT INTO paper_bet_ledger(bet_id,experiment_id,market_id,strategy_id,outcome,resolution,resolved_at,payload_json,created_at,updated_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (
+                    identifier,
+                    experiment,
+                    market,
+                    strategy,
+                    outcome_value,
+                    resolution_value,
+                    resolved_iso,
+                    payload_json,
+                    stamp,
+                    stamp,
+                ),
+            )
+        return True
+
+    def load_paper_bet_ledger(self, bet_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM paper_bet_ledger WHERE bet_id=?",
+                (str(bet_id),),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "bet_id": row["bet_id"],
+            "experiment_id": row["experiment_id"],
+            "market_id": row["market_id"],
+            "strategy_id": row["strategy_id"],
+            "outcome": row["outcome"],
+            "resolution": row["resolution"],
+            "resolved_at": _parse_datetime(row["resolved_at"]),
+            "payload": _load(row["payload_json"]),
+            "created_at": _parse_datetime(row["created_at"]),
+            "updated_at": _parse_datetime(row["updated_at"]),
+        }
+
+    def list_paper_bet_ledger(
+        self,
+        experiment_id: str,
+        *,
+        limit: int | None = 1000,
+    ) -> list[dict[str, Any]]:
+        if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 0):
+            raise ValueError("limit must be a non-negative integer or None")
+        query = "SELECT * FROM paper_bet_ledger WHERE experiment_id=? ORDER BY resolved_at,market_id"
+        values: list[Any] = [str(experiment_id)]
+        if limit is not None:
+            query += " LIMIT ?"
+            values.append(int(limit))
+        with self._lock:
+            rows = self._conn.execute(query, values).fetchall()
+        return [
+            {
+                "bet_id": row["bet_id"],
+                "experiment_id": row["experiment_id"],
+                "market_id": row["market_id"],
+                "strategy_id": row["strategy_id"],
+                "outcome": row["outcome"],
+                "resolution": row["resolution"],
+                "resolved_at": _parse_datetime(row["resolved_at"]),
+                "payload": _load(row["payload_json"]),
+                "created_at": _parse_datetime(row["created_at"]),
+                "updated_at": _parse_datetime(row["updated_at"]),
+            }
+            for row in rows
+        ]
+
     def list_latest_paper_observations(
         self,
         experiment_id: str,

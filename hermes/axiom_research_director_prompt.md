@@ -85,6 +85,10 @@ At each scheduled run:
    variants tested and selected; it does not inflate confidence across
    siblings. Mutations may use validation evidence only, remain bounded by
    family/generation budgets, and never read the locked partition.
+   The autonomous processor intentionally does not consume the locked holdout
+   at all. It is an immutable partition reserved for a separately controlled
+   human audit; no holdout result enters autonomous evaluation, mutation,
+   Hermes summaries, or promotion.
 
 Axiom workers may collect public metadata, order books, trades, OHLCV, and
 settlement observations, and may run deterministic paper simulations. They

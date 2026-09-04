@@ -14,6 +14,7 @@ from itertools import islice
 
 from typing import Any, Iterable, Mapping, Sequence
 from .domain import (
+    Fill,
     MarketType,
     OrderBookLevel,
     OrderBookSnapshot,
@@ -45,6 +46,7 @@ class PaperEngineCycle:
     fills_inserted: int
     settlements: int
     errors: tuple[str, ...] = ()
+    execution_events: int = 0
 
     def as_record(self) -> dict[str, Any]:
         return {
@@ -57,6 +59,7 @@ class PaperEngineCycle:
             "fills_inserted": self.fills_inserted,
             "settlements": self.settlements,
             "errors": list(self.errors),
+            "execution_events": self.execution_events,
         }
 
 
@@ -332,6 +335,7 @@ class ForwardPaperEngine:
         skipped = 0
         fills_inserted = 0
         settlements = 0
+        execution_events = 0
         errors: list[str] = provider_errors
         for raw in raw_observations:
             stamp = _observation_timestamp(raw)
@@ -457,12 +461,46 @@ class ForwardPaperEngine:
                             fill = self._bind_fill(fill)
                             if self.store.save_fill(fill, fill_id="paper-fill-" + self._run_id + "-" + fill.order_id):
                                 fill_saved = True
+                        execution_event = self.trader.last_execution_event
+                        execution_event["observation_id"] = observation_id
+                        execution_event["experiment_id"] = self._run_id
+                        execution_event["paper_only"] = True
+                        event_status = str(execution_event.get("status", "NO_SIGNAL")).strip().upper() or "NO_SIGNAL"
+                        if self.store.save_paper_execution_event(
+                            "paper-execution-" + self._run_id + "-" + observation_id,
+                            self._run_id,
+                            observation_id,
+                            market_id,
+                            stamp,
+                            event_status,
+                            execution_event,
+                        ):
+                            execution_events += 1
                         if terminal:
                             settlement_saved = True
                             self._settled.add(market_id)
                             self._settlement_by_market[market_id] = str(observation.get("settlement"))
                             if self.risk is not None:
                                 self.risk.reconcile_market(market_id, fills=self.portfolio.fills)
+                            ledger = build_resolved_bet(
+                                experiment_id=self._run_id,
+                                market_id=market_id,
+                                strategy_id=self._execution_strategy_id,
+                                settlement=_settlement_value(observation.get("settlement")) or str(observation.get("settlement")),
+                                resolved_at=stamp,
+                                fills=self._stored_fills_for_market(market_id),
+                            )
+                            if ledger is not None:
+                                self.store.save_paper_bet_ledger(
+                                    ledger["bet_id"],
+                                    self._run_id,
+                                    market_id,
+                                    self._execution_strategy_id,
+                                    ledger["outcome"],
+                                    ledger["resolution"],
+                                    stamp,
+                                    ledger,
+                                )
                         self._cursor[market_id] = max(self._cursor.get(market_id, stamp), stamp)
                         source_snapshot_id = str(observation.get("source_snapshot_id", "")).strip()
                         if source_snapshot_id:
@@ -524,6 +562,7 @@ class ForwardPaperEngine:
             fills_inserted,
             settlements,
             tuple(errors),
+            execution_events,
         )
         self._state["last_cycle"] = cycle.as_record()
         try:
@@ -670,6 +709,17 @@ class ForwardPaperEngine:
         return tagged
 
 
+    def _stored_fills_for_market(self, market_id: str) -> tuple[Fill, ...]:
+        try:
+            fills = self.store.load_fills(strategy_id=self._execution_strategy_id)
+        except Exception:
+            return ()
+        return tuple(
+            fill
+            for fill in fills
+            if str(fill.metadata.get("paper_experiment_id", "")) == self._run_id
+            and str(fill.market_id or fill.symbol) == str(market_id)
+        )
     def _restore_ledger(self) -> None:
         try:
             fills = self.store.load_fills(strategy_id=self._execution_strategy_id)
@@ -733,6 +783,18 @@ class ForwardPaperEngine:
             self._state.pop("model_state", None)
         else:
             self._state["model_state"] = model_state
+        portfolio_snapshot = self.portfolio.snapshot()
+        current_equity = _finite_number(portfolio_snapshot.get("equity"))
+        if current_equity is None:
+            current_equity = float(self.portfolio.initial_cash)
+        prior_peak = _finite_number(self._state.get("forward_peak_equity"))
+        if prior_peak is None or prior_peak <= 0:
+            prior_peak = float(self.portfolio.initial_cash)
+        peak_equity = max(prior_peak, current_equity)
+        current_drawdown = max(0.0, 1.0 - current_equity / peak_equity) if peak_equity > 0 else 0.0
+        prior_drawdown = _finite_number(self._state.get("forward_max_drawdown")) or 0.0
+        self._state["forward_peak_equity"] = peak_equity
+        self._state["forward_max_drawdown"] = max(prior_drawdown, current_drawdown)
         self._state.update(
             {
                 "experiment_id": self._run_id,
@@ -751,7 +813,7 @@ class ForwardPaperEngine:
                     for key, value in sorted(self._signal_history.items())
                 },
                 "settlement_by_market": dict(sorted(self._settlement_by_market.items())),
-                "portfolio": self.portfolio.snapshot(),
+                "portfolio": portfolio_snapshot,
                 "risk": risk_state,
                 "order_sequence": self.trader._sequence,
                 "fill_count": len(self.portfolio.fills),
@@ -765,6 +827,156 @@ class ForwardPaperEngine:
             timestamp=last_timestamp or utc_now(),
             expected_version=self._state_version,
         )
+
+
+def build_resolved_bet(
+    *,
+    experiment_id: str,
+    market_id: str,
+    strategy_id: str,
+    settlement: Any,
+    resolved_at: datetime,
+    fills: Iterable[Fill],
+) -> dict[str, Any] | None:
+    """Aggregate one resolved prediction market into one independent bet.
+
+    Fill prices and fees are execution facts.  The ledger computes gross PnL
+    from reference-price cash flows, subtracts simulated slippage and fees for
+    net PnL, and counts all fills for one market as one independent bet.
+    """
+
+    resolution = _settlement_value(settlement)
+    if resolution not in {
+        SettlementState.RESOLVED_YES.value,
+        SettlementState.RESOLVED_NO.value,
+        SettlementState.VOID.value,
+    }:
+        return None
+    ordered = sorted(
+        (
+            fill
+            for fill in fills
+            if isinstance(fill, Fill)
+            and fill.market_type is MarketType.PREDICTION
+            and str(fill.market_id or fill.symbol) == str(market_id)
+        ),
+        key=lambda fill: (fill.timestamp, fill.order_id),
+    )
+    if not ordered:
+        return None
+    position_by_outcome: dict[str, float] = {}
+    average_actual_cost: dict[str, float] = {}
+    bought_quantity: dict[str, float] = {}
+    reference_cash_flow = 0.0
+    fees = 0.0
+    slippage = 0.0
+    capital_at_risk = 0.0
+    expected_probability_total = 0.0
+    expected_probability_weight = 0.0
+    expected_edge_total = 0.0
+    expected_edge_weight = 0.0
+    seen_order_ids: set[str] = set()
+    partial_order_ids: set[str] = set()
+    requested_quantity = 0.0
+    filled_quantity = 0.0
+    for fill in ordered:
+        metadata = dict(fill.metadata or {})
+        outcome = str(metadata.get("outcome", "yes")).strip().lower()
+        if outcome not in {"yes", "no"}:
+            outcome = "yes"
+        signed_quantity = fill.quantity if fill.side is Side.BUY else -fill.quantity
+        position_by_outcome[outcome] = position_by_outcome.get(outcome, 0.0) + signed_quantity
+        reference = _finite_number(metadata.get("reference_price"))
+        if reference is None or reference <= 0:
+            reference = float(fill.price)
+        reference_cash_flow -= signed_quantity * reference
+        fees += float(fill.fees)
+        slippage += abs(float(fill.price) - reference) * float(fill.quantity)
+        if fill.side is Side.BUY:
+            bought_quantity[outcome] = bought_quantity.get(outcome, 0.0) + fill.quantity
+            average_actual_cost[outcome] = average_actual_cost.get(outcome, 0.0) + fill.quantity * fill.price
+        order_id = str(metadata.get("order_attempt_id", fill.order_id))
+        if order_id not in seen_order_ids:
+            seen_order_ids.add(order_id)
+            requested_quantity += _finite_number(metadata.get("requested_quantity")) or fill.quantity
+        filled_quantity += float(fill.quantity)
+        if bool(metadata.get("partial")) or str(metadata.get("execution_status", "")).upper() == "PARTIAL_FILL":
+            partial_order_ids.add(order_id)
+        selected_probability = _finite_number(fill.expected_probability)
+        if selected_probability is not None:
+            selected_probability = max(0.0, min(1.0, selected_probability))
+            yes_probability = selected_probability if outcome == "yes" else 1.0 - selected_probability
+            expected_probability_total += yes_probability * fill.quantity
+            expected_probability_weight += fill.quantity
+            expected_edge_total += (selected_probability - reference) * fill.quantity
+            expected_edge_weight += fill.quantity
+        exposure = 0.0
+        for position_outcome, position_quantity in position_by_outcome.items():
+            exposure += max(0.0, position_quantity) * float(fill.price)
+        capital_at_risk = max(capital_at_risk, exposure)
+    if resolution == SettlementState.RESOLVED_YES.value:
+        winning = "yes"
+        settlement_value = sum(max(0.0, position_by_outcome.get(outcome, 0.0)) for outcome in ("yes",))
+    elif resolution == SettlementState.RESOLVED_NO.value:
+        winning = "no"
+        settlement_value = sum(max(0.0, position_by_outcome.get(outcome, 0.0)) for outcome in ("no",))
+    else:
+        winning = None
+        settlement_value = sum(
+            max(0.0, position_by_outcome.get(outcome, 0.0))
+            * (
+                average_actual_cost.get(outcome, 0.0) / bought_quantity[outcome]
+                if bought_quantity.get(outcome, 0.0) > 0
+                else 0.0
+            )
+            for outcome in ("yes", "no")
+        )
+    gross_pnl = settlement_value + reference_cash_flow
+    net_pnl = gross_pnl - fees - slippage
+    active_outcomes = tuple(sorted(outcome for outcome, quantity in position_by_outcome.items() if abs(quantity) > 1e-12))
+    traded_outcomes = tuple(sorted(position_by_outcome))
+    outcome = traded_outcomes[0] if len(traded_outcomes) == 1 else "mixed"
+    resolved_position_count = len(traded_outcomes)
+    expected_probability = (
+        expected_probability_total / expected_probability_weight
+        if expected_probability_weight > 0
+        else None
+    )
+    expected_edge = (
+        expected_edge_total / expected_edge_weight
+        if expected_edge_weight > 0
+        else None
+    )
+    return {
+        "bet_id": f"{experiment_id}:{market_id}",
+        "experiment_id": str(experiment_id),
+        "market_id": str(market_id),
+        "strategy_id": str(strategy_id),
+        "outcome": outcome,
+        "resolution": resolution,
+        "resolved_at": ensure_utc(resolved_at).isoformat(),
+        "fills": len(ordered),
+        "order_attempts": len(seen_order_ids),
+        "partial_fills": len(partial_order_ids),
+        "positions": resolved_position_count,
+        "active_positions_at_resolution": len(active_outcomes),
+        "gross_pnl": gross_pnl,
+        "fees": fees,
+        "slippage": slippage,
+        "net_pnl": net_pnl,
+        "capital_at_risk": capital_at_risk,
+        "roi": net_pnl / capital_at_risk if capital_at_risk > 0 else 0.0,
+        "expected_probability_at_entry": expected_probability,
+        "expected_edge_at_entry": expected_edge,
+        "reference_cash_flow": reference_cash_flow,
+        "settlement_value": settlement_value,
+        "winning_outcome": winning,
+        "requested_quantity": requested_quantity,
+        "filled_quantity": filled_quantity,
+        "fill_ratio": min(1.0, filled_quantity / requested_quantity) if requested_quantity > 0 else 0.0,
+        "closed": True,
+        "paper_only": True,
+    }
 
 
 def _normalize_observation(raw: Any) -> tuple[str, dict[str, Any], OrderBookSnapshot | None, OrderBookSnapshot | None] | None:
@@ -977,6 +1189,14 @@ def _model_probability(model: Any | None, observation: Mapping[str, Any]) -> flo
     return probability if math.isfinite(probability) and 0 <= probability <= 1 else None
 
 
+def _finite_number(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
 def _settlement_value(value: Any) -> str:
     if isinstance(value, SettlementState):
         return value.value
@@ -1072,4 +1292,11 @@ def run_historical_replay(
     ).run(materialized, now=now)
 
 
-__all__ = ["ForwardPaperEngine", "PaperEngineCycle", "historical_replay_id", "run_forward_paper", "run_historical_replay"]
+__all__ = [
+    "ForwardPaperEngine",
+    "PaperEngineCycle",
+    "build_resolved_bet",
+    "historical_replay_id",
+    "run_forward_paper",
+    "run_historical_replay",
+]

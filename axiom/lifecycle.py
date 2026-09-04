@@ -35,7 +35,13 @@ _STAGE_ORDER = (
 
 @dataclass(frozen=True, slots=True)
 class PromotionCriteria:
-    """Explicit, configurable evidence gates; defaults are intentionally strict."""
+    """Configurable forward-evidence and hard-safety gates.
+
+    ``min_independent_samples`` means resolved independent forward bets, not
+    snapshots or fill fragments.  Performance rejection is deliberately
+    delayed until the configured resolved-bet and duration thresholds are
+    met; hard safety failures may reject immediately.
+    """
 
     min_independent_samples: int = 30
     min_trades: int = 20
@@ -47,9 +53,18 @@ class PromotionCriteria:
     min_liquidity: float = 0.0
     min_forward_duration_seconds: float = 7.0 * 86400.0
     min_regimes: int = 3
+    min_resolved_bets_for_performance_rejection: int = 5
+    min_forward_duration_seconds_for_performance_rejection: float = 0.0
+    min_order_attempts_for_execution_rejection: int = 5
 
     def __post_init__(self) -> None:
-        for name in ("min_independent_samples", "min_trades", "min_regimes"):
+        for name in (
+            "min_independent_samples",
+            "min_trades",
+            "min_regimes",
+            "min_resolved_bets_for_performance_rejection",
+            "min_order_attempts_for_execution_rejection",
+        ):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(f"{name} must be a non-negative integer")
@@ -61,6 +76,7 @@ class PromotionCriteria:
             "min_calibration",
             "min_liquidity",
             "min_forward_duration_seconds",
+            "min_forward_duration_seconds_for_performance_rejection",
         ):
             value = float(getattr(self, name))
             if not math.isfinite(value):
@@ -71,62 +87,123 @@ class PromotionCriteria:
                 raise ValueError(f"{name} must be in [0, 1]")
         if self.min_forward_duration_seconds < 0:
             raise ValueError("min_forward_duration_seconds must be non-negative")
+        if self.min_forward_duration_seconds_for_performance_rejection < 0:
+            raise ValueError("min_forward_duration_seconds_for_performance_rejection must be non-negative")
+
+    @staticmethod
+    def _number(evidence: Mapping[str, Any], *names: str, default: float = 0.0) -> float:
+        value: Any = default
+        for name in names:
+            if name in evidence:
+                value = evidence[name]
+                break
+        try:
+            result = float(value)
+        except (TypeError, ValueError):
+            return float("nan")
+        return result
+
+    @staticmethod
+    def _count(evidence: Mapping[str, Any], *names: str) -> int:
+        value: Any = 0
+        for name in names:
+            if name in evidence:
+                value = evidence[name]
+                break
+        if isinstance(value, bool):
+            return -1
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float) and math.isfinite(value) and value.is_integer():
+            return int(value)
+        return -1
 
     def evaluate(self, evidence: Mapping[str, Any]) -> tuple[str, ...]:
-        def number(*names: str, default: float = 0.0) -> float:
-            value: Any = default
-            for name in names:
-                if name in evidence:
-                    value = evidence[name]
-                    break
-            try:
-                result = float(value)
-            except (TypeError, ValueError):
-                return float("nan")
-            return result
+        """Return unmet promotion gates without rejecting the candidate."""
 
-        def count(*names: str) -> int:
-            value: Any = 0
-            for name in names:
-                if name in evidence:
-                    value = evidence[name]
-                    break
-            if isinstance(value, bool):
-                return -1
-            if isinstance(value, int):
-                return value
-            if isinstance(value, float) and math.isfinite(value) and value.is_integer():
-                return int(value)
-            return -1
-
+        independent = self._count(evidence, "forward_independent_resolved_bets")
+        trades = self._count(evidence, "forward_successful_order_attempts", "forward_trades")
+        drawdown = self._number(evidence, "forward_max_drawdown", default=float("nan"))
+        expectancy = self._number(evidence, "forward_expectancy", default=float("nan"))
+        confidence_lower_bound = self._number(
+            evidence,
+            "forward_confidence_lower_bound",
+            default=float("nan"),
+        )
+        stability = self._number(evidence, "forward_stability", default=float("nan"))
+        calibration = self._number(evidence, "forward_calibration", default=float("nan"))
+        liquidity = self._number(evidence, "forward_liquidity", default=float("nan"))
+        forward_duration = self._number(
+            evidence,
+            "forward_duration_seconds",
+            default=float("nan"),
+        )
+        regimes = self._count(evidence, "forward_regime_count")
         reasons: list[str] = []
-        if count("independent_samples", "sample_count") < self.min_independent_samples:
-            reasons.append("insufficient_independent_samples")
-        if count("trades", "trade_count") < self.min_trades:
-            reasons.append("insufficient_trades")
-        drawdown = number("max_drawdown", "drawdown", default=float("nan"))
+        if independent < self.min_independent_samples:
+            reasons.append("insufficient_independent_resolved_bets")
+        if trades < self.min_trades:
+            reasons.append("insufficient_successful_order_attempts")
         if not math.isfinite(drawdown) or drawdown > self.max_drawdown:
             reasons.append("drawdown_limit")
-        expectancy = number("expectancy", default=float("nan"))
         if not math.isfinite(expectancy) or expectancy < self.min_expectancy:
-            reasons.append("expectancy_floor")
-        confidence_lower_bound = number("confidence_lower_bound", "ci_lower_bound", default=float("nan"))
+            reasons.append("forward_expectancy_floor")
         if not math.isfinite(confidence_lower_bound) or confidence_lower_bound < self.min_confidence_lower_bound:
-            reasons.append("confidence_lower_bound")
-        stability = number("stability", "regime_stability", default=float("nan"))
+            reasons.append("forward_confidence_lower_bound")
         if not math.isfinite(stability) or stability < self.min_stability:
-            reasons.append("stability_floor")
-        calibration = number("calibration", "calibration_score", default=float("nan"))
+            reasons.append("forward_stability_floor")
         if not math.isfinite(calibration) or calibration < self.min_calibration:
-            reasons.append("calibration_floor")
-        liquidity = number("liquidity", "min_liquidity", default=float("nan"))
+            reasons.append("forward_calibration_floor")
         if not math.isfinite(liquidity) or liquidity < self.min_liquidity:
-            reasons.append("liquidity_floor")
-        forward_duration = number("forward_duration_seconds", "paper_forward_duration_seconds", default=float("nan"))
+            reasons.append("forward_liquidity_floor")
         if not math.isfinite(forward_duration) or forward_duration < self.min_forward_duration_seconds:
             reasons.append("insufficient_paper_forward_duration")
-        if count("regimes", "regime_count") < self.min_regimes:
-            reasons.append("insufficient_regime_diversity")
+        if regimes < self.min_regimes:
+            reasons.append("insufficient_forward_regime_diversity")
+        return tuple(dict.fromkeys(reasons))
+
+    def hard_rejection_reasons(self, evidence: Mapping[str, Any]) -> tuple[str, ...]:
+        """Return only immediate safety/invariant failures.
+
+        Negative performance is considered only after adequate independent
+        resolved bets and the configured forward-duration threshold.
+        """
+
+        reasons: list[str] = []
+        drawdown = self._number(evidence, "forward_max_drawdown", default=float("nan"))
+        if math.isfinite(drawdown) and drawdown > self.max_drawdown:
+            reasons.append("forward_drawdown_limit")
+        if bool(evidence.get("risk_breach")):
+            reasons.append("forward_risk_breach")
+        if bool(evidence.get("model_invalid")):
+            reasons.append("invalid_forward_model")
+        if bool(evidence.get("invariant_violation")):
+            reasons.append("forward_invariant_violation")
+        if bool(evidence.get("execution_impossible")):
+            reasons.append("execution_impossible")
+
+        attempts = self._count(evidence, "forward_order_attempts")
+        successful = self._count(evidence, "forward_successful_order_attempts", "forward_trades")
+        if (
+            attempts > 0
+            and attempts >= self.min_order_attempts_for_execution_rejection
+            and successful == 0
+        ):
+            reasons.append("execution_impossible")
+
+        resolved = self._count(evidence, "forward_independent_resolved_bets")
+        duration = self._number(
+            evidence,
+            "forward_duration_seconds",
+            default=0.0,
+        )
+        if (
+            resolved >= self.min_resolved_bets_for_performance_rejection
+            and duration >= self.min_forward_duration_seconds_for_performance_rejection
+        ):
+            expectancy = self._number(evidence, "forward_expectancy", default=float("nan"))
+            if math.isfinite(expectancy) and expectancy < self.min_expectancy:
+                reasons.append("forward_negative_expectancy")
         return tuple(dict.fromkeys(reasons))
 
     def as_record(self) -> dict[str, Any]:
@@ -141,6 +218,9 @@ class PromotionCriteria:
             "min_liquidity": self.min_liquidity,
             "min_forward_duration_seconds": self.min_forward_duration_seconds,
             "min_regimes": self.min_regimes,
+            "min_resolved_bets_for_performance_rejection": self.min_resolved_bets_for_performance_rejection,
+            "min_forward_duration_seconds_for_performance_rejection": self.min_forward_duration_seconds_for_performance_rejection,
+            "min_order_attempts_for_execution_rejection": self.min_order_attempts_for_execution_rejection,
         }
 
 

@@ -16,10 +16,11 @@ from statistics import mean
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from .backtest import CryptoBacktester, PredictionMarketBacktester
-from .director import compact_report, validate_hermes_proposal
-from .domain import MarketType, ResearchQuality, ensure_utc, parse_timestamp, utc_now
-from .evaluation import split_dataset
 from .forward import ForwardTestRegistry, _content_hash
+from .director import compact_report, validate_hermes_proposal
+from .domain import Fill, MarketType, ResearchQuality, SettlementState, ensure_utc, parse_timestamp, utc_now
+from .evaluation import split_dataset
+from .paper_engine import build_resolved_bet
 from .lifecycle import CandidateLifecycle, CandidateLifecycleManager, CandidateStage, PromotionCriteria
 from .metrics import expected_calibration_error
 from .mutations import DeterministicMutationEngine, ExperimentBudget
@@ -109,7 +110,12 @@ class AutonomousQueueCycle:
 
 
 class AutonomousResearchProcessor:
-    """Claim and execute durable research work without human intervention."""
+    """Claim and execute work with paper-only forward evidence.
+
+    The locked holdout is intentionally never consumed by this processor. It
+    remains an immutable partition available only for a separately controlled
+    human audit; no holdout result enters mutation, Hermes, or promotion data.
+    """
 
     def __init__(
         self,
@@ -275,13 +281,11 @@ class AutonomousResearchProcessor:
                             reason="forward paper evidence update",
                         )
                     reasons = self.config.promotion_criteria.evaluate({**existing, **evidence})
-                    filled = int(evidence.get("filled_trades", 0))
-                    expectancy = _finite(evidence.get("expectancy"), 0.0)
-                    hard_negative = filled > 0 and expectancy < 0.0
-                    if hard_negative:
+                    hard_reasons = self.config.promotion_criteria.hard_rejection_reasons(evidence)
+                    if hard_reasons:
                         candidate = self.lifecycle.reject(
                             candidate_id,
-                            "forward_negative_expectancy",
+                            hard_reasons[0],
                             evidence=evidence,
                             expected_stage=CandidateStage.PAPER_FORWARD,
                             expected_payload=candidate.payload,
@@ -291,7 +295,7 @@ class AutonomousResearchProcessor:
                             candidate_id,
                             CandidateStage.PAPER_PROMOTABLE,
                             {**evidence, "holdout_used": False},
-                            reason="paper-forward promotion criteria passed; human review required",
+                            reason="paper-forward criteria passed; human review required",
                         )
                     output.append(
                         {
@@ -684,6 +688,9 @@ class AutonomousResearchProcessor:
             dataset_version=plan.dataset_version,
             require_nonempty=True,
         )
+        # Keep the locked holdout in the split object for provenance only.
+        # Autonomous evaluation, mutation, Hermes summaries, and promotion use
+        # train/validation evidence and never consume split.holdout.
         return ordered, split
 
     def _apply_plan_filters(self, plan: ExperimentPlan, rows: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
@@ -963,20 +970,20 @@ class AutonomousResearchProcessor:
             **base,
             "robustness_passed": bool(sample_check["passed"] and stability_value >= 0.60 and validation_expectancy >= 0.0),
             "minimum_sample_check": sample_check,
-            "stability": stability_value,
-            "stability_summary": stability,
+            "validation_stability": stability_value,
+            "validation_stability_summary": stability,
             "multiple_testing": {
                 "variants_tested": variant_count,
                 "selected_from_variants": variant_count,
                 "selection_metric": "validation_expectancy",
                 "locked_partition_used_for_selection": False,
             },
-            "regime_behavior": {"regimes": validation.get("regime_count", 0)},
-            "execution_quality": validation.get("quality"),
-            "confidence_interval": validation.get("confidence_interval"),
+            "validation_regime_behavior": {"regimes": validation.get("regime_count", 0)},
+            "validation_execution_quality": validation.get("quality"),
+            "validation_confidence_interval": validation.get("confidence_interval"),
             "validation_expectancy": validation_expectancy,
-            "confidence_lower_bound": _finite(validation.get("confidence_lower_bound"), 0.0),
-            "calibration": _finite(validation.get("calibration"), 0.0),
+            "validation_confidence_lower_bound": _finite(validation.get("confidence_lower_bound"), 0.0),
+            "validation_calibration": _finite(validation.get("calibration"), 0.0),
         }
         if candidate.stage is CandidateStage.VALIDATED:
             if not sample_check["passed"]:
@@ -1063,10 +1070,20 @@ class AutonomousResearchProcessor:
                     "forward_duration_seconds": 0.0,
                     "holdout_used": False,
                     "forward_evidence": {
-                        "filled_trades": 0,
-                        "no_fills": 0,
-                        "expectancy": 0.0,
-                        "equity": spec.bankroll,
+                        "evidence_scope": "forward_only",
+                        "forward_order_attempts": 0,
+                        "forward_successful_order_attempts": 0,
+                        "forward_failed_order_attempts": 0,
+                        "fills": 0,
+                        "partial_fills": 0,
+                        "no_fill_orders": 0,
+                        "forward_independent_resolved_bets": 0,
+                        "forward_expectancy": None,
+                        "forward_confidence_lower_bound": None,
+                        "forward_stability": None,
+                        "forward_calibration": None,
+                        "forward_max_drawdown": 0.0,
+                        "paper_only": True,
                     },
                 },
                 reason="genuine forward registration created at current time",
@@ -1303,79 +1320,313 @@ class AutonomousResearchProcessor:
             for fill in self.store.load_fills(strategy_id=spec.strategy_hash)
             if str(fill.metadata.get("paper_experiment_id", "")) == forward_id
         ]
-        state_record = self.store.load_paper_state(forward_id) or {}
-        state = state_record.get("state", {}) if isinstance(state_record, Mapping) else {}
-        portfolio = state.get("portfolio", {}) if isinstance(state, Mapping) else {}
-        duration = max(0.0, (ensure_utc(now) - spec.registration_timestamp).total_seconds())
-        equity = _finite(portfolio.get("equity"), spec.bankroll)
-        prior_peak = _finite(payload.get("forward_peak_equity"), spec.bankroll)
-        peak = max(prior_peak, equity)
-        drawdown = max(0.0, 1.0 - equity / peak) if peak > 0 else 0.0
-        realized = _finite(portfolio.get("realized_pnl"), 0.0)
-        expectancy = realized / len(fills) if fills else _finite(payload.get("validation_expectancy"), 0.0)
+        event_records = self.store.list_paper_execution_events(forward_id, limit=_MAX_FORWARD_ROWS)
+        ledger_records = self.store.list_paper_bet_ledger(forward_id, limit=_MAX_FORWARD_ROWS)
         terminal_by_market: dict[str, str] = {}
-        liquidity: list[float] = []
-        regimes: set[str] = set()
-        calibration_rows: list[dict[str, Any]] = []
+        observed_markets: set[str] = set()
         for row in observations:
             item = row.get("payload", {}) if isinstance(row, Mapping) else {}
             item = item if isinstance(item, Mapping) else {}
-            market_id = str(row.get("market_id", item.get("market_id", "")))
-            settlement = str(item.get("settlement", "")).lower()
-            if settlement in {"resolved_yes", "resolved_no"}:
+            market_id = str(row.get("market_id", item.get("market_id", ""))).strip()
+            if market_id:
+                observed_markets.add(market_id)
+            settlement = _settlement_name(item.get("settlement"))
+            if settlement in {"resolved_yes", "resolved_no", "void"} and market_id:
                 terminal_by_market[market_id] = settlement
-            value = _finite(item.get("liquidity"), math.nan)
-            if math.isfinite(value):
-                liquidity.append(value)
-            regime = item.get("regime", item.get("regime_state"))
-            if regime is not None:
-                regimes.add(str(regime))
+
+        fills_by_market: dict[str, list[Fill]] = {}
         for fill in fills:
-            market_id = str(fill.market_id or fill.symbol)
-            terminal = terminal_by_market.get(market_id)
-            if terminal and fill.expected_probability is not None:
-                outcome = 1.0 if terminal == "resolved_yes" else 0.0
-                traded = str(fill.metadata.get("outcome", "yes")).lower()
-                if traded == "no":
-                    outcome = 1.0 - outcome
-                calibration_rows.append({"probability": fill.expected_probability, "outcome": outcome})
-        calibration = max(0.0, min(1.0, 1.0 - expected_calibration_error(calibration_rows))) if calibration_rows else _finite(payload.get("calibration"), 0.0)
-        previous_forward = payload.get("forward_evidence", {})
-        previous_forward = previous_forward if isinstance(previous_forward, Mapping) else {}
-        no_fills = max(0, len(observations) - len(fills))
-        stored_expectancy = previous_forward.get("expectancy")
-        forward_expectancy = _finite(stored_expectancy, expectancy)
-        if not math.isfinite(_finite(stored_expectancy, math.nan)) or abs(forward_expectancy) <= 1e-15:
-            forward_expectancy = expectancy
-        confidence_lower_bound = _finite(
-            previous_forward.get("confidence_lower_bound"),
-            _finite(payload.get("confidence_lower_bound"), 0.0),
+            fills_by_market.setdefault(str(fill.market_id or fill.symbol), []).append(fill)
+        ledger_by_market: dict[str, Mapping[str, Any]] = {}
+        for row in ledger_records:
+            market_id = str(row.get("market_id", "")).strip()
+            ledger = row.get("payload")
+            if market_id and isinstance(ledger, Mapping):
+                ledger_by_market[market_id] = ledger
+        for market_id, resolution in terminal_by_market.items():
+            if market_id in ledger_by_market:
+                continue
+            ledger = build_resolved_bet(
+                experiment_id=forward_id,
+                market_id=market_id,
+                strategy_id=spec.strategy_hash,
+                settlement=resolution,
+                resolved_at=next(
+                    (
+                        row["timestamp"]
+                        for row in observations
+                        if str(row.get("market_id", "")) == market_id
+                        and isinstance(row.get("payload"), Mapping)
+                        and _settlement_name(row["payload"].get("settlement")) == resolution
+                    ),
+                    now,
+                ),
+                fills=fills_by_market.get(market_id, ()),
+            )
+            if ledger is not None:
+                self.store.save_paper_bet_ledger(
+                    ledger["bet_id"],
+                    forward_id,
+                    market_id,
+                    spec.strategy_hash,
+                    ledger["outcome"],
+                    ledger["resolution"],
+                    parse_timestamp(ledger["resolved_at"]) or now,
+                    ledger,
+                )
+                ledger_by_market[market_id] = ledger
+        ledgers = list(ledger_by_market.values())
+
+        if not event_records:
+            event_records = [
+                {
+                    "market_id": str(fill.market_id or fill.symbol),
+                    "status": str(fill.metadata.get("execution_status", "FULL_FILL")).upper(),
+                    "payload": {
+                        "market_id": str(fill.market_id or fill.symbol),
+                        "status": str(fill.metadata.get("execution_status", "FULL_FILL")).upper(),
+                        "outcomes": ["SIGNAL", "ORDER_ATTEMPT", str(fill.metadata.get("execution_status", "FULL_FILL")).upper()],
+                        "order_attempted": True,
+                        "requested_quantity": _finite(fill.metadata.get("requested_quantity"), fill.quantity),
+                        "filled_quantity": fill.quantity,
+                        "liquidity": fill.metadata.get("liquidity"),
+                        "spread_paid": fill.metadata.get("spread_paid", 0.0),
+                        "depth_consumed": fill.metadata.get("depth_consumed", 0.0),
+                    },
+                }
+                for fill in fills
+            ]
+        event_payloads = [
+            row.get("payload", {})
+            for row in event_records
+            if isinstance(row, Mapping) and isinstance(row.get("payload"), Mapping)
+        ]
+        attempt_events = [
+            event
+            for event in event_payloads
+            if bool(event.get("order_attempted"))
+            or "ORDER_ATTEMPT" in tuple(event.get("outcomes", ()))
+        ]
+        successful_events = [
+            event
+            for event in attempt_events
+            if str(event.get("status", "")).upper() in {"FULL_FILL", "PARTIAL_FILL"}
+            and _finite(event.get("filled_quantity"), 0.0) > 0
+        ]
+        no_fill_events = [event for event in attempt_events if str(event.get("status", "")).upper() == "NO_FILL"]
+        risk_rejected_events = [
+            event for event in attempt_events if str(event.get("status", "")).upper() == "RISK_REJECTED"
+        ]
+        requested_quantity = sum(max(0.0, _finite(event.get("requested_quantity"), 0.0)) for event in attempt_events)
+        filled_quantity = sum(max(0.0, _finite(event.get("filled_quantity"), 0.0)) for event in attempt_events)
+        partial_fills = sum(
+            1
+            for fill in fills
+            if bool(fill.metadata.get("partial"))
+            or str(fill.metadata.get("execution_status", "")).upper() == "PARTIAL_FILL"
         )
-        stability = _finite(payload.get("stability"), 0.0)
+        liquidity_rejections = sum(
+            1
+            for event in no_fill_events
+            if bool(event.get("liquidity_rejected"))
+            or str(event.get("reason", "")).lower() in {"insufficient_liquidity", "invalid_order_book"}
+        )
+        order_attempts = len(attempt_events)
+        successful_order_attempts = len(successful_events)
+        failed_order_attempts = sum(
+            1
+            for event in attempt_events
+            if str(event.get("status", "")).upper() in {"NO_FILL", "RISK_REJECTED"}
+        )
+        markets_signaled = {
+            str(event.get("market_id", "")).strip()
+            for event in event_payloads
+            if str(event.get("market_id", "")).strip()
+            and "SIGNAL" in tuple(event.get("outcomes", ()))
+            and str(event.get("status", "")).upper() != "NO_SIGNAL"
+        }
+        markets_traded = {str(fill.market_id or fill.symbol).strip() for fill in fills}
+        markets_resolved = set(terminal_by_market)
+        resolved_positions = sum(int(_finite(ledger.get("positions"), 0.0)) for ledger in ledgers)
+        resolved_pnls = [_finite(ledger.get("net_pnl"), math.nan) for ledger in ledgers]
+        resolved_pnls = [value for value in resolved_pnls if math.isfinite(value)]
+        resolved_rois = [_finite(ledger.get("roi"), math.nan) for ledger in ledgers]
+        resolved_rois = [value for value in resolved_rois if math.isfinite(value)]
+        forward_expectancy = mean(resolved_pnls) if resolved_pnls else None
+        forward_roi = mean(resolved_rois) if resolved_rois else None
+        confidence_interval = (
+            bootstrap_confidence_interval(
+                resolved_pnls,
+                resamples=min(256, max(32, len(resolved_pnls) * 8)),
+                seed=0,
+            )
+            if resolved_pnls
+            else None
+        )
+        raw_confidence_lower_bound = (
+            _finite(confidence_interval.get("lower"), math.nan)
+            if isinstance(confidence_interval, Mapping)
+            else math.nan
+        )
+        forward_confidence_lower_bound = (
+            raw_confidence_lower_bound
+            if math.isfinite(raw_confidence_lower_bound)
+            else None
+        )
+        forward_stability = (
+            sum(1 for value in resolved_rois if value >= 0.0) / len(resolved_rois)
+            if len(resolved_rois) >= 2
+            else None
+        )
+        calibration_rows: list[dict[str, float]] = []
+        for ledger in ledgers:
+            probability = _finite(ledger.get("expected_probability_at_entry"), math.nan)
+            resolution = _settlement_name(ledger.get("resolution"))
+            if math.isfinite(probability) and 0.0 <= probability <= 1.0 and resolution in {"resolved_yes", "resolved_no"}:
+                calibration_rows.append(
+                    {
+                        "probability": probability,
+                        "outcome": 1.0 if resolution == "resolved_yes" else 0.0,
+                    }
+                )
+        forward_calibration = (
+            max(0.0, min(1.0, 1.0 - expected_calibration_error(calibration_rows)))
+            if calibration_rows
+            else None
+        )
+        state_record = self.store.load_paper_state(forward_id) or {}
+        state = state_record.get("state", {}) if isinstance(state_record, Mapping) else {}
+        portfolio = state.get("portfolio", {}) if isinstance(state, Mapping) else {}
+        risk_state = state.get("risk", {}) if isinstance(state, Mapping) else {}
+        duration = max(0.0, (ensure_utc(now) - spec.registration_timestamp).total_seconds())
+        risk_equity = _finite(risk_state.get("equity"), spec.bankroll)
+        equity = _finite(portfolio.get("equity"), risk_equity)
+        prior_peak = max(
+            _finite(payload.get("forward_peak_equity"), spec.bankroll),
+            _finite(state.get("forward_peak_equity"), spec.bankroll),
+        )
+        peak = max(prior_peak, equity)
+        calculated_drawdown = max(0.0, 1.0 - equity / peak) if peak > 0 else 0.0
+        drawdown = max(
+            calculated_drawdown,
+            _finite(state.get("forward_max_drawdown"), 0.0),
+            _finite(risk_state.get("drawdown"), 0.0),
+        )
+        event_liquidity = [
+            _finite(event.get("liquidity"), math.nan)
+            for event in attempt_events
+            if math.isfinite(_finite(event.get("liquidity"), math.nan))
+        ]
+        regime_values: set[str] = set()
+        for event in attempt_events:
+            regime = event.get("regime", event.get("regime_state"))
+            if regime is not None and str(regime).strip():
+                regime_values.add(str(regime).strip())
+        average_slippage = (
+            sum(float(fill.slippage) * float(fill.quantity) for fill in fills) / filled_quantity
+            if filled_quantity > 0
+            else None
+        )
+        spread_paid = (
+            sum(
+                max(0.0, _finite(event.get("spread_paid"), 0.0))
+                * max(0.0, _finite(event.get("filled_quantity"), 0.0))
+                for event in attempt_events
+            )
+            / filled_quantity
+            if filled_quantity > 0
+            else None
+        )
+        risk_reasons = risk_state.get("reasons", ()) if isinstance(risk_state, Mapping) else ()
+        risk_reasons = tuple(str(reason) for reason in risk_reasons) if isinstance(risk_reasons, (list, tuple, set)) else ()
+        hard_risk_reasons = {
+            "max_loss",
+            "max_drawdown",
+            "max_daily_loss",
+            "max_cvar",
+            "emergency_kill_switch",
+        }
+        execution_impossible = (
+            order_attempts > 0
+            and order_attempts >= self.config.promotion_criteria.min_order_attempts_for_execution_rejection
+            and successful_order_attempts == 0
+        )
+        forward_liquidity = mean(event_liquidity) if event_liquidity else None
+        independent_resolved_bets = len(ledgers)
+        unresolved_markets = markets_traded - markets_resolved
+        total_gross = sum(_finite(ledger.get("gross_pnl"), 0.0) for ledger in ledgers)
+        total_fees = sum(_finite(ledger.get("fees"), 0.0) for ledger in ledgers)
+        total_slippage = sum(_finite(ledger.get("slippage"), 0.0) for ledger in ledgers)
+        total_net = sum(_finite(ledger.get("net_pnl"), 0.0) for ledger in ledgers)
         return {
             "forward_test_id": forward_id,
+            "evidence_scope": "forward_only",
             "forward_duration_seconds": duration,
-            "independent_samples": len({str(row.get("market_id", "")) for row in observations}),
-            "filled_trades": len(fills),
-            "trades": len(fills),
-            "trade_count": len(fills),
-            "partial_fills": sum(1 for fill in fills if bool(fill.metadata.get("partial"))),
-            "no_fills": no_fills,
-            "expectancy": expectancy if fills else forward_expectancy,
-            "equity": equity,
-            "drawdown": drawdown,
-            "max_drawdown": drawdown,
+            "markets_observed": len(observed_markets),
+            "markets_signaled": len(markets_signaled),
+            "markets_traded": len(markets_traded),
+            "markets_resolved": len(markets_resolved),
+            "forward_trades": successful_order_attempts,
+            "trades": successful_order_attempts,
+            "forward_order_attempts": order_attempts,
+            "order_attempts": order_attempts,
+            "forward_successful_order_attempts": successful_order_attempts,
+            "successful_order_attempts": successful_order_attempts,
+            "forward_failed_order_attempts": failed_order_attempts,
+            "failed_order_attempts": failed_order_attempts,
+            "risk_rejected_orders": len(risk_rejected_events),
+            "fills": len(fills),
+            "partial_fills": partial_fills,
+            "no_fill_orders": len(no_fill_events),
+            "no_fills": len(no_fill_events),
+            "observations_without_signal": sum(
+                1 for event in event_payloads if str(event.get("status", "")).upper() == "NO_SIGNAL"
+            ),
+            "requested_quantity": requested_quantity,
+            "filled_quantity": filled_quantity,
+            "fill_ratio": min(1.0, filled_quantity / requested_quantity) if requested_quantity > 0 else None,
+            "depth_consumed": sum(max(0.0, _finite(event.get("depth_consumed"), 0.0)) for event in attempt_events),
+            "average_slippage": average_slippage,
+            "spread_paid": spread_paid,
+            "orders_rejected_for_liquidity": liquidity_rejections,
+            "forward_liquidity": forward_liquidity,
+            "positions_opened": len({(str(fill.market_id or fill.symbol), str(fill.metadata.get("outcome", "yes"))) for fill in fills}),
+            "resolved_positions": resolved_positions,
+            "independent_markets_traded": len(markets_traded),
+            "forward_independent_resolved_bets": independent_resolved_bets,
+            "independent_resolved_bets": independent_resolved_bets,
+            "unresolved_markets": len(unresolved_markets),
+            "unresolved_fills": sum(
+                1
+                for fill in fills
+                if str(fill.market_id or fill.symbol) not in ledger_by_market
+            ),
+            "forward_gross_pnl": total_gross if ledgers else None,
+            "forward_fees": total_fees if ledgers else None,
+            "forward_slippage": total_slippage if ledgers else None,
+            "forward_net_pnl": total_net if ledgers else None,
+            "forward_expectancy": forward_expectancy,
+            "forward_roi": forward_roi,
+            "forward_confidence_interval": (
+                dict(confidence_interval) if isinstance(confidence_interval, Mapping) else None
+            ),
+            "forward_confidence_lower_bound": forward_confidence_lower_bound,
+            "forward_stability": forward_stability,
+            "forward_calibration": forward_calibration,
+            "forward_max_drawdown": drawdown,
             "forward_peak_equity": peak,
-            "calibration": calibration,
-            "confidence_lower_bound": confidence_lower_bound,
-            "stability": stability,
-            "executable_edge": _finite(previous_forward.get("executable_edge"), 0.0),
-            "costs": sum(float(fill.fees) + float(fill.slippage) for fill in fills),
-            "regime_count": len(regimes) if regimes else (1 if observations else 0),
-            "liquidity": mean(liquidity) if liquidity else _finite(previous_forward.get("liquidity"), 0.0),
-            "model_uncertainty": _finite(previous_forward.get("model_uncertainty"), 0.0),
-            "benchmark_comparison": payload.get("benchmark_comparison", {"baseline_expectancy": 0.0, "delta": expectancy}),
+            "forward_regime_count": len(regime_values),
+            "risk_breach": bool(set(risk_reasons) & hard_risk_reasons),
+            "model_invalid": False,
+            "invariant_violation": False,
+            "execution_impossible": execution_impossible,
+            "resolved_bet_ids": [str(ledger.get("bet_id", "")) for ledger in ledgers],
             "paper_only": True,
+            "forward_benchmark_comparison": (
+                {"baseline_expectancy": 0.0, "delta": forward_expectancy}
+                if forward_expectancy is not None
+                else None
+            ),
         }
 
     def _evaluate_forward_candidate(self, candidate_id: str, now: datetime) -> CandidateLifecycle | None:
@@ -1385,13 +1636,23 @@ class AutonomousResearchProcessor:
         evidence = self._forward_evidence(record.as_record(), now)
         updated = self.lifecycle.record_evidence(candidate_id, evidence, expected_stage=CandidateStage.PAPER_FORWARD, reason="forward result evaluation")
         reasons = self.config.promotion_criteria.evaluate({**updated.payload, **evidence})
-        if int(evidence.get("filled_trades", 0)) > 0 and _finite(evidence.get("expectancy"), 0.0) < 0:
-            return self.lifecycle.reject(candidate_id, "forward_negative_expectancy", evidence=evidence, expected_stage=CandidateStage.PAPER_FORWARD, expected_payload=updated.payload)
+        hard_reasons = self.config.promotion_criteria.hard_rejection_reasons(evidence)
+        if hard_reasons:
+            return self.lifecycle.reject(
+                candidate_id,
+                hard_reasons[0],
+                evidence=evidence,
+                expected_stage=CandidateStage.PAPER_FORWARD,
+                expected_payload=updated.payload,
+            )
         if not reasons:
-            return self.lifecycle.advance(candidate_id, CandidateStage.PAPER_PROMOTABLE, {**evidence, "holdout_used": False}, reason="paper-forward criteria passed; human review required")
+            return self.lifecycle.advance(
+                candidate_id,
+                CandidateStage.PAPER_PROMOTABLE,
+                {**evidence, "holdout_used": False},
+                reason="paper-forward criteria passed; human review required",
+            )
         return updated
-
-
 def _candidate_id(plan: ExperimentPlan, parameters: Mapping[str, Any], *, generation: int) -> str:
     token = json.dumps(
         {"plan_id": plan.plan_id, "plan_hash": plan.plan_hash, "parameters": dict(parameters), "generation": generation},
@@ -1486,6 +1747,12 @@ def _finite(value: Any, default: float = 0.0) -> float:
     return number if math.isfinite(number) else float(default)
 
 
+def _settlement_name(value: Any) -> str:
+    if isinstance(value, SettlementState):
+        return value.value
+    return str(value or "").strip().lower()
+
+
 def _is_finite_number(value: Any) -> bool:
     try:
         return math.isfinite(float(value))
@@ -1501,7 +1768,88 @@ def _hash_document(value: Any) -> str:
 def _compact_evidence(value: Mapping[str, Any]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, item in value.items():
-        if key in {"metrics", "confidence_interval", "minimum_sample_check", "stability_summary", "benchmark_comparison", "regime_behavior", "execution_quality", "forward_test_id", "forward_duration_seconds", "independent_samples", "filled_trades", "partial_fills", "no_fills", "expectancy", "equity", "drawdown", "calibration", "costs", "regime_count", "liquidity", "model_uncertainty", "executable_edge", "paper_only"}:
+        if key in {
+            "metrics",
+            "confidence_interval",
+            "forward_confidence_interval",
+            "validation_confidence_interval",
+            "minimum_sample_check",
+            "validation_stability",
+            "validation_stability_summary",
+            "validation_expectancy",
+            "validation_confidence_lower_bound",
+            "validation_calibration",
+            "benchmark_comparison",
+            "forward_benchmark_comparison",
+            "validation_regime_behavior",
+            "validation_execution_quality",
+            "forward_test_id",
+            "evidence_scope",
+            "forward_duration_seconds",
+            "markets_observed",
+            "markets_signaled",
+            "markets_traded",
+            "markets_resolved",
+            "forward_order_attempts",
+            "order_attempts",
+            "forward_trades",
+            "trades",
+            "forward_successful_order_attempts",
+            "successful_order_attempts",
+            "forward_failed_order_attempts",
+            "failed_order_attempts",
+            "risk_rejected_orders",
+            "fills",
+            "partial_fills",
+            "no_fill_orders",
+            "no_fills",
+            "observations_without_signal",
+            "requested_quantity",
+            "filled_quantity",
+            "fill_ratio",
+            "depth_consumed",
+            "average_slippage",
+            "spread_paid",
+            "orders_rejected_for_liquidity",
+            "forward_liquidity",
+            "positions_opened",
+            "resolved_positions",
+            "independent_markets_traded",
+            "forward_independent_resolved_bets",
+            "independent_resolved_bets",
+            "unresolved_markets",
+            "unresolved_fills",
+            "forward_gross_pnl",
+            "forward_fees",
+            "forward_slippage",
+            "forward_net_pnl",
+            "forward_expectancy",
+            "forward_roi",
+            "forward_confidence_lower_bound",
+            "forward_stability",
+            "forward_calibration",
+            "forward_max_drawdown",
+            "forward_peak_equity",
+            "forward_regime_count",
+            "risk_breach",
+            "model_invalid",
+            "invariant_violation",
+            "execution_impossible",
+            "resolved_bet_ids",
+            "independent_samples",
+            "filled_trades",
+            "trades",
+            "trade_count",
+            "expectancy",
+            "confidence_lower_bound",
+            "stability",
+            "calibration",
+            "max_drawdown",
+            "regime_count",
+            "liquidity",
+            "costs",
+            "paper_only",
+        }:
             result[str(key)] = _compact_value(item)
     return result
 

@@ -6,13 +6,15 @@ silently routing an order to a venue.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from copy import deepcopy
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 import hashlib
 import inspect
 from itertools import islice
 import math
 from typing import Any, Iterable, Mapping, Sequence
+
 
 from .domain import (
     CryptoTicker,
@@ -34,6 +36,17 @@ from .domain import (
 
 _MAX_PAPER_HISTORY = 100_000
 _BOOK_UNSET = object()
+PAPER_EXECUTION_STATUSES = (
+    "NO_SIGNAL",
+    "SIGNAL",
+    "ORDER_ATTEMPT",
+    "FULL_FILL",
+    "PARTIAL_FILL",
+    "NO_FILL",
+    "RISK_REJECTED",
+    "RESOLUTION",
+)
+
 
 def _finite_number(value: Any) -> float | None:
     try:
@@ -41,8 +54,12 @@ def _finite_number(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return number if math.isfinite(number) else None
+
+
 class LiveExecutionDisabled(RuntimeError):
     """Raised for every attempt to enable real-money execution."""
+
+
 def _complement_book(book: OrderBookSnapshot) -> OrderBookSnapshot:
     """Convert a YES-token book into the complementary NO-token book."""
     bids = tuple(OrderBookLevel(1.0 - level.price, level.size) for level in book.asks)
@@ -129,10 +146,52 @@ class PaperTrader:
             raise LiveExecutionDisabled("paper traders cannot enable live execution")
         self._fills: list[Fill] = []
         self._sequence = 0
+        self._last_execution_event: dict[str, Any] = {
+            "status": None,
+            "outcomes": [],
+        }
 
     @property
     def fills(self) -> tuple[Fill, ...]:
         return tuple(self._fills)
+
+    @property
+    def last_execution_event(self) -> dict[str, Any]:
+        """Return the latest per-observation execution outcome."""
+
+        event = deepcopy(self._last_execution_event)
+        outcomes = event.get("outcomes")
+        if not isinstance(outcomes, list) or not outcomes:
+            event["status"] = "NO_SIGNAL"
+            event["outcomes"] = ["NO_SIGNAL"]
+        return event
+
+    def _begin_execution_event(self, *, market_id: str, timestamp: datetime) -> None:
+        self._last_execution_event = {
+            "market_id": str(market_id),
+            "timestamp": ensure_utc(timestamp).isoformat(),
+            "status": None,
+            "outcomes": [],
+            "signal": False,
+            "order_attempted": False,
+            "requested_quantity": 0.0,
+            "filled_quantity": 0.0,
+        }
+
+    def _execution_transition(self, status: str, **fields: Any) -> None:
+        normalized = str(status).strip().upper()
+        if normalized not in PAPER_EXECUTION_STATUSES:
+            raise ValueError(f"unsupported paper execution status: {status}")
+        event = self._last_execution_event
+        outcomes = event.setdefault("outcomes", [])
+        if not isinstance(outcomes, list):
+            outcomes = []
+            event["outcomes"] = outcomes
+        if not outcomes or outcomes[-1] != normalized:
+            outcomes.append(normalized)
+        event["status"] = normalized
+        event.update(fields)
+
 
     def _strategy_signal(self, observation: Any, context: Mapping[str, Any]) -> Any:
         if isinstance(self.strategy, Mapping):
@@ -415,6 +474,9 @@ class PaperTrader:
         signal_observation: Any | None = None,
         signal_history: Sequence[Any] | None = None,
     ) -> Fill | None:
+        event_market_id = str(market_id or symbol)
+        self._begin_execution_event(market_id=event_market_id, timestamp=timestamp)
+
         def value(name: str, default: Any = None) -> Any:
             return observation.get(name, default) if isinstance(observation, Mapping) else getattr(observation, name, default)
 
@@ -438,10 +500,7 @@ class PaperTrader:
             if no_mark is not None and 0.0 <= no_mark <= 1.0:
                 mark_prices[f"{symbol}|no"] = no_mark
         else:
-            raw_mark = reference
-            mark = _finite_number(raw_mark)
-            if mark is None:
-                mark = _finite_number(reference)
+            mark = _finite_number(reference)
             if mark is not None and mark >= 0:
                 mark_prices[symbol] = mark
         context: dict[str, Any] = {
@@ -460,6 +519,7 @@ class PaperTrader:
             "paper": True,
         }
         if not self._update_risk_equity(context, timestamp):
+            self._execution_transition("RISK_REJECTED", reason="risk_equity_update_failed", risk_rejected=True)
             return None
         if self.market_type is MarketType.PREDICTION:
             raw_state = value("settlement", SettlementState.OPEN)
@@ -483,13 +543,28 @@ class PaperTrader:
                             )
                         )
                     except (TypeError, ValueError):
+                        self._execution_transition(
+                            "RESOLUTION",
+                            resolution=state.value,
+                            invariant_violation=True,
+                            reason="portfolio_resolution_failed",
+                        )
                         return None
                     if not self._update_risk_equity(context, timestamp):
+                        self._execution_transition(
+                            "RESOLUTION",
+                            resolution=state.value,
+                            risk_rejected=True,
+                            reason="risk_equity_update_failed_after_resolution",
+                        )
                         return None
+                self._execution_transition("RESOLUTION", resolution=state.value)
                 return None
         signal_input = signal_observation if signal_observation is not None else observation
+
         def signal_value(name: str, default: Any = None) -> Any:
             return signal_input.get(name, default) if isinstance(signal_input, Mapping) else getattr(signal_input, name, default)
+
         signal_book = signal_value("order_book")
         if not isinstance(signal_book, OrderBookSnapshot):
             signal_book = None
@@ -538,13 +613,17 @@ class PaperTrader:
         signal = self._strategy_signal(signal_input, signal_context)
         normalized = self._normalize_signal(signal)
         if normalized is None:
+            if signal is not None and signal is not False:
+                self._execution_transition("SIGNAL", signal=True, signal_valid=False, reason="invalid_signal")
             return None
+        self._execution_transition("SIGNAL", signal=True, signal_valid=True)
         side, indicated_quantity = normalized
         outcome = self._signal_outcome(signal) if self.market_type is MarketType.PREDICTION else None
         execution_book = book
         if outcome == "yes" and execution_book is None:
             side_quote = initial_ask if side is Side.BUY else initial_bid
             if _finite_number(side_quote) is None:
+                self._execution_transition("SIGNAL", reason="missing_yes_quote")
                 return None
         if execution_book is None and outcome is None:
             side_quote = initial_ask if side is Side.BUY else initial_bid
@@ -552,12 +631,15 @@ class PaperTrader:
                 try:
                     reference = float(side_quote)
                 except (TypeError, ValueError):
+                    self._execution_transition("SIGNAL", reason="invalid_quote")
                     return None
         try:
             execution_reference = float(reference)
         except (TypeError, ValueError):
+            self._execution_transition("SIGNAL", reason="invalid_reference_price")
             return None
         if not math.isfinite(execution_reference) or execution_reference <= 0:
+            self._execution_transition("SIGNAL", reason="invalid_reference_price")
             return None
         no_bid = value("no_bid")
         no_ask = value("no_ask")
@@ -570,12 +652,15 @@ class PaperTrader:
             if quote is None and execution_book is not None:
                 quote = execution_book.best_ask if side is Side.BUY else execution_book.best_bid
             if quote is None:
+                self._execution_transition("SIGNAL", reason="missing_no_quote")
                 return None
             try:
                 execution_reference = float(quote)
             except (TypeError, ValueError):
+                self._execution_transition("SIGNAL", reason="invalid_no_quote")
                 return None
             if not math.isfinite(execution_reference) or execution_reference <= 0:
+                self._execution_transition("SIGNAL", reason="invalid_no_quote")
                 return None
         elif execution_book is None:
             side_quote = initial_ask if side is Side.BUY else initial_bid
@@ -583,14 +668,17 @@ class PaperTrader:
                 try:
                     execution_reference = float(side_quote)
                 except (TypeError, ValueError):
+                    self._execution_transition("SIGNAL", reason="invalid_execution_quote")
                     return None
         if self.market_type is MarketType.PREDICTION and execution_reference > 1.0:
+            self._execution_transition("SIGNAL", reason="prediction_price_out_of_range")
             return None
         if execution_book is not None:
             executable_reference = execution_book.best_ask if side is Side.BUY else execution_book.best_bid
             if executable_reference is not None and executable_reference > 0:
                 execution_reference = float(executable_reference)
         if self.market_type is MarketType.PREDICTION and execution_reference > 1.0:
+            self._execution_transition("SIGNAL", reason="prediction_price_out_of_range")
             return None
         if execution_book is not None:
             book_bid = execution_book.best_bid
@@ -637,9 +725,9 @@ class PaperTrader:
                 if cash_value is not None and math.isfinite(cash_value):
                     cost_factor = (1.0 + self.config.fee_rate) * (1.0 + self.config.slippage_bps / 10000.0)
                     if execution_book is not None:
-                        cash_price, available = execution_book.executable_price(side, quantity)
+                        cash_price, _available = execution_book.executable_price(side, quantity)
                         if cash_price > 0 and cost_factor > 0:
-                            quantity = min(quantity, available, cash_value / (cash_price * cost_factor))
+                            quantity = min(quantity, cash_value / (cash_price * cost_factor))
                     elif risk_price > 0 and cost_factor > 0:
                         quantity = min(quantity, cash_value / (risk_price * cost_factor))
             elif hasattr(self.portfolio, "get_position"):
@@ -649,9 +737,40 @@ class PaperTrader:
                     position = self.portfolio.get_position(symbol)
                 available = float(getattr(position, "quantity", 0.0)) if position is not None else 0.0
                 quantity = min(quantity, max(0.0, available))
+        if quantity <= 0 or not math.isfinite(quantity):
+            self._execution_transition("SIGNAL", reason="zero_sized_signal")
+            return None
+        requested_quantity = float(quantity)
+        order = PaperOrder(
+            order_id=self._order_id(symbol, timestamp, side),
+            market_type=self.market_type,
+            symbol=symbol,
+            side=side,
+            quantity=requested_quantity,
+            requested_at=timestamp,
+            reference_price=execution_reference,
+            strategy_id=self.strategy_id,
+            market_id=market_id,
+            outcome=outcome,
+        )
+        spread_paid = max(0.0, float(spread)) if spread is not None and math.isfinite(float(spread)) else 0.0
+        self._execution_transition(
+            "ORDER_ATTEMPT",
+            signal=True,
+            order_attempted=True,
+            order_id=order.order_id,
+            side=side.value,
+            outcome=outcome,
+            regime=value("regime", value("regime_state")),
+            requested_quantity=requested_quantity,
+            filled_quantity=0.0,
+            liquidity=liquidity,
+            spread_paid=spread_paid,
+        )
         if execution_book is not None:
             slippage_factor = 1.0 + (self.config.slippage_bps / 10000.0) * (1.0 if side is Side.BUY else -1.0)
             if not math.isfinite(slippage_factor) or slippage_factor <= 0:
+                self._execution_transition("NO_FILL", reason="invalid_slippage", liquidity_rejected=True)
                 return None
             try:
                 projected_price, projected_quantity = execution_book.executable_price(
@@ -660,11 +779,14 @@ class PaperTrader:
                     price_multiplier=slippage_factor,
                 )
             except (TypeError, ValueError):
+                self._execution_transition("NO_FILL", reason="invalid_order_book", liquidity_rejected=True)
                 return None
             if projected_quantity <= 0 or projected_price <= 0:
+                self._execution_transition("NO_FILL", reason="insufficient_liquidity", liquidity_rejected=True)
                 return None
             quantity = min(quantity, projected_quantity)
             if quantity <= 0:
+                self._execution_transition("NO_FILL", reason="insufficient_liquidity", liquidity_rejected=True)
                 return None
             if quantity < projected_quantity:
                 projected_price, projected_quantity = execution_book.executable_price(
@@ -673,35 +795,25 @@ class PaperTrader:
                     price_multiplier=slippage_factor,
                 )
             if projected_quantity <= 0 or projected_price <= 0:
+                self._execution_transition("NO_FILL", reason="insufficient_liquidity", liquidity_rejected=True)
                 return None
             execution_reference = projected_price
             risk_price = projected_price * slippage_factor
             context["reference_price"] = execution_reference
             context["risk_price"] = risk_price
-        if quantity <= 0 or not math.isfinite(quantity):
-            return None
-        order = PaperOrder(
-            order_id=self._order_id(symbol, timestamp, side),
-            market_type=self.market_type,
-            symbol=symbol,
-            side=side,
-            quantity=quantity,
-            requested_at=timestamp,
-            reference_price=execution_reference,
-            strategy_id=self.strategy_id,
-            market_id=market_id,
-            outcome=outcome,
-        )
         if not self._approved(order, context):
+            self._execution_transition("RISK_REJECTED", reason="risk_check_rejected", risk_rejected=True)
             return None
         if execution_book is not None:
             price, filled = execution_book.executable_price(side, quantity)
             quantity = filled
             if not quantity:
+                self._execution_transition("NO_FILL", reason="insufficient_liquidity", liquidity_rejected=True)
                 return None
         else:
             price = execution_reference
         if price <= 0 or not math.isfinite(price):
+            self._execution_transition("NO_FILL", reason="invalid_execution_price")
             return None
         direction = 1.0 if side is Side.BUY else -1.0
         price *= 1.0 + direction * self.config.slippage_bps / 10000.0
@@ -711,7 +823,10 @@ class PaperTrader:
             or self.market_type is MarketType.PREDICTION
             and price > 1.0 + 1e-12
         ):
+            self._execution_transition("NO_FILL", reason="invalid_slippage_adjusted_price")
             return None
+        partial = quantity < requested_quantity - 1e-12
+        execution_status = "PARTIAL_FILL" if partial else "FULL_FILL"
         fill = self._make_fill(
             symbol=symbol,
             side=side,
@@ -724,6 +839,29 @@ class PaperTrader:
             group=context.get("group"),
             expected_probability=trade_probability,
             order_id=order.order_id,
+        )
+        execution_metadata = {
+            "execution_status": execution_status,
+            "order_attempted": True,
+            "order_attempt_id": order.order_id,
+            "requested_quantity": requested_quantity,
+            "filled_quantity": float(quantity),
+            "fill_ratio": min(1.0, max(0.0, float(quantity) / requested_quantity)),
+            "depth_consumed": float(abs(quantity * price)) if execution_book is not None else 0.0,
+            "spread_paid": spread_paid,
+            "liquidity": liquidity,
+            "partial": partial,
+        }
+        fill = replace(fill, metadata={**dict(fill.metadata), **execution_metadata})
+        self._execution_transition(
+            execution_status,
+            order_id=order.order_id,
+            requested_quantity=requested_quantity,
+            filled_quantity=float(quantity),
+            fill_ratio=execution_metadata["fill_ratio"],
+            depth_consumed=execution_metadata["depth_consumed"],
+            spread_paid=spread_paid,
+            liquidity=liquidity,
         )
         self._fills.append(fill)
         self._notify_portfolio(fill)
@@ -917,8 +1055,8 @@ def paper_crypto(provider: Any, strategy: Any, risk: Any | None = None, portfoli
 def paper_prediction(provider: Any, strategy: Any, risk: Any | None = None, portfolio: Any | None = None, **kwargs: Any) -> PredictionPaperTrader:
     return PredictionPaperTrader(provider, strategy, risk, portfolio, **kwargs)
 
-
 __all__ = [
+    "PAPER_EXECUTION_STATUSES",
     "LiveExecutionDisabled", "PaperTradingConfig", "PaperOrder", "PaperTrader",
     "CryptoPaperTrader", "PredictionPaperTrader", "PaperCryptoTrader", "PaperPredictionTrader",
     "CryptoPaperTrading", "PredictionPaperTrading", "paper_crypto", "paper_prediction",

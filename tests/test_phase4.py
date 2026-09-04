@@ -90,7 +90,11 @@ def proposal(
     }
 
 
-def relaxed_criteria(*, forward_trades: int = 0) -> PromotionCriteria:
+def relaxed_criteria(
+    *,
+    forward_trades: int = 0,
+    min_resolved_bets_for_performance_rejection: int = 5,
+) -> PromotionCriteria:
     return PromotionCriteria(
         min_independent_samples=0,
         min_trades=forward_trades,
@@ -102,7 +106,77 @@ def relaxed_criteria(*, forward_trades: int = 0) -> PromotionCriteria:
         min_liquidity=0.0,
         min_forward_duration_seconds=0.0,
         min_regimes=0,
+        min_resolved_bets_for_performance_rejection=min_resolved_bets_for_performance_rejection,
     )
+
+
+class _BuyEverySnapshot:
+    def __init__(self, quantity: float = 1.0) -> None:
+        self.quantity = quantity
+
+    def signal(self, context: object) -> dict[str, object]:
+        return {"side": "buy_yes", "quantity": self.quantity}
+
+    def to_dict(self) -> dict[str, object]:
+        return {"id": "buy-every-snapshot"}
+
+
+class _NoSignal:
+    def signal(self, context: object) -> None:
+        return None
+
+    def to_dict(self) -> dict[str, object]:
+        return {"id": "no-signal"}
+
+
+def _forward_evidence(store: AxiomStore, spec: object, *, now: datetime) -> dict[str, object]:
+    active = processor(store, DurableResearchBus(store), criteria=relaxed_criteria())
+    return active._forward_evidence({"payload": {"forward_test_id": spec.experiment_id}}, now)
+
+
+
+
+def _observation(
+    market_id: str,
+    timestamp: datetime,
+    *,
+    settlement: str = "open",
+    model_probability: float = 0.8,
+    **extra: object,
+) -> dict[str, object]:
+    return {
+        "market_id": market_id,
+        "timestamp": timestamp.isoformat(),
+        "yes_bid": 0.49,
+        "yes_ask": 0.51,
+        "yes_mid": 0.50,
+        "no_bid": 0.49,
+        "no_ask": 0.51,
+        "no_mid": 0.50,
+        "model_probability": model_probability,
+        "liquidity": 100.0,
+        "expiry": (timestamp + timedelta(days=1)).isoformat(),
+        "settlement": settlement,
+        **extra,
+    }
+def _register_forward_candidate(
+    store: AxiomStore,
+    bus: DurableResearchBus,
+    *,
+    proposal_id: str,
+    criteria: PromotionCriteria,
+) -> tuple[AutonomousResearchProcessor, dict[str, object], object]:
+    store.save_dataset("dataset", "v1", prediction_rows())
+    item = bus.submit_hypothesis(proposal(proposal_id), available_at=T0, dedupe_key=proposal_id)
+    active = processor(store, bus, criteria=criteria)
+    cycle = active.process_pending(now=T0)
+    if cycle.completed != 1:
+        raise AssertionError(cycle)
+    record = store.load_candidate_lifecycle(limit=None)[0]
+    spec = ForwardTestRegistry(store).get(record["payload"]["forward_test_id"])
+    if spec is None:
+        raise AssertionError(f"missing forward spec for {item.item_id}")
+    return active, record, spec
 
 
 def processor(
@@ -253,6 +327,32 @@ class Phase4AutonomousLoopTests(unittest.TestCase):
                     "expiry": (future + timedelta(days=1)).isoformat(),
                     "settlement": "resolved_yes",
                 },
+                {
+                    "market_id": "forward-market-2",
+                    "timestamp": (future + timedelta(minutes=2)).isoformat(),
+                    "yes_bid": 0.49,
+                    "yes_ask": 0.51,
+                    "yes_mid": 0.50,
+                    "no_ask": 0.51,
+                    "no_mid": 0.50,
+                    "model_probability": 0.80,
+                    "liquidity": 100.0,
+                    "expiry": (future + timedelta(days=1)).isoformat(),
+                    "settlement": "open",
+                },
+                {
+                    "market_id": "forward-market-2",
+                    "timestamp": (future + timedelta(minutes=3)).isoformat(),
+                    "yes_bid": 0.49,
+                    "yes_ask": 0.51,
+                    "yes_mid": 0.50,
+                    "no_bid": 0.49,
+                    "no_ask": 0.51,
+                    "no_mid": 0.50,
+                    "liquidity": 100.0,
+                    "expiry": (future + timedelta(days=1)).isoformat(),
+                    "settlement": "resolved_yes",
+                },
             ]
             paper_cycle = run_forward_paper(
                 spec,
@@ -260,7 +360,7 @@ class Phase4AutonomousLoopTests(unittest.TestCase):
                 strategy=strategy,
                 model={"field": "model_probability"},
                 observations=observations,
-                now=future + timedelta(minutes=1),
+                now=future + timedelta(minutes=3),
             )
             self.assertGreaterEqual(paper_cycle.fills_inserted, 1)
             result = active.reevaluate_forward_candidates(now=future + timedelta(days=1))
@@ -295,6 +395,309 @@ class Phase4AutonomousLoopTests(unittest.TestCase):
         )
         self.assertFalse(validation.accepted)
         self.assertIn("UNSAFE_PLAN_FIELD", validation.reasons)
+    def test_one_losing_forward_bet_does_not_trigger_performance_rejection(self) -> None:
+        with AxiomStore(":memory:") as store:
+            bus = DurableResearchBus(store)
+            criteria = relaxed_criteria(
+                forward_trades=1,
+                min_resolved_bets_for_performance_rejection=2,
+            )
+            active, record, spec = _register_forward_candidate(
+                store,
+                bus,
+                proposal_id="one-losing-forward-bet",
+                criteria=criteria,
+            )
+            start = T0 + timedelta(hours=1)
+            observations = [
+                _observation("losing-market", start),
+                _observation("losing-market", start + timedelta(minutes=1), settlement="resolved_no"),
+            ]
+            run_forward_paper(
+                spec,
+                store=store,
+                strategy=record["payload"]["strategy"],
+                model={"field": "model_probability"},
+                observations=observations,
+                now=start + timedelta(minutes=1),
+            )
+            result = active.reevaluate_forward_candidates(now=start + timedelta(days=1))[0]
+            self.assertEqual(result["stage"], CandidateStage.PAPER_FORWARD.value)
+            self.assertEqual(result["forward_evidence"]["forward_independent_resolved_bets"], 1)
+            self.assertLess(result["forward_evidence"]["forward_expectancy"], 0.0)
+            self.assertNotIn("forward_negative_expectancy", result["promotion_reasons"])
+
+    def test_multiple_fills_same_market_count_one_independent_resolved_bet(self) -> None:
+        with AxiomStore(":memory:") as store:
+            strategy = _BuyEverySnapshot()
+            spec = ForwardTestRegistry(store).freeze(
+                strategy=strategy,
+                model={"field": "model_probability"},
+                start_timestamp=T0,
+                allowed_markets=("same-market",),
+            )
+            start = T0 + timedelta(hours=1)
+            cycle = run_forward_paper(
+                spec,
+                store=store,
+                strategy=_BuyEverySnapshot(),
+                model={"field": "model_probability"},
+                observations=[
+                    _observation("same-market", start),
+                    _observation("same-market", start + timedelta(minutes=1)),
+                    _observation("same-market", start + timedelta(minutes=2), settlement="resolved_yes"),
+                ],
+                now=start + timedelta(minutes=2),
+            )
+            evidence = _forward_evidence(store, spec, now=start + timedelta(days=1))
+            ledger = store.list_paper_bet_ledger(spec.experiment_id)
+            self.assertEqual(cycle.fills_inserted, 2)
+            self.assertEqual(evidence["fills"], 2)
+            self.assertEqual(evidence["successful_order_attempts"], 2)
+            self.assertEqual(evidence["independent_markets_traded"], 1)
+            self.assertEqual(evidence["forward_independent_resolved_bets"], 1)
+            self.assertEqual(evidence["resolved_positions"], 1)
+            self.assertEqual(len(ledger), 1)
+            self.assertEqual(ledger[0]["payload"]["fills"], 2)
+
+    def test_unresolved_fills_are_excluded_from_expectancy(self) -> None:
+        with AxiomStore(":memory:") as store:
+            strategy = _BuyEverySnapshot()
+            spec = ForwardTestRegistry(store).freeze(
+                strategy=strategy,
+                model={"field": "model_probability"},
+                start_timestamp=T0,
+                allowed_markets=("unresolved-market",),
+            )
+            start = T0 + timedelta(hours=1)
+            run_forward_paper(
+                spec,
+                store=store,
+                strategy=_BuyEverySnapshot(),
+                model={"field": "model_probability"},
+                observations=[_observation("unresolved-market", start)],
+                now=start,
+            )
+            evidence = _forward_evidence(store, spec, now=start + timedelta(days=1))
+            self.assertEqual(evidence["fills"], 1)
+            self.assertEqual(evidence["markets_traded"], 1)
+            self.assertEqual(evidence["markets_resolved"], 0)
+            self.assertEqual(evidence["forward_independent_resolved_bets"], 0)
+            self.assertEqual(evidence["unresolved_fills"], 1)
+            self.assertIsNone(evidence["forward_expectancy"])
+            self.assertIsNone(evidence["forward_net_pnl"])
+
+    def test_no_signal_snapshot_is_not_counted_as_no_fill(self) -> None:
+        with AxiomStore(":memory:") as store:
+            strategy = _NoSignal()
+            spec = ForwardTestRegistry(store).freeze(
+                strategy=strategy,
+                model={"field": "model_probability"},
+                start_timestamp=T0,
+                allowed_markets=("no-signal-market",),
+            )
+            start = T0 + timedelta(hours=1)
+            cycle = run_forward_paper(
+                spec,
+                store=store,
+                strategy=_NoSignal(),
+                model={"field": "model_probability"},
+                observations=[_observation("no-signal-market", start)],
+                now=start,
+            )
+            evidence = _forward_evidence(store, spec, now=start + timedelta(days=1))
+            events = store.list_paper_execution_events(spec.experiment_id)
+            self.assertEqual(cycle.fills_inserted, 0)
+            self.assertEqual(events[0]["status"], "NO_SIGNAL")
+            self.assertEqual(evidence["observations_without_signal"], 1)
+            self.assertEqual(evidence["forward_order_attempts"], 0)
+            self.assertEqual(evidence["no_fill_orders"], 0)
+
+    def test_partial_fill_accounting_uses_requested_and_filled_quantity(self) -> None:
+        with AxiomStore(":memory:") as store:
+            strategy = _BuyEverySnapshot(quantity=2.0)
+            spec = ForwardTestRegistry(store).freeze(
+                strategy=strategy,
+                model={"field": "model_probability"},
+                start_timestamp=T0,
+                allowed_markets=("partial-market",),
+            )
+            start = T0 + timedelta(hours=1)
+            observation = _observation(
+                "partial-market",
+                start,
+                yes_order_book={
+                    "timestamp": start.isoformat(),
+                    "bids": [{"price": 0.49, "size": 10.0}],
+                    "asks": [{"price": 0.51, "size": 0.25}],
+                },
+            )
+            cycle = run_forward_paper(
+                spec,
+                store=store,
+                strategy=_BuyEverySnapshot(quantity=2.0),
+                model={"field": "model_probability"},
+                observations=[observation],
+                now=start,
+            )
+            evidence = _forward_evidence(store, spec, now=start + timedelta(days=1))
+            event = store.list_paper_execution_events(spec.experiment_id)[0]
+            self.assertEqual(cycle.fills_inserted, 1)
+            self.assertEqual(event["status"], "PARTIAL_FILL")
+            self.assertEqual(evidence["partial_fills"], 1)
+            self.assertEqual(evidence["successful_order_attempts"], 1)
+            self.assertGreater(evidence["requested_quantity"], evidence["filled_quantity"])
+            self.assertLess(evidence["fill_ratio"], 1.0)
+            self.assertGreater(evidence["depth_consumed"], 0.0)
+
+    def test_forward_promotion_does_not_borrow_validation_metrics(self) -> None:
+        with AxiomStore(":memory:") as store:
+            bus = DurableResearchBus(store)
+            active, record, spec = _register_forward_candidate(
+                store,
+                bus,
+                proposal_id="validation-not-forward",
+                criteria=relaxed_criteria(),
+            )
+            result = active.reevaluate_forward_candidates(now=T0 + timedelta(days=1))[0]
+            evidence = result["forward_evidence"]
+            self.assertEqual(result["stage"], CandidateStage.PAPER_FORWARD.value)
+            self.assertIsNone(evidence["forward_confidence_lower_bound"])
+            self.assertIsNone(evidence["forward_stability"])
+            self.assertIsNone(evidence["forward_calibration"])
+            self.assertIn("forward_confidence_lower_bound", result["promotion_reasons"])
+            self.assertIn("forward_stability_floor", result["promotion_reasons"])
+            self.assertIn("forward_calibration_floor", result["promotion_reasons"])
+            persisted = store.load_candidate_lifecycle(record["candidate_id"])
+            self.assertIsNone(persisted["payload"]["forward_confidence_lower_bound"])
+            self.assertIsNotNone(persisted["payload"]["validation_confidence_lower_bound"])
+            self.assertEqual(persisted["payload"]["forward_test_id"], spec.experiment_id)
+
+    def test_expectancy_uses_resolved_independent_markets_and_costs(self) -> None:
+        with AxiomStore(":memory:") as store:
+            strategy = _BuyEverySnapshot()
+            spec = ForwardTestRegistry(store).freeze(
+                strategy=strategy,
+                model={"field": "model_probability"},
+                start_timestamp=T0,
+                allowed_markets=("market-one", "market-two"),
+            )
+            start = T0 + timedelta(hours=1)
+            observations = [
+                _observation("market-one", start),
+                _observation("market-one", start + timedelta(minutes=1)),
+                _observation("market-one", start + timedelta(minutes=2), settlement="resolved_yes"),
+                _observation("market-two", start + timedelta(minutes=3)),
+                _observation("market-two", start + timedelta(minutes=4), settlement="resolved_no"),
+            ]
+            run_forward_paper(
+                spec,
+                store=store,
+                strategy=_BuyEverySnapshot(),
+                model={"field": "model_probability"},
+                config=PaperTradingConfig(fee_rate=0.01, slippage_bps=100.0),
+                observations=observations,
+                now=start + timedelta(minutes=4),
+            )
+            evidence = _forward_evidence(store, spec, now=start + timedelta(days=1))
+            ledger = store.list_paper_bet_ledger(spec.experiment_id)
+            ledger_payloads = [row["payload"] for row in ledger]
+            expected = sum(float(row["net_pnl"]) for row in ledger_payloads) / len(ledger_payloads)
+            self.assertEqual(evidence["markets_traded"], 2)
+            self.assertEqual(evidence["forward_independent_resolved_bets"], 2)
+            self.assertEqual(evidence["fills"], 3)
+            self.assertEqual(evidence["forward_expectancy"], expected)
+            self.assertEqual(
+                evidence["forward_net_pnl"],
+                sum(float(row["net_pnl"]) for row in ledger_payloads),
+            )
+            self.assertGreater(evidence["forward_fees"], 0.0)
+            self.assertGreater(evidence["forward_slippage"], 0.0)
+
+    def test_severe_drawdown_is_hard_rejection_without_resolved_bets(self) -> None:
+        with AxiomStore(":memory:") as store:
+            bus = DurableResearchBus(store)
+            criteria = PromotionCriteria(
+                min_independent_samples=0,
+                min_trades=0,
+                max_drawdown=0.20,
+                min_expectancy=-1.0,
+                min_confidence_lower_bound=-1.0,
+                min_stability=0.0,
+                min_calibration=0.0,
+                min_liquidity=0.0,
+                min_forward_duration_seconds=0.0,
+                min_regimes=0,
+                min_resolved_bets_for_performance_rejection=5,
+                min_order_attempts_for_execution_rejection=5,
+            )
+            active, record, spec = _register_forward_candidate(
+                store,
+                bus,
+                proposal_id="hard-drawdown",
+                criteria=criteria,
+            )
+            store.save_paper_state(
+                spec.experiment_id,
+                {"portfolio": {"equity": 1000.0}, "paper_only": True},
+                timestamp=T0 + timedelta(hours=1),
+                expected_version=-1,
+            )
+            result = active.reevaluate_forward_candidates(now=T0 + timedelta(hours=1))[0]
+            self.assertEqual(result["stage"], CandidateStage.REJECTED.value)
+            self.assertEqual(result["forward_evidence"]["forward_independent_resolved_bets"], 0)
+            persisted = store.load_candidate_lifecycle(record["candidate_id"])
+            self.assertEqual(persisted["payload"]["rejection_reason"], "forward_drawdown_limit")
+
+    def test_locked_holdout_is_not_consumed_by_autonomous_evaluation(self) -> None:
+        marker = "LOCKED_HOLDOUT_SENTINEL"
+        rows = prediction_rows()
+        for row in rows:
+            if row["market_id"] == "market-9":
+                row["question"] = marker
+        with AxiomStore(":memory:") as store:
+            store.save_dataset("dataset", "v1", rows)
+            bus = DurableResearchBus(store)
+
+            class RecordingProcessor(AutonomousResearchProcessor):
+                seen_splits: list[tuple[tuple[str, ...], tuple[str, ...]]] = []
+
+                def _evaluate_datasets(self, plan, strategy, train, validation):  # type: ignore[no-untyped-def]
+                    self.seen_splits.append(
+                        (
+                            tuple(str(row.get("question", "")) for row in train),
+                            tuple(str(row.get("question", "")) for row in validation),
+                        )
+                    )
+                    return super()._evaluate_datasets(plan, strategy, train, validation)
+
+            active = RecordingProcessor(
+                store,
+                bus=bus,
+                config=processor(store, bus).config,
+                clock=lambda: T0,
+            )
+            plan = ExperimentPlan.from_proposal(proposal("holdout-isolation"))
+            _, split = active._load_split(plan)
+            self.assertTrue(any(marker in str(row.get("question")) for row in split.holdout))
+            self.assertFalse(any(marker in str(row.get("question")) for row in split.train))
+            self.assertFalse(any(marker in str(row.get("question")) for row in split.validation))
+            item = bus.submit_hypothesis(
+                proposal("holdout-isolation"),
+                available_at=T0,
+                dedupe_key="holdout-isolation",
+            )
+            cycle = active.process_pending(now=T0)
+            self.assertEqual(cycle.completed, 1)
+            self.assertTrue(active.seen_splits)
+            for train_questions, validation_questions in active.seen_splits:
+                self.assertNotIn(marker, train_questions)
+                self.assertNotIn(marker, validation_questions)
+            queued = bus.get(item.item_id)
+            self.assertIsNotNone(queued)
+            self.assertNotIn(marker, json.dumps(queued.result))
+            self.assertNotIn(marker, json.dumps(store.load_candidate_lifecycle(limit=None), default=str))
+
 
     def test_restart_after_crash_retries_transaction_without_duplicates(self) -> None:
         with AxiomStore(":memory:") as store:

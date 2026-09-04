@@ -83,9 +83,9 @@ from .probability import (
     ProbabilityModelRegistry,
 )
 from .hermes import CandidateMessage, Hermes, HermesPermissions, HermesValidationError, HypothesisMessage, ReportMessage
-from .paper import CryptoPaperTrader, LiveExecutionDisabled, PaperTradingConfig, PredictionPaperTrader
+from .paper import CryptoPaperTrader, LiveExecutionDisabled, PAPER_EXECUTION_STATUSES, PaperTradingConfig, PredictionPaperTrader
 from .node import NodeConfig, ResearchNode
-from .paper_engine import ForwardPaperEngine, PaperEngineCycle, historical_replay_id, run_forward_paper, run_historical_replay
+from .paper_engine import ForwardPaperEngine, PaperEngineCycle, build_resolved_bet, historical_replay_id, run_forward_paper, run_historical_replay
 from .experiment_plan import ExperimentPlan, ExperimentPlanError, PLAN_SCHEMA_VERSION
 from .autonomous import (
     AutonomousQueueCycle,
@@ -140,6 +140,7 @@ __all__ = [
     "ExperimentBudget",
     "MutationCandidate",
     "ForwardPaperEngine",
+    "build_resolved_bet",
     "PaperEngineCycle",
     "run_forward_paper",
     "run_historical_replay",
@@ -163,6 +164,7 @@ __all__ = [
     "InMemoryPredictionProvider",
     "InstrumentMetadata",
     "CryptoPaperTrader",
+    "PAPER_EXECUTION_STATUSES",
     "LiveExecutionDisabled",
     "MarketType",
     "BaseRateModel",
