@@ -18,7 +18,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread
 from types import MappingProxyType
 from typing import Any, Mapping
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from .director import research_summary
 from .domain import ensure_utc, parse_timestamp, to_record
@@ -146,6 +146,103 @@ _ENDPOINTS = (
     "evidence-maturity",
     "strategy",
 )
+_V2_ENDPOINTS = ("datasets", "activity", "candidates", "polymarket", "hermes", "paper")
+
+_DEFAULT_PAGE_SIZE = 25
+_PAGE_SIZE_OPTIONS = (10, 25, 50, 100)
+_MAX_PAGE_SIZE = 100
+
+
+def _pagination_error(query: Mapping[str, Any]) -> str | None:
+    """Return a client-facing validation message for v2 query parameters."""
+    def first(name: str) -> str:
+        value = query.get(name, "")
+        if isinstance(value, (list, tuple)):
+            value = value[0] if value else ""
+        return str(value).strip()
+
+    raw_page = first("page")
+    if raw_page:
+        try:
+            if int(raw_page) < 1:
+                return "page must be a positive integer"
+        except ValueError:
+            return "page must be a positive integer"
+    raw_size = first("page_size")
+    if raw_size:
+        try:
+            size = int(raw_size)
+        except ValueError:
+            return "page_size must be one of 10, 25, 50, or 100"
+        if size not in _PAGE_SIZE_OPTIONS:
+            return "page_size must be one of 10, 25, 50, or 100"
+    return None
+_MAX_SIZE_FALLBACK = 1000
+
+
+def _pagination_params(query: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """Normalize dashboard pagination controls without allowing large reads."""
+    query = query or {}
+
+    def first(name: str, default: str = "") -> str:
+        value = query.get(name, default)
+        if isinstance(value, (list, tuple)):
+            value = value[0] if value else default
+        return str(value).strip()
+
+    try:
+        page = int(first("page", "1"))
+    except (TypeError, ValueError):
+        page = 1
+    page = max(1, page)
+    try:
+        page_size = int(first("page_size", str(_DEFAULT_PAGE_SIZE)))
+    except (TypeError, ValueError):
+        page_size = _DEFAULT_PAGE_SIZE
+    if page_size not in _PAGE_SIZE_OPTIONS:
+        page_size = _DEFAULT_PAGE_SIZE
+    page_size = min(_MAX_PAGE_SIZE, max(10, page_size))
+    direction = first("direction", "desc").lower()
+    if direction not in {"asc", "desc"}:
+        direction = "desc"
+    return {
+        "page": page,
+        "page_size": page_size,
+        "sort": first("sort", ""),
+        "direction": direction,
+        "filter": first("filter", "") or None,
+        "stage": first("stage", "") or None,
+        "source_type": first("source_type", "") or None,
+        "market": first("market", "") or None,
+        "timeframe": first("timeframe", "") or None,
+        "quality": first("quality", "") or None,
+        "category": first("category", "") or None,
+        "settlement": first("settlement", "") or None,
+        "status": first("status", "") or None,
+        "item_id": first("item_id", "") or None,
+        "record_type": first("record_type", "") or None,
+        "dataset_version": first("dataset_version", "") or None,
+    }
+
+
+def _page_result(
+    items: Any,
+    *,
+    page: int,
+    page_size: int,
+    total: int | None = None,
+) -> dict[str, Any]:
+    """Return the stable common response shape used by every v2 collection."""
+    values = list(items) if isinstance(items, (list, tuple)) else []
+    total_value = max(len(values), int(total if total is not None else len(values)))
+    pages = max(1, math.ceil(total_value / page_size)) if total_value else 0
+    return {
+        "items": values,
+        "page": int(page),
+        "page_size": int(page_size),
+        "total": total_value,
+        "pages": pages,
+    }
 
 
 def _jsonable(value: Any) -> Any:
@@ -409,6 +506,7 @@ class DashboardData:
                 "trades": 0,
                 "collection_errors": 0,
                 "stale_markets": [],
+
                 "gaps": [],
                 "live_execution": False,
             }
@@ -416,6 +514,289 @@ class DashboardData:
         if not callable(health):
             return {"grade": "F", "error": "store has no polymarket health method", "live_execution": False}
         return health()
+    @staticmethod
+    def _normalize_page_response(value: Any, params: Mapping[str, Any]) -> dict[str, Any]:
+        if not isinstance(value, Mapping):
+            return _page_result([], page=int(params["page"]), page_size=int(params["page_size"]))
+        return _page_result(
+            value.get("items", []),
+            page=int(value.get("page", params["page"])),
+            page_size=int(value.get("page_size", params["page_size"])),
+            total=int(value.get("total", 0)),
+        )
+
+    def _store_page(self, method_name: str, params: Mapping[str, Any], **kwargs: Any) -> dict[str, Any]:
+        """Call a storage paginator, retaining a strict bounded compatibility path."""
+        page = int(params["page"])
+        page_size = int(params["page_size"])
+        method = getattr(self.store, method_name, None) if self.store is not None else None
+        if callable(method):
+            try:
+                return self._normalize_page_response(
+                    method(page=page, page_size=page_size, sort=params.get("sort") or None, direction=params.get("direction", "desc"), **kwargs),
+                    params,
+                )
+            except TypeError:
+                try:
+                    return self._normalize_page_response(method(page=page, page_size=page_size, **kwargs), params)
+                except (AttributeError, TypeError, ValueError):
+                    pass
+            except (AttributeError, ValueError):
+                pass
+        return _page_result([], page=page, page_size=page_size)
+
+    def paginate_dataset_catalog(self, params: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        values = _pagination_params(params)
+        values["sort"] = values.get("sort") or "updated_at"
+        result = self._store_page(
+            "paginate_dataset_catalog",
+            values,
+            source_type=values.get("source_type"),
+            market_type=values.get("market"),
+            timeframe=values.get("timeframe"),
+            quality=values.get("quality"),
+            filter=values.get("filter"),
+        )
+        if result["items"] or callable(getattr(self.store, "paginate_dataset_catalog", None)):
+            return result
+        if self.store is None or not callable(getattr(self.store, "list_dataset_catalog", None)):
+            configured = self._configured("datasets")
+            if isinstance(configured, Mapping):
+                records = list(configured.get("historical", [])) + list(configured.get("forward", []))
+                needle = str(values.get("filter") or "").lower()
+                if values.get("source_type"):
+                    records = [item for item in records if str(item.get("source_type", "")).upper() == str(values["source_type"]).upper()]
+                if needle:
+                    records = [item for item in records if needle in json.dumps(_jsonable(item), sort_keys=True).lower()]
+                offset = (values["page"] - 1) * values["page_size"]
+                return _page_result(records[offset : offset + values["page_size"]], page=values["page"], page_size=values["page_size"], total=len(records))
+            return result
+        limit = min(_MAX_SIZE_FALLBACK, values["page"] * values["page_size"])
+        try:
+            records = self.store.list_dataset_catalog(
+                source_type=values.get("source_type"),
+                market_type=values.get("market"),
+                limit=limit,
+            )
+        except TypeError:
+            records = self.store.list_dataset_catalog(limit=limit)
+        needle = str(values.get("filter") or "").lower()
+        if needle:
+            records = [item for item in records if needle in json.dumps(_jsonable(item), sort_keys=True).lower()]
+        if values.get("timeframe"):
+            records = [item for item in records if str(item.get("timeframe", "")) == str(values["timeframe"])]
+        if values.get("quality"):
+            records = [item for item in records if str(item.get("quality", "")) == str(values["quality"])]
+        offset = (values["page"] - 1) * values["page_size"]
+        return _page_result(records[offset : offset + values["page_size"]], page=values["page"], page_size=values["page_size"], total=len(records))
+
+    def paginate_candidate_lifecycle(self, params: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        values = _pagination_params(params)
+        values["sort"] = values.get("sort") or "updated_at"
+        result = self._store_page(
+            "paginate_candidate_lifecycle",
+            values,
+            stage=values.get("stage"),
+            quality=values.get("quality"),
+            market=values.get("market"),
+            source_type=values.get("source_type"),
+            filter=values.get("filter"),
+        )
+        if result["items"] or callable(getattr(self.store, "paginate_candidate_lifecycle", None)):
+            result["items"] = [
+                {**dict(item), **self._candidate_row(item)}
+                for item in result.get("items", [])
+                if isinstance(item, Mapping)
+            ]
+            return result
+        if self.store is None or not callable(getattr(self.store, "load_candidate_lifecycle", None)):
+            return result
+        limit = min(_MAX_PAGE_SIZE * _MAX_PAGE_SIZE, values["page"] * values["page_size"])
+        records = self.store.load_candidate_lifecycle(limit=limit)
+        records = records if isinstance(records, list) else []
+        needle = str(values.get("filter") or "").lower()
+        if values.get("stage"):
+            records = [item for item in records if str(item.get("stage", "")) == str(values["stage"])]
+        if needle:
+            records = [item for item in records if needle in json.dumps(_jsonable(item), sort_keys=True).lower()]
+        rows = [self._candidate_row(item) for item in records]
+        offset = (values["page"] - 1) * values["page_size"]
+        return _page_result(rows[offset : offset + values["page_size"]], page=values["page"], page_size=values["page_size"], total=len(rows))
+
+    def paginate_research_activity(self, params: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        values = _pagination_params(params)
+        values["sort"] = values.get("sort") or "created_at"
+        result = self._store_page(
+            "paginate_research_activity",
+            values,
+            source=values.get("source_type"),
+            source_type=values.get("source_type"),
+            status=values.get("status"),
+            market=values.get("market"),
+            filter=values.get("filter"),
+        )
+        if result["items"] or callable(getattr(self.store, "paginate_research_activity", None)):
+            return result
+        items = self._activity_feed(limit=min(_MAX_SIZE_FALLBACK, values["page"] * values["page_size"]))
+        needle = str(values.get("filter") or "").lower()
+        if needle:
+            items = [item for item in items if needle in json.dumps(_jsonable(item), sort_keys=True).lower()]
+        offset = (values["page"] - 1) * values["page_size"]
+        return _page_result(items[offset : offset + values["page_size"]], page=values["page"], page_size=values["page_size"], total=len(items))
+
+    def paginate_polymarket_markets(self, params: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        values = _pagination_params(params)
+        values["sort"] = values.get("sort") or "observed_at"
+        result = self._store_page(
+            "paginate_polymarket_markets",
+            values,
+            market=values.get("market"),
+            timeframe=values.get("timeframe"),
+            quality=values.get("quality"),
+            category=values.get("category"),
+            settlement=values.get("settlement"),
+            filter=values.get("filter"),
+            include_snapshots=True,
+        )
+        if result["items"] or callable(getattr(self.store, "paginate_polymarket_markets", None)):
+            for item in result.get("items", []):
+                if not isinstance(item, Mapping):
+                    continue
+                snapshot = item.get("snapshot")
+                if not isinstance(snapshot, Mapping):
+                    payload = item.get("payload")
+                    snapshot = payload.get("snapshot") if isinstance(payload, Mapping) else {}
+                if isinstance(snapshot, Mapping):
+                    for key in ("question", "yes_mid", "liquidity", "category", "settlement", "timeframe"):
+                        if key not in item and key in snapshot:
+                            item[key] = snapshot[key]
+            return result
+        data = self.prediction()
+        items = data.get("markets", []) if isinstance(data, Mapping) else []
+        items = items if isinstance(items, list) else []
+        needle = str(values.get("filter") or "").lower()
+        if values.get("category"):
+            items = [item for item in items if str(item.get("category", "")) == str(values["category"])]
+        if values.get("settlement"):
+            items = [item for item in items if str(item.get("settlement", "")) == str(values["settlement"])]
+        if needle:
+            items = [item for item in items if needle in json.dumps(_jsonable(item), sort_keys=True).lower()]
+        offset = (values["page"] - 1) * values["page_size"]
+        return _page_result(items[offset : offset + values["page_size"]], page=values["page"], page_size=values["page_size"], total=len(items))
+
+    def paginate_research_queue(self, params: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        values = _pagination_params(params)
+        values["sort"] = values.get("sort") or "priority"
+        result = self._store_page(
+            "paginate_research_queue",
+            values,
+            status=values.get("status"),
+            source=values.get("source_type"),
+            item_type=values.get("category"),
+            item_id=values.get("item_id"),
+            filter=values.get("filter"),
+        )
+        if result["items"] or callable(getattr(self.store, "paginate_research_queue", None)):
+            return result
+        if self.store is None or not callable(getattr(self.store, "list_research_items", None)):
+            return result
+        limit = min(_MAX_SIZE_FALLBACK, values["page"] * values["page_size"])
+        records = self.store.list_research_items(status=values.get("status"), limit=limit)
+        needle = str(values.get("filter") or "").lower()
+        if needle:
+            records = [item for item in records if needle in json.dumps(_jsonable(item), sort_keys=True).lower()]
+        offset = (values["page"] - 1) * values["page_size"]
+        return _page_result(records[offset : offset + values["page_size"]], page=values["page"], page_size=values["page_size"], total=len(records))
+
+    def paginate_paper_records(self, params: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        values = _pagination_params(params)
+        values["sort"] = values.get("sort") or "timestamp"
+        result = self._store_page(
+            "paginate_paper_records",
+            values,
+            market=values.get("market"),
+            status=values.get("status"),
+            filter=values.get("filter"),
+        )
+        if result["items"] or callable(getattr(self.store, "paginate_paper_records", None)):
+            return result
+        paper = self._paper_portfolio()
+        items = paper.get("states", []) if isinstance(paper, Mapping) else []
+        items = items if isinstance(items, list) else []
+        needle = str(values.get("filter") or "").lower()
+        if needle:
+            items = [item for item in items if needle in json.dumps(_jsonable(item), sort_keys=True).lower()]
+        offset = (values["page"] - 1) * values["page_size"]
+        return _page_result(items[offset : offset + values["page_size"]], page=values["page"], page_size=values["page_size"], total=len(items))
+
+    def dataset_detail(self, dataset_id: str) -> dict[str, Any]:
+        identifier = str(dataset_id)
+        record = None
+        if self.store is not None and callable(getattr(self.store, "load_dataset_catalog", None)):
+            record = self.store.load_dataset_catalog(identifier)
+        if record is None:
+            catalogs = self._configured("datasets")
+            if isinstance(catalogs, Mapping):
+                for item in catalogs.get("historical", []) + catalogs.get("forward", []):
+                    if isinstance(item, Mapping) and str(item.get("dataset_id")) == identifier:
+                        record = item
+                        break
+        if record is None:
+            return {"available": False, "dataset_id": identifier, "error": "dataset not found", "live_execution": False}
+        result: dict[str, Any] = {"available": True, "dataset_id": identifier, "dataset_version": record.get("dataset_version"), "catalog": record, "live_execution": False}
+        if self.store is not None and callable(getattr(self.store, "data_health", None)):
+            try:
+                result["health"] = self.store.data_health(identifier)
+            except (AttributeError, TypeError, ValueError):
+                pass
+        return result
+
+    def v2_snapshot(self, endpoint: str, params: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        name = endpoint.strip("/")
+        if name.lower().startswith("datasets/"):
+            parts = name.split("/")
+            identifier = unquote(parts[1])
+            detail = self.dataset_detail(identifier)
+            if len(parts) > 2 and parts[2].lower() == "missing-ranges":
+                values = _pagination_params(params)
+                method = getattr(self.store, "paginate_dataset_missing_ranges", None) if self.store is not None else None
+                if callable(method):
+                    return method(identifier, dataset_version=values.get("dataset_version"), page=values["page"], page_size=values["page_size"], sort=values["sort"] or "range_index", direction=values["direction"], filter=values["filter"])
+                catalog = detail.get("catalog", {}) if isinstance(detail, Mapping) else {}
+                ranges = catalog.get("missing_ranges", []) if isinstance(catalog, Mapping) else []
+                start = (values["page"] - 1) * values["page_size"]
+                return _page_result(ranges[start : start + values["page_size"]], page=values["page"], page_size=values["page_size"], total=len(ranges))
+            return detail
+        if name.lower().startswith("candidates/") and name.lower().endswith("/events"):
+            parts = name.split("/")
+            identifier = unquote(parts[1])
+            values = _pagination_params(params)
+            method = getattr(self.store, "paginate_candidate_lifecycle_events", None) if self.store is not None else None
+            if callable(method):
+                return method(candidate_id=identifier, page=values["page"], page_size=values["page_size"], sort=values["sort"] or "created_at", direction=values["direction"], filter=values["filter"])
+            events = self.store.list_candidate_lifecycle_events(identifier, limit=_MAX_SIZE_FALLBACK) if self.store is not None and callable(getattr(self.store, "list_candidate_lifecycle_events", None)) else []
+            start = (values["page"] - 1) * values["page_size"]
+            return _page_result(events[start : start + values["page_size"]], page=values["page"], page_size=values["page_size"], total=len(events))
+        if name.lower().startswith("candidates/"):
+            identifier = unquote(name.split("/", 1)[1])
+            return self.strategy_detail(identifier)
+        if name.lower().startswith("hermes/"):
+            identifier = unquote(name.split("/", 1)[1])
+            detail_params = dict(params or {})
+            detail_params["item_id"] = identifier
+            return self.paginate_research_queue(detail_params)
+        handlers = {
+            "datasets": self.paginate_dataset_catalog,
+            "activity": self.paginate_research_activity,
+            "candidates": self.paginate_candidate_lifecycle,
+            "polymarket": self.paginate_polymarket_markets,
+            "hermes": self.paginate_research_queue,
+            "paper": self.paginate_paper_records,
+        }
+        handler = handlers.get(name.lower())
+        if handler is None:
+            raise KeyError(endpoint)
+        return handler(params)
     def evidence_maturity(self) -> Any:
         configured = self._configured("evidence-maturity")
         if configured is not None:
@@ -612,9 +993,10 @@ class DashboardData:
         return {
             "status": status,
             "summary": self.store.dashboard_summary(),
-            "workers": normalized_workers,
             "cycles": self.store.list_collection_cycles(limit=20),
             "queue": self.store.research_queue_stats(),
+            "workers": normalized_workers,
+            "normalized_workers": normalized_workers,
             "autonomous": summary.get("autonomous", {}),
             "hermes": summary.get("hermes", {}),
             "health_grade": health_grade or None,
@@ -664,7 +1046,7 @@ class DashboardData:
                 "forward_count": 0,
                 "live_execution": False,
             }
-        records = self.store.list_dataset_catalog(limit=10_000)
+        records = self.store.list_dataset_catalog(limit=_MAX_SIZE_FALLBACK)
         historical = [item for item in records if str(item.get("source_type", "")).upper() == "HISTORICAL"]
         forward = [item for item in records if str(item.get("source_type", "")).upper() == "FORWARD_COLLECTED"]
         return {
@@ -706,33 +1088,31 @@ class DashboardData:
     def _candidate_rows(self) -> list[dict[str, Any]]:
         if self.store is None:
             return []
-        records = self.store.load_candidate_lifecycle(limit=10_000)
+        records = self.store.load_candidate_lifecycle(limit=_MAX_SIZE_FALLBACK)
         records = records if isinstance(records, list) else []
-        rows: list[dict[str, Any]] = []
-        for item in records:
-            payload = item.get("payload", {}) if isinstance(item, Mapping) else {}
-            payload = payload if isinstance(payload, Mapping) else {}
-            candidate_id = str(item.get("candidate_id", ""))
-            rows.append(
-                {
-                    "candidate_id": candidate_id,
-                    "strategy_id": payload.get("strategy_id", payload.get("experiment_id", candidate_id)),
-                    "family": payload.get("experiment_family", payload.get("family", "unknown")),
-                    "market": payload.get("market_type", payload.get("market", "unknown")),
-                    "generation": payload.get("generation", 0),
-                    "parent_id": payload.get("parent_id"),
-                    "stage": item.get("stage"),
-                    "validation_expectancy": payload.get("validation_expectancy", payload.get("validation_score")),
-                    "validation_max_drawdown": payload.get("validation_max_drawdown"),
-                    "validation_stability": payload.get("validation_stability"),
-                    "forward_bets": payload.get("forward_independent_resolved_bets", payload.get("markets_resolved")),
-                    "forward_pnl": payload.get("forward_pnl", payload.get("forward_net_pnl")),
-                    "data_quality": payload.get("data_quality", payload.get("quality", payload.get("research_quality"))),
-                    "rejection_reason": payload.get("rejection_reason"),
-                    "updated_at": item.get("updated_at"),
-                }
-            )
-        return rows
+        return [self._candidate_row(item) for item in records if isinstance(item, Mapping)]
+    @staticmethod
+    def _candidate_row(item: Mapping[str, Any]) -> dict[str, Any]:
+        payload = item.get("payload", {})
+        payload = payload if isinstance(payload, Mapping) else {}
+        candidate_id = str(item.get("candidate_id", ""))
+        return {
+            "candidate_id": candidate_id,
+            "strategy_id": payload.get("strategy_id", payload.get("experiment_id", candidate_id)),
+            "family": payload.get("experiment_family", payload.get("family", "unknown")),
+            "market": payload.get("market_type", payload.get("market", "unknown")),
+            "generation": payload.get("generation", 0),
+            "parent_id": payload.get("parent_id"),
+            "stage": item.get("stage"),
+            "validation_expectancy": payload.get("validation_expectancy", payload.get("validation_score")),
+            "validation_max_drawdown": payload.get("validation_max_drawdown"),
+            "validation_stability": payload.get("validation_stability"),
+            "forward_bets": payload.get("forward_independent_resolved_bets", payload.get("markets_resolved")),
+            "forward_pnl": payload.get("forward_pnl", payload.get("forward_net_pnl")),
+            "data_quality": payload.get("data_quality", payload.get("quality", payload.get("research_quality"))),
+            "rejection_reason": payload.get("rejection_reason"),
+            "updated_at": item.get("updated_at"),
+        }
 
     def _activity_feed(self, *, limit: int = 50) -> list[dict[str, Any]]:
         if self.store is None:
@@ -863,15 +1243,17 @@ class DashboardData:
             "win_rate": winning_bets / total_bets if total_bets else 0.0,
             "expectancy": total_pnl / total_bets if total_bets else 0.0,
         }
-
-    def btc_research_data(self) -> dict[str, Any]:
-        catalogs = self.dataset_catalog_data().get("historical", [])
+    def btc_research_data(self, *, catalog_data: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        catalogs_data = catalog_data if isinstance(catalog_data, Mapping) else self.dataset_catalog_data()
+        catalogs = catalogs_data.get("historical", [])
         btc_catalogs = [
             item
             for item in catalogs
             if str(item.get("market_type", "")).lower() == "crypto_spot"
             and str(item.get("instrument", "")).replace("/", "").replace("-", "").upper() == "BTCUSDT"
         ]
+        coverage = catalogs_data.get("coverage_summary", {})
+        btc_summary = coverage.get("btc", {}) if isinstance(coverage, Mapping) else {}
         reports: list[dict[str, Any]] = []
         if self.store is not None:
             for item in self.store.list_reports(limit=100, newest_first=True):
@@ -880,31 +1262,44 @@ class DashboardData:
                     reports.append({"report_id": item.get("report_id"), "report": report, "created_at": item.get("created_at")})
         latest = reports[0] if reports else None
         return {
-            "available": bool(btc_catalogs),
+            "available": bool(btc_catalogs or btc_summary),
             "catalog": btc_catalogs,
+            "catalog_summary": btc_summary,
             "latest_report": latest,
             "reports": reports[:20],
             "live_execution": False,
         }
 
-    def polymarket_research_data(self) -> dict[str, Any]:
-        catalogs = self.dataset_catalog_data()
+    def polymarket_research_data(
+        self,
+        *,
+        catalog_data: Mapping[str, Any] | None = None,
+        current_data: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        catalogs = catalog_data if isinstance(catalog_data, Mapping) else self.dataset_catalog_data()
         historical = [
             item
             for item in catalogs.get("historical", [])
             if str(item.get("market_type", "")).lower() == "prediction"
         ]
-        current = self.prediction()
+        current = current_data if isinstance(current_data, Mapping) else self.prediction()
         aggregate = next((item for item in historical if item.get("dataset_id") == "Polymarket-historical"), None)
+        coverage = catalogs.get("coverage_summary", {})
+        poly_summary = coverage.get("polymarket", {}) if isinstance(coverage, Mapping) else {}
+        historical_markets = int(poly_summary.get("historical_distinct_prediction_datasets", 0) or 0)
+        historical_price_points = int(poly_summary.get("historical_price_points", 0) or 0)
+        quality = poly_summary.get("research_quality") or poly_summary.get("quality") or (aggregate or {}).get("quality") or "PRICE_PROXY"
+        order_book_available = bool(poly_summary.get("historical_order_book_available", False) or (aggregate or {}).get("metadata", {}).get("historical_order_book_available", False))
         return {
-            "available": bool(historical or (isinstance(current, Mapping) and current.get("markets"))),
+            "available": bool(historical or historical_markets or (isinstance(current, Mapping) and current.get("markets"))),
             "current": current,
             "historical_catalog": historical,
             "historical_aggregate": aggregate,
-            "historical_markets": sum(1 for item in historical if str(item.get("dataset_id", "")).startswith("prediction:")),
-            "historical_price_points": int((aggregate or {}).get("row_count", 0)),
-            "research_quality": str((aggregate or {}).get("quality") or "PRICE_PROXY"),
-            "historical_order_book_available": bool((aggregate or {}).get("metadata", {}).get("historical_order_book_available", False)),
+            "historical_markets": historical_markets or sum(1 for item in historical if str(item.get("dataset_id", "")).startswith("prediction:")),
+            "historical_price_points": historical_price_points or int((aggregate or {}).get("row_count", 0)),
+            "research_quality": str(quality),
+            "historical_order_book_available": order_book_available,
+            "coverage_summary": poly_summary,
             "live_execution": False,
         }
 
@@ -949,11 +1344,87 @@ class DashboardData:
             "live_execution": False,
         }
 
+    def _operator_catalog_summary(self) -> dict[str, Any]:
+        """Build overview coverage from SQL aggregates plus two small pages."""
+        aggregate_method = getattr(self.store, "dashboard_coverage_summary", None) if self.store is not None else None
+        aggregate = aggregate_method() if callable(aggregate_method) else {}
+        aggregate = dict(aggregate) if isinstance(aggregate, Mapping) else {}
+        historical_page = self.paginate_dataset_catalog({"page": 1, "page_size": 10, "source_type": "HISTORICAL"})
+        forward_page = self.paginate_dataset_catalog({"page": 1, "page_size": 10, "source_type": "FORWARD_COLLECTED"})
+        historical = [item for item in historical_page.get("items", []) if isinstance(item, Mapping)]
+        forward = [item for item in forward_page.get("items", []) if isinstance(item, Mapping)]
+        historical_coverage = [
+            {
+                "dataset_id": item.get("dataset_id"),
+                "instrument": item.get("instrument"),
+                "timeframe": item.get("timeframe"),
+                "start": item.get("start_timestamp"),
+                "end": item.get("end_timestamp"),
+                "rows": item.get("row_count", 0),
+                "completeness": item.get("completeness", 0.0),
+                "quality": item.get("quality"),
+            }
+            for item in historical
+            if not str(item.get("dataset_id", "")).startswith("prediction:")
+        ]
+        forward_coverage = [
+            {
+                "dataset_id": item.get("dataset_id"),
+                "instrument": item.get("instrument"),
+                "timeframe": item.get("timeframe"),
+                "start": item.get("start_timestamp"),
+                "end": item.get("end_timestamp"),
+                "rows": item.get("row_count", 0),
+                "quality": item.get("quality"),
+            }
+            for item in forward
+        ]
+        return {
+            "historical": historical,
+            "forward": forward,
+            "historical_count": int(aggregate.get("historical_count", historical_page.get("total", len(historical)))),
+            "forward_count": int(aggregate.get("forward_count", forward_page.get("total", len(forward)))),
+            "historical_rows": int(aggregate.get("historical_rows", sum(int(item.get("row_count", 0)) for item in historical))),
+            "forward_rows": int(aggregate.get("forward_rows", sum(int(item.get("row_count", 0)) for item in forward))),
+            "historical_coverage": historical_coverage,
+            "forward_coverage": forward_coverage,
+            "coverage_summary": aggregate,
+            "live_execution": False,
+        }
+
+    def _operator_paper_summary(self) -> dict[str, Any]:
+        """Return a small paper page and aggregate counts for the overview."""
+        page = self.paginate_paper_records({"page": 1, "page_size": 10})
+        counts = self.store.dashboard_summary() if self.store is not None else {}
+        records = [item for item in page.get("items", []) if isinstance(item, Mapping)]
+        states = [item for item in records if str(item.get("record_type", "")).lower() == "state"]
+        portfolio: Mapping[str, Any] = {}
+        if self.store is not None and callable(getattr(self.store, "list_paper_states", None)):
+            try:
+                candidate = self._paper_portfolio()
+                if isinstance(candidate, Mapping):
+                    portfolio = candidate
+            except (AttributeError, TypeError, ValueError):
+                portfolio = {}
+        return {
+            "paper_money": True,
+            "live_execution": False,
+            "states": states,
+            "record_count": page.get("total", 0),
+            "state_count": int(counts.get("paper_state", len(states))),
+            "resolved_bets": int(portfolio.get("resolved_bets", counts.get("paper_bet_ledger", 0)) or 0),
+            "total_equity": _number_or_zero(portfolio.get("total_equity", 0.0)),
+            "total_pnl": _number_or_zero(portfolio.get("total_pnl", 0.0)),
+            "win_rate": _number_or_zero(portfolio.get("win_rate", 0.0)),
+            "expectancy": _number_or_zero(portfolio.get("expectancy", 0.0)),
+        }
+
     def operator_data(self) -> dict[str, Any]:
         configured = self._configured("operator")
         if configured is not None:
             return dict(configured) if isinstance(configured, Mapping) else {"value": configured}
-        catalogs = self.dataset_catalog_data()
+        catalogs = self._operator_catalog_summary()
+        overview_coverage = catalogs
         summary = self.research_summary_data()
         status = self.status_data() if self.store is not None else {"status": "not_started", "workers": []}
         workers = status.get("workers", []) if isinstance(status, Mapping) else []
@@ -962,7 +1433,7 @@ class DashboardData:
             for item in workers
             if isinstance(item, Mapping)
         }
-        bootstrap_states = self.store.list_dataset_bootstrap_states(limit=1000) if self.store is not None else []
+        bootstrap_states = self.store.list_dataset_bootstrap_states(limit=20) if self.store is not None else []
         btc_states = [item for item in bootstrap_states if str(item.get("dataset_id", "")).startswith("BTCUSDT-")]
         forward_states = [item for item in bootstrap_states if str(item.get("dataset_id", "")).startswith("Polymarket")]
         stages = {
@@ -979,10 +1450,23 @@ class DashboardData:
         funnel = self.store.candidate_lifecycle_funnel() if self.store is not None else {}
         for key, value in funnel.items():
             stages[str(key)] = int(value)
-        candidate_rows = self._candidate_rows()
+        candidate_page = self.paginate_candidate_lifecycle({"page": 1, "page_size": 10})
+        candidate_rows = [
+            {**dict(item), **self._candidate_row(item)}
+            for item in candidate_page.get("items", [])
+            if isinstance(item, Mapping)
+        ]
+        activity_page = self.paginate_research_activity({"page": 1, "page_size": 10})
+        activity_rows = activity_page.get("items", []) if isinstance(activity_page, Mapping) else []
         count = self.store.dashboard_summary() if self.store is not None else {}
         hermes = summary.get("hermes", {}) if isinstance(summary, Mapping) else {}
-        paper = self._paper_portfolio()
+        paper = self._operator_paper_summary()
+        polymarket_page = self.paginate_polymarket_markets({"page": 1, "page_size": 10})
+        polymarket_current = {
+            "markets": list(polymarket_page.get("items", [])),
+            "available": bool(polymarket_page.get("total", 0)),
+            "live_execution": False,
+        }
 
         def component(name: str, value: str, detail: Any = None) -> dict[str, Any]:
             return {"name": name, "state": value, "detail": detail}
@@ -996,20 +1480,53 @@ class DashboardData:
             "stale": "DEGRADED",
             "degraded": "DEGRADED",
         }.get(node_state, node_state.upper())
-        crypto_label = "READY" if catalogs.get("historical_count", 0) else ("UPDATING" if any(str(item.get("status")) == "RUNNING" for item in btc_states) else "NOT INITIALIZED")
-        polymarket_label = "READY" if catalogs.get("forward_count", 0) else ("UPDATING" if any(str(item.get("status")) == "RUNNING" for item in forward_states) else "NOT INITIALIZED")
-        hermes_label = "READY" if hermes.get("submitted", 0) or "research-queue" in worker_map else "NOT INITIALIZED"
-        paper_label = "ACTIVE" if paper.get("states") else "NOT INITIALIZED"
+        node_reason = status.get("detail") if isinstance(status, Mapping) else None
+        if not node_reason and isinstance(status, Mapping):
+            unhealthy = [
+                item for item in workers
+                if str(item.get("status", "")).lower() in {"degraded", "stale", "error"}
+            ]
+            for item in unhealthy:
+                payload = item.get("payload", {})
+                if isinstance(payload, Mapping):
+                    node_reason = payload.get("last_error") or payload.get("error")
+                if node_reason:
+                    break
+            if not node_reason and node_state in {"stale", "degraded"}:
+                node_reason = "Worker heartbeat, identity, lock ownership, or health grade is degraded."
+            if not node_reason and status.get("health_grade"):
+                node_reason = f"Health monitor grade is {status['health_grade']}."
+        crypto_label = "READY" if catalogs.get("historical_count", 0) else ("UPDATING" if any(str(item.get("status")).upper() == "RUNNING" for item in btc_states) else "NOT INITIALIZED")
+        polymarket_label = "READY" if catalogs.get("forward_count", 0) else ("UPDATING" if any(str(item.get("status")).upper() == "RUNNING" for item in forward_states) else "NOT INITIALIZED")
+        hermes_workers = [
+            str(item.get("status", "")).lower()
+            for name, item in worker_map.items()
+            if name in {"hermes", "research-queue", "autonomous-research"}
+        ]
+        if "running" in hermes_workers:
+            hermes_label, hermes_reason = "RUNNING", "Hermes queue worker is executing."
+        elif "degraded" in hermes_workers or "stale" in hermes_workers:
+            hermes_label, hermes_reason = "DEGRADED", "Hermes queue worker heartbeat or identity is stale."
+        elif "stopped" in hermes_workers:
+            hermes_label, hermes_reason = "STOPPED", "Hermes queue worker is stopped."
+        elif hermes_workers:
+            hermes_label, hermes_reason = "READY", "Hermes queue worker is idle."
+        elif hermes.get("submitted", 0) or hermes.get("pending", 0):
+            hermes_label, hermes_reason = "STOPPED", "Hermes work is persisted but no queue worker is executing."
+        else:
+            hermes_label, hermes_reason = "NOT INITIALIZED", "No Hermes execution state is persisted."
+        paper_state_count = int(paper.get("state_count", 0) or 0)
+        paper_label = "ACTIVE" if paper_state_count > 0 else "NOT INITIALIZED"
         return {
             "title": "AXIOM / operator research console",
             "live_trading": {"status": "Disabled", "enabled": False},
             "paper_risk_engine": {"status": "Active", "enabled": True},
             "components": [
-                component("AXIOM NODE", node_label, status.get("status") if isinstance(status, Mapping) else None),
-                component("POLYMARKET COLLECTOR", polymarket_label, {"forward_catalogs": catalogs.get("forward_count", 0)}),
-                component("CRYPTO DATA", crypto_label, {"historical_catalogs": catalogs.get("historical_count", 0)}),
-                component("HERMES", hermes_label, hermes),
-                component("PAPER ENGINE", paper_label, {"states": len(paper.get("states", []))}),
+                component("AXIOM NODE", node_label, {"status": node_state, "reason": node_reason}),
+                component("POLYMARKET COLLECTOR", polymarket_label, {"forward_catalogs": catalogs.get("forward_count", 0), "reason": "No forward catalog is persisted." if polymarket_label == "NOT INITIALIZED" else None}),
+                component("CRYPTO DATA", crypto_label, {"historical_catalogs": catalogs.get("historical_count", 0), "reason": "No historical catalog is persisted." if crypto_label == "NOT INITIALIZED" else None}),
+                component("HERMES", hermes_label, {**dict(hermes), "execution_state": hermes_label, "reason": hermes_reason}),
+                component("PAPER ENGINE", paper_label, {"states": paper_state_count, "reason": "Waiting for PAPER_FORWARD." if paper_label == "NOT INITIALIZED" else None}),
             ],
             "research_cards": {
                 "experiments_run": int(count.get("experiments", 0)),
@@ -1019,12 +1536,12 @@ class DashboardData:
                 "paper_forward": stages["PAPER_FORWARD"],
                 "paper_promotable": stages["PAPER_PROMOTABLE"],
             },
-            "coverage": catalogs,
-            "activity": self._activity_feed(),
+            "coverage": overview_coverage,
+            "activity": activity_rows,
             "lifecycle_funnel": stages,
             "candidates": candidate_rows,
-            "btc": self.btc_research_data(),
-            "polymarket": self.polymarket_research_data(),
+            "btc": self.btc_research_data(catalog_data=catalogs),
+            "polymarket": self.polymarket_research_data(catalog_data=catalogs, current_data=polymarket_current),
             "paper_portfolio": paper,
             "hermes": hermes,
             "raw": {
@@ -1091,7 +1608,7 @@ class DashboardData:
 
 
 def _dashboard_html() -> str:
-    """Return the read-only operator dashboard surface."""
+    """Return the bounded, read-only operator dashboard surface."""
     return """<!doctype html>
 <html lang="en">
 <head>
@@ -1099,297 +1616,85 @@ def _dashboard_html() -> str:
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>AXIOM / Operator Research Console</title>
   <style>
-    :root {
-      color-scheme: dark;
-      --bg: #080d17;
-      --panel: #101827;
-      --panel-2: #0c1422;
-      --line: #213047;
-      --text: #e8eef8;
-      --muted: #8b9ab0;
-      --blue: #67b7ff;
-      --cyan: #58e0d0;
-      --green: #65d39b;
-      --amber: #f4bf64;
-      --red: #f27d8d;
-      font-family: Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif;
-    }
+    :root { color-scheme: dark; --bg:#080d17; --panel:#101827; --panel2:#0c1422; --line:#213047; --text:#e8eef8; --muted:#8b9ab0; --blue:#67b7ff; --cyan:#58e0d0; --green:#65d39b; --amber:#f4bf64; --red:#f27d8d; font-family:Inter,ui-sans-serif,system-ui,-apple-system,Segoe UI,sans-serif; }
     * { box-sizing: border-box; }
-    body { margin: 0; background: radial-gradient(circle at 85% 0%, #13233d 0, var(--bg) 36rem); color: var(--text); }
-    header { border-bottom: 1px solid var(--line); background: rgba(8, 13, 23, .92); position: sticky; top: 0; z-index: 2; backdrop-filter: blur(12px); }
-    .topbar, main { max-width: 1500px; margin: 0 auto; padding-left: 28px; padding-right: 28px; }
-    .topbar { padding-top: 22px; padding-bottom: 16px; display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; }
-    h1, h2, h3, p { margin: 0; }
-    h1 { font-size: 1.35rem; letter-spacing: .08em; text-transform: uppercase; }
-    h2 { font-size: .97rem; letter-spacing: .04em; text-transform: uppercase; color: #d5e2f4; }
-    h3 { font-size: .85rem; color: var(--muted); text-transform: uppercase; letter-spacing: .08em; }
-    .eyebrow { color: var(--blue); font-size: .7rem; letter-spacing: .15em; text-transform: uppercase; margin-bottom: 8px; }
-    .subtitle, .muted { color: var(--muted); }
-    .subtitle { margin-top: 6px; font-size: .88rem; }
-    .live-lock { border: 1px solid #276a62; background: #0c2b2c; color: #9bf1d3; border-radius: 6px; padding: 10px 12px; font-size: .72rem; text-transform: uppercase; letter-spacing: .09em; white-space: nowrap; }
-    nav { display: flex; gap: 4px; padding: 0 28px 12px; max-width: 1500px; margin: 0 auto; overflow-x: auto; }
-    nav button, button.link { border: 1px solid transparent; color: var(--muted); background: transparent; cursor: pointer; }
-    nav button { padding: 8px 12px; border-radius: 5px; font-size: .75rem; letter-spacing: .06em; text-transform: uppercase; }
-    nav button:hover, nav button.active { color: var(--text); border-color: var(--line); background: #122039; }
-    main { padding-top: 24px; padding-bottom: 60px; }
-    .view { display: none; }
-    .view.active { display: block; }
-    .status-grid, .card-grid, .two-col, .three-col { display: grid; gap: 12px; }
-    .status-grid { grid-template-columns: repeat(5, minmax(150px, 1fr)); margin-bottom: 16px; }
-    .card-grid { grid-template-columns: repeat(6, minmax(120px, 1fr)); margin-bottom: 16px; }
-    .two-col { grid-template-columns: minmax(0, 1.4fr) minmax(300px, .8fr); }
-    .three-col { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-    .panel { border: 1px solid var(--line); background: linear-gradient(145deg, rgba(16, 24, 39, .96), rgba(10, 17, 29, .96)); border-radius: 8px; padding: 16px; min-width: 0; box-shadow: 0 10px 34px rgba(0, 0, 0, .14); }
-    .panel + .panel { margin-top: 12px; }
-    .status-card { padding: 13px 14px; }
-    .status-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
-    .status-name { font-size: .72rem; color: var(--muted); letter-spacing: .07em; text-transform: uppercase; }
-    .status-value { margin-top: 13px; font-size: .93rem; font-weight: 650; }
-    .badge { display: inline-block; border-radius: 999px; padding: 3px 7px; font-size: .63rem; letter-spacing: .05em; text-transform: uppercase; border: 1px solid var(--line); color: var(--muted); }
-    .badge.good { color: #9bf1d3; border-color: #276a62; background: #102d2d; }
-    .badge.warn { color: #ffd99a; border-color: #765424; background: #2d2414; }
-    .badge.bad { color: #ffb4bd; border-color: #713844; background: #2d161d; }
-    .metric { font-size: 1.55rem; font-variant-numeric: tabular-nums; margin-top: 10px; }
-    .metric-label { color: var(--muted); font-size: .72rem; margin-top: 4px; }
-    .section-title { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
-    .empty { border: 1px dashed #33445d; border-radius: 6px; color: var(--muted); padding: 18px; font-size: .83rem; line-height: 1.5; background: var(--panel-2); }
-    .empty strong { color: var(--text); display: block; margin-bottom: 5px; }
-    table { width: 100%; border-collapse: collapse; font-size: .78rem; }
-    th, td { text-align: left; padding: 9px 8px; border-bottom: 1px solid #1c2a3f; white-space: nowrap; }
-    th { color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: .06em; font-size: .64rem; }
-    tbody tr:hover { background: #142139; }
-    .scroll { overflow-x: auto; }
-    button.link { color: var(--blue); padding: 0; font: inherit; text-align: left; }
-    button.link:hover { text-decoration: underline; }
-    input, select { border: 1px solid var(--line); border-radius: 5px; background: #0a1220; color: var(--text); padding: 7px 9px; font-size: .75rem; }
-    .filters { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
-    .timeline { display: grid; gap: 2px; }
-    .timeline-item { display: grid; grid-template-columns: 92px 76px minmax(0, 1fr); gap: 10px; padding: 9px 0; border-bottom: 1px solid #1c2a3f; align-items: baseline; }
-    .timeline-time { color: var(--muted); font-size: .67rem; font-variant-numeric: tabular-nums; }
-    .timeline-kind { color: var(--cyan); text-transform: uppercase; letter-spacing: .06em; font-size: .63rem; }
-    .timeline-message { font-size: .78rem; }
-    .funnel { display: grid; gap: 7px; }
-    .funnel-row { display: grid; grid-template-columns: 145px 1fr 36px; gap: 8px; align-items: center; font-size: .71rem; }
-    .funnel-track { height: 9px; background: #172238; border-radius: 5px; overflow: hidden; }
-    .funnel-bar { height: 100%; background: linear-gradient(90deg, var(--blue), var(--cyan)); border-radius: 5px; min-width: 0; }
-    .chart { width: 100%; height: 170px; display: block; border-radius: 6px; background: #0a1220; }
-    .chart polyline { fill: none; stroke: var(--blue); stroke-width: 2.5; }
-    .chart line { stroke: #22334d; stroke-width: 1; }
-    .chart text { fill: var(--muted); font-size: 8px; }
-    .key-value { display: grid; grid-template-columns: 150px minmax(0, 1fr); gap: 8px; font-size: .78rem; }
-    .key-value + .key-value { margin-top: 8px; }
-    .key { color: var(--muted); }
-    details { margin-top: 16px; }
-    summary { color: var(--muted); cursor: pointer; font-size: .75rem; }
-    pre { margin: 10px 0 0; max-height: 430px; overflow: auto; white-space: pre-wrap; word-break: break-word; color: #b7c7dc; font-size: .7rem; line-height: 1.45; }
-    .page-note { color: var(--muted); font-size: .78rem; line-height: 1.55; margin-top: 10px; }
-    .notice { border-left: 3px solid var(--amber); padding: 9px 12px; color: #e7d4a8; background: #211b10; font-size: .76rem; line-height: 1.45; }
-    .right { text-align: right; }
-    @media (max-width: 1050px) { .status-grid { grid-template-columns: repeat(3, 1fr); } .card-grid { grid-template-columns: repeat(3, 1fr); } .two-col, .three-col { grid-template-columns: 1fr; } }
-    @media (max-width: 620px) { .topbar, main { padding-left: 15px; padding-right: 15px; } nav { padding-left: 15px; padding-right: 15px; } .status-grid, .card-grid { grid-template-columns: repeat(2, 1fr); } .timeline-item { grid-template-columns: 72px 60px minmax(0, 1fr); } }
+    body { width:100%; max-width:100vw; margin:0; overflow-x:hidden; background:radial-gradient(circle at 85% 0%,#13233d 0,var(--bg) 36rem); color:var(--text); }
+    header { border-bottom:1px solid var(--line); background:rgba(8,13,23,.94); position:sticky; top:0; z-index:2; backdrop-filter:blur(12px); }
+    .topbar, main { width:min(100% - 32px, 1400px); margin:0 auto; }
+    .topbar { padding:20px 0 12px; display:flex; align-items:flex-start; justify-content:space-between; gap:20px; }
+    h1,h2,h3,p { margin:0; } h1 { font-size:1.3rem; letter-spacing:.08em; text-transform:uppercase; } h2 { font-size:.95rem; letter-spacing:.04em; text-transform:uppercase; } h3 { font-size:.8rem; color:var(--muted); text-transform:uppercase; letter-spacing:.08em; }
+    .eyebrow { color:var(--blue); font-size:.68rem; letter-spacing:.15em; text-transform:uppercase; margin-bottom:7px; } .subtitle,.muted,.page-note { color:var(--muted); } .subtitle { margin-top:6px; font-size:.86rem; }
+    .live-lock { border:1px solid #276a62; background:#0c2b2c; color:#9bf1d3; border-radius:6px; padding:9px 11px; font-size:.7rem; text-transform:uppercase; letter-spacing:.08em; white-space:nowrap; }
+    nav { width:min(100% - 32px, 1400px); margin:0 auto; display:flex; gap:4px; padding:0 0 11px; overflow-x:auto; } nav button,button.link { border:1px solid transparent; color:var(--muted); background:transparent; cursor:pointer; } nav button { padding:7px 10px; border-radius:5px; font-size:.7rem; letter-spacing:.06em; text-transform:uppercase; } nav button:hover,nav button.active { color:var(--text); border-color:var(--line); background:#122039; }
+    main { padding:22px 0 55px; } .view { display:none; } .view.active { display:block; }
+    .grid,.two-col,.three-col,.status-grid,.card-grid { display:grid; gap:12px; } .status-grid { grid-template-columns:repeat(5,minmax(0,1fr)); margin-bottom:14px; } .card-grid { grid-template-columns:repeat(6,minmax(0,1fr)); margin-bottom:14px; } .two-col { grid-template-columns:minmax(0,1.45fr) minmax(260px,.8fr); } .three-col { grid-template-columns:repeat(3,minmax(0,1fr)); }
+    .panel { min-width:0; border:1px solid var(--line); background:linear-gradient(145deg,rgba(16,24,39,.96),rgba(10,17,29,.96)); border-radius:8px; padding:15px; box-shadow:0 10px 34px rgba(0,0,0,.14); } .panel + .panel { margin-top:12px; } .status-card { padding:12px 13px; }
+    .status-head,.section-title,.pager { display:flex; align-items:center; justify-content:space-between; gap:10px; } .status-name { font-size:.68rem; color:var(--muted); letter-spacing:.07em; text-transform:uppercase; } .status-value { margin-top:12px; font-size:.88rem; font-weight:650; }
+    .badge { display:inline-block; border-radius:999px; padding:3px 7px; font-size:.6rem; letter-spacing:.05em; text-transform:uppercase; border:1px solid var(--line); color:var(--muted); } .badge.good { color:#9bf1d3; border-color:#276a62; background:#102d2d; } .badge.warn { color:#ffd99a; border-color:#765424; background:#2d2414; } .badge.bad { color:#ffb4bd; border-color:#713844; background:#2d161d; }
+    .metric { font-size:1.45rem; font-variant-numeric:tabular-nums; margin-top:8px; } .metric-label { color:var(--muted); font-size:.69rem; margin-top:3px; } .empty { border:1px dashed #33445d; border-radius:6px; color:var(--muted); padding:17px; font-size:.8rem; line-height:1.5; background:var(--panel2); } .empty strong { color:var(--text); display:block; margin-bottom:5px; }
+    .scroll { width:100%; overflow-x:auto; } table { width:100%; border-collapse:collapse; font-size:.75rem; } th,td { text-align:left; padding:8px; border-bottom:1px solid #1c2a3f; white-space:nowrap; } th { position:sticky; top:0; z-index:1; background:#101827; color:var(--muted); font-weight:600; text-transform:uppercase; letter-spacing:.05em; font-size:.62rem; } tbody tr:hover { background:#142139; }
+    button.link { color:var(--blue); padding:0; font:inherit; text-align:left; } button.link:hover { text-decoration:underline; } input,select { min-width:0; border:1px solid var(--line); border-radius:5px; background:#0a1220; color:var(--text); padding:7px 9px; font-size:.73rem; } .filters { display:flex; gap:7px; flex-wrap:wrap; margin:10px 0; } .filters input { flex:1 1 180px; }
+    .timeline { display:grid; gap:2px; } .timeline-item { display:grid; grid-template-columns:95px 75px minmax(0,1fr); gap:9px; padding:8px 0; border-bottom:1px solid #1c2a3f; align-items:baseline; } .timeline-time { color:var(--muted); font-size:.65rem; } .timeline-kind { color:var(--cyan); text-transform:uppercase; letter-spacing:.05em; font-size:.61rem; }
+    .funnel { display:grid; gap:7px; } .funnel-row { display:grid; grid-template-columns:145px 1fr 35px; gap:8px; align-items:center; font-size:.69rem; } .funnel-track { height:8px; background:#172238; border-radius:5px; overflow:hidden; } .funnel-bar { height:100%; background:linear-gradient(90deg,var(--blue),var(--cyan)); border-radius:5px; }
+    .key-value { display:grid; grid-template-columns:145px minmax(0,1fr); gap:7px; font-size:.76rem; } .key { color:var(--muted); } .key-value + .key-value { margin-top:7px; } details { margin-top:12px; } summary { color:var(--muted); cursor:pointer; font-size:.72rem; } pre { margin:9px 0 0; max-height:350px; overflow:auto; white-space:pre-wrap; word-break:break-word; color:#b7c7dc; font-size:.68rem; line-height:1.4; } .page-note { font-size:.74rem; line-height:1.5; margin-top:9px; } .notice { border-left:3px solid var(--amber); padding:8px 11px; color:#e7d4a8; background:#211b10; font-size:.73rem; line-height:1.4; } .right { text-align:right; } .pager { margin-top:11px; color:var(--muted); font-size:.72rem; } .pager button { border:1px solid var(--line); border-radius:4px; color:var(--text); background:#0a1220; padding:5px 8px; cursor:pointer; } .pager button:disabled { opacity:.4; cursor:default; }
+    @media (max-width:1050px) { .status-grid { grid-template-columns:repeat(3,1fr); } .card-grid { grid-template-columns:repeat(3,1fr); } .two-col,.three-col { grid-template-columns:1fr; } } @media (max-width:620px) { .topbar,main,nav { width:min(100% - 24px,1400px); } .status-grid,.card-grid { grid-template-columns:repeat(2,1fr); } .timeline-item { grid-template-columns:72px 60px minmax(0,1fr); } }
   </style>
 </head>
 <body>
-  <header>
-    <div class="topbar">
-      <div><div class="eyebrow">Read-only research operations</div><h1>AXIOM / operator console</h1><p class="subtitle">Historical evidence, forward observation, and paper lifecycle in one view.</p></div>
-      <div class="live-lock">Live trading <strong>Disabled</strong><br>Paper risk engine <strong>Active</strong></div>
-    </div>
+  <header><div class="topbar"><div><div class="eyebrow">Read-only research operations</div><h1>AXIOM / operator console</h1><p class="subtitle">Historical evidence, forward observation, and paper lifecycle in one view.</p></div><div class="live-lock">Live trading <strong>Disabled</strong><br>Paper risk engine <strong>Active</strong></div></div>
     <nav aria-label="Research sections">
-      <button class="tab active" data-view="overview">Overview</button>
-      <button class="tab" data-view="btc">BTC Research</button>
-      <button class="tab" data-view="polymarket">Polymarket</button>
-      <button class="tab" data-view="portfolio">Paper Portfolio</button>
-      <button class="tab" data-view="hermes">Hermes</button>
+      <button class="tab active" data-view="overview">Overview</button><button class="tab" data-view="datasets">DATASETS</button><button class="tab" data-view="activity">ACTIVITY</button><button class="tab" data-view="btc">BTC Research</button><button class="tab" data-view="polymarket">Polymarket</button><button class="tab" data-view="candidates">Candidates</button><button class="tab" data-view="hermes">Hermes</button><button class="tab" data-view="portfolio">Paper Portfolio</button>
     </nav>
   </header>
   <main>
-    <section id="view-overview" class="view active">
-      <div id="component-grid" class="status-grid"></div>
-      <div id="research-cards" class="card-grid"></div>
-      <div class="two-col">
-        <div>
-          <article class="panel"><div class="section-title"><h2>Historical / forward coverage</h2><span id="coverage-summary" class="muted"></span></div><div id="coverage"></div></article>
-          <article class="panel"><div class="section-title"><h2>Candidate lifecycle funnel</h2><span class="muted">current durable stage</span></div><div id="funnel" class="funnel"></div></article>
-          <article class="panel"><div class="section-title"><h2>Candidate strategies</h2><span class="muted">select a row for evidence detail</span></div><div class="filters"><input id="candidate-filter" placeholder="Filter strategy, family, market" aria-label="Filter candidates"><select id="candidate-stage" aria-label="Filter candidate stage"><option value="">All stages</option></select></div><div id="candidates" class="scroll"></div></article>
-        </div>
-        <article class="panel"><div class="section-title"><h2>Research activity</h2><span id="last-refreshed" class="muted">waiting</span></div><div id="activity" class="timeline"></div></article>
-        <article class="panel"><div class="section-title"><h2>Strategy detail</h2><span class="muted">historical → forward → lifecycle</span></div><div id="strategy-detail" class="empty"><strong>Select a candidate</strong>Its hypothesis, parameters, evidence, lineage, rejection reason, and paper-only forward state will appear here.</div></article>
-      </div>
-      <details><summary>Technical details · raw APIs and retained debug surfaces</summary><p class="page-note">Existing JSON APIs remain available for automation. The older labels “Research maturity”, “Paper forward”, and “Research queue and node status” are retained below as raw endpoint links.</p><pre id="raw-overview"></pre></details>
+    <section id="view-overview" class="view active"><div id="component-grid" class="status-grid"></div><div id="research-cards" class="card-grid"></div>
+      <div class="two-col"><div><article class="panel"><div class="section-title"><h2>Historical / forward coverage</h2><a class="link" href="#datasets" data-link="datasets">View all</a></div><div id="coverage"></div></article>
+        <article class="panel"><div class="section-title"><h2>Candidate lifecycle funnel</h2><a class="link" href="#candidates" data-link="candidates">View all</a></div><div id="funnel" class="funnel"></div></article>
+        <article class="panel"><div class="section-title"><h2>Latest candidates</h2><a class="link" href="#candidates" data-link="candidates">View all</a></div><div id="overview-candidates" class="scroll"></div></article></div>
+        <div><article class="panel"><div class="section-title"><h2>Latest activity</h2><a class="link" href="#activity" data-link="activity">View all</a></div><div id="overview-activity" class="timeline"></div></article>
+        <article class="panel"><div class="section-title"><h2>Selected detail</h2><span class="muted">preserved on refresh</span></div><div id="detail" class="empty"><strong>Select an item</strong>Dataset and candidate evidence appears here.</div></article></div></div>
+      <details><summary>Technical details · raw APIs and retained debug surfaces</summary><p class="page-note">Existing JSON APIs remain available for automation. Research maturity, Paper forward, and Research queue and node status are retained below as raw endpoint links.</p><div id="api-links"><a href="/api/v2/datasets">datasets</a> · <a href="/api/v2/activity">activity</a> · <a href="/api/v2/candidates">candidates</a> · <a href="/api/v2/polymarket">polymarket</a> · <a href="/api/v2/hermes">hermes</a> · <a href="/api/v2/paper">paper</a> · <a href="/api/autonomous-research">autonomous-research</a></div><pre id="raw-overview"></pre></details>
     </section>
-    <section id="view-btc" class="view">
-      <article class="panel"><div class="section-title"><h2>BTC / USDT historical research</h2><span class="badge good">historical only</span></div><div id="btc-summary"></div><div id="btc-chart"></div><div id="btc-experiments" class="scroll"></div><div class="notice">Walk-forward results use deterministic existing strategy families. Fees, slippage, turnover, drawdown, expectancy, Sharpe, Sortino, and stability are reported; no live execution path exists.</div></article>
-    </section>
-    <section id="view-polymarket" class="view">
-      <article class="panel"><div class="section-title"><h2>Polymarket opportunities</h2><span class="badge warn">price proxy unless timestamped depth exists</span></div><div id="pm-summary"></div><div id="pm-markets" class="scroll"></div><p class="page-note">Historical price history is kept separate from forward order-book observations. No historical depth, spread, fills, or executable quotes are fabricated.</p></article>
-    </section>
-    <section id="view-portfolio" class="view">
-      <article class="panel"><div class="section-title"><h2>Paper portfolio</h2><span class="badge good">paper money</span></div><div id="portfolio-summary"></div><div id="portfolio-states" class="scroll"></div></article>
-    </section>
-    <section id="view-hermes" class="view">
-      <article class="panel"><div class="section-title"><h2>Hermes / research loop</h2><span class="badge">no autonomous trading</span></div><div id="hermes-summary"></div><div id="hermes-raw"></div></article>
-    </section>
-    <details><summary>Raw JSON API links</summary><p id="api-links" class="page-note"></p><pre id="raw-api"></pre></details>
-    <p class="muted page-note">Last refresh is read-only and cache-bypassed. Auto-refresh interval: 10 seconds.</p>
+    <section id="view-datasets" class="view"><article class="panel"><div class="section-title"><h2>DATASETS</h2><span id="dataset-total" class="muted"></span></div><div class="filters"><input id="datasets-filter" placeholder="Filter dataset, instrument, source" aria-label="Filter datasets"><select id="datasets-source"><option value="">All sources</option><option>HISTORICAL</option><option>FORWARD_COLLECTED</option></select><select id="datasets-size"><option>25</option><option>50</option><option>100</option></select></div><div id="datasets-table" class="scroll"></div><div id="datasets-pager" class="pager"></div></article><article id="dataset-detail" class="panel"></article></section>
+    <section id="view-activity" class="view"><article class="panel"><div class="section-title"><h2>ACTIVITY</h2><span id="activity-total" class="muted"></span></div><div class="filters"><input id="activity-filter" placeholder="Filter activity" aria-label="Filter activity"><select id="activity-status"><option value="">All statuses</option><option>PENDING</option><option>RUNNING</option><option>COMPLETE</option><option>COMPLETED</option><option>ACCEPTED</option><option>FAILED</option><option>ERROR</option><option>REJECTED</option></select><select id="activity-size"><option>25</option><option>50</option><option>100</option></select></div><div id="activity-table" class="scroll"></div><div id="activity-pager" class="pager"></div></article></section>
+    <section id="view-btc" class="view"><article class="panel"><div class="section-title"><h2>BTC / USDT historical research</h2><span class="badge good">historical only</span></div><div id="btc-summary"></div><div id="btc-experiments" class="scroll"></div><div class="notice">Walk-forward results are deterministic and paper-only; no live execution path exists.</div></article></section>
+    <section id="view-polymarket" class="view"><article class="panel"><div class="section-title"><h2>Polymarket opportunities</h2><span class="badge warn">price proxy unless timestamped depth exists</span></div><div class="filters"><input id="polymarket-filter" placeholder="Filter questions or markets" aria-label="Filter Polymarket"><select id="polymarket-category"><option value="">All categories</option></select><select id="polymarket-size"><option>25</option><option>50</option><option>100</option></select></div><div id="pm-summary"></div><div id="pm-markets" class="scroll"></div><div id="polymarket-pager" class="pager"></div><p class="page-note">Historical price history is separate from forward order-book observations. No historical depth, spread, fills, or executable quotes are fabricated.</p></article></section>
+    <section id="view-candidates" class="view"><article class="panel"><div class="section-title"><h2>CANDIDATES</h2><span id="candidate-total" class="muted"></span></div><div class="filters"><input id="candidates-filter" placeholder="Filter strategy, family, market" aria-label="Filter candidates"><select id="candidates-stage"><option value="">All stages</option></select><select id="candidates-size"><option>25</option><option>50</option><option>100</option></select></div><div id="candidates-table" class="scroll"></div><div id="candidates-pager" class="pager"></div></article></section>
+    <article id="candidate-detail" class="panel"><div class="section-title"><h2>Candidate detail</h2><span class="muted">historical → forward → lifecycle</span></div><div class="empty">Select a candidate to inspect evidence.</div></article>
+    <section id="view-hermes" class="view"><article class="panel"><div class="section-title"><h2>Hermes / research loop</h2><span class="badge">no autonomous trading</span></div><div id="hermes-summary"></div><div class="filters"><input id="hermes-filter" placeholder="Filter queue" aria-label="Filter Hermes queue"><select id="hermes-status"><option value="">All statuses</option><option>PENDING</option><option>TESTING</option><option>COMPLETED</option><option>ACCEPTED</option><option>REJECTED</option><option>FAILED</option><option>ERROR</option></select><select id="hermes-size"><option>25</option><option>50</option><option>100</option></select></div><div id="hermes-table" class="scroll"></div><div id="hermes-pager" class="pager"></div><div id="hermes-detail"></div></article></section>
+    <section id="view-portfolio" class="view"><article class="panel"><div class="section-title"><h2>Paper portfolio and histories</h2><span class="badge good">paper money</span></div><div id="portfolio-summary"></div><div class="filters"><input id="paper-filter" placeholder="Filter experiment, market" aria-label="Filter paper records"><select id="paper-status"><option value="">All statuses</option><option>FILLED</option><option>RESOLVED</option><option>OPEN</option><option>CLOSED</option><option>ACCEPTED</option><option>FAILED</option></select><select id="paper-size"><option>25</option><option>50</option><option>100</option></select></div><div id="portfolio-states" class="scroll"></div><div id="paper-pager" class="pager"></div></article></section>
   </main>
   <script>
-    const $ = (id) => document.getElementById(id);
-    const safe = (value) => String(value ?? "—").replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[char]));
-    const json = (value) => JSON.stringify(value ?? {}, null, 2);
-    const number = (value, digits = 3) => { const n = Number(value); return Number.isFinite(n) ? n.toFixed(digits) : "—"; };
-    const count = (value) => { const n = Number(value); return Number.isFinite(n) ? String(n) : "0"; };
-    const dateText = (value) => value ? new Date(value).toISOString().replace(".000Z", "Z") : "—";
-    const empty = (title, body) => `<div class="empty"><strong>${safe(title)}</strong>${safe(body)}</div>`;
-    const statusClass = (value) => { const text = String(value || "").toUpperCase(); return ["READY", "RUNNING", "ACTIVE", "COMPLETE", "HEALTHY"].includes(text) ? "good" : ["DEGRADED", "STOPPED", "UPDATING"].includes(text) ? "warn" : ""; };
-    const asArray = (value) => Array.isArray(value) ? value : [];
-    let operator = {};
-    let candidateSort = { key: "updated_at", direction: -1 };
-
-    function chart(values, label) {
-      const points = values.map(Number).filter(Number.isFinite);
-      if (!points.length) return empty("No chart yet", "Run BTC historical research after a catalog dataset is available.");
-      const low = Math.min(...points), high = Math.max(...points), span = high - low || 1;
-      const polyline = points.map((value, index) => `${10 + index * (380 / Math.max(1, points.length - 1))},${145 - ((value - low) / span) * 120}`).join(" ");
-      return `<svg class="chart" viewBox="0 0 400 170" role="img" aria-label="${safe(label)}"><line x1="10" y1="25" x2="390" y2="25"></line><line x1="10" y1="145" x2="390" y2="145"></line><polyline points="${polyline}"></polyline><text x="12" y="18">${safe(label)}</text><text x="12" y="163">${number(low, 4)}</text><text x="350" y="163">${number(high, 4)}</text></svg>`;
-    }
-
-    function renderComponents(data) {
-      $("component-grid").innerHTML = asArray(data.components).map((item) => {
-        const state = String(item.state || "NOT INITIALIZED");
-        return `<article class="panel status-card"><div class="status-head"><span class="status-name">${safe(item.name)}</span><span class="badge ${statusClass(state)}">${safe(state)}</span></div><div class="status-value">${safe(item.detail?.symbol || item.detail?.status || "read-only")}</div></article>`;
-      }).join("") || empty("System not initialized", "Start the normal AXIOM node to populate worker status.");
-    }
-
-    function renderCards(cards) {
-      const definitions = [["experiments_run", "Experiments run"], ["active_hypotheses", "Active hypotheses"], ["candidates_alive", "Candidates alive"], ["rejected", "Rejected"], ["paper_forward", "Paper forward"], ["paper_promotable", "Paper promotable"]];
-      $("research-cards").innerHTML = definitions.map(([key, label]) => `<article class="panel"><div class="metric">${count(cards?.[key])}</div><div class="metric-label">${label}</div></article>`).join("");
-    }
-
-    function renderCoverage(coverage) {
-      const historical = asArray(coverage?.historical_coverage);
-      const forward = asArray(coverage?.forward_coverage);
-      $("coverage-summary").textContent = `${count(coverage?.historical_rows)} historical rows · ${count(coverage?.forward_rows)} forward rows`;
-      const rows = (items, source) => items.length ? `<h3>${source}</h3><table><thead><tr><th>Dataset</th><th>Instrument</th><th>Timeframe</th><th>Range</th><th>Rows</th><th>Quality</th></tr></thead><tbody>${items.map((item) => `<tr><td>${safe(item.dataset_id)}</td><td>${safe(item.instrument)}</td><td>${safe(item.timeframe)}</td><td>${safe(dateText(item.start))} → ${safe(dateText(item.end))}</td><td>${count(item.rows)}${source === "Historical" ? ` (${number(Number(item.completeness) * 100, 1)}%)` : ""}</td><td>${safe(item.quality)}</td></tr>`).join("")}</tbody></table>` : empty(`${source} coverage not initialized`, source === "Historical" ? "Run bootstrap-history --crypto, then btc-research." : "Run the normal node or collect-data command for forward observations.");
-      $("coverage").innerHTML = rows(historical, "Historical") + rows(forward, "Forward collected");
-    }
-
-    function renderFunnel(funnel) {
-      const entries = Object.entries(funnel || {});
-      const maximum = Math.max(1, ...entries.map(([, value]) => Number(value) || 0));
-      $("funnel").innerHTML = entries.length ? entries.map(([stage, value]) => `<div class="funnel-row"><span>${safe(stage)}</span><span class="funnel-track"><span class="funnel-bar" style="width:${Math.min(100, ((Number(value) || 0) / maximum) * 100)}%"></span></span><span class="right">${count(value)}</span></div>`).join("") : empty("No candidate lifecycle", "Hermes hypotheses become visible here only after a durable research item is processed.");
-    }
-
-    function sortedCandidates(rows) {
-      const filter = String($("candidate-filter")?.value || "").toLowerCase();
-      const stage = String($("candidate-stage")?.value || "");
-      return asArray(rows).filter((row) => (!stage || row.stage === stage) && (!filter || JSON.stringify(row).toLowerCase().includes(filter))).sort((left, right) => {
-        const a = left[candidateSort.key] ?? "", b = right[candidateSort.key] ?? "";
-        return (a < b ? -1 : a > b ? 1 : 0) * candidateSort.direction;
-      });
-    }
-
-    function renderCandidates(rows) {
-      const allStages = [...new Set(asArray(rows).map((row) => row.stage).filter(Boolean))].sort();
-      const select = $("candidate-stage");
-      const current = select.value;
-      select.innerHTML = `<option value="">All stages</option>${allStages.map((stage) => `<option value="${safe(stage)}">${safe(stage)}</option>`).join("")}`;
-      select.value = allStages.includes(current) ? current : "";
-      const values = sortedCandidates(rows);
-      if (!values.length) { $("candidates").innerHTML = empty("No candidates yet", "Submit a bounded paper-only hypothesis through Hermes; lifecycle evidence appears after the queue worker runs."); return; }
-      $("candidates").innerHTML = `<table><thead><tr>${[["strategy_id", "Strategy"], ["family", "Family"], ["market", "Market"], ["stage", "Stage"], ["validation_expectancy", "Val exp."], ["validation_max_drawdown", "Val DD"], ["validation_stability", "Stability"], ["forward_bets", "Fwd bets"], ["data_quality", "Data"], ["updated_at", "Updated"]].map(([key, label]) => `<th><button class="link sort" data-sort="${key}">${label}</button></th>`).join("")}</tr></thead><tbody>${values.map((row) => `<tr><td><button class="link candidate" data-candidate="${encodeURIComponent(row.candidate_id)}">${safe(row.strategy_id)}</button></td><td>${safe(row.family)}</td><td>${safe(row.market)}</td><td><span class="badge">${safe(row.stage)}</span></td><td>${number(row.validation_expectancy)}</td><td>${number(row.validation_max_drawdown)}</td><td>${number(row.validation_stability)}</td><td>${count(row.forward_bets)}</td><td>${safe(row.data_quality)}</td><td>${safe(dateText(row.updated_at))}</td></tr>`).join("")}</tbody></table>`;
-      document.querySelectorAll(".sort").forEach((button) => button.addEventListener("click", () => { const key = button.dataset.sort; candidateSort = { key, direction: candidateSort.key === key ? -candidateSort.direction : 1 }; renderCandidates(operator.candidates); }));
-      document.querySelectorAll(".candidate").forEach((button) => button.addEventListener("click", () => loadDetail(decodeURIComponent(button.dataset.candidate))));
-    }
-
-    function renderDetail(detail) {
-      if (!detail?.available) {
-        $("strategy-detail").className = "empty";
-        $("strategy-detail").innerHTML = empty("Candidate not found", "Choose a row from the sortable candidate table.");
-        return;
-      }
-      const strategy = detail.strategy || {};
-      $("strategy-detail").className = "";
-      $("strategy-detail").innerHTML = `<div class="key-value"><span class="key">Strategy</span><strong>${safe(strategy.id || detail.candidate_id)}</strong></div><div class="key-value"><span class="key">Family</span><span>${safe(strategy.family)}</span></div><div class="key-value"><span class="key">Stage</span><span class="badge">${safe(detail.stage)}</span></div><div class="key-value"><span class="key">Generation / parent</span><span>${safe(strategy.generation)} / ${safe(strategy.parent_id || "root")}</span></div><div class="key-value"><span class="key">Hypothesis</span><span>${safe(detail.hypothesis || "not recorded")}</span></div><h3 style="margin-top:14px">Historical evidence</h3><pre>${safe(json(detail.historical))}</pre><h3 style="margin-top:14px">Forward paper evidence</h3><pre>${safe(json(detail.forward))}</pre>${detail.rejection_reason ? `<p class="page-note">Rejection: ${safe(detail.rejection_reason)}</p>` : ""}<details><summary>Lineage and lifecycle events</summary><pre>${safe(json({ lineage: detail.lineage, events: detail.lifecycle_events }))}</pre></details>`;
-    }
-
-    function renderActivity(items) {
-      const values = asArray(items);
-      $("activity").innerHTML = values.length ? values.slice(0, 30).map((item) => `<div class="timeline-item"><span class="timeline-time">${safe(dateText(item.timestamp))}</span><span class="timeline-kind">${safe(item.kind)}</span><span class="timeline-message">${safe(item.message)}</span></div>`).join("") : empty("No research activity yet", "Bootstrap, collection, or Hermes activity will appear here with its durable timestamp.");
-    }
-
-    function renderBtc(data) {
-      const report = data?.latest_report?.report || {};
-      const coverage = asArray(data?.catalog);
-      const metrics = asArray(report.experiments).map((item) => Number(item.aggregate?.mean_total_return)).filter(Number.isFinite);
-      $("btc-summary").innerHTML = coverage.length ? `<div class="three-col"><div class="key-value"><span class="key">Catalog snapshots</span><strong>${count(coverage.length)}</strong></div><div class="key-value"><span class="key">Latest rows</span><strong>${count(coverage[0]?.row_count)}</strong></div><div class="key-value"><span class="key">Research windows</span><strong>${count(report.walk_forward?.windows)}</strong></div></div><p class="page-note">${safe(dateText(coverage[0]?.start_timestamp))} → ${safe(dateText(coverage[0]?.end_timestamp))} · completeness ${number(Number(coverage[0]?.completeness) * 100, 1)}%</p>` : empty("BTC history not initialized", "Run python -m axiom.cli bootstrap-history --crypto --resume, then python -m axiom.cli btc-research.");
-      $("btc-chart").innerHTML = chart(metrics, "Mean locked-holdout return by family");
-      const experiments = asArray(report.experiments);
-      $("btc-experiments").innerHTML = experiments.length ? `<table><thead><tr><th>Family</th><th>Mean return</th><th>Max DD</th><th>Expectancy</th><th>Sharpe</th><th>Sortino</th><th>Turnover</th><th>Stability</th></tr></thead><tbody>${experiments.map((item) => `<tr><td>${safe(item.family)}</td><td>${number(item.aggregate?.mean_total_return)}</td><td>${number(item.aggregate?.mean_max_drawdown)}</td><td>${number(item.aggregate?.mean_expectancy)}</td><td>${number(item.aggregate?.mean_sharpe)}</td><td>${number(item.aggregate?.mean_sortino)}</td><td>${number(item.aggregate?.mean_turnover)}</td><td>${number(item.parameter_stability?.score)}</td></tr>`).join("")}</tbody></table>` : "";
-    }
-
-    function renderPolymarket(data) {
-      const aggregate = data?.historical_aggregate;
-      const current = asArray(data?.current?.markets);
-      $("pm-summary").innerHTML = `<div class="three-col"><div class="key-value"><span class="key">Historical markets</span><strong>${count(data?.historical_markets)}</strong></div><div class="key-value"><span class="key">Price points</span><strong>${count(data?.historical_price_points)}</strong></div><div class="key-value"><span class="key">Research quality</span><strong>${safe(data?.research_quality || "PRICE_PROXY")}</strong></div></div><p class="page-note">${aggregate ? `Aggregate range ${safe(dateText(aggregate.start_timestamp))} → ${safe(dateText(aggregate.end_timestamp))}.` : "No historical Polymarket catalog yet."}</p>`;
-      $("pm-markets").innerHTML = current.length ? `<table><thead><tr><th>Question</th><th>Category</th><th>YES</th><th>Liquidity</th><th>Settlement</th><th>Quality</th></tr></thead><tbody>${current.slice(0, 50).map((item) => `<tr><td>${safe(item.question || item.market_id)}</td><td>${safe(item.category)}</td><td>${number(item.yes_mid, 4)}</td><td>${number(item.liquidity)}</td><td>${safe(item.settlement)}</td><td>${safe(item.research_quality || "PRICE_PROXY")}</td></tr>`).join("")}</tbody></table>` : empty("No forward market observations", "Run the normal AXIOM node or collect-data to populate forward-only quotes. Historical price-proxy data is shown separately above.");
-    }
-
-    function renderPortfolio(data) {
-      $("portfolio-summary").innerHTML = `<div class="card-grid"><div class="panel"><div class="metric">${number(data?.total_equity, 2)}</div><div class="metric-label">paper equity</div></div><div class="panel"><div class="metric">${number(data?.total_pnl, 2)}</div><div class="metric-label">paper P/L</div></div><div class="panel"><div class="metric">${count(data?.resolved_bets)}</div><div class="metric-label">resolved bets</div></div><div class="panel"><div class="metric">${number(data?.win_rate * 100, 1)}%</div><div class="metric-label">win rate</div></div></div>`;
-      const states = asArray(data?.states);
-      $("portfolio-states").innerHTML = states.length ? `<table><thead><tr><th>Experiment</th><th>Equity</th><th>P/L</th><th>Drawdown</th><th>Fills</th><th>Open positions</th><th>Updated</th></tr></thead><tbody>${states.map((item) => `<tr><td>${safe(item.experiment_id)}</td><td>${number(item.equity, 2)}</td><td>${number(item.pnl, 2)}</td><td>${number(item.drawdown * 100, 1)}%</td><td>${count(item.fills)}</td><td>${safe(Object.keys(item.open_positions || {}).length)}</td><td>${safe(dateText(item.updated_at))}</td></tr>`).join("")}</tbody></table>` : empty("Paper portfolio is empty", "Candidates must reach PAPER_FORWARD before paper observations and portfolio state appear.");
-    }
-
-    function renderHermes(data) {
-      $("hermes-summary").innerHTML = `<div class="three-col"><div class="key-value"><span class="key">Submitted</span><strong>${count(data?.submitted)}</strong></div><div class="key-value"><span class="key">Accepted</span><strong>${count(data?.accepted)}</strong></div><div class="key-value"><span class="key">Pending</span><strong>${count(data?.pending)}</strong></div></div><p class="page-note">Hermes validates bounded hypotheses and time splits; it cannot submit orders or enable live trading.</p>`;
-      $("hermes-raw").innerHTML = data && Object.keys(data).length ? `<details open><summary>Hermes evidence</summary><pre>${safe(json(data))}</pre></details>` : empty("Hermes not initialized", "Start the research node or submit a paper-only proposal.");
-    }
-
-    async function loadDetail(candidateId) {
-      try {
-        const response = await fetch(`/api/strategy/${encodeURIComponent(candidateId)}`, { cache: "no-store" });
-        const detail = await response.json();
-        renderDetail(detail);
-        const panel = $("raw-overview");
-        panel.textContent = json(detail);
-        panel.closest("details").open = true;
-      } catch (error) { $("raw-overview").textContent = `Strategy detail unavailable: ${error.message}`; }
-    }
-
-    async function load() {
-      try {
-        const response = await fetch("/api/operator", { cache: "no-store" });
-        if (!response.ok) throw new Error(`operator HTTP ${response.status}`);
-        operator = await response.json();
-        renderComponents(operator);
-        renderCards(operator.research_cards);
-        renderCoverage(operator.coverage);
-        renderFunnel(operator.lifecycle_funnel);
-        renderCandidates(operator.candidates);
-        renderActivity(operator.activity);
-        renderBtc(operator.btc);
-        renderPolymarket(operator.polymarket);
-        renderPortfolio(operator.paper_portfolio);
-        renderHermes(operator.hermes);
-        $("last-refreshed").textContent = `refreshed ${new Date().toISOString().replace(".000Z", "Z")}`;
-        $("raw-overview").textContent = json(operator.raw);
-        $("raw-api").textContent = json(operator);
-        $("api-links").innerHTML = ["operator", "datasets", "crypto", "btc-research", "prediction", "polymarket-research", "paper", "paper-portfolio", "hermes", "research-summary", "autonomous-research", "status", "dataset-health"].map((name) => `<a href="/api/${name}">${name}</a>`).join(" · ");
-      } catch (error) {
-        $("component-grid").innerHTML = empty("Dashboard data unavailable", error.message);
-      }
-    }
-
-    document.querySelectorAll(".tab").forEach((button) => button.addEventListener("click", () => {
-      document.querySelectorAll(".tab").forEach((item) => item.classList.toggle("active", item === button));
-      document.querySelectorAll(".view").forEach((view) => view.classList.toggle("active", view.id === `view-${button.dataset.view}`));
-    }));
-    $("candidate-filter").addEventListener("input", () => renderCandidates(operator.candidates));
-    $("candidate-stage").addEventListener("change", () => renderCandidates(operator.candidates));
-    load();
-    const refreshHandle = setInterval(load, 10000);
-    window.addEventListener("beforeunload", () => clearInterval(refreshHandle));
+    const $ = (id) => document.getElementById(id), safe = (v) => String(v ?? "—").replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c])), json = (v) => JSON.stringify(v ?? {}, null, 2);
+    const count = (v) => Number.isFinite(Number(v)) ? String(v) : "0", dateText = (v) => v ? new Date(v).toISOString().replace(".000Z","Z") : "—", arr = (v) => Array.isArray(v) ? v : [];
+    const empty = (title,body) => `<div class="empty"><strong>${safe(title)}</strong>${safe(body)}</div>`, statusClass = (v) => { const s=String(v||"").toUpperCase(); return ["READY","RUNNING","ACTIVE","COMPLETE","COMPLETED","HEALTHY"].includes(s)?"good":["DEGRADED","STOPPED","UPDATING"].includes(s)?"warn":["ERROR","STALE","REJECTED"].includes(s)?"bad":""; };
+    let params = new URLSearchParams(location.search); const state = { tab: params.get("tab") || "overview", page: Math.max(1,Number(params.get("page")||1)), page_size: [10,25,50,100].includes(Number(params.get("page_size"))) ? Number(params.get("page_size")) : 25, filter: params.get("filter") || "", sort: params.get("sort") || "", direction: params.get("direction") === "asc" ? "asc" : "desc", selected: params.get("selected") || "", expanded: params.get("expanded") === "1" };
+    let operator = {}, current = {}, loadInFlight = false;
+    function saveState(push=false) { const q=new URLSearchParams(); q.set("tab",state.tab); q.set("page",state.page); q.set("page_size",state.page_size); if(state.filter)q.set("filter",state.filter); if(state.sort)q.set("sort",state.sort); if(state.direction!=="desc")q.set("direction",state.direction); if(state.selected)q.set("selected",state.selected); if(state.expanded)q.set("expanded","1"); document.querySelectorAll("select.facet").forEach(el=>{if(el.value)q.set(el.dataset.param||el.id,el.value)}); (push?history.pushState:history.replaceState).call(history,{}, "", `${location.pathname}?${q}`); }
+    function activate(tab,push=true) { if(tab!==state.tab){state.selected="";state.expanded=false;state.filter="";state.sort="";state.direction="desc";state.page=1;} state.tab=tab; document.querySelectorAll(".tab").forEach(b=>b.classList.toggle("active",b.dataset.view===tab)); document.querySelectorAll(".view").forEach(v=>v.classList.toggle("active",v.id===`view-${tab}`)); saveState(push); if(tab!=="overview"&&tab!=="btc") loadPage(tab); }
+    function sortButton(key,label) { const active=state.sort===key, arrow=active?(state.direction==="asc"?" ▲":" ▼"):""; return `<button class="link sort" data-sort="${safe(key)}">${safe(label)}${arrow}</button>`; }
+    function restoreFacets() { document.querySelectorAll("select.facet").forEach(el=>{const value=params.get(el.dataset.param||el.id);if(value!==null&&Array.from(el.options).some(o=>o.value===value))el.value=value;}); document.querySelectorAll('select[id$="-size"]').forEach(el=>{el.value=String(state.page_size);}); document.querySelectorAll(".filters input").forEach(el=>{el.value=state.filter;}); }
+    function ensureFacets() { const specs={datasets:[["datasets-market","Market","market",["crypto_spot","prediction"]],["datasets-timeframe","Timeframe","timeframe",["1m","1h","1d","live"]],["datasets-quality","Quality","quality",["OHLCV","PRICE_PROXY","ORDER_BOOK_SIMULATED"]]],polymarket:[["polymarket-settlement","Settlement","settlement",["open","resolved_yes","resolved_no","void"]],["polymarket-quality","Quality","quality",["PRICE_PROXY","ORDER_BOOK_SIMULATED"]]]}; Object.entries(specs).forEach(([view,entries])=>{const host=document.querySelector(`#view-${view} .filters`);if(!host)return;entries.forEach(([id,label,param,options])=>{if($(id))return;const s=document.createElement("select");s.id=id;s.className="facet";s.dataset.param=param;s.innerHTML=`<option value="">All ${label.toLowerCase()}</option>${options.map(o=>`<option value="${safe(o)}">${safe(o)}</option>`).join("")}`;host.appendChild(s);});}); document.querySelectorAll(".filters select").forEach(el=>{el.classList.add("facet");if(el.id.endsWith("-size")){el.dataset.param="page_size";if(!Array.from(el.options).some(o=>o.value==="10")){const option=document.createElement("option");option.value="10";option.textContent="10";el.insertBefore(option,el.firstChild);}}else if(!el.dataset.param)el.dataset.param=el.id.includes("source")?"source_type":el.id.includes("stage")?"stage":el.id.includes("status")?"status":el.id.includes("category")?"category":el.id;}); restoreFacets(); }
+    function pager(name,data) { const total=Number(data?.total)||0,page=Number(data?.page)||1,size=Number(data?.page_size)||25,pages=Number(data?.pages)||0,start=total?(page-1)*size+1:0,end=Math.min(page*size,total),windowStart=Math.min(Math.max(1,page-3),Math.max(1,pages-6)); const numbers=pages?Array.from({length:Math.min(pages,7)},(_,i)=>windowStart+i):[]; $(`${name}-pager`).innerHTML=`<span>Showing ${start}–${end} of ${total} · Page ${page} of ${pages||1}</span><span><button data-page="${page-1}" ${page<=1?"disabled":""}>Previous</button> ${numbers.map(n=>`<button data-page="${n}" ${n===page?"disabled":""}>${n}</button>`).join(" ")} <button data-page="${page+1}" ${!pages||page>=pages?"disabled":""}>Next</button></span>`; $(`${name}-pager`).querySelectorAll("button").forEach(b=>b.addEventListener("click",()=>{const next=Number(b.dataset.page);if(name==="dataset-ranges")loadDataset(state.selected,next,false);else if(name==="candidate-events")loadCandidate(state.selected,next,false);else{state.page=next;saveState(true);loadPage(name==="paper"?"portfolio":name);}})); }
+    async function fetchV2(name) { const q=new URLSearchParams({page:String(state.page),page_size:String(state.page_size),direction:state.direction}); if(state.filter)q.set("filter",state.filter); if(state.sort)q.set("sort",state.sort); const controls={datasets:[["datasets-source","source_type"],["datasets-market","market"],["datasets-timeframe","timeframe"],["datasets-quality","quality"]],activity:[["activity-status","status"]],candidates:[["candidates-stage","stage"]],polymarket:[["polymarket-category","category"],["polymarket-settlement","settlement"],["polymarket-quality","quality"]],hermes:[["hermes-status","status"]],paper:[["paper-status","status"]]}; for(const [id,key] of (controls[state.tab]||[])){const el=$(id);if(el&&el.value)q.set(key,el.value);} const response=await fetch(`/api/v2/${name}?${q}`,{cache:"no-store"}); if(!response.ok)throw new Error(`${name} HTTP ${response.status}`); return response.json(); }
+    function renderComponents(data) { $("component-grid").innerHTML=arr(data.components).map(i=>{const s=String(i.state||"NOT INITIALIZED"),reason=i.detail?.reason||i.detail?.error||"";return `<article class="panel status-card"><div class="status-head"><span class="status-name">${safe(i.name)}</span><span class="badge ${statusClass(s)}">${safe(s)}</span></div><div class="status-value">${safe(i.detail?.status||i.detail?.symbol||"read-only")}</div>${reason?`<p class="page-note">${safe(reason)}</p>`:""}</article>`}).join("")||empty("System not initialized","Start the normal AXIOM node to populate worker status."); }
+    function renderOverview(data) { renderComponents(data); const cards=data.research_cards||{}; $("research-cards").innerHTML=[["experiments_run","Experiments run"],["active_hypotheses","Active hypotheses"],["candidates_alive","Candidates alive"],["rejected","Rejected"],["paper_forward","Paper forward"],["paper_promotable","Paper promotable"]].map(([k,l])=>`<article class="panel"><div class="metric">${count(cards[k])}</div><div class="metric-label">${l}</div></article>`).join(""); const c=data.coverage||{}; $("coverage").innerHTML=`<div class="three-col"><div class="key-value"><span class="key">Historical datasets</span><strong>${count(c.historical_count)}</strong></div><div class="key-value"><span class="key">Forward datasets</span><strong>${count(c.forward_count)}</strong></div><div class="key-value"><span class="key">Rows observed</span><strong>${count((c.historical_rows||0)+(c.forward_rows||0))}</strong></div></div><p class="page-note">Prediction market datasets are available in DATASETS; overview intentionally shows summaries only.</p>`; const funnel=data.lifecycle_funnel||{}; const max=Math.max(1,...Object.values(funnel).map(Number)); $("funnel").innerHTML=Object.entries(funnel).map(([k,v])=>`<div class="funnel-row"><span>${safe(k)}</span><span class="funnel-track"><span class="funnel-bar" style="width:${Math.min(100,Number(v)/max*100)}%"></span></span><span class="right">${count(v)}</span></div>`).join("")||empty("No candidate lifecycle","Hermes hypotheses appear after a durable queue item is processed."); $("overview-candidates").innerHTML=tableCandidates(arr(data.candidates).slice(0,10),false); $("overview-activity").innerHTML=arr(data.activity).slice(0,10).map(i=>`<div class="timeline-item"><span class="timeline-time">${safe(dateText(i.timestamp))}</span><span class="timeline-kind">${safe(i.kind)}</span><span>${safe(i.message)}</span></div>`).join("")||empty("No research activity yet","Durable bootstrap, collection, and Hermes activity will appear here."); $("raw-overview").textContent=json(data.raw||{}); }
+    function tableCandidates(items,interactive=true) { if(!items.length)return empty("No candidates yet","Submit a bounded paper-only hypothesis through Hermes."); const sortable={strategy_id:"candidate_id",stage:"stage",updated_at:"updated_at"}; return `<table><thead><tr>${[["strategy_id","Strategy"],["family","Family"],["market","Market"],["stage","Stage"],["updated_at","Updated"]].map(([k,l])=>`<th>${interactive&&sortable[k]?sortButton(sortable[k],l):safe(l)}</th>`).join("")}</tr></thead><tbody>${items.map(i=>`<tr><td>${interactive?`<button class="link candidate" data-id="${encodeURIComponent(i.candidate_id||"")}">${safe(i.strategy_id||i.candidate_id)}</button>`:safe(i.strategy_id||i.candidate_id)}</td><td>${safe(i.family)}</td><td>${safe(i.market)}</td><td><span class="badge ${statusClass(i.stage)}">${safe(i.stage)}</span></td><td>${safe(dateText(i.updated_at))}</td></tr>`).join("")}</tbody></table>`; }
+    function bindTable() { document.querySelectorAll(".sort").forEach(b=>b.addEventListener("click",()=>{const k=b.dataset.sort;state.direction=state.sort===k&&state.direction==="desc"?"asc":"desc";state.sort=k;state.page=1;saveState(true);loadPage(state.tab)})); document.querySelectorAll(".candidate").forEach(b=>b.addEventListener("click",()=>loadCandidate(decodeURIComponent(b.dataset.id)))); document.querySelectorAll(".dataset").forEach(b=>b.addEventListener("click",()=>loadDataset(decodeURIComponent(b.dataset.id)))); }
+    async function loadDataset(id,rangePage=1,persist=true) { state.selected=id; state.expanded=true; if(persist)saveState(true); try { const detailResponse=await fetch(`/api/v2/datasets/${encodeURIComponent(id)}`,{cache:"no-store"}),d=await detailResponse.json(),version=d.dataset_version||d.catalog?.dataset_version||"",rangeQuery=new URLSearchParams({page:String(rangePage),page_size:String(state.page_size)}); if(version)rangeQuery.set("dataset_version",version); const rangesResponse=await fetch(`/api/v2/datasets/${encodeURIComponent(id)}/missing-ranges?${rangeQuery}`,{cache:"no-store"}),rangesData=rangesResponse.ok?await rangesResponse.json():{}; const markup=d.available?`<div class="key-value"><span class="key">Dataset</span><strong>${safe(d.dataset_id||id)}</strong></div><div class="key-value"><span class="key">Version</span><strong>${safe(d.dataset_version||d.catalog?.dataset_version)}</strong></div><div class="key-value"><span class="key">Quality</span><span class="badge">${safe(d.catalog?.quality)}</span></div><details open><summary>Health and missing ranges</summary><pre>${safe(json({health:d.health,missing_ranges:arr(rangesData.items)}))}</pre><div id="dataset-ranges-pager" class="pager"></div></details>`:empty("Dataset unavailable",d.error||"Dataset not found"); $("detail").innerHTML=markup; if($("dataset-detail"))$("dataset-detail").innerHTML=markup; if(d.available&&$("dataset-ranges-pager"))pager("dataset-ranges",rangesData); } catch(e) { const markup=empty("Dataset detail unavailable",e.message); $("detail").innerHTML=markup; if($("dataset-detail"))$("dataset-detail").innerHTML=markup; } }
+    async function loadHermes(id,persist=true) { state.selected=id; state.expanded=true; if(persist)saveState(true); try { const r=await fetch(`/api/v2/hermes/${encodeURIComponent(id)}`,{cache:"no-store"}),d=await r.json(); const item=arr(d.items)[0]; $("hermes-detail").innerHTML=item?`<details open><summary>Hermes item ${safe(id)}</summary><pre>${safe(json(item))}</pre></details>`:empty("Hermes item unavailable","The queue item no longer exists."); } catch(e) { $("hermes-detail").innerHTML=empty("Hermes detail unavailable",e.message); } }
+    function renderDatasets(data) { $("dataset-total").textContent=`${count(data.total)} datasets`; const rows=arr(data.items); $("datasets-table").innerHTML=rows.length?`<table><thead><tr>${[["dataset_id","Dataset"],["source_type","Source"],["market_type","Market"],["instrument","Instrument"],["timeframe","Timeframe"],["quality","Quality"],["row_count","Rows"],["updated_at","Updated"]].map(([k,l])=>`<th>${sortButton(k,l)}</th>`).join("")}</tr></thead><tbody>${rows.map(i=>`<tr><td><button class="link dataset" data-id="${encodeURIComponent(i.dataset_id||"")}">${safe(i.dataset_id)}</button></td><td>${safe(i.source_type)}</td><td>${safe(i.market_type)}</td><td>${safe(i.instrument)}</td><td>${safe(i.timeframe)}</td><td>${safe(i.quality)}</td><td>${count(i.row_count)}</td><td>${safe(dateText(i.updated_at))}</td></tr>`).join("")}</tbody></table>`:empty("No datasets","Catalog history has not been initialized."); pager("datasets",data); bindTable(); if(state.tab==="datasets"&&state.selected)loadDataset(state.selected,1,false); }
+    function renderActivity(data) { $("activity-total").textContent=`${count(data.total)} events`; $("activity-table").innerHTML=arr(data.items).length?`<table><thead><tr>${[["timestamp","Time"],["kind","Kind"],["message","Activity"]].map(([k,l])=>`<th>${k==="message"?safe(l):sortButton(k,l)}</th>`).join("")}</tr></thead><tbody>${arr(data.items).map(i=>`<tr><td>${safe(dateText(i.timestamp))}</td><td>${safe(i.kind)}</td><td>${safe(i.message)}${i.details&&Object.keys(i.details).length?` <details><summary>details</summary><pre>${safe(json(i.details))}</pre></details>`:""}</td></tr>`).join("")}</tbody></table>`:empty("No research activity","Durable activity will appear after workers run."); pager("activity",data); bindTable(); }
+    function renderCandidates(data) { $("candidate-total").textContent=`${count(data.total)} candidates`; const stages=[...new Set(arr(data.items).map(i=>i.stage).filter(Boolean))].sort(),select=$("candidates-stage"),selected=select.value||params.get("stage")||""; select.innerHTML=`<option value="">All stages</option>${stages.map(s=>`<option value="${safe(s)}">${safe(s)}</option>`).join("")}`; if(selected&&!stages.includes(selected))select.insertAdjacentHTML("beforeend",`<option value="${safe(selected)}">${safe(selected)}</option>`); select.value=selected; $("candidates-table").innerHTML=tableCandidates(arr(data.items)); pager("candidates",data); bindTable(); if(state.tab==="candidates"&&state.selected)loadCandidate(state.selected,1,false); }
+    function renderPolymarket(data) { const items=arr(data.items),categories=[...new Set(items.map(i=>i.category).filter(Boolean))].sort(),cat=$("polymarket-category"),old=cat.value||params.get("category")||""; cat.innerHTML=`<option value="">All categories</option>${categories.map(c=>`<option value="${safe(c)}">${safe(c)}</option>`).join("")}`; if(old&&!categories.includes(old))cat.insertAdjacentHTML("beforeend",`<option value="${safe(old)}">${safe(old)}</option>`); cat.value=old; const quality=items.map(i=>i.quality||i.research_quality).find(Boolean)||"—"; $("pm-summary").innerHTML=`<div class="three-col"><div class="key-value"><span class="key">Markets</span><strong>${count(data.total)}</strong></div><div class="key-value"><span class="key">Page</span><strong>${count(data.page)}</strong></div><div class="key-value"><span class="key">Quality</span><strong>${safe(quality)}</strong></div></div>`; const sortable={market_id:"market_id",category:"category",settlement:"settlement",quality:"quality"}; $("pm-markets").innerHTML=items.length?`<table><thead><tr>${[["market_id","Market"],["question","Question"],["category","Category"],["yes_mid","YES"],["liquidity","Liquidity"],["settlement","Settlement"],["quality","Quality"]].map(([k,l])=>`<th>${sortable[k]?sortButton(sortable[k],l):safe(l)}</th>`).join("")}</tr></thead><tbody>${items.map(i=>`<tr><td>${safe(i.market_id)}</td><td><details><summary>${safe(String(i.question||i.snapshot?.question||i.market_id).slice(0,90))}</summary><p class="page-note">${safe(i.question||i.snapshot?.question||i.market_id)}</p></details></td><td>${safe(i.category)}</td><td>${safe(i.yes_mid??i.snapshot?.yes_mid??i.payload?.snapshot?.yes_mid)}</td><td>${safe(i.liquidity??i.snapshot?.liquidity??i.payload?.snapshot?.liquidity)}</td><td>${safe(i.settlement??i.snapshot?.settlement??i.payload?.snapshot?.settlement)}</td><td>${safe(i.quality||i.research_quality||"—")}</td></tr>`).join("")}</tbody></table>`:empty("No forward market observations","Run the normal node or collect-data for forward-only quotes."); pager("polymarket",data); bindTable(); }
+    function renderHermes(data) { const h=operator.hermes||{}; $("hermes-summary").innerHTML=`<div class="three-col"><div class="key-value"><span class="key">Submitted</span><strong>${count(h.submitted)}</strong></div><div class="key-value"><span class="key">Accepted</span><strong>${count(h.accepted)}</strong></div><div class="key-value"><span class="key">Pending</span><strong>${count(h.pending)}</strong></div></div><p class="page-note">Hermes status reflects queue execution state, not integration availability. ${safe(h.reason||"")}</p>`; $("hermes-table").innerHTML=arr(data.items).length?`<table><thead><tr>${[["item_id","Item"],["item_type","Type"],["status","Status"],["created_at","Created"]].map(([k,l])=>`<th>${sortButton(k,l)}</th>`).join("")}</tr></thead><tbody>${arr(data.items).map(i=>`<tr><td><button class="link hermes-item" data-id="${encodeURIComponent(i.item_id||"")}">${safe(i.item_id)}</button></td><td>${safe(i.item_type)}</td><td><span class="badge ${statusClass(i.status)}">${safe(i.status)}</span></td><td>${safe(dateText(i.created_at||i.updated_at))}</td></tr>`).join("")}</tbody></table>`:empty("Hermes not initialized","Start the research node or submit a paper-only proposal."); pager("hermes",data); bindTable(); document.querySelectorAll(".hermes-item").forEach(b=>b.addEventListener("click",()=>loadHermes(decodeURIComponent(b.dataset.id)))); if(state.tab==="hermes"&&state.selected)loadHermes(state.selected,false); }
+    async function loadCandidate(id,eventPage=1,persist=true) { state.selected=id; state.expanded=true; if(persist)saveState(true); try { const q=new URLSearchParams({page:String(eventPage),page_size:String(state.page_size)}),r=await fetch(`/api/v2/candidates/${encodeURIComponent(id)}/events?${q}`,{cache:"no-store"}),d=await r.json(); const markup=`<div class="key-value"><span class="key">Candidate</span><strong>${safe(id)}</strong></div>${arr(d.items).length?`<table><thead><tr><th>Time</th><th>Stage</th><th>Reason</th></tr></thead><tbody>${arr(d.items).map(i=>`<tr><td>${safe(dateText(i.created_at||i.timestamp))}</td><td><span class="badge">${safe(i.stage||i.to_stage)}</span></td><td>${safe(i.reason||i.message)}</td></tr>`).join("")}</tbody></table>`:empty("No lifecycle events","No persisted lifecycle evidence exists for this candidate.")}<div id="candidate-events-pager" class="pager"></div>`; $("detail").innerHTML=markup; if(state.tab==="candidates")$("dataset-detail").innerHTML=markup; if($("candidate-events-pager")){const total=Number(d.total)||0,page=Number(d.page)||1,size=Number(d.page_size)||state.page_size,pages=Number(d.pages)||0,start=total?(page-1)*size+1:0,end=Math.min(page*size,total); $("candidate-events-pager").innerHTML=`<span>Showing ${start}–${end} of ${total}</span><span><button data-page="${page-1}" ${page<=1?"disabled":""}>Previous</button> <button data-page="${page+1}" ${!pages||page>=pages?"disabled":""}>Next</button></span>`; $("candidate-events-pager").querySelectorAll("button").forEach(b=>b.addEventListener("click",()=>loadCandidate(id,Number(b.dataset.page),false)));} } catch(e) { $("detail").innerHTML=empty("Candidate detail unavailable",e.message); } }
+    function renderPaper(data) { const p=operator.paper_portfolio||{}; $("portfolio-summary").innerHTML=`<div class="card-grid"><div class="panel"><div class="metric">${p.state_count?Number(p.total_equity||0).toFixed(2):"—"}</div><div class="metric-label">paper equity</div></div><div class="panel"><div class="metric">${p.state_count?Number(p.total_pnl||0).toFixed(2):"—"}</div><div class="metric-label">paper P/L</div></div><div class="panel"><div class="metric">${count(data.total)}</div><div class="metric-label">paper records</div></div><div class="panel"><div class="metric">${p.state_count?`${(Number(p.win_rate||0)*100).toFixed(1)}%`:"—"}</div><div class="metric-label">win rate</div></div></div>`; $("portfolio-states").innerHTML=arr(data.items).length?`<table><thead><tr><th>${sortButton("timestamp","Time")}</th><th>${sortButton("record_type","Type")}</th><th>Experiment</th><th>Market</th><th>Status</th><th>Details</th></tr></thead><tbody>${arr(data.items).map(i=>`<tr><td>${safe(dateText(i.timestamp||i.created_at||i.updated_at))}</td><td>${safe(i.record_type)}</td><td>${safe(i.experiment_id)}</td><td>${safe(i.market_id||i.symbol)}</td><td><span class="badge ${statusClass(i.status)}">${safe(i.status)}</span></td><td><details><summary>view</summary><pre>${safe(json(i))}</pre></details></td></tr>`).join("")}</tbody></table>`:empty("Waiting for PAPER_FORWARD","Paper portfolio initializes only after a candidate enters PAPER_FORWARD and observations are persisted."); pager("paper",data); bindTable(); }
+    async function loadPage(tab) { const endpoint={datasets:"datasets",activity:"activity",candidates:"candidates",polymarket:"polymarket",hermes:"hermes",portfolio:"paper"}[tab]; if(!endpoint)return; try { current=await fetchV2(endpoint); ({datasets:renderDatasets,activity:renderActivity,candidates:renderCandidates,polymarket:renderPolymarket,hermes:renderHermes,portfolio:renderPaper}[tab])(current); } catch(e) { const target={datasets:"datasets-table",activity:"activity-table",candidates:"candidates-table",polymarket:"pm-markets",hermes:"hermes-table",portfolio:"portfolio-states"}[tab]; if($(target))$(target).innerHTML=empty("Dashboard data unavailable",e.message); } }
+    function renderBtc(data) { const b=operator.btc||{},summary=b.catalog_summary||{},rows=arr(summary.latest_by_timeframe||summary.timeframes),fallback=arr(b.catalog),catalogRows=rows.length?rows:fallback; $("btc-summary").innerHTML=catalogRows.length?`<div class="three-col"><div class="key-value"><span class="key">Catalog timeframes</span><strong>${count(catalogRows.length)}</strong></div><div class="key-value"><span class="key">Rows observed</span><strong>${count(catalogRows.reduce((total,item)=>total+Number(item.row_count||0),0))}</strong></div><div class="key-value"><span class="key">Latest report</span><strong>${safe(dateText(b.latest_report?.created_at))}</strong></div></div>`:empty("BTC history not initialized","Run bootstrap-history --crypto, then btc-research."); $("btc-experiments").innerHTML=""; }
+    async function load() { if(loadInFlight)return; loadInFlight=true; try { const response=await fetch("/api/operator",{cache:"no-store"}); if(!response.ok)throw new Error(`operator HTTP ${response.status}`); operator=await response.json(); renderOverview(operator); renderBtc(operator); if(state.tab!=="overview"&&state.tab!=="btc")await loadPage(state.tab); } catch(e) { $("component-grid").innerHTML=empty("Dashboard unavailable",e.message); } finally { loadInFlight=false; } }
+    ensureFacets(); document.querySelectorAll(".tab").forEach(b=>b.addEventListener("click",()=>activate(b.dataset.view))); document.querySelectorAll("[data-link]").forEach(b=>b.addEventListener("click",e=>{e.preventDefault();activate(b.dataset.link)})); document.querySelectorAll(".filters input,.filters select").forEach(el=>el.addEventListener(el.tagName==="INPUT"?"input":"change",()=>{if(el.id.endsWith("-size")){const n=Number(el.value);if([10,25,50,100].includes(n)){state.page_size=n;document.querySelectorAll('select[id$="-size"]').forEach(s=>s.value=String(n));}} else if(el.id.includes("-filter"))state.filter=el.value;state.page=1;saveState(true);loadPage(state.tab)})); window.addEventListener("popstate",()=>{const q=new URLSearchParams(location.search),nextTab=q.get("tab")||"overview",changed=nextTab!==state.tab;params=q;state.tab=nextTab;state.page=Math.max(1,Number(q.get("page")||1));state.page_size=[10,25,50,100].includes(Number(q.get("page_size")))?Number(q.get("page_size")):25;state.filter=changed?"":q.get("filter")||"";state.sort=changed?"":q.get("sort")||"";state.direction=changed?"desc":q.get("direction")==="asc"?"asc":"desc";state.selected=changed?"":q.get("selected")||"";state.expanded=changed?false:q.get("expanded")==="1";restoreFacets();activate(state.tab,false)}); load(); activate(state.tab,false); const refreshHandle=setInterval(load,10000); window.addEventListener("beforeunload",()=>clearInterval(refreshHandle));
+    // setInterval(load, 10000) is the ten-second refresh contract.
   </script>
 </body>
 </html>"""
@@ -1410,20 +1715,38 @@ class _DashboardHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self) -> None:  # noqa: N802 - stdlib handler API
-        path = urlparse(self.path).path.strip("/")
+        parsed = urlparse(self.path)
+        path = parsed.path.strip("/")
         if path in {"", "index.html"}:
             self._send(200, _dashboard_html(), "text/html; charset=utf-8")
             return
+        query = parse_qs(parsed.query, keep_blank_values=True)
+        if path.startswith("api/v2/"):
+            endpoint = path[len("api/v2/") :]
+            allowed = endpoint.lower() in _V2_ENDPOINTS or endpoint.lower().startswith(("datasets/", "candidates/", "hermes/"))
+            if allowed:
+                validation_error = _pagination_error(query)
+                if validation_error:
+                    self._send(400, {"error": "invalid pagination", "detail": validation_error})
+                    return
+                try:
+                    self._send(200, self.server.dashboard_data.v2_snapshot(endpoint, query))
+                except ValueError as exc:
+                    self._send(400, {"error": "invalid request", "detail": str(exc)})
+                except Exception as exc:
+                    self._send(503, {"error": "data unavailable", "detail": str(exc)})
+                return
         endpoint = path[4:] if path.startswith("api/") else path
         dynamic_strategy = endpoint.lower().startswith("strategy/") and len(endpoint.split("/", 1)[1]) > 0
         if endpoint in _ENDPOINTS or dynamic_strategy:
             try:
+                if dynamic_strategy:
+                    endpoint = "strategy/" + unquote(endpoint.split("/", 1)[1])
                 self._send(200, self.server.dashboard_data.snapshot(endpoint))
             except Exception as exc:
                 self._send(503, {"error": "data unavailable", "detail": str(exc)})
             return
-        self._send(404, {"error": "not found", "endpoints": ["/", *[f"/api/{name}" for name in _ENDPOINTS]]})
-
+        self._send(404, {"error": "not found", "endpoints": ["/", *[f"/api/{name}" for name in _ENDPOINTS], *[f"/api/v2/{name}" for name in _V2_ENDPOINTS]]})
 
 class _BoundDashboardServer(ThreadingHTTPServer):
     def __init__(self, address: tuple[str, int], data: DashboardData) -> None:

@@ -24,6 +24,8 @@ _MAX_LATEST_SCAN_ROWS = 10_000
 _MAX_EVIDENCE_SCAN_ROWS = 100_000
 _QUEUE_RELEASE_BATCH = 256
 _QUEUE_LINEAGE_LIMIT = 256
+_PAGINATION_PAGE_SIZES = (10, 25, 50, 100)
+_DEFAULT_PAGE_SIZE = 25
 
 
 from .domain import (
@@ -139,6 +141,8 @@ class AxiomStore:
                     ON dataset_catalog(source_type, updated_at);
                 CREATE INDEX IF NOT EXISTS idx_dataset_catalog_instrument
                     ON dataset_catalog(instrument, timeframe, updated_at);
+                CREATE INDEX IF NOT EXISTS idx_dataset_catalog_updated
+                    ON dataset_catalog(updated_at, dataset_id, dataset_version);
                 CREATE TABLE IF NOT EXISTS dataset_bootstrap_state (
                     dataset_id TEXT PRIMARY KEY,
                     provider TEXT NOT NULL,
@@ -153,6 +157,8 @@ class AxiomStore:
                     payload_json TEXT NOT NULL DEFAULT '{}',
                     updated_at TEXT NOT NULL
                 );
+                CREATE INDEX IF NOT EXISTS idx_dataset_bootstrap_updated
+                    ON dataset_bootstrap_state(updated_at, dataset_id);
                 CREATE TABLE IF NOT EXISTS dataset_staging_bars (
                     dataset_id TEXT NOT NULL,
                     timestamp TEXT NOT NULL,
@@ -223,6 +229,8 @@ class AxiomStore:
                     payload_json TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE INDEX IF NOT EXISTS idx_reports_created
+                    ON reports(created_at, report_id);
                 CREATE TABLE IF NOT EXISTS polymarket_markets (
                     market_id TEXT NOT NULL,
                     observed_at TEXT NOT NULL,
@@ -233,6 +241,8 @@ class AxiomStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_polymarket_markets_observed
                     ON polymarket_markets(market_id, observed_at);
+                CREATE INDEX IF NOT EXISTS idx_polymarket_markets_dashboard
+                    ON polymarket_markets(observed_at, market_id, metadata_hash);
                 CREATE TABLE IF NOT EXISTS polymarket_snapshots (
                     snapshot_id TEXT PRIMARY KEY,
                     market_id TEXT NOT NULL,
@@ -244,6 +254,8 @@ class AxiomStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_polymarket_snapshots_market_time
                     ON polymarket_snapshots(market_id, source_timestamp, observed_at);
+                CREATE INDEX IF NOT EXISTS idx_polymarket_snapshots_dashboard
+                    ON polymarket_snapshots(observed_at, market_id, snapshot_id);
                 CREATE TABLE IF NOT EXISTS polymarket_trades (
                     trade_key TEXT PRIMARY KEY,
                     market_id TEXT NOT NULL,
@@ -269,6 +281,8 @@ class AxiomStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_collection_errors_market_time
                     ON collection_errors(market_id, observed_at);
+                CREATE INDEX IF NOT EXISTS idx_collection_errors_observed
+                    ON collection_errors(observed_at, error_id);
                 CREATE TABLE IF NOT EXISTS forward_tests (
                     experiment_id TEXT PRIMARY KEY,
                     strategy_hash TEXT NOT NULL,
@@ -291,6 +305,8 @@ class AxiomStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_collection_cycles_time
                     ON collection_cycles(collector_name, started_at);
+                CREATE INDEX IF NOT EXISTS idx_collection_cycles_ended
+                    ON collection_cycles(ended_at, cycle_id);
                 CREATE TABLE IF NOT EXISTS research_queue (
                     item_id TEXT PRIMARY KEY,
                     item_type TEXT NOT NULL,
@@ -313,6 +329,12 @@ class AxiomStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_research_queue_status
                     ON research_queue(status, priority DESC, available_at, created_at);
+                CREATE INDEX IF NOT EXISTS idx_research_queue_dashboard
+                    ON research_queue(status, priority DESC, created_at, item_id);
+                CREATE INDEX IF NOT EXISTS idx_research_queue_source_created
+                    ON research_queue(source, created_at, item_id);
+                CREATE INDEX IF NOT EXISTS idx_research_queue_type_created
+                    ON research_queue(item_type, created_at, item_id);
                 CREATE TABLE IF NOT EXISTS research_queue_events (
                     event_id TEXT PRIMARY KEY,
                     item_id TEXT NOT NULL,
@@ -323,12 +345,18 @@ class AxiomStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_research_queue_events_item
                     ON research_queue_events(item_id, created_at);
+                CREATE INDEX IF NOT EXISTS idx_research_queue_events_created
+                    ON research_queue_events(created_at, event_id);
                 CREATE TABLE IF NOT EXISTS candidate_lifecycle (
                     candidate_id TEXT PRIMARY KEY,
                     stage TEXT NOT NULL,
                     payload_json TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
+                CREATE INDEX IF NOT EXISTS idx_candidate_lifecycle_stage_updated
+                    ON candidate_lifecycle(stage, updated_at, candidate_id);
+                CREATE INDEX IF NOT EXISTS idx_candidate_lifecycle_updated
+                    ON candidate_lifecycle(updated_at, candidate_id);
                 CREATE TABLE IF NOT EXISTS candidate_lifecycle_events (
                     event_id TEXT PRIMARY KEY,
                     candidate_id TEXT NOT NULL,
@@ -340,12 +368,16 @@ class AxiomStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_candidate_lifecycle_events_candidate
                     ON candidate_lifecycle_events(candidate_id, created_at);
+                CREATE INDEX IF NOT EXISTS idx_candidate_lifecycle_events_created
+                    ON candidate_lifecycle_events(created_at, event_id);
                 CREATE TABLE IF NOT EXISTS paper_state (
                     experiment_id TEXT PRIMARY KEY,
                     state_json TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     state_version INTEGER NOT NULL DEFAULT 0
                 );
+                CREATE INDEX IF NOT EXISTS idx_paper_state_updated
+                    ON paper_state(updated_at, experiment_id);
                 CREATE TABLE IF NOT EXISTS paper_observations (
                     observation_id TEXT PRIMARY KEY,
                     experiment_id TEXT NOT NULL,
@@ -356,6 +388,8 @@ class AxiomStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_paper_observations_experiment_time
                     ON paper_observations(experiment_id, timestamp);
+                CREATE INDEX IF NOT EXISTS idx_paper_observations_dashboard
+                    ON paper_observations(timestamp, observation_id);
                 CREATE TABLE IF NOT EXISTS paper_execution_events (
                     event_id TEXT PRIMARY KEY,
                     experiment_id TEXT NOT NULL,
@@ -369,6 +403,8 @@ class AxiomStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_paper_execution_events_experiment_time
                     ON paper_execution_events(experiment_id, timestamp);
+                CREATE INDEX IF NOT EXISTS idx_paper_execution_events_dashboard
+                    ON paper_execution_events(timestamp, event_id);
                 CREATE TABLE IF NOT EXISTS paper_bet_ledger (
                     bet_id TEXT PRIMARY KEY,
                     experiment_id TEXT NOT NULL,
@@ -384,6 +420,8 @@ class AxiomStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_paper_bet_ledger_experiment_time
                     ON paper_bet_ledger(experiment_id, resolved_at);
+                CREATE INDEX IF NOT EXISTS idx_paper_bet_ledger_dashboard
+                    ON paper_bet_ledger(resolved_at, bet_id);
                 CREATE TABLE IF NOT EXISTS opportunity_snapshots (
                     opportunity_id TEXT PRIMARY KEY,
                     observed_at TEXT NOT NULL,
@@ -3572,6 +3610,1078 @@ class AxiomStore:
             )
         bounded = result[:limit]
         return bounded if include_payload else [item["market_id"] for item in bounded]
+    def paginate_dataset_catalog(
+        self,
+        *,
+        page: int = 1,
+        page_size: int = _DEFAULT_PAGE_SIZE,
+        source_type: str | None = None,
+        market_type: str | None = None,
+        instrument: str | None = None,
+        timeframe: str | None = None,
+        quality: str | None = None,
+        market: str | None = None,
+        category: str | None = None,
+        dataset_id: str | None = None,
+        sort: str = "updated_at",
+        direction: str = "desc",
+        filter: str | None = None,
+    ) -> dict[str, Any]:
+        """Read a page of dataset catalog records without materializing the catalog."""
+        requested_page, size = _pagination_args(page, page_size)
+        sort_columns = {
+            "updated_at": "updated_at",
+            "last_updated": "updated_at",
+            "created_at": "created_at",
+            "dataset_id": "dataset_id",
+            "dataset_version": "dataset_version",
+            "version": "dataset_version",
+            "provider": "provider",
+            "instrument": "instrument",
+            "market_type": "market_type",
+            "timeframe": "timeframe",
+            "row_count": "row_count",
+            "completeness": "completeness",
+            "quality": "quality",
+            "source_type": "source_type",
+        }
+        order_column = sort_columns.get(str(sort or "updated_at").strip().lower())
+        if order_column is None:
+            raise ValueError(f"unsupported dataset catalog sort: {sort}")
+        order_direction = str(direction or "desc").strip().lower()
+        if order_direction not in {"asc", "desc"}:
+            raise ValueError("direction must be 'asc' or 'desc'")
+        clauses: list[str] = []
+        values: list[Any] = []
+        if dataset_id is not None and str(dataset_id).strip():
+            clauses.append("dataset_id=?")
+            values.append(str(dataset_id).strip())
+        exact_filters = (
+            ("source_type", source_type, True),
+            ("market_type", market_type, False),
+            ("instrument", instrument, False),
+            ("timeframe", timeframe, False),
+            ("quality", quality, False),
+        )
+        for column, value, uppercase in exact_filters:
+            if value is not None and str(value).strip():
+                text = _enum_value(value) or str(value).strip()
+                clauses.append(f"{column}=?")
+                values.append(text.upper() if uppercase else text)
+        if market is not None and str(market).strip():
+            clauses.append("market_type=?")
+            values.append(str(market).strip())
+        if category is not None and str(category).strip():
+            clauses.append(
+                "(lower(json_extract(metadata_json,'$.category'))=lower(?) "
+                "OR lower(json_extract(metadata_json,'$.metadata.category'))=lower(?) "
+                "OR lower(market_type)=lower(?))"
+            )
+            category_text = str(category).strip()
+            values.extend([category_text, category_text, category_text])
+        like_sql, like_values = _like_filter(
+            filter,
+            (
+                "dataset_id",
+                "dataset_version",
+                "provider",
+                "instrument",
+                "market_type",
+                "timeframe",
+                "quality",
+                "source_type",
+                "metadata_json",
+            ),
+        )
+        if like_sql:
+            clauses.append(like_sql)
+            values.extend(like_values)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        with self._lock:
+            total = int(self._conn.execute(f"SELECT COUNT(*) AS n FROM dataset_catalog{where}", values).fetchone()["n"])
+            actual_page, pages = _pagination_shape(requested_page, size, total)
+            query = (
+                "SELECT * FROM dataset_catalog"
+                f"{where} ORDER BY {order_column} {order_direction.upper()},dataset_id ASC,dataset_version ASC "
+                "LIMIT ? OFFSET ?"
+            )
+            rows = self._conn.execute(query, [*values, size, (actual_page - 1) * size]).fetchall()
+        return {
+            "items": [_dataset_catalog_record(row) for row in rows],
+            "page": actual_page,
+            "page_size": size,
+            "total": total,
+            "pages": pages,
+        }
+
+    def paginate_dataset_missing_ranges(
+        self,
+        dataset_id: str,
+        *,
+        dataset_version: str | None = None,
+        page: int = 1,
+        page_size: int = _DEFAULT_PAGE_SIZE,
+        sort: str = "range_index",
+        direction: str = "asc",
+        filter: str | None = None,
+    ) -> dict[str, Any]:
+        """Page a catalog row's missing-range JSON through SQLite ``json_each``."""
+        requested_page, size = _pagination_args(page, page_size)
+        identifier = str(dataset_id).strip()
+        if not identifier:
+            raise ValueError("dataset_id is required")
+        sort_columns = {
+            "range_index": "range_index",
+            "range": "range_json",
+            "dataset_version": "dataset_version",
+        }
+        order_column = sort_columns.get(str(sort or "range_index").strip().lower())
+        if order_column is None:
+            raise ValueError(f"unsupported missing range sort: {sort}")
+        order_direction = str(direction or "asc").strip().lower()
+        if order_direction not in {"asc", "desc"}:
+            raise ValueError("direction must be 'asc' or 'desc'")
+        cte = (
+            "WITH ranges AS ("
+            "SELECT c.dataset_id,c.dataset_version,CAST(r.key AS INTEGER) AS range_index,"
+            "r.value AS range_json FROM dataset_catalog AS c "
+            "JOIN json_each(c.missing_ranges_json) AS r "
+            "WHERE c.dataset_id=?"
+        )
+        values: list[Any] = [identifier]
+        if dataset_version is not None and str(dataset_version).strip():
+            cte += " AND c.dataset_version=?"
+            values.append(str(dataset_version).strip())
+        cte += ")"
+        clauses: list[str] = []
+        filter_sql, filter_values = _like_filter(filter, ("dataset_version", "range_json", "range_index"))
+        if filter_sql:
+            clauses.append(filter_sql)
+            values.extend(filter_values)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        with self._lock:
+            total = int(self._conn.execute(f"{cte} SELECT COUNT(*) AS n FROM ranges{where}", values).fetchone()["n"])
+            actual_page, pages = _pagination_shape(requested_page, size, total)
+            rows = self._conn.execute(
+                f"{cte} SELECT dataset_id,dataset_version,range_index,range_json FROM ranges{where} "
+                f"ORDER BY {order_column} {order_direction.upper()},dataset_version ASC,dataset_id ASC "
+                "LIMIT ? OFFSET ?",
+                [*values, size, (actual_page - 1) * size],
+            ).fetchall()
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            raw_range = row["range_json"]
+            try:
+                parsed_range = _load(raw_range)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                parsed_range = raw_range
+            items.append(
+                {
+                    "dataset_id": row["dataset_id"],
+                    "dataset_version": row["dataset_version"],
+                    "range_index": int(row["range_index"]),
+                    "range": parsed_range,
+                    "missing_range": parsed_range,
+                }
+            )
+        return {"items": items, "page": actual_page, "page_size": size, "total": total, "pages": pages}
+
+    def paginate_candidate_lifecycle(
+        self,
+        *,
+        page: int = 1,
+        page_size: int = _DEFAULT_PAGE_SIZE,
+        stage: str | None = None,
+        quality: str | None = None,
+        market: str | None = None,
+        source_type: str | None = None,
+        candidate_id: str | None = None,
+        sort: str = "updated_at",
+        direction: str = "desc",
+        filter: str | None = None,
+    ) -> dict[str, Any]:
+        """Read the current candidate lifecycle rows with SQL-side filtering."""
+        requested_page, size = _pagination_args(page, page_size)
+        sort_columns = {
+            "updated_at": "updated_at",
+            "candidate_id": "candidate_id",
+            "stage": "stage",
+        }
+        order_column = sort_columns.get(str(sort or "updated_at").strip().lower())
+        if order_column is None:
+            raise ValueError(f"unsupported candidate lifecycle sort: {sort}")
+        order_direction = str(direction or "desc").strip().lower()
+        if order_direction not in {"asc", "desc"}:
+            raise ValueError("direction must be 'asc' or 'desc'")
+        clauses: list[str] = []
+        values: list[Any] = []
+        if candidate_id is not None and str(candidate_id).strip():
+            clauses.append("candidate_id=?")
+            values.append(str(candidate_id).strip())
+        if stage is not None and str(stage).strip():
+            clauses.append("stage=?")
+            values.append(str(stage).strip().upper())
+        if quality is not None and str(quality).strip():
+            quality_text = str(quality).strip()
+            clauses.append(
+                "(lower(json_extract(payload_json,'$.quality'))=lower(?) "
+                "OR lower(json_extract(payload_json,'$.research_quality'))=lower(?) "
+                "OR lower(json_extract(payload_json,'$.data_quality'))=lower(?))"
+            )
+            values.extend([quality_text] * 3)
+        if market is not None and str(market).strip():
+            market_text = str(market).strip()
+            clauses.append(
+                "(lower(json_extract(payload_json,'$.market'))=lower(?) "
+                "OR lower(json_extract(payload_json,'$.market_type'))=lower(?))"
+            )
+            values.extend([market_text, market_text])
+        if source_type is not None and str(source_type).strip():
+            source_text = str(source_type).strip()
+            clauses.append(
+                "(lower(json_extract(payload_json,'$.source'))=lower(?) "
+                "OR lower(json_extract(payload_json,'$.source_type'))=lower(?))"
+            )
+            values.extend([source_text, source_text])
+        like_sql, like_values = _like_filter(filter, ("candidate_id", "stage", "payload_json"))
+        if like_sql:
+            clauses.append(like_sql)
+            values.extend(like_values)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        with self._lock:
+            total = int(self._conn.execute(f"SELECT COUNT(*) AS n FROM candidate_lifecycle{where}", values).fetchone()["n"])
+            actual_page, pages = _pagination_shape(requested_page, size, total)
+            rows = self._conn.execute(
+                "SELECT candidate_id,stage,payload_json,updated_at FROM candidate_lifecycle"
+                f"{where} ORDER BY {order_column} {order_direction.upper()},candidate_id ASC "
+                "LIMIT ? OFFSET ?",
+                [*values, size, (actual_page - 1) * size],
+            ).fetchall()
+        items = [
+            {
+                "candidate_id": row["candidate_id"],
+                "stage": row["stage"],
+                "payload": _load(row["payload_json"]),
+                "updated_at": _parse_datetime(row["updated_at"]),
+            }
+            for row in rows
+        ]
+        return {"items": items, "page": actual_page, "page_size": size, "total": total, "pages": pages}
+
+    def paginate_candidate_lifecycle_events(
+        self,
+        *,
+        candidate_id: str | None = None,
+        stage: str | None = None,
+        page: int = 1,
+        page_size: int = _DEFAULT_PAGE_SIZE,
+        sort: str = "created_at",
+        direction: str = "desc",
+        filter: str | None = None,
+    ) -> dict[str, Any]:
+        """Page immutable candidate lifecycle transition events."""
+        requested_page, size = _pagination_args(page, page_size)
+        sort_columns = {
+            "created_at": "created_at",
+            "event_id": "event_id",
+            "candidate_id": "candidate_id",
+            "from_stage": "from_stage",
+            "to_stage": "to_stage",
+        }
+        order_column = sort_columns.get(str(sort or "created_at").strip().lower())
+        if order_column is None:
+            raise ValueError(f"unsupported candidate lifecycle event sort: {sort}")
+        order_direction = str(direction or "desc").strip().lower()
+        if order_direction not in {"asc", "desc"}:
+            raise ValueError("direction must be 'asc' or 'desc'")
+        clauses: list[str] = []
+        values: list[Any] = []
+        if candidate_id is not None and str(candidate_id).strip():
+            clauses.append("candidate_id=?")
+            values.append(str(candidate_id).strip())
+        if stage is not None and str(stage).strip():
+            stage_text = str(stage).strip().upper()
+            clauses.append("(from_stage=? OR to_stage=?)")
+            values.extend([stage_text, stage_text])
+        like_sql, like_values = _like_filter(
+            filter,
+            ("event_id", "candidate_id", "from_stage", "to_stage", "reason", "payload_json"),
+        )
+        if like_sql:
+            clauses.append(like_sql)
+            values.extend(like_values)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        with self._lock:
+            total = int(
+                self._conn.execute(f"SELECT COUNT(*) AS n FROM candidate_lifecycle_events{where}", values).fetchone()["n"]
+            )
+            actual_page, pages = _pagination_shape(requested_page, size, total)
+            rows = self._conn.execute(
+                "SELECT event_id,candidate_id,from_stage,to_stage,reason,payload_json,created_at "
+                "FROM candidate_lifecycle_events"
+                f"{where} ORDER BY {order_column} {order_direction.upper()},event_id ASC "
+                "LIMIT ? OFFSET ?",
+                [*values, size, (actual_page - 1) * size],
+            ).fetchall()
+        items = [
+            {
+                "event_id": row["event_id"],
+                "candidate_id": row["candidate_id"],
+                "from_stage": row["from_stage"],
+                "to_stage": row["to_stage"],
+                "reason": row["reason"],
+                "payload": _load(row["payload_json"]),
+                "created_at": _parse_datetime(row["created_at"]),
+            }
+            for row in rows
+        ]
+        return {"items": items, "page": actual_page, "page_size": size, "total": total, "pages": pages}
+
+    def paginate_research_queue(
+        self,
+        *,
+        page: int = 1,
+        page_size: int = _DEFAULT_PAGE_SIZE,
+        status: str | None = None,
+        source: str | None = None,
+        item_type: str | None = None,
+        item_id: str | None = None,
+        market: str | None = None,
+        category: str | None = None,
+        quality: str | None = None,
+        sort: str = "priority",
+        direction: str = "desc",
+        filter: str | None = None,
+    ) -> dict[str, Any]:
+        """Read research queue items with bounded SQL pagination."""
+        requested_page, size = _pagination_args(page, page_size)
+        sort_columns = {
+            "priority": "priority",
+            "created_at": "created_at",
+            "updated_at": "updated_at",
+            "available_at": "available_at",
+            "item_id": "item_id",
+            "item_type": "item_type",
+            "status": "status",
+            "source": "source",
+        }
+        order_column = sort_columns.get(str(sort or "priority").strip().lower())
+        if order_column is None:
+            raise ValueError(f"unsupported research queue sort: {sort}")
+        order_direction = str(direction or "desc").strip().lower()
+        if order_direction not in {"asc", "desc"}:
+            raise ValueError("direction must be 'asc' or 'desc'")
+        clauses: list[str] = []
+        values: list[Any] = []
+        if item_id is not None and str(item_id).strip():
+            clauses.append("item_id=?")
+            values.append(str(item_id).strip())
+        for column, value, uppercase in (
+            ("status", status, True),
+            ("source", source, False),
+            ("item_type", item_type, False),
+        ):
+            if value is not None and str(value).strip():
+                text = str(value).strip()
+                clauses.append(f"{column}=?")
+                values.append(text.upper() if uppercase else text)
+        for key, value in (("market", market), ("category", category), ("quality", quality)):
+            if value is not None and str(value).strip():
+                text = str(value).strip()
+                paths = {
+                    "market": ("$.market", "$.market_id", "$.market_type"),
+                    "category": ("$.category", "$.metadata.category"),
+                    "quality": ("$.quality", "$.research_quality", "$.data_quality"),
+                }[key]
+                category_clauses = [f"lower(json_extract(payload_json,'{path}'))=lower(?)" for path in paths]
+                if key == "category":
+                    category_clauses.insert(0, "lower(item_type)=lower(?)")
+                clauses.append("(" + " OR ".join(category_clauses) + ")")
+                values.extend([text] * len(category_clauses))
+        like_sql, like_values = _like_filter(
+            filter,
+            ("item_id", "item_type", "status", "source", "author", "payload_json", "last_error"),
+        )
+        if like_sql:
+            clauses.append(like_sql)
+            values.extend(like_values)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        with self._lock:
+            total = int(self._conn.execute(f"SELECT COUNT(*) AS n FROM research_queue{where}", values).fetchone()["n"])
+            actual_page, pages = _pagination_shape(requested_page, size, total)
+            rows = self._conn.execute(
+                "SELECT * FROM research_queue"
+                f"{where} ORDER BY {order_column} {order_direction.upper()},created_at ASC,item_id ASC "
+                "LIMIT ? OFFSET ?",
+                [*values, size, (actual_page - 1) * size],
+            ).fetchall()
+        items = [_research_queue_record(row) for row in rows]
+        return {"items": items, "page": actual_page, "page_size": size, "total": total, "pages": pages}
+
+    def paginate_research_activity(
+        self,
+        *,
+        page: int = 1,
+        page_size: int = _DEFAULT_PAGE_SIZE,
+        source: str | None = None,
+        source_type: str | None = None,
+        kind: str | None = None,
+        item_type: str | None = None,
+        status: str | None = None,
+        market: str | None = None,
+        sort: str = "timestamp",
+        direction: str = "desc",
+        filter: str | None = None,
+    ) -> dict[str, Any]:
+        """Page the persisted activity feed using a SQL UNION.
+
+        Every source contributes a stable key (for example ``report_id`` or
+        ``event_id``), so equal timestamps never make page boundaries move.
+        """
+        requested_page, size = _pagination_args(page, page_size)
+        sort_columns = {
+            "timestamp": "timestamp",
+            "created_at": "timestamp",
+            "updated_at": "timestamp",
+            "kind": "kind",
+            "source": "source",
+            "status": "status",
+            "item_type": "item_type",
+            "event_id": "event_id",
+        }
+        order_column = sort_columns.get(str(sort or "timestamp").strip().lower())
+        if order_column is None:
+            raise ValueError(f"unsupported activity sort: {sort}")
+        order_direction = str(direction or "desc").strip().lower()
+        if order_direction not in {"asc", "desc"}:
+            raise ValueError("direction must be 'asc' or 'desc'")
+        cte = """
+            WITH activity(
+                kind,timestamp,event_id,message,details_json,source,source_type,
+                status,item_type,market_id
+            ) AS (
+                SELECT
+                    'dataset', updated_at,
+                    'dataset:' || dataset_id || '/' || dataset_version,
+                    'Dataset ' || dataset_id || ' published (' || row_count || ' rows)',
+                    json_object(
+                        'dataset_id',dataset_id,'dataset_version',dataset_version,
+                        'source_type',source_type,'timeframe',timeframe,'quality',quality
+                    ),
+                    source_type,source_type,NULL,NULL,NULL
+                FROM dataset_catalog
+                UNION ALL
+                SELECT
+                    'bootstrap', updated_at, 'bootstrap:' || dataset_id,
+                    dataset_id || ' bootstrap ' || lower(status),
+                    payload_json, 'bootstrap','bootstrap',status,NULL,NULL
+                FROM dataset_bootstrap_state
+                UNION ALL
+                SELECT
+                    'collection', COALESCE(ended_at,started_at), 'collection:' || cycle_id,
+                    'Polymarket collection cycle completed (' ||
+                        COALESCE(json_extract(payload_json,'$.markets_seen'),0) || ' markets)',
+                    payload_json, collector_name,'collection',NULL,NULL,NULL
+                FROM collection_cycles
+                UNION ALL
+                SELECT
+                    'lifecycle', created_at, 'lifecycle:' || event_id,
+                    'Candidate ' || candidate_id || ' moved to ' || to_stage,
+                    json_object('from_stage',from_stage,'reason',reason),
+                    'lifecycle','lifecycle',to_stage,NULL,NULL
+                FROM candidate_lifecycle_events
+                UNION ALL
+                SELECT
+                    'research', updated_at, 'research:item:' || item_id,
+                    'Research item ' || item_type || ' is ' || lower(status),
+                    json_object('item_id',item_id,'last_error',last_error),
+                    source,'research',status,item_type,
+                    json_extract(payload_json,'$.market_id')
+                FROM research_queue
+                UNION ALL
+                SELECT
+                    'research', created_at, 'research:event:' || event_id,
+                    'Research queue item ' || item_id || ' moved to ' || to_status,
+                    detail, 'queue','research',to_status,NULL,NULL
+                FROM research_queue_events
+                UNION ALL
+                SELECT
+                    'report', created_at, 'report:' || report_id,
+                    'Research report ' || report_id || ' saved',
+                    json_object('experiment_id',experiment_id),
+                    'report','report',NULL,NULL,NULL
+                FROM reports
+                UNION ALL
+                SELECT
+                    'collection_error', observed_at, 'collection_error:' || error_id,
+                    'Collection error: ' || kind || ' (' || detail || ')',
+                    payload_json, 'collection','collection_error',kind,NULL,market_id
+                FROM collection_errors
+            )
+        """
+        clauses: list[str] = []
+        values: list[Any] = []
+        if source is not None and str(source).strip():
+            text = str(source).strip()
+            clauses.append("(source=? OR source_type=? OR kind=?)")
+            values.extend([text, text, text])
+        if source_type is not None and str(source_type).strip():
+            text = str(source_type).strip()
+            clauses.append("(source_type=? OR source=? OR kind=?)")
+            values.extend([text, text, text])
+        if kind is not None and str(kind).strip():
+            clauses.append("kind=?")
+            values.append(str(kind).strip().lower())
+        if item_type is not None and str(item_type).strip():
+            clauses.append("item_type=?")
+            values.append(str(item_type).strip())
+        if status is not None and str(status).strip():
+            clauses.append("lower(status)=lower(?)")
+            values.append(str(status).strip())
+        if market is not None and str(market).strip():
+            clauses.append("market_id=?")
+            values.append(str(market).strip())
+        like_sql, like_values = _like_filter(
+            filter,
+            ("kind", "timestamp", "event_id", "message", "details_json", "source", "source_type", "status", "item_type", "market_id"),
+        )
+        if like_sql:
+            clauses.append(like_sql)
+            values.extend(like_values)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        with self._lock:
+            total = int(self._conn.execute(f"{cte} SELECT COUNT(*) AS n FROM activity{where}", values).fetchone()["n"])
+            actual_page, pages = _pagination_shape(requested_page, size, total)
+            rows = self._conn.execute(
+                f"{cte} SELECT kind,timestamp,event_id,message,details_json,source,source_type,status,item_type,market_id "
+                f"FROM activity{where} "
+                f"ORDER BY {order_column} {order_direction.upper()},event_id ASC "
+                "LIMIT ? OFFSET ?",
+                [*values, size, (actual_page - 1) * size],
+            ).fetchall()
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            details = _load(row["details_json"]) if row["details_json"] else {}
+            items.append(
+                {
+                    "kind": row["kind"],
+                    "timestamp": _parse_datetime(row["timestamp"]),
+                    "event_id": row["event_id"],
+                    "message": row["message"],
+                    "details": details if isinstance(details, Mapping) else {"value": details},
+                    "source": row["source"],
+                    "source_type": row["source_type"],
+                    "status": row["status"],
+                    "item_type": row["item_type"],
+                    "market_id": row["market_id"],
+                }
+            )
+        return {"items": items, "page": actual_page, "page_size": size, "total": total, "pages": pages}
+
+    def paginate_polymarket_markets(
+        self,
+        *,
+        page: int = 1,
+        page_size: int = _DEFAULT_PAGE_SIZE,
+        market: str | None = None,
+        market_id: str | None = None,
+        timeframe: str | None = None,
+        quality: str | None = None,
+        category: str | None = None,
+        settlement: str | None = None,
+        sort: str = "observed_at",
+        direction: str = "desc",
+        filter: str | None = None,
+        include_snapshots: bool = True,
+    ) -> dict[str, Any]:
+        """Page one latest metadata/snapshot record per persisted market id."""
+        requested_page, size = _pagination_args(page, page_size)
+        sort_columns = {
+            "observed_at": "observed_at",
+            "source_timestamp": "source_timestamp",
+            "market_id": "market_id",
+            "quality": "quality",
+            "category": "category",
+            "timeframe": "timeframe",
+            "settlement": "settlement",
+        }
+        order_column = sort_columns.get(str(sort or "observed_at").strip().lower())
+        if order_column is None:
+            raise ValueError(f"unsupported Polymarket sort: {sort}")
+        order_direction = str(direction or "desc").strip().lower()
+        if order_direction not in {"asc", "desc"}:
+            raise ValueError("direction must be 'asc' or 'desc'")
+        cte = """
+            WITH metadata_ranked AS (
+                SELECT market_id,observed_at,metadata_hash,payload_json,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY market_id
+                        ORDER BY observed_at DESC,metadata_hash DESC
+                    ) AS row_number
+                FROM polymarket_markets
+            ),
+            metadata_latest AS (
+                SELECT market_id,observed_at,metadata_hash,payload_json
+                FROM metadata_ranked WHERE row_number=1
+            ),
+            snapshot_ranked AS (
+                SELECT market_id,observed_at,source_timestamp,snapshot_id,payload_json,quality,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY market_id
+                        ORDER BY observed_at DESC,source_timestamp DESC,snapshot_id DESC
+                    ) AS row_number
+                FROM polymarket_snapshots
+            ),
+            snapshot_latest AS (
+                SELECT market_id,observed_at,source_timestamp,snapshot_id,payload_json,quality
+                FROM snapshot_ranked WHERE row_number=1
+            ),
+            markets AS (
+                SELECT
+                    m.market_id,
+                    COALESCE(s.observed_at,m.observed_at) AS observed_at,
+                    m.observed_at AS metadata_observed_at,
+                    m.metadata_hash,
+                    m.payload_json AS metadata_payload,
+                    s.observed_at AS snapshot_observed_at,
+                    s.source_timestamp,
+                    s.snapshot_id,
+                    s.payload_json AS snapshot_payload,
+                    s.quality,
+                    COALESCE(
+                        json_extract(s.payload_json,'$.category'),
+                        json_extract(s.payload_json,'$.snapshot.category'),
+                        json_extract(s.payload_json,'$.metadata.category'),
+                        json_extract(m.payload_json,'$.category'),
+                        json_extract(m.payload_json,'$.metadata.category')
+                    ) AS category,
+                    COALESCE(
+                        json_extract(s.payload_json,'$.timeframe'),
+                        json_extract(s.payload_json,'$.snapshot.timeframe'),
+                        json_extract(s.payload_json,'$.metadata.timeframe'),
+                        json_extract(m.payload_json,'$.timeframe'),
+                        json_extract(m.payload_json,'$.metadata.timeframe')
+                    ) AS timeframe,
+                    lower(COALESCE(
+                        json_extract(s.payload_json,'$.settlement'),
+                        json_extract(s.payload_json,'$.snapshot.settlement'),
+                        json_extract(s.payload_json,'$.metadata.settlement'),
+                        json_extract(m.payload_json,'$.settlement'),
+                        json_extract(m.payload_json,'$.metadata.settlement')
+                    )) AS settlement
+                FROM metadata_latest AS m
+                LEFT JOIN snapshot_latest AS s ON s.market_id=m.market_id
+                UNION ALL
+                SELECT
+                    s.market_id,
+                    s.observed_at,
+                    NULL,NULL,NULL,
+                    s.observed_at,
+                    s.source_timestamp,
+                    s.snapshot_id,
+                    s.payload_json,
+                    s.quality,
+                    COALESCE(
+                        json_extract(s.payload_json,'$.category'),
+                        json_extract(s.payload_json,'$.snapshot.category'),
+                        json_extract(s.payload_json,'$.metadata.category')
+                    ),
+                    COALESCE(
+                        json_extract(s.payload_json,'$.timeframe'),
+                        json_extract(s.payload_json,'$.snapshot.timeframe'),
+                        json_extract(s.payload_json,'$.metadata.timeframe')
+                    ),
+                    lower(COALESCE(
+                        json_extract(s.payload_json,'$.settlement'),
+                        json_extract(s.payload_json,'$.snapshot.settlement'),
+                        json_extract(s.payload_json,'$.metadata.settlement')
+                    ))
+                FROM snapshot_latest AS s
+                LEFT JOIN metadata_latest AS m ON m.market_id=s.market_id
+                WHERE m.market_id IS NULL
+            )
+        """
+        clauses: list[str] = []
+        values: list[Any] = []
+        identifier = market_id if market_id is not None else market
+        if identifier is not None and str(identifier).strip():
+            clauses.append("market_id=?")
+            values.append(str(identifier).strip())
+        for column, value in (("timeframe", timeframe), ("category", category), ("settlement", settlement)):
+            if value is not None and str(value).strip():
+                clauses.append(f"lower(CAST({column} AS TEXT))=lower(?)")
+                values.append(_enum_value(value) or str(value).strip())
+        if quality is not None and str(quality).strip():
+            quality_text = _enum_value(quality) or str(quality).strip()
+            clauses.append(
+                "(lower(CAST(quality AS TEXT))=lower(?) "
+                "OR lower(json_extract(snapshot_payload,'$.quality'))=lower(?) "
+                "OR lower(json_extract(metadata_payload,'$.quality'))=lower(?))"
+            )
+            values.extend([quality_text] * 3)
+        like_sql, like_values = _like_filter(
+            filter,
+            (
+                "market_id",
+                "metadata_payload",
+                "snapshot_payload",
+                "quality",
+                "category",
+                "timeframe",
+                "settlement",
+            ),
+        )
+        if like_sql:
+            clauses.append(like_sql)
+            values.extend(like_values)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        with self._lock:
+            total = int(self._conn.execute(f"{cte} SELECT COUNT(*) AS n FROM markets{where}", values).fetchone()["n"])
+            actual_page, pages = _pagination_shape(requested_page, size, total)
+            rows = self._conn.execute(
+                f"{cte} SELECT market_id,observed_at,metadata_observed_at,metadata_hash,metadata_payload,"
+                "snapshot_observed_at,source_timestamp,snapshot_id,snapshot_payload,quality,category,timeframe,settlement "
+                f"FROM markets{where} ORDER BY {order_column} {order_direction.upper()},market_id ASC "
+                "LIMIT ? OFFSET ?",
+                [*values, size, (actual_page - 1) * size],
+            ).fetchall()
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            metadata_payload = _load(row["metadata_payload"]) if row["metadata_payload"] else None
+            snapshot_payload = _load(row["snapshot_payload"]) if row["snapshot_payload"] else None
+            metadata = metadata_payload if isinstance(metadata_payload, Mapping) else {}
+            snapshot_record = snapshot_payload if isinstance(snapshot_payload, Mapping) else {}
+            if snapshot_record:
+                payload = dict(snapshot_record)
+            else:
+                payload = dict(metadata)
+            if metadata and "metadata" not in payload and "metadata" in metadata:
+                payload["metadata"] = metadata["metadata"]
+            if snapshot_record and "snapshot" not in payload and "snapshot" in snapshot_record:
+                payload["snapshot"] = snapshot_record["snapshot"]
+            metadata_value = payload.get("metadata", {})
+            metadata_value = metadata_value if isinstance(metadata_value, Mapping) else {}
+            snapshot_value = payload.get("snapshot", {})
+            snapshot_value = snapshot_value if isinstance(snapshot_value, Mapping) else {}
+            closed_value = metadata_value.get("closed", payload.get("closed", False))
+            closed = (
+                closed_value
+                if isinstance(closed_value, bool)
+                else str(closed_value).strip().lower() in {"1", "true", "yes", "y", "on", "closed"}
+            )
+            settlement_value = str(
+                snapshot_value.get("settlement", payload.get("settlement", row["settlement"] or ""))
+            ).strip().lower()
+            active = not closed and settlement_value not in {
+                SettlementState.RESOLVED_YES.value,
+                SettlementState.RESOLVED_NO.value,
+                SettlementState.VOID.value,
+            }
+            item = {
+                "market_id": row["market_id"],
+                "observed_at": _parse_datetime(row["observed_at"]),
+                "metadata_observed_at": _parse_datetime(row["metadata_observed_at"]),
+                "snapshot_observed_at": _parse_datetime(row["snapshot_observed_at"]),
+                "source_timestamp": _parse_datetime(row["source_timestamp"]),
+                "metadata_hash": row["metadata_hash"],
+                "snapshot_id": row["snapshot_id"],
+                "quality": row["quality"] or payload.get("quality") or payload.get("research_quality"),
+                "category": row["category"],
+                "timeframe": row["timeframe"],
+                "settlement": settlement_value or None,
+                "active": active,
+                "payload": payload,
+            }
+            if include_snapshots:
+                item["metadata"] = dict(metadata)
+                item["snapshot"] = dict(snapshot_value)
+            items.append(item)
+        return {"items": items, "page": actual_page, "page_size": size, "total": total, "pages": pages}
+
+    def paginate_paper_records(
+        self,
+        *,
+        page: int = 1,
+        page_size: int = _DEFAULT_PAGE_SIZE,
+        experiment_id: str | None = None,
+        market: str | None = None,
+        market_id: str | None = None,
+        status: str | None = None,
+        record_type: str | None = None,
+        sort: str = "timestamp",
+        direction: str = "desc",
+        filter: str | None = None,
+    ) -> dict[str, Any]:
+        """Page persisted paper states, observations, executions and bets."""
+        requested_page, size = _pagination_args(page, page_size)
+        sort_columns = {
+            "timestamp": "timestamp",
+            "created_at": "created_at",
+            "updated_at": "updated_at",
+            "record_type": "record_type",
+            "record_id": "record_id",
+            "experiment_id": "experiment_id",
+            "market_id": "market_id",
+            "status": "status",
+        }
+        order_column = sort_columns.get(str(sort or "timestamp").strip().lower())
+        if order_column is None:
+            raise ValueError(f"unsupported paper record sort: {sort}")
+        order_direction = str(direction or "desc").strip().lower()
+        if order_direction not in {"asc", "desc"}:
+            raise ValueError("direction must be 'asc' or 'desc'")
+        cte = """
+            WITH paper_records(
+                record_type,record_id,experiment_id,market_id,timestamp,status,
+                outcome,resolution,strategy_id,payload_json,created_at,updated_at
+            ) AS (
+                SELECT
+                    'state',experiment_id,experiment_id,NULL,updated_at,
+                    json_extract(state_json,'$.status'),NULL,NULL,NULL,
+                    state_json,updated_at,updated_at
+                FROM paper_state
+                UNION ALL
+                SELECT
+                    'observation',observation_id,experiment_id,market_id,timestamp,
+                    json_extract(payload_json,'$.status'),NULL,NULL,NULL,
+                    payload_json,created_at,created_at
+                FROM paper_observations
+                UNION ALL
+                SELECT
+                    'execution',event_id,experiment_id,market_id,timestamp,status,
+                    NULL,NULL,NULL,payload_json,created_at,created_at
+                FROM paper_execution_events
+                UNION ALL
+                SELECT
+                    'bet',bet_id,experiment_id,market_id,resolved_at,resolution,
+                    outcome,resolution,strategy_id,payload_json,created_at,updated_at
+                FROM paper_bet_ledger
+            )
+        """
+        clauses: list[str] = []
+        values: list[Any] = []
+        if experiment_id is not None and str(experiment_id).strip():
+            clauses.append("experiment_id=?")
+            values.append(str(experiment_id).strip())
+        identifier = market_id if market_id is not None else market
+        if identifier is not None and str(identifier).strip():
+            clauses.append("market_id=?")
+            values.append(str(identifier).strip())
+        if status is not None and str(status).strip():
+            status_text = str(status).strip()
+            clauses.append(
+                "(lower(CAST(status AS TEXT))=lower(?) "
+                "OR lower(CAST(outcome AS TEXT))=lower(?) "
+                "OR lower(CAST(resolution AS TEXT))=lower(?) "
+                "OR lower(payload_json) LIKE lower(?))"
+            )
+            values.extend([status_text, status_text, status_text, f"%{status_text}%"])
+        if record_type is not None and str(record_type).strip():
+            record_type_text = str(record_type).strip().lower()
+            record_type_aliases = {
+                "states": "state",
+                "paper_state": "state",
+                "paper_states": "state",
+                "observations": "observation",
+                "paper_observations": "observation",
+                "executions": "execution",
+                "execution_events": "execution",
+                "paper_execution_events": "execution",
+                "bets": "bet",
+                "ledger": "bet",
+                "paper_bet_ledger": "bet",
+            }
+            normalized_type = record_type_aliases.get(record_type_text, record_type_text)
+            if normalized_type not in {"state", "observation", "execution", "bet"}:
+                raise ValueError(f"unsupported paper record type: {record_type}")
+            clauses.append("record_type=?")
+            values.append(normalized_type)
+        like_sql, like_values = _like_filter(
+            filter,
+            (
+                "record_type",
+                "record_id",
+                "experiment_id",
+                "market_id",
+                "timestamp",
+                "status",
+                "outcome",
+                "resolution",
+                "strategy_id",
+                "payload_json",
+            ),
+        )
+        if like_sql:
+            clauses.append(like_sql)
+            values.extend(like_values)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        with self._lock:
+            total = int(self._conn.execute(f"{cte} SELECT COUNT(*) AS n FROM paper_records{where}", values).fetchone()["n"])
+            actual_page, pages = _pagination_shape(requested_page, size, total)
+            rows = self._conn.execute(
+                f"{cte} SELECT record_type,record_id,experiment_id,market_id,timestamp,status,outcome,"
+                "resolution,strategy_id,payload_json,created_at,updated_at "
+                f"FROM paper_records{where} ORDER BY {order_column} {order_direction.upper()},record_id ASC,record_type ASC "
+                "LIMIT ? OFFSET ?",
+                [*values, size, (actual_page - 1) * size],
+            ).fetchall()
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            payload = _load(row["payload_json"]) if row["payload_json"] else {}
+            item = {
+                "record_type": row["record_type"],
+                "record_id": row["record_id"],
+                "id": row["record_id"],
+                "experiment_id": row["experiment_id"],
+                "market_id": row["market_id"],
+                "timestamp": _parse_datetime(row["timestamp"]),
+                "status": row["status"],
+                "outcome": row["outcome"],
+                "resolution": row["resolution"],
+                "strategy_id": row["strategy_id"],
+                "payload": payload,
+                "created_at": _parse_datetime(row["created_at"]),
+                "updated_at": _parse_datetime(row["updated_at"]),
+            }
+            if row["record_type"] == "state":
+                item["state"] = payload
+            items.append(item)
+        return {"items": items, "page": actual_page, "page_size": size, "total": total, "pages": pages}
+
+    def dashboard_coverage_summary(self) -> dict[str, Any]:
+        """Return compact dashboard coverage aggregates without table-sized reads."""
+        btc_query = (
+            "SELECT * FROM ("
+            "SELECT c.*,ROW_NUMBER() OVER (PARTITION BY timeframe "
+            "ORDER BY updated_at DESC,dataset_id DESC,dataset_version DESC) AS row_number "
+            "FROM dataset_catalog AS c "
+            "WHERE source_type='HISTORICAL' AND lower(market_type)='crypto_spot' "
+            "AND replace(replace(upper(instrument),'/',''),'-','')='BTCUSDT'"
+            ") WHERE row_number=1 ORDER BY timeframe,dataset_id,dataset_version"
+        )
+        with self._lock:
+            total_rows = self._conn.execute(
+                "SELECT source_type,COUNT(*) AS dataset_count,COALESCE(SUM(row_count),0) AS row_count "
+                "FROM dataset_catalog GROUP BY source_type"
+            ).fetchall()
+            btc_rows = self._conn.execute(btc_query).fetchall()
+            aggregate_row = self._conn.execute(
+                "SELECT row_count,quality,metadata_json FROM dataset_catalog "
+                "WHERE source_type='HISTORICAL' AND lower(market_type)='prediction' "
+                "AND dataset_id='Polymarket-historical' "
+                "ORDER BY updated_at DESC,dataset_version DESC LIMIT 1"
+            ).fetchone()
+            prediction_total = self._conn.execute(
+                "SELECT COUNT(DISTINCT dataset_id) AS n FROM dataset_catalog "
+                "WHERE source_type='HISTORICAL' AND lower(market_type)='prediction' "
+                "AND dataset_id LIKE 'prediction:%'"
+            ).fetchone()
+            prediction_points = self._conn.execute(
+                "SELECT COALESCE(SUM(row_count),0) AS n FROM dataset_catalog "
+                "WHERE source_type='HISTORICAL' AND lower(market_type)='prediction' "
+                "AND dataset_id LIKE 'prediction:%'"
+            ).fetchone()
+            category_rows = self._conn.execute(
+                "SELECT COALESCE(json_extract(metadata_json,'$.category'),'other') AS category,"
+                "COUNT(*) AS n FROM dataset_catalog "
+                "WHERE source_type='HISTORICAL' AND lower(market_type)='prediction' "
+                "AND dataset_id LIKE 'prediction:%' GROUP BY category ORDER BY category"
+            ).fetchall()
+            quality_rows = self._conn.execute(
+                "SELECT quality,COUNT(*) AS n FROM dataset_catalog "
+                "WHERE source_type='HISTORICAL' AND lower(market_type)='prediction' "
+                "AND dataset_id LIKE 'prediction:%' GROUP BY quality ORDER BY quality"
+            ).fetchall()
+            forward_where = (
+                "upper(COALESCE(json_extract(payload_json,'$.source_type'),''))<>'HISTORICAL' "
+                "AND snapshot_id NOT LIKE 'pmhist:%'"
+            )
+            forward_stats = self._conn.execute(
+                "SELECT COUNT(*) AS snapshot_count,COUNT(DISTINCT market_id) AS market_count,"
+                "COALESCE(SUM(CASE WHEN "
+                "json_type(payload_json,'$.yes_order_book') IN ('object','array') "
+                "OR json_type(payload_json,'$.no_order_book') IN ('object','array') "
+                "OR json_type(payload_json,'$.order_book') IN ('object','array') THEN 1 ELSE 0 END),0) AS order_book_rows,"
+                "MIN(observed_at) AS since FROM polymarket_snapshots WHERE " + forward_where
+            ).fetchone()
+            historical_book_rows = self._conn.execute(
+                "SELECT COALESCE(SUM(CASE WHEN "
+                "lower(COALESCE(json_extract(metadata_json,'$.historical_order_book_available'),'false')) "
+                "IN ('1','true','yes','on') THEN row_count ELSE 0 END),0) AS n "
+                "FROM dataset_catalog WHERE source_type='HISTORICAL' AND lower(market_type)='prediction' "
+                "AND dataset_id LIKE 'prediction:%'"
+            ).fetchone()
+        totals = {
+            str(row["source_type"]).lower(): {
+                "count": int(row["dataset_count"]),
+                "datasets": int(row["dataset_count"]),
+                "rows": int(row["row_count"]),
+            }
+            for row in total_rows
+        }
+        historical = totals.get("historical", {"count": 0, "datasets": 0, "rows": 0})
+        forward = totals.get("forward_collected", {"count": 0, "datasets": 0, "rows": 0})
+        btc_catalog = [_dataset_catalog_record(row) for row in btc_rows]
+        aggregate_metadata: Mapping[str, Any] = {}
+        if aggregate_row is not None:
+            loaded_metadata = _load(aggregate_row["metadata_json"])
+            if isinstance(loaded_metadata, Mapping):
+                aggregate_metadata = loaded_metadata
+        category_value = aggregate_metadata.get("category_counts")
+        if isinstance(category_value, Mapping):
+            category_counts = {str(key): int(value) for key, value in category_value.items()}
+        else:
+            category_counts = {str(row["category"] or "other"): int(row["n"]) for row in category_rows}
+        quality_counts = {str(row["quality"] or "UNKNOWN"): int(row["n"]) for row in quality_rows}
+        prediction_count = int(prediction_total["n"] or 0)
+        aggregate_points = int(aggregate_row["row_count"] or 0) if aggregate_row is not None else 0
+        price_points = aggregate_points if aggregate_row is not None else int(prediction_points["n"] or 0)
+        aggregate_quality = (
+            str(aggregate_row["quality"])
+            if aggregate_row is not None and aggregate_row["quality"] is not None
+            else str(aggregate_metadata.get("research_quality") or "PRICE_PROXY")
+        )
+        historical_order_book = bool(
+            aggregate_metadata.get("historical_order_book_available", False)
+            or int(historical_book_rows["n"] or 0) > 0
+        )
+        forward_summary = {
+            "tracked_markets": int(forward_stats["market_count"] or 0),
+            "markets": int(forward_stats["market_count"] or 0),
+            "snapshots": int(forward_stats["snapshot_count"] or 0),
+            "order_book_rows": int(forward_stats["order_book_rows"] or 0),
+            "since": _parse_datetime(forward_stats["since"]),
+        }
+        polymarket_summary = {
+            "historical_distinct_prediction_datasets": prediction_count,
+            "distinct_prediction_datasets": prediction_count,
+            "historical_datasets": prediction_count,
+            "price_points": price_points,
+            "historical_price_points": price_points,
+            "categories": category_counts,
+            "category_counts": category_counts,
+            "quality": aggregate_quality,
+            "research_quality": aggregate_quality,
+            "quality_counts": quality_counts,
+            "historical_order_book_available": historical_order_book,
+            "historical_order_book_rows": int(historical_book_rows["n"] or 0),
+        }
+        return {
+            "historical_count": int(historical["count"]),
+            "historical_datasets": int(historical["datasets"]),
+            "historical_rows": int(historical["rows"]),
+            "forward_count": int(forward["count"]),
+            "forward_datasets": int(forward["datasets"]),
+            "forward_rows": int(forward["rows"]),
+            "btc_latest_catalog": btc_catalog,
+            "btc_timeframes": btc_catalog,
+            "btc": {"latest_by_timeframe": btc_catalog, "timeframes": btc_catalog},
+            "polymarket_historical": polymarket_summary,
+            "polymarket": polymarket_summary,
+            "forward": forward_summary,
+            "forward_tracked": forward_summary,
+        }
+
     # Dashboard and quality ------------------------------------------
     def data_health(self, dataset_id: str | None = None, version: str | None = None) -> dict[str, Any]:
         """Return lightweight provenance/quality counters for dashboards.
@@ -3715,6 +4825,40 @@ def _research_queue_record(row: sqlite3.Row | None) -> dict[str, Any] | None:
         "attempts": int(row["attempts"]),
         "last_error": row["last_error"],
     }
+
+
+def _pagination_args(page: int, page_size: int) -> tuple[int, int]:
+    """Validate the bounded dashboard pagination contract."""
+    if isinstance(page, bool) or not isinstance(page, int) or page < 1:
+        raise ValueError("page must be a positive integer")
+    if isinstance(page_size, bool) or not isinstance(page_size, int) or page_size not in _PAGINATION_PAGE_SIZES:
+        raise ValueError(f"page_size must be one of {_PAGINATION_PAGE_SIZES}")
+    return int(page), int(page_size)
+
+
+def _pagination_shape(requested_page: int, page_size: int, total: int) -> tuple[int, int]:
+    if int(total) <= 0:
+        return 1, 0
+    pages = (int(total) + page_size - 1) // page_size
+    return min(requested_page, pages), pages
+
+
+def _pagination_response(
+    requested_page: int,
+    page_size: int,
+    total: int,
+    items: list[dict[str, Any]],
+) -> dict[str, Any]:
+    page, pages = _pagination_shape(requested_page, page_size, total)
+    return {"items": items, "page": page, "page_size": page_size, "total": int(total), "pages": pages}
+def _like_filter(value: Any, columns: Sequence[str]) -> tuple[str, list[Any]]:
+    if value is None:
+        return "", []
+    text = str(value).strip().lower()
+    if not text:
+        return "", []
+    pattern = f"%{text}%"
+    return "(" + " OR ".join(f"lower(CAST({column} AS TEXT)) LIKE ?" for column in columns) + ")", [pattern] * len(columns)
 
 
 def _enum_value(value: Any) -> str | None:
