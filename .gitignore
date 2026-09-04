@@ -6,7 +6,22 @@ __pycache__/
 .venv/
 venv/
 .env
-reports/axiom.sqlite
-reports/*.sqlite-shm
-reports/*.sqlite-wal
-%TEMP%axiom-demo.json
+
+# Runtime databases, journals, caches, and generated datasets.
+runtime-data/
+*.sqlite
+*.sqlite3
+*.db
+*.sqlite-journal
+*.db-journal
+*.sqlite-wal
+*.sqlite-shm
+*.db-wal
+*.db-shm
+*.log
+*.pid
+*.lock
+*.parquet
+*.feather
+*.arrow
+.cache/

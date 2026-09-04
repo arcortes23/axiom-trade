@@ -7,7 +7,9 @@ small or price-only sample as proof of profitability.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from itertools import islice
 from datetime import datetime, timedelta, timezone
+import hashlib
 import json
 import math
 from statistics import mean
@@ -27,6 +29,7 @@ from .strategy import validate_strategy
 from .tracking import ExperimentTracker
 
 
+_MAX_RESEARCH_RECORDS = 100_000
 _BUCKETS: tuple[tuple[str, float, float], ...] = (
     ("0-1c", 0.00, 0.01),
     ("1-2c", 0.01, 0.02),
@@ -71,16 +74,18 @@ def run_crypto_research(
     provider = provider or BinanceAdapter(timeout=timeout)
     errors: list[str] = []
     try:
-        bars = tuple(provider.historical_ohlcv(symbol, start=start, end=end, interval="1d"))
+        bars = tuple(islice(iter(provider.historical_ohlcv(symbol, start=start, end=end, interval="1d")), _MAX_RESEARCH_RECORDS))
     except Exception as exc:  # network adapters must not abort the report
         bars = ()
         errors.append(f"crypto data error: {exc}")
+    _consume_transport_errors(provider, errors, "crypto historical data")
     source_quality = _research_quality(provider, SimulationQuality.MEDIUM if bars else SimulationQuality.LOW)
     try:
         instrument_metadata = provider.metadata(symbol)
     except Exception as exc:
         instrument_metadata = None
         errors.append(f"crypto metadata error: {exc}")
+    _consume_transport_errors(provider, errors, "crypto metadata")
     base: dict[str, Any] = {
         "market_type": MarketType.CRYPTO_SPOT.value,
         "provider": str(getattr(provider, "provider_name", provider.__class__.__name__)),
@@ -264,19 +269,32 @@ def run_prediction_research(
 ) -> dict[str, Any]:
     """Study resolved Polymarket price buckets and calibration without LLM odds."""
     provider = provider or PolymarketAdapter(timeout=timeout)
+    if isinstance(market_limit, bool) or not isinstance(market_limit, int) or market_limit < 0:
+        raise ValueError("market_limit must be a non-negative integer")
+    requested = int(market_limit)
     errors: list[str] = []
     try:
-        markets = tuple(provider.markets(active=False))[: max(0, int(market_limit))]
+        if requested == 0:
+            markets = ()
+        else:
+            try:
+                raw_markets = provider.markets(active=False, limit=requested)
+            except TypeError as exc:
+                if "limit" not in str(exc):
+                    raise
+                raw_markets = provider.markets(active=False)
+            markets = tuple(islice(raw_markets, requested))
     except Exception as exc:
         markets = ()
         errors.append(f"prediction catalog error: {exc}")
     base: dict[str, Any] = {
         "market_type": MarketType.PREDICTION.value,
         "provider": str(getattr(provider, "provider_name", provider.__class__.__name__)),
-        "markets_requested": max(0, int(market_limit)),
-        "markets_seen": len(markets),
+        "markets_requested": requested,
         "markets_with_history": 0,
         "independent_resolved_markets": 0,
+        "resolved_market_groups": 0,
+        "independence_method": "unique event IDs or normalized question and expiry",
         "simulation_quality": SimulationQuality.LOW.value,
         "research_quality": ResearchQuality.PRICE_PROXY.value,
         "historical_order_books_available": False,
@@ -297,16 +315,18 @@ def run_prediction_research(
     time_rois: list[tuple[float, float]] = []
     repricing_scores: list[float] = []
     markets_with_history = 0
-    resolved_count = 0
+    resolved_market_groups: set[tuple[str, str]] = set()
     has_historical_books = False
     for market in markets:
         if not isinstance(market, PredictionMarketSnapshot):
             continue
         try:
-            raw_history = tuple(provider.price_history(market.market_id))
+            raw_history = tuple(islice(iter(provider.price_history(market.market_id)), _MAX_RESEARCH_RECORDS))
         except Exception as exc:
             errors.append(f"{market.market_id}: history error: {exc}")
+            _consume_transport_errors(provider, errors, f"{market.market_id} history")
             continue
+        _consume_transport_errors(provider, errors, f"{market.market_id} history")
         timed_history: list[tuple[datetime, Mapping[str, Any]]] = []
         for point in raw_history:
             if not isinstance(point, Mapping):
@@ -359,7 +379,7 @@ def run_prediction_research(
             continue
         if outcome is None:
             continue
-        resolved_count += 1
+        resolved_market_groups.add(_resolved_market_group_key(market))
         benchmark_rows.extend(
             {
                 "timestamp": _point_timestamp(point),
@@ -426,7 +446,8 @@ def run_prediction_research(
 
     calibration_records = [{"probability": probability, "outcome": outcome} for probability, outcome in calibration]
     base["markets_with_history"] = markets_with_history
-    base["independent_resolved_markets"] = resolved_count
+    base["independent_resolved_markets"] = len(resolved_market_groups)
+    base["resolved_market_groups"] = len(resolved_market_groups)
     base["price_buckets"] = buckets
     base["calibration"] = {
         "observations": len(calibration_records),
@@ -479,7 +500,7 @@ def run_prediction_research(
     base["errors"] = errors
     base["limitations"] = [
         "Public Polymarket histories are price-only unless a source supplies timestamped depth; this report labels such samples PRICE_PROXY.",
-        "Resolved samples are selected from the provider catalog and may be small or non-independent.",
+        "The independent-market count is a deduplicated event/question/expiry grouping proxy, not a statistical independence claim.",
         "Market price is used only as a calibration baseline; no LLM opinion is used as a probability model.",
         "Bucket ROI is descriptive and does not establish executable profitability.",
         "Historical order-book execution requires timestamped books; current books are never backfilled into history.",
@@ -523,8 +544,6 @@ def _chronological_split(rows: Sequence[Any]) -> tuple[Any, str]:
 
 
 def _content_version(rows: Iterable[Any]) -> str:
-    import hashlib
-
     encoded = json.dumps(_jsonable(list(rows)), sort_keys=True, separators=(",", ":"))
     return "sha256:" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
@@ -554,13 +573,22 @@ def _bucket_for(price: float) -> str | None:
     return None
 
 
-
 def _binary_outcome(state: SettlementState) -> float | None:
     if state is SettlementState.RESOLVED_YES:
         return 1.0
     if state is SettlementState.RESOLVED_NO:
         return 0.0
     return None
+
+
+def _resolved_market_group_key(market: PredictionMarketSnapshot) -> tuple[str, str]:
+    event_id = getattr(market, "event_id", None)
+    if event_id is not None and str(event_id).strip():
+        return ("event:" + str(event_id).strip().casefold(), "")
+    question = " ".join(str(market.question).casefold().split())
+    question_hash = hashlib.sha256(question.encode("utf-8")).hexdigest()
+    expiry = market.expiry.isoformat() if market.expiry is not None else ""
+    return ("question:" + question_hash, expiry)
 def _quality_rank(value: str) -> int:
     return {
         SimulationQuality.LOW.value: 0,
@@ -629,6 +657,20 @@ def _jsonable(value: Any) -> Any:
     if hasattr(value, "__dataclass_fields__"):
         return {name: _jsonable(getattr(value, name)) for name in value.__dataclass_fields__}
     return value
+
+def _consume_transport_errors(provider: Any, errors: list[str], context: str) -> None:
+    consume = getattr(provider, "consume_transport_errors", None)
+    if not callable(consume):
+        return
+    try:
+        transport_errors = tuple(consume())
+    except Exception as exc:
+        errors.append(f"{context}: transport error collector failed: {exc}")
+        return
+    for error in transport_errors:
+        status = getattr(error, "status", None)
+        detail = f"HTTP {status}" if status is not None else str(error)
+        errors.append(f"{context}: {detail}")
 
 
 __all__ = ["ResearchReport", "run_crypto_research", "run_initial_research", "run_prediction_research", "write_report"]

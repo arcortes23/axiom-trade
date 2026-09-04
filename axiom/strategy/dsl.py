@@ -24,7 +24,7 @@ CRYPTO_FAMILIES = frozenset({
     "rsi", "volume_filter",
 })
 PREDICTION_FAMILIES = frozenset({
-    "probability_mispricing", "tails", "mean_reversion", "momentum", "time_decay",
+    "probability_mispricing", "tails", "lottery_ticket", "mean_reversion", "momentum", "time_decay",
     "consistency", "cross_asset", "event_frequency", "liquidity", "correlation_aware",
 })
 FAMILIES = CRYPTO_FAMILIES | PREDICTION_FAMILIES

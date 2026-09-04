@@ -19,6 +19,7 @@ from .domain import (
 from .attribution import fitness_attribution
 from .benchmarks import BenchmarkResult, crypto_benchmarks, prediction_benchmarks
 from .collector import CollectionCycle, CollectorConfig, PolymarketCollector
+from .dashboard import DashboardData, DashboardServer, create_dashboard_server
 from .domain import ResearchQuality
 from .forward import ForwardTestRegistry, ForwardTestSpec
 from .opportunity import Opportunity, scan_opportunities
@@ -46,8 +47,10 @@ from .strategy import StrategyDefinition, StrategyDSL, StrategySpec, StrategyVal
 from .portfolio import OrderRequest, OrderState, Portfolio, Position
 from .backtest import BacktestResult, CryptoBacktester, CryptoOHLCVBacktester, PredictionBacktester, PredictionMarketBacktester, PredictionMarketHistoricalSimulator
 from .metrics import (
+    brier_score,
     calibration_buckets,
     calibration_at_horizons,
+    calculate_crypto_metrics,
     calculate_prediction_metrics,
     calmar_ratio,
     conditional_value_at_risk,
@@ -81,10 +84,17 @@ from .probability import (
 )
 from .hermes import CandidateMessage, Hermes, HermesPermissions, HermesValidationError, HypothesisMessage, ReportMessage
 from .paper import CryptoPaperTrader, LiveExecutionDisabled, PaperTradingConfig, PredictionPaperTrader
-from .dashboard import DashboardData, DashboardServer, create_dashboard_server
+from .node import NodeConfig, ResearchNode
+from .paper_engine import ForwardPaperEngine, PaperEngineCycle, historical_replay_id, run_forward_paper, run_historical_replay
+from .lifecycle import CandidateLifecycle, CandidateLifecycleManager, CandidateStage, PromotionCriteria
+from .mutations import DeterministicMutationEngine, ExperimentBudget, MutationCandidate
+from .research_bus import DurableResearchBus, ResearchBusPermissionError, ResearchQueueItem, ResearchQueueStatus
+from .director import ProposalValidation, compact_report, research_summary, validate_hermes_proposal
 from .research import ResearchReport, run_crypto_research, run_initial_research, run_prediction_research, write_report
 
 __all__ = [
+    "DashboardData",
+    "DashboardServer",
     "AxiomStore",
     "BenchmarkResult",
     "CollectionCycle",
@@ -101,6 +111,7 @@ __all__ = [
     "BayesianBelief",
     "BetaBelief",
     "BinanceAdapter",
+    "CryptoTicker",
     "CryptoOHLCVBacktester",
     "CandidateMessage",
     "CryptoBacktester",
@@ -108,16 +119,32 @@ __all__ = [
     "DataPipeline",
     "IngestionReport",
     "MarketDataPipeline",
-    "CryptoPaperTrader",
-    "CryptoTicker",
-    "DashboardData",
-    "DashboardServer",
+    "EvolutionCandidate",
     "DatasetPartition",
     "DatasetSplit",
     "EvaluationResult",
-    "EvolutionCandidate",
     "EvolutionEngine",
     "EvolutionResult",
+    "CandidateLifecycle",
+    "CandidateLifecycleManager",
+    "CandidateStage",
+    "PromotionCriteria",
+    "DeterministicMutationEngine",
+    "ExperimentBudget",
+    "MutationCandidate",
+    "ForwardPaperEngine",
+    "PaperEngineCycle",
+    "run_forward_paper",
+    "run_historical_replay",
+    "historical_replay_id",
+    "DurableResearchBus",
+    "ResearchBusPermissionError",
+    "ResearchQueueItem",
+    "ResearchQueueStatus",
+    "ProposalValidation",
+    "compact_report",
+    "research_summary",
+    "validate_hermes_proposal",
     "ExperimentRecord",
     "ExperimentTracker",
     "Fill",
@@ -128,6 +155,7 @@ __all__ = [
     "InMemoryCryptoProvider",
     "InMemoryPredictionProvider",
     "InstrumentMetadata",
+    "CryptoPaperTrader",
     "LiveExecutionDisabled",
     "MarketType",
     "BaseRateModel",
@@ -140,8 +168,9 @@ __all__ = [
     "OrderBookSnapshot",
     "OrderRequest",
     "OrderState",
-    "OrderType",
     "PaperTradingConfig",
+    "NodeConfig",
+    "ResearchNode",
     "PolymarketAdapter",
     "Portfolio",
     "Position",

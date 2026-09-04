@@ -7,24 +7,31 @@ objects are reconstructed as canonical domain dataclasses, while arbitrary
 strategy, experiment and report payloads remain plain JSON-compatible values.
 """
 from __future__ import annotations
-
+from contextlib import contextmanager
 import hashlib
 import json
+import math
 import os
-import sqlite3
 import threading
-from contextlib import contextmanager
+import sqlite3
+from itertools import islice
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Sequence
+_MAX_LATEST_SCAN_ROWS = 10_000
+_MAX_EVIDENCE_SCAN_ROWS = 100_000
+_QUEUE_RELEASE_BATCH = 256
+_QUEUE_LINEAGE_LIMIT = 256
+
 
 from .domain import (
     CryptoTicker,
     Fill,
     InstrumentMetadata,
     MarketType,
+    ResearchQuality,
     OHLCVBar,
     OrderBookLevel,
     OrderBookSnapshot,
@@ -216,8 +223,122 @@ class AxiomStore:
                     quality TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS collection_cycles (
+                    cycle_id TEXT PRIMARY KEY,
+                    collector_name TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    ended_at TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_collection_cycles_time
+                    ON collection_cycles(collector_name, started_at);
+                CREATE TABLE IF NOT EXISTS research_queue (
+                    item_id TEXT PRIMARY KEY,
+                    item_type TEXT NOT NULL,
+                    dedupe_key TEXT NOT NULL UNIQUE,
+                    status TEXT NOT NULL,
+                    priority INTEGER NOT NULL DEFAULT 0,
+                    payload_json TEXT NOT NULL,
+                    source TEXT NOT NULL DEFAULT '',
+                    author TEXT NOT NULL DEFAULT '',
+                    lineage_json TEXT NOT NULL DEFAULT '[]',
+                    schema_version TEXT NOT NULL DEFAULT '1',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    available_at TEXT NOT NULL,
+                    lease_until TEXT,
+                    lease_owner TEXT,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT,
+                    result_json TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_research_queue_status
+                    ON research_queue(status, priority DESC, available_at, created_at);
+                CREATE TABLE IF NOT EXISTS research_queue_events (
+                    event_id TEXT PRIMARY KEY,
+                    item_id TEXT NOT NULL,
+                    from_status TEXT,
+                    to_status TEXT NOT NULL,
+                    detail TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_research_queue_events_item
+                    ON research_queue_events(item_id, created_at);
+                CREATE TABLE IF NOT EXISTS candidate_lifecycle (
+                    candidate_id TEXT PRIMARY KEY,
+                    stage TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS candidate_lifecycle_events (
+                    event_id TEXT PRIMARY KEY,
+                    candidate_id TEXT NOT NULL,
+                    from_stage TEXT,
+                    to_stage TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_candidate_lifecycle_events_candidate
+                    ON candidate_lifecycle_events(candidate_id, created_at);
+                CREATE TABLE IF NOT EXISTS paper_state (
+                    experiment_id TEXT PRIMARY KEY,
+                    state_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    state_version INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS paper_observations (
+                    observation_id TEXT PRIMARY KEY,
+                    experiment_id TEXT NOT NULL,
+                    market_id TEXT NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_paper_observations_experiment_time
+                    ON paper_observations(experiment_id, timestamp);
+                CREATE TABLE IF NOT EXISTS opportunity_snapshots (
+                    opportunity_id TEXT PRIMARY KEY,
+                    observed_at TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_opportunity_snapshots_time
+                    ON opportunity_snapshots(observed_at);
+                CREATE TABLE IF NOT EXISTS experiment_budget (
+                    budget_id TEXT PRIMARY KEY,
+                    payload_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS experiment_budget_reservations (
+                    budget_id TEXT NOT NULL,
+                    reservation_key TEXT NOT NULL,
+                    family TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (budget_id, reservation_key)
+                );
+                CREATE TABLE IF NOT EXISTS worker_state (
+                    worker_name TEXT PRIMARY KEY,
+                    status TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    started_at TEXT,
+                    heartbeat_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
                 """
             )
+            queue_columns = {str(row["name"]) for row in self._conn.execute("PRAGMA table_info(research_queue)").fetchall()}
+            if "updated_at" not in queue_columns:
+                self._conn.execute("ALTER TABLE research_queue ADD COLUMN updated_at TEXT")
+                self._conn.execute("UPDATE research_queue SET updated_at=created_at WHERE updated_at IS NULL")
+            if "lease_owner" not in queue_columns:
+                self._conn.execute("ALTER TABLE research_queue ADD COLUMN lease_owner TEXT")
+            if "result_json" not in queue_columns:
+                self._conn.execute("ALTER TABLE research_queue ADD COLUMN result_json TEXT")
+            paper_state_columns = {str(row["name"]) for row in self._conn.execute("PRAGMA table_info(paper_state)").fetchall()}
+            if "state_version" not in paper_state_columns:
+                self._conn.execute("ALTER TABLE paper_state ADD COLUMN state_version INTEGER NOT NULL DEFAULT 0")
             self._migrate_market_tables()
     def _migrate_market_tables(self) -> None:
         """Upgrade pre-versioned market tables without discarding records."""
@@ -449,8 +570,8 @@ class AxiomStore:
             values.append(_iso(end))
         query = "SELECT payload_json FROM bars WHERE " + " AND ".join(clauses) + " ORDER BY timestamp,dataset_id,dataset_version"
         if limit is not None:
-            if limit < 0:
-                raise ValueError("limit must be non-negative")
+            if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+                raise ValueError("limit must be a non-negative integer")
             query += " LIMIT ?"
             values.append(int(limit))
         with self._lock:
@@ -524,8 +645,8 @@ class AxiomStore:
             values.append(str(kind))
         query = "SELECT kind,payload_json FROM snapshots WHERE " + " AND ".join(clauses) + " ORDER BY timestamp,dataset_id,dataset_version"
         if limit is not None:
-            if limit < 0:
-                raise ValueError("limit must be non-negative")
+            if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+                raise ValueError("limit must be a non-negative integer")
             query += " LIMIT ?"
             values.append(int(limit))
         with self._lock:
@@ -560,10 +681,18 @@ class AxiomStore:
         digest = str(metadata_hash or hashlib.sha256(payload_json.encode("utf-8")).hexdigest())
         with self._write_context():
             existing = self._conn.execute(
-                "SELECT 1 FROM polymarket_markets WHERE market_id=? AND metadata_hash=? LIMIT 1",
+                "SELECT payload_json FROM polymarket_markets WHERE market_id=? AND metadata_hash=? LIMIT 1",
                 (identifier, digest),
             ).fetchone()
             if existing is not None:
+                existing_payload = _load(existing["payload_json"])
+                if isinstance(existing_payload, Mapping):
+                    existing_identity = {key: value for key, value in existing_payload.items() if key != "observed_at"}
+                else:
+                    existing_identity = existing_payload
+                current_identity = {key: value for key, value in payload.items() if key != "observed_at"} if isinstance(payload, Mapping) else payload
+                if _dump(existing_identity) != _dump(current_identity):
+                    raise ValueError(f"metadata hash conflicts with stored payload: {identifier}/{digest}")
                 return False
             self._conn.execute(
                 "INSERT INTO polymarket_markets(market_id,observed_at,metadata_hash,payload_json,created_at) VALUES (?,?,?,?,?)",
@@ -592,11 +721,25 @@ class AxiomStore:
         payload_json = _dump(payload)
         quality_value = _enum_value(quality) or "ORDER_BOOK_SIMULATED"
         with self._write_context():
-            cursor = self._conn.execute(
-                "INSERT OR IGNORE INTO polymarket_snapshots(snapshot_id,market_id,source_timestamp,observed_at,payload_json,quality,created_at) VALUES (?,?,?,?,?,?,?)",
+            existing = self._conn.execute(
+                "SELECT market_id,source_timestamp,observed_at,payload_json,quality FROM polymarket_snapshots WHERE snapshot_id=?",
+                (snapshot_key,),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    str(existing["market_id"]) != identifier
+                    or str(existing["source_timestamp"]) != source
+                    or str(existing["observed_at"]) != observed
+                    or str(existing["payload_json"]) != payload_json
+                    or str(existing["quality"]) != quality_value
+                ):
+                    raise ValueError(f"snapshot id conflicts with stored payload: {snapshot_key}")
+                return False
+            self._conn.execute(
+                "INSERT INTO polymarket_snapshots(snapshot_id,market_id,source_timestamp,observed_at,payload_json,quality,created_at) VALUES (?,?,?,?,?,?,?)",
                 (snapshot_key, identifier, source, observed, payload_json, quality_value, _now_iso()),
             )
-        return cursor.rowcount > 0
+        return True
 
     def save_polymarket_trade(
         self,
@@ -631,11 +774,23 @@ class AxiomStore:
         if not key:
             raise ValueError("trade key is required")
         with self._write_context():
-            cursor = self._conn.execute(
-                "INSERT OR IGNORE INTO polymarket_trades(trade_key,market_id,timestamp,payload_json,created_at) VALUES (?,?,?,?,?)",
+            existing = self._conn.execute(
+                "SELECT market_id,timestamp,payload_json FROM polymarket_trades WHERE trade_key=?",
+                (key,),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    str(existing["market_id"]) != identifier
+                    or str(existing["timestamp"]) != _iso(timestamp)
+                    or str(existing["payload_json"]) != payload_json
+                ):
+                    raise ValueError(f"trade key conflicts with stored payload: {key}")
+                return False
+            self._conn.execute(
+                "INSERT INTO polymarket_trades(trade_key,market_id,timestamp,payload_json,created_at) VALUES (?,?,?,?,?)",
                 (key, identifier, _iso(timestamp), payload_json, _now_iso()),
             )
-        return cursor.rowcount > 0
+        return True
 
     def load_polymarket_snapshots(
         self,
@@ -643,6 +798,10 @@ class AxiomStore:
         *,
         start: datetime | None = None,
         end: datetime | None = None,
+        source_start: datetime | None = None,
+        source_end: datetime | None = None,
+        source_after: tuple[datetime, str] | None = None,
+        latest: bool = False,
         limit: int | None = None,
     ) -> list[dict[str, Any]]:
         clauses: list[str] = []
@@ -656,15 +815,76 @@ class AxiomStore:
         if end is not None:
             clauses.append("observed_at<=?")
             values.append(_iso(end))
+        if source_start is not None:
+            clauses.append("source_timestamp>=?")
+            values.append(_iso(source_start))
+        if source_end is not None:
+            clauses.append("source_timestamp<=?")
+            values.append(_iso(source_end))
+        if source_after is not None:
+            if not isinstance(source_after, (tuple, list)) or len(source_after) != 2:
+                raise ValueError("source_after must contain timestamp and snapshot id")
+            after_timestamp, after_snapshot_id = source_after
+            clauses.append("(source_timestamp>? OR (source_timestamp=? AND snapshot_id>?))")
+            values.extend([_iso(after_timestamp), _iso(after_timestamp), str(after_snapshot_id)])
         query = "SELECT snapshot_id,market_id,source_timestamp,observed_at,payload_json,quality FROM polymarket_snapshots"
         if clauses:
             query += " WHERE " + " AND ".join(clauses)
-        query += " ORDER BY observed_at,market_id,source_timestamp"
+        query += (
+            " ORDER BY observed_at DESC,market_id,source_timestamp DESC,snapshot_id DESC"
+            if latest
+            else (
+                " ORDER BY source_timestamp,market_id,snapshot_id"
+                if source_after is not None or source_start is not None or source_end is not None
+                else " ORDER BY observed_at,market_id,source_timestamp,snapshot_id"
+            )
+        )
         if limit is not None:
-            if limit < 0:
-                raise ValueError("limit must be non-negative")
+            if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+                raise ValueError("limit must be a non-negative integer")
             query += " LIMIT ?"
-            values.append(int(limit))
+            values.append(limit)
+        with self._lock:
+            rows = self._conn.execute(query, values).fetchall()
+        return [
+            {
+                "snapshot_id": row["snapshot_id"],
+                "market_id": row["market_id"],
+                "source_timestamp": _parse_datetime(row["source_timestamp"]),
+                "observed_at": _parse_datetime(row["observed_at"]),
+                "payload": _load(row["payload_json"]),
+                "quality": row["quality"],
+            }
+            for row in rows
+        ]
+
+    def load_latest_polymarket_snapshots(
+        self,
+        market_ids: Sequence[str] | None = None,
+        *,
+        limit: int = 1000,
+    ) -> list[dict[str, Any]]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+            raise ValueError("limit must be a non-negative integer")
+        identifiers = tuple(dict.fromkeys(str(item).strip() for item in (market_ids or ()) if str(item).strip()))
+        if market_ids is not None and not identifiers:
+            return []
+        clauses: list[str] = []
+        values: list[Any] = []
+        if identifiers:
+            placeholders = ",".join("?" for _ in identifiers)
+            clauses.append(f"market_id IN ({placeholders})")
+            values.extend(identifiers)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        query = (
+            "SELECT snapshot_id,market_id,source_timestamp,observed_at,payload_json,quality FROM ("
+            "SELECT p.*, ROW_NUMBER() OVER (PARTITION BY market_id "
+            "ORDER BY observed_at DESC,source_timestamp DESC,snapshot_id DESC) AS row_number "
+            "FROM polymarket_snapshots p"
+            f"{where}"
+            ") WHERE row_number=1 ORDER BY market_id LIMIT ?"
+        )
+        values.append(int(limit))
         with self._lock:
             rows = self._conn.execute(query, values).fetchall()
         return [
@@ -712,12 +932,6 @@ class AxiomStore:
                 result.append(payload)
         return result
 
-    def tracked_polymarket_markets(self) -> list[str]:
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT market_id FROM polymarket_markets UNION SELECT market_id FROM polymarket_snapshots ORDER BY market_id"
-            ).fetchall()
-        return [str(row["market_id"]) for row in rows]
 
     def get_collector_state(self, collector_name: str) -> dict[str, Any] | None:
         with self._lock:
@@ -784,12 +998,41 @@ class AxiomStore:
         if start_timestamp is None:
             raise ValueError("frozen forward test start_timestamp is required")
         bankroll = float(spec.get("bankroll", 0.0))
-        if bankroll <= 0:
-            raise ValueError("frozen forward test bankroll must be positive")
-        config_json = _dump(spec.get("config", {}))
+        if not math.isfinite(bankroll) or bankroll <= 0:
+            raise ValueError("frozen forward test bankroll must be finite and positive")
+        config = spec.get("config", {})
+        if not isinstance(config, Mapping):
+            raise ValueError("frozen forward test config must be a mapping")
+        public_config: dict[str, Any] = {}
+        for key, value in config.items():
+            normalized = str(key).replace("-", "_").lower()
+            if normalized in {"live", "live_execution"}:
+                if value is not None and (not isinstance(value, bool) or value):
+                    raise ValueError("frozen forward tests are paper-only")
+                continue
+            if normalized == "execution":
+                if value not in (None, "paper_only"):
+                    raise ValueError("frozen forward tests are paper-only")
+                continue
+            public_config[str(key)] = value
+        try:
+            from .research_bus import _validate_payload
+
+            _validate_payload(public_config)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("frozen forward test config contains forbidden private or execution fields") from exc
+        config_json = _dump(config)
+        try:
+            from .forward import _validate_private_fields
+
+            _validate_private_fields(spec.get("risk_limits", {}), path="risk_limits")
+        except (TypeError, ValueError) as exc:
+            raise ValueError("frozen forward test risk limits contain forbidden private fields") from exc
         allowed_json = _dump(spec.get("allowed_markets", []))
         limits_json = _dump(spec.get("risk_limits", {}))
         quality = _enum_value(spec.get("quality")) or "PAPER_FORWARD"
+        if quality != ResearchQuality.PAPER_FORWARD.value:
+            raise ValueError("frozen forward tests must use PAPER_FORWARD quality")
         values = (
             identifier,
             strategy_hash,
@@ -824,9 +1067,14 @@ class AxiomStore:
             )
         return True
 
-    def load_forward_tests(self) -> list[dict[str, Any]]:
+    def load_forward_tests(self, *, limit: int = 1000) -> list[dict[str, Any]]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+            raise ValueError("limit must be a non-negative integer")
         with self._lock:
-            rows = self._conn.execute("SELECT * FROM forward_tests ORDER BY start_timestamp,experiment_id").fetchall()
+            rows = self._conn.execute(
+                "SELECT * FROM forward_tests ORDER BY start_timestamp,experiment_id LIMIT ?",
+                (int(limit),),
+            ).fetchall()
         return [
             {
                 "experiment_id": row["experiment_id"],
@@ -842,6 +1090,152 @@ class AxiomStore:
             }
             for row in rows
         ]
+    def load_forward_test(self, experiment_id: str) -> dict[str, Any] | None:
+        identifier = str(experiment_id).strip()
+        if not identifier:
+            raise ValueError("experiment_id is required")
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM forward_tests WHERE experiment_id=? LIMIT 1",
+                (identifier,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "experiment_id": row["experiment_id"],
+            "strategy_hash": row["strategy_hash"],
+            "model_hash": row["model_hash"],
+            "config": _load(row["config_json"]),
+            "start_timestamp": _parse_datetime(row["start_timestamp"]),
+            "bankroll": float(row["bankroll"]),
+            "allowed_markets": _load(row["allowed_markets_json"]),
+            "risk_limits": _load(row["risk_limits_json"]),
+            "quality": row["quality"],
+            "created_at": _parse_datetime(row["created_at"]),
+        }
+
+    def polymarket_evidence_maturity(self, *, now: datetime | None = None) -> dict[str, Any]:
+        """Report research-evidence maturity separately from collector health."""
+        current = ensure_utc(now or utc_now())
+        cutoff = current.isoformat()
+        with self._lock:
+            market_row = self._conn.execute(
+                "WITH market_ids AS ("
+                "SELECT market_id FROM polymarket_markets "
+                "WHERE rowid > COALESCE((SELECT MAX(rowid)-? FROM polymarket_markets),0) AND observed_at <= ? "
+                "UNION SELECT market_id FROM polymarket_snapshots "
+                "WHERE rowid > COALESCE((SELECT MAX(rowid)-? FROM polymarket_snapshots),0) AND observed_at <= ?"
+                ") SELECT COUNT(*) AS market_count FROM market_ids",
+                (_MAX_EVIDENCE_SCAN_ROWS, cutoff, _MAX_EVIDENCE_SCAN_ROWS, cutoff),
+            ).fetchone()
+            snapshot_row = self._conn.execute(
+                "SELECT COUNT(*) AS snapshot_count, "
+                "COUNT(DISTINCT market_id) AS snapshot_markets, "
+                "SUM(CASE WHEN quality = 'ORDER_BOOK_SIMULATED' THEN 1 ELSE 0 END) AS book_snapshots, "
+                "SUM(CASE WHEN json_valid(payload_json) THEN "
+                "  CASE WHEN json_extract(payload_json, '$.metadata_available') = 1 THEN 1 ELSE 0 END "
+                " ELSE 0 END) AS metadata_complete, "
+                "SUM(CASE WHEN json_valid(payload_json) THEN "
+                "  CASE WHEN json_extract(payload_json, '$.time_to_resolution_seconds') IS NOT NULL THEN 1 ELSE 0 END "
+                " ELSE 0 END) AS time_to_resolution, "
+                "COUNT(DISTINCT CASE WHEN json_valid(payload_json) THEN "
+                "  CASE WHEN lower(CAST(json_extract(payload_json, '$.settlement') AS TEXT)) "
+                "       IN ('resolved_yes', 'resolved_no', 'void') THEN market_id ELSE NULL END "
+                " ELSE NULL END) AS resolved_markets, "
+                "MIN(observed_at) AS first_observed_at, MAX(observed_at) AS latest_observed_at "
+                "FROM polymarket_snapshots "
+                "WHERE rowid > COALESCE((SELECT MAX(rowid)-? FROM polymarket_snapshots),0) AND observed_at <= ?",
+                (_MAX_EVIDENCE_SCAN_ROWS, cutoff),
+            ).fetchone()
+            regime_row = self._conn.execute(
+                "SELECT COUNT(*) AS regime_count FROM ("
+                "SELECT DISTINCT CASE WHEN json_valid(payload_json) THEN "
+                "  CASE "
+                "    WHEN NULLIF(TRIM(CAST(json_extract(payload_json, '$.regime') AS TEXT)), '') IS NOT NULL "
+                "      THEN TRIM(CAST(json_extract(payload_json, '$.regime') AS TEXT)) "
+                "    WHEN NULLIF(TRIM(CAST(json_extract(payload_json, '$.snapshot.regime') AS TEXT)), '') IS NOT NULL "
+                "      THEN TRIM(CAST(json_extract(payload_json, '$.snapshot.regime') AS TEXT)) "
+                "    ELSE NULL "
+                "  END "
+                " ELSE NULL END AS regime "
+                "FROM polymarket_snapshots "
+                "WHERE rowid > COALESCE((SELECT MAX(rowid)-? FROM polymarket_snapshots),0) AND observed_at <= ?"
+                ") WHERE regime IS NOT NULL",
+                (_MAX_EVIDENCE_SCAN_ROWS, cutoff),
+            ).fetchone()
+            trade_row = self._conn.execute(
+                "WITH market_ids AS ("
+                "SELECT market_id FROM polymarket_markets "
+                "WHERE rowid > COALESCE((SELECT MAX(rowid)-? FROM polymarket_markets),0) AND observed_at <= ? "
+                "UNION SELECT market_id FROM polymarket_snapshots "
+                "WHERE rowid > COALESCE((SELECT MAX(rowid)-? FROM polymarket_snapshots),0) AND observed_at <= ?"
+                ") SELECT COUNT(DISTINCT trades.market_id) AS trade_markets "
+                "FROM polymarket_trades AS trades "
+                "JOIN market_ids ON market_ids.market_id = trades.market_id "
+                "WHERE trades.rowid > COALESCE((SELECT MAX(rowid)-? FROM polymarket_trades),0) AND trades.timestamp <= ?",
+                (_MAX_EVIDENCE_SCAN_ROWS, cutoff, _MAX_EVIDENCE_SCAN_ROWS, cutoff, _MAX_EVIDENCE_SCAN_ROWS, cutoff),
+            ).fetchone()
+        market_count = int((market_row["market_count"] if market_row else 0) or 0)
+        snapshot_count = int((snapshot_row["snapshot_count"] if snapshot_row else 0) or 0)
+        snapshot_markets = int((snapshot_row["snapshot_markets"] if snapshot_row else 0) or 0)
+        book_snapshots = int((snapshot_row["book_snapshots"] if snapshot_row else 0) or 0)
+        metadata_complete = int((snapshot_row["metadata_complete"] if snapshot_row else 0) or 0)
+        time_to_resolution = int((snapshot_row["time_to_resolution"] if snapshot_row else 0) or 0)
+        resolved_markets = int((snapshot_row["resolved_markets"] if snapshot_row else 0) or 0)
+        trade_markets = int((trade_row["trade_markets"] if trade_row else 0) or 0)
+        regime_count = int((regime_row["regime_count"] if regime_row else 0) or 0)
+        first_observed = _parse_datetime(snapshot_row["first_observed_at"]) if snapshot_row else None
+        latest_observed = _parse_datetime(snapshot_row["latest_observed_at"]) if snapshot_row else None
+        duration_seconds = max(0.0, (latest_observed - first_observed).total_seconds()) if first_observed and latest_observed else 0.0
+        requirements = {
+            "independent_markets": 20,
+            "snapshots": 100,
+            "observation_days": 7.0,
+            "resolved_markets": 10,
+            "order_book_coverage": 0.8,
+            "metadata_completeness": 0.9,
+            "trade_coverage": 0.2,
+            "regime_count": 3,
+            "time_to_resolution_observations": 50,
+        }
+        checks = {
+            "independent_markets": market_count >= requirements["independent_markets"],
+            "snapshots": snapshot_count >= requirements["snapshots"],
+            "observation_days": duration_seconds / 86400.0 >= requirements["observation_days"],
+            "resolved_markets": resolved_markets >= requirements["resolved_markets"],
+            "order_book_coverage": book_snapshots / snapshot_count >= requirements["order_book_coverage"] if snapshot_count else False,
+            "metadata_completeness": metadata_complete / snapshot_count >= requirements["metadata_completeness"] if snapshot_count else False,
+            "trade_coverage": trade_markets / market_count >= requirements["trade_coverage"] if market_count else False,
+            "regime_count": regime_count >= requirements["regime_count"],
+            "time_to_resolution_observations": time_to_resolution >= requirements["time_to_resolution_observations"],
+        }
+        passed = sum(bool(value) for value in checks.values())
+        grade = "A" if passed == len(checks) else "B" if passed >= 6 else "C" if passed >= 4 else "D" if passed else "F"
+        return {
+            "grade": grade,
+            "grade_scope": "research_evidence_maturity",
+            "independent_markets": market_count,
+            "markets_with_snapshots": snapshot_markets,
+            "snapshots": snapshot_count,
+            "resolved_markets": resolved_markets,
+            "order_book_snapshots": book_snapshots,
+            "order_book_coverage": book_snapshots / snapshot_count if snapshot_count else 0.0,
+            "trade_markets": trade_markets,
+            "trade_coverage": trade_markets / market_count if market_count else 0.0,
+            "metadata_complete_snapshots": metadata_complete,
+            "regime_count": regime_count,
+            "time_to_resolution_observations": time_to_resolution,
+            "observation_duration_seconds": duration_seconds,
+            "latest_observed_at": latest_observed.isoformat() if latest_observed else None,
+            "as_of": current.isoformat(),
+            "scan_limits": {
+                "market_rows": _MAX_EVIDENCE_SCAN_ROWS,
+                "snapshot_rows": _MAX_EVIDENCE_SCAN_ROWS,
+                "trade_rows": _MAX_EVIDENCE_SCAN_ROWS,
+            },
+            "requirements": requirements,
+            "checks": checks,
+        }
 
     def polymarket_health(
         self,
@@ -851,75 +1245,136 @@ class AxiomStore:
         now: datetime | None = None,
     ) -> dict[str, Any]:
         expected = float(expected_interval_seconds)
-        if not expected > 0:
-            raise ValueError("expected_interval_seconds must be positive")
+        if not math.isfinite(expected) or expected <= 0:
+            raise ValueError("expected_interval_seconds must be finite and positive")
         stale_after = float(stale_after_seconds if stale_after_seconds is not None else expected * 3.0)
-        if stale_after <= 0:
-            raise ValueError("stale_after_seconds must be positive")
+        if not math.isfinite(stale_after) or stale_after <= 0:
+            raise ValueError("stale_after_seconds must be finite and positive")
         current = ensure_utc(now or utc_now())
         with self._lock:
-            snapshot_rows = self._conn.execute(
-                "SELECT market_id,observed_at,payload_json FROM polymarket_snapshots ORDER BY market_id,observed_at"
+            current_iso = current.isoformat()
+            snapshot_count = int(
+                self._conn.execute(
+                    "SELECT COUNT(*) AS n FROM polymarket_snapshots "
+                    "WHERE rowid > COALESCE((SELECT MAX(rowid)-? FROM polymarket_snapshots),0) AND observed_at<=?",
+                    (_MAX_LATEST_SCAN_ROWS, current_iso),
+                ).fetchone()["n"]
+            )
+            latest_rows = self._conn.execute(
+                "SELECT market_id,observed_at,payload_json FROM ("
+                "SELECT market_id,observed_at,payload_json,"
+                "ROW_NUMBER() OVER (PARTITION BY market_id ORDER BY observed_at DESC,source_timestamp DESC,snapshot_id DESC) AS row_number "
+                "FROM polymarket_snapshots "
+                "WHERE rowid > COALESCE((SELECT MAX(rowid)-? FROM polymarket_snapshots),0) AND observed_at<=?) WHERE row_number=1",
+                (_MAX_LATEST_SCAN_ROWS, current_iso),
+            ).fetchall()
+            gap_count = int(
+                self._conn.execute(
+                    "SELECT COUNT(*) AS n FROM ("
+                    "SELECT market_id,observed_at,"
+                    "LAG(observed_at) OVER (PARTITION BY market_id ORDER BY observed_at,source_timestamp,snapshot_id) AS previous_observed_at "
+                    "FROM polymarket_snapshots "
+                    "WHERE rowid > COALESCE((SELECT MAX(rowid)-? FROM polymarket_snapshots),0) AND observed_at<=?) "
+                    "WHERE previous_observed_at IS NOT NULL "
+                    "AND (julianday(observed_at)-julianday(previous_observed_at))*86400.0>?",
+                    (_MAX_LATEST_SCAN_ROWS, current_iso, expected * 1.5),
+                ).fetchone()["n"]
+            )
+            gap_rows = self._conn.execute(
+                "SELECT market_id,previous_observed_at,observed_at FROM ("
+                "SELECT market_id,observed_at,"
+                "LAG(observed_at) OVER (PARTITION BY market_id ORDER BY observed_at,source_timestamp,snapshot_id) AS previous_observed_at "
+                "FROM polymarket_snapshots "
+                "WHERE rowid > COALESCE((SELECT MAX(rowid)-? FROM polymarket_snapshots),0) AND observed_at<=?) "
+                "WHERE previous_observed_at IS NOT NULL "
+                "AND (julianday(observed_at)-julianday(previous_observed_at))*86400.0>? "
+                "ORDER BY observed_at DESC,market_id LIMIT 64",
+                (_MAX_LATEST_SCAN_ROWS, current_iso, expected * 1.5),
             ).fetchall()
             market_count = int(
                 self._conn.execute(
-                    "SELECT COUNT(*) AS n FROM (SELECT market_id FROM polymarket_markets UNION SELECT market_id FROM polymarket_snapshots)"
+                    "SELECT COUNT(*) AS n FROM ("
+                    "SELECT market_id FROM polymarket_markets "
+                    "WHERE rowid > COALESCE((SELECT MAX(rowid)-? FROM polymarket_markets),0) AND observed_at<=? "
+                    "UNION SELECT market_id FROM polymarket_snapshots "
+                    "WHERE rowid > COALESCE((SELECT MAX(rowid)-? FROM polymarket_snapshots),0) AND observed_at<=?)",
+                    (_MAX_LATEST_SCAN_ROWS, current_iso, _MAX_LATEST_SCAN_ROWS, current_iso),
                 ).fetchone()["n"]
             )
-            trade_count = int(self._conn.execute("SELECT COUNT(*) AS n FROM polymarket_trades").fetchone()["n"])
-            metadata_count = int(self._conn.execute("SELECT COUNT(*) AS n FROM polymarket_markets").fetchone()["n"])
-            error_count = int(self._conn.execute("SELECT COUNT(*) AS n FROM collection_errors").fetchone()["n"])
+            trade_count = int(
+                self._conn.execute(
+                    "SELECT COUNT(*) AS n FROM polymarket_trades "
+                    "WHERE rowid > COALESCE((SELECT MAX(rowid)-? FROM polymarket_trades),0) AND timestamp<=?",
+                    (_MAX_LATEST_SCAN_ROWS, current_iso),
+                ).fetchone()["n"]
+            )
+            metadata_count = int(
+                self._conn.execute(
+                    "SELECT COUNT(*) AS n FROM polymarket_markets "
+                    "WHERE rowid > COALESCE((SELECT MAX(rowid)-? FROM polymarket_markets),0) AND observed_at<=?",
+                    (_MAX_LATEST_SCAN_ROWS, current_iso),
+                ).fetchone()["n"]
+            )
+            error_count = int(
+                self._conn.execute(
+                    "SELECT COUNT(*) AS n FROM collection_errors "
+                    "WHERE rowid > COALESCE((SELECT MAX(rowid)-? FROM collection_errors),0) AND observed_at<=?",
+                    (_MAX_LATEST_SCAN_ROWS, current_iso),
+                ).fetchone()["n"]
+            )
             malformed_count = int(
                 self._conn.execute(
-                    "SELECT COUNT(*) AS n FROM collection_errors WHERE lower(kind) LIKE '%malform%' OR lower(kind) LIKE '%parse%'"
+                    "SELECT COUNT(*) AS n FROM collection_errors "
+                    "WHERE rowid > COALESCE((SELECT MAX(rowid)-? FROM collection_errors),0) AND observed_at<=? "
+                    "AND (lower(kind) LIKE '%malform%' OR lower(kind) LIKE '%parse%')",
+                    (_MAX_LATEST_SCAN_ROWS, current_iso),
                 ).fetchone()["n"]
             )
-        observations: dict[str, list[datetime]] = {}
         latest_payload: dict[str, Mapping[str, Any]] = {}
-        for row in snapshot_rows:
+        latest_by_market: dict[str, datetime] = {}
+        for row in latest_rows:
             timestamp = _parse_datetime(row["observed_at"])
             if timestamp is None:
                 continue
             market = str(row["market_id"])
-            observations.setdefault(market, []).append(timestamp)
-            latest_payload[market] = _load(row["payload_json"])
+            latest_by_market[market] = timestamp
+            payload = _load(row["payload_json"])
+            latest_payload[market] = payload if isinstance(payload, Mapping) else {}
         gaps: list[dict[str, Any]] = []
-        latest_by_market: dict[str, datetime] = {}
-        for market, stamps in observations.items():
-            stamps.sort()
-            latest_by_market[market] = stamps[-1]
-            for previous, current_stamp in zip(stamps, stamps[1:]):
-                gap_seconds = (current_stamp - previous).total_seconds()
-                if gap_seconds > expected * 1.5:
-                    missing = max(1, int(round(gap_seconds / expected)) - 1)
-                    gaps.append(
-                        {
-                            "market_id": market,
-                            "from": previous.isoformat(),
-                            "to": current_stamp.isoformat(),
-                            "seconds": gap_seconds,
-                            "missing_intervals": missing,
-                        }
-                    )
+        for row in gap_rows:
+            previous = _parse_datetime(row["previous_observed_at"])
+            current_stamp = _parse_datetime(row["observed_at"])
+            if previous is None or current_stamp is None:
+                continue
+            gap_seconds = (current_stamp - previous).total_seconds()
+            missing = max(1, int(round(gap_seconds / expected)) - 1)
+            gaps.append(
+                {
+                    "market_id": str(row["market_id"]),
+                    "from": previous.isoformat(),
+                    "to": current_stamp.isoformat(),
+                    "seconds": gap_seconds,
+                    "missing_intervals": missing,
+                }
+            )
         stale_markets = sorted(
             market for market, stamp in latest_by_market.items() if (current - stamp).total_seconds() > stale_after
         )
         resolved_markets = 0
         for payload in latest_payload.values():
             snapshot = payload.get("snapshot") if isinstance(payload, Mapping) else None
-            settlement = snapshot.get("settlement") if isinstance(snapshot, Mapping) else None
-            if str(settlement) in {
+            settlement = str(snapshot.get("settlement", "")).strip().lower() if isinstance(snapshot, Mapping) else ""
+            if settlement in {
                 SettlementState.RESOLVED_YES.value,
                 SettlementState.RESOLVED_NO.value,
                 SettlementState.VOID.value,
             }:
                 resolved_markets += 1
-        snapshot_count = len(snapshot_rows)
         if snapshot_count == 0:
             grade = "F"
-        elif malformed_count or (observations and len(stale_markets) / max(1, len(observations)) > 0.5):
+        elif malformed_count or (latest_by_market and len(stale_markets) / max(1, len(latest_by_market)) > 0.5):
             grade = "D"
-        elif stale_markets or gaps:
+        elif stale_markets or gap_count:
             grade = "C"
         elif error_count:
             grade = "B"
@@ -929,8 +1384,22 @@ class AxiomStore:
         latest = max(latest_by_market.values(), default=None)
         return {
             "grade": grade,
+            "grade_scope": "collector_health",
+            "collector_health": {
+                "grade": grade,
+                "markets": market_count,
+                "markets_with_snapshots": len(latest_by_market),
+                "snapshots": snapshot_count,
+                "trades": trade_count,
+                "collection_errors": error_count,
+                "malformed_records": malformed_count,
+                "stale_markets": stale_markets,
+                "gaps": gaps,
+                "gap_count": gap_count,
+                "latest_observed_at": latest.isoformat() if latest else None,
+            },
             "markets": market_count,
-            "markets_with_snapshots": len(observations),
+            "markets_with_snapshots": len(latest_by_market),
             "resolved_markets": resolved_markets,
             "snapshots": snapshot_count,
             "trades": trade_count,
@@ -939,10 +1408,16 @@ class AxiomStore:
             "malformed_records": malformed_count,
             "stale_markets": stale_markets,
             "gaps": gaps,
+            "gap_count": gap_count,
             "latest_observed_at": latest.isoformat() if latest else None,
             "expected_interval_seconds": expected,
             "stale_after_seconds": stale_after,
             "storage_bytes": storage_bytes,
+            "scan_limits": {
+                "latest_rows": _MAX_LATEST_SCAN_ROWS,
+                "gap_sample": 64,
+            },
+            "evidence_maturity": self.polymarket_evidence_maturity(now=current),
         }
 
     # Strategy and experiment artifacts -------------------------------
@@ -999,13 +1474,18 @@ class AxiomStore:
             row = self._conn.execute("SELECT payload_json FROM experiments WHERE experiment_id=?", (str(experiment_id),)).fetchone()
         return _load(row["payload_json"]) if row else None
 
-    def list_experiments(self, strategy_id: str | None = None) -> list[dict[str, Any]]:
+    def list_experiments(self, strategy_id: str | None = None, *, limit: int | None = None) -> list[dict[str, Any]]:
+        if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 0):
+            raise ValueError("limit must be a non-negative integer or None")
         query = "SELECT experiment_id,strategy_id,payload_json,created_at FROM experiments"
-        values: tuple[Any, ...] = ()
+        values: list[Any] = []
         if strategy_id is not None:
             query += " WHERE strategy_id=?"
-            values = (str(strategy_id),)
+            values.append(str(strategy_id))
         query += " ORDER BY created_at,experiment_id"
+        if limit is not None:
+            query += " LIMIT ?"
+            values.append(int(limit))
         with self._lock:
             rows = self._conn.execute(query, values).fetchall()
         return [
@@ -1026,6 +1506,49 @@ class AxiomStore:
         except sqlite3.IntegrityError as exc:
             raise ValueError(f"fill already exists: {identifier}") from exc
         return identifier
+    def save_paper_execution(
+        self,
+        observation_id: str,
+        experiment_id: str,
+        market_id: str,
+        timestamp: datetime,
+        payload: Any,
+        fill: Fill,
+        *,
+        fill_id: str | None = None,
+    ) -> bool:
+        """Atomically persist one paper fill and its observation claim."""
+        identifier = str(fill_id or ("fill-" + hashlib.sha256(_dump(fill).encode("utf-8")).hexdigest()))
+        with self.transaction():
+            if not self.save_paper_observation(observation_id, experiment_id, market_id, timestamp, payload):
+                existing_fill = self.load_fill(identifier)
+                if existing_fill is not None and existing_fill != fill:
+                    raise ValueError(f"fill already exists with different payload: {identifier}")
+                return False
+            existing_fill = self.load_fill(identifier)
+            if existing_fill is None:
+                self.save_fill(fill, fill_id=identifier)
+            elif existing_fill != fill:
+                raise ValueError(f"fill already exists with different payload: {identifier}")
+        return True
+    def paper_history_counts(self, experiment_id: str) -> dict[str, int]:
+        identifier = str(experiment_id).strip()
+        if not identifier:
+            raise ValueError("experiment_id is required")
+        with self._lock:
+            observations = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM paper_observations WHERE experiment_id=?",
+                (identifier,),
+            ).fetchone()
+            fills = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM fills WHERE fill_id LIKE ? OR fill_id LIKE ?",
+                (identifier + "-%", "paper-fill-" + identifier + "-%"),
+            ).fetchone()
+        return {
+            "observations": int(observations["n"]),
+            "fills": int(fills["n"]),
+        }
+
 
     def load_fill(self, fill_id: str) -> Fill | None:
         with self._lock:
@@ -1076,13 +1599,24 @@ class AxiomStore:
             row = self._conn.execute("SELECT payload_json FROM reports WHERE report_id=?", (str(report_id),)).fetchone()
         return _load(row["payload_json"]) if row else None
 
-    def list_reports(self, experiment_id: str | None = None) -> list[dict[str, Any]]:
+    def list_reports(
+        self,
+        experiment_id: str | None = None,
+        *,
+        limit: int | None = None,
+        newest_first: bool = False,
+    ) -> list[dict[str, Any]]:
+        if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 0):
+            raise ValueError("limit must be a non-negative integer or None")
         query = "SELECT report_id,experiment_id,payload_json,created_at FROM reports"
-        values: tuple[Any, ...] = ()
+        values: list[Any] = []
         if experiment_id is not None:
             query += " WHERE experiment_id=?"
-            values = (str(experiment_id),)
-        query += " ORDER BY created_at,report_id"
+            values.append(str(experiment_id))
+        query += " ORDER BY created_at " + ("DESC" if newest_first else "ASC") + ",report_id " + ("DESC" if newest_first else "ASC")
+        if limit is not None:
+            query += " LIMIT ?"
+            values.append(int(limit))
         with self._lock:
             rows = self._conn.execute(query, values).fetchall()
         return [
@@ -1090,6 +1624,977 @@ class AxiomStore:
             for row in rows
         ]
 
+    # Durable operations ------------------------------------------------
+    def save_report_if_absent(self, report_id: str, report: Any, *, experiment_id: str | None = None) -> bool:
+        """Insert a report atomically and return whether this call inserted it."""
+        identifier = str(report_id)
+        payload = _dump(report)
+        with self._write_context():
+            cursor = self._conn.execute(
+                "INSERT OR IGNORE INTO reports(report_id,experiment_id,payload_json,created_at) VALUES (?,?,?,?)",
+                (identifier, experiment_id, payload, _now_iso()),
+            )
+        if cursor.rowcount:
+            return True
+        with self._lock:
+            row = self._conn.execute("SELECT payload_json FROM reports WHERE report_id=?", (identifier,)).fetchone()
+        equivalent = False
+        if row is not None and row["payload_json"] != payload:
+            equivalent = _report_payload_equivalent(_load(row["payload_json"]), report)
+        if row is None or (row["payload_json"] != payload and not equivalent):
+            raise ValueError(f"report already exists with different payload: {identifier}")
+        return False
+
+    def save_collection_cycle(
+        self,
+        cycle_id: str,
+        collector_name: str,
+        payload: Any,
+        *,
+        started_at: datetime,
+        ended_at: datetime | None = None,
+    ) -> bool:
+        started = _iso(started_at)
+        ended = _iso(ended_at or started_at)
+        payload_json = _dump(payload)
+        identifier = str(cycle_id)
+        with self._write_context():
+            cursor = self._conn.execute(
+                "INSERT OR IGNORE INTO collection_cycles(cycle_id,collector_name,started_at,ended_at,payload_json,created_at) "
+                "VALUES (?,?,?,?,?,?)",
+                (identifier, str(collector_name), started, ended, payload_json, _now_iso()),
+            )
+            if cursor.rowcount:
+                return True
+            existing = self._conn.execute(
+                "SELECT collector_name,started_at,ended_at,payload_json FROM collection_cycles WHERE cycle_id=?",
+                (identifier,),
+            ).fetchone()
+        if existing is None:
+            raise RuntimeError(f"collection cycle disappeared during duplicate check: {identifier}")
+        if (
+            str(existing["collector_name"]) != str(collector_name)
+            or str(existing["started_at"]) != started
+            or str(existing["ended_at"]) != ended
+            or str(existing["payload_json"]) != payload_json
+        ):
+            raise ValueError(f"collection cycle already exists with different payload: {identifier}")
+        return False
+
+    def list_collection_cycles(self, *, collector_name: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+            raise ValueError("limit must be a non-negative integer")
+        query = "SELECT * FROM collection_cycles"
+        values: list[Any] = []
+        if collector_name is not None:
+            query += " WHERE collector_name=?"
+            values.append(str(collector_name))
+        query += " ORDER BY started_at DESC,cycle_id DESC LIMIT ?"
+        values.append(int(limit))
+        with self._lock:
+            rows = self._conn.execute(query, values).fetchall()
+        return [
+            {
+                "cycle_id": row["cycle_id"],
+                "collector_name": row["collector_name"],
+                "started_at": _parse_datetime(row["started_at"]),
+                "ended_at": _parse_datetime(row["ended_at"]),
+                "payload": _load(row["payload_json"]),
+                "created_at": _parse_datetime(row["created_at"]),
+            }
+            for row in rows
+        ]
+
+    def enqueue_research_item(
+        self,
+        item_type: str,
+        payload: Any,
+        *,
+        dedupe_key: str | None = None,
+        source: str = "",
+        author: str = "",
+        lineage: Iterable[Any] = (),
+        schema_version: str = "1",
+        priority: int = 0,
+        available_at: datetime | None = None,
+        item_id: str | None = None,
+    ) -> dict[str, Any]:
+        item_type = str(item_type).strip()
+        if not item_type:
+            raise ValueError("item_type is required")
+        if isinstance(priority, bool) or not isinstance(priority, int):
+            raise ValueError("priority must be an integer")
+        schema_version = str(schema_version).strip()
+        if not schema_version:
+            raise ValueError("schema_version is required")
+        lineage_value = list(islice(iter(lineage), _QUEUE_LINEAGE_LIMIT + 1))
+        if len(lineage_value) > _QUEUE_LINEAGE_LIMIT:
+            raise ValueError(f"research lineage exceeds {_QUEUE_LINEAGE_LIMIT} entries")
+        payload_json = _dump(payload)
+        if dedupe_key is None:
+            dedupe_key = hashlib.sha256(
+                _dump({"item_type": item_type, "payload": payload, "source": source, "lineage": lineage_value}).encode("utf-8")
+            ).hexdigest()
+        dedupe_key = str(dedupe_key).strip()
+        if not dedupe_key:
+            raise ValueError("dedupe_key is required")
+        identifier = str(item_id or ("queue-" + hashlib.sha256(dedupe_key.encode("utf-8")).hexdigest())).strip()
+        if not identifier:
+            raise ValueError("item_id is required")
+        now = _now_iso()
+        available = _iso(available_at or utc_now())
+        with self._write_context():
+            self._conn.execute(
+                "INSERT OR IGNORE INTO research_queue(item_id,item_type,dedupe_key,status,priority,payload_json,source,author,"
+                "lineage_json,schema_version,created_at,updated_at,available_at,lease_until,attempts,last_error) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    identifier,
+                    item_type,
+                    dedupe_key,
+                    "PENDING",
+                    int(priority),
+                    payload_json,
+                    str(source),
+                    str(author),
+                    _dump(lineage_value),
+                    str(schema_version),
+                    now,
+                    now,
+                    available,
+                    None,
+                    0,
+                    None,
+                ),
+            )
+            row = self._conn.execute("SELECT * FROM research_queue WHERE dedupe_key=?", (dedupe_key,)).fetchone()
+            if row is not None:
+                if (
+                    str(row["item_type"]) != item_type
+                    or str(row["payload_json"]) != payload_json
+                    or str(row["source"]) != str(source)
+                    or str(row["author"]) != str(author)
+                    or str(row["lineage_json"]) != _dump(lineage_value)
+                ):
+                    raise ValueError(f"research queue dedupe conflict: {dedupe_key}")
+        if row is None:
+            raise RuntimeError("research queue insert did not produce a row")
+        return _research_queue_record(row)
+
+    def get_research_item(self, item_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute("SELECT * FROM research_queue WHERE item_id=?", (str(item_id),)).fetchone()
+        return _research_queue_record(row) if row else None
+
+    def claim_research_item(
+        self,
+        worker: str,
+        *,
+        now: datetime | None = None,
+        lease_seconds: float = 300.0,
+    ) -> dict[str, Any] | None:
+        if not str(worker).strip():
+            raise ValueError("worker is required")
+        lease_value = float(lease_seconds)
+        if not math.isfinite(lease_value) or lease_value <= 0:
+            raise ValueError("lease_seconds must be finite and positive")
+        current = ensure_utc(now or utc_now())
+        current_iso = current.isoformat()
+        lease_iso = current.timestamp() + lease_value
+        lease_time = datetime.fromtimestamp(lease_iso, tz=timezone.utc).isoformat()
+        self.release_expired_research_items(now=current)
+        with self._write_context():
+            row = self._conn.execute(
+                "SELECT * FROM research_queue WHERE status='PENDING' AND available_at<=? "
+                "ORDER BY CASE WHEN (julianday(?) - julianday(created_at))*86400.0 >= 300 THEN 1 ELSE 0 END DESC,"
+                "priority DESC,created_at,item_id LIMIT 1",
+                (current_iso, current_iso),
+            ).fetchone()
+            if row is None:
+                return None
+            previous = str(row["status"])
+            updated = self._conn.execute(
+                "UPDATE research_queue SET status='TESTING',lease_until=?,lease_owner=?,attempts=attempts+1,updated_at=? "
+                "WHERE item_id=? AND status='PENDING'",
+                (lease_time, str(worker), current_iso, row["item_id"]),
+            )
+            if updated.rowcount != 1:
+                return None
+            event_id = "queue-event-" + hashlib.sha256(
+                _dump({"item_id": row["item_id"], "from": previous, "to": "TESTING", "at": current_iso, "worker": worker}).encode("utf-8")
+            ).hexdigest()
+            self._conn.execute(
+                "INSERT OR IGNORE INTO research_queue_events(event_id,item_id,from_status,to_status,detail,created_at) "
+                "VALUES (?,?,?,?,?,?)",
+                (event_id, row["item_id"], previous, "TESTING", _dump({"worker": str(worker)}), current_iso),
+            )
+            claimed = self._conn.execute("SELECT * FROM research_queue WHERE item_id=?", (row["item_id"],)).fetchone()
+        return _research_queue_record(claimed) if claimed else None
+
+    def complete_research_item(
+        self,
+        item_id: str,
+        status: str,
+        *,
+        result: Any | None = None,
+        error: str | None = None,
+        now: datetime | None = None,
+        worker: str | None = None,
+    ) -> dict[str, Any]:
+        normalized = str(status).upper()
+        allowed = {"ACCEPTED", "REJECTED", "COMPLETED", "FAILED", "PENDING"}
+        if normalized not in allowed:
+            raise ValueError(f"unsupported research queue status: {status}")
+        current = ensure_utc(now or utc_now())
+        current_iso = current.isoformat()
+        with self._write_context():
+            row = self._conn.execute("SELECT * FROM research_queue WHERE item_id=?", (str(item_id),)).fetchone()
+            if row is None:
+                raise KeyError(item_id)
+            previous = str(row["status"])
+            if previous != "TESTING":
+                raise RuntimeError(f"queue item is not leased: {item_id}")
+            owner = str(row["lease_owner"] or "")
+            if not worker or str(worker) != owner:
+                raise PermissionError("queue lease owner mismatch")
+            lease_until = _parse_datetime(row["lease_until"])
+            if lease_until is None or lease_until <= current:
+                raise RuntimeError("queue lease expired")
+            result_json = row["result_json"] if result is None else _dump(result)
+            updated_cursor = self._conn.execute(
+                "UPDATE research_queue SET status=?,updated_at=?,lease_until=NULL,lease_owner=NULL,last_error=?,result_json=? "
+                "WHERE item_id=? AND status='TESTING' AND lease_owner=? AND lease_until>?",
+                (normalized, current_iso, error, result_json, str(item_id), owner, current_iso),
+            )
+            if updated_cursor.rowcount != 1:
+                raise RuntimeError("queue lease lost before completion")
+            event_id = "queue-event-" + hashlib.sha256(
+                _dump({"item_id": item_id, "from": previous, "to": normalized, "at": current_iso, "worker": worker}).encode("utf-8")
+            ).hexdigest()
+            self._conn.execute(
+                "INSERT OR IGNORE INTO research_queue_events(event_id,item_id,from_status,to_status,detail,created_at) VALUES (?,?,?,?,?,?)",
+                (event_id, str(item_id), previous, normalized, _dump({"error": error, "worker": worker}), current_iso),
+            )
+            updated = self._conn.execute("SELECT * FROM research_queue WHERE item_id=?", (str(item_id),)).fetchone()
+        return _research_queue_record(updated)
+
+    def release_expired_research_items(self, *, now: datetime | None = None) -> int:
+        current = ensure_utc(now or utc_now())
+        current_iso = current.isoformat()
+        released = 0
+        with self._write_context():
+            while True:
+                rows = self._conn.execute(
+                    "SELECT item_id FROM research_queue WHERE status='TESTING' "
+                    "AND lease_until IS NOT NULL AND lease_until<=? LIMIT ?",
+                    (current_iso, _QUEUE_RELEASE_BATCH),
+                ).fetchall()
+                if not rows:
+                    break
+                for row in rows:
+                    updated = self._conn.execute(
+                        "UPDATE research_queue SET status='PENDING',lease_until=NULL,lease_owner=NULL,updated_at=? "
+                        "WHERE item_id=? AND status='TESTING' AND lease_until IS NOT NULL AND lease_until<=?",
+                        (current_iso, row["item_id"], current_iso),
+                    )
+                    if updated.rowcount != 1:
+                        continue
+                    released += 1
+                    event_id = "queue-event-" + hashlib.sha256(
+                        _dump({"item_id": row["item_id"], "from": "TESTING", "to": "PENDING", "at": current_iso, "reason": "lease_expired"}).encode("utf-8")
+                    ).hexdigest()
+                    self._conn.execute(
+                        "INSERT OR IGNORE INTO research_queue_events(event_id,item_id,from_status,to_status,detail,created_at) VALUES (?,?,?,?,?,?)",
+                        (event_id, row["item_id"], "TESTING", "PENDING", _dump({"reason": "lease_expired"}), current_iso),
+                    )
+        return released
+    def list_research_items(self, *, status: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+            raise ValueError("limit must be a non-negative integer")
+        query = "SELECT * FROM research_queue"
+        values: list[Any] = []
+        if status is not None:
+            query += " WHERE status=?"
+            values.append(str(status).upper())
+        query += " ORDER BY priority DESC,created_at,item_id LIMIT ?"
+        values.append(int(limit))
+        with self._lock:
+            rows = self._conn.execute(query, values).fetchall()
+        return [_research_queue_record(row) for row in rows]
+
+    def research_queue_stats(self) -> dict[str, int]:
+        with self._lock:
+            rows = self._conn.execute("SELECT status,COUNT(*) AS n FROM research_queue GROUP BY status").fetchall()
+        result = {str(row["status"]): int(row["n"]) for row in rows}
+        result["total"] = sum(result.values())
+        return result
+
+    def save_candidate_lifecycle(
+        self,
+        candidate_id: str,
+        stage: str,
+        payload: Any,
+        *,
+        from_stage: str | None = None,
+        reason: str = "",
+        timestamp: datetime | None = None,
+    ) -> bool:
+        current_iso = _iso(timestamp or utc_now())
+        identifier = str(candidate_id).strip()
+        stage = str(stage).strip()
+        if not identifier:
+            raise ValueError("candidate_id is required")
+        if stage not in {
+            "IDEA",
+            "SCHEMA_VALIDATED",
+            "BACKTESTED",
+            "VALIDATED",
+            "ROBUSTNESS_CHECKED",
+            "FROZEN",
+            "PAPER_FORWARD",
+            "PAPER_PROMOTABLE",
+            "REJECTED",
+        }:
+            raise ValueError(f"unsupported candidate stage: {stage}")
+        with self._write_context():
+            existing = self._conn.execute(
+                "SELECT stage,payload_json FROM candidate_lifecycle WHERE candidate_id=?", (identifier,)
+            ).fetchone()
+            if existing is None and stage != "IDEA":
+                raise ValueError("new candidates must start at IDEA")
+            payload_json = _dump(payload)
+            current_stage: str | None = None
+            if existing is not None and str(existing["stage"]) == str(stage) and existing["payload_json"] == payload_json:
+                return False
+            if existing is not None:
+                stage_order = {
+                    "IDEA": 0,
+                    "SCHEMA_VALIDATED": 1,
+                    "BACKTESTED": 2,
+                    "VALIDATED": 3,
+                    "ROBUSTNESS_CHECKED": 4,
+                    "FROZEN": 5,
+                    "PAPER_FORWARD": 6,
+                    "PAPER_PROMOTABLE": 7,
+                    "REJECTED": 8,
+                }
+                current_stage = str(existing["stage"])
+                if current_stage == "REJECTED":
+                    raise ValueError(f"rejected candidate is terminal: {identifier}")
+                if from_stage is not None and current_stage != str(from_stage):
+                    raise ValueError(f"stale candidate lifecycle writer: expected {from_stage}, found {current_stage}")
+                if str(stage) != "REJECTED" and stage_order.get(str(stage), -1) <= stage_order.get(current_stage, -1):
+                    raise ValueError(f"candidate lifecycle cannot regress: {current_stage} -> {stage}")
+                updated_cursor = self._conn.execute(
+                    "UPDATE candidate_lifecycle SET stage=?,payload_json=?,updated_at=? "
+                    "WHERE candidate_id=? AND stage=? AND payload_json=?",
+                    (str(stage), payload_json, current_iso, identifier, current_stage, existing["payload_json"]),
+                )
+                if updated_cursor.rowcount != 1:
+                    raise RuntimeError("stale candidate lifecycle writer")
+            else:
+                inserted_cursor = self._conn.execute(
+                    "INSERT OR IGNORE INTO candidate_lifecycle(candidate_id,stage,payload_json,updated_at) VALUES (?,?,?,?)",
+                    (identifier, str(stage), payload_json, current_iso),
+                )
+                if inserted_cursor.rowcount != 1:
+                    raise RuntimeError("candidate lifecycle was created concurrently")
+            event_from = from_stage if from_stage is not None else current_stage
+            event_id = "lifecycle-event-" + hashlib.sha256(
+                _dump(
+                    {
+                        "candidate_id": identifier,
+                        "from": event_from,
+                        "to": stage,
+                        "reason": reason,
+                        "payload": payload,
+                        "at": current_iso,
+                    }
+                ).encode("utf-8")
+            ).hexdigest()
+            self._conn.execute(
+                "INSERT OR IGNORE INTO candidate_lifecycle_events(event_id,candidate_id,from_stage,to_stage,reason,payload_json,created_at) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (event_id, identifier, event_from, str(stage), str(reason), payload_json, current_iso),
+            )
+        return True
+
+    def load_candidate_lifecycle(
+        self,
+        candidate_id: str | None = None,
+        *,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]] | dict[str, Any] | None:
+        if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 0):
+            raise ValueError("limit must be a non-negative integer or None")
+        query = "SELECT * FROM candidate_lifecycle"
+        values: list[Any] = []
+        if candidate_id is not None:
+            query += " WHERE candidate_id=?"
+            values.append(str(candidate_id))
+        query += " ORDER BY updated_at,candidate_id"
+        if candidate_id is None and limit is not None:
+            query += " LIMIT ?"
+            values.append(int(limit))
+        with self._lock:
+            rows = self._conn.execute(query, values).fetchall()
+        records = [
+            {
+                "candidate_id": row["candidate_id"],
+                "stage": row["stage"],
+                "payload": _load(row["payload_json"]),
+                "updated_at": _parse_datetime(row["updated_at"]),
+            }
+            for row in rows
+        ]
+        if candidate_id is not None:
+            return records[0] if records else None
+        return records
+
+    def list_candidate_lifecycle_events(self, candidate_id: str | None = None, *, limit: int = 100) -> list[dict[str, Any]]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+            raise ValueError("limit must be non-negative")
+        query = "SELECT * FROM candidate_lifecycle_events"
+        values: list[Any] = []
+        if candidate_id is not None:
+            query += " WHERE candidate_id=?"
+            values.append(str(candidate_id))
+        query += " ORDER BY created_at,event_id LIMIT ?"
+        values.append(int(limit))
+        with self._lock:
+            rows = self._conn.execute(query, values).fetchall()
+        return [
+            {
+                "event_id": row["event_id"],
+                "candidate_id": row["candidate_id"],
+                "from_stage": row["from_stage"],
+                "to_stage": row["to_stage"],
+                "reason": row["reason"],
+                "payload": _load(row["payload_json"]),
+                "created_at": _parse_datetime(row["created_at"]),
+            }
+            for row in rows
+        ]
+
+    def save_paper_state(
+        self,
+        experiment_id: str,
+        state: Any,
+        *,
+        timestamp: datetime | None = None,
+        expected_version: int | None = None,
+    ) -> int:
+        current_iso = _iso(timestamp or utc_now())
+        identifier = str(experiment_id).strip()
+        if not identifier:
+            raise ValueError("experiment_id is required")
+        if expected_version is not None and (isinstance(expected_version, bool) or not isinstance(expected_version, int) or expected_version < -1):
+            raise ValueError("expected_version must be None or a non-negative integer (or -1 for insert)")
+        payload = _dump(state)
+        with self._write_context():
+            if expected_version is None:
+                self._conn.execute(
+                    "INSERT INTO paper_state(experiment_id,state_json,updated_at,state_version) VALUES (?,?,?,0) "
+                    "ON CONFLICT(experiment_id) DO UPDATE SET state_json=excluded.state_json,"
+                    "updated_at=excluded.updated_at,state_version=paper_state.state_version+1",
+                    (identifier, payload, current_iso),
+                )
+            elif expected_version == -1:
+                cursor = self._conn.execute(
+                    "INSERT INTO paper_state(experiment_id,state_json,updated_at,state_version) VALUES (?,?,?,0) "
+                    "ON CONFLICT(experiment_id) DO NOTHING",
+                    (identifier, payload, current_iso),
+                )
+                if cursor.rowcount != 1:
+                    raise RuntimeError("paper state was created concurrently")
+            else:
+                cursor = self._conn.execute(
+                    "UPDATE paper_state SET state_json=?,updated_at=?,state_version=state_version+1 "
+                    "WHERE experiment_id=? AND state_version=?",
+                    (payload, current_iso, identifier, expected_version),
+                )
+                if cursor.rowcount != 1:
+                    raise RuntimeError("paper state changed concurrently")
+            row = self._conn.execute("SELECT state_version FROM paper_state WHERE experiment_id=?", (identifier,)).fetchone()
+        return int(row["state_version"])
+
+    def load_paper_state(self, experiment_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute("SELECT * FROM paper_state WHERE experiment_id=?", (str(experiment_id),)).fetchone()
+        if row is None:
+            return None
+        return {
+            "experiment_id": row["experiment_id"],
+            "state": _load(row["state_json"]),
+            "updated_at": _parse_datetime(row["updated_at"]),
+            "state_version": int(row["state_version"] or 0),
+        }
+    def list_paper_states(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+            raise ValueError("limit must be non-negative")
+        with self._lock:
+            rows = self._conn.execute("SELECT * FROM paper_state ORDER BY updated_at DESC,experiment_id LIMIT ?", (int(limit),)).fetchall()
+        return [
+            {
+                "experiment_id": row["experiment_id"],
+                "state": _load(row["state_json"]),
+                "updated_at": _parse_datetime(row["updated_at"]),
+            }
+            for row in rows
+        ]
+
+    def paper_observation_exists(self, observation_id: str) -> bool:
+        identifier = str(observation_id).strip()
+        if not identifier:
+            raise ValueError("observation_id is required")
+        with self._lock:
+            return self._conn.execute(
+                "SELECT 1 FROM paper_observations WHERE observation_id=? LIMIT 1",
+                (identifier,),
+            ).fetchone() is not None
+
+    def save_paper_observation(
+        self,
+        observation_id: str,
+        experiment_id: str,
+        market_id: str,
+        timestamp: datetime,
+        payload: Any,
+    ) -> bool:
+        identifier = str(observation_id).strip()
+        experiment = str(experiment_id).strip()
+        market = str(market_id).strip()
+        if not identifier or not experiment or not market:
+            raise ValueError("paper observation identifiers are required")
+        timestamp_iso = _iso(timestamp)
+        payload_json = _dump(payload)
+        with self._write_context():
+            existing = self._conn.execute(
+                "SELECT experiment_id,market_id,timestamp,payload_json FROM paper_observations WHERE observation_id=?",
+                (identifier,),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    str(existing["experiment_id"]) != experiment
+                    or str(existing["market_id"]) != market
+                    or str(existing["timestamp"]) != timestamp_iso
+                    or str(existing["payload_json"]) != payload_json
+                ):
+                    raise ValueError(f"paper observation conflicts with stored payload: {identifier}")
+                return False
+            self._conn.execute(
+                "INSERT INTO paper_observations(observation_id,experiment_id,market_id,timestamp,payload_json,created_at) "
+                "VALUES (?,?,?,?,?,?)",
+                (identifier, experiment, market, timestamp_iso, payload_json, _now_iso()),
+            )
+        return True
+
+    def list_paper_observations(self, experiment_id: str, *, limit: int | None = 1000) -> list[dict[str, Any]]:
+        if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 0):
+            raise ValueError("limit must be a non-negative integer or None")
+        query = "SELECT * FROM paper_observations WHERE experiment_id=? ORDER BY timestamp,observation_id"
+        values: list[Any] = [str(experiment_id)]
+        if limit is not None:
+            query += " LIMIT ?"
+            values.append(int(limit))
+        with self._lock:
+            rows = self._conn.execute(query, values).fetchall()
+        return [
+            {
+                "observation_id": row["observation_id"],
+                "experiment_id": row["experiment_id"],
+                "market_id": row["market_id"],
+                "timestamp": _parse_datetime(row["timestamp"]),
+                "payload": _load(row["payload_json"]),
+                "created_at": _parse_datetime(row["created_at"]),
+            }
+            for row in rows
+        ]
+    def list_latest_paper_observations(
+        self,
+        experiment_id: str,
+        *,
+        per_market_limit: int = 512,
+    ) -> list[dict[str, Any]]:
+        if isinstance(per_market_limit, bool) or not isinstance(per_market_limit, int) or per_market_limit < 0:
+            raise ValueError("per_market_limit must be a non-negative integer")
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT observation_id,experiment_id,market_id,timestamp,payload_json,created_at FROM ("
+                "SELECT p.*, ROW_NUMBER() OVER (PARTITION BY market_id ORDER BY timestamp DESC,observation_id DESC) AS row_number "
+                "FROM paper_observations AS p WHERE experiment_id=?"
+                ") WHERE row_number<=? ORDER BY timestamp,market_id,observation_id",
+                (str(experiment_id), int(per_market_limit)),
+            ).fetchall()
+        return [
+            {
+                "observation_id": row["observation_id"],
+                "experiment_id": row["experiment_id"],
+                "market_id": row["market_id"],
+                "timestamp": _parse_datetime(row["timestamp"]),
+                "payload": _load(row["payload_json"]),
+                "created_at": _parse_datetime(row["created_at"]),
+            }
+            for row in rows
+        ]
+
+
+    def save_opportunity_snapshots(self, observed_at: datetime, opportunities: Iterable[Any]) -> int:
+        rows = []
+        timestamp = _iso(observed_at)
+        for opportunity in opportunities:
+            payload = _dump(opportunity)
+            identifier = "opportunity-" + hashlib.sha256((timestamp + payload).encode("utf-8")).hexdigest()
+            rows.append((identifier, timestamp, payload, _now_iso()))
+        inserted = 0
+        if rows:
+            with self._write_context():
+                for row in rows:
+                    cursor = self._conn.execute(
+                        "INSERT OR IGNORE INTO opportunity_snapshots(opportunity_id,observed_at,payload_json,created_at) VALUES (?,?,?,?)",
+                        row,
+                    )
+                    inserted += max(0, int(cursor.rowcount))
+        return inserted
+
+    def list_opportunity_snapshots(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+            raise ValueError("limit must be non-negative")
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM opportunity_snapshots ORDER BY observed_at DESC,opportunity_id LIMIT ?", (int(limit),)
+            ).fetchall()
+        return [
+            {
+                "opportunity_id": row["opportunity_id"],
+                "observed_at": _parse_datetime(row["observed_at"]),
+                "opportunity": _load(row["payload_json"]),
+                "created_at": _parse_datetime(row["created_at"]),
+            }
+            for row in rows
+        ]
+
+    def save_experiment_budget(self, budget_id: str, budget: Any, *, timestamp: datetime | None = None) -> None:
+        identifier = str(budget_id).strip()
+        if not identifier or not isinstance(budget, Mapping):
+            raise ValueError("budget_id and budget mapping are required")
+        payload = dict(budget)
+        try:
+            total_limit = int(payload["total_limit"])
+            per_family_limit = int(payload["per_family_limit"])
+            used_total = int(payload.get("used_total", 0))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("budget limits and usage must be integers") from exc
+        if (
+            total_limit < 0
+            or per_family_limit < 0
+            or used_total < 0
+            or used_total > total_limit
+            or isinstance(payload.get("total_limit"), bool)
+            or isinstance(payload.get("per_family_limit"), bool)
+            or isinstance(payload.get("used_total", 0), bool)
+        ):
+            raise ValueError("budget limits and usage must be non-negative and within limits")
+        used_by_family = payload.get("used_by_family", {})
+        if not isinstance(used_by_family, Mapping):
+            raise ValueError("used_by_family must be a mapping")
+        normalized_family: dict[str, int] = {}
+        for family, value in used_by_family.items():
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0 or value > per_family_limit:
+                raise ValueError("family budget usage must be non-negative and within limits")
+            normalized_family[str(family)] = value
+        if sum(normalized_family.values()) > used_total:
+            raise ValueError("family budget usage exceeds total usage")
+        payload.update(
+            {
+                "budget_id": identifier,
+                "total_limit": total_limit,
+                "per_family_limit": per_family_limit,
+                "used_total": used_total,
+                "used_by_family": normalized_family,
+            }
+        )
+        payload_json = _dump(payload)
+        stamp = _iso(timestamp or utc_now())
+        with self._write_context():
+            existing = self._conn.execute(
+                "SELECT payload_json FROM experiment_budget WHERE budget_id=?", (identifier,)
+            ).fetchone()
+            reservation_rows = self._conn.execute(
+                "SELECT family,COUNT(*) AS n FROM experiment_budget_reservations WHERE budget_id=? GROUP BY family",
+                (identifier,),
+            ).fetchall()
+            reservation_total = sum(int(row["n"]) for row in reservation_rows)
+            reservation_family = {str(row["family"]): int(row["n"]) for row in reservation_rows}
+            if existing is not None:
+                prior = _load(existing["payload_json"])
+                prior = prior if isinstance(prior, Mapping) else {}
+                if (
+                    int(prior.get("total_limit", total_limit)) != total_limit
+                    or int(prior.get("per_family_limit", per_family_limit)) != per_family_limit
+                ):
+                    raise ValueError("experiment budget limits are immutable")
+                prior_used = int(prior.get("used_total", 0))
+                prior_family = prior.get("used_by_family", {})
+                prior_family = prior_family if isinstance(prior_family, Mapping) else {}
+                if used_total < max(prior_used, reservation_total):
+                    raise ValueError("experiment budget usage cannot be reset or reduced")
+                if any(
+                    normalized_family.get(str(family), 0) < max(int(prior_family.get(family, 0)), count)
+                    for family, count in reservation_family.items()
+                ):
+                    raise ValueError("experiment family usage cannot be reset or reduced")
+                if any(
+                    normalized_family.get(str(family), 0) < int(value)
+                    for family, value in prior_family.items()
+                ):
+                    raise ValueError("experiment family usage cannot be reset or reduced")
+            self._conn.execute(
+                "INSERT INTO experiment_budget(budget_id,payload_json,updated_at) VALUES (?,?,?) "
+                "ON CONFLICT(budget_id) DO UPDATE SET payload_json=excluded.payload_json,updated_at=excluded.updated_at",
+                (identifier, payload_json, stamp),
+            )
+
+    def load_experiment_budget(self, budget_id: str = "default") -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute("SELECT * FROM experiment_budget WHERE budget_id=?", (str(budget_id),)).fetchone()
+        if row is None:
+            return None
+        return {"budget_id": row["budget_id"], "budget": _load(row["payload_json"]), "updated_at": _parse_datetime(row["updated_at"])}
+    def reserve_experiment_budget(
+        self,
+        budget_id: str,
+        *,
+        total_limit: int,
+        per_family_limit: int,
+        family: str,
+        reservation_key: str,
+        amount: int = 1,
+        timestamp: datetime | None = None,
+    ) -> dict[str, Any]:
+        if isinstance(total_limit, bool) or not isinstance(total_limit, int) or total_limit < 0:
+            raise ValueError("total_limit must be a non-negative integer")
+        if isinstance(per_family_limit, bool) or not isinstance(per_family_limit, int) or per_family_limit < 0:
+            raise ValueError("per_family_limit must be a non-negative integer")
+        if isinstance(amount, bool) or not isinstance(amount, int) or amount <= 0:
+            raise ValueError("amount must be a positive integer")
+        identifier = str(budget_id)
+        family_name = str(family).strip() or "unknown"
+        reservation = str(reservation_key).strip()
+        if not reservation:
+            raise ValueError("reservation_key is required")
+        stamp = _iso(timestamp or utc_now())
+
+        def reserve() -> dict[str, Any]:
+            existing_row = self._conn.execute(
+                "SELECT family FROM experiment_budget_reservations WHERE budget_id=? AND reservation_key=?",
+                (identifier, reservation),
+            ).fetchone()
+            existing_reservation = existing_row is not None
+            if existing_row is not None and str(existing_row["family"]) != family_name:
+                raise ValueError("reservation_key is already allocated to another experiment family")
+            row = self._conn.execute(
+                "SELECT payload_json FROM experiment_budget WHERE budget_id=?", (identifier,)
+            ).fetchone()
+            payload = _load(row["payload_json"]) if row else {}
+            payload = dict(payload) if isinstance(payload, Mapping) else {}
+            if row is not None:
+                stored_total = payload.get("total_limit")
+                stored_family = payload.get("per_family_limit")
+                if (
+                    stored_total is not None and int(stored_total) != total_limit
+                ) or (
+                    stored_family is not None and int(stored_family) != per_family_limit
+                ):
+                    raise ValueError("experiment budget limits are immutable")
+            used_total = int(payload.get("used_total", 0))
+            used_by_family = dict(payload.get("used_by_family", {})) if isinstance(payload.get("used_by_family", {}), Mapping) else {}
+            total = int(payload.get("total_limit", total_limit))
+            per_family = int(payload.get("per_family_limit", per_family_limit))
+            if not existing_reservation:
+                used_family = int(used_by_family.get(family_name, 0))
+                if used_total + amount > total:
+                    raise RuntimeError("experiment budget exhausted")
+                if used_family + amount > per_family:
+                    raise RuntimeError(f"experiment family budget exhausted: {family_name}")
+                used_total += amount
+                used_by_family[family_name] = used_family + amount
+                self._conn.execute(
+                    "INSERT INTO experiment_budget_reservations(budget_id,reservation_key,family,created_at) VALUES (?,?,?,?)",
+                    (identifier, reservation, family_name, stamp),
+                )
+            record = {
+                "budget_id": identifier,
+                "total_limit": total,
+                "per_family_limit": per_family,
+                "used_total": used_total,
+                "used_by_family": dict(sorted(used_by_family.items())),
+            }
+            self._conn.execute(
+                "INSERT INTO experiment_budget(budget_id,payload_json,updated_at) VALUES (?,?,?) "
+                "ON CONFLICT(budget_id) DO UPDATE SET payload_json=excluded.payload_json,updated_at=excluded.updated_at",
+                (identifier, _dump(record), stamp),
+            )
+            return {"budget": record, "allocated": not existing_reservation}
+
+        with self._lock:
+            if self._transaction_depth:
+                return reserve()
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                result = reserve()
+                self._conn.commit()
+                return result
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def save_worker_state(
+        self,
+        worker_name: str,
+        status: str,
+        payload: Any = None,
+        *,
+        started_at: datetime | None = None,
+        heartbeat_at: datetime | None = None,
+    ) -> None:
+        worker = str(worker_name).strip()
+        state = str(status).strip()
+        if not worker:
+            raise ValueError("worker_name is required")
+        if not state:
+            raise ValueError("worker status is required")
+        heartbeat = heartbeat_at or utc_now()
+        with self._write_context():
+            self._conn.execute(
+                "INSERT INTO worker_state(worker_name,status,payload_json,started_at,heartbeat_at,updated_at) VALUES (?,?,?,?,?,?) "
+                "ON CONFLICT(worker_name) DO UPDATE SET status=excluded.status,payload_json=excluded.payload_json,"
+                "started_at=COALESCE(worker_state.started_at,excluded.started_at),heartbeat_at=excluded.heartbeat_at,updated_at=excluded.updated_at",
+                (
+                    worker,
+                    state,
+                    _dump(payload if payload is not None else {}),
+                    _iso(started_at) if started_at else None,
+                    _iso(heartbeat),
+                    _now_iso(),
+                ),
+            )
+
+    def list_worker_states(self, *, limit: int = 256) -> list[dict[str, Any]]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+            raise ValueError("limit must be a non-negative integer")
+        with self._lock:
+            rows = self._conn.execute("SELECT * FROM worker_state ORDER BY worker_name LIMIT ?", (int(limit),)).fetchall()
+        return [
+            {
+                "worker_name": row["worker_name"],
+                "status": row["status"],
+                "payload": _load(row["payload_json"]),
+                "started_at": _parse_datetime(row["started_at"]),
+                "heartbeat_at": _parse_datetime(row["heartbeat_at"]),
+                "updated_at": _parse_datetime(row["updated_at"]),
+            }
+            for row in rows
+        ]
+
+    def tracked_polymarket_markets(
+        self,
+        *,
+        active_only: bool = True,
+        now: datetime | None = None,
+        include_payload: bool = False,
+        limit: int = 1000,
+    ) -> list[Any]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+            raise ValueError("limit must be a non-negative integer")
+        current = ensure_utc(now or utc_now())
+        with self._lock:
+            metadata_rows = self._conn.execute(
+                "SELECT market_id,observed_at,metadata_hash,payload_json FROM ("
+                "SELECT market_id,observed_at,metadata_hash,payload_json,"
+                "ROW_NUMBER() OVER (PARTITION BY market_id ORDER BY observed_at DESC,metadata_hash DESC) AS row_number "
+                "FROM polymarket_markets WHERE observed_at<=?) WHERE row_number=1 ORDER BY market_id LIMIT ?",
+                (current.isoformat(), int(limit)),
+            ).fetchall()
+            snapshot_rows = self._conn.execute(
+                "SELECT market_id,observed_at,source_timestamp,snapshot_id,payload_json FROM ("
+                "SELECT market_id,observed_at,source_timestamp,snapshot_id,payload_json,"
+                "ROW_NUMBER() OVER (PARTITION BY market_id ORDER BY observed_at DESC,source_timestamp DESC,snapshot_id DESC) AS row_number "
+                "FROM polymarket_snapshots WHERE observed_at<=?) WHERE row_number=1 ORDER BY market_id LIMIT ?",
+                (current.isoformat(), int(limit)),
+            ).fetchall()
+        metadata_latest: dict[str, tuple[datetime | None, Any]] = {}
+        snapshot_latest: dict[str, tuple[datetime | None, Any]] = {}
+        for row in metadata_rows:
+            stamp = _parse_datetime(row["observed_at"])
+            if stamp is not None and stamp > current:
+                continue
+            identifier = str(row["market_id"])
+            metadata_latest[identifier] = (stamp, _load(row["payload_json"]))
+        for row in snapshot_rows:
+            stamp = _parse_datetime(row["observed_at"])
+            if stamp is not None and stamp > current:
+                continue
+            identifier = str(row["market_id"])
+            snapshot_latest[identifier] = (stamp, _load(row["payload_json"]))
+        result: list[dict[str, Any]] = []
+        terminal = {
+            SettlementState.RESOLVED_YES.value,
+            SettlementState.RESOLVED_NO.value,
+            SettlementState.VOID.value,
+        }
+        for market_id in sorted(set(metadata_latest) | set(snapshot_latest)):
+            metadata_stamp, metadata_payload = metadata_latest.get(market_id, (None, None))
+            snapshot_stamp, snapshot_payload = snapshot_latest.get(market_id, (None, None))
+            if snapshot_stamp is not None and (metadata_stamp is None or snapshot_stamp >= metadata_stamp):
+                payload = dict(snapshot_payload) if isinstance(snapshot_payload, Mapping) else {}
+            else:
+                payload = dict(metadata_payload) if isinstance(metadata_payload, Mapping) else {}
+            if isinstance(metadata_payload, Mapping) and "metadata" not in payload:
+                payload["metadata"] = metadata_payload.get("metadata")
+            if isinstance(snapshot_payload, Mapping) and "snapshot" not in payload:
+                payload["snapshot"] = snapshot_payload.get("snapshot")
+            metadata_value = payload.get("metadata", {})
+            metadata = metadata_value if isinstance(metadata_value, Mapping) else {}
+            metadata_extra_value = metadata.get("extra", {})
+            metadata_extra = metadata_extra_value if isinstance(metadata_extra_value, Mapping) else {}
+            snapshot_value = payload.get("snapshot", {})
+            snapshot = snapshot_value if isinstance(snapshot_value, Mapping) else {}
+            settlement = str(snapshot.get("settlement", payload.get("settlement", ""))).strip().lower()
+            raw_closed = metadata.get(
+                "closed",
+                payload.get("closed", metadata_extra.get("closed", False)),
+            )
+            closed = raw_closed if isinstance(raw_closed, bool) else str(raw_closed).strip().lower() in {"1", "true", "yes", "y", "on", "closed"}
+            raw_active = metadata.get("active", payload.get("active", metadata_extra.get("active")))
+            explicit_active = None if raw_active is None else (
+                raw_active if isinstance(raw_active, bool) else str(raw_active).strip().lower() in {"1", "true", "yes", "y", "on", "active"}
+            )
+            expiry = _parse_datetime(
+                snapshot.get("expiry")
+                or metadata.get("expiry")
+                or payload.get("expiry")
+                or metadata_extra.get("expiry")
+            )
+            observed_at = snapshot_stamp or metadata_stamp
+            active = (
+                (explicit_active if explicit_active is not None else not closed)
+                and not closed
+                and settlement not in terminal
+                and (expiry is None or expiry > current)
+            )
+            if active_only and not active:
+                continue
+            result.append(
+                {
+                    "market_id": market_id,
+                    "observed_at": observed_at,
+                    "active": active,
+                    "payload": payload,
+                }
+            )
+        bounded = result[:limit]
+        return bounded if include_payload else [item["market_id"] for item in bounded]
     # Dashboard and quality ------------------------------------------
     def data_health(self, dataset_id: str | None = None, version: str | None = None) -> dict[str, Any]:
         """Return lightweight provenance/quality counters for dashboards.
@@ -1135,8 +2640,18 @@ class AxiomStore:
                 ("polymarket_trades", "polymarket_trades"),
                 ("collection_errors", "collection_errors"),
                 ("forward_tests", "forward_tests"),
+                ("collection_cycles", "collection_cycles"),
+                ("research_queue", "research_queue"),
+                ("candidate_lifecycle", "candidate_lifecycle"),
+                ("paper_state", "paper_state"),
+                ("paper_observations", "paper_observations"),
+                ("opportunity_snapshots", "opportunity_snapshots"),
+                ("experiment_budget", "experiment_budget"),
+                ("worker_state", "worker_state"),
             ):
                 result[label] = int(self._conn.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()["n"])
+
+
             for table, label in (("datasets", "latest_dataset"), ("experiments", "latest_experiment"), ("reports", "latest_report")):
                 row = self._conn.execute(f"SELECT created_at FROM {table} ORDER BY created_at DESC LIMIT 1").fetchone()
                 result[label] = _parse_datetime(row["created_at"]) if row else None
@@ -1156,6 +2671,29 @@ class AxiomStore:
                 )
         except sqlite3.IntegrityError as exc:
             raise ValueError(f"duplicate immutable record in {table} ({key_columns})") from exc
+def _research_queue_record(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    return {
+        "item_id": row["item_id"],
+        "item_type": row["item_type"],
+        "dedupe_key": row["dedupe_key"],
+        "status": row["status"],
+        "priority": int(row["priority"]),
+        "payload": _load(row["payload_json"]),
+        "result": None if row["result_json"] is None else _load(row["result_json"]),
+        "source": row["source"],
+        "author": row["author"],
+        "lineage": _load(row["lineage_json"]),
+        "schema_version": row["schema_version"],
+        "created_at": _parse_datetime(row["created_at"]),
+        "updated_at": _parse_datetime(row["updated_at"]),
+        "available_at": _parse_datetime(row["available_at"]),
+        "lease_until": _parse_datetime(row["lease_until"]),
+        "lease_owner": row["lease_owner"],
+        "attempts": int(row["attempts"]),
+        "last_error": row["last_error"],
+    }
 
 
 def _enum_value(value: Any) -> str | None:
@@ -1186,6 +2724,11 @@ def _dump(value: Any) -> str:
 
 def _load(value: str) -> Any:
     return json.loads(value)
+def _report_payload_equivalent(left: Any, right: Any) -> bool:
+    if isinstance(left, Mapping) and isinstance(right, Mapping):
+        left = {str(key): value for key, value in left.items() if str(key) != "generated_at"}
+        right = {str(key): value for key, value in right.items() if str(key) != "generated_at"}
+    return _dump(left) == _dump(right)
 
 
 def _now_iso() -> str:
@@ -1282,6 +2825,7 @@ def _snapshot_from_record(kind: str, record: Mapping[str, Any]) -> Any:
             yes_token_id=record.get("yes_token_id"),
             no_token_id=record.get("no_token_id"),
         )
+    return record
 
 
 def _settlement(value: Any) -> SettlementState:

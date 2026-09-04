@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from itertools import islice
 from typing import Any, Iterable, Mapping, Sequence
 
 from ..domain import (
@@ -19,6 +20,23 @@ from ..domain import (
 from ..evaluation import dataset_version
 from ..storage import AxiomStore
 from .interfaces import CryptoMarketDataProvider, PredictionMarketDataProvider
+_MAX_INGEST_MARKETS = 1_000
+_MAX_INGEST_RECORDS = 100_000
+
+
+def _consume_transport_errors(provider: Any, context: str) -> list[str]:
+    consume = getattr(provider, "consume_transport_errors", None)
+    if not callable(consume):
+        return []
+    try:
+        errors = consume()
+    except Exception as exc:
+        return [f"{context}: transport error collector failed: {exc}"]
+    messages: list[str] = []
+    for error in errors or ():
+        status = getattr(error, "status", None)
+        messages.append(f"{context}: HTTP {status}" if status is not None else f"{context}: {error}")
+    return messages
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,10 +88,11 @@ class MarketDataPipeline:
     ) -> IngestionReport:
         errors: list[str] = []
         try:
-            bars = tuple(provider.historical_ohlcv(symbol, start=start, end=end, interval=interval))
+            bars = tuple(islice(iter(provider.historical_ohlcv(symbol, start=start, end=end, interval=interval)), _MAX_INGEST_RECORDS))
         except Exception as exc:
             bars = ()
             errors.append(f"historical data error: {exc}")
+        errors.extend(_consume_transport_errors(provider, "historical data"))
         resolved_version = version or dataset_version(bars)
         quality = _provider_quality(provider, SimulationQuality.MEDIUM if bars else SimulationQuality.LOW)
         dataset_id = f"crypto:{symbol.replace('/', '').replace('-', '').upper()}"
@@ -82,6 +101,7 @@ class MarketDataPipeline:
         except Exception as exc:
             instrument = None
             errors.append(f"metadata error: {exc}")
+        errors.extend(_consume_transport_errors(provider, "metadata"))
         payload_metadata = {
             "provider": getattr(provider, "provider_name", provider.__class__.__name__),
             "symbol": symbol,
@@ -123,16 +143,46 @@ class MarketDataPipeline:
         version_prefix: str | None = None,
     ) -> tuple[IngestionReport, ...]:
         if market_ids is None:
-            market_ids = (snapshot.market_id for snapshot in provider.markets(active=False))
-        reports: list[IngestionReport] = []
+            try:
+                discovered = tuple(islice(iter(provider.markets(active=False)), _MAX_INGEST_MARKETS))
+                market_ids = (snapshot.market_id for snapshot in discovered)
+                discovery_errors = _consume_transport_errors(provider, "market discovery")
+                if discovery_errors:
+                    return (
+                        IngestionReport(
+                            "prediction:unavailable",
+                            "unavailable",
+                            str(getattr(provider, "provider_name", provider.__class__.__name__)),
+                            MarketType.PREDICTION,
+                            0,
+                            SimulationQuality.LOW,
+                            errors=tuple(discovery_errors),
+                        ),
+                    )
+            except Exception as exc:
+                discovery_errors = [f"market discovery error: {exc}"]
+                discovery_errors.extend(_consume_transport_errors(provider, "market discovery"))
+                return (
+                    IngestionReport(
+                        "prediction:unavailable",
+                        "unavailable",
+                        str(getattr(provider, "provider_name", provider.__class__.__name__)),
+                        MarketType.PREDICTION,
+                        0,
+                        SimulationQuality.LOW,
+                        errors=tuple(discovery_errors),
+                    ),
+                )
         provider_name = str(getattr(provider, "provider_name", provider.__class__.__name__))
-        for market_id in market_ids:
+        reports: list[IngestionReport] = []
+        for market_id in islice(iter(market_ids), _MAX_INGEST_MARKETS):
             try:
                 market = provider.market(str(market_id))
                 market_error: str | None = None
             except Exception as exc:
                 market = None
                 market_error = f"market lookup error: {exc}"
+            market_transport_errors = _consume_transport_errors(provider, f"market {market_id}")
             if market is None:
                 reports.append(
                     IngestionReport(
@@ -141,17 +191,29 @@ class MarketDataPipeline:
                         provider_name,
                         MarketType.PREDICTION,
                         0,
-                        SimulationQuality.LOW,
-                        errors=(market_error or "market metadata unavailable",),
+                        errors=tuple(
+                            item
+                            for item in (market_error, *market_transport_errors, "market metadata unavailable")
+                            if item
+                        ),
                     )
                 )
                 continue
+            dataset_id = f"prediction:{market.market_id}"
             try:
-                history = tuple(provider.price_history(market.market_id, start=start, end=end))
+                instrument = provider.metadata(market.market_id)
+                metadata_error: str | None = None if instrument is not None else "instrument metadata unavailable"
+            except Exception as exc:
+                instrument = None
+                metadata_error = f"instrument metadata error: {exc}"
+            metadata_transport_errors = _consume_transport_errors(provider, f"metadata {market.market_id}")
+            try:
+                history = tuple(islice(iter(provider.price_history(market.market_id, start=start, end=end)), _MAX_INGEST_RECORDS))
                 history_error: str | None = None
             except Exception as exc:
                 history = ()
                 history_error = f"price history error: {exc}"
+            history_transport_errors = _consume_transport_errors(provider, f"price history {market.market_id}")
             snapshots = tuple(_historical_snapshots(market, history))
             resolved_version = version_prefix or dataset_version(
                 history or ({"market_id": market.market_id, "timestamp": market.timestamp},)
@@ -162,9 +224,23 @@ class MarketDataPipeline:
                 if not snapshots or not history or not all(_has_depth(item) for item in snapshots)
                 else SimulationQuality.MEDIUM,
             )
-            dataset_id = f"prediction:{market.market_id}"
-            errors = tuple(item for item in (history_error, "price history unavailable" if not history else None) if item)
-            if history_error is None:
+            errors = tuple(
+                item
+                for item in (
+                    market_error,
+                    *market_transport_errors,
+                    history_error,
+                    *history_transport_errors,
+                    metadata_error,
+                    *metadata_transport_errors,
+                    "price history unavailable" if not history else None,
+                )
+                if item
+            )
+            if history_error is None and history:
+                raw_market = to_record(market)
+                metadata_record = to_record(instrument) if instrument is not None else None
+                market_extra = getattr(instrument, "extra", {}) if instrument is not None else {}
                 with self.store.transaction():
                     self.store.save_dataset(
                         dataset_id,
@@ -177,9 +253,31 @@ class MarketDataPipeline:
                             "resolution_criteria": market.resolution_criteria,
                             "rules": market.resolution_criteria,
                             "expiry": market.expiry,
-                            "settlement": market.settlement.value,
-                            "yes_token_id": market.yes_token_id,
-                            "no_token_id": market.no_token_id,
+                            "yes_token_id": market.yes_token_id or market_extra.get("yes_token_id"),
+                            "no_token_id": market.no_token_id or market_extra.get("no_token_id"),
+                            "condition_id": market_extra.get("condition_id"),
+                            "outcomes": market_extra.get("outcomes"),
+                            "active": market_extra.get(
+                                "active",
+                                market.settlement not in {
+                                    SettlementState.RESOLVED_YES,
+                                    SettlementState.RESOLVED_NO,
+                                    SettlementState.VOID,
+                                },
+                            ),
+                            "closed": market_extra.get(
+                                "closed",
+                                market.settlement in {
+                                    SettlementState.RESOLVED_YES,
+                                    SettlementState.RESOLVED_NO,
+                                    SettlementState.VOID,
+                                },
+                            ),
+                            "start": market_extra.get("start") or raw_market.get("timestamp"),
+                            "end": market_extra.get("end") or market.expiry,
+                            "raw_market": raw_market,
+                            "instrument_metadata": metadata_record,
+                            "instrument_metadata_available": instrument is not None,
                             "historical_order_book": bool(snapshots and all(item.order_book is not None for item in snapshots)),
                             "research_quality": "ORDER_BOOK_SIMULATED" if any(item.order_book is not None for item in snapshots) else "PRICE_PROXY",
                         },
@@ -324,7 +422,9 @@ def _historical_snapshots(
         state = SettlementState.OPEN
         raw_state = point.get("settlement")
         try:
-            candidate_state = SettlementState(str(raw_state)) if raw_state is not None else SettlementState.OPEN
+            candidate_state = (
+                SettlementState(str(raw_state).strip().lower()) if raw_state is not None else SettlementState.OPEN
+            )
         except ValueError:
             candidate_state = SettlementState.UNKNOWN
         if candidate_state in terminal_states:

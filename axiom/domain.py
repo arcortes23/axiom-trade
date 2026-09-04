@@ -106,10 +106,15 @@ class OHLCVBar:
                 raise ValueError("OHLCV spread must be finite and non-negative")
             object.__setattr__(self, "spread", spread)
         if self.trades is not None:
-            trades = int(self.trades)
-            if trades < 0:
-                raise ValueError("OHLCV trades must be non-negative")
-            object.__setattr__(self, "trades", trades)
+            if isinstance(self.trades, bool):
+                raise ValueError("OHLCV trades must be a non-negative integer")
+            try:
+                trades_value = float(self.trades)
+            except (TypeError, ValueError):
+                raise ValueError("OHLCV trades must be a non-negative integer") from None
+            if not math.isfinite(trades_value) or trades_value < 0 or not trades_value.is_integer():
+                raise ValueError("OHLCV trades must be a non-negative integer")
+            object.__setattr__(self, "trades", int(trades_value))
 
 
 @dataclass(frozen=True, slots=True)
@@ -320,7 +325,7 @@ class PredictionMarketSnapshot:
             object.__setattr__(self, "expiry", ensure_utc(self.expiry))
         if not isinstance(self.settlement, SettlementState):
             try:
-                object.__setattr__(self, "settlement", SettlementState(str(self.settlement)))
+                object.__setattr__(self, "settlement", SettlementState(str(self.settlement).strip().lower()))
             except ValueError:
                 object.__setattr__(self, "settlement", SettlementState.UNKNOWN)
         object.__setattr__(self, "tags", tuple(str(tag) for tag in self.tags))
@@ -386,9 +391,9 @@ class Fill:
     def __post_init__(self) -> None:
         object.__setattr__(self, "timestamp", ensure_utc(self.timestamp))
         if not isinstance(self.market_type, MarketType):
-            object.__setattr__(self, "market_type", MarketType(str(self.market_type)))
+            object.__setattr__(self, "market_type", MarketType(str(self.market_type).strip().lower()))
         if not isinstance(self.side, Side):
-            object.__setattr__(self, "side", Side(str(self.side)))
+            object.__setattr__(self, "side", Side(str(self.side).strip().lower()))
         if not str(self.symbol).strip() or not str(self.order_id).strip():
             raise ValueError("fill symbol and order_id are required")
         values = tuple(float(getattr(self, name)) for name in ("quantity", "price", "fees", "slippage"))
@@ -422,7 +427,7 @@ class ResolvedContract:
         if not str(self.market_id).strip():
             raise ValueError("resolved contract market_id is required")
         if not isinstance(self.outcome, SettlementState):
-            object.__setattr__(self, "outcome", SettlementState(str(self.outcome)))
+            object.__setattr__(self, "outcome", SettlementState(str(self.outcome).strip().lower()))
         if self.outcome not in {
             SettlementState.RESOLVED_YES,
             SettlementState.RESOLVED_NO,

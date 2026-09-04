@@ -181,6 +181,14 @@ class ExperimentTracker:
         if callable(save_experiment):
             try:
                 save_experiment(record.experiment_id, payload, strategy_id=record.strategy_id)
+            except TypeError:
+                try:
+                    save_experiment(record.experiment_id, payload)
+                except TypeError:
+                    try:
+                        save_experiment(payload)
+                    except TypeError:
+                        save_experiment(record)
             except ValueError:
                 loader = getattr(self.store, "load_experiment", None)
                 existing = loader(record.experiment_id) if callable(loader) else None

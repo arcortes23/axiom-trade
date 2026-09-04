@@ -172,7 +172,7 @@ def _model_probability(data: Any, item: Any, index: int = -1) -> float | None:
         value = _snapshot_value(item, key)
         if value is not None:
             result = _number(value, math.nan)
-            return result if math.isfinite(result) else None
+            return result if math.isfinite(result) and 0.0 <= result <= 1.0 else None
     if isinstance(data, Mapping):
         values = data.get("probabilities", data.get("model_probabilities"))
         if isinstance(values, Mapping):
@@ -186,7 +186,7 @@ def _model_probability(data: Any, item: Any, index: int = -1) -> float | None:
         else:
             value = None
         result = _number(value, math.nan)
-        if math.isfinite(result):
+        if math.isfinite(result) and 0.0 <= result <= 1.0:
             return result
     return None
 
@@ -224,6 +224,17 @@ def _prediction_signal(family: str, data: Any, params: Mapping[str, Any]) -> flo
         if model_p >= 1.0 - tail and market_p < model_p:
             return _clip((market_p - model_p) / max(tail, 1e-12))
         return 0.0
+    if family == "lottery_ticket":
+        maximum_price = _number(params.get("max_probability", params.get("tail_probability", 0.10)), 0.10)
+        minimum_edge = max(_number(params.get("min_edge", params.get("threshold", 0.0)), 0.0), 0.0)
+        if (
+            model_p is None
+            or market_p is None
+            or market_p > maximum_price
+            or model_p <= market_p + minimum_edge
+        ):
+            return 0.0
+        return _clip((model_p - market_p) / max(threshold, 0.05))
     history_market = [market for market in (_market_probability(s) for s in snapshots) if market is not None]
     paired = []
     for index, snapshot in enumerate(snapshots):

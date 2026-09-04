@@ -134,8 +134,8 @@ class SyntheticCryptoProvider(CryptoMarketDataProvider):
         return tuple(result)
 
     def order_book(self, symbol: str, depth: int = 20) -> OrderBookSnapshot | None:
-        if depth <= 0:
-            raise ValueError("depth must be positive")
+        if isinstance(depth, bool) or not isinstance(depth, int) or depth <= 0:
+            raise ValueError("depth must be a positive integer")
         ticker = self.ticker(symbol)
         if ticker is None:
             return None
@@ -221,8 +221,8 @@ class InMemoryCryptoProvider(SyntheticCryptoProvider):
         return tuple(item for item in self._trades_by_symbol.get(self._normalize(symbol), ()) if _in_range(item.timestamp, start, end))
 
     def order_book(self, symbol: str, depth: int = 20) -> OrderBookSnapshot | None:
-        if depth <= 0:
-            raise ValueError("depth must be positive")
+        if isinstance(depth, bool) or not isinstance(depth, int) or depth <= 0:
+            raise ValueError("depth must be a positive integer")
         book = self._books.get(self._normalize(symbol))
         if book is None:
             return None

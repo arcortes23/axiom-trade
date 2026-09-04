@@ -6,12 +6,78 @@ from datetime import datetime
 import hashlib
 import json
 import math
+import re
 from typing import Any, Mapping, Sequence
 
 from .domain import ResearchQuality, ensure_utc, parse_timestamp, utc_now
+from .research_bus import ResearchBusPermissionError, _validate_payload
 from .storage import AxiomStore
+from .risk import RiskLimits
 
 
+_PRIVATE_FORWARD_TOKENS = frozenset(
+    {
+        "credential",
+        "private",
+        "secret",
+        "api_key",
+        "password",
+        "token",
+        "cookie",
+        "session",
+        "authorization",
+        "bearer",
+        "oauth",
+        "jwt",
+        "broker",
+        "wallet",
+        "execute",
+        "execution",
+        "live",
+        "withdraw",
+    }
+)
+
+
+def _validate_private_fields(value: Any, *, path: str = "value", depth: int = 0) -> None:
+    if depth > 8:
+        raise ValueError(f"forward input nesting exceeds 8 levels: {path}")
+    if isinstance(value, Mapping):
+        if len(value) > 256:
+            raise ValueError(f"forward input mapping is too large: {path}")
+        for key, child in value.items():
+            normalized = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", str(key))
+            normalized = re.sub(r"[^A-Za-z0-9]+", "_", normalized).strip("_").lower()
+            compact = normalized.replace("_", "")
+            if any(token in normalized or token in compact for token in _PRIVATE_FORWARD_TOKENS):
+                raise ValueError(f"forward input contains forbidden private or execution field: {path}.{key}")
+            _validate_private_fields(child, path=f"{path}.{key}", depth=depth + 1)
+    elif isinstance(value, (list, tuple)):
+        if len(value) > 256:
+            raise ValueError(f"forward input collection is too large: {path}")
+        for index, child in enumerate(value):
+            _validate_private_fields(child, path=f"{path}[{index}]", depth=depth + 1)
+
+
+def _validate_forward_config(config: Mapping[str, Any]) -> None:
+    if not isinstance(config, Mapping):
+        raise ValueError("forward test config must be a mapping")
+    public: dict[str, Any] = {}
+    for key, value in config.items():
+        normalized = str(key).replace("-", "_").lower()
+        if normalized in {"live", "live_execution"}:
+            if value is not None and (not isinstance(value, bool) or value):
+                raise ValueError("forward tests are paper-only")
+            continue
+        if normalized == "execution":
+            if value not in (None, "paper_only"):
+                raise ValueError("forward tests are paper-only")
+            continue
+        public[str(key)] = value
+    try:
+        _validate_payload(public)
+    except (ResearchBusPermissionError, TypeError, ValueError) as exc:
+        raise ValueError("forward test config contains forbidden private or execution fields") from exc
 @dataclass(frozen=True, slots=True)
 class ForwardTestSpec:
     experiment_id: str
@@ -23,6 +89,9 @@ class ForwardTestSpec:
     allowed_markets: tuple[str, ...] = ()
     risk_limits: Mapping[str, Any] = field(default_factory=dict)
     quality: ResearchQuality = ResearchQuality.PAPER_FORWARD
+    registration_timestamp: datetime | None = None
+
+
     def __post_init__(self) -> None:
         bankroll = float(self.bankroll)
         if (
@@ -37,12 +106,24 @@ class ForwardTestSpec:
             object.__setattr__(self, "quality", ResearchQuality(str(self.quality)))
         if self.quality is not ResearchQuality.PAPER_FORWARD:
             raise ValueError("forward registry accepts PAPER_FORWARD specs only")
-        object.__setattr__(self, "start_timestamp", ensure_utc(self.start_timestamp))
-        object.__setattr__(self, "bankroll", bankroll)
-        object.__setattr__(self, "allowed_markets", tuple(dict.fromkeys(str(item).strip() for item in self.allowed_markets if str(item).strip())))
+        start = ensure_utc(self.start_timestamp)
+        registration = ensure_utc(self.registration_timestamp or start)
+        if registration != start:
+            raise ValueError("registration_timestamp must equal start_timestamp for a frozen test")
+        object.__setattr__(self, "start_timestamp", start)
+        object.__setattr__(self, "registration_timestamp", registration)
+        _validate_forward_config(self.config)
+        try:
+            RiskLimits(**dict(self.risk_limits))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("forward risk_limits are invalid") from exc
+        _validate_private_fields(self.risk_limits, path="risk_limits")
+        normalized_markets = tuple(dict.fromkeys(str(item).strip() for item in self.allowed_markets if str(item).strip()))
+        if len(normalized_markets) > 1000:
+            raise ValueError("forward test allowed_markets exceeds 1000 entries")
+        object.__setattr__(self, "allowed_markets", normalized_markets)
         object.__setattr__(self, "config", _freeze_json(self.config))
         object.__setattr__(self, "risk_limits", _freeze_json(self.risk_limits))
-
     def as_record(self) -> dict[str, Any]:
         return {
             "experiment_id": self.experiment_id,
@@ -50,6 +131,7 @@ class ForwardTestSpec:
             "model_hash": self.model_hash,
             "config": _plain(self.config),
             "start_timestamp": self.start_timestamp.isoformat(),
+            "registration_timestamp": self.registration_timestamp.isoformat(),
             "bankroll": self.bankroll,
             "allowed_markets": list(self.allowed_markets),
             "risk_limits": _plain(self.risk_limits),
@@ -76,8 +158,17 @@ class ForwardTestRegistry:
         risk_limits: Mapping[str, Any] | None = None,
         experiment_id: str | None = None,
     ) -> ForwardTestSpec:
-        strategy_hash = _content_hash(strategy)
-        model_hash = _content_hash(model)
+        config_document = config.get("strategy_document") if isinstance(config, Mapping) else None
+        config_model_document = config.get("model_document") if isinstance(config, Mapping) else None
+        if isinstance(config_document, Mapping) and _content_hash(_normalized_strategy_document(config_document)) != _content_hash(_normalized_strategy_document(strategy)):
+            raise ValueError("config strategy_document does not match frozen strategy")
+        model_source = getattr(model, "document", model)
+        if isinstance(config_model_document, Mapping) and _content_hash(config_model_document) != _content_hash(model_source):
+            raise ValueError("config model_document does not match frozen model")
+        strategy_value = config_document if isinstance(config_document, Mapping) else strategy
+        model_value = config_model_document if isinstance(config_model_document, Mapping) else model_source
+        strategy_hash = _content_hash(_normalized_strategy_document(strategy_value))
+        model_hash = _content_hash(model_value)
         start = ensure_utc(start_timestamp or utc_now())
         normalized_markets = tuple(dict.fromkeys(str(item).strip() for item in allowed_markets if str(item).strip()))
         payload = {
@@ -85,6 +176,7 @@ class ForwardTestRegistry:
             "model_hash": model_hash,
             "config": dict(config or {}),
             "start_timestamp": start.isoformat(),
+            "registration_timestamp": start.isoformat(),
             "bankroll": float(bankroll),
             "allowed_markets": list(normalized_markets),
             "risk_limits": dict(risk_limits or {}),
@@ -101,6 +193,35 @@ class ForwardTestRegistry:
             self.store.save_forward_test(identifier, spec.as_record())
         self._specs[identifier] = spec
         return spec
+    def register_forward_test(
+        self,
+        *,
+        strategy: Any,
+        model: Any,
+        registration_timestamp: datetime | None = None,
+        now: datetime | None = None,
+        config: Mapping[str, Any] | None = None,
+        bankroll: float = 10_000.0,
+        allowed_markets: Sequence[str] = (),
+        risk_limits: Mapping[str, Any] | None = None,
+        experiment_id: str | None = None,
+    ) -> ForwardTestSpec:
+        """Register a genuinely forward test; historical starts are rejected."""
+        current = ensure_utc(now or utc_now())
+        registration = ensure_utc(registration_timestamp or current)
+        if registration < current:
+            raise ValueError("forward registration_timestamp cannot be in the past")
+        return self.freeze(
+            strategy=strategy,
+            model=model,
+            config=config,
+            start_timestamp=registration,
+            bankroll=bankroll,
+            allowed_markets=allowed_markets,
+            risk_limits=risk_limits,
+            experiment_id=experiment_id,
+        )
+
 
     def list(self) -> tuple[ForwardTestSpec, ...]:
         if self.store is not None:
@@ -121,10 +242,45 @@ class ForwardTestRegistry:
                         tuple(record["allowed_markets"]),
                         record["risk_limits"],
                         ResearchQuality(record["quality"]),
+                        start_timestamp,
                     )
                 )
             return tuple(specs)
         return tuple(sorted(self._specs.values(), key=lambda spec: (spec.start_timestamp, spec.experiment_id)))
+    def get(self, experiment_id: str) -> ForwardTestSpec | None:
+        identifier = str(experiment_id).strip()
+        if not identifier:
+            return None
+        if self.store is None:
+            return self._specs.get(identifier)
+        record = self.store.load_forward_test(identifier)
+        if record is None:
+            return None
+        start_timestamp = parse_timestamp(record["start_timestamp"])
+        if start_timestamp is None:
+            raise ValueError(f"invalid persisted forward-test timestamp: {identifier}")
+        return ForwardTestSpec(
+            record["experiment_id"],
+            record["strategy_hash"],
+            record["model_hash"],
+            record["config"],
+            start_timestamp,
+            record["bankroll"],
+            tuple(record["allowed_markets"]),
+            record["risk_limits"],
+            ResearchQuality(record["quality"]),
+            start_timestamp,
+        )
+def _normalized_strategy_document(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        try:
+            from .strategy import load_strategy
+
+            return load_strategy(value).to_dict()
+        except Exception:
+            return value
+    return value
+
 
 
 def _content_hash(value: Any) -> str:

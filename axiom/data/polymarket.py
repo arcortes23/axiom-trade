@@ -8,7 +8,9 @@ fabricating probabilities or settlement outcomes.
 """
 from __future__ import annotations
 
+import math
 import urllib.parse
+
 from datetime import datetime
 from typing import Any, Callable, Mapping, Sequence
 
@@ -24,7 +26,7 @@ from ..domain import (
     ensure_utc,
     utc_now,
 )
-from ._http import as_float, decode_jsonish, fetch_json, parse_timestamp, query_url
+from ._http import HTTPFetchError, as_float, decode_jsonish, fetch_json_strict, parse_timestamp, query_url
 from .interfaces import PredictionMarketDataProvider
 
 
@@ -47,33 +49,53 @@ class PolymarketAdapter(PredictionMarketDataProvider):
         timeout: float = 10.0,
         opener: Callable[..., Any] | None = None,
     ) -> None:
-        if timeout <= 0:
-            raise ValueError("timeout must be positive")
+        timeout_value = float(timeout)
+        if not math.isfinite(timeout_value) or timeout_value <= 0:
+            raise ValueError("timeout must be finite and positive")
         # base_url is a convenient alias for Gamma's origin.
-        self.gamma_url = (base_url or gamma_url).rstrip("/")
-        self.clob_url = clob_url.rstrip("/")
-        self.timeout = float(timeout)
+        self.gamma_url = str(base_url or gamma_url).rstrip("/")
+        self.clob_url = str(clob_url).rstrip("/")
+        self.timeout = timeout_value
         self._opener = opener
         self._raw_cache: dict[str, Mapping[str, Any]] = {}
+        self._transport_errors: list[HTTPFetchError] = []
+        self._last_trades_complete = True
+        self._last_trade_cursor: str | None = None
+
+    def consume_transport_errors(self) -> tuple[HTTPFetchError, ...]:
+        errors = tuple(self._transport_errors)
+        self._transport_errors.clear()
+        return errors
 
     def _gamma_get(self, path: str, **params: Any) -> Any | None:
-        return fetch_json(query_url(self.gamma_url, path, params), self.timeout, self._opener)
+        try:
+            return fetch_json_strict(query_url(self.gamma_url, path, params), self.timeout, self._opener)
+        except HTTPFetchError as exc:
+            self._transport_errors.append(exc)
+            return None
 
     def _clob_get(self, path: str, **params: Any) -> Any | None:
-        return fetch_json(query_url(self.clob_url, path, params), self.timeout, self._opener)
+        try:
+            return fetch_json_strict(query_url(self.clob_url, path, params), self.timeout, self._opener)
+        except HTTPFetchError as exc:
+            self._transport_errors.append(exc)
+            return None
 
-    def markets(self, active: bool = True) -> Sequence[PredictionMarketSnapshot]:
-        params: dict[str, Any] = {"active": str(bool(active)).lower(), "limit": 100}
+    def markets(self, active: bool = True, *, limit: int | None = None) -> Sequence[PredictionMarketSnapshot]:
+        if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 0):
+            raise ValueError("limit must be a non-negative integer")
+        if limit == 0:
+            return []
+        page_size = min(100, limit) if limit is not None else 100
+        params: dict[str, Any] = {"active": str(bool(active)).lower(), "limit": page_size}
         if not active:
-            # Gamma's ``active=false`` still returns open markets; ``closed``
-            # is the explicit historical/settled query.
             params["closed"] = "true"
             params["order"] = "createdAt"
             params["ascending"] = "false"
         result: list[PredictionMarketSnapshot] = []
         seen_ids: set[str] = set()
         for page_number in range(100):
-            params["offset"] = page_number * 100
+            params["offset"] = page_number * page_size
             payload = self._gamma_get("/markets", **params)
             if isinstance(payload, Mapping):
                 payload = payload.get("markets", payload.get("data", []))
@@ -88,7 +110,9 @@ class PolymarketAdapter(PredictionMarketDataProvider):
                     seen_ids.add(snapshot.market_id)
                     result.append(snapshot)
                     page_added += 1
-            if len(payload) < 100 or page_added == 0:
+                    if limit is not None and len(result) >= int(limit):
+                        return result
+            if len(payload) < page_size or page_added == 0:
                 break
         return result
 
@@ -164,8 +188,8 @@ class PolymarketAdapter(PredictionMarketDataProvider):
         return result
 
     def order_book_for_token(self, token_id: str, depth: int = 20) -> OrderBookSnapshot | None:
-        if depth <= 0:
-            raise ValueError("depth must be positive")
+        if isinstance(depth, bool) or not isinstance(depth, int) or depth <= 0:
+            raise ValueError("depth must be a positive integer")
         payload = self._clob_get("/book", token_id=str(token_id))
         if not isinstance(payload, Mapping):
             return None
@@ -196,19 +220,36 @@ class PolymarketAdapter(PredictionMarketDataProvider):
                     result[outcome] = book
         return result
 
+    @property
+    def last_trade_cursor(self) -> str | None:
+        return self._last_trade_cursor
+
     def trades(
         self,
         market_id: str,
         start: datetime | None = None,
         end: datetime | None = None,
+        *,
+        max_pages: int = 100,
+        cursor: str | None = None,
     ) -> Sequence[TradePrint]:
-        """Fetch public CLOB trades when the endpoint exposes them."""
+        """Fetch bounded public CLOB trades without advancing incomplete watermarks."""
+        if isinstance(max_pages, bool) or not isinstance(max_pages, int) or max_pages <= 0:
+            raise ValueError("max_pages must be a positive integer")
+        initial_cursor = str(cursor).strip() if cursor is not None and str(cursor).strip() else None
+        self._last_trades_complete = True
+        self._last_trade_cursor = initial_cursor
         params: dict[str, Any] = {"market": str(market_id), "limit": 100}
-        result: list[TradePrint] = []
+        if initial_cursor is not None:
+            params["cursor"] = initial_cursor
         seen: set[str] = set()
-        for _ in range(100):
+        result: list[TradePrint] = []
+        for page_number in range(int(max_pages)):
             previous_cursor = params.get("cursor")
             payload = self._clob_get("/trades", **params)
+            if payload is None:
+                self._last_trades_complete = False
+                break
             cursor = None
             if isinstance(payload, Mapping):
                 rows = payload.get("data", payload.get("trades", []))
@@ -216,6 +257,7 @@ class PolymarketAdapter(PredictionMarketDataProvider):
             else:
                 rows = payload
             if not isinstance(rows, list):
+                self._last_trades_complete = False
                 break
             for row in rows:
                 if not isinstance(row, Mapping):
@@ -223,7 +265,7 @@ class PolymarketAdapter(PredictionMarketDataProvider):
                 stamp = parse_timestamp(row.get("timestamp", row.get("ts", row.get("time"))))
                 price = as_float(row.get("price", row.get("p")))
                 size = as_float(row.get("size", row.get("amount", row.get("q"))))
-                if stamp is None or price is None or size is None or price <= 0 or size <= 0:
+                if stamp is None or price is None or size is None or price <= 0 or price > 1 or size <= 0:
                     continue
                 if start is not None and stamp < ensure_utc(start):
                     continue
@@ -248,9 +290,16 @@ class PolymarketAdapter(PredictionMarketDataProvider):
                         token_id=str(token) if token is not None else None,
                     )
                 )
-            if not cursor or not rows or str(cursor) == str(previous_cursor):
+            if not cursor or not rows:
+                break
+            if str(cursor) == str(previous_cursor):
+                self._last_trade_cursor = str(previous_cursor) if previous_cursor is not None else None
+                self._last_trades_complete = False
                 break
             params["cursor"] = str(cursor)
+            self._last_trade_cursor = str(cursor)
+            if page_number + 1 >= int(max_pages):
+                self._last_trades_complete = False
         result.sort(key=lambda item: item.timestamp)
         return result
 
@@ -294,6 +343,13 @@ class PolymarketAdapter(PredictionMarketDataProvider):
                 "volume": snapshot.volume,
                 "liquidity": snapshot.liquidity,
                 "closed": _boolish(raw.get("closed")),
+                "active": _boolish(raw.get("active")) if raw.get("active") is not None else (
+                    not _boolish(raw.get("closed"))
+                    and snapshot.settlement not in {SettlementState.RESOLVED_YES, SettlementState.RESOLVED_NO, SettlementState.VOID}
+                ),
+                "start": raw.get("startDate", raw.get("start_date", raw.get("createdAt", raw.get("created_at")))),
+                "end": raw.get("endDate", raw.get("end_date", raw.get("endDateIso", raw.get("expirationDate")))),
+                "rules": snapshot.resolution_criteria,
                 "outcomes": decode_jsonish(raw.get("outcomes", [])),
                 "clob_token_ids": decode_jsonish(raw.get("clobTokenIds", raw.get("clob_token_ids", []))),
                 "condition_id": raw.get("conditionId", raw.get("condition_id")),
@@ -303,9 +359,15 @@ class PolymarketAdapter(PredictionMarketDataProvider):
         )
 
     def _remember(self, payload: Mapping[str, Any]) -> None:
-        identifier = payload.get("id", payload.get("market_id"))
-        if identifier is not None:
-            self._raw_cache[str(identifier)] = payload
+        identifiers = (
+            payload.get("id"),
+            payload.get("market_id"),
+            payload.get("conditionId"),
+            payload.get("condition_id"),
+        )
+        for identifier in identifiers:
+            if identifier is not None and str(identifier):
+                self._raw_cache[str(identifier)] = payload
 
     def _yes_token(self, market_id: str) -> str | None:
         tokens = self.token_ids(market_id)

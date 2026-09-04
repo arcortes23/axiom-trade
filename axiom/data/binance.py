@@ -7,6 +7,7 @@ observations.  Returned timestamps are timezone-aware UTC values.
 from __future__ import annotations
 
 from datetime import datetime
+import math
 from typing import Any, Callable, Mapping, Sequence
 
 from ..domain import (
@@ -21,7 +22,7 @@ from ..domain import (
     ensure_utc,
     utc_now,
 )
-from ._http import as_float, as_int, fetch_json, parse_timestamp, query_url
+from ._http import HTTPFetchError, as_float, as_int, fetch_json_strict, parse_timestamp, query_url
 from .interfaces import CryptoMarketDataProvider
 
 
@@ -46,12 +47,14 @@ class BinanceAdapter(CryptoMarketDataProvider):
         timeout: float = 10.0,
         opener: Callable[..., Any] | None = None,
     ) -> None:
-        if timeout <= 0:
-            raise ValueError("timeout must be positive")
+        timeout_value = float(timeout)
+        if not math.isfinite(timeout_value) or timeout_value <= 0:
+            raise ValueError("timeout must be finite and positive")
         self.symbol = self._normalize_symbol(symbol)
         self.base_url = base_url.rstrip("/")
-        self.timeout = float(timeout)
+        self.timeout = timeout_value
         self._opener = opener
+        self._transport_errors: list[HTTPFetchError] = []
 
     @staticmethod
     def _normalize_symbol(symbol: str) -> str:
@@ -60,8 +63,17 @@ class BinanceAdapter(CryptoMarketDataProvider):
             raise ValueError("symbol must not be empty")
         return normalized
 
+    def consume_transport_errors(self) -> tuple[HTTPFetchError, ...]:
+        errors = tuple(self._transport_errors)
+        self._transport_errors.clear()
+        return errors
+
     def _get(self, path: str, **params: Any) -> Any | None:
-        return fetch_json(query_url(self.base_url, path, params), self.timeout, self._opener)
+        try:
+            return fetch_json_strict(query_url(self.base_url, path, params), self.timeout, self._opener)
+        except HTTPFetchError as exc:
+            self._transport_errors.append(exc)
+            return None
 
     def historical_ohlcv(
         self,
@@ -79,7 +91,7 @@ class BinanceAdapter(CryptoMarketDataProvider):
             "endTime": _millis(end),
         }
         bars: list[OHLCVBar] = []
-        while True:
+        for _page in range(100):
             payload = self._get("/api/v3/klines", **params)
             if not isinstance(payload, list):
                 break
@@ -222,9 +234,9 @@ class BinanceAdapter(CryptoMarketDataProvider):
 
     def order_book(self, symbol: str, depth: int = 20) -> OrderBookSnapshot | None:
         symbol = self._normalize_symbol(symbol)
-        if depth <= 0:
-            raise ValueError("depth must be positive")
-        payload = self._get("/api/v3/depth", symbol=symbol, limit=min(int(depth), 5000))
+        if isinstance(depth, bool) or not isinstance(depth, int) or depth <= 0:
+            raise ValueError("depth must be a positive integer")
+        payload = self._get("/api/v3/depth", symbol=symbol, limit=min(depth, 5000))
         if not isinstance(payload, Mapping):
             return None
         bids = self._levels(payload.get("bids"), reverse=True, depth=depth)
