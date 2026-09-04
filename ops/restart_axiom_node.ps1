@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [string]$DbPath = "runtime-data/axiom_phase3.sqlite",
+    [string]$DbPath = "runtime-data/axiom.sqlite",
     [double]$IntervalSeconds = 60,
     [ValidateSet("public", "synthetic", "disabled")]
     [string]$CryptoSource = "public",

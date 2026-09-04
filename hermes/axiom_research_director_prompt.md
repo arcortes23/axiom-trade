@@ -43,7 +43,7 @@ At each scheduled run:
    market histories into the prompt.
 
    ```powershell
-   python -m axiom.cli research-summary --db "<repo>\runtime-data\axiom_phase4.sqlite"
+   python -m axiom.cli research-summary --db "<repo>\runtime-data\axiom.sqlite"
    ```
 
 2. Submit **one conceptual hypothesis per run**. Submit more only when the
@@ -73,7 +73,7 @@ At each scheduled run:
    before enqueue:
 
    ```powershell
-   python -m axiom.cli submit-proposal --db "<repo>\runtime-data\axiom_phase4.sqlite" --proposal '{"proposal_id":"proposal-<stable-id>","statement":"<one falsifiable statement>","source":"<public source or AXIOM dataset/research-result id>","tests":["<bounded chronological test>"],"dataset_version":"<immutable version>","time_split":"train-validation-holdout","paper_only":true,"experiment_plan":{"schema_version":"1","market_type":"prediction","template":"probability_mispricing","dataset_version":"<immutable version>","max_variants":4,"min_samples":30,"paper_only":true}}'
+   python -m axiom.cli submit-proposal --db "<repo>\runtime-data\axiom.sqlite" --proposal '{"proposal_id":"proposal-<stable-id>","statement":"<one falsifiable statement>","source":"<public source or AXIOM dataset/research-result id>","tests":["<bounded chronological test>"],"dataset_version":"<immutable version>","time_split":"train-validation-holdout","paper_only":true,"experiment_plan":{"schema_version":"1","market_type":"prediction","template":"probability_mispricing","dataset_version":"<immutable version>","max_variants":4,"min_samples":30,"paper_only":true}}'
    ```
 
 5. Treat `accepted: false` as a hard stop. Do not retry with a larger
