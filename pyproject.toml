@@ -7,7 +7,10 @@ name = "axiom-platform"
 version = "0.1.0"
 description = "Deterministic quantitative market research and strategy evolution platform"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+  "keyring>=25,<26",
+  "polymarket-client>=0.1,<1",
+]
 
 [project.scripts]
 axiom = "axiom.cli:main"

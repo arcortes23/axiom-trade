@@ -29,6 +29,36 @@ python -m axiom.cli research-summary
 python -m axiom.cli submit-proposal --proposal '{"proposal_id":"proposal-example","statement":"<one falsifiable statement>","source":"<public source or immutable AXIOM result>","tests":["<bounded chronological test>"],"dataset_version":"<immutable version>","time_split":"train-validation-holdout","paper_only":true,"experiment_plan":{"schema_version":"1","market_type":"prediction","template":"probability_mispricing","dataset_version":"<immutable version>","max_variants":4,"min_samples":30,"paper_only":true}}'
 ```
 
+## Micro-live Polymarket canary
+
+Production live trading remains disabled. The optional `LIVE_CANARY` path uses
+the current official Polymarket unified Python SDK and CLOB V2 semantics only.
+Use a dedicated Polymarket wallet containing only the small amount intended for
+AXIOM canary testing. Never provide a primary-wallet private key.
+
+Credentials are stored through Windows Credential Manager via the OS keyring:
+
+```powershell
+python -m axiom.cli credentials configure polymarket
+python -m axiom.cli credentials status
+```
+
+Environment variables are supported only when `--allow-environment` is passed.
+They are `POLYMARKET_PRIVATE_KEY`, `POLYMARKET_WALLET_ADDRESS`,
+`POLYMARKET_RELAYER_API_KEY`, and `POLYMARKET_RELAYER_API_KEY_ADDRESS`.
+Credential values never enter SQLite, dashboard JSON, reports, or logs.
+
+```powershell
+python -m axiom.cli canary-check --candidate <candidate-id> --market <market-id> --token <token-id>
+python -m axiom.cli canary-arm --venue polymarket --candidate <candidate-id> --target-notional-usd 1.00 --expires-hours 24
+python -m axiom.cli canary-status
+python -m axiom.cli canary-disarm
+python -m axiom.cli canary-kill
+```
+
+`canary-check` is no-order. `canary-kill` prevents further submissions
+immediately. An expired arm returns to paper-only automatically.
+
 PowerShell lifecycle commands use the same default:
 
 ```powershell

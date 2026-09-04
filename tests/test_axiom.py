@@ -990,36 +990,18 @@ class PhaseTwoQualityTests(unittest.TestCase):
         self.assertEqual(fills[0].timestamp, T0)
         self.assertEqual(portfolio.get_position("m", outcome="yes").quantity, 0.0)  # type: ignore[union-attr]
 
-    def test_polymarket_trades_follow_cursor_after_short_page(self) -> None:
+    def test_polymarket_public_collector_does_not_call_private_trades_endpoint(self) -> None:
         calls: list[str] = []
 
-        class Response:
-            def __init__(self, payload: object) -> None:
-                self.payload = json.dumps(payload).encode("utf-8")
-
-            def read(self) -> bytes:
-                return self.payload
-
-            def close(self) -> None:
-                return
-
-        def opener(request: object, timeout: float) -> Response:
+        def opener(request: object, timeout: float) -> object:
             del timeout
-            url = str(getattr(request, "full_url"))
-            calls.append(url)
-            cursor = parse_qs(urlparse(url).query).get("cursor")
-            row = {
-                "timestamp": int((T0 + timedelta(minutes=len(calls))).timestamp()),
-                "price": "0.50",
-                "size": "1.0",
-                "id": f"trade-{len(calls)}",
-                "side": "BUY",
-            }
-            return Response({"data": [row], "next_cursor": "next" if not cursor else None})
+            calls.append(str(getattr(request, "full_url")))
+            raise AssertionError("public collector must not call authenticated /trades")
 
-        trades = PolymarketAdapter(opener=opener, timeout=1.0).trades("m")
-        self.assertEqual(len(trades), 2)
-        self.assertEqual(len(calls), 2)
+        adapter = PolymarketAdapter(opener=opener, timeout=1.0)
+        self.assertEqual(adapter.trades("m"), ())
+        self.assertFalse(adapter.public_trade_history_available)
+        self.assertEqual(calls, [])
 
     def test_immutable_trade_keys_are_scoped_and_robustness_rejects_bad_counts(self) -> None:
         trade = TradePrint(T0, 0.5, 1.0, trade_id="same")

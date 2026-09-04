@@ -8,8 +8,10 @@ import json
 import math
 from pathlib import Path
 from typing import Any, Mapping, Sequence
+from decimal import Decimal
 
 from .collector import CollectorConfig, PolymarketCollector
+from .canary import CanaryBlocked, CanaryService, CredentialStore, PolymarketClobV2Venue
 from .dashboard import DashboardData, DashboardServer
 from .data import BinanceAdapter, PolymarketAdapter, SyntheticCryptoProvider
 from .director import compact_report, research_summary, validate_hermes_proposal
@@ -259,6 +261,36 @@ def build_parser() -> argparse.ArgumentParser:
     proposal = commands.add_parser("submit-proposal", help="validate and enqueue a bounded Hermes research proposal")
     proposal.add_argument("--db", default=DEFAULT_DB_PATH)
     proposal.add_argument("--proposal", required=True, help="JSON object or path to a JSON file")
+    credentials = commands.add_parser("credentials", help="configure or inspect secure venue credentials")
+    credential_commands = credentials.add_subparsers(dest="credentials_command", required=True)
+    credential_configure = credential_commands.add_parser("configure")
+    credential_configure.add_argument("venue", choices=("polymarket",))
+    credential_status = credential_commands.add_parser("status")
+    credential_status.add_argument("venue", nargs="?", choices=("polymarket",), default="polymarket")
+    credential_status.add_argument("--allow-environment", action="store_true")
+    for name, help_text in (
+        ("canary-status", "show micro-live canary state"),
+        ("canary-disarm", "return immediately to paper-only"),
+        ("canary-kill", "prevent all further canary submissions"),
+    ):
+        command = commands.add_parser(name, help=help_text)
+        command.add_argument("--db", default=DEFAULT_DB_PATH)
+    eligible = commands.add_parser("canary-eligible", help="verify and record independent canary eligibility")
+    eligible.add_argument("--db", default=DEFAULT_DB_PATH)
+    eligible.add_argument("--candidate", required=True)
+    arm = commands.add_parser("canary-arm", help="explicitly arm an expiring Polymarket micro-live canary")
+    arm.add_argument("--db", default=DEFAULT_DB_PATH)
+    arm.add_argument("--venue", choices=("polymarket",), required=True)
+    arm.add_argument("--candidate", required=True)
+    arm.add_argument("--target-notional-usd", type=Decimal, default=Decimal("1.00"))
+    arm.add_argument("--expires-hours", type=Decimal, default=Decimal("24"))
+    arm.add_argument("--allow-environment", action="store_true")
+    check = commands.add_parser("canary-check", help="perform authenticated checks without placing an order")
+    check.add_argument("--db", default=DEFAULT_DB_PATH)
+    check.add_argument("--candidate")
+    check.add_argument("--market")
+    check.add_argument("--token")
+    check.add_argument("--allow-environment", action="store_true")
     return parser
 def _register_cli_forward_test(args: argparse.Namespace, store: AxiomStore, *, historical: bool = False) -> Any:
     current = utc_now()
@@ -367,6 +399,42 @@ def _load_cli_execution_inputs(args: argparse.Namespace, spec: Any) -> tuple[Any
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.command == "credentials":
+        credentials = CredentialStore()
+        if args.credentials_command == "configure":
+            print("Use a dedicated Polymarket wallet containing only the small amount intended for AXIOM canary testing.")
+            credentials.configure()
+        print(json.dumps({"venue": "polymarket", "configured": credentials.configured(allow_environment=getattr(args, "allow_environment", False))}))
+        return 0
+    if args.command in {"canary-status", "canary-disarm", "canary-kill", "canary-eligible", "canary-arm", "canary-check"}:
+        try:
+            with AxiomStore(args.db) as store:
+                service = CanaryService(store)
+                if args.command == "canary-status":
+                    payload = service.status()
+                elif args.command == "canary-disarm":
+                    service.disarm(); payload = service.status()
+                elif args.command == "canary-kill":
+                    service.kill(); payload = service.status()
+                elif args.command == "canary-eligible":
+                    service.mark_eligible(args.candidate); payload = {"candidate": args.candidate, "canary_eligible": True, "live_execution": False}
+                else:
+                    values = service.credentials.load(allow_environment=args.allow_environment)
+                    venue = PolymarketClobV2Venue(values) if values else None
+                    if args.command == "canary-check":
+                        payload = service.check(candidate_id=args.candidate, venue=venue, market_id=args.market, token_id=args.token, allow_environment=args.allow_environment)
+                    else:
+                        if venue is None:
+                            raise CanaryBlocked("CREDENTIALS_NOT_CONFIGURED")
+                        confirmation = input(f"Arm {args.candidate} on Polymarket for ${args.target_notional_usd} until {args.expires_hours}h? Type ARM: ")
+                        if confirmation.strip() != "ARM":
+                            raise CanaryBlocked("OPERATOR_CONFIRMATION_REQUIRED")
+                        payload = service.arm(args.candidate, venue=venue, target_notional_usd=args.target_notional_usd, expires_hours=args.expires_hours, credentials_configured=True)
+            print(json.dumps(payload, sort_keys=True, indent=2, default=str))
+            return 0 if payload.get("ready", True) else 1
+        except CanaryBlocked as exc:
+            print(json.dumps({"ready": False, "message": "NOT READY FOR MICRO LIVE CANARY", "failures": [str(exc)], "live_execution": False}, sort_keys=True, indent=2))
+            return 1
     if args.command in {"demo", "synthetic-demo", "research"}:
         result = run_synthetic_research(rows=args.rows, train=args.train, validation=args.validation, holdout=args.holdout, strategy_id=args.strategy)
         print(json.dumps(result, sort_keys=True, indent=2))

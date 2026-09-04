@@ -36,6 +36,12 @@ def validate_hermes_proposal(proposal: Mapping[str, Any], *, max_bytes: int = 16
         raise ValueError("max_bytes must be a positive integer")
     if not isinstance(proposal, Mapping):
         return ProposalValidation(False, None, ("proposal must be a mapping",))
+    forbidden_canary = sorted(
+        str(key) for key in proposal
+        if any(token in str(key).replace("-", "_").lower() for token in ("canary", "credential", "private_key", "place_order", "cancel_order"))
+    )
+    if forbidden_canary:
+        return ProposalValidation(False, None, ("LIVE_EXECUTION_FORBIDDEN", f"Hermes cannot access canary controls: {forbidden_canary}"))
     try:
         normalized = _validate_payload(proposal)
     except ResearchBusPermissionError as exc:

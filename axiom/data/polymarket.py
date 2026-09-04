@@ -221,8 +221,13 @@ class PolymarketAdapter(PredictionMarketDataProvider):
         return result
 
     @property
+    def public_trade_history_available(self) -> bool:
+        """CLOB ``GET /trades`` is authenticated in the current V2 API."""
+        return False
+
+    @property
     def last_trade_cursor(self) -> str | None:
-        return self._last_trade_cursor
+        return None
 
     def trades(
         self,
@@ -233,75 +238,16 @@ class PolymarketAdapter(PredictionMarketDataProvider):
         max_pages: int = 100,
         cursor: str | None = None,
     ) -> Sequence[TradePrint]:
-        """Fetch bounded public CLOB trades without advancing incomplete watermarks."""
+        """Return no rows rather than calling the authenticated account endpoint.
+
+        Public price history and last-trade streams remain available, but they
+        are not equivalent to authenticated account trade history.
+        """
         if isinstance(max_pages, bool) or not isinstance(max_pages, int) or max_pages <= 0:
             raise ValueError("max_pages must be a positive integer")
-        initial_cursor = str(cursor).strip() if cursor is not None and str(cursor).strip() else None
         self._last_trades_complete = True
-        self._last_trade_cursor = initial_cursor
-        params: dict[str, Any] = {"market": str(market_id), "limit": 100}
-        if initial_cursor is not None:
-            params["cursor"] = initial_cursor
-        seen: set[str] = set()
-        result: list[TradePrint] = []
-        for page_number in range(int(max_pages)):
-            previous_cursor = params.get("cursor")
-            payload = self._clob_get("/trades", **params)
-            if payload is None:
-                self._last_trades_complete = False
-                break
-            cursor = None
-            if isinstance(payload, Mapping):
-                rows = payload.get("data", payload.get("trades", []))
-                cursor = payload.get("next_cursor", payload.get("nextCursor"))
-            else:
-                rows = payload
-            if not isinstance(rows, list):
-                self._last_trades_complete = False
-                break
-            for row in rows:
-                if not isinstance(row, Mapping):
-                    continue
-                stamp = parse_timestamp(row.get("timestamp", row.get("ts", row.get("time"))))
-                price = as_float(row.get("price", row.get("p")))
-                size = as_float(row.get("size", row.get("amount", row.get("q"))))
-                if stamp is None or price is None or size is None or price <= 0 or price > 1 or size <= 0:
-                    continue
-                if start is not None and stamp < ensure_utc(start):
-                    continue
-                if end is not None and stamp > ensure_utc(end):
-                    continue
-                token = row.get("asset_id", row.get("token_id", row.get("assetId")))
-                trade_id = row.get("id", row.get("trade_id", row.get("tradeId")))
-                identity = str(trade_id or f"{stamp.isoformat()}|{price}|{size}|{token or ''}")
-                if identity in seen:
-                    continue
-                seen.add(identity)
-                side_value = str(row.get("side", "")).strip().lower()
-                side = Side(side_value) if side_value in {"buy", "sell"} else None
-                result.append(
-                    TradePrint(
-                        stamp,
-                        price,
-                        size,
-                        side,
-                        trade_id=identity,
-                        market_id=str(market_id),
-                        token_id=str(token) if token is not None else None,
-                    )
-                )
-            if not cursor or not rows:
-                break
-            if str(cursor) == str(previous_cursor):
-                self._last_trade_cursor = str(previous_cursor) if previous_cursor is not None else None
-                self._last_trades_complete = False
-                break
-            params["cursor"] = str(cursor)
-            self._last_trade_cursor = str(cursor)
-            if page_number + 1 >= int(max_pages):
-                self._last_trades_complete = False
-        result.sort(key=lambda item: item.timestamp)
-        return result
+        self._last_trade_cursor = None
+        return ()
 
     @staticmethod
     def _levels(value: Any, *, reverse: bool, depth: int) -> list[OrderBookLevel]:

@@ -51,6 +51,7 @@ class CollectorConfig:
     jitter_seconds: float = 0.25
     failure_cooldown_seconds: float = 30.0
     max_trade_pages: int = 100
+    max_provider_clock_skew_seconds: float = 5.0
     retain_cycles: int = 1
     poll_plan: Callable[..., Any] | None = None
 
@@ -74,6 +75,7 @@ class CollectorConfig:
             "backoff_max_seconds",
             "jitter_seconds",
             "failure_cooldown_seconds",
+            "max_provider_clock_skew_seconds",
         ):
             value = float(getattr(self, name))
             if not math.isfinite(value) or value < 0:
@@ -430,6 +432,7 @@ class PolymarketCollector:
             metadata_hash=metadata_hash,
         ):
             counters["metadata_inserted"] += 1
+        books_request_started_at = observed_at if point_in_time else ensure_utc(self.clock())
         try:
             books = dict(
                 self._call_provider(
@@ -455,10 +458,11 @@ class PolymarketCollector:
             yes_book = None
         if not isinstance(no_book, OrderBookSnapshot):
             no_book = None
+        latest_allowed_source_time = books_retrieved_at + timedelta(seconds=self.config.max_provider_clock_skew_seconds)
         future_data = [
             label
             for label, item in (("market", snapshot), ("yes order book", yes_book), ("no order book", no_book))
-            if item is not None and ensure_utc(item.timestamp) > books_retrieved_at
+            if item is not None and ensure_utc(item.timestamp) > latest_allowed_source_time
         ]
         if future_data:
             counters["errors"] += len(future_data)
@@ -489,6 +493,8 @@ class PolymarketCollector:
             "liquidity": canonical.liquidity,
             "observed_at": collection_observed_at.isoformat(),
             "source_timestamp": source_timestamp.isoformat(),
+            "request_started_at": books_request_started_at.isoformat(),
+            "response_received_at": books_retrieved_at.isoformat(),
             "time_to_resolution_seconds": (
                 max(0.0, (canonical.expiry - source_timestamp).total_seconds()) if canonical.expiry else None
             ),
