@@ -362,6 +362,19 @@ def build_parser() -> argparse.ArgumentParser:
     check.add_argument("--token")
     check.add_argument("--asset-id", dest="token")
     check.add_argument("--allow-environment", action="store_true")
+    signal_command = commands.add_parser(
+        "canary-signal",
+        help="evaluate one eligible candidate against the latest stored observation",
+    )
+    signal_command.add_argument("--db", default=DEFAULT_DB_PATH)
+    signal_command.add_argument("--candidate", required=True)
+    submit_command = commands.add_parser(
+        "canary-submit",
+        help="submit exactly one persisted canary signal after operator confirmation",
+    )
+    submit_command.add_argument("--db", default=DEFAULT_DB_PATH)
+    submit_command.add_argument("--signal", required=True)
+    submit_command.add_argument("--allow-environment", action="store_true")
     return parser
 def _register_cli_forward_test(args: argparse.Namespace, store: AxiomStore, *, historical: bool = False) -> Any:
     current = utc_now()
@@ -721,6 +734,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         "canary-arm",
         "canary-check",
         "canary-connectivity-check",
+        "canary-signal",
+        "canary-submit",
     }:
         try:
             with AxiomStore(args.db) as store:
@@ -728,7 +743,30 @@ def main(argv: Sequence[str] | None = None) -> int:
                     store,
                     allow_environment=getattr(args, "allow_environment", False),
                 )
-                if args.command == "canary-status":
+                if args.command == "canary-signal":
+                    signal = service.generate_signal(args.candidate)
+                    payload = {
+                        "candidate": args.candidate,
+                        "signal": signal,
+                        "signal_status": "READY" if signal is not None else "NO_CANARY_SIGNAL",
+                        "paper_only": True,
+                        "live_execution": False,
+                    }
+                elif args.command == "canary-submit":
+                    confirmation = input(
+                        f"Submit persisted canary signal {args.signal}. "
+                        "Type SUBMIT $1 to continue: "
+                    )
+                    if confirmation.strip() != "SUBMIT $1":
+                        raise CanaryBlocked("OPERATOR_CONFIRMATION_REQUIRED")
+                    payload = service.submit_signal(
+                        args.signal,
+                        venue=PolymarketClobV2Venue(
+                            allow_environment=args.allow_environment
+                        ),
+                        allow_environment=args.allow_environment,
+                    )
+                elif args.command == "canary-status":
                     payload = service.status()
                 elif args.command == "canary-disarm":
                     service.disarm()

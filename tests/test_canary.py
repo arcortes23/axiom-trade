@@ -687,4 +687,322 @@ class CanaryTests(unittest.TestCase):
     def test_dashboard_labels_real_canary_and_production_disabled(self):
         data=DashboardData(store=self.store).operator_data(); self.assertFalse(data["live_execution"]); self.assertFalse(PRODUCTION_LIVE_EXECUTION); self.assertIn("REAL CANARY MONEY",_dashboard_html()); self.assertEqual(data["canary"]["production_live_trading"],"DISABLED")
 
+class CanarySignalTests(unittest.TestCase):
+    def setUp(self):
+        self.now = T0
+        self.store = HealthyStore(":memory:")
+        self.service = CanaryService(
+            self.store,
+            credentials=FakeCredentials(),
+            clock=lambda: self.now,
+        )
+        self.strategy = {
+            "version": 1,
+            "market_type": "prediction",
+            "family": "probability_mispricing",
+            "parameters": {"threshold": 0.05},
+            "operations": [],
+            "probability_model": "fixed",
+            "resolution_aware": True,
+            "resolution_inputs": ["expiry", "settlement"],
+            "strategy_id": "C",
+        }
+        self.model = {"probability": 0.80}
+        self._add_candidate("C")
+        self._save_snapshot("snap")
+
+    def tearDown(self):
+        self.store.close()
+
+    def _add_candidate(self, candidate_id):
+        strategy = {**self.strategy, "strategy_id": candidate_id}
+        strategy_hash = self.service._document_hash(strategy)
+        model_hash = self.service._document_hash(self.model)
+        config_hash = "config-hash"
+        payload = {
+            "schema_validated": True,
+            "historical_backtest_passed": True,
+            "validation_passed": True,
+            "robustness_passed": True,
+            "data_quality_passed": True,
+            "frozen": True,
+            "holdout_used": False,
+            "strategy_hash": strategy_hash,
+            "model_hash": model_hash,
+            "config_hash": config_hash,
+            "frozen_hash": hashlib.sha256(
+                "|".join((strategy_hash, model_hash, config_hash)).encode()
+            ).hexdigest(),
+            "strategy_document": strategy,
+            "model_document": self.model,
+        }
+        self.store.save_candidate_lifecycle(
+            candidate_id, "IDEA", payload, timestamp=T0
+        )
+        self.store.save_candidate_lifecycle(
+            candidate_id, "FROZEN", payload, timestamp=T0
+        )
+        self.service.mark_eligible(candidate_id)
+
+    def _save_snapshot(
+        self,
+        snapshot_id,
+        *,
+        active=True,
+        price="0.50",
+        settlement="open",
+    ):
+        payload = {
+            "source_type": "FORWARD_COLLECTED",
+            "snapshot": {
+                "market_id": "m",
+                "timestamp": T0.isoformat(),
+                "yes_mid": price,
+                "yes_ask": price,
+                "no_ask": price,
+                "yes_token_id": "yes",
+                "no_token_id": "no",
+                "settlement": settlement,
+            },
+            "yes_token_id": "yes",
+            "no_token_id": "no",
+            "settlement": settlement,
+            "active": active,
+        }
+        self.store.save_polymarket_snapshot(
+            snapshot_id,
+            "m",
+            T0,
+            self.now,
+            payload,
+            source_type="FORWARD_COLLECTED",
+        )
+
+    def _signal(self):
+        signal = self.service.generate_signal("C")
+        self.assertIsNotNone(signal)
+        assert signal is not None
+        return signal
+
+    def _arm(self, candidate_id="C"):
+        return self.service.arm(
+            candidate_id,
+            venue=FakeVenue(),
+            credentials_configured=True,
+        )
+
+    def test_eligible_candidate_generates_persisted_signal(self):
+        signal = self._signal()
+        self.assertEqual(signal["status"], "READY")
+        self.assertEqual(signal["candidate_id"], "C")
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM canary_signals"
+            ).fetchone()[0],
+            1,
+        )
+
+    def test_inactive_candidate_has_no_signal(self):
+        self._save_snapshot("zz-inactive", active=False)
+        self.assertIsNone(self.service.generate_signal("C"))
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM canary_signals"
+            ).fetchone()[0],
+            0,
+        )
+
+    def test_signal_records_exact_frozen_hash_binding(self):
+        signal = self._signal()
+        lifecycle = self.store.load_candidate_lifecycle("C")
+        payload = lifecycle["payload"]
+        self.assertEqual(signal["strategy_hash"], payload["strategy_hash"])
+        self.assertEqual(signal["model_hash"], payload["model_hash"])
+        self.assertEqual(signal["config_hash"], payload["config_hash"])
+        self.assertEqual(
+            signal["frozen_hash"],
+            hashlib.sha256(
+                "|".join(
+                    (
+                        signal["strategy_hash"],
+                        signal["model_hash"],
+                        signal["config_hash"],
+                    )
+                ).encode()
+            ).hexdigest(),
+        )
+
+    def test_changed_candidate_invalidates_signal(self):
+        signal = self._signal()
+        changed = dict(self.store.load_candidate_lifecycle("C")["payload"])
+        changed["data_quality_passed"] = False
+        self.store.save_candidate_lifecycle("C", "FROZEN", changed, timestamp=T0)
+        with self.assertRaisesRegex(CanaryBlocked, "CANDIDATE_NOT_CANARY_ELIGIBLE"):
+            self.service.submit_signal(
+                signal["signal_id"], venue=FakeVenue(), allow_test_venue=True
+            )
+        self.assertEqual(
+            self.service.get_signal(signal["signal_id"])["status"],
+            "NO_LONGER_VALID",
+        )
+
+    def test_expired_signal_is_rejected(self):
+        signal = self._signal()
+        self.now = T0 + timedelta(seconds=61)
+        with self.assertRaisesRegex(CanaryBlocked, "CANARY_SIGNAL_EXPIRED"):
+            self.service.submit_signal(
+                signal["signal_id"], venue=FakeVenue(), allow_test_venue=True
+            )
+        self.assertEqual(
+            self.service.get_signal(signal["signal_id"])["status"], "EXPIRED"
+        )
+
+    def test_cli_exposes_no_signal_overrides(self):
+        with self.assertRaises(SystemExit):
+            main(
+                [
+                    "canary-submit",
+                    "--db",
+                    ":memory:",
+                    "--signal",
+                    "s",
+                    "--market",
+                    "forged-market",
+                ]
+            )
+
+    def test_armed_candidate_mismatch_rejects_without_submission(self):
+        signal = self._signal()
+        self._add_candidate("D")
+        self._arm("D")
+        venue = FakeVenue()
+        with self.assertRaisesRegex(CanaryBlocked, "CANDIDATE_MISMATCH"):
+            self.service.submit_signal(
+                signal["signal_id"], venue=venue, allow_test_venue=True
+            )
+        self.assertFalse(venue.submissions)
+
+    def test_duplicate_signal_rejected(self):
+        signal = self._signal()
+        self._arm()
+        venue = FakeVenue()
+        self.service.submit_signal(
+            signal["signal_id"], venue=venue, allow_test_venue=True
+        )
+        with self.assertRaisesRegex(CanaryBlocked, "DUPLICATE_SIGNAL"):
+            self.service.submit_signal(
+                signal["signal_id"], venue=venue, allow_test_venue=True
+            )
+        self.assertEqual(len(venue.submissions), 1)
+
+    def test_killed_canary_rejects_signal(self):
+        signal = self._signal()
+        self._arm()
+        self.service.kill()
+        venue = FakeVenue()
+        with self.assertRaisesRegex(CanaryBlocked, "CANARY_NOT_ARMED"):
+            self.service.submit_signal(
+                signal["signal_id"], venue=venue, allow_test_venue=True
+            )
+        self.assertFalse(venue.submissions)
+
+    def test_complete_gate_revalidation_rejects_signal(self):
+        signal = self._signal()
+        self._arm()
+        changed = dict(self.store.load_candidate_lifecycle("C")["payload"])
+        changed["robustness_passed"] = False
+        self.store.save_candidate_lifecycle("C", "FROZEN", changed, timestamp=T0)
+        with self.assertRaisesRegex(CanaryBlocked, "CANDIDATE_NOT_CANARY_ELIGIBLE"):
+            self.service.submit_signal(
+                signal["signal_id"], venue=FakeVenue(), allow_test_venue=True
+            )
+
+    def test_exact_submit_confirmation_is_required(self):
+        with patch("builtins.input", return_value="submit $1"):
+            self.assertEqual(
+                main(
+                    [
+                        "canary-submit",
+                        "--db",
+                        ":memory:",
+                        "--signal",
+                        "missing",
+                    ]
+                ),
+                1,
+            )
+
+    def test_aborted_submit_makes_zero_exchange_requests(self):
+        venue = FakeVenue()
+        with patch("builtins.input", return_value="SUBMIT"):
+            self.assertEqual(
+                main(
+                    [
+                        "canary-submit",
+                        "--db",
+                        ":memory:",
+                        "--signal",
+                        "missing",
+                    ]
+                ),
+                1,
+            )
+        self.assertFalse(venue.submissions)
+
+    def test_signal_generation_makes_zero_exchange_mutations(self):
+        self.assertIsNotNone(self._signal())
+        self.assertFalse(FakeVenue().submissions)
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM canary_ledger"
+            ).fetchone()[0],
+            0,
+        )
+
+    def test_dashboard_displays_signal_readiness_separately(self):
+        signal = self._signal()
+        data = DashboardData(store=self.store).operator_data()
+        self.assertEqual(data["canary_signal"]["signal_id"], signal["signal_id"])
+        html = _dashboard_html()
+        self.assertIn("Signal readiness", html)
+        self.assertIn("Order result", html)
+        self.assertNotIn("do_POST", html)
+
+    def test_signal_submission_timeout_is_unknown(self):
+        signal = self._signal()
+        self._arm()
+        release = threading.Event()
+
+        class TimeoutVenue(FakeVenue):
+            def submit_limit_order(self, **kwargs):
+                release.wait(1)
+                return {"ok": True, "order_id": "late-order", "status": "matched"}
+
+        try:
+            with patch("axiom.canary.CANARY_SUBMISSION_TIMEOUT_SECONDS", 0.01):
+                with self.assertRaisesRegex(
+                    CanaryBlocked, "CANARY_SUBMISSION_UNKNOWN"
+                ):
+                    self.service.submit_signal(
+                        signal["signal_id"],
+                        venue=TimeoutVenue(),
+                        allow_test_venue=True,
+                    )
+        finally:
+            release.set()
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT status FROM canary_ledger WHERE signal_id=?",
+                (signal["signal_id"],),
+            ).fetchone()[0],
+            "UNKNOWN",
+        )
+        self.assertEqual(
+            self.service.get_signal(signal["signal_id"])["status"], "UNKNOWN"
+        )
+
+    def test_signal_suite_never_enables_real_orders(self):
+        self.assertFalse(PRODUCTION_LIVE_EXECUTION)
+        self.assertNotIn("live_execution\": true", json.dumps(self._signal()))
+
 if __name__=="__main__": unittest.main()
