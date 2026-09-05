@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import hashlib
 import json
 from pathlib import Path
 import tempfile
@@ -206,6 +207,33 @@ class DashboardPaginationFixture(unittest.TestCase):
                         reason="fixture event pagination",
                         timestamp=T0,
                     )
+            elif index == 2:
+                payload = {
+                    **payload,
+                    "strategy_hash": "fixture-strategy-hash-02",
+                    "model_hash": "fixture-model-hash-02",
+                    "config_hash": "fixture-config-hash-02",
+                }
+                payload["frozen_hash"] = hashlib.sha256(
+                    "|".join(
+                        payload[key] for key in ("strategy_hash", "model_hash", "config_hash")
+                    ).encode()
+                ).hexdigest()
+                self.store.save_candidate_lifecycle(
+                    candidate_id,
+                    "IDEA",
+                    payload,
+                    reason="fixture seed",
+                    timestamp=T0,
+                )
+                self.store.save_candidate_lifecycle(
+                    candidate_id,
+                    "FROZEN",
+                    payload,
+                    from_stage="IDEA",
+                    reason="fixture seed",
+                    timestamp=T0,
+                )
             elif index % 2 == 0:
                 self.store.save_candidate_lifecycle(
                     candidate_id,
@@ -230,6 +258,29 @@ class DashboardPaginationFixture(unittest.TestCase):
                     reason="fixture seed",
                     timestamp=T0,
                 )
+        # Persist one historical-gates-passed candidate as CANARY_ELIGIBLE
+        # before any paper-forward or promotion stage.
+        self.store.connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS canary_eligibility (
+              candidate_id TEXT PRIMARY KEY, eligible_at TEXT NOT NULL,
+              frozen_hash TEXT NOT NULL, evidence_json TEXT NOT NULL
+            );
+            """
+        )
+        eligible_record = self.store.load_candidate_lifecycle("candidate-02")
+        assert isinstance(eligible_record, dict)
+        eligible_payload = eligible_record["payload"]
+        self.store.connection.execute(
+            "INSERT INTO canary_eligibility(candidate_id,eligible_at,frozen_hash,evidence_json) VALUES (?,?,?,?)",
+            (
+                "candidate-02",
+                T0.isoformat(),
+                eligible_payload["frozen_hash"],
+                json.dumps(eligible_payload, sort_keys=True),
+            ),
+        )
+        self.store.connection.commit()
     def _seed_queue(self) -> None:
         for index in range(QUEUE_COUNT):
             self.store.enqueue_research_item(
@@ -551,6 +602,69 @@ class DashboardPaginationEndpointTests(DashboardPaginationFixture):
             [item["candidate_id"] for item in descending["items"]],
             [f"candidate-{index:02d}" for index in range(12, 2, -1)],
         )
+    def test_candidate_statuses_keep_canary_and_paper_lifecycle_distinct(self) -> None:
+        page = self._page(
+            "api/v2/candidates",
+            page=1,
+            page_size=10,
+            sort="candidate_id",
+            direction="asc",
+            expected_page=1,
+            expected_size=10,
+            expected_total=CANDIDATE_COUNT,
+        )
+        eligible_before_paper = next(item for item in page["items"] if item["candidate_id"] == "candidate-02")
+        self.assertEqual(eligible_before_paper["stage"], "FROZEN")
+        self.assertEqual(eligible_before_paper["historical_gates"], "PASSED")
+        self.assertTrue(eligible_before_paper["canary_eligible"])
+        self.assertEqual(eligible_before_paper["canary_status"], "ELIGIBLE")
+        self.assertFalse(eligible_before_paper["paper_forward"])
+        self.assertEqual(eligible_before_paper["paper_forward_status"], "NOT_STARTED")
+        self.assertFalse(eligible_before_paper["paper_promotable"])
+        self.assertEqual(eligible_before_paper["paper_promotable_status"], "NOT_YET")
+
+        promoted = next(item for item in page["items"] if item["candidate_id"] == "candidate-00")
+        self.assertTrue(promoted["paper_forward"])
+        self.assertTrue(promoted["paper_promotable"])
+        self.assertFalse(promoted["canary_eligible"])
+
+        status, detail, _ = self._request("api/v2/candidates/candidate-02")
+        self.assertEqual(status, 200)
+        assert isinstance(detail, dict)
+        self.assertEqual(detail["historical_gates"], "PASSED")
+        self.assertEqual(detail["canary_status"], "ELIGIBLE")
+        self.assertEqual(detail["paper_forward_status"], "NOT_STARTED")
+        self.assertEqual(detail["paper_promotable_status"], "NOT_YET")
+
+        status, operator, _ = self._request("api/operator")
+        self.assertEqual(status, 200)
+        assert isinstance(operator, dict)
+        self.assertEqual(operator["candidate_status"]["canary_eligible"], 1)
+        self.assertEqual(operator["candidate_status"]["paper_forward"], 1)
+        self.assertEqual(operator["candidate_status"]["paper_promotable"], 1)
+        self.store.connection.execute(
+            "UPDATE canary_eligibility SET frozen_hash=? WHERE candidate_id=?",
+            ("tampered-frozen-hash", "candidate-02"),
+        )
+        self.store.connection.commit()
+        stale_page = self._page(
+            "api/v2/candidates",
+            page=1,
+            page_size=10,
+            sort="candidate_id",
+            direction="asc",
+            expected_page=1,
+            expected_size=10,
+            expected_total=CANDIDATE_COUNT,
+        )
+        stale = next(item for item in stale_page["items"] if item["candidate_id"] == "candidate-02")
+        self.assertFalse(stale["canary_eligible"])
+        self.assertEqual(stale["canary_status"], "NOT_ELIGIBLE")
+        status, operator, _ = self._request("api/operator")
+        self.assertEqual(status, 200)
+        assert isinstance(operator, dict)
+        self.assertEqual(operator["candidate_status"]["canary_eligible"], 0)
+
 
     @staticmethod
     def _market_value(item: dict[str, object], key: str) -> object:
@@ -827,6 +941,12 @@ class DashboardPaginationSurfaceTests(DashboardPaginationFixture):
             "polymarket-settlement",
             "polymarket-quality",
             "fetch(",
+            "canary_eligible",
+            "historical_gates",
+            "Historical gates",
+            "Micro-live canary",
+            "Paper forward status",
+            "Paper promotable",
         ):
             self.assertIn(marker, html)
         self.assertRegex(html, r"history\.(?:replaceState|pushState)")

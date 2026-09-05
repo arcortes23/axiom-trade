@@ -13,14 +13,12 @@ import getpass
 import hashlib
 import importlib.metadata
 import json
-import math
 import os
 import sqlite3
 from typing import Any, Mapping, Protocol
 from urllib.request import Request, urlopen
 
 from .domain import ensure_utc, utc_now
-from .lifecycle import PromotionCriteria
 from .storage import AxiomStore
 
 SUPPORTED_POLYMARKET_SDK = "0.9"
@@ -32,19 +30,117 @@ DEFAULT_DAILY_LOSS_USD = Decimal("2.00")
 DEFAULT_MAX_OPEN_POSITIONS = 3
 DEFAULT_MAX_ORDERS_PER_DAY = 5
 DEFAULT_MAX_SLIPPAGE_BPS = 100
-_SECRET_NAMES = ("private_key", "wallet_address", "relayer_api_key", "relayer_api_key_address")
+_CANARY_ELIGIBLE_STAGES = frozenset({"FROZEN", "PAPER_FORWARD", "PAPER_PROMOTABLE"})
+_MANDATORY_SECRET_NAMES = ("private_key", "wallet_address")
+_OPTIONAL_SECRET_NAMES = ("relayer_api_key", "relayer_api_key_address")
+_SECRET_NAMES = _MANDATORY_SECRET_NAMES + _OPTIONAL_SECRET_NAMES
 _ENV_NAMES = {
     "private_key": "POLYMARKET_PRIVATE_KEY",
     "wallet_address": "POLYMARKET_WALLET_ADDRESS",
     "relayer_api_key": "POLYMARKET_RELAYER_API_KEY",
     "relayer_api_key_address": "POLYMARKET_RELAYER_API_KEY_ADDRESS",
 }
+
+
  
 
 def _sdk_value(source: Any, name: str, default: Any = None) -> Any:
     if isinstance(source, Mapping):
         return source.get(name, default)
     return getattr(source, name, default)
+
+def _base_units(value: Any, *, field: str) -> int:
+    """Normalize an SDK base-unit value without accepting lossy numbers."""
+    if isinstance(value, bool):
+        raise ValueError(f"{field} must be an integer")
+    if isinstance(value, int):
+        result = value
+    elif isinstance(value, str):
+        try:
+            result = int(value)
+        except (TypeError, ValueError):
+            raise ValueError(f"{field} must be an integer") from None
+    else:
+        raise ValueError(f"{field} must be an integer")
+    if result < 0:
+        raise ValueError(f"{field} must not be negative")
+    return result
+
+
+def _normalize_balance_allowance(value: Any) -> tuple[int, dict[str, int]]:
+    """Normalize ``BalanceAllowance`` models and mapping test doubles."""
+    raw_balance = _sdk_value(value, "balance", None)
+    raw_allowances = _sdk_value(value, "allowances", None)
+    if raw_balance is None or not isinstance(raw_allowances, Mapping):
+        raise ValueError("balance/allowances are unavailable")
+    balance = _base_units(raw_balance, field="balance")
+    allowances: dict[str, int] = {}
+    for spender, allowance in raw_allowances.items():
+        if not isinstance(spender, str) or not spender.strip():
+            raise ValueError("allowance spender must be a non-empty string")
+        allowances[spender] = _base_units(
+            allowance,
+            field=f"allowances[{spender}]",
+        )
+    return balance, allowances
+
+
+def _order_balance_allowance_target(
+    *, side: Any, asset_id: str, market_version: Any = None
+) -> tuple[str, str | None]:
+    """Return the SDK balance target for the signed order's side/version."""
+    normalized_side = str(_sdk_value(side, "value", side) or "").upper()
+    if normalized_side == "BUY":
+        return "COLLATERAL", None
+    if normalized_side != "SELL":
+        raise CanaryBlocked("CANARY_ALLOWANCE_UNAVAILABLE")
+    version = str(_sdk_value(market_version, "value", market_version) or "").lower()
+    if version == "v2":
+        return "CONDITIONAL-V2", str(asset_id)
+    if version == "v1":
+        return "CONDITIONAL", str(asset_id)
+    raise CanaryBlocked("CANARY_ALLOWANCE_UNAVAILABLE")
+
+
+def _resolve_official_spender(
+    client: Any, *, asset_id: str, market_version: Any, neg_risk: Any
+) -> str:
+    """Resolve the exact exchange spender from SDK environment metadata."""
+    context = getattr(client, "_ctx", None)
+    config = _sdk_value(context, "environment_config")
+    if config is None:
+        raise CanaryBlocked("CANARY_SPENDER_UNAVAILABLE")
+    version = str(_sdk_value(market_version, "value", market_version) or "").lower()
+    if version == "v2":
+        spender = _sdk_value(config, "exchange_v3")
+    elif version == "v1" and isinstance(neg_risk, bool):
+        spender = _sdk_value(
+            config,
+            "neg_risk_exchange" if neg_risk else "standard_exchange",
+        )
+    else:
+        raise CanaryBlocked("CANARY_SPENDER_UNAVAILABLE")
+    if not isinstance(spender, str) or not spender.strip():
+        raise CanaryBlocked("CANARY_SPENDER_UNAVAILABLE")
+    return spender
+
+
+def _allowance_for_spender(
+    allowances: Mapping[str, int], spender: str
+) -> int:
+    matches = [
+        amount
+        for key, amount in allowances.items()
+        if isinstance(key, str) and key.lower() == spender.lower()
+    ]
+    if len(matches) > 1:
+        raise CanaryBlocked("CANARY_ALLOWANCE_UNAVAILABLE")
+    if matches:
+        return matches[0]
+    # The SDK's own allowance helper treats an absent spender as zero.  Keep
+    # that distinction from an unavailable/malformed allowance payload so the
+    # canary emits the explicit insufficient-allowance rejection.
+    return 0
 
 
 def _best_ask_price(asks: Any) -> Decimal:
@@ -119,7 +215,7 @@ def _read_only_operation(
         raise ValueError(f"unsupported read operation: {operation}")
     try:
         import polymarket
-        from polymarket import RelayerApiKey, SecureClient
+        from polymarket import SecureClient
     except ImportError as exc:
         raise CanaryBlocked("OFFICIAL_POLYMARKET_SDK_NOT_INSTALLED") from exc
     version = PolymarketClobV2Venue.installed_sdk_version()
@@ -129,16 +225,16 @@ def _read_only_operation(
     safe_create = getattr(SecureClient, "_create", None)
     if not callable(safe_create):
         raise CanaryBlocked("OFFICIAL_POLYMARKET_SDK_NOT_READONLY_COMPATIBLE")
+    # Official v0.9 ``SecureClient.create`` calls ``_ensure_wallet_ready``,
+    # which can deploy a wallet or invoke relayer workflows.  The canary uses
+    # private ``_create`` only after this compatibility guard to avoid that
+    # side effect during read-only connectivity.
     try:
-        api_key = RelayerApiKey(
-            key=values["relayer_api_key"],
-            address=values["relayer_api_key_address"],
-        )
+        # A signer-backed CLOB client does not need relayer/gasless credentials.
         client = safe_create(
             private_key=values["private_key"],
             wallet=values["wallet_address"],
             validate_credentials=True,
-            api_key=api_key,
         )
     except CanaryBlocked:
         raise
@@ -194,6 +290,11 @@ def _read_only_operation(
         state = _sdk_value(market, "state")
         trading = _sdk_value(market, "trading")
         fee_schedule = _sdk_value(trading, "fee_schedule")
+        neg_risk = _sdk_value(
+            state,
+            "neg_risk",
+            _sdk_value(market, "neg_risk"),
+        )
         fee_rate = _sdk_value(fee_schedule, "rate")
         fee_bps = (
             Decimal(str(fee_rate)) * Decimal("10000")
@@ -202,6 +303,7 @@ def _read_only_operation(
         )
         return {
             "market_version": str(_sdk_value(market, "version", "") or ""),
+            "neg_risk": neg_risk,
             "outcome": outcome,
             "token_id": selected_token_id,
             "position_id": selected_position_id,
@@ -286,16 +388,32 @@ class CredentialStore:
             import keyring
         except ImportError as exc:
             raise CanaryBlocked("OS_KEYRING_UNAVAILABLE") from exc
-        values = {
+
+        mandatory = {
             "private_key": reader("Dedicated canary signer private key: "),
             "wallet_address": reader("Dedicated Polymarket wallet address: "),
-            "relayer_api_key": reader("Polymarket relayer API key: "),
-            "relayer_api_key_address": reader("Polymarket relayer API key address: "),
         }
-        if not all(values.values()):
+        if not all(mandatory.values()):
             raise CanaryBlocked("CREDENTIAL_CONFIGURATION_INCOMPLETE")
-        for name, value in values.items():
+        for name, value in mandatory.items():
             keyring.set_password(self.service, name, value)
+
+        # Relayer credentials are optional for signer-backed CLOB workflows.
+        # Blank/omitted values intentionally leave any existing keyring values
+        # untouched so configuring mandatory credentials is non-destructive.
+        for name, prompt in (
+            ("relayer_api_key", "Polymarket relayer API key (optional): "),
+            (
+                "relayer_api_key_address",
+                "Polymarket relayer API key address (optional): ",
+            ),
+        ):
+            try:
+                value = reader(prompt)
+            except (EOFError, StopIteration):
+                value = ""
+            if value:
+                keyring.set_password(self.service, name, value)
 
     def load(self, *, allow_environment: bool = False) -> dict[str, str]:
         values: dict[str, str] = {}
@@ -311,7 +429,11 @@ class CredentialStore:
             for name, variable in _ENV_NAMES.items():
                 if name not in values and os.environ.get(variable):
                     values[name] = os.environ[variable]
-        return values if all(name in values for name in _SECRET_NAMES) else {}
+        return (
+            values
+            if all(name in values for name in _MANDATORY_SECRET_NAMES)
+            else {}
+        )
 
     def configured(self, *, allow_environment: bool = False) -> bool:
         return bool(self.load(allow_environment=allow_environment))
@@ -373,7 +495,7 @@ class PolymarketClobV2Venue:
             raise CanaryBlocked("CREDENTIALS_NOT_CONFIGURED") from exc
         if (
             not isinstance(values, Mapping)
-            or not all(values.get(name) for name in _SECRET_NAMES)
+            or not all(values.get(name) for name in _MANDATORY_SECRET_NAMES)
         ):
             raise CanaryBlocked("CREDENTIALS_NOT_CONFIGURED")
         return _read_only_operation(
@@ -416,6 +538,149 @@ class PolymarketClobV2Venue:
 
     def balance(self) -> Decimal:
         return self._read_operation("balance")
+
+
+def _canary_merged_lifecycle_payload(record: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(record, Mapping):
+        return None
+    raw_payload = record.get("payload")
+    if not isinstance(raw_payload, Mapping):
+        return None
+    payload = dict(raw_payload)
+    forward_evidence = payload.get("forward_evidence")
+    if forward_evidence is not None:
+        if not isinstance(forward_evidence, Mapping):
+            return None
+        merged = dict(forward_evidence)
+        # Lifecycle fields are authoritative; forward evidence supplies the
+        # persisted forward metrics when they are nested.
+        merged.update(payload)
+        return merged
+    return payload
+
+
+def _canary_document_hash(value: Any) -> str | None:
+    try:
+        encoded = json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (TypeError, ValueError):
+        return None
+    return "sha256:" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _canary_lifecycle_frozen_hash(store: AxiomStore, record: Mapping[str, Any] | None) -> str | None:
+    """Return the verified frozen binding recorded by a lifecycle row."""
+    if not isinstance(record, Mapping) or record.get("stage") not in _CANARY_ELIGIBLE_STAGES:
+        return None
+    payload = _canary_merged_lifecycle_payload(record)
+    if payload is None:
+        return None
+    hash_parts: list[str] = []
+    for key in ("strategy_hash", "model_hash", "config_hash"):
+        value = payload.get(key)
+        if not isinstance(value, str) or not value.strip():
+            return None
+        hash_parts.append(value)
+    expected_frozen_hash = hashlib.sha256("|".join(hash_parts).encode("utf-8")).hexdigest()
+    frozen_hash = payload.get("frozen_hash")
+    if not isinstance(frozen_hash, str) or frozen_hash != expected_frozen_hash:
+        return None
+
+    frozen_documents = payload.get("frozen_documents")
+    if frozen_documents is None:
+        frozen_documents = {}
+    elif not isinstance(frozen_documents, Mapping):
+        return None
+    strategy_document = payload.get(
+        "strategy_document",
+        frozen_documents.get("strategy_document", frozen_documents.get("strategy")),
+    )
+    model_document = payload.get(
+        "model_document",
+        frozen_documents.get("model_document", frozen_documents.get("model")),
+    )
+    forward_config = payload.get(
+        "forward_config",
+        frozen_documents.get("forward_config", frozen_documents.get("config")),
+    )
+    risk_snapshot = payload.get(
+        "risk_snapshot",
+        frozen_documents.get("risk_snapshot", frozen_documents.get("risk_limits")),
+    )
+
+    forward_test_id = payload.get("forward_test_id")
+    if forward_test_id:
+        try:
+            forward_test = store.load_forward_test(str(forward_test_id))
+        except (TypeError, ValueError):
+            forward_test = None
+        if forward_test is None:
+            return None
+        if (
+            str(forward_test.get("strategy_hash", "")) != hash_parts[0]
+            or str(forward_test.get("model_hash", "")) != hash_parts[1]
+        ):
+            return None
+        if forward_config is None:
+            forward_config = forward_test.get("config")
+        if risk_snapshot is None:
+            risk_snapshot = forward_test.get("risk_limits")
+
+    if isinstance(forward_config, Mapping):
+        if strategy_document is None:
+            strategy_document = forward_config.get("strategy_document")
+        if model_document is None:
+            model_document = forward_config.get("model_document")
+    if strategy_document is not None and _canary_document_hash(strategy_document) != hash_parts[0]:
+        return None
+    if model_document is not None and _canary_document_hash(model_document) != hash_parts[1]:
+        return None
+    if forward_config is not None or risk_snapshot is not None:
+        if not isinstance(forward_config, Mapping) or not isinstance(risk_snapshot, Mapping):
+            return None
+        config_hash = _canary_document_hash(
+            {"config": forward_config, "risk_limits": risk_snapshot}
+        )
+        if config_hash != hash_parts[2]:
+            return None
+    return frozen_hash
+
+
+def _canary_eligibility_is_bound(
+    store: AxiomStore,
+    candidate_id: str,
+    eligibility: Mapping[str, Any] | None,
+) -> bool:
+    """Verify eligibility and its frozen hash still bind to the lifecycle."""
+    if eligibility is None:
+        return False
+    try:
+        eligibility = dict(eligibility)
+    except (TypeError, ValueError):
+        return False
+    frozen_hash = eligibility.get("frozen_hash")
+    if not isinstance(frozen_hash, str) or not frozen_hash:
+        return False
+    try:
+        evidence = json.loads(str(eligibility.get("evidence_json") or ""))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    if not isinstance(evidence, Mapping) or evidence.get("frozen_hash") != frozen_hash:
+        return False
+    try:
+        record = store.load_candidate_lifecycle(candidate_id)
+    except Exception:
+        return False
+    payload = _canary_merged_lifecycle_payload(record)
+    return (
+        _canary_lifecycle_frozen_hash(store, record) == frozen_hash
+        and payload is not None
+        and dict(evidence) == payload
+    )
 
 
 class CanaryService:
@@ -471,143 +736,21 @@ class CanaryService:
         return {"target_notional_usd": str(limits.target_notional_usd), "max_exposure_usd": str(limits.max_exposure_usd), "max_daily_loss_usd": str(limits.max_daily_loss_usd), "max_open_positions": limits.max_open_positions, "max_orders_per_day": limits.max_orders_per_day, "max_slippage_bps": limits.max_slippage_bps}
     @staticmethod
     def _merged_lifecycle_payload(record: Mapping[str, Any] | None) -> dict[str, Any] | None:
-        if not isinstance(record, Mapping):
-            return None
-        raw_payload = record.get("payload")
-        if not isinstance(raw_payload, Mapping):
-            return None
-        payload = dict(raw_payload)
-        forward_evidence = payload.get("forward_evidence")
-        if forward_evidence is not None:
-            if not isinstance(forward_evidence, Mapping):
-                return None
-            merged = dict(forward_evidence)
-            # Lifecycle fields are authoritative; forward evidence supplies the
-            # persisted forward metrics when they are nested.
-            merged.update(payload)
-            return merged
-        return payload
+        return _canary_merged_lifecycle_payload(record)
 
     @staticmethod
     def _document_hash(value: Any) -> str | None:
-        try:
-            encoded = json.dumps(
-                value,
-                sort_keys=True,
-                separators=(",", ":"),
-                allow_nan=False,
-                default=str,
-            )
-        except (TypeError, ValueError):
-            return None
-        return "sha256:" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+        return _canary_document_hash(value)
 
     def _lifecycle_frozen_hash(self, record: Mapping[str, Any] | None) -> str | None:
-        """Return the verified frozen binding recorded by its lifecycle."""
-        if not isinstance(record, Mapping) or record.get("stage") != "PAPER_PROMOTABLE":
-            return None
-        payload = self._merged_lifecycle_payload(record)
-        if payload is None:
-            return None
-        hash_parts: list[str] = []
-        for key in ("strategy_hash", "model_hash", "config_hash"):
-            value = payload.get(key)
-            if not isinstance(value, str) or not value.strip():
-                return None
-            hash_parts.append(value)
-        expected_frozen_hash = hashlib.sha256("|".join(hash_parts).encode("utf-8")).hexdigest()
-        frozen_hash = payload.get("frozen_hash")
-        if not isinstance(frozen_hash, str) or frozen_hash != expected_frozen_hash:
-            return None
-
-        frozen_documents = payload.get("frozen_documents")
-        if not isinstance(frozen_documents, Mapping):
-            frozen_documents = {}
-        strategy_document = payload.get(
-            "strategy_document",
-            frozen_documents.get("strategy_document", frozen_documents.get("strategy")),
-        )
-        model_document = payload.get(
-            "model_document",
-            frozen_documents.get("model_document", frozen_documents.get("model")),
-        )
-        forward_config = payload.get(
-            "forward_config",
-            frozen_documents.get("forward_config", frozen_documents.get("config")),
-        )
-        risk_snapshot = payload.get(
-            "risk_snapshot",
-            frozen_documents.get("risk_snapshot", frozen_documents.get("risk_limits")),
-        )
-
-        forward_test_id = payload.get("forward_test_id")
-        if forward_test_id:
-            try:
-                forward_test = self.store.load_forward_test(str(forward_test_id))
-            except (TypeError, ValueError):
-                forward_test = None
-            if forward_test is None:
-                return None
-            if (
-                str(forward_test.get("strategy_hash", "")) != hash_parts[0]
-                or str(forward_test.get("model_hash", "")) != hash_parts[1]
-            ):
-                return None
-            if forward_config is None:
-                forward_config = forward_test.get("config")
-            if risk_snapshot is None:
-                risk_snapshot = forward_test.get("risk_limits")
-
-        if isinstance(forward_config, Mapping):
-            if strategy_document is None:
-                strategy_document = forward_config.get("strategy_document")
-            if model_document is None:
-                model_document = forward_config.get("model_document")
-        if strategy_document is not None and self._document_hash(strategy_document) != hash_parts[0]:
-            return None
-        if model_document is not None and self._document_hash(model_document) != hash_parts[1]:
-            return None
-        if forward_config is not None or risk_snapshot is not None:
-            if not isinstance(forward_config, Mapping) or not isinstance(risk_snapshot, Mapping):
-                return None
-            config_hash = self._document_hash(
-                {"config": forward_config, "risk_limits": risk_snapshot}
-            )
-            if config_hash != hash_parts[2]:
-                return None
-        return frozen_hash
+        return _canary_lifecycle_frozen_hash(self.store, record)
 
     def _eligibility_is_bound(self, candidate_id: str, eligibility: Mapping[str, Any] | None) -> bool:
-        """Verify eligibility and its frozen hash still bind to the lifecycle."""
-        if eligibility is None:
-            return False
-        try:
-            eligibility = dict(eligibility)
-        except (TypeError, ValueError):
-            return False
-        frozen_hash = eligibility.get("frozen_hash")
-        if not isinstance(frozen_hash, str) or not frozen_hash:
-            return False
-        try:
-            evidence = json.loads(str(eligibility.get("evidence_json") or ""))
-        except (TypeError, ValueError, json.JSONDecodeError):
-            return False
-        if not isinstance(evidence, Mapping) or evidence.get("frozen_hash") != frozen_hash:
-            return False
-        try:
-            record = self.store.load_candidate_lifecycle(candidate_id)
-        except Exception:
-            return False
-        payload = self._merged_lifecycle_payload(record)
-        return (
-            self._lifecycle_frozen_hash(record) == frozen_hash
-            and payload is not None
-            and dict(evidence) == payload
-        )
+        return _canary_eligibility_is_bound(self.store, candidate_id, eligibility)
 
     def mark_eligible(self, candidate_id: str) -> None:
         record = self.store.load_candidate_lifecycle(candidate_id)
-        if not record or record.get("stage") != "PAPER_PROMOTABLE":
+        if not record or record.get("stage") not in _CANARY_ELIGIBLE_STAGES:
             raise CanaryBlocked("CANDIDATE_RESEARCH_GATES_INCOMPLETE")
         payload = self._merged_lifecycle_payload(record)
         if payload is None:
@@ -624,59 +767,20 @@ class CanaryService:
             any(payload.get(name) is not True for name in required_true)
             or payload.get("holdout_used") is not False
             or payload.get("frozen") is not True
-            or payload.get("critical_error") is True
+            or bool(payload.get("critical_error"))
         ):
             raise CanaryBlocked("CANDIDATE_RESEARCH_GATES_INCOMPLETE")
 
-        count_fields = (
-            "forward_independent_resolved_bets",
-            "forward_regime_count",
-        )
-        successful_trades = payload.get(
-            "forward_successful_order_attempts",
-            payload.get("forward_trades"),
-        )
-        number_fields = (
-            "forward_duration_seconds",
-            "forward_expectancy",
-            "forward_confidence_lower_bound",
-            "forward_stability",
-            "forward_calibration",
-            "forward_liquidity",
-            "forward_max_drawdown",
-        )
-        if any(
-            name not in payload
-            or isinstance(payload[name], bool)
-            or not isinstance(payload[name], int)
-            or payload[name] < 0
-            for name in count_fields
-        ) or (
-            isinstance(successful_trades, bool)
-            or not isinstance(successful_trades, int)
-            or successful_trades < 0
-        ) or any(
-            name not in payload
-            or isinstance(payload[name], bool)
-            or not isinstance(payload[name], (int, float))
-            or not math.isfinite(float(payload[name]))
-            for name in number_fields
-        ):
-            raise CanaryBlocked("CANDIDATE_RESEARCH_GATES_INCOMPLETE")
-
-        criteria = PromotionCriteria()
-        if criteria.evaluate(payload):
-            raise CanaryBlocked("CANDIDATE_RESEARCH_GATES_INCOMPLETE")
         frozen_hash = self._lifecycle_frozen_hash(record)
         if frozen_hash is None:
             raise CanaryBlocked("CANDIDATE_RESEARCH_GATES_INCOMPLETE")
 
         # Keep the persisted values verbatim: eligibility is a binding, not a
-        # re-derived summary that can silently lose forward evidence.
+        # re-derived summary that can silently lose additive forward evidence.
         evidence = dict(payload)
         evidence["frozen_hash"] = frozen_hash
         try:
-            evidence_json = json.dumps(evidence, sort_keys=True)
+            evidence_json = json.dumps(evidence, sort_keys=True, allow_nan=False)
         except (TypeError, ValueError):
             raise CanaryBlocked("CANDIDATE_RESEARCH_GATES_INCOMPLETE") from None
         with self.store.connection:
@@ -1118,12 +1222,14 @@ class CanaryService:
 
         def submit_official_order(
             *,
+            market_version: Any,
+            neg_risk: Any,
             asset_id: str,
             side: str,
             price: Decimal,
             size: Decimal,
         ) -> Mapping[str, Any]:
-            """Construct/place only after this submit's locked reservation."""
+            """Sign, check allowance, and post only after reservation."""
             try:
                 values = self.credentials.load(allow_environment=environment)
             except CanaryBlocked:
@@ -1132,12 +1238,12 @@ class CanaryService:
                 raise CanaryBlocked("CREDENTIALS_NOT_CONFIGURED") from exc
             if (
                 not isinstance(values, Mapping)
-                or not all(values.get(name) for name in _SECRET_NAMES)
+                or not all(values.get(name) for name in _MANDATORY_SECRET_NAMES)
             ):
                 raise CanaryBlocked("CREDENTIALS_NOT_CONFIGURED")
             try:
                 import polymarket
-                from polymarket import RelayerApiKey, SecureClient
+                from polymarket import SecureClient
             except ImportError as exc:
                 raise CanaryBlocked(
                     "OFFICIAL_POLYMARKET_SDK_NOT_INSTALLED"
@@ -1151,31 +1257,85 @@ class CanaryService:
                 raise CanaryBlocked(
                     "OFFICIAL_POLYMARKET_SDK_NOT_READONLY_COMPATIBLE"
                 )
+            # Official v0.9 ``SecureClient.create`` calls ``_ensure_wallet_ready``,
+            # which can deploy a wallet or invoke relayer workflows.  The
+            # canary uses private ``_create`` only after this compatibility
+            # guard to avoid that side effect.
+
+            # In official v0.9, ``place_limit_order`` delegates to allowance
+            # recovery: an allowance rejection can reach ``approve_erc20`` or
+            # ``approve_erc1155_for_all`` and the ``/balance-allowance/update``
+            # endpoint.  The canary therefore splits local signing from
+            # posting, checks the exact maker amount first, and never invokes
+            # that recovery path.
+            client: Any = None
             try:
-                api_key = RelayerApiKey(
-                    key=values["relayer_api_key"],
-                    address=values["relayer_api_key_address"],
-                )
                 client = safe_create(
                     private_key=values["private_key"],
                     wallet=values["wallet_address"],
                     validate_credentials=True,
-                    api_key=api_key,
+                )
+                signed = client.create_limit_order(
+                    asset_id=asset_id,
+                    side=side.upper(),
+                    price=str(price),
+                    size=str(size),
                 )
                 try:
-                    response = client.place_limit_order(
-                        asset_id=asset_id,
-                        side=side.upper(),
-                        price=str(price),
-                        size=str(size),
+                    required = _base_units(
+                        _sdk_value(signed, "maker_amount", None),
+                        field="signed maker_amount",
                     )
-                finally:
-                    close = getattr(client, "close", None)
-                    if callable(close):
-                        try:
-                            close()
-                        except Exception:
-                            pass
+                except ValueError as exc:
+                    raise CanaryBlocked("CANARY_ALLOWANCE_UNAVAILABLE") from exc
+
+                asset_type, allowance_asset_id = _order_balance_allowance_target(
+                    side=side,
+                    asset_id=asset_id,
+                    market_version=market_version,
+                )
+                spender = _resolve_official_spender(
+                    client,
+                    asset_id=asset_id,
+                    market_version=market_version,
+                    neg_risk=neg_risk,
+                )
+                request: dict[str, Any] = {"asset_type": asset_type}
+                if allowance_asset_id is not None:
+                    request["asset_id"] = allowance_asset_id
+                try:
+                    balance_allowance = client.get_balance_allowance(**request)
+                    balance, allowances = _normalize_balance_allowance(
+                        balance_allowance
+                    )
+                    allowance = _allowance_for_spender(allowances, spender)
+                except CanaryBlocked:
+                    raise
+                except (TypeError, ValueError) as exc:
+                    raise CanaryBlocked("CANARY_ALLOWANCE_UNAVAILABLE") from exc
+                if balance < required:
+                    raise CanaryBlocked("INSUFFICIENT_BALANCE")
+                if allowance < required:
+                    raise CanaryBlocked("CANARY_ALLOWANCE_INSUFFICIENT")
+                response = client.post_order(signed)
+                accepted = bool(_sdk_value(response, "ok", False))
+                if accepted:
+                    return {
+                        "ok": True,
+                        "order_id": _sdk_value(response, "order_id"),
+                        "status": _sdk_value(response, "status"),
+                        "trade_ids": list(
+                            _sdk_value(response, "trade_ids", ()) or ()
+                        ),
+                    }
+                return {
+                    "ok": False,
+                    "status": "REJECTED",
+                    "error_code": _sdk_value(response, "code", "unknown"),
+                    "error_message": _sdk_value(
+                        response, "message", "order rejected"
+                    ),
+                }
             except CanaryBlocked:
                 raise
             except TypeError as exc:
@@ -1184,24 +1344,14 @@ class CanaryService:
                 ) from exc
             except Exception as exc:
                 raise CanaryBlocked("ORDER_SUBMISSION_FAILED") from exc
-            accepted = bool(_sdk_value(response, "ok", False))
-            if accepted:
-                return {
-                    "ok": True,
-                    "order_id": _sdk_value(response, "order_id"),
-                    "status": _sdk_value(response, "status"),
-                    "trade_ids": list(
-                        _sdk_value(response, "trade_ids", ()) or ()
-                    ),
-                }
-            return {
-                "ok": False,
-                "status": "REJECTED",
-                "error_code": _sdk_value(response, "code", "unknown"),
-                "error_message": _sdk_value(
-                    response, "message", "order rejected"
-                ),
-            }
+            finally:
+                if client is not None:
+                    close = getattr(client, "close", None)
+                    if callable(close):
+                        try:
+                            close()
+                        except Exception:
+                            pass
 
         def execution_parameters(
             limits: Mapping[str, Any],
@@ -1370,7 +1520,7 @@ class CanaryService:
                 locked_limits = enforce_controls(locked_snapshot)
                 (
                     _locked_geo,
-                    _locked_context,
+                    locked_context,
                     resolved_asset_id,
                     best,
                     target,
@@ -1476,6 +1626,8 @@ class CanaryService:
                 try:
                     if is_official_venue:
                         response = submit_official_order(
+                            market_version=locked_context.get("market_version"),
+                            neg_risk=locked_context.get("neg_risk"),
                             asset_id=resolved_asset_id,
                             side=side.upper(),
                             price=max_price,

@@ -13,7 +13,8 @@ import math
 import os
 from pathlib import Path
 import re
-from .canary import CanaryService
+import sqlite3
+from .canary import CanaryService, _canary_eligibility_is_bound
 import subprocess
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread
@@ -153,6 +154,8 @@ _V2_ENDPOINTS = ("datasets", "activity", "candidates", "polymarket", "hermes", "
 _DEFAULT_PAGE_SIZE = 25
 _PAGE_SIZE_OPTIONS = (10, 25, 50, 100)
 _MAX_PAGE_SIZE = 100
+_CANARY_ELIGIBLE_STAGES = frozenset({"FROZEN", "PAPER_FORWARD", "PAPER_PROMOTABLE"})
+_PAPER_FORWARD_STAGES = frozenset({"PAPER_FORWARD", "PAPER_PROMOTABLE"})
 
 
 def _pagination_error(query: Mapping[str, Any]) -> str | None:
@@ -1550,8 +1553,102 @@ class DashboardData:
         records = self.store.load_candidate_lifecycle(limit=_MAX_SIZE_FALLBACK)
         records = records if isinstance(records, list) else []
         return [self._candidate_row(item) for item in records if isinstance(item, Mapping)]
-    @staticmethod
-    def _candidate_row(item: Mapping[str, Any]) -> dict[str, Any]:
+
+    def _candidate_canary_eligibility(self, candidate_id: str) -> Mapping[str, Any] | None:
+        """Read and verify the persisted eligibility binding."""
+        if self.store is None or not candidate_id:
+            return None
+        connection = getattr(self.store, "connection", None)
+        if connection is None:
+            return None
+        try:
+            lock = getattr(self.store, "_lock", None)
+            if lock is None:
+                row = connection.execute(
+                    "SELECT candidate_id,eligible_at,frozen_hash,evidence_json "
+                    "FROM canary_eligibility WHERE candidate_id=?",
+                    (candidate_id,),
+                ).fetchone()
+            else:
+                with lock:
+                    row = connection.execute(
+                        "SELECT candidate_id,eligible_at,frozen_hash,evidence_json "
+                        "FROM canary_eligibility WHERE candidate_id=?",
+                        (candidate_id,),
+                    ).fetchone()
+        except (AttributeError, sqlite3.Error):
+            # The canary schema is optional for read-only dashboard consumers.
+            return None
+        if row is None:
+            return None
+        eligibility = dict(row)
+        if not _canary_eligibility_is_bound(self.store, candidate_id, eligibility):
+            return None
+        return {
+            "candidate_id": eligibility.get("candidate_id"),
+            "eligible_at": eligibility.get("eligible_at"),
+        }
+    def _candidate_canary_eligibility_count(self) -> int:
+        """Count persisted bindings that still validate against lifecycle."""
+        if self.store is None:
+            return 0
+        connection = getattr(self.store, "connection", None)
+        if connection is None:
+            return 0
+        query = (
+            "SELECT e.candidate_id,e.frozen_hash,e.evidence_json "
+            "FROM canary_eligibility AS e "
+            "JOIN candidate_lifecycle AS c ON c.candidate_id=e.candidate_id "
+            "WHERE c.stage IN ('FROZEN','PAPER_FORWARD','PAPER_PROMOTABLE')"
+        )
+        try:
+            lock = getattr(self.store, "_lock", None)
+            if lock is None:
+                rows = connection.execute(query).fetchall()
+            else:
+                with lock:
+                    rows = connection.execute(query).fetchall()
+        except (AttributeError, sqlite3.Error):
+            return 0
+        return sum(
+            1
+            for row in rows
+            if _canary_eligibility_is_bound(
+                self.store,
+                str(row["candidate_id"]),
+                row,
+            )
+        )
+
+
+    def _candidate_status_fields(self, item: Mapping[str, Any]) -> dict[str, Any]:
+        stage = str(item.get("stage") or "").strip().upper()
+        eligibility = self._candidate_canary_eligibility(str(item.get("candidate_id") or "").strip())
+        canary_eligible = eligibility is not None and stage in _CANARY_ELIGIBLE_STAGES
+        if stage == "PAPER_FORWARD":
+            paper_forward_status = "ACTIVE"
+            paper_status = "PAPER_FORWARD"
+        elif stage == "PAPER_PROMOTABLE":
+            paper_forward_status = "COMPLETE"
+            paper_status = "PAPER_PROMOTABLE"
+        else:
+            paper_forward_status = "NOT_STARTED"
+            paper_status = "NOT_STARTED"
+        return {
+            # Historical gates are lifecycle evidence; canary eligibility is
+            # the separate persisted binding that authorizes a micro-live test.
+            "historical_gates": "PASSED" if stage in _CANARY_ELIGIBLE_STAGES else "NOT_PASSED",
+            "canary_eligible": canary_eligible,
+            "canary_eligible_at": eligibility.get("eligible_at") if canary_eligible else None,
+            "canary_status": "ELIGIBLE" if canary_eligible else "NOT_ELIGIBLE",
+            "paper_forward": stage in _PAPER_FORWARD_STAGES,
+            "paper_forward_status": paper_forward_status,
+            "paper_promotable": stage == "PAPER_PROMOTABLE",
+            "paper_promotable_status": "PROMOTABLE" if stage == "PAPER_PROMOTABLE" else "NOT_YET",
+            "paper_status": paper_status,
+        }
+
+    def _candidate_row(self, item: Mapping[str, Any]) -> dict[str, Any]:
         payload = item.get("payload", {})
         payload = payload if isinstance(payload, Mapping) else {}
         candidate_id = str(item.get("candidate_id", ""))
@@ -1571,6 +1668,7 @@ class DashboardData:
             "data_quality": payload.get("data_quality", payload.get("quality", payload.get("research_quality"))),
             "rejection_reason": payload.get("rejection_reason"),
             "updated_at": item.get("updated_at"),
+            **self._candidate_status_fields(item),
         }
 
     def _activity_feed(self, *, limit: int = 50) -> list[dict[str, Any]]:
@@ -1860,6 +1958,7 @@ class DashboardData:
             "available": True,
             "candidate_id": identifier,
             "stage": lifecycle.get("stage"),
+            **self._candidate_status_fields(lifecycle),
             "strategy": {
                 "id": payload.get("strategy_id", payload.get("experiment_id", identifier)),
                 "family": payload.get("experiment_family", payload.get("family")),
@@ -2023,6 +2122,13 @@ class DashboardData:
             for item in candidate_page.get("items", [])
             if isinstance(item, Mapping)
         ]
+        candidate_status = {
+            "canary_eligible": self._candidate_canary_eligibility_count(),
+            # Paper status is lifecycle-derived and intentionally remains
+            # separate from the persisted canary eligibility binding.
+            "paper_forward": stages["PAPER_FORWARD"] + stages["PAPER_PROMOTABLE"],
+            "paper_promotable": stages["PAPER_PROMOTABLE"],
+        }
         activity_page = self.paginate_research_activity({"page": 1, "page_size": 10})
         activity_rows = activity_page.get("items", []) if isinstance(activity_page, Mapping) else []
         count = self.store.dashboard_summary() if self.store is not None else {}
@@ -2177,6 +2283,7 @@ class DashboardData:
                 "research_rejected": int(hermes.get("rejected", 0) or 0),
                 # Kept as an additive compatibility alias for existing clients.
                 "rejected": stages["REJECTED"],
+                "canary_eligible": candidate_status["canary_eligible"],
                 "paper_forward": stages["PAPER_FORWARD"],
                 "paper_promotable": stages["PAPER_PROMOTABLE"],
                 "newest_hermes_outcome": latest_hermes_outcome,
@@ -2184,6 +2291,7 @@ class DashboardData:
             "coverage": catalogs,
             "activity": activity_rows,
             "lifecycle_funnel": stages,
+            "candidate_status": candidate_status,
             "candidates": candidate_rows,
             "btc": self.btc_research_data(catalog_data=catalogs),
             "crypto_research": crypto_research,
@@ -2317,7 +2425,7 @@ def _dashboard_html() -> str:
   <script>
     const $ = (id) => document.getElementById(id), safe = (v) => String(v ?? "—").replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c])), json = (v) => JSON.stringify(v ?? {}, null, 2);
     const count = (v) => Number.isFinite(Number(v)) ? String(v) : "0", dateText = (v) => v ? new Date(v).toISOString().replace(".000Z","Z") : "—", arr = (v) => Array.isArray(v) ? v : [];
-    const empty = (title,body) => `<div class="empty"><strong>${safe(title)}</strong>${safe(body)}</div>`, statusClass = (v) => { const s=String(v||"").toUpperCase(); return ["READY","RUNNING","ACTIVE","COMPLETE","COMPLETED","HEALTHY"].includes(s)?"good":["DEGRADED","STOPPED","UPDATING"].includes(s)?"warn":["ERROR","STALE","REJECTED"].includes(s)?"bad":""; };
+    const empty = (title,body) => `<div class="empty"><strong>${safe(title)}</strong>${safe(body)}</div>`, statusClass = (v) => { const s=String(v||"").toUpperCase(); return ["READY","RUNNING","ACTIVE","COMPLETE","COMPLETED","HEALTHY","ELIGIBLE","PASSED","PROMOTABLE"].includes(s)?"good":["DEGRADED","STOPPED","UPDATING"].includes(s)?"warn":["ERROR","STALE","REJECTED"].includes(s)?"bad":""; };
     let params = new URLSearchParams(location.search); const state = { tab: params.get("tab") || "overview", page: Math.max(1,Number(params.get("page")||1)), page_size: [10,25,50,100].includes(Number(params.get("page_size"))) ? Number(params.get("page_size")) : 25, filter: params.get("filter") || "", sort: params.get("sort") || "", direction: params.get("direction") === "asc" ? "asc" : "desc", selected: params.get("selected") || "", expanded: params.get("expanded") === "1" };
     let operator = {}, current = {}, loadInFlight = false;
     function saveState(push=false) { const q=new URLSearchParams(); q.set("tab",state.tab); q.set("page",state.page); q.set("page_size",state.page_size); if(state.filter)q.set("filter",state.filter); if(state.sort)q.set("sort",state.sort); if(state.direction!=="desc")q.set("direction",state.direction); if(state.selected)q.set("selected",state.selected); if(state.expanded)q.set("expanded","1"); document.querySelectorAll("select.facet").forEach(el=>{if(el.value)q.set(el.dataset.param||el.id,el.value)}); (push?history.pushState:history.replaceState).call(history,{}, "", `${location.pathname}?${q}`); }
@@ -2329,7 +2437,7 @@ def _dashboard_html() -> str:
     async function fetchV2(name) { const q=new URLSearchParams({page:String(state.page),page_size:String(state.page_size),direction:state.direction}); if(state.filter)q.set("filter",state.filter); if(state.sort)q.set("sort",state.sort); const controls={datasets:[["datasets-source","source_type"],["datasets-market","market"],["datasets-timeframe","timeframe"],["datasets-quality","quality"]],activity:[["activity-status","status"]],candidates:[["candidates-stage","stage"]],polymarket:[["polymarket-category","category"],["polymarket-settlement","settlement"],["polymarket-quality","quality"]],hermes:[["hermes-status","status"]],paper:[["paper-status","status"]]}; for(const [id,key] of (controls[state.tab]||[])){const el=$(id);if(el&&el.value)q.set(key,el.value);} const response=await fetch(`/api/v2/${name}?${q}`,{cache:"no-store"}); if(!response.ok)throw new Error(`${name} HTTP ${response.status}`); return response.json(); }
     function renderComponents(data) { $("component-grid").innerHTML=arr(data.components).map(i=>{const s=String(i.state||"NOT INITIALIZED"),reason=i.detail?.reason||i.detail?.error||"";return `<article class="panel status-card"><div class="status-head"><span class="status-name">${safe(i.name)}</span><span class="badge ${statusClass(s)}">${safe(s)}</span></div><div class="status-value">${safe(i.detail?.status||i.detail?.symbol||"read-only")}</div>${reason?`<p class="page-note">${safe(reason)}</p>`:""}</article>`}).join("")||empty("System not initialized","Start the normal AXIOM node to populate worker status."); }
     function renderOverview(data) { renderComponents(data); const cards=data.research_cards||{}; $("research-cards").innerHTML=[["experiments_run","Experiments run"],["active_hypotheses","Active hypotheses"],["candidates_alive","Candidates alive"],["rejected","Rejected"],["paper_forward","Paper forward"],["paper_promotable","Paper promotable"]].map(([k,l])=>`<article class="panel"><div class="metric">${count(cards[k])}</div><div class="metric-label">${l}</div></article>`).join(""); const c=data.coverage||{}; $("coverage").innerHTML=`<div class="three-col"><div class="key-value"><span class="key">Historical datasets</span><strong>${count(c.historical_count)}</strong></div><div class="key-value"><span class="key">Forward datasets</span><strong>${count(c.forward_count)}</strong></div><div class="key-value"><span class="key">Rows observed</span><strong>${count((c.historical_rows||0)+(c.forward_rows||0))}</strong></div></div><p class="page-note">Prediction market datasets are available in DATASETS; overview intentionally shows summaries only.</p>`; const funnel=data.lifecycle_funnel||{}; const max=Math.max(1,...Object.values(funnel).map(Number)); $("funnel").innerHTML=Object.entries(funnel).map(([k,v])=>`<div class="funnel-row"><span>${safe(k)}</span><span class="funnel-track"><span class="funnel-bar" style="width:${Math.min(100,Number(v)/max*100)}%"></span></span><span class="right">${count(v)}</span></div>`).join("")||empty("No candidate lifecycle","Hermes hypotheses appear after a durable queue item is processed."); $("overview-candidates").innerHTML=tableCandidates(arr(data.candidates).slice(0,10),false); $("overview-activity").innerHTML=arr(data.activity).slice(0,10).map(i=>`<div class="timeline-item"><span class="timeline-time">${safe(dateText(i.timestamp))}</span><span class="timeline-kind">${safe(i.kind)}</span><span>${safe(i.message)}</span></div>`).join("")||empty("No research activity yet","Durable bootstrap, collection, and Hermes activity will appear here."); $("raw-overview").textContent=json(data.raw||{}); }
-    function tableCandidates(items,interactive=true) { if(!items.length)return empty("No candidates yet","Submit a bounded paper-only hypothesis through Hermes."); const sortable={strategy_id:"candidate_id",stage:"stage",updated_at:"updated_at"}; return `<table><thead><tr>${[["strategy_id","Strategy"],["family","Family"],["market","Market"],["stage","Stage"],["updated_at","Updated"]].map(([k,l])=>`<th>${interactive&&sortable[k]?sortButton(sortable[k],l):safe(l)}</th>`).join("")}</tr></thead><tbody>${items.map(i=>`<tr><td>${interactive?`<button class="link candidate" data-id="${encodeURIComponent(i.candidate_id||"")}">${safe(i.strategy_id||i.candidate_id)}</button>`:safe(i.strategy_id||i.candidate_id)}</td><td>${safe(i.family)}</td><td>${safe(i.market)}</td><td><span class="badge ${statusClass(i.stage)}">${safe(i.stage)}</span></td><td>${safe(dateText(i.updated_at))}</td></tr>`).join("")}</tbody></table>`; }
+    function tableCandidates(items,interactive=true) { if(!items.length)return empty("No candidates yet","Submit a bounded paper-only hypothesis through Hermes."); const sortable={strategy_id:"candidate_id",stage:"stage",updated_at:"updated_at"}; return `<table><thead><tr>${[["strategy_id","Strategy"],["family","Family"],["market","Market"],["stage","Stage"],["historical_gates","Historical gates"],["canary_status","Micro-live canary"],["paper_forward_status","Paper forward status"],["paper_promotable_status","Paper promotable"],["updated_at","Updated"]].map(([k,l])=>`<th>${interactive&&sortable[k]?sortButton(sortable[k],l):safe(l)}</th>`).join("")}</tr></thead><tbody>${items.map(i=>`<tr><td>${interactive?`<button class="link candidate" data-id="${encodeURIComponent(i.candidate_id||"")}">${safe(i.strategy_id||i.candidate_id)}</button>`:safe(i.strategy_id||i.candidate_id)}</td><td>${safe(i.family)}</td><td>${safe(i.market)}</td><td><span class="badge ${statusClass(i.stage)}">${safe(i.stage)}</span></td><td><span class="badge ${statusClass(i.historical_gates)}">${safe(i.historical_gates||"NOT_PASSED")}</span></td><td><span class="badge ${statusClass(i.canary_status)}">${safe(i.canary_status||"NOT_ELIGIBLE")}</span></td><td><span class="badge ${statusClass(i.paper_forward_status)}">${safe(i.paper_forward_status||"NOT_STARTED")}</span></td><td><span class="badge ${statusClass(i.paper_promotable_status)}">${safe(i.paper_promotable_status||"NOT_YET")}</span></td><td>${safe(dateText(i.updated_at))}</td></tr>`).join("")}</tbody></table>`; }
     function bindTable() { document.querySelectorAll(".sort").forEach(b=>b.addEventListener("click",()=>{const k=b.dataset.sort;state.direction=state.sort===k&&state.direction==="desc"?"asc":"desc";state.sort=k;state.page=1;saveState(true);loadPage(state.tab)})); document.querySelectorAll(".candidate").forEach(b=>b.addEventListener("click",()=>loadCandidate(decodeURIComponent(b.dataset.id)))); document.querySelectorAll(".dataset").forEach(b=>b.addEventListener("click",()=>loadDataset(decodeURIComponent(b.dataset.id)))); }
     async function loadDataset(id,rangePage=1,persist=true) { state.selected=id; state.expanded=true; if(persist)saveState(true); try { const detailResponse=await fetch(`/api/v2/datasets/${encodeURIComponent(id)}`,{cache:"no-store"}),d=await detailResponse.json(),version=d.dataset_version||d.catalog?.dataset_version||"",rangeQuery=new URLSearchParams({page:String(rangePage),page_size:String(state.page_size)}); if(version)rangeQuery.set("dataset_version",version); const rangesResponse=await fetch(`/api/v2/datasets/${encodeURIComponent(id)}/missing-ranges?${rangeQuery}`,{cache:"no-store"}),rangesData=rangesResponse.ok?await rangesResponse.json():{}; const markup=d.available?`<div class="key-value"><span class="key">Dataset</span><strong>${safe(d.dataset_id||id)}</strong></div><div class="key-value"><span class="key">Version</span><strong>${safe(d.dataset_version||d.catalog?.dataset_version)}</strong></div><div class="key-value"><span class="key">Quality</span><span class="badge">${safe(d.catalog?.quality)}</span></div><details open><summary>Health and missing ranges</summary><pre>${safe(json({health:d.health,missing_ranges:arr(rangesData.items)}))}</pre><div id="dataset-ranges-pager" class="pager"></div></details>`:empty("Dataset unavailable",d.error||"Dataset not found"); $("detail").innerHTML=markup; if($("dataset-detail"))$("dataset-detail").innerHTML=markup; if(d.available&&$("dataset-ranges-pager"))pager("dataset-ranges",rangesData); } catch(e) { const markup=empty("Dataset detail unavailable",e.message); $("detail").innerHTML=markup; if($("dataset-detail"))$("dataset-detail").innerHTML=markup; } }
     async function loadHermes(id,persist=true) { state.selected=id; state.expanded=true; if(persist)saveState(true); try { const r=await fetch(`/api/v2/hermes/${encodeURIComponent(id)}`,{cache:"no-store"}),d=await r.json(); const item=arr(d.items)[0]; $("hermes-detail").innerHTML=item?`<details open><summary>Hermes item ${safe(id)}</summary><pre>${safe(json(item))}</pre></details>`:empty("Hermes item unavailable","The queue item no longer exists."); } catch(e) { $("hermes-detail").innerHTML=empty("Hermes detail unavailable",e.message); } }
@@ -2338,14 +2446,14 @@ def _dashboard_html() -> str:
     function renderCandidates(data) { $("candidate-total").textContent=`${count(data.total)} candidates`; const stages=[...new Set(arr(data.items).map(i=>i.stage).filter(Boolean))].sort(),select=$("candidates-stage"),selected=select.value||params.get("stage")||""; select.innerHTML=`<option value="">All stages</option>${stages.map(s=>`<option value="${safe(s)}">${safe(s)}</option>`).join("")}`; if(selected&&!stages.includes(selected))select.insertAdjacentHTML("beforeend",`<option value="${safe(selected)}">${safe(selected)}</option>`); select.value=selected; $("candidates-table").innerHTML=tableCandidates(arr(data.items)); pager("candidates",data); bindTable(); if(state.tab==="candidates"&&state.selected)loadCandidate(state.selected,1,false); }
     function renderPolymarket(data) { const items=arr(data.items),categories=[...new Set(items.map(i=>i.category).filter(Boolean))].sort(),cat=$("polymarket-category"),old=cat.value||params.get("category")||""; cat.innerHTML=`<option value="">All categories</option>${categories.map(c=>`<option value="${safe(c)}">${safe(c)}</option>`).join("")}`; if(old&&!categories.includes(old))cat.insertAdjacentHTML("beforeend",`<option value="${safe(old)}">${safe(old)}</option>`); cat.value=old; const quality=items.map(i=>i.quality||i.research_quality).find(Boolean)||"—"; $("pm-summary").innerHTML=`<div class="three-col"><div class="key-value"><span class="key">Markets</span><strong>${count(data.total)}</strong></div><div class="key-value"><span class="key">Page</span><strong>${count(data.page)}</strong></div><div class="key-value"><span class="key">Quality</span><strong>${safe(quality)}</strong></div></div>`; const sortable={market_id:"market_id",category:"category",settlement:"settlement",quality:"quality"}; $("pm-markets").innerHTML=items.length?`<table><thead><tr>${[["market_id","Market"],["question","Question"],["category","Category"],["yes_mid","YES"],["liquidity","Liquidity"],["settlement","Settlement"],["quality","Quality"]].map(([k,l])=>`<th>${sortable[k]?sortButton(sortable[k],l):safe(l)}</th>`).join("")}</tr></thead><tbody>${items.map(i=>`<tr><td>${safe(i.market_id)}</td><td><details><summary>${safe(String(i.question||i.snapshot?.question||i.market_id).slice(0,90))}</summary><p class="page-note">${safe(i.question||i.snapshot?.question||i.market_id)}</p></details></td><td>${safe(i.category)}</td><td>${safe(i.yes_mid??i.snapshot?.yes_mid??i.payload?.snapshot?.yes_mid)}</td><td>${safe(i.liquidity??i.snapshot?.liquidity??i.payload?.snapshot?.liquidity)}</td><td>${safe(i.settlement??i.snapshot?.settlement??i.payload?.snapshot?.settlement)}</td><td>${safe(i.quality||i.research_quality||"—")}</td></tr>`).join("")}</tbody></table>`:empty("No forward market observations","Run the normal node or collect-data for forward-only quotes."); pager("polymarket",data); bindTable(); }
     function renderHermes(data) { const h=operator.hermes||{}; $("hermes-summary").innerHTML=`<div class="three-col"><div class="key-value"><span class="key">Submitted</span><strong>${count(h.submitted)}</strong></div><div class="key-value"><span class="key">Accepted</span><strong>${count(h.accepted)}</strong></div><div class="key-value"><span class="key">Pending</span><strong>${count(h.pending)}</strong></div></div><p class="page-note">Hermes status reflects queue execution state, not integration availability. ${safe(h.reason||"")}</p>`; $("hermes-table").innerHTML=arr(data.items).length?`<table><thead><tr>${[["item_id","Item"],["item_type","Type"],["status","Status"],["created_at","Created"]].map(([k,l])=>`<th>${sortButton(k,l)}</th>`).join("")}</tr></thead><tbody>${arr(data.items).map(i=>`<tr><td><button class="link hermes-item" data-id="${encodeURIComponent(i.item_id||"")}">${safe(i.item_id)}</button></td><td>${safe(i.item_type)}</td><td><span class="badge ${statusClass(i.status)}">${safe(i.status)}</span></td><td>${safe(dateText(i.created_at||i.updated_at))}</td></tr>`).join("")}</tbody></table>`:empty("Hermes not initialized","Start the research node or submit a paper-only proposal."); pager("hermes",data); bindTable(); document.querySelectorAll(".hermes-item").forEach(b=>b.addEventListener("click",()=>loadHermes(decodeURIComponent(b.dataset.id)))); if(state.tab==="hermes"&&state.selected)loadHermes(state.selected,false); }
-    async function loadCandidate(id,eventPage=1,persist=true) { state.selected=id; state.expanded=true; if(persist)saveState(true); try { const q=new URLSearchParams({page:String(eventPage),page_size:String(state.page_size)}),r=await fetch(`/api/v2/candidates/${encodeURIComponent(id)}/events?${q}`,{cache:"no-store"}),d=await r.json(); const markup=`<div class="key-value"><span class="key">Candidate</span><strong>${safe(id)}</strong></div>${arr(d.items).length?`<table><thead><tr><th>Time</th><th>Stage</th><th>Reason</th></tr></thead><tbody>${arr(d.items).map(i=>`<tr><td>${safe(dateText(i.created_at||i.timestamp))}</td><td><span class="badge">${safe(i.stage||i.to_stage)}</span></td><td>${safe(i.reason||i.message)}</td></tr>`).join("")}</tbody></table>`:empty("No lifecycle events","No persisted lifecycle evidence exists for this candidate.")}<div id="candidate-events-pager" class="pager"></div>`; $("detail").innerHTML=markup; if(state.tab==="candidates")$("dataset-detail").innerHTML=markup; if($("candidate-events-pager")){const total=Number(d.total)||0,page=Number(d.page)||1,size=Number(d.page_size)||state.page_size,pages=Number(d.pages)||0,start=total?(page-1)*size+1:0,end=Math.min(page*size,total); $("candidate-events-pager").innerHTML=`<span>Showing ${start}–${end} of ${total}</span><span><button data-page="${page-1}" ${page<=1?"disabled":""}>Previous</button> <button data-page="${page+1}" ${!pages||page>=pages?"disabled":""}>Next</button></span>`; $("candidate-events-pager").querySelectorAll("button").forEach(b=>b.addEventListener("click",()=>loadCandidate(id,Number(b.dataset.page),false)));} } catch(e) { $("detail").innerHTML=empty("Candidate detail unavailable",e.message); } }
+    async function loadCandidate(id,eventPage=1,persist=true) { state.selected=id; state.expanded=true; if(persist)saveState(true); try { const q=new URLSearchParams({page:String(eventPage),page_size:String(state.page_size)}),candidateResponse=await fetch(`/api/v2/candidates/${encodeURIComponent(id)}`,{cache:"no-store"}),r=await fetch(`/api/v2/candidates/${encodeURIComponent(id)}/events?${q}`,{cache:"no-store"}),candidate=candidateResponse.ok?await candidateResponse.json():{},d=await r.json(); const checks=[["Historical gates",candidate.historical_gates||"NOT_PASSED"],["Micro-live canary",candidate.canary_status||"NOT_ELIGIBLE"],["Paper forward status",candidate.paper_forward_status||"NOT_STARTED"],["Paper promotable",candidate.paper_promotable_status||"NOT_YET"]]; const markup=`<div class="key-value"><span class="key">Candidate</span><strong>${safe(candidate.candidate_id||id)}</strong></div><div class="three-col">${checks.map(([label,value])=>`<div class="key-value"><span class="key">${safe(label)}</span><strong><span class="badge ${statusClass(value)}">${safe(value)}</span></strong></div>`).join("")}</div>${arr(d.items).length?`<table><thead><tr><th>Time</th><th>Stage</th><th>Reason</th></tr></thead><tbody>${arr(d.items).map(i=>`<tr><td>${safe(dateText(i.created_at||i.timestamp))}</td><td><span class="badge">${safe(i.stage||i.to_stage)}</span></td><td>${safe(i.reason||i.message)}</td></tr>`).join("")}</tbody></table>`:empty("No lifecycle events","No persisted lifecycle evidence exists for this candidate.")}<div id="candidate-events-pager" class="pager"></div>`; $("detail").innerHTML=markup; if(state.tab==="candidates")$("dataset-detail").innerHTML=markup; if($("candidate-events-pager")){const total=Number(d.total)||0,page=Number(d.page)||1,size=Number(d.page_size)||state.page_size,pages=Number(d.pages)||0,start=total?(page-1)*size+1:0,end=Math.min(page*size,total); $("candidate-events-pager").innerHTML=`<span>Showing ${start}–${end} of ${total}</span><span><button data-page="${page-1}" ${page<=1?"disabled":""}>Previous</button> <button data-page="${page+1}" ${!pages||page>=pages?"disabled":""}>Next</button></span>`; $("candidate-events-pager").querySelectorAll("button").forEach(b=>b.addEventListener("click",()=>loadCandidate(id,Number(b.dataset.page),false)));} } catch(e) { $("detail").innerHTML=empty("Candidate detail unavailable",e.message); } }
     function renderPaper(data) { const p=operator.paper_portfolio||{}; $("portfolio-summary").innerHTML=`<div class="card-grid"><div class="panel"><div class="metric">${p.state_count?Number(p.total_equity||0).toFixed(2):"—"}</div><div class="metric-label">paper equity</div></div><div class="panel"><div class="metric">${p.state_count?Number(p.total_pnl||0).toFixed(2):"—"}</div><div class="metric-label">paper P/L</div></div><div class="panel"><div class="metric">${count(data.total)}</div><div class="metric-label">paper records</div></div><div class="panel"><div class="metric">${p.state_count?`${(Number(p.win_rate||0)*100).toFixed(1)}%`:"—"}</div><div class="metric-label">win rate</div></div></div>`; $("portfolio-states").innerHTML=arr(data.items).length?`<table><thead><tr><th>${sortButton("timestamp","Time")}</th><th>${sortButton("record_type","Type")}</th><th>Experiment</th><th>Market</th><th>Status</th><th>Details</th></tr></thead><tbody>${arr(data.items).map(i=>`<tr><td>${safe(dateText(i.timestamp||i.created_at||i.updated_at))}</td><td>${safe(i.record_type)}</td><td>${safe(i.experiment_id)}</td><td>${safe(i.market_id||i.symbol)}</td><td><span class="badge ${statusClass(i.status)}">${safe(i.status)}</span></td><td><details><summary>view</summary><pre>${safe(json(i))}</pre></details></td></tr>`).join("")}</tbody></table>`:empty("Waiting for PAPER_FORWARD","Paper portfolio initializes only after a candidate enters PAPER_FORWARD and observations are persisted."); pager("paper",data); bindTable(); }
     async function loadPage(tab) { const endpoint={datasets:"datasets",activity:"activity",candidates:"candidates",polymarket:"polymarket",hermes:"hermes","crypto":"crypto-research",portfolio:"paper"}[tab]; if(!endpoint)return; try { current=await fetchV2(endpoint); ({datasets:renderDatasets,activity:renderActivity,candidates:renderCandidates,polymarket:renderPolymarket,hermes:renderHermes,crypto:renderCrypto,portfolio:renderPaper}[tab])(current); } catch(e) { const target={datasets:"datasets-table",activity:"activity-table",candidates:"candidates-table",polymarket:"pm-markets",hermes:"hermes-table",crypto:"crypto-table",portfolio:"portfolio-states"}[tab]; if($(target))$(target).innerHTML=empty("Dashboard data unavailable",e.message); } }
     function renderCanary(data) { const c=data.canary||{}; $("canary-summary").innerHTML=`<div class="card-grid"><div class="panel"><div class="metric">${safe(c.micro_live_canary||"DISARMED")}</div><div class="metric-label">Micro live canary</div></div><div class="panel"><div class="metric">${safe(c.candidate)}</div><div class="metric-label">Candidate · expires ${safe(c.expiry)}</div></div><div class="panel"><div class="metric">${count(c.today_orders)}</div><div class="metric-label">Today's orders</div></div><div class="panel"><div class="metric">$${Number(c.today_realized_pnl||0).toFixed(2)}</div><div class="metric-label">Today's realized P/L</div></div><div class="panel"><div class="metric">$${Number(c.total_exposure||0).toFixed(2)}</div><div class="metric-label">Total exposure · ${count(c.open_positions)} positions</div></div><div class="panel"><div class="metric">$${Number(c.daily_loss_budget_remaining||0).toFixed(2)}</div><div class="metric-label">Daily loss budget remaining</div></div></div>`; $("canary-trades").innerHTML=arr(c.trades).length?`<table><thead><tr><th>Time</th><th>Candidate</th><th>Market</th><th>Side</th><th>Notional</th><th>Paper expected price</th><th>Actual price</th><th>Difference</th><th>Status</th><th>P/L</th></tr></thead><tbody>${arr(c.trades).map(i=>`<tr><td>${safe(dateText(i.timestamp))}</td><td>${safe(i.candidate_id)}</td><td>${safe(i.market_id)}</td><td>${safe(i.side)}</td><td>${safe(i.requested_notional)}</td><td>${safe(i.paper_expected_price)}</td><td>${safe(i.actual_average_price)}</td><td>${safe(i.price_difference)}</td><td>${safe(i.status)}</td><td>${safe(i.realized_pnl)}</td></tr>`).join("")}</tbody></table>`:empty("No real canary trades","Arm an eligible candidate explicitly; paper research continues independently."); }
     function renderBtc(data) { const b=operator.btc||{},summary=b.catalog_summary||{},rows=arr(summary.latest_by_timeframe||summary.timeframes),fallback=arr(b.catalog),catalogRows=rows.length?rows:fallback; $("btc-summary").innerHTML=catalogRows.length?`<div class="three-col"><div class="key-value"><span class="key">Catalog timeframes</span><strong>${count(catalogRows.length)}</strong></div><div class="key-value"><span class="key">Rows observed</span><strong>${count(catalogRows.reduce((total,item)=>total+Number(item.row_count||0),0))}</strong></div><div class="key-value"><span class="key">Latest report</span><strong>${safe(dateText(b.latest_report?.created_at))}</strong></div></div>`:empty("BTC history not initialized","Run bootstrap-history --crypto, then btc-research."); $("btc-experiments").innerHTML=""; }
     async function loadCrypto(symbol,persist=true) { state.selected=symbol; state.expanded=true; if(persist)saveState(true); try { const response=await fetch(`/api/v2/crypto-research/${encodeURIComponent(symbol)}`,{cache:"no-store"}),data=await response.json(); $("crypto-detail").innerHTML=arr(data.items).length?`<details open><summary>Crypto detail · ${safe(symbol)}</summary><div class="three-col"><div class="key-value"><span class="key">Universe version</span><strong>${safe(data.universe_version)}</strong></div><div class="key-value"><span class="key">Strategies</span><strong>${count(arr(data.strategies).length)}</strong></div><div class="key-value"><span class="key">Families</span><strong>${count(arr(data.families).length)}</strong></div></div><pre>${safe(json({catalogs:data.items,reports:data.reports,validation:data.validation,coverage:data.coverage}))}</pre></details>`:empty("Crypto symbol unavailable","No catalog is persisted for this symbol."); } catch(e) { $("crypto-detail").innerHTML=empty("Crypto detail unavailable",e.message); } }
     function renderCrypto(data) { const rows=arr(data.items),symbols=arr(data.symbols),summary={universe_version:data.universe_version,symbols:data.symbol_count??symbols.length,assets:data.asset_count??arr(data.assets).length,catalogs:data.total,reports:arr(data.reports).length}; $("crypto-summary").innerHTML=`<div class="three-col">${[["Universe version",summary.universe_version],["Symbols",summary.symbols],["Assets",summary.assets],["Catalogs",summary.catalogs],["Reports",summary.reports],["Families",arr(data.families).length]].map(([label,value])=>`<div class="key-value"><span class="key">${safe(label)}</span><strong>${safe(value)}</strong></div>`).join("")}</div>`; $("crypto-table").innerHTML=rows.length?`<table><thead><tr><th>Symbol</th><th>Dataset</th><th>Version</th><th>Source</th><th>Coverage</th><th>Strategies</th><th>Experiments</th><th>Validation</th><th>Families</th></tr></thead><tbody>${rows.map(i=>`<tr><td><button class="link crypto-symbol-row" data-symbol="${encodeURIComponent(i.symbol||"")}">${safe(i.symbol)}</button></td><td>${safe(i.dataset_id)}</td><td>${safe(i.dataset_version)}</td><td>${safe(i.source_type)}</td><td>${safe(json(i.coverage))}</td><td>${safe(json(i.strategies))}</td><td>${safe(json(i.experiments))}</td><td>${safe(json(i.validation))}</td><td>${safe(json(i.families))}</td></tr>`).join("")}</tbody></table>`:empty("No crypto catalogs","No crypto catalog or report has been persisted."); pager("crypto",data); document.querySelectorAll(".crypto-symbol-row").forEach(b=>b.addEventListener("click",()=>loadCrypto(decodeURIComponent(b.dataset.symbol)))); }
-    function renderOutcomeCards(data) { const cards=data.research_cards||{}, latest=data.hermes_latest_outcome||cards.newest_hermes_outcome||{}; $("research-cards").innerHTML=[["experiments_run","Experiments run"],["active_hypotheses","Active hypotheses"],["candidates_alive","Candidates alive"],["candidate_rejected","Candidate Rejected"],["research_rejected","Research Rejected"],["paper_forward","Paper forward"],["paper_promotable","Paper promotable"]].map(([key,label])=>`<article class="panel"><div class="metric">${count(cards[key])}</div><div class="metric-label">${label}</div></article>`).join("")+`<article class="panel"><div class="metric">${safe(latest.status||"—")}</div><div class="metric-label">Newest Hermes outcome · ${safe(latest.item_id||"none")}</div>${latest.human_reason?`<p class="page-note">${safe(latest.human_reason)}</p>`:""}</article>`; }
+    function renderOutcomeCards(data) { const cards=data.research_cards||{}, latest=data.hermes_latest_outcome||cards.newest_hermes_outcome||{}; $("research-cards").innerHTML=[["experiments_run","Experiments run"],["active_hypotheses","Active hypotheses"],["candidates_alive","Candidates alive"],["candidate_rejected","Candidate Rejected"],["research_rejected","Research Rejected"],["canary_eligible","Canary eligible"],["paper_forward","Paper forward"],["paper_promotable","Paper promotable"]].map(([key,label])=>`<article class="panel"><div class="metric">${count(cards[key])}</div><div class="metric-label">${label}</div></article>`).join("")+`<article class="panel"><div class="metric">${safe(latest.status||"—")}</div><div class="metric-label">Newest Hermes outcome · ${safe(latest.item_id||"none")}</div>${latest.human_reason?`<p class="page-note">${safe(latest.human_reason)}</p>`:""}</article>`; }
     const _renderOverview=renderOverview; renderOverview=(data)=>{_renderOverview(data);renderOutcomeCards(data);};
     async function load() { if(loadInFlight)return; loadInFlight=true; try { const response=await fetch("/api/operator",{cache:"no-store"}); if(!response.ok)throw new Error(`operator HTTP ${response.status}`); operator=await response.json(); renderOverview(operator); renderCrypto(operator.crypto_research||{}); renderCanary(operator); if(!["overview","crypto","canary"].includes(state.tab))await loadPage(state.tab); } catch(e) { $("component-grid").innerHTML=empty("Dashboard unavailable",e.message); } finally { loadInFlight=false; } }
     ensureFacets(); document.querySelectorAll(".tab").forEach(b=>b.addEventListener("click",()=>activate(b.dataset.view))); document.querySelectorAll("[data-link]").forEach(b=>b.addEventListener("click",e=>{e.preventDefault();activate(b.dataset.link)})); document.querySelectorAll(".filters input,.filters select").forEach(el=>el.addEventListener(el.tagName==="INPUT"?"input":"change",()=>{if(el.id.endsWith("-size")){const n=Number(el.value);if([10,25,50,100].includes(n)){state.page_size=n;document.querySelectorAll('select[id$="-size"]').forEach(s=>s.value=String(n));}} else if(el.id.includes("-filter"))state.filter=el.value;state.page=1;saveState(true);loadPage(state.tab)})); window.addEventListener("popstate",()=>{const q=new URLSearchParams(location.search),nextTab=q.get("tab")||"overview",changed=nextTab!==state.tab;params=q;state.tab=nextTab;state.page=Math.max(1,Number(q.get("page")||1));state.page_size=[10,25,50,100].includes(Number(q.get("page_size")))?Number(q.get("page_size")):25;state.filter=changed?"":q.get("filter")||"";state.sort=changed?"":q.get("sort")||"";state.direction=changed?"desc":q.get("direction")==="asc"?"asc":"desc";state.selected=changed?"":q.get("selected")||"";state.expanded=changed?false:q.get("expanded")==="1";restoreFacets();activate(state.tab,false)}); load(); activate(state.tab,false); const refreshHandle=setInterval(load,10000); window.addEventListener("beforeunload",()=>clearInterval(refreshHandle));

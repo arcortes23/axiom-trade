@@ -102,23 +102,112 @@ class CanaryTests(unittest.TestCase):
     def test_missing_credentials_cannot_arm(self):
         service=CanaryService(self.store,credentials=FakeCredentials(False),clock=lambda:T0)
         self.assertBlocked("CREDENTIALS_NOT_CONFIGURED",lambda:service.arm("C123",venue=self.venue,credentials_configured=True))
+
+    def test_credentials_require_only_signer_and_preserve_optional_relayer_values(self):
+        class Keyring:
+            values = {
+                "relayer_api_key": "existing-relayer-key",
+                "relayer_api_key_address": "existing-relayer-address",
+            }
+
+            @classmethod
+            def get_password(cls, _service, name):
+                return cls.values.get(name)
+
+            @classmethod
+            def set_password(cls, _service, name, value):
+                cls.values[name] = value
+
+        responses = iter(("private-key", "wallet-address", "", ""))
+        with patch.dict(sys.modules, {"keyring": Keyring}):
+            credentials = CredentialStore()
+            credentials.configure(reader=lambda _prompt: next(responses))
+            loaded = credentials.load()
+            self.assertTrue(credentials.configured())
+
+        self.assertEqual(loaded["private_key"], "private-key")
+        self.assertEqual(loaded["wallet_address"], "wallet-address")
+        self.assertEqual(loaded["relayer_api_key"], "existing-relayer-key")
+        self.assertEqual(
+            loaded["relayer_api_key_address"],
+            "existing-relayer-address",
+        )
+
     def test_hermes_has_no_canary_execution_fields(self):
         from axiom.director import validate_hermes_proposal
         result=validate_hermes_proposal({"proposal_id":"x","statement":"x","source":"x","tests":["x"],"dataset_version":"v","time_split":"train-validation-holdout","paper_only":True,"canary_arm":True})
         self.assertFalse(result.accepted)
     def test_ineligible_candidate_cannot_arm(self): self.assertBlocked("NOT_CANARY_ELIGIBLE",lambda:self.service.arm("other",venue=self.venue,credentials_configured=True))
-    def test_early_lifecycle_stages_cannot_mark_eligible(self):
+    def test_frozen_and_paper_forward_stages_can_mark_eligible_without_promotion(self):
         template = dict(self.store.load_candidate_lifecycle("C123")["payload"])
-        for candidate_id, terminal_stage in (("EARLY-FROZEN", "FROZEN"), ("EARLY-FORWARD", "PAPER_FORWARD")):
+        template.pop("forward_evidence", None)
+        progression = (
+            "SCHEMA_VALIDATED",
+            "BACKTESTED",
+            "VALIDATED",
+            "ROBUSTNESS_CHECKED",
+            "FROZEN",
+            "PAPER_FORWARD",
+        )
+        for candidate_id, terminal_stage in (
+            ("ELIGIBLE-FROZEN", "FROZEN"),
+            ("ELIGIBLE-FORWARD", "PAPER_FORWARD"),
+        ):
             self.store.save_candidate_lifecycle(candidate_id, "IDEA", template, timestamp=T0)
-            for stage in ("SCHEMA_VALIDATED", "BACKTESTED", "VALIDATED", "ROBUSTNESS_CHECKED", "FROZEN", "PAPER_FORWARD"):
+            for stage in progression:
                 self.store.save_candidate_lifecycle(candidate_id, stage, template, timestamp=T0)
                 if stage == terminal_stage:
                     break
+
+            self.service.mark_eligible(candidate_id)
+            lifecycle = self.store.load_candidate_lifecycle(candidate_id)
+            row = self.store.connection.execute(
+                "SELECT frozen_hash,evidence_json FROM canary_eligibility WHERE candidate_id=?",
+                (candidate_id,),
+            ).fetchone()
+            self.assertIsNotNone(row)
+            self.assertEqual(lifecycle["stage"], terminal_stage)
+            self.assertNotEqual(lifecycle["stage"], "PAPER_PROMOTABLE")
+            self.assertEqual(row["frozen_hash"], template["frozen_hash"])
+            self.assertEqual(json.loads(row["evidence_json"]), lifecycle["payload"])
+
+    def test_rejected_candidate_cannot_mark_eligible(self):
+        template = dict(self.store.load_candidate_lifecycle("C123")["payload"])
+        candidate_id = "REJECTED-CANDIDATE"
+        self.store.save_candidate_lifecycle(candidate_id, "IDEA", template, timestamp=T0)
+        self.store.save_candidate_lifecycle(candidate_id, "REJECTED", template, timestamp=T0)
+        self.assertBlocked(
+            "CANDIDATE_RESEARCH_GATES_INCOMPLETE",
+            lambda: self.service.mark_eligible(candidate_id),
+        )
+    def test_missing_gate_tampered_hash_and_malformed_documents_are_rejected(self):
+        template = dict(self.store.load_candidate_lifecycle("C123")["payload"])
+        template.pop("forward_evidence", None)
+        cases = (
+            ("MISSING-GATE", {**template, "data_quality_passed": False}),
+            ("TAMPERED-HASH", {**template, "frozen_hash": "tampered"}),
+            ("MALFORMED-DOCUMENTS", {**template, "frozen_documents": []}),
+        )
+        for candidate_id, payload in cases:
+            self.store.save_candidate_lifecycle(candidate_id, "IDEA", payload, timestamp=T0)
+            self.store.save_candidate_lifecycle(candidate_id, "FROZEN", payload, timestamp=T0)
             self.assertBlocked(
                 "CANDIDATE_RESEARCH_GATES_INCOMPLETE",
                 lambda candidate_id=candidate_id: self.service.mark_eligible(candidate_id),
             )
+
+    def test_lifecycle_evidence_change_invalidates_existing_eligibility(self):
+        payload = dict(self.store.load_candidate_lifecycle("C123")["payload"])
+        payload["forward_evidence"] = {
+            **payload["forward_evidence"],
+            "observation_marker": "changed-after-eligibility",
+        }
+        self.store.save_candidate_lifecycle("C123", "PAPER_PROMOTABLE", payload, timestamp=T0)
+        self.assertBlocked(
+            "CANDIDATE_NOT_CANARY_ELIGIBLE",
+            lambda: self.service.arm("C123", venue=self.venue, credentials_configured=True),
+        )
+
     def test_expired_arm_cannot_trade(self):
         self.arm(expires_hours=Decimal("0.001")); self.service.clock=lambda:T0+timedelta(hours=1)
         self.assertBlocked("CANARY_NOT_ARMED",self.submit)

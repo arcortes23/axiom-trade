@@ -34,8 +34,6 @@ class _CredentialStore(CredentialStore):
         return {
             "private_key": "private-key-fixture",
             "wallet_address": "wallet-fixture",
-            "relayer_api_key": "relayer-key-fixture",
-            "relayer_api_key_address": "relayer-address-fixture",
         }
 
 
@@ -91,8 +89,22 @@ class _SDKClient:
         self.market_calls: list[dict[str, object]] = []
         self.book_calls: list[dict[str, object]] = []
         self.balance_calls: list[dict[str, object]] = []
+        self.create_calls: list[dict[str, object]] = []
+        self.post_calls: list[object] = []
         self.place_calls: list[dict[str, object]] = []
+        self.approval_calls: list[tuple[str, dict[str, object]]] = []
+        self.update_calls: list[dict[str, object]] = []
+        self.call_events: list[str] = []
+        self.allowance = "1000000"
+        self.allowances: dict[str, str] | None = None
         self.close_calls = 0
+        self._ctx = {
+            "environment_config": {
+                "standard_exchange": "0xstandard",
+                "neg_risk_exchange": "0xnegrisk",
+                "exchange_v3": "0xexchange-v3",
+            }
+        }
 
     def get_market(self, **kwargs: object) -> dict[str, object]:
         self.market_calls.append(kwargs)
@@ -117,11 +129,42 @@ class _SDKClient:
 
     def get_balance_allowance(self, **kwargs: object) -> dict[str, object]:
         self.balance_calls.append(kwargs)
-        return {"balance": "2500000"}
+        self.call_events.append("get_balance_allowance")
+        allowances = (
+            self.allowances
+            if self.allowances is not None
+            else {"0xexchange-v3": self.allowance}
+        )
+        return {
+            "balance": "2500000",
+            "allowances": allowances,
+        }
+
+    def create_limit_order(self, **kwargs: object) -> dict[str, object]:
+        self.create_calls.append(kwargs)
+        self.call_events.append("create_limit_order")
+        return {"maker_amount": "1000000", "token_id": "position-yes", "side": "BUY"}
+
+    def post_order(self, signed: object) -> dict[str, object]:
+        self.post_calls.append(signed)
+        self.call_events.append("post_order")
+        return {"ok": True, "order_id": "mock-order", "status": "submitted", "trade_ids": []}
 
     def place_limit_order(self, **kwargs: object) -> dict[str, object]:
         self.place_calls.append(kwargs)
-        return {"ok": True, "order_id": "mock-order", "status": "submitted", "trade_ids": []}
+        return {"ok": True, "order_id": "unexpected-place", "status": "submitted"}
+
+    def approve_erc20(self, **kwargs: object) -> object:
+        self.approval_calls.append(("approve_erc20", kwargs))
+        return object()
+
+    def approve_erc1155_for_all(self, **kwargs: object) -> object:
+        self.approval_calls.append(("approve_erc1155_for_all", kwargs))
+        return object()
+
+    def update_balance_allowance(self, **kwargs: object) -> object:
+        self.update_calls.append(kwargs)
+        return object()
     def close(self) -> None:
         self.close_calls += 1
 
@@ -392,15 +435,136 @@ class CanaryReadinessTests(unittest.TestCase):
             self.assertNotIn("wallet", rendered)
             self.assertNotIn("signer", rendered)
 
-    def test_official_venue_uses_read_only_asset_aware_sdk_calls(self) -> None:
-        client = _SDKClient()
-        relayer_factory = MagicMock(return_value={"key": "api-key"})
+    def _submit_official_fixture(self, client: _SDKClient, signal_id: str) -> None:
         secure_factory = MagicMock(spec=["_create"])
         secure_factory._create.return_value = client
         credentials = _CredentialStore(True)
         venue = PolymarketClobV2Venue()
         sdk_module = MagicMock()
-        sdk_module.RelayerApiKey = relayer_factory
+        sdk_module.SecureClient = secure_factory
+        snapshot = {
+            "micro_live_canary": "ARMED",
+            "candidate": "candidate-1",
+            "today_orders": 0,
+            "open_positions": 0,
+            "today_realized_pnl": 0.0,
+            "total_exposure": 0.0,
+            "limits": {
+                "target_notional_usd": "1.00",
+                "max_exposure_usd": "5.00",
+                "max_daily_loss_usd": "2.00",
+                "max_open_positions": 3,
+                "max_orders_per_day": 5,
+                "max_slippage_bps": 100,
+            },
+        }
+        context = {
+            "asset_id": "position-yes",
+            "market_version": "v2",
+            "neg_risk": False,
+            "accepting_orders": True,
+            "min_order_size": "1",
+            "tick_size": "0.01",
+            "bids": [{"price": "0.49", "size": "100"}],
+            "asks": [{"price": "0.50", "size": "100"}],
+            "fee_bps": "10",
+        }
+        with patch.dict(sys.modules, {"polymarket": sdk_module}), patch.object(
+            PolymarketClobV2Venue,
+            "installed_sdk_version",
+            return_value="0.9.2",
+        ), patch.object(
+            CredentialStore,
+            "load",
+            return_value=credentials.load(),
+        ), patch.object(
+            PolymarketClobV2Venue,
+            "geoblock",
+            return_value={"blocked": False, "close_only": False},
+        ), AxiomStore(":memory:") as store:
+            service = CanaryService(store, credentials=credentials, clock=lambda: T0)
+            with patch.object(service, "status", return_value=snapshot), patch.object(
+                store,
+                "polymarket_health",
+                return_value={"grade": "A"},
+            ), patch.object(
+                PolymarketClobV2Venue,
+                "market_context",
+                return_value=context,
+            ):
+                service.submit(
+                    signal_id=signal_id,
+                    candidate_id="candidate-1",
+                    market_id="market-1",
+                    token_id="yes",
+                    side="BUY",
+                    paper_expected_price=Decimal("0.50"),
+                    venue=venue,
+                )
+
+    def test_official_insufficient_allowance_never_posts_or_approves(self) -> None:
+        for allowances in (
+            {"0xexchange-v3": "999999"},
+            {"0xother-spender": "100000000"},
+            {},
+        ):
+            client = _SDKClient()
+            client.allowances = allowances
+            with self.assertRaisesRegex(
+                CanaryBlocked,
+                "CANARY_ALLOWANCE_INSUFFICIENT",
+            ):
+                self._submit_official_fixture(
+                    client,
+                    f"insufficient-allowance-{len(allowances)}",
+                )
+
+            self.assertEqual(len(client.create_calls), 1)
+            self.assertEqual(client.post_calls, [])
+            self.assertEqual(client.place_calls, [])
+            self.assertEqual(client.approval_calls, [])
+            self.assertEqual(client.update_calls, [])
+            self.assertEqual(
+                client.call_events[-2:],
+                ["create_limit_order", "get_balance_allowance"],
+            )
+            self.assertGreater(client.close_calls, 0)
+
+    def test_official_allowance_targets_are_protocol_specific(self) -> None:
+        from axiom.canary import _order_balance_allowance_target
+
+        self.assertEqual(
+            _order_balance_allowance_target(
+                side="BUY",
+                asset_id="collateral-not-used",
+                market_version="v1",
+            ),
+            ("COLLATERAL", None),
+        )
+        self.assertEqual(
+            _order_balance_allowance_target(
+                side="SELL",
+                asset_id="legacy-token",
+                market_version="v1",
+            ),
+            ("CONDITIONAL", "legacy-token"),
+        )
+        self.assertEqual(
+            _order_balance_allowance_target(
+                side="SELL",
+                asset_id="v2-position",
+                market_version="v2",
+            ),
+            ("CONDITIONAL-V2", "v2-position"),
+        )
+
+    def test_official_venue_uses_read_only_asset_aware_sdk_calls(self) -> None:
+        client = _SDKClient()
+        secure_factory = MagicMock(spec=["_create"])
+        secure_factory._create.return_value = client
+        credentials = _CredentialStore(True)
+        venue = PolymarketClobV2Venue()
+        sdk_module = MagicMock()
         sdk_module.SecureClient = secure_factory
         with patch.dict(sys.modules, {"polymarket": sdk_module}), patch.object(
             PolymarketClobV2Venue,
@@ -410,7 +574,11 @@ class CanaryReadinessTests(unittest.TestCase):
             CredentialStore,
             "load",
             return_value=credentials.load(),
-        ), patch.object(PolymarketClobV2Venue, "geoblock", return_value={"blocked": False, "close_only": False}):
+        ), patch.object(
+            PolymarketClobV2Venue,
+            "geoblock",
+            return_value={"blocked": False, "close_only": False},
+        ):
             with AxiomStore(":memory:") as store:
                 result = CanaryService(store, credentials=credentials, clock=lambda: T0).connectivity_check(
                     candidate_id=None, venue=venue, market_id="market-1", token_id="yes"
@@ -420,27 +588,22 @@ class CanaryReadinessTests(unittest.TestCase):
             self.assertEqual(client.market_calls, [{"id": "market-1"}])
             self.assertEqual(client.book_calls, [{"asset_id": "position-yes"}])
             self.assertEqual(client.balance_calls, [{"asset_type": "COLLATERAL"}])
-            self.assertEqual(client.place_calls, [])
+            self.assertEqual(client.post_calls, [])
             self.assertEqual(result["diagnostics"]["market"]["asset_id"], "position-yes")
-            self.assertEqual(
-                relayer_factory.call_count,
-                4,
-            )
             self.assertEqual(secure_factory._create.call_count, 4)
             secure_factory._create.assert_called_with(
                 private_key="private-key-fixture",
                 wallet="wallet-fixture",
                 validate_credentials=True,
-                api_key={"key": "api-key"},
             )
 
             self.assertFalse(hasattr(venue, "submit_limit_order"))
-            self.assertEqual(client.place_calls, [])
+            self.assertEqual(client.post_calls, [])
             self.assertFalse(hasattr(venue, "_bind_service_capability"))
             self.assertFalse(hasattr(venue, "_secure_client"))
             self.assertFalse(hasattr(venue, "_submit_limit_order"))
             self.assertFalse(hasattr(venue, "_read_only"))
-            self.assertFalse(hasattr(venue, "_credential_provider"))
+            self.assertEqual(client.post_calls, [])
             self.assertFalse(hasattr(venue, "_client"))
             self.assertFalse(
                 any("place_limit_order" in name for name in dir(venue))
@@ -466,6 +629,8 @@ class CanaryReadinessTests(unittest.TestCase):
                 }
                 context = {
                     "asset_id": "position-yes",
+                    "market_version": "v2",
+                    "neg_risk": False,
                     "accepting_orders": True,
                     "min_order_size": "1",
                     "tick_size": "0.01",
@@ -492,7 +657,7 @@ class CanaryReadinessTests(unittest.TestCase):
                         venue=venue,
                     )
             self.assertEqual(
-                client.place_calls,
+                client.create_calls,
                 [
                     {
                         "asset_id": "position-yes",
@@ -502,6 +667,19 @@ class CanaryReadinessTests(unittest.TestCase):
                     }
                 ],
             )
+            self.assertEqual(len(client.post_calls), 1)
+            self.assertEqual(client.post_calls[0]["maker_amount"], "1000000")
+            self.assertEqual(
+                client.balance_calls[-1],
+                {"asset_type": "COLLATERAL"},
+            )
+            self.assertEqual(
+                client.call_events[-3:],
+                ["create_limit_order", "get_balance_allowance", "post_order"],
+            )
+            self.assertEqual(client.place_calls, [])
+            self.assertEqual(client.approval_calls, [])
+            self.assertEqual(client.update_calls, [])
             self.assertEqual(client.close_calls, 7)
     def test_official_venue_rejects_custom_geoblock_url(self) -> None:
         with self.assertRaises(TypeError):
