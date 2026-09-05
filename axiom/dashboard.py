@@ -2253,7 +2253,9 @@ class DashboardData:
             hermes_label, hermes_reason = "NOT INITIALIZED", "No Hermes execution state is persisted."
         paper_state_count = int(paper.get("state_count", 0) or 0)
         paper_label = "ACTIVE" if paper_state_count > 0 else "NOT INITIALIZED"
-        canary_service = CanaryService(self.store) if self.store is not None else None
+        canary_service = (
+            CanaryService(self.store, initialize=False) if self.store is not None else None
+        )
         canary_status = (
             canary_service.status()
             if canary_service is not None

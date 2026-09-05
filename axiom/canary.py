@@ -762,12 +762,14 @@ class CanaryService:
         credentials: CredentialStore | None = None,
         clock=utc_now,
         allow_environment: bool = False,
+        initialize: bool = True,
     ) -> None:
         self.store = store
         self.credentials = credentials or CredentialStore()
         self.clock = clock
         self.allow_environment = bool(allow_environment)
-        self._initialize()
+        if initialize:
+            self._initialize()
 
     def _initialize(self) -> None:
         with self.store.connection:
@@ -1233,16 +1235,21 @@ class CanaryService:
         return self._signal_from_row(row) if row is not None else None
 
     def latest_signal(self, candidate_id: str | None = None) -> Mapping[str, Any] | None:
-        if candidate_id is None:
-            row = self.store.connection.execute(
-                "SELECT * FROM canary_signals ORDER BY generated_at DESC,signal_id DESC LIMIT 1"
-            ).fetchone()
-        else:
-            row = self.store.connection.execute(
-                "SELECT * FROM canary_signals WHERE candidate_id=? "
-                "ORDER BY generated_at DESC,signal_id DESC LIMIT 1",
-                (str(candidate_id).strip(),),
-            ).fetchone()
+        try:
+            if candidate_id is None:
+                row = self.store.connection.execute(
+                    "SELECT * FROM canary_signals ORDER BY generated_at DESC,signal_id DESC LIMIT 1"
+                ).fetchone()
+            else:
+                row = self.store.connection.execute(
+                    "SELECT * FROM canary_signals WHERE candidate_id=? "
+                    "ORDER BY generated_at DESC,signal_id DESC LIMIT 1",
+                    (str(candidate_id).strip(),),
+                ).fetchone()
+        except sqlite3.OperationalError as exc:
+            if "no such table" not in str(exc).lower():
+                raise
+            row = None
         return self._signal_from_row(row) if row is not None else None
 
     def _set_signal_status(
@@ -1543,10 +1550,16 @@ class CanaryService:
                     "control_generation=excluded.control_generation",
                     (state, now, generation + 1),
                 )
-
     def status(self) -> dict[str, Any]:
-        row=self.store.connection.execute("SELECT * FROM canary_control WHERE singleton=1").fetchone()
-        now=ensure_utc(self.clock())
+        try:
+            row = self.store.connection.execute(
+                "SELECT * FROM canary_control WHERE singleton=1"
+            ).fetchone()
+        except sqlite3.OperationalError as exc:
+            if "no such table" not in str(exc).lower():
+                raise
+            row = None
+        now = ensure_utc(self.clock())
         if row is None:
             return {
                 "production_live_trading": "DISABLED",

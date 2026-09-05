@@ -227,7 +227,7 @@ $arguments = @(
 $process = Start-Process -FilePath $pythonExecutable -ArgumentList $arguments -WorkingDirectory $root -WindowStyle Hidden -PassThru
 $processStartTime = [datetime]$process.StartTime
 $ready = $false
-$probe = 'import sqlite3,sys; c=sqlite3.connect(sys.argv[1], timeout=1); r=c.execute(\"SELECT status FROM worker_state WHERE worker_name=?\", (\"axiom-node\",)).fetchone(); print(r[0] if r else \"\"); c.close()'
+$probe = 'import sqlite3,sys; c=sqlite3.connect(sys.argv[1], timeout=45); c.execute("PRAGMA busy_timeout=45000"); c.execute("PRAGMA query_only=ON"); r=c.execute("SELECT status FROM worker_state WHERE worker_name=?", ("axiom-node",)).fetchone(); print(r[0] if r else ""); c.close()'
 for ($attempt = 0; $attempt -lt 40; $attempt++) {
     Start-Sleep -Milliseconds 250
     if ($process.HasExited) { break }

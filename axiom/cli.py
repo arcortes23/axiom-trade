@@ -30,7 +30,7 @@ from .research import run_multi_symbol_crypto_research
 from .research_bus import DurableResearchBus, ResearchBusPermissionError, _validate_payload
 from .strategy import evaluate_signal_record, load_strategy
 from .tracking import ExperimentTracker
-from .storage import AxiomStore
+from .storage import AxiomStore, SQLiteBusyTimeout
 from .bootstrap import (
     BTC_HISTORY_START,
     BTC_INTERVAL_SECONDS,
@@ -717,7 +717,7 @@ def _load_cli_execution_inputs(args: argparse.Namespace, spec: Any) -> tuple[Any
     return _CliStrategy(strategy_definition), _CliProbabilityModel(model_document)
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def _main_impl(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "credentials":
         credentials = CredentialStore()
@@ -1301,6 +1301,24 @@ def _parse_cli_timestamp(value: str | None) -> datetime | None:
 
 
 
+
+def main(argv: Sequence[str] | None = None) -> int:
+    try:
+        return _main_impl(argv)
+    except SQLiteBusyTimeout as exc:
+        print(
+            json.dumps(
+                {
+                    "ready": False,
+                    "code": exc.code,
+                    "message": exc.friendly_message,
+                    "live_execution": False,
+                },
+                sort_keys=True,
+                indent=2,
+            )
+        )
+        return 1
 
 if __name__ == "__main__":
     raise SystemExit(main())

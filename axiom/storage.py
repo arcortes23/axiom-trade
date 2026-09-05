@@ -10,10 +10,12 @@ from __future__ import annotations
 from contextlib import contextmanager
 import hashlib
 import json
+import logging
 import math
 import os
 import threading
 import sqlite3
+import time
 from itertools import islice
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timedelta, timezone
@@ -29,6 +31,82 @@ _DEFAULT_PAGE_SIZE = 25
 _POLYMARKET_SOURCE_TYPES = frozenset({"HISTORICAL", "FORWARD_COLLECTED"})
 _DEFAULT_OPERATIONAL_WINDOW_SECONDS = 3_600.0
 _MAX_OPERATIONAL_WINDOW_SECONDS = 86_400.0
+SQLITE_CONNECTION_TIMEOUT_SECONDS = 45.0
+SQLITE_BUSY_RETRY_ATTEMPTS = 4
+SQLITE_BUSY_RETRY_INITIAL_SECONDS = 0.05
+SQLITE_BUSY_RETRY_MAX_SECONDS = 0.5
+_LOGGER = logging.getLogger(__name__)
+
+
+class SQLiteBusyTimeout(sqlite3.OperationalError):
+    """Bounded retry exhaustion while another writer owns SQLite."""
+
+    code = "SQLITE_BUSY_TIMEOUT"
+    friendly_message = "another AXIOM writer held the operational database too long"
+
+    def __init__(self, operation_name: str) -> None:
+        super().__init__(
+            f"{self.code}: {self.friendly_message}"
+            f" ({operation_name})"
+        )
+
+
+def _is_transient_sqlite_error(exc: BaseException) -> bool:
+    if isinstance(exc, SQLiteBusyTimeout) or not isinstance(exc, sqlite3.Error):
+        return False
+    message = str(exc).lower()
+    if "schema" in message and "lock" in message:
+        return False
+    code = getattr(exc, "sqlite_errorcode", None)
+    if isinstance(code, int):
+        base_code = code & 0xFF
+        if base_code in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}:
+            return True
+    return any(
+        marker in message
+        for marker in ("database is locked", "database table is locked", "sqlite_busy")
+    )
+
+
+def sqlite_retry(
+    operation: Any,
+    *,
+    operation_name: str = "SQLite operation",
+    max_attempts: int = SQLITE_BUSY_RETRY_ATTEMPTS,
+    initial_delay: float = SQLITE_BUSY_RETRY_INITIAL_SECONDS,
+    max_delay: float = SQLITE_BUSY_RETRY_MAX_SECONDS,
+) -> Any:
+    """Run an SQLite operation with bounded retries for transient lock errors."""
+    attempts = int(max_attempts)
+    if isinstance(max_attempts, bool) or attempts < 1:
+        raise ValueError("max_attempts must be positive")
+    delay = float(initial_delay)
+    delay_cap = float(max_delay)
+    if (
+        not math.isfinite(delay)
+        or not math.isfinite(delay_cap)
+        or delay < 0
+        or delay_cap < 0
+    ):
+        raise ValueError("SQLite retry delays must be finite and non-negative")
+    delay_cap = max(delay, delay_cap)
+    for attempt in range(attempts):
+        try:
+            return operation()
+        except sqlite3.Error as exc:
+            if not _is_transient_sqlite_error(exc):
+                raise
+            if attempt >= attempts - 1:
+                _LOGGER.warning(
+                    "SQLite busy retry exhausted operation=%s attempts=%d",
+                    operation_name,
+                    attempts,
+                )
+                raise SQLiteBusyTimeout(operation_name) from exc
+            if delay:
+                time.sleep(min(delay, delay_cap))
+                delay = min(delay * 2.0, delay_cap)
+    raise AssertionError("sqlite_retry exhausted without returning or raising")
 
 from .domain import (
     CryptoTicker,
@@ -60,17 +138,87 @@ class AxiomStore:
         connection: Optional existing connection, useful for test fixtures.
     """
 
-    def __init__(self, path: str | os.PathLike[str] = ":memory:", *, connection: sqlite3.Connection | None = None) -> None:
+    def __init__(
+        self,
+        path: str | os.PathLike[str] = ":memory:",
+        *,
+        connection: sqlite3.Connection | None = None,
+        sqlite_timeout_seconds: float = SQLITE_CONNECTION_TIMEOUT_SECONDS,
+    ) -> None:
         self.path = str(path)
+        timeout = float(sqlite_timeout_seconds)
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("sqlite_timeout_seconds must be finite and positive")
         if connection is None and self.path not in {":memory:", ""} and not self.path.startswith("file:"):
             parent = Path(self.path).expanduser().parent
             if str(parent) not in {"", "."}:
                 parent.mkdir(parents=True, exist_ok=True)
-        self._conn = connection or sqlite3.connect(self.path, check_same_thread=False)
+        created_connection = connection is None
+        self._conn = (
+            connection
+            if connection is not None
+            else sqlite3.connect(
+                self.path,
+                timeout=timeout,
+                check_same_thread=False,
+                uri=self.path.startswith("file:"),
+            )
+        )
         self._conn.row_factory = sqlite3.Row
         self._lock = threading.RLock()
         self._transaction_depth = 0
-        self.initialize()
+        self._sqlite_timeout_seconds = timeout
+        self._sqlite_busy_timeout_ms = max(1, int(round(timeout * 1000.0)))
+        try:
+            self._configure_connection()
+            self.initialize()
+        except BaseException:
+            if created_connection:
+                self._conn.close()
+            raise
+
+    def _database_filename(self) -> str:
+        rows = self._conn.execute("PRAGMA database_list").fetchall()
+        for row in rows:
+            name = str(row[1] if not isinstance(row, Mapping) else row["name"])
+            if name == "main":
+                value = row[2] if not isinstance(row, Mapping) else row["file"]
+                return str(value or "")
+        return ""
+
+    def _configure_connection(self) -> None:
+        """Configure and verify per-connection SQLite concurrency guarantees."""
+        self._conn.execute("PRAGMA foreign_keys=ON")
+        foreign_keys = int(self._conn.execute("PRAGMA foreign_keys").fetchone()[0])
+        if foreign_keys != 1:
+            raise sqlite3.OperationalError("SQLite foreign_keys pragma was not enabled")
+        self._conn.execute(f"PRAGMA busy_timeout={self._sqlite_busy_timeout_ms}")
+        busy_timeout = int(self._conn.execute("PRAGMA busy_timeout").fetchone()[0])
+        if busy_timeout != self._sqlite_busy_timeout_ms:
+            raise sqlite3.OperationalError("SQLite busy_timeout pragma was not applied")
+        file_backed = bool(self._database_filename())
+
+        def configure_journal() -> None:
+            if file_backed:
+                result = self._conn.execute("PRAGMA journal_mode=WAL").fetchone()
+                actual = str(result[0] if result is not None else "").lower()
+                if actual != "wal":
+                    raise sqlite3.OperationalError(
+                        f"SQLite WAL mode unavailable; actual journal mode is {actual or 'unknown'}"
+                    )
+            self._conn.execute("PRAGMA synchronous=NORMAL")
+
+        sqlite_retry(configure_journal, operation_name="configure SQLite journal mode")
+        journal_result = self._conn.execute("PRAGMA journal_mode").fetchone()
+        journal_mode = str(journal_result[0] if journal_result is not None else "").lower()
+        if file_backed and journal_mode != "wal":
+            raise sqlite3.OperationalError(
+                f"SQLite journal mode verification failed: {journal_mode or 'unknown'}"
+            )
+        synchronous = int(self._conn.execute("PRAGMA synchronous").fetchone()[0])
+        if synchronous != 1:
+            raise sqlite3.OperationalError("SQLite synchronous=NORMAL was not applied")
+
 
     @property
     def connection(self) -> sqlite3.Connection:
@@ -81,7 +229,10 @@ class AxiomStore:
         """Group several append-only writes into one rollback boundary."""
         with self._lock:
             if immediate and not self._transaction_depth:
-                self._conn.execute("BEGIN IMMEDIATE")
+                sqlite_retry(
+                    lambda: self._conn.execute("BEGIN IMMEDIATE"),
+                    operation_name="begin immediate SQLite transaction",
+                )
                 self._transaction_depth += 1
                 try:
                     yield self
@@ -89,7 +240,14 @@ class AxiomStore:
                     self._conn.rollback()
                     raise
                 else:
-                    self._conn.commit()
+                    try:
+                        sqlite_retry(
+                            self._conn.commit,
+                            operation_name="commit SQLite transaction",
+                        )
+                    except BaseException:
+                        self._conn.rollback()
+                        raise
                 finally:
                     self._transaction_depth -= 1
                 return
@@ -111,7 +269,16 @@ class AxiomStore:
     def _write_context(self) -> Iterator[None]:
         with self._lock:
             if self._transaction_depth:
-                yield
+                savepoint = f"axiom_write_{id(self):x}_{self._transaction_depth}"
+                self._conn.execute(f"SAVEPOINT {savepoint}")
+                try:
+                    yield
+                except BaseException:
+                    self._conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                    self._conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                    raise
+                else:
+                    self._conn.execute(f"RELEASE SAVEPOINT {savepoint}")
             else:
                 with self._conn:
                     yield
@@ -119,6 +286,10 @@ class AxiomStore:
 
     def initialize(self) -> None:
         """Create schema and indexes without changing existing records."""
+        sqlite_retry(self._initialize_schema, operation_name="initialize SQLite schema")
+
+    def _initialize_schema(self) -> None:
+        """Create schema and indexes for one initialization attempt."""
         with self._lock, self._conn:
             self._conn.executescript(
                 """
@@ -635,12 +806,15 @@ class AxiomStore:
         payload = _dump(records)
         metadata_json = _dump(dict(metadata or {}))
         quality_value = _enum_value(quality)
-        try:
+        def operation() -> None:
             with self._write_context():
                 self._conn.execute(
                     "INSERT INTO datasets(dataset_id, version, payload_json, metadata_json, quality, created_at) VALUES (?, ?, ?, ?, ?, ?)",
                     (dataset_id, version, payload, metadata_json, quality_value, _now_iso()),
                 )
+
+        try:
+            sqlite_retry(operation, operation_name=f"save dataset {dataset_id}/{version}")
         except sqlite3.IntegrityError as exc:
             raise ValueError(f"dataset version already exists: {dataset_id}/{version}") from exc
 
@@ -814,41 +988,49 @@ class AxiomStore:
             updated_iso,
             metadata_json,
         )
-        with self._write_context():
-            existing = self._conn.execute(
-                "SELECT * FROM dataset_catalog WHERE dataset_id=? AND dataset_version=?",
-                (identifier, version),
-            ).fetchone()
-            if existing is not None:
-                immutable_columns = (
-                    "provider",
-                    "instrument",
-                    "market_type",
-                    "timeframe",
-                    "start_timestamp",
-                    "end_timestamp",
-                    "row_count",
-                    "completeness",
-                    "missing_ranges_json",
-                    "quality",
-                    "source_type",
-                    "snapshot_id",
-                    "metadata_json",
+        def operation() -> bool:
+            with self._write_context():
+                existing = self._conn.execute(
+                    "SELECT * FROM dataset_catalog WHERE dataset_id=? AND dataset_version=?",
+                    (identifier, version),
+                ).fetchone()
+                if existing is not None:
+                    immutable_columns = (
+                        "provider",
+                        "instrument",
+                        "market_type",
+                        "timeframe",
+                        "start_timestamp",
+                        "end_timestamp",
+                        "row_count",
+                        "completeness",
+                        "missing_ranges_json",
+                        "quality",
+                        "source_type",
+                        "snapshot_id",
+                        "metadata_json",
+                    )
+                    expected = tuple(values[index] for index in (2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 16))
+                    actual = tuple(existing[column] for column in immutable_columns)
+                    if actual != expected:
+                        raise ValueError(f"dataset catalog snapshot conflicts with stored payload: {identifier}/{version}")
+                    return False
+                self._conn.execute(
+                    "INSERT INTO dataset_catalog("
+                    "dataset_id,dataset_version,provider,instrument,market_type,timeframe,"
+                    "start_timestamp,end_timestamp,row_count,completeness,missing_ranges_json,"
+                    "quality,source_type,snapshot_id,created_at,updated_at,metadata_json"
+                    ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    values,
                 )
-                expected = tuple(values[index] for index in (2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 16))
-                actual = tuple(existing[column] for column in immutable_columns)
-                if actual != expected:
-                    raise ValueError(f"dataset catalog snapshot conflicts with stored payload: {identifier}/{version}")
-                return False
-            self._conn.execute(
-                "INSERT INTO dataset_catalog("
-                "dataset_id,dataset_version,provider,instrument,market_type,timeframe,"
-                "start_timestamp,end_timestamp,row_count,completeness,missing_ranges_json,"
-                "quality,source_type,snapshot_id,created_at,updated_at,metadata_json"
-                ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                values,
+            return True
+
+        return bool(
+            sqlite_retry(
+                operation,
+                operation_name=f"save dataset catalog {identifier}/{version}",
             )
-        return True
+        )
 
     def load_dataset_catalog(self, dataset_id: str, dataset_version: str | None = None) -> dict[str, Any] | None:
         clauses = ["dataset_id=?"]
@@ -901,32 +1083,38 @@ class AxiomStore:
         required = ("provider", "instrument", "market_type", "timeframe", "status")
         if any(not str(body.get(name, "")).strip() for name in required):
             raise ValueError("dataset bootstrap state is missing required fields")
-        with self._write_context():
-            self._conn.execute(
-                "INSERT INTO dataset_bootstrap_state("
-                "dataset_id,provider,instrument,market_type,timeframe,requested_start,requested_end,"
-                "next_timestamp,base_version,status,payload_json,updated_at"
-                ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?) "
-                "ON CONFLICT(dataset_id) DO UPDATE SET "
-                "provider=excluded.provider,instrument=excluded.instrument,market_type=excluded.market_type,"
-                "timeframe=excluded.timeframe,requested_start=excluded.requested_start,requested_end=excluded.requested_end,"
-                "next_timestamp=excluded.next_timestamp,base_version=excluded.base_version,status=excluded.status,"
-                "payload_json=excluded.payload_json,updated_at=excluded.updated_at",
-                (
-                    identifier,
-                    str(body["provider"]),
-                    str(body["instrument"]),
-                    _enum_value(body["market_type"]) or str(body["market_type"]),
-                    str(body["timeframe"]),
-                    _iso(body["requested_start"]) if isinstance(body.get("requested_start"), datetime) else body.get("requested_start"),
-                    _iso(body["requested_end"]) if isinstance(body.get("requested_end"), datetime) else body.get("requested_end"),
-                    _iso(body["next_timestamp"]) if isinstance(body.get("next_timestamp"), datetime) else body.get("next_timestamp"),
-                    body.get("base_version"),
-                    str(body["status"]).upper(),
-                    _dump(body),
-                    _now_iso(),
-                ),
-            )
+        def operation() -> None:
+            with self._write_context():
+                self._conn.execute(
+                    "INSERT INTO dataset_bootstrap_state("
+                    "dataset_id,provider,instrument,market_type,timeframe,requested_start,requested_end,"
+                    "next_timestamp,base_version,status,payload_json,updated_at"
+                    ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?) "
+                    "ON CONFLICT(dataset_id) DO UPDATE SET "
+                    "provider=excluded.provider,instrument=excluded.instrument,market_type=excluded.market_type,"
+                    "timeframe=excluded.timeframe,requested_start=excluded.requested_start,requested_end=excluded.requested_end,"
+                    "next_timestamp=excluded.next_timestamp,base_version=excluded.base_version,status=excluded.status,"
+                    "payload_json=excluded.payload_json,updated_at=excluded.updated_at",
+                    (
+                        identifier,
+                        str(body["provider"]),
+                        str(body["instrument"]),
+                        _enum_value(body["market_type"]) or str(body["market_type"]),
+                        str(body["timeframe"]),
+                        _iso(body["requested_start"]) if isinstance(body.get("requested_start"), datetime) else body.get("requested_start"),
+                        _iso(body["requested_end"]) if isinstance(body.get("requested_end"), datetime) else body.get("requested_end"),
+                        _iso(body["next_timestamp"]) if isinstance(body.get("next_timestamp"), datetime) else body.get("next_timestamp"),
+                        body.get("base_version"),
+                        str(body["status"]).upper(),
+                        _dump(body),
+                        _now_iso(),
+                    ),
+                )
+
+        sqlite_retry(
+            operation,
+            operation_name=f"save bootstrap state {identifier}",
+        )
 
     def load_dataset_bootstrap_state(self, dataset_id: str) -> dict[str, Any] | None:
         with self._lock:
@@ -980,24 +1168,31 @@ class AxiomStore:
             if not isinstance(bar, OHLCVBar):
                 raise TypeError("save_dataset_staging_bars expects OHLCVBar records")
             normalized.append((_iso(bar.timestamp), _dump(bar)))
-        inserted = duplicates = 0
-        with self._write_context():
-            for timestamp, payload_json in normalized:
-                existing = self._conn.execute(
-                    "SELECT payload_json FROM dataset_staging_bars WHERE dataset_id=? AND timestamp=?",
-                    (identifier, timestamp),
-                ).fetchone()
-                if existing is not None:
-                    if str(existing["payload_json"]) != payload_json:
-                        raise ValueError(f"staged bar conflicts with stored payload: {identifier}/{timestamp}")
-                    duplicates += 1
-                    continue
-                self._conn.execute(
-                    "INSERT INTO dataset_staging_bars(dataset_id,timestamp,payload_json,created_at) VALUES (?,?,?,?)",
-                    (identifier, timestamp, payload_json, _now_iso()),
-                )
-                inserted += 1
-        return {"inserted": inserted, "duplicates": duplicates}
+
+        def operation() -> dict[str, int]:
+            inserted = duplicates = 0
+            with self._write_context():
+                for timestamp, payload_json in normalized:
+                    existing = self._conn.execute(
+                        "SELECT payload_json FROM dataset_staging_bars WHERE dataset_id=? AND timestamp=?",
+                        (identifier, timestamp),
+                    ).fetchone()
+                    if existing is not None:
+                        if str(existing["payload_json"]) != payload_json:
+                            raise ValueError(f"staged bar conflicts with stored payload: {identifier}/{timestamp}")
+                        duplicates += 1
+                        continue
+                    self._conn.execute(
+                        "INSERT INTO dataset_staging_bars(dataset_id,timestamp,payload_json,created_at) VALUES (?,?,?,?)",
+                        (identifier, timestamp, payload_json, _now_iso()),
+                    )
+                    inserted += 1
+            return {"inserted": inserted, "duplicates": duplicates}
+
+        return sqlite_retry(
+            operation,
+            operation_name=f"stage bars {identifier}",
+        )
 
     def load_dataset_staging_bars(self, dataset_id: str, *, limit: int | None = None) -> list[OHLCVBar]:
         if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 0):
@@ -1010,14 +1205,21 @@ class AxiomStore:
         with self._lock:
             rows = self._conn.execute(query, values).fetchall()
         return [_bar_from_record(_load(row["payload_json"])) for row in rows]
-
     def clear_dataset_staging_bars(self, dataset_id: str) -> int:
-        with self._write_context():
-            cursor = self._conn.execute(
-                "DELETE FROM dataset_staging_bars WHERE dataset_id=?",
-                (str(dataset_id),),
+        def operation() -> int:
+            with self._write_context():
+                cursor = self._conn.execute(
+                    "DELETE FROM dataset_staging_bars WHERE dataset_id=?",
+                    (str(dataset_id),),
+                )
+                return int(cursor.rowcount)
+
+        return int(
+            sqlite_retry(
+                operation,
+                operation_name=f"clear staged bars {str(dataset_id).strip()}",
             )
-        return int(cursor.rowcount)
+        )
 
     def save_historical_regime_labels(
         self,
@@ -1439,6 +1641,91 @@ class AxiomStore:
             ("symbol", "timestamp", "payload_json", "dataset_id", "dataset_version", "created_at"),
         )
         return len(rows)
+    def publish_dataset_bars_chunk(
+        self,
+        symbol: str,
+        bars: Iterable[OHLCVBar],
+        *,
+        dataset_id: str,
+        dataset_version: str,
+    ) -> dict[str, int]:
+        """Idempotently copy one staged publication chunk into immutable bars."""
+        identifier = str(dataset_id).strip()
+        version = str(dataset_version).strip()
+        if not identifier or not version:
+            raise ValueError("published bars require dataset identity")
+        normalized = []
+        for bar in bars:
+            if not isinstance(bar, OHLCVBar):
+                raise TypeError("publish_dataset_bars_chunk expects OHLCVBar records")
+            normalized.append(
+                (
+                    str(symbol),
+                    _iso(bar.timestamp),
+                    _dump(bar),
+                    identifier,
+                    version,
+                )
+            )
+
+        def operation() -> dict[str, int]:
+            inserted = duplicates = 0
+            with self._write_context():
+                for symbol_value, timestamp, payload_json, dataset_value, version_value in normalized:
+                    existing = self._conn.execute(
+                        "SELECT payload_json FROM bars WHERE symbol=? AND timestamp=? "
+                        "AND dataset_id=? AND dataset_version=?",
+                        (symbol_value, timestamp, dataset_value, version_value),
+                    ).fetchone()
+                    if existing is not None:
+                        if str(existing["payload_json"]) != payload_json:
+                            raise ValueError(
+                                "published bar conflicts with stored payload: "
+                                f"{dataset_value}/{version_value}/{timestamp}"
+                            )
+                        duplicates += 1
+                        continue
+                    self._conn.execute(
+                        "INSERT INTO bars(symbol,timestamp,payload_json,dataset_id,dataset_version,created_at) "
+                        "VALUES (?,?,?,?,?,?)",
+                        (
+                            symbol_value,
+                            timestamp,
+                            payload_json,
+                            dataset_value,
+                            version_value,
+                            _now_iso(),
+                        ),
+                    )
+                    inserted += 1
+            return {"inserted": inserted, "duplicates": duplicates}
+
+        return sqlite_retry(
+            operation,
+            operation_name=f"publish bars {identifier}/{version}",
+        )
+
+    def count_bars(
+        self,
+        symbol: str,
+        *,
+        dataset_id: str | None = None,
+        dataset_version: str | None = None,
+    ) -> int:
+        clauses = ["symbol=?"]
+        values: list[Any] = [str(symbol)]
+        if dataset_id is not None:
+            clauses.append("dataset_id=?")
+            values.append(str(dataset_id))
+        if dataset_version is not None:
+            clauses.append("dataset_version=?")
+            values.append(str(dataset_version))
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM bars WHERE " + " AND ".join(clauses),
+                values,
+            ).fetchone()
+        return int(row["n"]) if row is not None else 0
 
     def load_bars(
         self,
@@ -3884,20 +4171,23 @@ class AxiomStore:
         if not state:
             raise ValueError("worker status is required")
         heartbeat = heartbeat_at or utc_now()
-        with self._write_context():
-            self._conn.execute(
-                "INSERT INTO worker_state(worker_name,status,payload_json,started_at,heartbeat_at,updated_at) VALUES (?,?,?,?,?,?) "
-                "ON CONFLICT(worker_name) DO UPDATE SET status=excluded.status,payload_json=excluded.payload_json,"
-                "started_at=COALESCE(worker_state.started_at,excluded.started_at),heartbeat_at=excluded.heartbeat_at,updated_at=excluded.updated_at",
-                (
-                    worker,
-                    state,
-                    _dump(payload if payload is not None else {}),
-                    _iso(started_at) if started_at else None,
-                    _iso(heartbeat),
-                    _now_iso(),
-                ),
-            )
+        def operation() -> None:
+            with self._write_context():
+                self._conn.execute(
+                    "INSERT INTO worker_state(worker_name,status,payload_json,started_at,heartbeat_at,updated_at) VALUES (?,?,?,?,?,?) "
+                    "ON CONFLICT(worker_name) DO UPDATE SET status=excluded.status,payload_json=excluded.payload_json,"
+                    "started_at=COALESCE(worker_state.started_at,excluded.started_at),heartbeat_at=excluded.heartbeat_at,updated_at=excluded.updated_at",
+                    (
+                        worker,
+                        state,
+                        _dump(payload if payload is not None else {}),
+                        _iso(started_at) if started_at else None,
+                        _iso(heartbeat),
+                        _now_iso(),
+                    ),
+                )
+
+        sqlite_retry(operation, operation_name=f"save worker state {worker}")
 
     def list_worker_states(self, *, limit: int = 256) -> list[dict[str, Any]]:
         if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
@@ -5174,11 +5464,15 @@ class AxiomStore:
         if not rows:
             return
         placeholders = ",".join("?" for _ in columns)
-        try:
+
+        def operation() -> None:
             with self._write_context():
                 self._conn.executemany(
                     f"INSERT INTO {table}({','.join(columns)}) VALUES ({placeholders})", rows
                 )
+
+        try:
+            sqlite_retry(operation, operation_name=f"insert into {table}")
         except sqlite3.IntegrityError as exc:
             raise ValueError(f"duplicate immutable record in {table} ({key_columns})") from exc
 def _dataset_catalog_record(row: sqlite3.Row) -> dict[str, Any]:

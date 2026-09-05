@@ -44,6 +44,7 @@ BTC_INTERVAL_SECONDS: dict[str, int] = {
 }
 BTC_DATASET_IDS = {interval: f"{BTC_SYMBOL}-{interval}-full" for interval in BTC_INTERVAL_SECONDS}
 POLYMARKET_DATASET_ID = "Polymarket-historical"
+BOOTSTRAP_PUBLICATION_CHUNK_SIZE = 512
 
 
 @dataclass(frozen=True, slots=True)
@@ -563,6 +564,38 @@ class HistoricalBootstrapper:
         self.max_attempts = int(max_attempts)
         self.backoff = float(backoff)
 
+    def _publish_crypto_version(
+        self,
+        symbol: str,
+        dataset_id: str,
+        version: str,
+        bars: Sequence[OHLCVBar],
+        catalog: Mapping[str, Any],
+    ) -> None:
+        """Publish a fully staged immutable version in short writer windows."""
+        if self.store.load_dataset_catalog(dataset_id, version) is None:
+            for offset in range(0, len(bars), BOOTSTRAP_PUBLICATION_CHUNK_SIZE):
+                self.store.publish_dataset_bars_chunk(
+                    symbol,
+                    bars[offset : offset + BOOTSTRAP_PUBLICATION_CHUNK_SIZE],
+                    dataset_id=dataset_id,
+                    dataset_version=version,
+                )
+        with self.store.transaction(immediate=True):
+            if self.store.load_dataset_catalog(dataset_id, version) is None:
+                published = self.store.count_bars(
+                    symbol,
+                    dataset_id=dataset_id,
+                    dataset_version=version,
+                )
+                if published != len(bars):
+                    raise ValueError(
+                        f"immutable bar publication incomplete: {dataset_id}/{version} "
+                        f"{published}/{len(bars)}"
+                    )
+                self.store.save_dataset_catalog(dataset_id, version, **dict(catalog))
+            self.store.clear_dataset_staging_bars(dataset_id)
+
     def status(self) -> dict[str, Any]:
         return {
             "catalog": self.store.list_dataset_catalog(limit=10_000),
@@ -724,6 +757,7 @@ class HistoricalBootstrapper:
             base_version = None
         if latest is not None and base_catalog is not None and _same_time(latest.get("end_timestamp"), requested_end):
             if float(latest.get("completeness", 0.0)) >= 1.0 and not latest.get("missing_ranges"):
+                self.store.clear_dataset_staging_bars(dataset_id)
                 self.store.save_dataset_bootstrap_state(
                     dataset_id,
                     {
@@ -916,18 +950,27 @@ class HistoricalBootstrapper:
             "incremental": base_version is not None,
         }
         try:
-            with self.store.transaction():
-                if self.store.load_dataset_catalog(dataset_id, version) is None:
-                    self.store.save_bars(symbol, combined, dataset_id=dataset_id, dataset_version=version)
-                    self.store.save_dataset_catalog(
-                        dataset_id, version, provider=_provider_name(provider), instrument=symbol,
-                        market_type=MarketType.CRYPTO_SPOT, timeframe=interval,
-                        start_timestamp=combined[0].timestamp, end_timestamp=combined[-1].timestamp,
-                        row_count=len(combined), completeness=completeness, missing_ranges=missing,
-                        quality="OHLCV", source_type="HISTORICAL", snapshot_id=f"{dataset_id}:{version}",
-                        metadata=metadata,
-                    )
-                self.store.clear_dataset_staging_bars(dataset_id)
+            self._publish_crypto_version(
+                symbol,
+                dataset_id,
+                version,
+                combined,
+                {
+                    "provider": _provider_name(provider),
+                    "instrument": symbol,
+                    "market_type": MarketType.CRYPTO_SPOT,
+                    "timeframe": interval,
+                    "start_timestamp": combined[0].timestamp,
+                    "end_timestamp": combined[-1].timestamp,
+                    "row_count": len(combined),
+                    "completeness": completeness,
+                    "missing_ranges": missing,
+                    "quality": "OHLCV",
+                    "source_type": "HISTORICAL",
+                    "snapshot_id": f"{dataset_id}:{version}",
+                    "metadata": metadata,
+                },
+            )
         except ValueError as exc:
             errors.append(str(exc))
             return BootstrapReport(
@@ -999,6 +1042,7 @@ class HistoricalBootstrapper:
             base_version = None
         if latest is not None and base_catalog is not None and _same_time(latest.get("end_timestamp"), requested_end):
             if float(latest.get("completeness", 0.0)) >= 1.0 and not latest.get("missing_ranges"):
+                self.store.clear_dataset_staging_bars(dataset_id)
                 self.store.save_dataset_bootstrap_state(
                     dataset_id,
                     {
@@ -1195,27 +1239,27 @@ class HistoricalBootstrapper:
             "incremental": base_version is not None,
         }
         try:
-            with self.store.transaction():
-                if self.store.load_dataset_catalog(dataset_id, version) is None:
-                    self.store.save_bars(BTC_SYMBOL, combined, dataset_id=dataset_id, dataset_version=version)
-                    self.store.save_dataset_catalog(
-                        dataset_id,
-                        version,
-                        provider=_provider_name(provider),
-                        instrument=BTC_SYMBOL,
-                        market_type=MarketType.CRYPTO_SPOT,
-                        timeframe=interval,
-                        start_timestamp=combined[0].timestamp,
-                        end_timestamp=combined[-1].timestamp,
-                        row_count=len(combined),
-                        completeness=completeness,
-                        missing_ranges=missing,
-                        quality="OHLCV",
-                        source_type="HISTORICAL",
-                        snapshot_id=f"{dataset_id}:{version}",
-                        metadata=metadata,
-                    )
-                self.store.clear_dataset_staging_bars(dataset_id)
+            self._publish_crypto_version(
+                BTC_SYMBOL,
+                dataset_id,
+                version,
+                combined,
+                {
+                    "provider": _provider_name(provider),
+                    "instrument": BTC_SYMBOL,
+                    "market_type": MarketType.CRYPTO_SPOT,
+                    "timeframe": interval,
+                    "start_timestamp": combined[0].timestamp,
+                    "end_timestamp": combined[-1].timestamp,
+                    "row_count": len(combined),
+                    "completeness": completeness,
+                    "missing_ranges": missing,
+                    "quality": "OHLCV",
+                    "source_type": "HISTORICAL",
+                    "snapshot_id": f"{dataset_id}:{version}",
+                    "metadata": metadata,
+                },
+            )
         except ValueError as exc:
             errors.append(str(exc))
             self.store.save_dataset_bootstrap_state(
