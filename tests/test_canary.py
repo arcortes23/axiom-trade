@@ -5,6 +5,10 @@ from decimal import Decimal
 import json
 import hashlib
 import sys
+import multiprocessing
+import sqlite3
+import tempfile
+import threading
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -48,6 +52,44 @@ class CrashGapVenue(FakeVenue):
         ).fetchone()
         self.observed_status = row["status"] if row is not None else None
         raise KeyboardInterrupt("simulated process interruption")
+
+
+class ProcessBlockingVenue(FakeVenue):
+    def __init__(self, entered, release):
+        super().__init__()
+        self.entered = entered
+        self.release = release
+
+    def submit_limit_order(self, **kwargs):
+        self.entered.set()
+        if not self.release.wait(15):
+            raise RuntimeError("process test release timed out")
+        return {"ok": True, "order_id": "process-order", "status": "matched"}
+
+
+def _blocked_submit_worker(database_path, entered, release, results):
+    store = HealthyStore(database_path)
+    try:
+        service = CanaryService(
+            store,
+            credentials=FakeCredentials(),
+            clock=lambda: T0,
+        )
+        result = service.submit(
+            signal_id="cross-process",
+            candidate_id="C123",
+            market_id="m",
+            token_id="yes",
+            side="BUY",
+            paper_expected_price=Decimal("0.50"),
+            venue=ProcessBlockingVenue(entered, release),
+            allow_test_venue=True,
+        )
+        results.put(("ok", result))
+    except BaseException as exc:
+        results.put(("error", type(exc).__name__, str(exc)))
+    finally:
+        store.close()
 
 
 class CanaryTests(unittest.TestCase):
@@ -409,8 +451,8 @@ class CanaryTests(unittest.TestCase):
         venue = CrashGapVenue(self.store)
         with self.assertRaises(KeyboardInterrupt):
             self.submit("crash-gap", venue=venue)
-        self.assertTrue(venue.observed_in_transaction)
-        self.assertEqual(venue.observed_status, "RESERVED")
+        self.assertFalse(venue.observed_in_transaction)
+        self.assertEqual(venue.observed_status, "SUBMITTING")
         self.assertEqual(
             self.store.connection.execute(
                 "SELECT status FROM canary_ledger WHERE signal_id='crash-gap'"
@@ -427,6 +469,118 @@ class CanaryTests(unittest.TestCase):
             "DUPLICATE_SIGNAL",
             lambda: self.submit("crash-gap"),
         )
+    def test_cross_process_kill_does_not_wait_for_blocked_submission(self):
+        self.arm()
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = f"{directory}\\canary.sqlite3"
+            target = sqlite3.connect(database_path)
+            try:
+                self.store.connection.backup(target)
+            finally:
+                target.close()
+            context = multiprocessing.get_context("spawn")
+            entered = context.Event()
+            release = context.Event()
+            results = context.Queue()
+            process = context.Process(
+                target=_blocked_submit_worker,
+                args=(database_path, entered, release, results),
+            )
+            killer_store = HealthyStore(database_path)
+            killer_service = CanaryService(
+                killer_store,
+                credentials=FakeCredentials(),
+                clock=lambda: T0,
+            )
+            process.start()
+            try:
+                self.assertTrue(entered.wait(10))
+                inflight = killer_service.status()
+                self.assertEqual(inflight["micro_live_canary"], "ARMED")
+                self.assertEqual(inflight["last_request_status"], "SUBMITTING")
+                self.assertEqual(
+                    inflight["control_generation"],
+                    1,
+                )
+                killer_service.kill()
+                self.assertEqual(
+                    killer_store.connection.execute(
+                        "SELECT state FROM canary_control WHERE singleton=1"
+                    ).fetchone()[0],
+                    "KILLED",
+                )
+                self.assertFalse(killer_store.connection.in_transaction)
+            finally:
+                release.set()
+                process.join(15)
+                if process.is_alive():
+                    process.terminate()
+                    process.join(5)
+                killer_store.close()
+            self.assertEqual(process.exitcode, 0)
+            result = results.get(timeout=5)
+            self.assertEqual(result[0], "ok")
+            final_store = HealthyStore(database_path)
+            try:
+                self.assertEqual(
+                    final_store.connection.execute(
+                        "SELECT status FROM canary_ledger WHERE signal_id='cross-process'"
+                    ).fetchone()[0],
+                    "SUBMITTED",
+                )
+                self.assertEqual(
+                    CanaryService(
+                        final_store,
+                        credentials=FakeCredentials(),
+                        clock=lambda: T0,
+                    ).status()["micro_live_canary"],
+                    "KILLED",
+                )
+                execution_evidence = json.loads(
+                    final_store.connection.execute(
+                        "SELECT evidence_json FROM canary_execution_events"
+                    ).fetchone()[0]
+                )
+                self.assertEqual(execution_evidence["request_control_generation"], 1)
+                self.assertEqual(execution_evidence["control_generation"], 2)
+            finally:
+                final_store.close()
+
+    def test_submission_timeout_is_durable_unknown_and_not_retried(self):
+        self.arm()
+        entered = threading.Event()
+        release = threading.Event()
+
+        class TimeoutVenue(FakeVenue):
+            def submit_limit_order(self, **kwargs):
+                entered.set()
+                release.wait(10)
+                return {"ok": True, "order_id": "late-order", "status": "matched"}
+
+        try:
+            with patch("axiom.canary.CANARY_SUBMISSION_TIMEOUT_SECONDS", 0.01):
+                with self.assertRaisesRegex(
+                    CanaryBlocked,
+                    "CANARY_SUBMISSION_UNKNOWN",
+                ):
+                    self.submit("timeout", venue=TimeoutVenue())
+            self.assertTrue(entered.is_set())
+            self.assertEqual(
+                self.store.connection.execute(
+                    "SELECT status FROM canary_ledger WHERE signal_id='timeout'"
+                ).fetchone()[0],
+                "UNKNOWN",
+            )
+            self.assertEqual(
+                self.store.connection.execute(
+                    "SELECT status FROM canary_execution_events"
+                ).fetchone()[0],
+                "UNKNOWN",
+            )
+            self.assertBlocked("DUPLICATE_SIGNAL", lambda: self.submit("timeout"))
+        finally:
+            release.set()
+
 
     def test_accepted_execution_status_counts_as_open_exposure(self):
         self.arm()
@@ -440,8 +594,8 @@ class CanaryTests(unittest.TestCase):
         ledger_status = self.store.connection.execute(
             "SELECT status FROM canary_ledger"
         ).fetchone()[0]
-        self.assertEqual(event_status, "OPEN")
-        self.assertEqual(ledger_status, "OPEN")
+        self.assertEqual(event_status, "SUBMITTED")
+        self.assertEqual(ledger_status, "SUBMITTED")
     def test_different_candidate_cannot_trade_or_write_ledger(self):
         self.arm()
         venue = FakeVenue()
@@ -462,10 +616,72 @@ class CanaryTests(unittest.TestCase):
         result = self.service.connectivity_check(candidate_id="C123", venue=None)
         self.assertFalse(result["ready"])
         self.assertIn("VENUE_REQUIRED", result["failures"])
+    def test_connectivity_check_is_prearming_read_only(self):
+        result = self.service.connectivity_check(
+            candidate_id=None,
+            venue=self.venue,
+            market_id="m",
+            token_id="yes",
+        )
+        self.assertTrue(result["ready"], result)
+        self.assertTrue(result["connectivity_only"])
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM canary_control"
+            ).fetchone()[0],
+            0,
+        )
+        self.assertNotIn("CANARY_NOT_ARMED", result["failures"])
+        self.assertFalse(self.venue.submissions)
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM canary_ledger"
+            ).fetchone()[0],
+            0,
+        )
+
+    def test_full_canary_check_remains_armed_gate(self):
+        result = self.service.check(
+            candidate_id="C123",
+            venue=self.venue,
+        )
+        self.assertFalse(result["ready"])
+        self.assertIn("CANARY_NOT_ARMED", result["failures"])
+        self.assertFalse(result["connectivity_only"])
+
     def test_credentials_never_persist_or_render(self):
         self.arm(); self.submit(); dump="\n".join(str(tuple(r)) for r in self.store.connection.iterdump()); dashboard=json.dumps(DashboardData(store=self.store).operator_data(),default=str)+_dashboard_html(); self.assertNotIn("test-only",dump+dashboard)
+    def test_dashboard_preserves_killed_state_and_last_request_status(self):
+        self.arm()
+        self.submit("dashboard-request")
+        self.service.kill()
+        canary = DashboardData(store=self.store).operator_data()["canary"]
+        self.assertEqual(canary["micro_live_canary"], "KILLED")
+        self.assertEqual(canary["last_request_status"], "SUBMITTED")
+        html = _dashboard_html()
+        self.assertEqual(
+            canary["expiry"],
+            (T0 + timedelta(hours=24)).isoformat(),
+        )
+        self.assertIn("SUBMITTING", html)
+        self.assertIn("last_request_status", json.dumps(canary))
+        self.assertIn("in-flight not retracted", html)
+
     def test_paper_and_real_ledgers_are_separate(self):
-        self.arm(); self.submit(); self.assertEqual(self.store.connection.execute("SELECT COUNT(*) FROM canary_ledger").fetchone()[0],1); self.assertEqual(self.store.connection.execute("SELECT COUNT(*) FROM paper_execution_events").fetchone()[0],0)
+        self.arm()
+        self.submit()
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM canary_ledger"
+            ).fetchone()[0],
+            1,
+        )
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM paper_execution_events"
+            ).fetchone()[0],
+            0,
+        )
     def test_canary_check_without_credentials_rejects_without_order(self):
         service=CanaryService(self.store,credentials=FakeCredentials(False),clock=lambda:T0); result=service.check(candidate_id="C123",venue=None); self.assertFalse(result["ready"]); self.assertIn("CREDENTIALS_NOT_CONFIGURED",result["failures"]); self.assertFalse(self.venue.submissions)
     def test_dashboard_labels_real_canary_and_production_disabled(self):

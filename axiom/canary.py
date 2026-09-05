@@ -15,8 +15,10 @@ import importlib.metadata
 import json
 import os
 import sqlite3
-from typing import Any, Mapping, Protocol
+import queue
+import threading
 from urllib.request import Request, urlopen
+from typing import Any, Mapping, Protocol
 
 from .domain import ensure_utc, utc_now
 from .storage import AxiomStore
@@ -30,6 +32,8 @@ DEFAULT_DAILY_LOSS_USD = Decimal("2.00")
 DEFAULT_MAX_OPEN_POSITIONS = 3
 DEFAULT_MAX_ORDERS_PER_DAY = 5
 DEFAULT_MAX_SLIPPAGE_BPS = 100
+
+CANARY_SUBMISSION_TIMEOUT_SECONDS = 15.0
 _CANARY_ELIGIBLE_STAGES = frozenset({"FROZEN", "PAPER_FORWARD", "PAPER_PROMOTABLE"})
 _MANDATORY_SECRET_NAMES = ("private_key", "wallet_address")
 _OPTIONAL_SECRET_NAMES = ("relayer_api_key", "relayer_api_key_address")
@@ -142,6 +146,32 @@ def _allowance_for_spender(
     # canary emits the explicit insufficient-allowance rejection.
     return 0
 
+def _call_with_timeout(operation: Any, timeout_seconds: float) -> Any:
+    """Bound a synchronous external call without holding application locks.
+
+    The worker is daemonized because Python cannot safely interrupt a blocking
+    socket from the caller thread. A timeout therefore records UNKNOWN while
+    the SDK call may still finish; callers must treat that request as already
+    transmitted and never retry it automatically.
+    """
+    result_queue: queue.Queue[tuple[str, Any]] = queue.Queue(maxsize=1)
+
+    def invoke() -> None:
+        try:
+            result_queue.put(("ok", operation()))
+        except BaseException as exc:
+            result_queue.put(("error", exc))
+
+    worker = threading.Thread(target=invoke, name="axiom-canary-submit", daemon=True)
+    worker.start()
+    worker.join(max(0.0, float(timeout_seconds)))
+    if worker.is_alive():
+        raise TimeoutError("canary external submission timed out")
+    kind, value = result_queue.get_nowait()
+    if kind == "error":
+        raise value
+    return value
+
 
 def _best_ask_price(asks: Any) -> Decimal:
     """Return the lowest finite, positive ask price from an order book."""
@@ -211,7 +241,7 @@ def _read_only_operation(
     token_id: str | None = None,
 ) -> Any:
     """Construct one local read client and return normalized diagnostics only."""
-    if operation not in {"account", "balance", "market_context"}:
+    if operation not in {"account", "balance", "allowance", "market_context"}:
         raise ValueError(f"unsupported read operation: {operation}")
     try:
         import polymarket
@@ -277,6 +307,22 @@ def _read_only_operation(
             raise CanaryBlocked("BALANCE_RESPONSE_INVALID") from exc
         finally:
             close_client()
+    if operation == "allowance":
+        try:
+            value = client.get_balance_allowance(asset_type="COLLATERAL")
+            balance, allowances = _normalize_balance_allowance(value)
+            return {
+                "status": "OK",
+                "asset_type": "COLLATERAL",
+                "balance_base_units": str(balance),
+                "spenders": sorted(allowances),
+            }
+        except CanaryBlocked:
+            raise
+        except Exception as exc:
+            raise CanaryBlocked("BALANCE_RESPONSE_INVALID") from exc
+        finally:
+            close_client()
 
     if not market_id or not token_id:
         close_client()
@@ -300,6 +346,24 @@ def _read_only_operation(
             Decimal(str(fee_rate)) * Decimal("10000")
             if fee_rate is not None
             else Decimal(str(_sdk_value(market, "fee_bps", 0) or 0))
+        )
+        allowance = {
+            "status": "OK",
+            "asset_type": "COLLATERAL",
+            "spender": _resolve_official_spender(
+                client,
+                asset_id=asset_id,
+                market_version=_sdk_value(market, "version", ""),
+                neg_risk=neg_risk,
+            ),
+        }
+        allowance_value = client.get_balance_allowance(asset_type="COLLATERAL")
+        _, allowance_map = _normalize_balance_allowance(allowance_value)
+        allowance["available_base_units"] = str(
+            _allowance_for_spender(allowance_map, allowance["spender"])
+        )
+        allowance["available_usd"] = str(
+            Decimal(allowance["available_base_units"]) / Decimal("1000000")
         )
         return {
             "market_version": str(_sdk_value(market, "version", "") or ""),
@@ -332,6 +396,7 @@ def _read_only_operation(
                 for level in (_sdk_value(book, "asks", ()) or ())
             ],
             "fee_bps": str(fee_bps),
+            "allowance": allowance,
         }
     except CanaryBlocked:
         raise
@@ -483,7 +548,7 @@ class PolymarketClobV2Venue:
         token_id: str | None = None,
     ) -> Any:
         """Run one allowlisted authenticated read with a local SDK client."""
-        if operation not in {"account", "balance", "market_context"}:
+        if operation not in {"account", "balance", "allowance", "market_context"}:
             raise ValueError(f"unsupported read operation: {operation}")
         try:
             values = CredentialStore().load(
@@ -538,6 +603,10 @@ class PolymarketClobV2Venue:
 
     def balance(self) -> Decimal:
         return self._read_operation("balance")
+
+    def allowance(self) -> Mapping[str, Any]:
+        """Return collateral allowance diagnostics without selecting a market."""
+        return self._read_operation("allowance")
 
 
 def _canary_merged_lifecycle_payload(record: Mapping[str, Any] | None) -> dict[str, Any] | None:
@@ -698,8 +767,6 @@ class CanaryService:
         self.allow_environment = bool(allow_environment)
         self._initialize()
 
-
-
     def _initialize(self) -> None:
         with self.store.connection:
             self.store.connection.executescript("""
@@ -728,6 +795,28 @@ class CanaryService:
               ON canary_execution_events(canary_event_id, timestamp);
             CREATE INDEX IF NOT EXISTS idx_canary_ledger_time ON canary_ledger(timestamp, event_id);
             """)
+            columns = {
+                str(row["name"])
+                for row in self.store.connection.execute("PRAGMA table_info(canary_control)")
+            }
+            if "control_generation" not in columns:
+                self.store.connection.execute(
+                    "ALTER TABLE canary_control ADD COLUMN control_generation "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
+            columns = {
+                str(row["name"])
+                for row in self.store.connection.execute("PRAGMA table_info(canary_ledger)")
+            }
+            if "control_generation" not in columns:
+                self.store.connection.execute(
+                    "ALTER TABLE canary_ledger ADD COLUMN control_generation "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
+            self.store.connection.execute(
+                "UPDATE canary_control SET control_generation=1 "
+                "WHERE control_generation < 1"
+            )
 
     @staticmethod
     def _integrity(candidate: str, venue: str, expires: str, limits: Mapping[str, Any]) -> str:
@@ -813,8 +902,17 @@ class CanaryService:
                 raise CanaryBlocked("CANARY_TRANSACTION_ACTIVE")
             now = ensure_utc(self.clock())
             existing_control = connection.execute(
-                "SELECT state FROM canary_control WHERE singleton=1"
+                "SELECT state,control_generation FROM canary_control "
+                "WHERE singleton=1"
             ).fetchone()
+            try:
+                current_generation = (
+                    int(existing_control["control_generation"] or 0)
+                    if existing_control is not None
+                    else 0
+                )
+            except (TypeError, ValueError):
+                raise CanaryBlocked("CANARY_CONTROL_CORRUPT") from None
             if (
                 existing_control is not None
                 and str(existing_control["state"]).upper() == "KILLED"
@@ -853,22 +951,34 @@ class CanaryService:
             connection.execute("BEGIN IMMEDIATE")
             try:
                 current = connection.execute(
-                    "SELECT state FROM canary_control WHERE singleton=1"
+                    "SELECT state,control_generation FROM canary_control "
+                    "WHERE singleton=1"
                 ).fetchone()
+                try:
+                    current_generation = (
+                        int(current["control_generation"] or 0)
+                        if current is not None
+                        else 0
+                    )
+                except (TypeError, ValueError):
+                    raise CanaryBlocked("CANARY_CONTROL_CORRUPT") from None
                 if (
                     current is not None
                     and str(current["state"]).upper() == "KILLED"
                 ):
                     raise CanaryBlocked("CANARY_KILLED")
                 connection.execute(
-                    "INSERT INTO canary_control "
-                    "VALUES(1,'ARMED',?,?,?,?,?,?,?) "
+                    "INSERT INTO canary_control("
+                    "singleton,state,candidate_id,venue,armed_at,expires_at,"
+                    "limits_json,integrity_hash,updated_at,control_generation) "
+                    "VALUES(1,'ARMED',?,?,?,?,?,?,?,?) "
                     "ON CONFLICT(singleton) DO UPDATE SET "
                     "state=excluded.state,candidate_id=excluded.candidate_id,"
                     "venue=excluded.venue,armed_at=excluded.armed_at,"
                     "expires_at=excluded.expires_at,limits_json=excluded.limits_json,"
                     "integrity_hash=excluded.integrity_hash,"
-                    "updated_at=excluded.updated_at",
+                    "updated_at=excluded.updated_at,"
+                    "control_generation=excluded.control_generation",
                     (
                         candidate_id,
                         "polymarket",
@@ -877,6 +987,7 @@ class CanaryService:
                         json.dumps(values, sort_keys=True),
                         digest,
                         now.isoformat(),
+                        current_generation + 1,
                     ),
                 )
                 connection.commit()
@@ -897,24 +1008,53 @@ class CanaryService:
                 raise CanaryBlocked("CANARY_TRANSACTION_ACTIVE")
             with connection:
                 current = connection.execute(
-                    "SELECT state FROM canary_control WHERE singleton=1"
+                    "SELECT state,control_generation FROM canary_control "
+                    "WHERE singleton=1"
                 ).fetchone()
                 if current is not None and str(current["state"]).upper() == "KILLED":
                     # KILLED is a terminal latch; disarm must not make it
                     # possible to arm again.
                     return
+                try:
+                    generation = (
+                        int(current["control_generation"] or 0)
+                        if current is not None
+                        else 0
+                    )
+                except (TypeError, ValueError):
+                    raise CanaryBlocked("CANARY_CONTROL_CORRUPT") from None
                 connection.execute(
-                    "INSERT INTO canary_control(singleton,state,limits_json,integrity_hash,updated_at) "
-                    "VALUES(1,?,'{}','',?) ON CONFLICT(singleton) DO UPDATE SET "
-                    "state=excluded.state,updated_at=excluded.updated_at",
-                    (state, now),
+                    "INSERT INTO canary_control("
+                    "singleton,state,limits_json,integrity_hash,updated_at,"
+                    "control_generation) VALUES(1,?,'{}','',?,?) "
+                    "ON CONFLICT(singleton) DO UPDATE SET "
+                    "state=excluded.state,updated_at=excluded.updated_at,"
+                    "control_generation=excluded.control_generation",
+                    (state, now, generation + 1),
                 )
 
     def status(self) -> dict[str, Any]:
         row=self.store.connection.execute("SELECT * FROM canary_control WHERE singleton=1").fetchone()
         now=ensure_utc(self.clock())
         if row is None:
-            return {"production_live_trading":"DISABLED","micro_live_canary":"DISARMED","candidate":None,"venue":None,"expiry":None,"today_orders":0,"today_realized_pnl":0.0,"total_exposure":0.0,"open_positions":0,"daily_loss_budget_remaining":float(DEFAULT_DAILY_LOSS_USD),"limits":self._limits_record(CanaryLimits()),"live_execution":False,"trades":[]}
+            return {
+                "production_live_trading": "DISABLED",
+                "micro_live_canary": "DISARMED",
+                "candidate": None,
+                "venue": None,
+                "expiry": None,
+                "control_generation": 0,
+                "last_request_status": None,
+                "today_orders": 0,
+                "today_realized_pnl": 0.0,
+                "total_exposure": 0.0,
+                "open_positions": 0,
+                "daily_loss_budget_remaining": float(DEFAULT_DAILY_LOSS_USD),
+                "limits": self._limits_record(CanaryLimits()),
+                "live_execution": False,
+                "trades": [],
+                "kill_semantics": "KILL_PREVENTS_NEW_SUBMISSIONS; IN_FLIGHT_REQUESTS_ARE_NOT_RETRACTED",
+            }
         data=dict(row); state=data["state"]
         limits: dict[str, Any] = {}
         try:
@@ -940,20 +1080,74 @@ class CanaryService:
                     if expired:
                         state="DISARMED"
         start=now.replace(hour=0,minute=0,second=0,microsecond=0).isoformat()
-        trades=[dict(x) for x in self.store.connection.execute("SELECT l.timestamp,l.candidate_id,l.market_id,l.side,l.requested_notional,l.paper_expected_price,e.actual_average_price,CASE WHEN e.actual_average_price IS NOT NULL THEN CAST(e.actual_average_price AS REAL)-CAST(l.paper_expected_price AS REAL) END price_difference,COALESCE(e.status,l.status) status,l.realized_pnl FROM canary_ledger l LEFT JOIN canary_execution_events e ON e.execution_event_id=(SELECT e2.execution_event_id FROM canary_execution_events e2 WHERE e2.canary_event_id=l.event_id ORDER BY e2.timestamp DESC,e2.execution_event_id DESC LIMIT 1) ORDER BY l.timestamp DESC LIMIT 100")]
-        aggregates=self.store.connection.execute("SELECT COALESCE(SUM(CASE WHEN timestamp>=? THEN 1 ELSE 0 END),0) orders, COALESCE(SUM(CASE WHEN status IN ('RESERVED','UNKNOWN','OPEN','PARTIAL','SUBMITTED') THEN CAST(requested_notional AS REAL) ELSE 0 END),0) exposure, COUNT(DISTINCT CASE WHEN status IN ('RESERVED','UNKNOWN','OPEN','PARTIAL','SUBMITTED') THEN market_id END) positions, COALESCE(SUM(CASE WHEN timestamp>=? THEN CAST(realized_pnl AS REAL) ELSE 0 END),0) pnl FROM canary_ledger WHERE timestamp>=? OR status IN ('RESERVED','UNKNOWN','OPEN','PARTIAL','SUBMITTED')",(start,start,start)).fetchone()
-        return {"production_live_trading":"DISABLED","micro_live_canary":state,"candidate":data.get("candidate_id"),"venue":data.get("venue"),"expiry":data.get("expires_at"),"today_orders":int(aggregates["orders"]),"today_realized_pnl":float(aggregates["pnl"]),"total_exposure":float(aggregates["exposure"]),"open_positions":int(aggregates["positions"]),"daily_loss_budget_remaining":max(0,float(limits.get("max_daily_loss_usd",2))+float(aggregates["pnl"])),"limits":limits,"trades":trades,"live_execution":False}
+        trades = [
+            dict(x)
+            for x in self.store.connection.execute(
+                "SELECT l.timestamp,l.candidate_id,l.market_id,l.side,"
+                "l.requested_notional,l.paper_expected_price,e.actual_average_price,"
+                "CASE WHEN e.actual_average_price IS NOT NULL THEN "
+                "CAST(e.actual_average_price AS REAL)-CAST(l.paper_expected_price AS REAL) "
+                "END price_difference,COALESCE(e.status,l.status) status,"
+                "l.realized_pnl FROM canary_ledger l LEFT JOIN "
+                "canary_execution_events e ON e.execution_event_id=("
+                "SELECT e2.execution_event_id FROM canary_execution_events e2 "
+                "WHERE e2.canary_event_id=l.event_id ORDER BY e2.timestamp DESC,"
+                "e2.execution_event_id DESC LIMIT 1) ORDER BY l.timestamp DESC LIMIT 100"
+            )
+        ]
+        last_request_status = (
+            str(trades[0].get("status") or "").upper() if trades else None
+        )
+        active_states = "('RESERVED','SUBMITTING','UNKNOWN','OPEN','PARTIAL','SUBMITTED')"
+        aggregates = self.store.connection.execute(
+            "SELECT COALESCE(SUM(CASE WHEN timestamp>=? THEN 1 ELSE 0 END),0) orders,"
+            "COALESCE(SUM(CASE WHEN status IN " + active_states
+            + " THEN CAST(requested_notional AS REAL) ELSE 0 END),0) exposure,"
+            "COUNT(DISTINCT CASE WHEN status IN " + active_states
+            + " THEN market_id END) positions,"
+            "COALESCE(SUM(CASE WHEN timestamp>=? THEN CAST(realized_pnl AS REAL) "
+            "ELSE 0 END),0) pnl FROM canary_ledger WHERE timestamp>=? OR status IN "
+            + active_states,
+            (start, start, start),
+        ).fetchone()
+        try:
+            control_generation = int(data.get("control_generation") or 0)
+        except (TypeError, ValueError):
+            state = "KILLED"
+            control_generation = 0
+        return {
+            "production_live_trading": "DISABLED",
+            "micro_live_canary": state,
+            "candidate": data.get("candidate_id"),
+            "venue": data.get("venue"),
+            "expiry": data.get("expires_at"),
+            "control_generation": control_generation,
+            "last_request_status": last_request_status,
+            "today_orders": int(aggregates["orders"]),
+            "today_realized_pnl": float(aggregates["pnl"]),
+            "total_exposure": float(aggregates["exposure"]),
+            "open_positions": int(aggregates["positions"]),
+            "daily_loss_budget_remaining": max(
+                0,
+                float(limits.get("max_daily_loss_usd", 2)) + float(aggregates["pnl"]),
+            ),
+            "limits": limits,
+            "trades": trades,
+            "live_execution": False,
+            "kill_semantics": "KILL_PREVENTS_NEW_SUBMISSIONS; IN_FLIGHT_REQUESTS_ARE_NOT_RETRACTED",
+        }
 
     def check(
         self,
         *,
-        candidate_id: str | None,
-        venue: CanaryVenue | None,
+        candidate_id: str | None = None,
+        venue: CanaryVenue | None = None,
         market_id: str | None = None,
         token_id: str | None = None,
         allow_environment: bool | None = None,
+        _connectivity_only: bool = False,
     ) -> dict[str, Any]:
-        """Run read-only canary readiness checks and return bounded diagnostics."""
+        """Run full readiness or pre-arming read-only diagnostics."""
         failures: list[str] = []
         environment = (
             self.allow_environment
@@ -961,17 +1155,19 @@ class CanaryService:
             else bool(allow_environment)
         )
         status = self.status()
-        if status["micro_live_canary"] != "ARMED":
-            failures.append("CANARY_NOT_ARMED")
-        if candidate_id and candidate_id != status.get("candidate"):
-            failures.append("CANDIDATE_NOT_ARMED")
+        if not _connectivity_only:
+            if status["micro_live_canary"] != "ARMED":
+                failures.append("CANARY_NOT_ARMED")
+            if candidate_id and candidate_id != status.get("candidate"):
+                failures.append("CANDIDATE_NOT_ARMED")
         credentials_configured = self.credentials.configured(
             allow_environment=environment
         )
         if not credentials_configured:
             failures.append("CREDENTIALS_NOT_CONFIGURED")
         if venue is None and (
-            credentials_configured or status["micro_live_canary"] == "ARMED"
+            credentials_configured
+            or (not _connectivity_only and status["micro_live_canary"] == "ARMED")
         ):
             failures.append("VENUE_REQUIRED")
         diagnostics: dict[str, Any] = {
@@ -985,17 +1181,19 @@ class CanaryService:
             "authentication": {"status": "SKIPPED"},
             "account": {"status": "SKIPPED"},
             "balance": {"status": "SKIPPED"},
+            "allowance": {"status": "SKIPPED"},
             "market": {"status": "SKIPPED"},
             "book": {"status": "SKIPPED"},
         }
         try:
             health = self.store.polymarket_health(now=ensure_utc(self.clock()))
             diagnostics["collector"] = dict(health)
-            if str(health.get("grade", "F")).upper() not in {"A", "B"}:
+            if not _connectivity_only and str(health.get("grade", "F")).upper() not in {"A", "B"}:
                 failures.append("COLLECTOR_DEGRADED")
         except Exception:
             diagnostics["collector"] = {"grade": "F"}
-            failures.append("COLLECTOR_DEGRADED")
+            if not _connectivity_only:
+                failures.append("COLLECTOR_DEGRADED")
         if venue is not None:
             try:
                 geo = dict(venue.geoblock())
@@ -1058,9 +1256,50 @@ class CanaryService:
                     except Exception:
                         diagnostics["balance"] = {"status": "FAILED"}
                         failures.append("BALANCE_CHECK_FAILED")
+                    if not (market_id and token_id):
+                        allowance_method = getattr(venue, "allowance", None)
+                        if callable(allowance_method):
+                            try:
+                                allowance = allowance_method()
+                                if not isinstance(allowance, Mapping):
+                                    raise TypeError("allowance diagnostics must be a mapping")
+                                diagnostics["allowance"] = dict(allowance)
+                                if (
+                                    not _connectivity_only
+                                    and type(venue) is PolymarketClobV2Venue
+                                    and allowance.get("status") != "OK"
+                                ):
+                                    failures.append("CANARY_ALLOWANCE_UNAVAILABLE")
+                            except CanaryBlocked as exc:
+                                diagnostics["allowance"] = {"status": "FAILED"}
+                                failures.append(str(exc))
+                            except Exception:
+                                diagnostics["allowance"] = {"status": "FAILED"}
+                                failures.append("CANARY_ALLOWANCE_UNAVAILABLE")
+                        elif type(venue) is PolymarketClobV2Venue:
+                            failures.append("CANARY_ALLOWANCE_UNAVAILABLE")
                     if market_id and token_id:
                         try:
                             context = dict(venue.market_context(market_id, token_id))
+                            allowance = context.get("allowance")
+                            if isinstance(allowance, Mapping):
+                                diagnostics["allowance"] = dict(allowance)
+                                if allowance.get("status") != "OK":
+                                    failures.append("CANARY_ALLOWANCE_UNAVAILABLE")
+                                else:
+                                    target = Decimal(
+                                        str(status.get("limits", {}).get("target_notional_usd", 1))
+                                    )
+                                    available_allowance = Decimal(
+                                        _base_units(
+                                            allowance.get("available_base_units"),
+                                            field="allowance",
+                                        )
+                                    )
+                                    if available_allowance < target * Decimal("1000000"):
+                                        failures.append("CANARY_ALLOWANCE_INSUFFICIENT")
+                            elif type(venue) is PolymarketClobV2Venue:
+                                failures.append("CANARY_ALLOWANCE_UNAVAILABLE")
                             diagnostics["market"] = {
                                 key: context[key]
                                 for key in (
@@ -1137,17 +1376,27 @@ class CanaryService:
                     }
         return {
             "ready": not failures,
-            "message": "READY FOR MICRO LIVE CANARY"
-            if not failures
-            else "NOT READY FOR MICRO LIVE CANARY",
+            "message": (
+                "READY FOR CANARY CONNECTIVITY"
+                if _connectivity_only and not failures
+                else "NOT READY FOR CANARY CONNECTIVITY"
+                if _connectivity_only
+                else "READY FOR MICRO LIVE CANARY"
+                if not failures
+                else "NOT READY FOR MICRO LIVE CANARY"
+            ),
             "failures": list(dict.fromkeys(failures)),
             "diagnostics": diagnostics,
             "live_execution": False,
+            "connectivity_only": _connectivity_only,
         }
 
     def connectivity_check(self, **kwargs: Any) -> dict[str, Any]:
-        """Strict alias for the no-order connectivity command."""
-        return self.check(**kwargs)
+        """Run pre-arming read-only diagnostics without canary state gates."""
+        values = dict(kwargs)
+        values.pop("candidate_id", None)
+        values["_connectivity_only"] = True
+        return self.check(**values)
 
     def submit(
         self,
@@ -1177,30 +1426,35 @@ class CanaryService:
             snapshot: Mapping[str, Any],
             *,
             additional_exposure: Decimal = Decimal("0"),
+            reservation_event_id: str | None = None,
         ) -> Mapping[str, Any]:
             limits = snapshot.get("limits", {})
             if snapshot["micro_live_canary"] != "ARMED":
                 block("CANARY_NOT_ARMED")
-            if self.store.connection.execute(
-                "SELECT 1 FROM canary_ledger WHERE signal_id=?",
+            existing = self.store.connection.execute(
+                "SELECT event_id FROM canary_ledger WHERE signal_id=?",
                 (signal_id,),
-            ).fetchone():
+            ).fetchone()
+            if existing is not None and existing["event_id"] != reservation_event_id:
                 block("DUPLICATE_SIGNAL")
             if candidate_id != snapshot.get("candidate"):
                 block("CANDIDATE_MISMATCH")
-            if snapshot["today_orders"] >= int(limits["max_orders_per_day"]):
-                block("DAILY_ORDER_LIMIT")
-            if snapshot["open_positions"] >= int(limits["max_open_positions"]):
-                block("OPEN_POSITION_LIMIT")
+            if reservation_event_id is None:
+                if snapshot["today_orders"] >= int(limits["max_orders_per_day"]):
+                    block("DAILY_ORDER_LIMIT")
+                if snapshot["open_positions"] >= int(limits["max_open_positions"]):
+                    block("OPEN_POSITION_LIMIT")
+                target = Decimal(limits["target_notional_usd"])
+                exposure = Decimal(str(snapshot["total_exposure"])) + target
+            else:
+                if snapshot["today_orders"] > int(limits["max_orders_per_day"]):
+                    block("DAILY_ORDER_LIMIT")
+                if snapshot["open_positions"] > int(limits["max_open_positions"]):
+                    block("OPEN_POSITION_LIMIT")
+                exposure = Decimal(str(snapshot["total_exposure"]))
             if snapshot["today_realized_pnl"] <= -float(limits["max_daily_loss_usd"]):
                 block("DAILY_LOSS_LIMIT")
-            target = Decimal(limits["target_notional_usd"])
-            if (
-                Decimal(str(snapshot["total_exposure"]))
-                + target
-                + additional_exposure
-                > Decimal(limits["max_exposure_usd"])
-            ):
+            if exposure + additional_exposure > Decimal(limits["max_exposure_usd"]):
                 block("EXPOSURE_LIMIT")
             return limits
 
@@ -1473,8 +1727,8 @@ class CanaryService:
                 evidence,
             )
 
-        # Preflight reads provide fast rejection, but every value is repeated
-        # after BEGIN IMMEDIATE before reservation or order placement.
+        # All venue/network reads complete before the short writer
+        # transactions below.  SQLite only fences persisted canary state.
         preflight_snapshot = self.status()
         if str(self.store.polymarket_health(now=now).get("grade", "F")).upper() not in {"A", "B"}:
             block("COLLECTOR_DEGRADED")
@@ -1499,48 +1753,62 @@ class CanaryService:
             preflight_snapshot,
             additional_exposure=estimated_fees,
         )
+        # This authenticated balance read is intentionally outside every
+        # SQLite writer transaction; the short reservation fence rechecks all
+        # persisted control state immediately afterward.
         enforce_balance(venue.balance(), notional, estimated_fees)
         event_id = "canary-" + hashlib.sha256(signal_id.encode()).hexdigest()[:24]
 
         connection = self.store.connection
-        # AxiomStore serializes same-store callers with its re-entrant lock;
-        # BEGIN IMMEDIATE additionally serializes writers on shared stores.
         with self.store._lock:
             if connection.in_transaction:
                 raise CanaryBlocked("CANARY_TRANSACTION_ACTIVE")
-
-            # Commit the reservation before invoking anything that can reach
-            # the exchange.  A process crash in the gap must leave this row
-            # durable so a retry is rejected by signal_id uniqueness.
             connection.execute("BEGIN IMMEDIATE")
             try:
                 locked_snapshot = self.status()
-                if str(self.store.polymarket_health(now=ensure_utc(self.clock())).get("grade", "F")).upper() not in {"A", "B"}:
+                if locked_snapshot["micro_live_canary"] == "KILLED":
+                    block("CANARY_KILLED")
+                if locked_snapshot["micro_live_canary"] != "ARMED":
+                    block("CANARY_NOT_ARMED")
+                if candidate_id != locked_snapshot.get("candidate"):
+                    block("CANDIDATE_MISMATCH")
+                expiry = locked_snapshot.get("expiry")
+                try:
+                    expired = (
+                        not expiry
+                        or ensure_utc(datetime.fromisoformat(str(expiry)))
+                        <= ensure_utc(self.clock())
+                    )
+                except (TypeError, ValueError):
+                    block("CANARY_CONTROL_CORRUPT")
+                if expired:
+                    block("CANARY_NOT_ARMED")
+                if str(
+                    self.store.polymarket_health(
+                        now=ensure_utc(self.clock())
+                    ).get("grade", "F")
+                ).upper() not in {"A", "B"}:
                     block("COLLECTOR_DEGRADED")
-                locked_limits = enforce_controls(locked_snapshot)
-                (
-                    _locked_geo,
-                    locked_context,
-                    resolved_asset_id,
-                    best,
-                    target,
-                    max_price,
-                    quantity,
-                    estimated_fees,
-                    evidence,
-                ) = prepare_order(locked_limits)
-                notional = quantity * max_price
-                enforce_controls(
+                locked_limits = enforce_controls(
                     locked_snapshot,
                     additional_exposure=estimated_fees,
                 )
-                # Re-read account funds while holding the reservation lock;
-                # the preflight value may have become stale.
-                enforce_balance(venue.balance(), notional, estimated_fees)
+                if locked_limits != limits:
+                    block("CANARY_CONTROL_CORRUPT")
+                control_generation = int(
+                    locked_snapshot.get("control_generation") or 0
+                )
+                if control_generation <= 0:
+                    block("CANARY_CONTROL_CORRUPT")
                 event_time = ensure_utc(self.clock())
+                evidence_record = dict(evidence)
+                evidence_record["control_generation"] = control_generation
                 connection.execute(
-                    "INSERT INTO canary_ledger(event_id,signal_id,timestamp,candidate_id,venue,market_id,token_id,side,requested_notional,paper_expected_price,max_price,submitted_quantity,status,evidence_json) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "INSERT INTO canary_ledger("
+                    "event_id,signal_id,timestamp,candidate_id,venue,market_id,"
+                    "token_id,side,requested_notional,paper_expected_price,max_price,"
+                    "submitted_quantity,status,evidence_json,control_generation) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         event_id,
                         signal_id,
@@ -1555,7 +1823,8 @@ class CanaryService:
                         str(max_price),
                         str(quantity),
                         "RESERVED",
-                        json.dumps(evidence, sort_keys=True),
+                        json.dumps(evidence_record, sort_keys=True),
+                        control_generation,
                     ),
                 )
                 connection.commit()
@@ -1568,144 +1837,257 @@ class CanaryService:
                     connection.rollback()
                 raise
 
-            def persist_unknown() -> None:
-                """Durably mark a submitted-but-unobserved order as unknown."""
-                unknown_at = ensure_utc(self.clock())
-                connection.execute("BEGIN IMMEDIATE")
-                try:
-                    connection.execute(
-                        "UPDATE canary_ledger SET status='UNKNOWN' WHERE event_id=?",
-                        (event_id,),
-                    )
-                    connection.execute(
-                        "INSERT INTO canary_execution_events(execution_event_id,canary_event_id,timestamp,exchange_order_id,status,fill_quantity,actual_average_price,fees,latency_ms,evidence_json) "
-                        "VALUES(?,?,?,?,?,?,?,?,?,?) "
-                        "ON CONFLICT(execution_event_id) DO UPDATE SET timestamp=excluded.timestamp,status=excluded.status,evidence_json=excluded.evidence_json",
-                        (
-                            event_id + "-submitted",
-                            event_id,
-                            unknown_at.isoformat(),
-                            None,
-                            "UNKNOWN",
-                            None,
-                            None,
-                            None,
-                            None,
-                            json.dumps(
-                                {"error": "VENUE_SUBMIT_FAILED"},
-                                sort_keys=True,
-                            ),
-                        ),
-                    )
-                    connection.commit()
-                except BaseException:
-                    if connection.in_transaction:
-                        connection.rollback()
-                    raise
-
-            # Fence control state and hold the writer lock over the external
-            # call.  A concurrent kill either commits before this transaction
-            # (and is observed below) or waits until the sink result is durable.
+        # Transition RESERVED -> SUBMITTING under a second short fence.
+        with self.store._lock:
+            if connection.in_transaction:
+                raise CanaryBlocked("CANARY_TRANSACTION_ACTIVE")
             connection.execute("BEGIN IMMEDIATE")
             try:
+                control = connection.execute(
+                    "SELECT state,candidate_id,expires_at,limits_json,"
+                    "integrity_hash,control_generation "
+                    "FROM canary_control WHERE singleton=1"
+                ).fetchone()
+                if control is None:
+                    block("CANARY_NOT_ARMED")
+                control_state = str(control["state"]).upper()
+                if control_state == "KILLED":
+                    block("CANARY_KILLED")
+                if control_state != "ARMED":
+                    block("CANARY_NOT_ARMED")
+                if str(control["candidate_id"]) != candidate_id:
+                    block("CANDIDATE_MISMATCH")
+                try:
+                    control_expiry = str(control["expires_at"] or "")
+                    if (
+                        not control_expiry
+                        or ensure_utc(datetime.fromisoformat(control_expiry))
+                        <= ensure_utc(self.clock())
+                    ):
+                        block("CANARY_NOT_ARMED")
+                    control_limits = json.loads(control["limits_json"] or "{}")
+                    if not isinstance(control_limits, Mapping):
+                        block("CANARY_CONTROL_CORRUPT")
+                    control_generation = int(control["control_generation"] or 0)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    block("CANARY_CONTROL_CORRUPT")
+                expected_integrity = self._integrity(
+                    candidate_id,
+                    "polymarket",
+                    control_expiry,
+                    control_limits,
+                )
+                if expected_integrity != control["integrity_hash"]:
+                    block("CANARY_CONTROL_CORRUPT")
+                if control_generation <= 0:
+                    block("CANARY_CONTROL_CORRUPT")
+                if str(
+                    self.store.polymarket_health(
+                        now=ensure_utc(self.clock())
+                    ).get("grade", "F")
+                ).upper() not in {"A", "B"}:
+                    block("COLLECTOR_DEGRADED")
                 fenced_snapshot = self.status()
+                if fenced_snapshot["micro_live_canary"] == "KILLED":
+                    block("CANARY_KILLED")
                 if fenced_snapshot["micro_live_canary"] != "ARMED":
                     block("CANARY_NOT_ARMED")
-                if candidate_id != fenced_snapshot.get("candidate"):
-                    block("CANDIDATE_MISMATCH")
-                if str(self.store.polymarket_health(now=ensure_utc(self.clock())).get("grade", "F")).upper() not in {"A", "B"}:
-                    block("COLLECTOR_DEGRADED")
+                fenced_limits = enforce_controls(
+                    fenced_snapshot,
+                    additional_exposure=estimated_fees,
+                    reservation_event_id=event_id,
+                )
+                if fenced_limits != control_limits:
+                    block("CANARY_CONTROL_CORRUPT")
                 reservation = connection.execute(
                     "SELECT status FROM canary_ledger WHERE event_id=?",
                     (event_id,),
                 ).fetchone()
                 if reservation is None or str(reservation["status"]).upper() != "RESERVED":
                     block("CANARY_RESERVATION_FAILED")
-
-                submitted_at = ensure_utc(self.clock())
-                try:
-                    if is_official_venue:
-                        response = submit_official_order(
-                            market_version=locked_context.get("market_version"),
-                            neg_risk=locked_context.get("neg_risk"),
-                            asset_id=resolved_asset_id,
-                            side=side.upper(),
-                            price=max_price,
-                            size=quantity,
-                        )
-                    else:
-                        response = venue.submit_limit_order(
-                            token_id=resolved_asset_id,
-                            side=side.upper(),
-                            price=max_price,
-                            size=quantity,
-                        )
-                except BaseException:
-                    # Roll back only the fence transaction.  The reservation
-                    # was committed separately and therefore survives a crash.
-                    if connection.in_transaction:
-                        connection.rollback()
-                    try:
-                        persist_unknown()
-                    except BaseException:
-                        # Never mask the sink failure; RESERVED still blocks a
-                        # duplicate retry if this best-effort update fails.
-                        pass
-                    raise
-
-                received_at = ensure_utc(self.clock())
-                execution_id = event_id + "-submitted"
-                raw_status = str(
-                    response.get("status")
-                    or ("SUBMITTED" if response.get("ok") else "REJECTED")
-                ).upper()
-                execution_status = (
-                    "OPEN"
-                    if response.get("ok")
-                    and raw_status
-                    not in {"REJECTED", "FAILED", "ERROR", "CANCELLED", "CANCELED", "EXPIRED"}
-                    else "REJECTED"
+                updated = connection.execute(
+                    "UPDATE canary_ledger SET status='SUBMITTING',"
+                    "control_generation=? WHERE event_id=? AND status='RESERVED'",
+                    (control_generation, event_id),
                 )
-                connection.execute(
-                    "INSERT INTO canary_execution_events(execution_event_id,canary_event_id,timestamp,exchange_order_id,status,fill_quantity,actual_average_price,fees,latency_ms,evidence_json) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,?)",
-                    (
-                        execution_id,
-                        event_id,
-                        received_at.isoformat(),
-                        response.get("order_id"),
-                        execution_status,
-                        str(response.get("fill_quantity"))
-                        if response.get("fill_quantity") is not None
-                        else None,
-                        str(response.get("actual_average_price"))
-                        if response.get("actual_average_price") is not None
-                        else None,
-                        str(response.get("fees"))
-                        if response.get("fees") is not None
-                        else None,
-                        max(
-                            0,
-                            int((received_at - submitted_at).total_seconds() * 1000),
-                        ),
-                        json.dumps(
-                            {"trade_ids": response.get("trade_ids", [])},
-                            sort_keys=True,
-                        ),
-                    ),
-                )
-                connection.execute(
-                    "UPDATE canary_ledger SET status=? WHERE event_id=?",
-                    (execution_status, event_id),
-                )
+                if updated.rowcount != 1:
+                    block("CANARY_RESERVATION_FAILED")
                 connection.commit()
             except BaseException:
                 if connection.in_transaction:
                     connection.rollback()
                 raise
+
+        submitted_at = ensure_utc(self.clock())
+
+        def external_submission() -> Mapping[str, Any]:
+            if is_official_venue:
+                return submit_official_order(
+                    market_version=context.get("market_version"),
+                    neg_risk=context.get("neg_risk"),
+                    asset_id=resolved_asset_id,
+                    side=side.upper(),
+                    price=max_price,
+                    size=quantity,
+                )
+            return venue.submit_limit_order(
+                token_id=resolved_asset_id,
+                side=side.upper(),
+                price=max_price,
+                size=quantity,
+            )
+
+        def persist_outcome(
+            *,
+            outcome: str,
+            response: Mapping[str, Any] | None = None,
+            error: str | None = None,
+        ) -> str:
+            received_at = ensure_utc(self.clock())
+            response = response or {}
+            with self.store._lock:
+                if connection.in_transaction:
+                    raise CanaryBlocked("CANARY_TRANSACTION_ACTIVE")
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    control_row = connection.execute(
+                        "SELECT state,control_generation FROM canary_control "
+                        "WHERE singleton=1"
+                    ).fetchone()
+                    current_control_state = (
+                        str(control_row["state"]).upper()
+                        if control_row is not None
+                        else "DISARMED"
+                    )
+                    current_generation = (
+                        int(control_row["control_generation"] or 0)
+                        if control_row is not None
+                        else 0
+                    )
+                    trade_ids = response.get("trade_ids", [])
+                    if not isinstance(trade_ids, (list, tuple)):
+                        trade_ids = []
+                    evidence_event: dict[str, Any] = {
+                        "trade_ids": list(trade_ids),
+                        "control_state": current_control_state,
+                        "control_generation": current_generation,
+                        "request_control_generation": control_generation,
+                    }
+                    if error:
+                        evidence_event["error"] = error
+                    connection.execute(
+                        "INSERT INTO canary_execution_events("
+                        "execution_event_id,canary_event_id,timestamp,exchange_order_id,"
+                        "status,fill_quantity,actual_average_price,fees,latency_ms,"
+                        "evidence_json) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                        (
+                            event_id + "-submitted",
+                            event_id,
+                            received_at.isoformat(),
+                            response.get("order_id"),
+                            outcome,
+                            str(response.get("fill_quantity"))
+                            if response.get("fill_quantity") is not None
+                            else None,
+                            str(response.get("actual_average_price"))
+                            if response.get("actual_average_price") is not None
+                            else None,
+                            str(response.get("fees"))
+                            if response.get("fees") is not None
+                            else None,
+                            max(
+                                0,
+                                int(
+                                    (received_at - submitted_at).total_seconds()
+                                    * 1000
+                                ),
+                            ),
+                            json.dumps(evidence_event, sort_keys=True),
+                        ),
+                    )
+                    connection.execute(
+                        "UPDATE canary_ledger SET status=?,exchange_order_id=?,"
+                        "fill_quantity=?,actual_average_price=?,fees=? WHERE "
+                        "event_id=? AND status='SUBMITTING'",
+                        (
+                            outcome,
+                            response.get("order_id"),
+                            str(response.get("fill_quantity"))
+                            if response.get("fill_quantity") is not None
+                            else None,
+                            str(response.get("actual_average_price"))
+                            if response.get("actual_average_price") is not None
+                            else None,
+                            str(response.get("fees"))
+                            if response.get("fees") is not None
+                            else None,
+                            event_id,
+                        ),
+                    )
+                    connection.commit()
+                    return current_control_state
+                except BaseException:
+                    if connection.in_transaction:
+                        connection.rollback()
+                    raise
+
+        response: Mapping[str, Any] | None = None
+        try:
+            response = _call_with_timeout(
+                external_submission,
+                CANARY_SUBMISSION_TIMEOUT_SECONDS,
+            )
+            if not isinstance(response, Mapping):
+                raise RuntimeError("external submission response is not a mapping")
+            raw_status = str(
+                response.get("status")
+                or ("SUBMITTED" if response.get("ok") else "REJECTED")
+            ).upper()
+            outcome = (
+                "SUBMITTED"
+                if response.get("ok")
+                and raw_status
+                not in {"REJECTED", "FAILED", "ERROR", "CANCELLED", "CANCELED", "EXPIRED"}
+                else "REJECTED"
+            )
+            control_state = persist_outcome(outcome=outcome, response=response)
+        except CanaryBlocked as exc:
+            code = str(exc)
+            pre_submission_rejection = code in {
+                "CANARY_ALLOWANCE_INSUFFICIENT",
+                "CANARY_ALLOWANCE_UNAVAILABLE",
+                "CANARY_SPENDER_UNAVAILABLE",
+                "INSUFFICIENT_BALANCE",
+                "CREDENTIALS_NOT_CONFIGURED",
+                "OFFICIAL_POLYMARKET_SDK_NOT_INSTALLED",
+                "OFFICIAL_POLYMARKET_SDK_NOT_READONLY_COMPATIBLE",
+                "UNSUPPORTED_POLYMARKET_SDK",
+            }
+            if pre_submission_rejection:
+                control_state = persist_outcome(
+                    outcome="REJECTED",
+                    response={
+                        "ok": False,
+                        "status": "REJECTED",
+                        "code": code,
+                        "message": code,
+                    },
+                    error=code,
+                )
+                raise
+            persist_outcome(outcome="UNKNOWN", error=code)
+            raise CanaryBlocked("CANARY_SUBMISSION_UNKNOWN") from exc
+        except TimeoutError as exc:
+            persist_outcome(outcome="UNKNOWN", error=str(exc))
+            raise CanaryBlocked("CANARY_SUBMISSION_UNKNOWN") from exc
+        except BaseException as exc:
+            persist_outcome(outcome="UNKNOWN", error=type(exc).__name__)
+            raise
         return {
             "event_id": event_id,
-            "status": response.get("status"),
+            "status": response.get("status") if response is not None else outcome,
+            "execution_status": outcome,
+            "canary_state": control_state,
             "requested_notional": str(notional),
             "production_live_execution": False,
         }

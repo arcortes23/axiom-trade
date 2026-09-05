@@ -960,5 +960,29 @@ class DashboardPaginationSurfaceTests(DashboardPaginationFixture):
         self.assertNotIn("market-00", html)
 
 
+    def test_dashboard_formats_utc_as_pht_without_mutating_api_timestamps(self) -> None:
+        html = _dashboard_html()
+        self.assertIn("Asia/Manila", html)
+        self.assertIn("PHT", html)
+        self.assertIn("hourCycle:\"h23\"", html)
+        self.assertNotIn("new Date(v).toISOString()", html)
+
+        midnight_utc = datetime(2024, 1, 1, 16, tzinfo=UTC)
+        rollover = midnight_utc.astimezone(timezone(timedelta(hours=8)))
+        self.assertEqual(
+            rollover.strftime("%Y-%m-%d %H:%M:%S PHT"),
+            "2024-01-02 00:00:00 PHT",
+        )
+        status, payload, _ = self._request(
+            "api/v2/datasets",
+            page=1,
+            page_size=10,
+            sort="dataset_id",
+            direction="asc",
+        )
+        self.assertEqual(status, 200)
+        assert isinstance(payload, dict)
+        self.assertEqual(payload["items"][0]["updated_at"], T0.isoformat())
+
 if __name__ == "__main__":
     unittest.main()

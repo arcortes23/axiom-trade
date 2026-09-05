@@ -445,6 +445,8 @@ class CanaryReadinessTests(unittest.TestCase):
         snapshot = {
             "micro_live_canary": "ARMED",
             "candidate": "candidate-1",
+            "expiry": (T0 + timedelta(hours=1)).isoformat(),
+            "control_generation": 1,
             "today_orders": 0,
             "open_positions": 0,
             "today_realized_pnl": 0.0,
@@ -483,6 +485,30 @@ class CanaryReadinessTests(unittest.TestCase):
             return_value={"blocked": False, "close_only": False},
         ), AxiomStore(":memory:") as store:
             service = CanaryService(store, credentials=credentials, clock=lambda: T0)
+            expiry = (T0 + timedelta(hours=1)).isoformat()
+            store.connection.execute(
+                "INSERT INTO canary_control("
+                "singleton,state,candidate_id,venue,armed_at,expires_at,limits_json,"
+                "integrity_hash,updated_at,control_generation) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (
+                    1,
+                    "ARMED",
+                    "candidate-1",
+                    "polymarket",
+                    T0.isoformat(),
+                    expiry,
+                    json.dumps(snapshot["limits"], sort_keys=True),
+                    service._integrity(
+                        "candidate-1",
+                        "polymarket",
+                        expiry,
+                        snapshot["limits"],
+                    ),
+                    T0.isoformat(),
+                    1,
+                ),
+            )
+            store.connection.commit()
             with patch.object(service, "status", return_value=snapshot), patch.object(
                 store,
                 "polymarket_health",
@@ -587,7 +613,7 @@ class CanaryReadinessTests(unittest.TestCase):
             self.assertIn("market", result["diagnostics"])
             self.assertEqual(client.market_calls, [{"id": "market-1"}])
             self.assertEqual(client.book_calls, [{"asset_id": "position-yes"}])
-            self.assertEqual(client.balance_calls, [{"asset_type": "COLLATERAL"}])
+            self.assertEqual(client.balance_calls, [{"asset_type": "COLLATERAL"}, {"asset_type": "COLLATERAL"}])
             self.assertEqual(client.post_calls, [])
             self.assertEqual(result["diagnostics"]["market"]["asset_id"], "position-yes")
             self.assertEqual(secure_factory._create.call_count, 4)
@@ -614,6 +640,8 @@ class CanaryReadinessTests(unittest.TestCase):
                 snapshot = {
                     "micro_live_canary": "ARMED",
                     "candidate": "candidate-1",
+                    "expiry": (T0 + timedelta(hours=1)).isoformat(),
+                    "control_generation": 1,
                     "today_orders": 0,
                     "open_positions": 0,
                     "today_realized_pnl": 0.0,
@@ -638,6 +666,29 @@ class CanaryReadinessTests(unittest.TestCase):
                     "asks": [{"price": "0.50", "size": "100"}],
                     "fee_bps": "10",
                 }
+                store.connection.execute(
+                    "INSERT INTO canary_control("
+                    "singleton,state,candidate_id,venue,armed_at,expires_at,limits_json,"
+                    "integrity_hash,updated_at,control_generation) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        1,
+                        "ARMED",
+                        "candidate-1",
+                        "polymarket",
+                        T0.isoformat(),
+                        snapshot["expiry"],
+                        json.dumps(snapshot["limits"], sort_keys=True),
+                        service._integrity(
+                            "candidate-1",
+                            "polymarket",
+                            snapshot["expiry"],
+                            snapshot["limits"],
+                        ),
+                        T0.isoformat(),
+                        1,
+                    ),
+                )
+                store.connection.commit()
                 with patch.object(service, "status", return_value=snapshot), patch.object(
                     store,
                     "polymarket_health",
@@ -680,7 +731,7 @@ class CanaryReadinessTests(unittest.TestCase):
             self.assertEqual(client.place_calls, [])
             self.assertEqual(client.approval_calls, [])
             self.assertEqual(client.update_calls, [])
-            self.assertEqual(client.close_calls, 7)
+            self.assertEqual(client.close_calls, 6)
     def test_official_venue_rejects_custom_geoblock_url(self) -> None:
         with self.assertRaises(TypeError):
             PolymarketClobV2Venue(
