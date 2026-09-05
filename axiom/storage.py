@@ -2481,6 +2481,47 @@ class AxiomStore:
         latest_window_seconds = max(window, stale_after)
         latest_window_start = current - timedelta(seconds=latest_window_seconds)
         current_iso, window_iso, latest_window_iso = current.isoformat(), window_start.isoformat(), latest_window_start.isoformat()
+        cycle_limit = int(recent_cycles or 24)
+        cycle_rows = self.list_collection_cycles(collector_name="polymarket", limit=cycle_limit)
+        cycle_payloads = [
+            item.get("payload")
+            for item in cycle_rows
+            if isinstance(item, Mapping) and isinstance(item.get("payload"), Mapping)
+        ]
+        cycle_starts = [
+            stamp
+            for item in cycle_rows
+            for stamp in [_parse_datetime(item.get("started_at"))]
+            if stamp is not None
+        ]
+        cycle_intervals = [
+            (newer - older).total_seconds()
+            for newer, older in zip(cycle_starts, cycle_starts[1:])
+            if (newer - older).total_seconds() > 0
+        ]
+        effective_cadence = (
+            round(sum(cycle_intervals) / len(cycle_intervals), 3)
+            if cycle_intervals
+            else None
+        )
+        latest_cycle_payload = cycle_payloads[0] if cycle_payloads else {}
+        last_successful_cycle = next(
+            (
+                item
+                for item in cycle_rows
+                if isinstance(item, Mapping)
+                and isinstance(item.get("payload"), Mapping)
+                and int(item["payload"].get("markets_successful", item["payload"].get("snapshots_inserted", 0)) or 0) > 0
+            ),
+            None,
+        )
+        collector_state = self.get_collector_state("polymarket") or {}
+        scheduled_values = collector_state.get("scheduled_market_ids") if isinstance(collector_state, Mapping) else None
+        scheduled_market_ids = (
+            {str(value) for value in scheduled_values if str(value).strip()}
+            if isinstance(scheduled_values, (list, tuple, set, frozenset))
+            else set()
+        )
         with self._lock:
             latest_rows = self._conn.execute(
                 "SELECT market_id,observed_at,payload_json FROM ("
@@ -2521,45 +2562,54 @@ class AxiomStore:
                 (latest_window_iso, current_iso),
             ).fetchone()["n"])
         tracked = self.tracked_polymarket_markets(active_only=True, now=current, include_payload=True, limit=1000)
-        active_markets = {
-            str(item.get("market_id"))
-            for item in tracked
-            if isinstance(item, Mapping) and item.get("market_id")
-        }
+        active_markets = (
+            set(scheduled_market_ids)
+            if scheduled_market_ids
+            else {
+                str(item.get("market_id"))
+                for item in tracked
+                if isinstance(item, Mapping) and item.get("market_id")
+            }
+        )
         latest_by_market: dict[str, datetime] = {}
         latest_payload: dict[str, Mapping[str, Any]] = {}
         for row in latest_rows:
+            market = str(row["market_id"])
+            if scheduled_market_ids and market not in scheduled_market_ids:
+                continue
             stamp = _parse_datetime(row["observed_at"])
             if stamp is None:
                 continue
-            market = str(row["market_id"])
             latest_by_market[market] = stamp
             payload = _load(row["payload_json"])
             latest_payload[market] = payload if isinstance(payload, Mapping) else {}
-            if market not in active_markets:
+            if not scheduled_market_ids and market not in active_markets:
                 snapshot = latest_payload[market].get("snapshot")
                 settlement = str(snapshot.get("settlement", "")).lower() if isinstance(snapshot, Mapping) else ""
                 if settlement not in {"resolved_yes", "resolved_no", "void"}:
                     active_markets.add(market)
         current_rows: dict[str, list[datetime]] = {}
         for row in recent_rows:
-            stamp = _parse_datetime(row["observed_at"])
             market = str(row["market_id"])
+            if scheduled_market_ids and market not in scheduled_market_ids:
+                continue
+            stamp = _parse_datetime(row["observed_at"])
             if stamp is not None:
                 current_rows.setdefault(market, []).append(stamp)
-                if market not in active_markets:
+                if not scheduled_market_ids:
                     active_markets.add(market)
+        gap_interval = effective_cadence or expected
         gaps: list[dict[str, Any]] = []
         for market, stamps in current_rows.items():
             for previous, observed in zip(stamps, stamps[1:]):
                 gap_seconds = (observed - previous).total_seconds()
-                if gap_seconds > expected * 1.5:
+                if gap_seconds > gap_interval * 1.5:
                     gaps.append({
                         "market_id": market,
                         "from": previous.isoformat(),
                         "to": observed.isoformat(),
                         "seconds": gap_seconds,
-                        "missing_intervals": max(1, int(round(gap_seconds / expected)) - 1),
+                        "missing_intervals": max(1, int(round(gap_seconds / gap_interval)) - 1),
                     })
         stale_markets = sorted(
             market for market in active_markets
@@ -2577,14 +2627,22 @@ class AxiomStore:
             }
             for row in error_rows
         ]
+        failure_counts: dict[str, int] = {}
+        for item in current_failures:
+            code = str(item.get("reason_code") or "UNKNOWN")
+            failure_counts[code] = failure_counts.get(code, 0) + 1
+        top_failure_codes = [
+            {"code": code, "count": count}
+            for code, count in sorted(failure_counts.items(), key=lambda pair: (-pair[1], pair[0]))[:8]
+        ]
         malformed_count = sum("MALFORM" in str(item["kind"]).upper() or "PARSE" in str(item["kind"]).upper() for item in current_failures)
         reasons: list[dict[str, str]] = []
         if not current_rows:
             reasons.append({"code": "NO_FORWARD_SNAPSHOTS", "reason": "No FORWARD_COLLECTED snapshot was observed in the current window."})
         if stale_markets:
-            reasons.append({"code": "STALE_MARKETS", "reason": f"{len(stale_markets)} active/tracked market(s) have no successful sample within the staleness threshold."})
+            reasons.append({"code": "STALE_MARKETS", "reason": f"{len(stale_markets)} scheduled market(s) have no successful sample within the staleness threshold."})
         if gaps:
-            reasons.append({"code": "COLLECTION_GAPS", "reason": f"{len(gaps)} in-window collection gap(s) exceed the expected interval."})
+            reasons.append({"code": "COLLECTION_GAPS", "reason": f"{len(gaps)} in-window collection gap(s) exceed the measured collection cadence."})
         if malformed_count:
             reasons.append({"code": "MALFORMED_RECORDS", "reason": f"{malformed_count} malformed current collector record(s)."})
         if current_failures:
@@ -2600,12 +2658,24 @@ class AxiomStore:
         else:
             grade = "A"
         maturity = self.polymarket_evidence_maturity(now=current)
+        latest_cycle_started = _parse_datetime(
+            latest_cycle_payload.get("started_at") if isinstance(latest_cycle_payload, Mapping) else None
+        )
+        latest_cycle_ended = _parse_datetime(
+            latest_cycle_payload.get("ended_at") if isinstance(latest_cycle_payload, Mapping) else None
+        )
+        last_successful_at = (
+            last_successful_cycle.get("ended_at")
+            if isinstance(last_successful_cycle, Mapping)
+            else None
+        )
         collector = {
             "grade": grade,
             "grade_scope": "collector_health",
             "reason_code": reasons[0]["code"] if reasons else None,
             "reasons": reasons,
             "markets": len(active_markets),
+            "scheduled_market_count": len(scheduled_market_ids),
             "markets_with_snapshots": len(latest_by_market),
             "metadata_records": metadata_count,
             "current_snapshots": sum(len(items) for items in current_rows.values()),
@@ -2613,6 +2683,7 @@ class AxiomStore:
             "trades": trade_count,
             "collection_errors": len(current_failures),
             "current_failures": current_failures,
+            "top_failure_codes": top_failure_codes,
             "malformed_records": malformed_count,
             "stale_markets": stale_markets,
             "gaps": gaps,
@@ -2621,8 +2692,18 @@ class AxiomStore:
             "window_start": window_start.isoformat(),
             "window_end": current.isoformat(),
             "window_seconds": window,
+            "configured_interval_seconds": expected,
             "expected_interval_seconds": expected,
+            "effective_collection_cadence_seconds": effective_cadence,
+            "gap_interval_seconds": gap_interval,
             "stale_after_seconds": stale_after,
+            "last_cycle_started_at": latest_cycle_started.isoformat() if latest_cycle_started else None,
+            "last_cycle_ended_at": latest_cycle_ended.isoformat() if latest_cycle_ended else None,
+            "last_cycle_duration_seconds": latest_cycle_payload.get("duration_seconds"),
+            "last_cycle_markets_attempted": latest_cycle_payload.get("markets_attempted", 0),
+            "last_cycle_markets_successful": latest_cycle_payload.get("markets_successful", 0),
+            "last_cycle_markets_failed": latest_cycle_payload.get("markets_failed", 0),
+            "last_successful_cycle": last_successful_at.isoformat() if hasattr(last_successful_at, "isoformat") else last_successful_at,
         }
         return {
             "grade": grade,
@@ -2637,9 +2718,16 @@ class AxiomStore:
             "trades": trade_count,
             "collection_errors": len(current_failures),
             "current_failures": current_failures,
+            "top_failure_codes": top_failure_codes,
+            "scheduled_market_count": collector["scheduled_market_count"],
+            "effective_collection_cadence_seconds": collector["effective_collection_cadence_seconds"],
+            "last_cycle_duration_seconds": collector["last_cycle_duration_seconds"],
+            "last_successful_cycle": collector["last_successful_cycle"],
+            "last_cycle_markets_attempted": collector["last_cycle_markets_attempted"],
+            "last_cycle_markets_successful": collector["last_cycle_markets_successful"],
+            "last_cycle_markets_failed": collector["last_cycle_markets_failed"],
             "stale_markets": stale_markets,
             "gaps": gaps,
-            "gap_count": len(gaps),
             "window_start": collector["window_start"],
             "window_end": collector["window_end"],
             "window_seconds": window,
@@ -5417,6 +5505,163 @@ class AxiomStore:
             "historical_catalog": int(historical_catalog_count),
             "forward_catalog": int(forward_catalog_count),
             "quality": quality,
+        }
+
+    def dashboard_overview_summary(self, *, activity_limit: int = 8) -> dict[str, Any]:
+        """Return bounded SQL aggregates for the dashboard overview."""
+        if isinstance(activity_limit, bool) or not isinstance(activity_limit, int) or not 1 <= activity_limit <= 32:
+            raise ValueError("activity_limit must be between 1 and 32")
+        count_tables = (
+            ("dataset_catalog", "dataset_catalog"),
+            ("bars", "bars"),
+            ("polymarket_snapshots", "polymarket_snapshots"),
+            ("polymarket_trades", "polymarket_trades"),
+            ("collection_errors", "collection_errors"),
+            ("collection_cycles", "collection_cycles"),
+            ("research_queue", "research_queue"),
+            ("candidate_lifecycle", "candidate_lifecycle"),
+            ("reports", "reports"),
+            ("experiments", "experiments"),
+            ("paper_state", "paper_state"),
+            ("paper_observations", "paper_observations"),
+            ("paper_execution_events", "paper_execution_events"),
+            ("paper_bet_ledger", "paper_bet_ledger"),
+        )
+        activity_cte = """
+            WITH activity(
+                kind,timestamp,event_id,message,details_json,source,source_type,
+                status,item_type,market_id
+            ) AS (
+                SELECT 'dataset',updated_at,'dataset:' || dataset_id || '/' || dataset_version,
+                    'Dataset ' || dataset_id || ' published (' || row_count || ' rows)',
+                    json_object('dataset_id',dataset_id,'dataset_version',dataset_version,
+                        'source_type',source_type,'timeframe',timeframe,'quality',quality),
+                    source_type,source_type,NULL,NULL,NULL
+                FROM dataset_catalog
+                UNION ALL
+                SELECT 'bootstrap',updated_at,'bootstrap:' || dataset_id,
+                    dataset_id || ' bootstrap ' || lower(status),payload_json,
+                    'bootstrap','bootstrap',status,NULL,NULL
+                FROM dataset_bootstrap_state
+                UNION ALL
+                SELECT 'collection',COALESCE(ended_at,started_at),'collection:' || cycle_id,
+                    'Polymarket collection cycle completed (' ||
+                        COALESCE(json_extract(payload_json,'$.markets_seen'),0) || ' markets)',
+                    payload_json,collector_name,'collection',NULL,NULL,NULL
+                FROM collection_cycles
+                UNION ALL
+                SELECT 'lifecycle',created_at,'lifecycle:' || event_id,
+                    'Candidate ' || candidate_id || ' moved to ' || to_stage,
+                    json_object('from_stage',from_stage,'reason',reason),
+                    'lifecycle','lifecycle',to_stage,NULL,NULL
+                FROM candidate_lifecycle_events
+                UNION ALL
+                SELECT 'research',updated_at,'research:item:' || item_id,
+                    'Research item ' || item_type || ' is ' || lower(status),
+                    json_object('item_id',item_id,'last_error',last_error),
+                    source,'research',status,item_type,
+                    json_extract(payload_json,'$.market_id')
+                FROM research_queue
+                UNION ALL
+                SELECT 'research',created_at,'research:event:' || event_id,
+                    'Research queue item ' || item_id || ' moved to ' || to_status,
+                    detail,'queue','research',to_status,NULL,NULL
+                FROM research_queue_events
+                UNION ALL
+                SELECT 'report',created_at,'report:' || report_id,
+                    'Research report ' || report_id || ' saved',
+                    json_object('experiment_id',experiment_id),
+                    'report','report',NULL,NULL,NULL
+                FROM reports
+                UNION ALL
+                SELECT 'collection_error',observed_at,'collection_error:' || error_id,
+                    'Collection error: ' || kind || ' (' || detail || ')',
+                    payload_json,'collection','collection_error',kind,NULL,market_id
+                FROM collection_errors
+            )
+        """
+        with self._lock:
+            counts = {
+                label: int(self._conn.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()["n"])
+                for table, label in count_tables
+            }
+            catalog_rows = self._conn.execute(
+                "SELECT lower(source_type) AS source_type,COUNT(*) AS dataset_count,"
+                "COALESCE(SUM(row_count),0) AS row_count "
+                "FROM dataset_catalog GROUP BY lower(source_type)"
+            ).fetchall()
+            candidate_rows = self._conn.execute(
+                "SELECT stage,COUNT(*) AS n FROM candidate_lifecycle GROUP BY stage ORDER BY stage"
+            ).fetchall()
+            queue_rows = self._conn.execute(
+                "SELECT status,COUNT(*) AS n FROM research_queue GROUP BY status ORDER BY status"
+            ).fetchall()
+            bootstrap_rows = self._conn.execute(
+                "SELECT status,COUNT(*) AS n FROM dataset_bootstrap_state GROUP BY status ORDER BY status"
+            ).fetchall()
+            worker_rows = self._conn.execute(
+                "SELECT worker_name,status,payload_json,heartbeat_at,updated_at "
+                "FROM worker_state ORDER BY updated_at DESC,worker_name ASC LIMIT 32"
+            ).fetchall()
+            latest_queue_row = self._conn.execute(
+                "SELECT * FROM research_queue ORDER BY updated_at DESC,item_id DESC LIMIT 1"
+            ).fetchone()
+            activity_rows = self._conn.execute(
+                f"{activity_cte} SELECT kind,timestamp,event_id,message,details_json,source,source_type,"
+                "status,item_type,market_id FROM activity "
+                "ORDER BY timestamp DESC,event_id ASC LIMIT ?",
+                (activity_limit,),
+            ).fetchall()
+        catalog = {
+            str(row["source_type"] or "unknown"): {
+                "datasets": int(row["dataset_count"]),
+                "rows": int(row["row_count"]),
+            }
+            for row in catalog_rows
+        }
+        activity = []
+        for row in activity_rows:
+            details = _load(row["details_json"]) if row["details_json"] else {}
+            activity.append(
+                {
+                    "kind": row["kind"],
+                    "timestamp": _parse_datetime(row["timestamp"]),
+                    "event_id": row["event_id"],
+                    "message": row["message"],
+                    "details": details if isinstance(details, Mapping) else {"value": details},
+                    "source": row["source"],
+                    "source_type": row["source_type"],
+                    "status": row["status"],
+                    "item_type": row["item_type"],
+                    "market_id": row["market_id"],
+                }
+            )
+        workers = [
+            {
+                "worker_name": row["worker_name"],
+                "status": row["status"],
+                "payload": _load(row["payload_json"]) if row["payload_json"] else {},
+                "heartbeat_at": _parse_datetime(row["heartbeat_at"]),
+                "updated_at": _parse_datetime(row["updated_at"]),
+            }
+            for row in worker_rows
+        ]
+        latest_queue = _research_queue_record(latest_queue_row) if latest_queue_row is not None else None
+        return {
+            "counts": counts,
+            "catalog": catalog,
+            "candidate_stages": {str(row["stage"]): int(row["n"]) for row in candidate_rows},
+            "queue_statuses": {str(row["status"]): int(row["n"]) for row in queue_rows},
+            "bootstrap_statuses": {str(row["status"]): int(row["n"]) for row in bootstrap_rows},
+            "workers": workers,
+            "latest_queue_item": latest_queue,
+            "latest_activity": activity,
+            "logical_rows": {
+                "catalog": sum(value["rows"] for value in catalog.values()),
+                "bars": counts["bars"],
+                "polymarket_snapshots": counts["polymarket_snapshots"],
+                "paper_observations": counts["paper_observations"],
+            },
         }
 
     def dashboard_summary(self) -> dict[str, Any]:

@@ -283,9 +283,19 @@ class DashboardPaginationFixture(unittest.TestCase):
         self.store.connection.commit()
     def _seed_queue(self) -> None:
         for index in range(QUEUE_COUNT):
+            payload = {"label": f"hypothesis-{index:02d}", "market": "crypto_spot"}
+            if index == 0:
+                payload.update(
+                    {
+                        "plan": {
+                            "dataset_selector": {"dataset_id": "fixture-dataset", "dataset_version": "fixture-v1"},
+                            "experiment_family": "fixture-family",
+                        },
+                    }
+                )
             self.store.enqueue_research_item(
                 "hypothesis",
-                {"label": f"hypothesis-{index:02d}", "market": "crypto_spot"},
+                payload,
                 source="fixture-hermes",
                 author="fixture",
                 item_id=f"queue-{index:02d}",
@@ -734,6 +744,8 @@ class DashboardPaginationEndpointTests(DashboardPaginationFixture):
         )
         self.assertTrue(all(self._market_value(item, "settlement") == "open" for item in open_markets["items"]))
         self.assertTrue(all(item["quality"] == "ORDER_BOOK_SIMULATED" for item in open_markets["items"]))
+        self.assertTrue(all("quality_label" in item and "quality_context" in item for item in open_markets["items"]))
+        self.assertEqual(open_markets["items"][0]["quality_label"], "CURRENT ORDER BOOK · SIMULATED EXECUTION")
 
     def test_activity_is_paginated_and_uses_deterministic_tie_breaking(self) -> None:
         page = self._page(
@@ -798,6 +810,11 @@ class DashboardPaginationEndpointTests(DashboardPaginationFixture):
         )
         self.assertEqual(accepted["items"][0]["item_id"], "queue-00")
         self.assertEqual(accepted["items"][0]["status"], "ACCEPTED")
+        status, detail, _ = self._request("api/v2/hermes/queue-00")
+        self.assertEqual(status, 200)
+        self.assertEqual(detail["dataset_id"], "fixture-dataset")
+        self.assertEqual(detail["dataset_version"], "fixture-v1")
+        self.assertEqual(detail["family"], "fixture-family")
 
         first_paper = self._page(
             "api/v2/paper",
@@ -910,7 +927,6 @@ class DashboardPaginationSurfaceTests(DashboardPaginationFixture):
         self.assertNotIn("items", overview)
         self.assertNotIn("dataset-00", overview_body)
         self.assertLess(len(overview_body), 5000)
-
         status, datasets, datasets_body = self._request("api/v2/datasets", page=1, page_size=10)
         self.assertEqual(status, 200)
         self.assertIsInstance(datasets, dict)
@@ -918,6 +934,16 @@ class DashboardPaginationSurfaceTests(DashboardPaginationFixture):
         self.assertLessEqual(len(datasets["items"]), 10)
         self.assertLess(len(datasets_body), 50000)
         self.assertNotIn('"records"', datasets_body)
+
+    def test_lightweight_overview_endpoint_is_bounded(self) -> None:
+        status, overview, overview_body = self._request("api/v2/overview-summary")
+        self.assertEqual(status, 200)
+        self.assertIsInstance(overview, dict)
+        assert isinstance(overview, dict)
+        self.assertLess(len(overview_body), 50000)
+        self.assertLessEqual(len(overview["latest_activity"]), 8)
+        self.assertNotIn("current_failures", overview_body)
+        self.assertIn("collector_health", overview)
 
     def test_html_has_paginated_views_url_state_and_responsive_sticky_layout(self) -> None:
         html = _dashboard_html()
@@ -938,7 +964,7 @@ class DashboardPaginationSurfaceTests(DashboardPaginationFixture):
             "datasets-market",
             "datasets-timeframe",
             "datasets-quality",
-            "polymarket-settlement",
+            "AbortController",
             "polymarket-quality",
             "fetch(",
             "canary_eligible",

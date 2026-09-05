@@ -153,7 +153,7 @@ _ENDPOINTS = (
     "evidence-maturity",
     "strategy",
 )
-_V2_ENDPOINTS = ("datasets", "activity", "candidates", "polymarket", "hermes", "crypto-research", "crypto", "paper")
+_V2_ENDPOINTS = ("overview-summary", "canary", "datasets", "activity", "candidates", "polymarket", "hermes", "crypto-research", "crypto", "paper")
 
 _DEFAULT_PAGE_SIZE = 25
 _PAGE_SIZE_OPTIONS = (10, 25, 50, 100)
@@ -228,11 +228,12 @@ def _pagination_params(query: Mapping[str, Any] | None = None) -> dict[str, Any]
         "category": first("category", "") or None,
         "settlement": first("settlement", "") or None,
         "status": first("status", "") or None,
+        "kind": first("kind", "") or None,
         "item_id": first("item_id", "") or None,
         "record_type": first("record_type", "") or None,
-        "dataset_version": first("dataset_version", "") or None,
         "symbol": first("symbol", "") or None,
         "universe_version": first("universe_version", "") or None,
+        "dataset_version": first("dataset_version", "") or None,
     }
 
 
@@ -322,6 +323,25 @@ def _hermes_human_reason(row: Mapping[str, Any], result: Mapping[str, Any], payl
         return None
     return str(value).strip() or None
 
+
+def _polymarket_quality_display(item: Mapping[str, Any]) -> tuple[str, str]:
+    payload = item.get("payload")
+    payload = payload if isinstance(payload, Mapping) else {}
+    source_type = str(
+        payload.get("source_type")
+        or item.get("source_type")
+        or ("HISTORICAL" if str(item.get("snapshot_id", "")).startswith("pmhist:") else "FORWARD_COLLECTED")
+    ).upper()
+    quality = str(item.get("quality") or payload.get("quality") or payload.get("research_quality") or "UNKNOWN").upper()
+    if source_type == "HISTORICAL":
+        if quality in {"HISTORICAL_ORDER_BOOK", "ORDER_BOOK"} or bool(item.get("historical_order_book_available")):
+            return "HISTORICAL TIMESTAMPED DEPTH", "Historical depth is timestamped; it is not a current book."
+        return "HISTORICAL PRICE PROXY", "Historical price history; no historical depth is asserted."
+    if quality == "ORDER_BOOK_SIMULATED":
+        return "CURRENT ORDER BOOK · SIMULATED EXECUTION", "Forward order-book observation; fills remain simulated."
+    if quality in {"PRICE_PROXY", "UNKNOWN"}:
+        return "CURRENT PRICE PROXY", "Forward price observation; no order-book depth is asserted."
+    return f"CURRENT {quality.replace('_', ' ')}", "Forward observation; execution remains simulated."
 
 def _hermes_row(item: Mapping[str, Any]) -> dict[str, Any]:
     """Expose queue provenance without requiring callers to decode JSON payloads."""
@@ -764,6 +784,7 @@ class DashboardData:
             values,
             source=values.get("source_type"),
             source_type=values.get("source_type"),
+            kind=values.get("kind"),
             status=values.get("status"),
             market=values.get("market"),
             filter=values.get("filter"),
@@ -803,6 +824,9 @@ class DashboardData:
                     for key in ("question", "yes_mid", "liquidity", "category", "settlement", "timeframe"):
                         if key not in item and key in snapshot:
                             item[key] = snapshot[key]
+                quality_label, quality_context = _polymarket_quality_display(item)
+                item["quality_label"] = quality_label
+                item["quality_context"] = quality_context
             return result
         data = self.prediction()
         items = data.get("markets", []) if isinstance(data, Mapping) else []
@@ -814,6 +838,11 @@ class DashboardData:
             items = [item for item in items if str(item.get("settlement", "")) == str(values["settlement"])]
         if needle:
             items = [item for item in items if needle in json.dumps(_jsonable(item), sort_keys=True).lower()]
+        for item in items:
+            if isinstance(item, Mapping):
+                label, context = _polymarket_quality_display(item)
+                item["quality_label"] = label
+                item["quality_context"] = context
         offset = (values["page"] - 1) * values["page_size"]
         return _page_result(items[offset : offset + values["page_size"]], page=values["page"], page_size=values["page_size"], total=len(items))
 
@@ -905,6 +934,12 @@ class DashboardData:
         statement = _nested_value(result, payload, keys=("statement", "hypothesis", "thesis"))
         tests = _nested_value(result, payload, keys=("tests", "validation_plan", "test_plan"))
         plan = _nested_value(result, payload, keys=("plan", "experiment_plan", "plan_id"))
+        plan_payload = plan if isinstance(plan, Mapping) else {}
+        dataset_selector = plan_payload.get("dataset_selector")
+        dataset_selector = dataset_selector if isinstance(dataset_selector, Mapping) else {}
+        dataset_id = row.get("dataset_id") or dataset_selector.get("dataset_id")
+        dataset_version = row.get("dataset_version") or dataset_selector.get("dataset_version")
+        family = row.get("family") or payload.get("experiment_family") or payload.get("family") or plan_payload.get("experiment_family")
         return {
             "available": True,
             "item_id": identifier,
@@ -919,9 +954,9 @@ class DashboardData:
             "time": row.get("time"),
             "source": row.get("source"),
             "status": row.get("status"),
-            "dataset_id": row.get("dataset_id"),
-            "dataset_version": row.get("dataset_version"),
-            "family": row.get("family"),
+            "dataset_id": dataset_id,
+            "dataset_version": dataset_version,
+            "family": family,
             "attempts": row.get("attempts", 0),
             "reason_code": row.get("reason_code"),
             "outcome_type": row.get("outcome_type"),
@@ -931,8 +966,8 @@ class DashboardData:
                     "type": row.get("outcome_type"),
                     "label": row.get("outcome_label"),
                     "reason_code": row.get("reason_code"),
-                    "dataset_id": row.get("dataset_id"),
-                    "dataset_version": row.get("dataset_version"),
+                    "dataset_id": dataset_id,
+                    "dataset_version": dataset_version,
                 }
                 if row.get("outcome_type")
                 else None
@@ -1004,16 +1039,46 @@ class DashboardData:
         }
 
     @staticmethod
+    def _crypto_bootstrap_report_row(item: Mapping[str, Any]) -> dict[str, Any] | None:
+        report = item.get("report")
+        report = report if isinstance(report, Mapping) else {}
+        report_id = str(item.get("report_id") or "").lower()
+        experiment_id = str(item.get("experiment_id") or "").lower()
+        is_bootstrap = (
+            report_id.startswith(("historical-bootstrap:", "bootstrap:"))
+            or experiment_id.startswith("crypto-universe:")
+            or str(report.get("kind") or "").lower() in {"historical_bootstrap", "bootstrap"}
+        )
+        if not is_bootstrap:
+            return None
+        return {
+            "report_id": item.get("report_id"),
+            "experiment_id": item.get("experiment_id"),
+            "created_at": item.get("created_at"),
+            "kind": report.get("kind", report.get("report_type", "bootstrap")),
+            "report_type": report.get("report_type", report.get("kind", "bootstrap")),
+            "universe_version": _nested_value(report, keys=("universe_version", "catalog_version")),
+            "assets": _bounded_value(report.get("assets", [])),
+            "symbols": _bounded_value(report.get("symbols", report.get("instruments", []))),
+            "coverage": _bounded_value(report.get("coverage", report.get("coverage_summary", {}))),
+            "validation": _bounded_value(report.get("validation", report.get("validation_summary", {}))),
+            "report": _bounded_value(report),
+        }
+
+    @staticmethod
     def _crypto_report_row(item: Mapping[str, Any]) -> dict[str, Any] | None:
         report = item.get("report")
         report = report if isinstance(report, Mapping) else {}
-        text = json.dumps(_jsonable(report), sort_keys=True).lower()
-        is_crypto = (
-            "crypto" in text
-            or "btc_historical" in text
-            or str(item.get("experiment_id", "")).lower().startswith(("crypto", "btcusdt"))
+        if DashboardData._crypto_bootstrap_report_row(item) is not None:
+            return None
+        experiment_id = str(item.get("experiment_id") or "").lower()
+        kind = str(report.get("kind") or report.get("report_type") or "").lower()
+        is_strategy = bool(
+            experiment_id.startswith(("crypto-research:", "crypto-paper:", "btcusdt"))
+            or kind in {"btc_historical_walk_forward", "crypto_strategy_research", "crypto_walk_forward"}
+            or any(key in report for key in ("strategies", "experiments", "validation", "families", "strategy"))
         )
-        if not is_crypto:
+        if not is_strategy:
             return None
         return {
             "report_id": item.get("report_id"),
@@ -1063,12 +1128,18 @@ class DashboardData:
             start = (values["page"] - 1) * values["page_size"]
             page_rows = records[start : start + values["page_size"]]
             reports_raw = configured.get("reports", [])
-            reports = [
-                row for item in reports_raw if isinstance(item, Mapping)
-                for row in [self._crypto_report_row(item)]
-                if row is not None
-            ][:20]
-            return self._crypto_research_result(page_rows, reports, values, total=total)
+            reports: list[dict[str, Any]] = []
+            bootstrap_reports: list[dict[str, Any]] = []
+            for item in reports_raw if isinstance(reports_raw, list) else []:
+                if not isinstance(item, Mapping):
+                    continue
+                report_row = self._crypto_report_row(item)
+                if report_row is not None and len(reports) < 20:
+                    reports.append(report_row)
+                bootstrap_row = self._crypto_bootstrap_report_row(item)
+                if bootstrap_row is not None and len(bootstrap_reports) < 20:
+                    bootstrap_reports.append(bootstrap_row)
+            return self._crypto_research_result(page_rows, reports, values, total=total, bootstrap_reports=bootstrap_reports)
         result = self._store_page(
             "paginate_dataset_catalog",
             values,
@@ -1083,15 +1154,24 @@ class DashboardData:
             if isinstance(item, Mapping)
         ]
         reports: list[dict[str, Any]] = []
+        bootstrap_reports: list[dict[str, Any]] = []
         if self.store is not None and callable(getattr(self.store, "list_reports", None)):
-            for item in self.store.list_reports(limit=100, newest_first=True):
-                if isinstance(item, Mapping):
-                    report_row = self._crypto_report_row(item)
-                    if report_row is not None:
-                        reports.append(report_row)
-                        if len(reports) >= 20:
-                            break
-        return self._crypto_research_result(rows, reports, values, total=int(result.get("total", len(rows))))
+            for item in self.store.list_reports(limit=256, newest_first=True):
+                if not isinstance(item, Mapping):
+                    continue
+                report_row = self._crypto_report_row(item)
+                if report_row is not None and len(reports) < 20:
+                    reports.append(report_row)
+                bootstrap_row = self._crypto_bootstrap_report_row(item)
+                if bootstrap_row is not None and len(bootstrap_reports) < 20:
+                    bootstrap_reports.append(bootstrap_row)
+        return self._crypto_research_result(
+            rows,
+            reports,
+            values,
+            total=int(result.get("total", len(rows))),
+            bootstrap_reports=bootstrap_reports,
+        )
 
     def _crypto_research_result(
         self,
@@ -1100,11 +1180,13 @@ class DashboardData:
         values: Mapping[str, Any],
         *,
         total: int,
+        bootstrap_reports: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
-        symbols = sorted({str(symbol) for row in rows for symbol in row.get("symbols", []) if str(symbol).strip()})
-        assets = sorted({str(asset) for row in rows for asset in row.get("assets", []) if str(asset).strip()})
+        bootstrap_reports = bootstrap_reports or []
+        symbols = sorted({str(symbol) for row in rows for symbol in (row.get("symbols") or []) if str(symbol).strip()})
+        assets = sorted({str(asset) for row in rows for asset in (row.get("assets") or []) if str(asset).strip()})
         universe_versions = [row.get("universe_version") for row in rows if row.get("universe_version")]
-        universe_versions.extend(report.get("universe_version") for report in reports if report.get("universe_version"))
+        universe_versions.extend(report.get("universe_version") for report in reports + bootstrap_reports if report.get("universe_version"))
         def collect(key: str) -> list[Any]:
             values_out: list[Any] = []
             for row in rows + reports:
@@ -1122,15 +1204,19 @@ class DashboardData:
                     unique.append(_bounded_value(value))
             return unique[:64]
         bootstrap_progress = self._bootstrap_progress_rows()
+        bootstrap_universe = self._bootstrap_universe_summary()
         return {
             **_page_result(rows, page=int(values["page"]), page_size=int(values["page_size"]), total=total),
-            "available": bool(total or reports),
+            "available": bool(total or reports or bootstrap_reports),
             "catalogs": rows,
             "catalog": rows,
             "reports": reports,
+            "strategy_reports": reports,
+            "bootstrap_reports": bootstrap_reports,
+            "bootstrap_report_count": len(bootstrap_reports),
             "bootstrap_progress": bootstrap_progress,
             "bootstrap_states": bootstrap_progress,
-            "universe_version": universe_versions[0] if universe_versions else None,
+            "bootstrap_universe": bootstrap_universe,
             "universe_versions": list(dict.fromkeys(str(value) for value in universe_versions))[:32],
             "assets": assets[:64],
             "asset_count": len(assets),
@@ -1153,6 +1239,28 @@ class DashboardData:
         return result
 
 
+    def _paper_view_result(self, result: dict[str, Any]) -> dict[str, Any]:
+        counts = self.store.dashboard_summary() if self.store is not None else {}
+        candidate = self._paper_portfolio(candidate_only=True)
+        result = dict(result)
+        result["paper_telemetry"] = {
+            "observation_records": int(counts.get("paper_observations", 0) or 0),
+            "execution_events": int(counts.get("paper_execution_events", 0) or 0),
+            "resolved_bets": int(counts.get("paper_bet_ledger", 0) or 0),
+            "record_count": sum(
+                int(counts.get(key, 0) or 0)
+                for key in ("paper_observations", "paper_execution_events", "paper_bet_ledger")
+            ),
+        }
+        result["candidate_portfolios"] = candidate.get("states", [])
+        result["candidate_portfolio_summary"] = {
+            key: candidate.get(key, 0)
+            for key in ("total_equity", "total_pnl", "resolved_bets", "win_rate", "expectancy")
+        }
+        result["paper_only"] = True
+        result["live_execution"] = False
+        return result
+
     def paginate_paper_records(self, params: Mapping[str, Any] | None = None) -> dict[str, Any]:
         values = _pagination_params(params)
         values["sort"] = values.get("sort") or "timestamp"
@@ -1164,7 +1272,7 @@ class DashboardData:
             filter=values.get("filter"),
         )
         if result["items"] or callable(getattr(self.store, "paginate_paper_records", None)):
-            return result
+            return self._paper_view_result(result)
         paper = self._paper_portfolio()
         items = paper.get("states", []) if isinstance(paper, Mapping) else []
         items = items if isinstance(items, list) else []
@@ -1172,7 +1280,9 @@ class DashboardData:
         if needle:
             items = [item for item in items if needle in json.dumps(_jsonable(item), sort_keys=True).lower()]
         offset = (values["page"] - 1) * values["page_size"]
-        return _page_result(items[offset : offset + values["page_size"]], page=values["page"], page_size=values["page_size"], total=len(items))
+        return self._paper_view_result(
+            _page_result(items[offset : offset + values["page_size"]], page=values["page"], page_size=values["page_size"], total=len(items))
+        )
 
     def dataset_detail(self, dataset_id: str) -> dict[str, Any]:
         identifier = str(dataset_id)
@@ -1232,6 +1342,8 @@ class DashboardData:
             identifier = unquote(name.split("/", 1)[1])
             return self.crypto_research_detail(identifier)
         handlers = {
+            "overview-summary": lambda _params: self.overview_summary(),
+            "canary": lambda _params: self.canary_data(),
             "datasets": self.paginate_dataset_catalog,
             "activity": self.paginate_research_activity,
             "candidates": self.paginate_candidate_lifecycle,
@@ -1769,7 +1881,7 @@ class DashboardData:
         events.sort(key=lambda item: parse_timestamp(item.get("timestamp")) or datetime.min.replace(tzinfo=datetime.now().astimezone().tzinfo), reverse=True)
         return events[:limit]
 
-    def _paper_portfolio(self) -> dict[str, Any]:
+    def _paper_portfolio(self, *, candidate_only: bool = False) -> dict[str, Any]:
         if self.store is None:
             return {
                 "paper_money": True,
@@ -1779,6 +1891,17 @@ class DashboardData:
                 "total_pnl": 0.0,
             }
         states = self.store.list_paper_states(limit=1000)
+        if candidate_only:
+            candidate_ids = self._candidate_paper_experiment_ids()
+            states = [
+                item
+                for item in states
+                if isinstance(item, Mapping)
+                and (
+                    str(item.get("experiment_id") or "").strip() in candidate_ids
+                    or str((item.get("state") or {}).get("candidate_id") if isinstance(item.get("state"), Mapping) else "").strip() in candidate_ids
+                )
+            ]
         rows: list[dict[str, Any]] = []
         total_equity = 0.0
         total_pnl = 0.0
@@ -1819,6 +1942,7 @@ class DashboardData:
                     "open_positions": portfolio.get("positions", {}),
                     "resolved_bets": len(ledger),
                     "paper_only": True,
+
                 }
             )
         return {
@@ -1831,8 +1955,45 @@ class DashboardData:
             "win_rate": winning_bets / total_bets if total_bets else 0.0,
             "expectancy": total_pnl / total_bets if total_bets else 0.0,
         }
+    def _candidate_paper_experiment_ids(self) -> set[str]:
+        if self.store is None:
+            return set()
+        lifecycle_loader = getattr(self.store, "load_candidate_lifecycle", None)
+        if not callable(lifecycle_loader):
+            return set()
+        records = lifecycle_loader(limit=1000)
+        result: set[str] = set()
+        for item in records if isinstance(records, list) else []:
+            if not isinstance(item, Mapping) or str(item.get("stage") or "").upper() not in _PAPER_FORWARD_STAGES:
+                continue
+            candidate_id = str(item.get("candidate_id") or "").strip()
+            payload = item.get("payload")
+            payload = payload if isinstance(payload, Mapping) else {}
+            for value in (candidate_id, payload.get("experiment_id"), payload.get("strategy_id"), payload.get("paper_experiment_id")):
+                if str(value or "").strip():
+                    result.add(str(value).strip())
+        return result
 
-    def _bootstrap_progress_rows(self, states: Any | None = None) -> list[dict[str, Any]]:
+    def _bootstrap_universe_summary(self) -> dict[str, Any]:
+        states = (
+            self.store.list_dataset_bootstrap_states(limit=1000)
+            if self.store is not None and callable(getattr(self.store, "list_dataset_bootstrap_states", None))
+            else []
+        )
+        rows = self._bootstrap_progress_rows(states, limit=1000)
+        selected_symbols = sorted({str(item["selected_symbol"]).strip() for item in rows if str(item.get("selected_symbol") or "").strip()})
+        progress_values = [float(item["progress"]) for item in rows if item.get("progress") is not None]
+        versions = sorted({str(item.get("universe_version")).strip() for item in rows if str(item.get("universe_version") or "").strip()})
+        return {
+            "selected_count": len(selected_symbols),
+            "selected_symbols": selected_symbols[:64],
+            "dataset_count": len(rows),
+            "universe_version": versions[0] if versions else None,
+            "progress": sum(progress_values) / len(progress_values) if progress_values else None,
+            "completed_datasets": sum(1 for item in rows if str(item.get("status")).upper() in {"COMPLETE", "EMPTY"}),
+        }
+
+    def _bootstrap_progress_rows(self, states: Any | None = None, *, limit: int = 20) -> list[dict[str, Any]]:
         """Expose bounded, per-dataset bootstrap cursors for operator clients."""
         if states is None:
             states = (
@@ -1843,7 +2004,7 @@ class DashboardData:
         if not isinstance(states, (list, tuple)):
             return []
         rows: list[dict[str, Any]] = []
-        for item in states[:20]:
+        for item in states[: max(0, int(limit))]:
             if not isinstance(item, Mapping):
                 continue
             payload = item.get("payload")
@@ -1858,8 +2019,7 @@ class DashboardData:
             if not symbol:
                 continue
             errors = value("errors")
-            if not isinstance(errors, (list, tuple)):
-                errors = []
+            errors = list(errors) if isinstance(errors, (list, tuple)) else []
             requested_start = value("requested_start")
             requested_end = value("requested_end")
             next_timestamp = value("next_timestamp")
@@ -2113,6 +2273,194 @@ class DashboardData:
             "dataset_version": row.get("dataset_version"),
             "family": row.get("family"),
             "attempts": row.get("attempts", 0),
+            "live_execution": False,
+        }
+
+    def overview_summary(self) -> dict[str, Any]:
+        """Return the bounded overview payload; list views stay lazy."""
+        configured = self._configured("overview-summary")
+        if configured is not None:
+            return dict(configured) if isinstance(configured, Mapping) else {"value": configured}
+        if self.store is None or not callable(getattr(self.store, "dashboard_overview_summary", None)):
+            return {
+                "available": False,
+                "components": [],
+                "research_cards": {},
+                "coverage": {},
+                "latest_activity": [],
+                "live_execution": False,
+            }
+        aggregate = self.store.dashboard_overview_summary(activity_limit=8)
+        counts = aggregate.get("counts", {}) if isinstance(aggregate, Mapping) else {}
+        catalog = aggregate.get("catalog", {}) if isinstance(aggregate, Mapping) else {}
+        stages = {
+            str(key): int(value)
+            for key, value in (aggregate.get("candidate_stages", {}) if isinstance(aggregate, Mapping) else {}).items()
+        }
+        queue_statuses = {
+            str(key).upper(): int(value)
+            for key, value in (aggregate.get("queue_statuses", {}) if isinstance(aggregate, Mapping) else {}).items()
+        }
+        bootstrap_statuses = {
+            str(key).upper(): int(value)
+            for key, value in (aggregate.get("bootstrap_statuses", {}) if isinstance(aggregate, Mapping) else {}).items()
+        }
+        workers = [
+            item for item in (aggregate.get("workers", []) if isinstance(aggregate, Mapping) else [])
+            if isinstance(item, Mapping)
+        ]
+        worker_map = {str(item.get("worker_name")): item for item in workers}
+        health_worker = worker_map.get("health-monitor", {})
+        health_payload = health_worker.get("payload", {}) if isinstance(health_worker, Mapping) else {}
+        health_payload = health_payload if isinstance(health_payload, Mapping) else {}
+        health_grade = str(health_payload.get("grade") or "").upper() or None
+        collector_state = self.store.get_collector_state("polymarket") or {}
+        collector_state = collector_state if isinstance(collector_state, Mapping) else {}
+        collector_detail = {
+            "grade": health_payload.get("grade"),
+            "reason_code": health_payload.get("reason_code"),
+            "reasons": _bounded_value(health_payload.get("reasons", [])),
+            "collection_errors": health_payload.get("collection_errors", 0),
+            "top_failure_codes": _bounded_value(health_payload.get("top_failure_codes", [])),
+            "stale_market_count": health_payload.get("stale_market_count", len(health_payload.get("stale_markets", []))),
+            "gap_count": health_payload.get("gap_count", len(health_payload.get("gaps", []))),
+            "configured_interval_seconds": health_payload.get("configured_interval_seconds") or 60.0,
+            "effective_collection_cadence_seconds": health_payload.get("effective_collection_cadence_seconds"),
+            "stale_after_seconds": health_payload.get("stale_after_seconds") or 180.0,
+            "last_cycle_duration_seconds": collector_state.get("last_cycle_duration_seconds", health_payload.get("last_cycle_duration_seconds")),
+            "last_cycle_started_at": collector_state.get("last_cycle_started_at", health_payload.get("last_cycle_started_at")),
+            "last_cycle_ended_at": collector_state.get("last_cycle_ended_at", health_payload.get("last_cycle_ended_at")),
+            "markets_attempted": collector_state.get("markets_attempted", health_payload.get("last_cycle_markets_attempted", 0)),
+            "markets_successful": collector_state.get("markets_successful", health_payload.get("last_cycle_markets_successful", 0)),
+            "markets_failed": collector_state.get("markets_failed", health_payload.get("last_cycle_markets_failed", 0)),
+            "last_cycle_markets_attempted": collector_state.get("markets_attempted", health_payload.get("last_cycle_markets_attempted", 0)),
+            "last_cycle_markets_successful": collector_state.get("markets_successful", health_payload.get("last_cycle_markets_successful", 0)),
+            "last_cycle_markets_failed": collector_state.get("markets_failed", health_payload.get("last_cycle_markets_failed", 0)),
+            "scheduled_market_count": len(collector_state.get("scheduled_market_ids", []))
+            if isinstance(collector_state.get("scheduled_market_ids"), (list, tuple))
+            else health_payload.get("scheduled_market_count", 0),
+            "last_successful_cycle": health_payload.get("last_successful_cycle"),
+        }
+        health_reason = (
+            health_payload.get("degrading_reason")
+            or health_payload.get("reason")
+            or health_payload.get("last_error")
+            or health_payload.get("reason_code")
+        )
+
+        def worker_state(name: str, default: str = "NOT INITIALIZED") -> str:
+            item = worker_map.get(name, {})
+            status = str(item.get("status") or "").upper()
+            return status or default
+
+        crypto_ready = int(catalog.get("historical", {}).get("datasets", 0) or 0) > 0 if isinstance(catalog.get("historical"), Mapping) else False
+        canary_service = CanaryService(self.store, initialize=False)
+        canary_status = canary_service.status()
+        latest_signal = canary_service.latest_signal()
+        latest_queue = aggregate.get("latest_queue_item") if isinstance(aggregate, Mapping) else None
+        latest_outcome = None
+        if isinstance(latest_queue, Mapping) and _is_terminal_hermes_status(latest_queue.get("status")):
+            latest_outcome = {
+                "time": latest_queue.get("updated_at") or latest_queue.get("created_at"),
+                "item_id": latest_queue.get("item_id"),
+                "status": latest_queue.get("status"),
+                "reason_code": latest_queue.get("reason_code"),
+                "outcome_type": latest_queue.get("outcome_type"),
+                "outcome_label": latest_queue.get("outcome_label"),
+                "human_reason": latest_queue.get("human_reason"),
+                "dataset_id": latest_queue.get("dataset_id"),
+                "dataset_version": latest_queue.get("dataset_version"),
+                "family": latest_queue.get("family"),
+            }
+        historical = catalog.get("historical", {}) if isinstance(catalog, Mapping) else {}
+        forward = catalog.get("forward_collected", {}) if isinstance(catalog, Mapping) else {}
+        candidate_canary_count = self._candidate_canary_eligibility_count()
+        components = [
+            {
+                "name": "AXIOM NODE",
+                "state": worker_state("axiom-node"),
+                "detail": {"reason": health_reason if worker_state("axiom-node") in {"DEGRADED", "STALE"} else None},
+            },
+            {
+                "name": "POLYMARKET COLLECTOR",
+                "state": health_grade or worker_state("health-monitor"),
+                "detail": collector_detail,
+            },
+            {
+                "name": "CRYPTO DATA",
+                "state": "READY" if crypto_ready else ("UPDATING" if bootstrap_statuses.get("RUNNING") else "NOT INITIALIZED"),
+                "detail": {"bootstrap_statuses": bootstrap_statuses},
+            },
+            {
+                "name": "HERMES",
+                "state": worker_state("research-queue", "READY" if queue_statuses else "NOT INITIALIZED"),
+                "detail": {"queue_statuses": queue_statuses, "latest_outcome": latest_outcome},
+            },
+            {
+                "name": "PAPER ENGINE",
+                "state": "ACTIVE" if counts.get("paper_state", 0) else "NOT INITIALIZED",
+                "detail": {"states": counts.get("paper_state", 0)},
+            },
+        ]
+        return {
+            "available": True,
+            "title": "AXIOM / operator research console",
+            "live_trading": {"status": "Disabled", "enabled": False},
+            "paper_risk_engine": {"status": "Active", "enabled": True},
+            "components": components,
+            "research_cards": {
+                "experiments_run": counts.get("experiments", 0),
+                "active_hypotheses": queue_statuses.get("PENDING", 0) + queue_statuses.get("TESTING", 0),
+                "candidates_alive": sum(value for key, value in stages.items() if key != "REJECTED"),
+                "candidate_rejected": stages.get("REJECTED", 0),
+                "research_rejected": queue_statuses.get("REJECTED", 0) + queue_statuses.get("FAILED", 0),
+                "canary_eligible": candidate_canary_count,
+                "paper_forward": stages.get("PAPER_FORWARD", 0) + stages.get("PAPER_PROMOTABLE", 0),
+                "paper_promotable": stages.get("PAPER_PROMOTABLE", 0),
+            },
+            "coverage": {
+                "historical_count": historical.get("datasets", 0) if isinstance(historical, Mapping) else 0,
+                "historical_rows": historical.get("rows", 0) if isinstance(historical, Mapping) else 0,
+                "forward_count": forward.get("datasets", 0) if isinstance(forward, Mapping) else 0,
+                "forward_rows": forward.get("rows", 0) if isinstance(forward, Mapping) else 0,
+                "logical_rows": aggregate.get("logical_rows", {}),
+            },
+            "activity": aggregate.get("latest_activity", []),
+            "latest_activity": aggregate.get("latest_activity", []),
+            "lifecycle_funnel": stages,
+            "candidate_status": {
+                "canary_eligible": candidate_canary_count,
+                "paper_forward": stages.get("PAPER_FORWARD", 0) + stages.get("PAPER_PROMOTABLE", 0),
+                "paper_promotable": stages.get("PAPER_PROMOTABLE", 0),
+            },
+            "hermes": {"statuses": queue_statuses, "latest_outcome": latest_outcome},
+            "hermes_latest_outcome": latest_outcome,
+            "canary": canary_status,
+            "canary_signal": latest_signal,
+            "collector_health": collector_detail,
+            "counts": counts,
+            "paper_summary": {
+                "telemetry_records": counts.get("paper_observations", 0)
+                + counts.get("paper_execution_events", 0)
+                + counts.get("paper_bet_ledger", 0),
+                "candidate_portfolios": 0,
+            },
+            "paper_only": True,
+            "live_execution": False,
+        }
+
+    def canary_data(self) -> dict[str, Any]:
+        """Return only the read-only canary status and latest signal."""
+        if self.store is None:
+            return {
+                "canary": {"production_live_trading": "DISABLED", "micro_live_canary": "DISARMED", "live_execution": False, "trades": []},
+                "canary_signal": None,
+                "live_execution": False,
+            }
+        service = CanaryService(self.store, initialize=False)
+        return {
+            "canary": service.status(),
+            "canary_signal": service.latest_signal(),
             "live_execution": False,
         }
 
@@ -2432,7 +2780,7 @@ def _dashboard_html() -> str:
     h1,h2,h3,p { margin:0; } h1 { font-size:1.3rem; letter-spacing:.08em; text-transform:uppercase; } h2 { font-size:.95rem; letter-spacing:.04em; text-transform:uppercase; } h3 { font-size:.8rem; color:var(--muted); text-transform:uppercase; letter-spacing:.08em; }
     .eyebrow { color:var(--blue); font-size:.68rem; letter-spacing:.15em; text-transform:uppercase; margin-bottom:7px; } .subtitle,.muted,.page-note { color:var(--muted); } .subtitle { margin-top:6px; font-size:.86rem; }
     .live-lock { border:1px solid #276a62; background:#0c2b2c; color:#9bf1d3; border-radius:6px; padding:9px 11px; font-size:.7rem; text-transform:uppercase; letter-spacing:.08em; white-space:nowrap; }
-    nav { width:min(100% - 32px, 1400px); margin:0 auto; display:flex; gap:4px; padding:0 0 11px; overflow-x:auto; } nav button,button.link { border:1px solid transparent; color:var(--muted); background:transparent; cursor:pointer; } nav button { padding:7px 10px; border-radius:5px; font-size:.7rem; letter-spacing:.06em; text-transform:uppercase; } nav button:hover,nav button.active { color:var(--text); border-color:var(--line); background:#122039; }
+    nav { width:min(100% - 32px, 1400px); margin:0 auto; display:flex; gap:4px; padding:0 0 11px; overflow-x:auto; } nav button,button.link { border:1px solid transparent; color:var(--muted); background:transparent; cursor:pointer; } nav button { padding:7px 10px; border-radius:5px; font-size:.7rem; letter-spacing:.06em; text-transform:uppercase; } nav button.tab:hover:not(.active) { color:var(--text); border-color:var(--line); background:#122039; } nav button.tab.active { color:var(--text); border-color:var(--line); background:#122039; } nav button.tab:focus-visible { outline:2px solid var(--blue); outline-offset:2px; }
     main { padding:22px 0 55px; } .view { display:none; } .view.active { display:block; }
     .grid,.two-col,.three-col,.status-grid,.card-grid { display:grid; gap:12px; } .status-grid { grid-template-columns:repeat(5,minmax(0,1fr)); margin-bottom:14px; } .card-grid { grid-template-columns:repeat(6,minmax(0,1fr)); margin-bottom:14px; } .two-col { grid-template-columns:minmax(0,1.45fr) minmax(260px,.8fr); } .three-col { grid-template-columns:repeat(3,minmax(0,1fr)); }
     .panel { min-width:0; border:1px solid var(--line); background:linear-gradient(145deg,rgba(16,24,39,.96),rgba(10,17,29,.96)); border-radius:8px; padding:15px; box-shadow:0 10px 34px rgba(0,0,0,.14); } .panel + .panel { margin-top:12px; } .status-card { padding:12px 13px; }
@@ -2445,6 +2793,7 @@ def _dashboard_html() -> str:
     .funnel { display:grid; gap:7px; } .funnel-row { display:grid; grid-template-columns:145px 1fr 35px; gap:8px; align-items:center; font-size:.69rem; } .funnel-track { height:8px; background:#172238; border-radius:5px; overflow:hidden; } .funnel-bar { height:100%; background:linear-gradient(90deg,var(--blue),var(--cyan)); border-radius:5px; }
     .key-value { display:grid; grid-template-columns:145px minmax(0,1fr); gap:7px; font-size:.76rem; } .key { color:var(--muted); } .key-value + .key-value { margin-top:7px; } details { margin-top:12px; } summary { color:var(--muted); cursor:pointer; font-size:.72rem; } pre { margin:9px 0 0; max-height:350px; overflow:auto; white-space:pre-wrap; word-break:break-word; color:#b7c7dc; font-size:.68rem; line-height:1.4; } .page-note { font-size:.74rem; line-height:1.5; margin-top:9px; } .notice { border-left:3px solid var(--amber); padding:8px 11px; color:#e7d4a8; background:#211b10; font-size:.73rem; line-height:1.4; } .right { text-align:right; } .pager { margin-top:11px; color:var(--muted); font-size:.72rem; } .pager button { border:1px solid var(--line); border-radius:4px; color:var(--text); background:#0a1220; padding:5px 8px; cursor:pointer; } .pager button:disabled { opacity:.4; cursor:default; }
     @media (max-width:1050px) { .status-grid { grid-template-columns:repeat(3,1fr); } .card-grid { grid-template-columns:repeat(3,1fr); } .two-col,.three-col { grid-template-columns:1fr; } } @media (max-width:620px) { .topbar,main,nav { width:min(100% - 24px,1400px); } .status-grid,.card-grid { grid-template-columns:repeat(2,1fr); } .timeline-item { grid-template-columns:72px 60px minmax(0,1fr); } }
+    .identity { display:flex; flex-direction:column; gap:2px; min-width:160px; } .identity-main { color:var(--text); font-weight:650; } .identity-sub { color:var(--muted); font-size:.65rem; } .copy { border:1px solid var(--line); border-radius:4px; background:transparent; color:var(--blue); cursor:pointer; font-size:.62rem; padding:2px 5px; margin-left:5px; } .copy:hover { background:#122039; } .refresh-note { min-height:1.1em; color:var(--muted); font-size:.68rem; } .refresh-note.slow { color:var(--amber); } .quality-context { display:block; color:var(--muted); font-size:.62rem; white-space:normal; max-width:260px; } .activity-compact { border-bottom:1px solid #1c2a3f; padding:8px 0; } .activity-compact + .activity-compact { margin-top:2px; } .detail-grid { display:grid; gap:10px; } .detail-section { border-top:1px solid #1c2a3f; padding-top:9px; } .detail-section h3 { margin-bottom:6px; } .progress { height:7px; background:#172238; border-radius:5px; overflow:hidden; } .progress > i { display:block; height:100%; background:linear-gradient(90deg,var(--blue),var(--cyan)); }
   </style>
 </head>
 <body>
@@ -2475,7 +2824,7 @@ def _dashboard_html() -> str:
   <script>
     const $ = (id) => document.getElementById(id), safe = (v) => String(v ?? "—").replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c])), json = (v) => JSON.stringify(v ?? {}, null, 2);
     const count = (v) => Number.isFinite(Number(v)) ? String(v) : "0", phtDateFormatter = new Intl.DateTimeFormat("en-PH-u-hc-h23", { timeZone:"Asia/Manila", year:"numeric", month:"2-digit", day:"2-digit", hour:"2-digit", minute:"2-digit", second:"2-digit", hourCycle:"h23" }), dateText = (v) => { if(!v || typeof v !== "string" || !/(?:Z|[+-][0-9]{2}:[0-9]{2})$/.test(v)) return "—"; const date = new Date(v); if(Number.isNaN(date.getTime())) return "—"; const parts = Object.fromEntries(phtDateFormatter.formatToParts(date).filter(i => i.type !== "literal").map(i => [i.type, i.value])); return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}:${parts.second} PHT`; }, arr = (v) => Array.isArray(v) ? v : [];
-    const empty = (title,body) => `<div class="empty"><strong>${safe(title)}</strong>${safe(body)}</div>`, statusClass = (v) => { const s=String(v||"").toUpperCase(); return ["READY","RUNNING","ACTIVE","COMPLETE","COMPLETED","HEALTHY","ELIGIBLE","PASSED","PROMOTABLE"].includes(s)?"good":["DEGRADED","STOPPED","UPDATING","SUBMITTING","UNKNOWN"].includes(s)?"warn":["ERROR","STALE","REJECTED","KILLED"].includes(s)?"bad":""; };
+    const empty = (title,body) => `<div class="empty"><strong>${safe(title)}</strong>${safe(body)}</div>`, statusClass = (v) => { const s=String(v||"").toUpperCase(); return ["READY","RUNNING","ACTIVE","COMPLETE","COMPLETED","HEALTHY","ELIGIBLE","PASSED","PROMOTABLE","A","B"].includes(s)?"good":["DEGRADED","STOPPED","UPDATING","SUBMITTING","UNKNOWN","C"].includes(s)?"warn":["ERROR","STALE","REJECTED","KILLED","D","F"].includes(s)?"bad":""; };
     let params = new URLSearchParams(location.search); const state = { tab: params.get("tab") || "overview", page: Math.max(1,Number(params.get("page")||1)), page_size: [10,25,50,100].includes(Number(params.get("page_size"))) ? Number(params.get("page_size")) : 25, filter: params.get("filter") || "", sort: params.get("sort") || "", direction: params.get("direction") === "asc" ? "asc" : "desc", selected: params.get("selected") || "", expanded: params.get("expanded") === "1" };
     let operator = {}, current = {}, loadInFlight = false;
     function saveState(push=false) { const q=new URLSearchParams(); q.set("tab",state.tab); q.set("page",state.page); q.set("page_size",state.page_size); if(state.filter)q.set("filter",state.filter); if(state.sort)q.set("sort",state.sort); if(state.direction!=="desc")q.set("direction",state.direction); if(state.selected)q.set("selected",state.selected); if(state.expanded)q.set("expanded","1"); document.querySelectorAll("select.facet").forEach(el=>{if(el.value)q.set(el.dataset.param||el.id,el.value)}); (push?history.pushState:history.replaceState).call(history,{}, "", `${location.pathname}?${q}`); }
@@ -2518,6 +2867,36 @@ def _dashboard_html() -> str:
     function renderOutcomeCards(data) { const cards=data.research_cards||{}, latest=data.hermes_latest_outcome||cards.newest_hermes_outcome||{}, latestLabel=latest.outcome_label||latest.status||"—"; $("research-cards").innerHTML=[["experiments_run","Experiments run"],["active_hypotheses","Active hypotheses"],["candidates_alive","Candidates alive"],["candidate_rejected","Candidate Rejected"],["research_rejected","Research Rejected"],["canary_eligible","Canary eligible"],["paper_forward","Paper forward"],["paper_promotable","Paper promotable"]].map(([k,l])=>`<article class="panel"><div class="metric">${count(cards[k])}</div><div class="metric-label">${l}</div></article>`).join("")+`<article class="panel"><div class="metric">${safe(latestLabel)}</div><div class="metric-label">Newest Hermes outcome · ${safe(latest.item_id||"none")}</div><div class="page-note">Dataset: ${safe(latest.dataset_id||"—")} / ${safe(latest.dataset_version||"—")}</div>${latest.human_reason?`<p class="page-note">${safe(latest.human_reason)}</p>`:""}</article>`; }
     const _renderOverview=renderOverview; renderOverview=(data)=>{_renderOverview(data);renderOutcomeCards(data);};
     async function load() { if(loadInFlight)return; loadInFlight=true; try { const response=await fetch("/api/operator",{cache:"no-store"}); if(!response.ok)throw new Error(`operator HTTP ${response.status}`); operator=await response.json(); renderOverview(operator); renderCrypto(operator.crypto_research||{}); renderCanary(operator); if(!["overview","crypto","canary"].includes(state.tab))await loadPage(state.tab); } catch(e) { $("component-grid").innerHTML=empty("Dashboard unavailable",e.message); } finally { loadInFlight=false; } }
+    const VIEW_ENDPOINT = {overview:"overview-summary",canary:"canary",datasets:"datasets",activity:"activity",candidates:"candidates",polymarket:"polymarket",hermes:"hermes",crypto:"crypto-research",portfolio:"paper"};
+    const VIEW_TARGET = {datasets:"datasets-table",activity:"activity-table",candidates:"candidates-table",polymarket:"pm-markets",hermes:"hermes-table",crypto:"crypto-table",portfolio:"portfolio-states"};
+    const VIEW_CADENCE = {overview:10000,canary:15000,datasets:30000,activity:15000,candidates:30000,polymarket:30000,hermes:30000,crypto:30000,portfolio:30000};
+    let activeController = null, detailController = null, refreshGeneration = 0, nextRefreshAt = 0, slowRefreshTimer = null, startupPending = true;
+    // Shared status classifier covers readiness, degradation, and terminal grades.
+    function refreshCadence(tab) { return VIEW_CADENCE[tab] || 30000; }
+    function refreshNote(tab) { const view=$(`view-${tab}`); if(!view)return null; let note=view.querySelector(".refresh-note"); if(!note){ const title=view.querySelector(".section-title"); if(!title)return null; note=document.createElement("span"); note.className="refresh-note"; title.appendChild(note); } return note; }
+    function refreshMessage(tab,message,slow=false) { const note=refreshNote(tab); if(note){note.textContent=message||"";note.classList.toggle("slow",slow);} }
+    function shortId(value) { const text=String(value??""); return text.length>30?`${text.slice(0,13)}…${text.slice(-11)}`:text||"—"; }
+    function copyButton(value) { const text=String(value??""); return text?`<span role="button" tabindex="0" class="copy" data-copy="${safe(text)}" title="Copy full value">copy</span>`:""; }
+    function identity(primary,full,secondary="") { return `<span class="identity" title="${safe(full||primary)}"><span class="identity-main">${safe(primary||"—")}${copyButton(full||primary)}</span>${secondary?`<span class="identity-sub">${safe(secondary)}</span>`:""}</span>`; }
+    function datasetPrimary(item) { const instrument=String(item.instrument||"").trim(),timeframe=String(item.timeframe||"").trim(); return String(item.market_type||"").toLowerCase()==="crypto_spot"&&instrument?`${instrument}${timeframe?` · ${timeframe}`:""}`:shortId(item.dataset_id); }
+    function activityKey(item) { const d=item.details||{}; return [String(d.selected_symbol||d.symbol||d.instrument||d.dataset_id||item.market_id||""),String(d.timeframe||"")].join("|"); }
+    function compactActivityRows(rows) { const compact=[]; for(const item of arr(rows)){ const previous=compact[compact.length-1]; if(previous&&item.kind==="bootstrap"&&previous.kind==="bootstrap"&&activityKey(previous)===activityKey(item)){previous.count++;previous.events.push(item);continue;} compact.push({...item,count:1,events:[item]}); } return compact; }
+    function activityMarkup(rows) { return compactActivityRows(rows).map(item=>{const suffix=item.count>1?` ×${item.count}`:"";const detail=item.events.length>1?` <details><summary>${item.events.length} adjacent bootstrap events</summary><pre>${safe(json(item.events))}</pre></details>`:(item.details&&Object.keys(item.details).length?` <details><summary>details</summary><pre>${safe(json(item.details))}</pre></details>`:"");return `<div class="activity-compact"><div class="timeline-item"><span class="timeline-time">${safe(dateText(item.timestamp))}</span><span class="timeline-kind">${safe(item.kind)}${suffix}</span><span>${safe(item.message)}${detail}</span></div></div>`; }).join("")||empty("No research activity","Durable activity will appear after workers run."); }
+    function ensureActivityKind() { const status=$("activity-status"); if(!status||$("activity-kind"))return; const select=document.createElement("select"); select.id="activity-kind"; select.className="facet"; select.dataset.param="kind"; select.setAttribute("aria-label","Filter activity type"); select.innerHTML='<option value="">All activity types</option>'+["bootstrap","dataset","research","lifecycle","collection","collection_error","report"].map(v=>`<option value="${v}">${v.replace("_"," ")}</option>`).join(""); status.parentNode.insertBefore(select,status); }
+    fetchV2 = async function(name,signal) { const q=new URLSearchParams(); if(!["overview-summary","canary"].includes(name)){q.set("page",String(state.page));q.set("page_size",String(state.page_size));q.set("direction",state.direction);if(state.filter)q.set("filter",state.filter);if(state.sort)q.set("sort",state.sort);} const controls={datasets:[["datasets-source","source_type"],["datasets-market","market"],["datasets-timeframe","timeframe"],["datasets-quality","quality"]],activity:[["activity-status","status"],["activity-kind","kind"]],candidates:[["candidates-stage","stage"]],polymarket:[["polymarket-category","category"],["polymarket-settlement","settlement"],["polymarket-quality","quality"]],hermes:[["hermes-status","status"]],paper:[["paper-status","status"]]}; for(const [id,key] of (controls[state.tab]||[])){const el=$(id);if(el&&el.value)q.set(key,el.value);} if(state.tab==="crypto"&&$("crypto-symbol")?.value.trim())q.set("symbol",$("crypto-symbol").value.trim()); const url=`/api/v2/${name}${q.toString()?`?${q}`:""}`,response=await fetch(url,{cache:"no-store",signal}); if(!response.ok)throw new Error(`${name} HTTP ${response.status}`); return response.json(); };
+    renderOverview = (data) => { renderComponents(data); renderOutcomeCards(data); const c=data.coverage||{},h=data.collector_health||{}; $("coverage").innerHTML=`<div class="three-col"><div class="key-value"><span class="key">Historical datasets</span><strong>${count(c.historical_count)}</strong></div><div class="key-value"><span class="key">Historical rows</span><strong>${count(c.historical_rows)}</strong></div><div class="key-value"><span class="key">Forward datasets</span><strong>${count(c.forward_count)}</strong></div><div class="key-value"><span class="key">Forward rows</span><strong>${count(c.forward_rows)}</strong></div><div class="key-value"><span class="key">Logical observations</span><strong>${count((c.logical_rows||{}).bars)}</strong></div><div class="key-value"><span class="key">Collector errors</span><strong>${count(h.collection_errors)}</strong></div><div class="key-value"><span class="key">Last cycle duration</span><strong>${h.last_cycle_duration_seconds==null?"—":`${Number(h.last_cycle_duration_seconds).toFixed(1)}s`}</strong></div><div class="key-value"><span class="key">Effective cadence</span><strong>${h.effective_collection_cadence_seconds==null?"—":`${Number(h.effective_collection_cadence_seconds).toFixed(1)}s`}</strong></div><div class="key-value"><span class="key">Markets A / S / F</span><strong>${count(h.last_cycle_markets_attempted)} / ${count(h.last_cycle_markets_successful)} / ${count(h.last_cycle_markets_failed)}</strong></div></div><p class="page-note">Configured interval ${safe(h.configured_interval_seconds??"—")}s · stale threshold ${safe(h.stale_after_seconds??"—")}s · last successful cycle ${safe(dateText(h.last_successful_cycle))}</p>`; $("overview-activity").innerHTML=activityMarkup(arr(data.latest_activity||data.activity)); $("overview-candidates").innerHTML=empty("Candidate list is lazy","Open Candidates to load the bounded lifecycle page."); $("raw-overview").textContent=json({counts:data.counts,collector_health:h,latest_outcome:data.hermes_latest_outcome}); };
+    renderDatasets = (data) => { $("dataset-total").textContent=`${count(data.total)} datasets`; const rows=arr(data.items); $("datasets-table").innerHTML=rows.length?`<table><thead><tr>${[["dataset_id","Dataset"],["source_type","Source"],["market_type","Market"],["instrument","Instrument"],["timeframe","Timeframe"],["quality","Quality"],["row_count","Rows"],["updated_at","Updated"]].map(([k,l])=>`<th>${sortButton(k,l)}</th>`).join("")}</tr></thead><tbody>${rows.map(i=>`<tr><td><button class="link dataset" data-id="${encodeURIComponent(i.dataset_id||"")}">${identity(datasetPrimary(i),i.dataset_id,i.dataset_id===datasetPrimary(i)?"":`full ${shortId(i.dataset_id)}`)}</button></td><td>${safe(i.source_type)}</td><td>${safe(i.market_type)}</td><td>${safe(i.instrument)}</td><td>${safe(i.timeframe)}</td><td>${safe(i.quality)}</td><td>${count(i.row_count)}</td><td>${safe(dateText(i.updated_at))}</td></tr>`).join("")}</tbody></table>`:empty("No datasets","No catalog records match the current filters."); pager("datasets",data); bindTable(); };
+    renderActivity = (data) => { ensureActivityKind(); $("activity-total").textContent=`${count(data.total)} events`; $("activity-table").innerHTML=arr(data.items).length?`<div class="timeline">${activityMarkup(data.items)}</div>`:empty("No research activity","Durable activity will appear after workers run."); pager("activity",data); bindTable(); };
+    renderCrypto = (data) => { const rows=arr(data.items),u=data.bootstrap_universe||{}; $("crypto-summary").innerHTML=`<div class="three-col"><div class="key-value"><span class="key">Universe version</span><strong title="${safe(data.universe_version)}">${safe(shortId(data.universe_version))}${copyButton(data.universe_version)}</strong></div><div class="key-value"><span class="key">Selected universe</span><strong>${count(u.selected_count)}</strong></div><div class="key-value"><span class="key">Bootstrap progress</span><strong>${u.progress==null?"—":(Number(u.progress)*100).toFixed(1)+"%"}</strong></div><div class="key-value"><span class="key">Bootstrap datasets</span><strong>${count(u.dataset_count)}</strong></div><div class="key-value"><span class="key">Bootstrap reports</span><strong>${count(data.bootstrap_report_count??arr(data.bootstrap_reports).length)}</strong></div><div class="key-value"><span class="key">Strategy reports</span><strong>${count(arr(data.strategy_reports||data.reports).length)}</strong></div></div>`; $("crypto-table").innerHTML=rows.length?`<table><thead><tr><th>Symbol</th><th>Dataset</th><th>Source</th><th>Rows</th><th>Quality</th><th>Updated</th></tr></thead><tbody>${rows.map(i=>`<tr><td>${safe(i.symbol||arr(i.symbols)[0])}</td><td>${identity(shortId(i.dataset_id),i.dataset_id,shortId(i.dataset_version))}</td><td>${safe(i.source_type)}</td><td>${count(i.row_count)}</td><td>${safe(i.quality)}</td><td>${safe(dateText(i.updated_at))}</td></tr>`).join("")}</tbody></table>`:empty("No crypto catalogs","Crypto data is separate from strategy research; run the bounded bootstrap or select another symbol."); if(arr(data.bootstrap_progress).length){$("crypto-detail").innerHTML=`<article class="panel"><div class="section-title"><h2>Bootstrap cursors</h2><span class="muted">${count(u.completed_datasets)} complete / ${count(u.dataset_count)} datasets</span></div><div class="scroll"><table><thead><tr><th>Selected symbol</th><th>Timeframe</th><th>Status</th><th>Progress</th><th>Records</th><th>Errors</th></tr></thead><tbody>${arr(data.bootstrap_progress).map(i=>`<tr><td>${safe(i.selected_symbol||i.symbol)}</td><td>${safe(i.timeframe)}</td><td>${safe(i.status)}</td><td>${i.progress==null?"—":(Number(i.progress)*100).toFixed(1)+"%"}</td><td>${count(i.records)}</td><td>${count(i.error_count)}</td></tr>`).join("")}</tbody></table></div></article>`;} else $("crypto-detail").innerHTML=""; pager("crypto",data); bindTable(); };
+    renderPolymarket = (data) => { const items=arr(data.items),categories=[...new Set(items.map(i=>i.category).filter(Boolean))].sort(),cat=$("polymarket-category"),old=cat.value||params.get("category")||""; cat.innerHTML=`<option value="">All categories</option>${categories.map(c=>`<option value="${safe(c)}">${safe(c)}</option>`).join("")}`;if(old&&!categories.includes(old))cat.insertAdjacentHTML("beforeend",`<option value="${safe(old)}">${safe(old)}</option>`);cat.value=old;const quality=items.map(i=>i.quality_label||i.quality).find(Boolean)||"—";$("pm-summary").innerHTML=`<div class="three-col"><div class="key-value"><span class="key">Markets</span><strong>${count(data.total)}</strong></div><div class="key-value"><span class="key">Evidence quality</span><strong>${safe(quality)}</strong></div><div class="key-value"><span class="key">Execution</span><strong>SIMULATED ONLY</strong></div></div>`;$("pm-markets").innerHTML=items.length?`<table><thead><tr><th>Market</th><th>Question</th><th>Category</th><th>Quality</th><th>Settlement</th><th>Observed</th></tr></thead><tbody>${items.map(i=>`<tr><td>${identity(shortId(i.market_id),i.market_id)}</td><td title="${safe(i.question||"")}">${safe(i.question||"—")}</td><td>${safe(i.category)}</td><td><strong>${safe(i.quality_label||i.quality||"UNKNOWN")}</strong><span class="quality-context">${safe(i.quality_context||"")}</span></td><td>${safe(i.settlement)}</td><td>${safe(dateText(i.observed_at))}</td></tr>`).join("")}</tbody></table>`:empty("No Polymarket observations","No persisted market page matches the current filters.");pager("polymarket",data);bindTable(); };
+    renderHermes = (data) => { const items=arr(data.items),statuses={}; for(const i of items){const s=String(i.status||"UNKNOWN").toUpperCase();statuses[s]=(statuses[s]||0)+1;} $("hermes-summary").innerHTML=`<div class="three-col"><div class="key-value"><span class="key">Queue items</span><strong>${count(data.total)}</strong></div><div class="key-value"><span class="key">Visible statuses</span><strong>${safe(Object.entries(statuses).map(([k,v])=>`${k} ${v}`).join(" · ")||"—")}</strong></div><div class="key-value"><span class="key">Execution</span><strong>PAPER ONLY</strong></div></div>`; $("hermes-table").innerHTML=items.length?`<table><thead><tr><th>Queue item</th><th>Family</th><th>Dataset / version</th><th>Status</th><th>Outcome</th><th>Updated</th></tr></thead><tbody>${items.map(i=>`<tr><td><button class="link hermes" data-id="${encodeURIComponent(i.item_id||"")}">${identity(shortId(i.item_id),i.item_id,i.item_type||"")}</button></td><td>${safe(i.family)}</td><td>${identity(shortId(i.dataset_id),i.dataset_id,shortId(i.dataset_version))}</td><td><span class="badge ${statusClass(i.status)}">${safe(i.status)}</span></td><td>${safe(i.outcome_label||i.reason_code||"—")}</td><td>${safe(dateText(i.time||i.updated_at))}</td></tr>`).join("")}</tbody></table>`:empty("Hermes queue empty","Submit a bounded paper-only proposal to populate the research loop.");pager("hermes",data);bindTable();document.querySelectorAll(".hermes").forEach(b=>b.addEventListener("click",()=>loadHermes(decodeURIComponent(b.dataset.id)))); };
+    function detailSection(title,value) { if(value==null||value===""||(Array.isArray(value)&&!value.length))return ""; return `<section class="detail-section"><h3>${safe(title)}</h3>${typeof value==="string"||typeof value==="number"?`<div>${safe(value)}</div>`:`<pre>${safe(json(value))}</pre>`}</section>`; }
+    loadHermes = async function(id,persist=true) { state.selected=id;state.expanded=true;if(persist)saveState(true);if(detailController)detailController.abort();detailController=new AbortController();try{const response=await fetch(`/api/v2/hermes/${encodeURIComponent(id)}`,{cache:"no-store",signal:detailController.signal});if(!response.ok)throw new Error(`Hermes HTTP ${response.status}`);const d=await response.json(),item=arr(d.items)[0]||d.item||{};$("hermes-detail").innerHTML=d.available?`<article class="panel"><div class="section-title"><h2>Proposal detail</h2><span class="badge ${statusClass(d.status||item.status)}">${safe(d.status||item.status||"UNKNOWN")}</span></div><div class="detail-grid">${detailSection("Statement",d.statement)}<div class="detail-section"><h3>Exact dataset and family</h3><div class="key-value"><span class="key">Dataset ID</span><strong>${identity(shortId(d.dataset_id||item.dataset_id),d.dataset_id||item.dataset_id)}</strong></div><div class="key-value"><span class="key">Dataset version</span><strong>${identity(shortId(d.dataset_version||item.dataset_version),d.dataset_version||item.dataset_version)}</strong></div><div class="key-value"><span class="key">Family</span><strong>${safe(d.family||item.family)}</strong></div></div>${detailSection("Parameters / experiment plan",d.plan)}${detailSection("Submission validation and tests",d.tests)}${detailSection("Queue lifecycle",d.lifecycle_events)}${detailSection("Terminal result",d.final_result)}${d.rejection?detailSection("Rejection code and reason",d.rejection):""}</div><details><summary>raw proposal evidence</summary><pre>${safe(json(d))}</pre></details></article>`:empty("Hermes item unavailable",d.error||"The queue item was not found.");}catch(error){if(error.name!=="AbortError")$("hermes-detail").innerHTML=empty("Hermes detail unavailable",error.message);} };
+    renderPaper = (data) => { const s=data.candidate_portfolio_summary||{},portfolios=arr(data.candidate_portfolios),t=data.paper_telemetry||{}; $("portfolio-summary").innerHTML=`<div class="card-grid"><div class="panel"><div class="metric">${portfolios.length?Number(s.total_equity||0).toFixed(2):"—"}</div><div class="metric-label">candidate paper equity</div></div><div class="panel"><div class="metric">${portfolios.length?Number(s.total_pnl||0).toFixed(2):"—"}</div><div class="metric-label">candidate paper P/L</div></div><div class="panel"><div class="metric">${count(portfolios.length)}</div><div class="metric-label">candidate portfolios</div></div><div class="panel"><div class="metric">${count(t.observation_records)}</div><div class="metric-label">paper telemetry observations</div></div><div class="panel"><div class="metric">${count(t.execution_events)}</div><div class="metric-label">paper execution events</div></div><div class="panel"><div class="metric">${count(t.resolved_bets)}</div><div class="metric-label">paper ledger bets</div></div></div><p class="page-note">Telemetry is persisted observation/execution history. Candidate portfolios are lifecycle-linked PAPER_FORWARD/PAPER_PROMOTABLE states only.</p>`; $("portfolio-states").innerHTML=arr(data.items).length?`<table><thead><tr><th>Record</th><th>Experiment</th><th>Market</th><th>Status</th><th>Timestamp</th></tr></thead><tbody>${arr(data.items).map(i=>`<tr><td>${safe(i.record_type)} · ${identity(shortId(i.record_id),i.record_id)}</td><td>${safe(i.experiment_id)}</td><td>${safe(i.market_id)}</td><td>${safe(i.status||i.resolution||i.outcome)}</td><td>${safe(dateText(i.timestamp))}</td></tr>`).join("")}</tbody></table>`:empty("No paper telemetry","No paper observations, execution events, or ledger records are persisted.");pager("paper",data);bindTable(); };
+    loadPage = async function(tab,force=false) { if(tab!==state.tab||!VIEW_ENDPOINT[tab]||document.hidden||loadInFlight||(!force&&Date.now()<nextRefreshAt))return; const generation=++refreshGeneration,controller=new AbortController();activeController=controller;loadInFlight=true;refreshMessage(tab,"");slowRefreshTimer=setTimeout(()=>{if(generation===refreshGeneration)refreshMessage(tab,"Refreshing…",true);},2000);try{const data=await fetchV2(VIEW_ENDPOINT[tab],controller.signal);if(generation!==refreshGeneration||tab!==state.tab)return;current=data;({overview:renderOverview,canary:renderCanary,datasets:renderDatasets,activity:renderActivity,candidates:renderCandidates,polymarket:renderPolymarket,hermes:renderHermes,crypto:renderCrypto,portfolio:renderPaper}[tab])(data);refreshMessage(tab,`Updated · ${new Date().toLocaleTimeString()}`);}catch(error){if(error.name!=="AbortError"&&generation===refreshGeneration)refreshMessage(tab,"Refresh failed · showing last successful content",true);}finally{clearTimeout(slowRefreshTimer);if(generation===refreshGeneration){activeController=null;loadInFlight=false;nextRefreshAt=Date.now()+refreshCadence(tab);}} };
+    activate = function(tab,push=true) { if(!VIEW_ENDPOINT[tab])tab="overview";if(tab!==state.tab){state.selected="";state.expanded=false;state.filter="";state.sort="";state.direction="desc";state.page=1;}state.tab=tab;document.querySelectorAll(".tab").forEach(b=>b.classList.toggle("active",b.dataset.view===tab));document.querySelectorAll(".view").forEach(v=>v.classList.toggle("active",v.id===`view-${tab}`));if($("candidate-detail"))$("candidate-detail").style.display=tab==="candidates"?"block":"none";if($("detail"))$("detail").style.display=tab==="overview"?"block":"none";if(activeController)activeController.abort();if(detailController)detailController.abort();activeController=null;loadInFlight=false;refreshGeneration++;nextRefreshAt=0;saveState(push);setTimeout(()=>loadPage(tab,true),0); };
+    load = async function() { if(startupPending){startupPending=false;return;} if(document.hidden||loadInFlight)return; return loadPage(state.tab,false); };
+    ensureActivityKind(); if($("crypto-symbol")){const oldSymbol=$("crypto-symbol"),newSymbol=oldSymbol.cloneNode(true);oldSymbol.replaceWith(newSymbol);newSymbol.addEventListener("input",()=>{state.page=1;saveState(true);loadPage("crypto",true);});} document.addEventListener("click",event=>{const button=event.target.closest?.(".copy");if(!button)return;navigator.clipboard?.writeText(button.dataset.copy||"").then(()=>{button.textContent="copied";setTimeout(()=>button.textContent="copy",1200);}).catch(()=>{});}); document.addEventListener("visibilitychange",()=>{if(document.hidden){if(activeController)activeController.abort();}else{nextRefreshAt=0;load();}});
     ensureFacets(); document.querySelectorAll(".tab").forEach(b=>b.addEventListener("click",()=>activate(b.dataset.view))); document.querySelectorAll("[data-link]").forEach(b=>b.addEventListener("click",e=>{e.preventDefault();activate(b.dataset.link)})); document.querySelectorAll(".filters input,.filters select").forEach(el=>el.addEventListener(el.tagName==="INPUT"?"input":"change",()=>{if(el.id.endsWith("-size")){const n=Number(el.value);if([10,25,50,100].includes(n)){state.page_size=n;document.querySelectorAll('select[id$="-size"]').forEach(s=>s.value=String(n));}} else if(el.id.includes("-filter"))state.filter=el.value;state.page=1;saveState(true);loadPage(state.tab)})); window.addEventListener("popstate",()=>{const q=new URLSearchParams(location.search),nextTab=q.get("tab")||"overview",changed=nextTab!==state.tab;params=q;state.tab=nextTab;state.page=Math.max(1,Number(q.get("page")||1));state.page_size=[10,25,50,100].includes(Number(q.get("page_size")))?Number(q.get("page_size")):25;state.filter=changed?"":q.get("filter")||"";state.sort=changed?"":q.get("sort")||"";state.direction=changed?"desc":q.get("direction")==="asc"?"asc":"desc";state.selected=changed?"":q.get("selected")||"";state.expanded=changed?false:q.get("expanded")==="1";restoreFacets();activate(state.tab,false)}); load(); activate(state.tab,false); const refreshHandle=setInterval(load,10000); window.addEventListener("beforeunload",()=>clearInterval(refreshHandle));
     if($("crypto-symbol"))$("crypto-symbol").addEventListener("input",async()=>{const symbol=$("crypto-symbol").value.trim(),q=new URLSearchParams({page:"1",page_size:String(state.page_size),direction:state.direction});if(symbol)q.set("symbol",symbol);const response=await fetch(`/api/v2/crypto-research?${q}`,{cache:"no-store"});if(response.ok)renderCrypto(await response.json());});
     // setInterval(load, 10000) is the ten-second refresh contract.

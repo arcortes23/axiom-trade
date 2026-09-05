@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import tempfile
 import unittest
 
+from axiom.collector import CollectionCycle
 from axiom.domain import OrderBookLevel, OrderBookSnapshot, PredictionMarketSnapshot, SettlementState
 from axiom.node import NodeConfig, ResearchNode
 from axiom.storage import AxiomStore
@@ -88,6 +90,48 @@ class ScalabilityHealthTests(unittest.TestCase):
         )
         node._run_opportunity_pipeline()
         return store
+    def test_node_collection_uses_live_observation_time(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database_path = f"{temporary_directory}/node.sqlite3"
+            store = AxiomStore(database_path)
+            node = ResearchNode(
+                NodeConfig(database_path, crypto_enabled=False, max_markets=1),
+                provider=_HealthProvider(T0, T0),
+                opportunity_model={},
+                store=store,
+                clock=lambda: T0,
+                sleep=lambda _: None,
+            )
+            calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+            class _RecordingCollector:
+                def collect_once(self, *args: object, **kwargs: object) -> CollectionCycle:
+                    calls.append((args, kwargs))
+                    return CollectionCycle(
+                        T0,
+                        T0,
+                        1,
+                        markets_attempted=1,
+                        markets_successful=1,
+                        markets_failed=0,
+                    )
+
+            node.collector = _RecordingCollector()  # type: ignore[assignment]
+            node._configure_logging = lambda: None  # type: ignore[method-assign]
+            node._start_heartbeat_watchdog = lambda: None  # type: ignore[method-assign]
+            node._run_crypto_paper = lambda: None  # type: ignore[method-assign]
+            node._run_opportunity_pipeline = lambda: None  # type: ignore[method-assign]
+            node._run_paper_workers = lambda: None  # type: ignore[method-assign]
+            node._run_research_queue = lambda: None  # type: ignore[method-assign]
+            node._run_health_monitor = lambda: None  # type: ignore[method-assign]
+            node.bus.resume_expired = lambda now: None  # type: ignore[method-assign]
+            node.research_processor.reevaluate_forward_candidates = lambda now: None  # type: ignore[method-assign]
+            try:
+                node.run(max_cycles=1)
+                self.assertEqual(calls, [((), {})])
+            finally:
+                store.close()
+
 
     def test_provider_timestamps_within_request_or_skew_window_are_evidence(self) -> None:
         market_timestamp = T0 + timedelta(seconds=2)

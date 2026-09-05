@@ -469,7 +469,7 @@ class ResearchNode:
                 )
                 try:
                     self._run_crypto_paper()
-                    cycle = self.collector.collect_once(now=ensure_utc(self.clock()))
+                    cycle = self.collector.collect_once()
                     self._run_opportunity_pipeline()
                     self._cycles.append(cycle)
                     if len(self._cycles) > self.config.retain_cycles:
@@ -1519,15 +1519,23 @@ class ResearchNode:
                     "evidence_grade": health.get("historical_maturity_grade", health.get("evidence_maturity", {}).get("grade")),
                     "historical_error_count": health.get("historical_error_count", 0),
                     "markets": health.get("markets", 0),
+                    "scheduled_market_count": health.get("scheduled_market_count", 0),
                     "stale_markets": list(stale_markets),
                     "stale_market_count": stale_market_count,
                     "gaps": health.get("gaps", []),
                     "current_failures": list(current_failures) if isinstance(current_failures, (list, tuple)) else [],
+                    "top_failure_codes": health.get("top_failure_codes", []),
                     "trades": health.get("trades", 0),
                     "collection_errors": health.get("collection_errors", 0),
+                    "configured_interval_seconds": health.get("configured_interval_seconds"),
+                    "effective_collection_cadence_seconds": health.get("effective_collection_cadence_seconds"),
+                    "last_cycle_duration_seconds": health.get("last_cycle_duration_seconds"),
+                    "last_successful_cycle": health.get("last_successful_cycle"),
+                    "last_cycle_markets_attempted": health.get("last_cycle_markets_attempted", 0),
+                    "last_cycle_markets_successful": health.get("last_cycle_markets_successful", 0),
+                    "last_cycle_markets_failed": health.get("last_cycle_markets_failed", 0),
                     "window_start": health.get("window_start"),
                     "window_end": health.get("window_end"),
-                    "window_seconds": health.get("window_seconds"),
                     "paper_only": True,
                     "live_execution": False,
                 },

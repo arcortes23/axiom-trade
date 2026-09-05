@@ -97,6 +97,9 @@ class CollectionCycle:
     started_at: datetime
     ended_at: datetime
     markets_seen: int
+    markets_attempted: int
+    markets_successful: int
+    markets_failed: int
     metadata_inserted: int
     snapshots_inserted: int
     snapshot_duplicates: int
@@ -112,9 +115,12 @@ class CollectionCycle:
     metadata_failures: int = 0
     order_book_failures: int = 0
     trade_failures: int = 0
+    elapsed_seconds: float | None = None
 
     @property
     def duration_seconds(self) -> float:
+        if self.elapsed_seconds is not None:
+            return max(0.0, float(self.elapsed_seconds))
         return max(0.0, (self.ended_at - self.started_at).total_seconds())
 
     def as_record(self) -> dict[str, Any]:
@@ -123,6 +129,9 @@ class CollectionCycle:
             "ended_at": self.ended_at.isoformat(),
             "duration_seconds": self.duration_seconds,
             "markets_seen": self.markets_seen,
+            "markets_attempted": self.markets_attempted,
+            "markets_successful": self.markets_successful,
+            "markets_failed": self.markets_failed,
             "metadata_inserted": self.metadata_inserted,
             "snapshots_inserted": self.snapshots_inserted,
             "snapshot_duplicates": self.snapshot_duplicates,
@@ -139,6 +148,8 @@ class CollectionCycle:
             "order_book_failures": self.order_book_failures,
             "trade_failures": self.trade_failures,
         }
+
+
 
 
 class PolymarketCollector:
@@ -166,7 +177,11 @@ class PolymarketCollector:
         now: datetime | None = None,
     ) -> CollectionCycle:
         started = ensure_utc(now or self.clock())
+        monotonic_started = time.monotonic()
         counters: dict[str, int] = {
+            "markets_attempted": 0,
+            "markets_successful": 0,
+            "markets_failed": 0,
             "metadata_inserted": 0,
             "snapshots_inserted": 0,
             "snapshot_duplicates": 0,
@@ -203,6 +218,8 @@ class PolymarketCollector:
         if self.config.max_markets is not None:
             ids = ids[: self.config.max_markets]
         for market_id in ids:
+            skipped_before = counters["skipped_markets"]
+            errors_before = counters["errors"]
             try:
                 self._collect_market(
                     market_id,
@@ -214,10 +231,23 @@ class PolymarketCollector:
             except Exception as exc:
                 counters["errors"] += 1
                 self.store.save_collection_error(market_id, started, "collector", str(exc))
+            if counters["skipped_markets"] != skipped_before:
+                continue
+            counters["markets_attempted"] += 1
+            if counters["errors"] == errors_before:
+                counters["markets_successful"] += 1
+            else:
+                counters["markets_failed"] += 1
         ended = ensure_utc(now or self.clock())
         if ended < started:
             ended = started
-        cycle = CollectionCycle(started, ended, len(ids), **counters)
+        cycle = CollectionCycle(
+            started,
+            ended,
+            len(ids),
+            elapsed_seconds=max(0.0, time.monotonic() - monotonic_started),
+            **counters,
+        )
         cycle_payload = cycle.as_record()
         cycle_id = "cycle-" + hashlib.sha256(
             f"{self.config.collector_name}|{started.isoformat()}|{ended.isoformat()}|{_stable_payload(cycle_payload)}".encode("utf-8")
@@ -268,6 +298,8 @@ class PolymarketCollector:
             {
                 "last_cycle_started_at": started.isoformat(),
                 "last_cycle_ended_at": ended.isoformat(),
+                "last_cycle_duration_seconds": cycle.duration_seconds,
+                "scheduled_market_ids": list(ids),
                 "markets_seen": len(ids),
                 "stale_after_seconds": self.config.stale_after_seconds,
                 **counters,
