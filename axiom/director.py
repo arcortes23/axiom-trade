@@ -13,6 +13,11 @@ from typing import Any, Mapping
 from .research_bus import ResearchBusPermissionError, _validate_payload
 from .storage import AxiomStore
 
+_DATASET_VERSION_ALIASES = frozenset({"latest", "current", "default", "unversioned"})
+_MAX_RESEARCHABLE_DATASET_SCAN = 256
+_MAX_RESEARCHABLE_PREDICTION_CONSTITUENTS = 8
+_MAX_RESEARCHABLE_CRYPTO_DATASETS = 32
+
 
 @dataclass(frozen=True, slots=True)
 class ProposalValidation:
@@ -30,7 +35,12 @@ class ProposalValidation:
         }
 
 
-def validate_hermes_proposal(proposal: Mapping[str, Any], *, max_bytes: int = 16_384) -> ProposalValidation:
+def validate_hermes_proposal(
+    proposal: Mapping[str, Any],
+    *,
+    max_bytes: int = 16_384,
+    store: AxiomStore | None = None,
+) -> ProposalValidation:
     reasons: list[str] = []
     if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes <= 0:
         raise ValueError("max_bytes must be a positive integer")
@@ -87,20 +97,356 @@ def validate_hermes_proposal(proposal: Mapping[str, Any], *, max_bytes: int = 16
             reasons.append("time_split must be chronological train-validation-holdout")
     if normalized.get("paper_only") is not True:
         reasons.append("paper_only must be true")
+    plan = None
     if not reasons:
         from .experiment_plan import ExperimentPlan, ExperimentPlanError
+
         plan_proposal = dict(normalized)
         generated_id = "proposal-" + hashlib.sha256(_canonical(normalized).encode("utf-8")).hexdigest()[:24]
         if not str(plan_proposal.get("proposal_id", "")).strip():
             plan_proposal["proposal_id"] = generated_id
         try:
-            ExperimentPlan.from_proposal(plan_proposal)
+            plan = ExperimentPlan.from_proposal(plan_proposal)
         except ExperimentPlanError as exc:
             reasons.extend((exc.reason, exc.detail))
+    if not reasons and store is not None and plan is not None:
+        reasons.extend(_persisted_binding_reasons(store, plan))
     proposal_id = str(normalized.get("proposal_id", "")).strip() or None
     if proposal_id is None and not reasons:
         proposal_id = "proposal-" + hashlib.sha256(_canonical(normalized).encode("utf-8")).hexdigest()[:24]
     return ProposalValidation(not reasons, proposal_id, tuple(reasons), normalized if not reasons else None)
+def _catalog_version(catalog: Mapping[str, Any]) -> str:
+    return str(catalog.get("dataset_version", catalog.get("version", ""))).strip()
+
+
+def _complete_historical_catalog(catalog: Any) -> bool:
+    if not isinstance(catalog, Mapping):
+        return False
+    if str(catalog.get("source_type", "")).strip().upper() != "HISTORICAL":
+        return False
+    version = _catalog_version(catalog)
+    if not version or version.casefold() in _DATASET_VERSION_ALIASES:
+        return False
+    try:
+        row_count = int(catalog.get("row_count", 0))
+        completeness = float(catalog.get("completeness", 0.0))
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return row_count > 0 and math.isfinite(completeness) and completeness >= 1.0 and not catalog.get("missing_ranges")
+
+
+def _find_persisted_universe_catalog(
+    store: AxiomStore,
+    universe_id: str,
+    universe_version: str,
+    *,
+    universe_dataset_id: str | None = None,
+) -> Mapping[str, Any] | None:
+    loader = getattr(store, "load_dataset_catalog", None)
+    if callable(loader):
+        identifiers = [str(universe_dataset_id).strip()] if universe_dataset_id else []
+        identifiers.append(f"universe:{universe_id}")
+        for identifier in dict.fromkeys(item for item in identifiers if item):
+            candidate = loader(identifier, universe_version)
+            if (
+                isinstance(candidate, Mapping)
+                and str(candidate.get("dataset_id", "")).strip() == identifier
+                and _catalog_version(candidate) == universe_version
+                and str(candidate.get("market_type", "")).strip().lower() == "crypto_spot"
+                and str(candidate.get("timeframe", "")).strip() == "point_in_time"
+            ):
+                return candidate
+    lister = getattr(store, "list_dataset_catalog", None)
+    if callable(lister):
+        for candidate in lister(limit=_MAX_RESEARCHABLE_DATASET_SCAN):
+            if not isinstance(candidate, Mapping):
+                continue
+            metadata = candidate.get("metadata")
+            metadata = metadata if isinstance(metadata, Mapping) else {}
+            if (
+                str(candidate.get("dataset_version", candidate.get("version", ""))).strip() == universe_version
+                and str(metadata.get("universe_id", "")).strip() == universe_id
+                and str(candidate.get("dataset_id", "")).strip()
+                == str(universe_dataset_id or f"universe:{universe_id}").strip()
+                and str(candidate.get("market_type", "")).strip().lower() == "crypto_spot"
+                and str(candidate.get("timeframe", "")).strip() == "point_in_time"
+            ):
+                return candidate
+    return None
+
+
+def _load_historical_catalog(store: AxiomStore, dataset_id: str) -> Mapping[str, Any] | None:
+    loader = getattr(store, "load_dataset_catalog", None)
+    if not callable(loader):
+        return None
+    latest = loader(dataset_id)
+    if isinstance(latest, Mapping) and _complete_historical_catalog(latest):
+        return latest
+    versions_loader = getattr(store, "dataset_versions", None)
+    if not callable(versions_loader):
+        return None
+    try:
+        versions = list(versions_loader(dataset_id))
+    except (TypeError, ValueError):
+        return None
+    for version in reversed(versions[-_MAX_RESEARCHABLE_DATASET_SCAN:]):
+        candidate = loader(dataset_id, str(version))
+        if isinstance(candidate, Mapping) and _complete_historical_catalog(candidate):
+            return candidate
+    return None
+
+
+def _prediction_catalog_integrity_reason(store: AxiomStore, catalog: Mapping[str, Any]) -> str | None:
+    dataset_id = str(catalog.get("dataset_id", "")).strip()
+    metadata = catalog.get("metadata")
+    metadata = metadata if isinstance(metadata, Mapping) else {}
+    if dataset_id.startswith("prediction:"):
+        expected_market_id = dataset_id.split(":", 1)[1]
+        market_id = str(metadata.get("market_id", metadata.get("polymarket_key", ""))).strip()
+        if market_id and market_id != expected_market_id:
+            return "prediction constituent market_id does not match dataset_id"
+        return None
+    if dataset_id != "Polymarket-historical" or "market_versions" not in metadata:
+        return None
+    market_versions = metadata.get("market_versions")
+    if not isinstance(market_versions, (list, tuple)) or not market_versions:
+        return "prediction aggregate market_versions metadata is invalid"
+    loader = getattr(store, "load_dataset_catalog", None)
+    if not callable(loader):
+        return "prediction aggregate constituents cannot be resolved exactly"
+    aggregate_rows = catalog.get("row_count")
+    if isinstance(aggregate_rows, bool) or not isinstance(aggregate_rows, int) or aggregate_rows <= 0:
+        return "prediction aggregate row_count is invalid"
+    seen: set[tuple[str, str]] = set()
+    constituent_rows = 0
+    for item in market_versions:
+        if not isinstance(item, Mapping):
+            return "prediction aggregate constituent metadata is invalid"
+        market_id = str(item.get("market_id", "")).strip()
+        constituent_id = str(item.get("dataset_id") or f"prediction:{market_id}").strip()
+        version = str(item.get("version", item.get("dataset_version", ""))).strip()
+        expected_rows = item.get("records", item.get("row_count"))
+        identity = (constituent_id, version)
+        if (
+            not market_id
+            or constituent_id != f"prediction:{market_id}"
+            or not version
+            or version.casefold() in _DATASET_VERSION_ALIASES
+            or identity in seen
+            or isinstance(expected_rows, bool)
+            or not isinstance(expected_rows, int)
+            or expected_rows <= 0
+        ):
+            return "prediction aggregate constituent binding is not exact"
+        constituent = loader(constituent_id, version)
+        if not isinstance(constituent, Mapping) or not _complete_historical_catalog(constituent):
+            return f"prediction aggregate constituent is unavailable: {constituent_id}/{version}"
+        if (
+            str(constituent.get("dataset_id", "")).strip() != constituent_id
+            or _catalog_version(constituent) != version
+            or str(constituent.get("market_type", "")).strip().lower() != "prediction"
+            or constituent.get("row_count") != expected_rows
+        ):
+            return "prediction aggregate constituent catalog does not match exact metadata"
+        constituent_metadata = constituent.get("metadata")
+        constituent_metadata = constituent_metadata if isinstance(constituent_metadata, Mapping) else {}
+        persisted_market_id = str(
+            constituent_metadata.get("market_id", constituent_metadata.get("polymarket_key", ""))
+        ).strip()
+        if persisted_market_id != market_id:
+            return "prediction aggregate constituent market_id does not match exact metadata"
+        seen.add(identity)
+        constituent_rows += expected_rows
+    if constituent_rows != aggregate_rows:
+        return "prediction aggregate row_count does not match exact constituent counts"
+    return None
+
+
+def _crypto_catalog_provenance(
+    store: AxiomStore,
+    catalog: Mapping[str, Any],
+) -> tuple[str, str, str] | None:
+    metadata = catalog.get("metadata")
+    metadata = dict(metadata) if isinstance(metadata, Mapping) else {}
+    universe_id = str(metadata.get("universe_id", "")).strip()
+    universe_version = str(metadata.get("universe_version", "")).strip()
+    universe_hash = str(metadata.get("universe_snapshot_hash", "")).strip()
+    survivorship = str(
+        metadata.get("survivorship_bias")
+        or metadata.get("survivorship_label")
+        or metadata.get("survivorship")
+        or ""
+    ).strip()
+    if not universe_id or not universe_version or not universe_hash or not survivorship:
+        return None
+    universe = _find_persisted_universe_catalog(
+        store,
+        universe_id,
+        universe_version,
+        universe_dataset_id=str(metadata.get("universe_dataset_id", "")).strip() or None,
+    )
+    if universe is None:
+        return None
+    universe_metadata = universe.get("metadata")
+    universe_metadata = universe_metadata if isinstance(universe_metadata, Mapping) else {}
+    persisted_id = str(universe_metadata.get("universe_id", "")).strip()
+    persisted_hash = str(universe_metadata.get("snapshot_hash", "")).strip()
+    persisted_version = _catalog_version(universe)
+    if (
+        persisted_id != universe_id
+        or persisted_version != universe_version
+        or persisted_hash != universe_hash
+        or universe_metadata.get("point_in_time") is not True
+    ):
+        return None
+    return universe_id, universe_version, survivorship
+
+
+def _researchable_dataset_entry(
+    catalog: Mapping[str, Any],
+    *,
+    crypto_provenance: tuple[str, str, str] | None = None,
+) -> dict[str, Any]:
+    metadata = catalog.get("metadata")
+    metadata = metadata if isinstance(metadata, Mapping) else {}
+    dataset_id = str(catalog.get("dataset_id", "")).strip()
+    instrument = str(catalog.get("instrument") or metadata.get("instrument") or "").strip() or None
+    market_id = str(metadata.get("market_id") or "").strip() or None
+    entry: dict[str, Any] = {
+        "dataset_id": dataset_id,
+        "dataset_version": _catalog_version(catalog),
+        "market_type": str(catalog.get("market_type", "")).strip().lower(),
+        "instrument": instrument,
+        "market_id": market_id,
+        "timeframe": str(catalog.get("timeframe") or "").strip() or None,
+        "source_type": "HISTORICAL",
+        "quality": catalog.get("quality"),
+        "row_count": int(catalog.get("row_count", 0)),
+        "start_timestamp": catalog.get("start_timestamp"),
+        "end_timestamp": catalog.get("end_timestamp"),
+        "universe_id": None,
+        "universe_version": None,
+        "survivorship_label": None,
+    }
+    if dataset_id.startswith("prediction:") and entry["market_id"] is None:
+        entry["market_id"] = dataset_id.split(":", 1)[1] or None
+    if crypto_provenance is not None:
+        entry["symbol"] = instrument
+        entry["universe_id"], entry["universe_version"], entry["survivorship_label"] = crypto_provenance
+    return _compact(entry)
+
+
+def _researchable_datasets(store: AxiomStore) -> dict[str, list[dict[str, Any]]]:
+    """Return the small allow-list of complete historical dataset bindings."""
+    catalogs = store.list_dataset_catalog(
+        source_type="HISTORICAL",
+        limit=_MAX_RESEARCHABLE_DATASET_SCAN,
+    )
+    complete = [item for item in catalogs if _complete_historical_catalog(item)]
+    prediction_catalogs = [
+        item for item in complete
+        if str(item.get("market_type", "")).strip().lower() == "prediction"
+    ]
+    prediction: list[dict[str, Any]] = []
+    aggregate = _load_historical_catalog(store, "Polymarket-historical")
+    if (
+        aggregate is not None
+        and _prediction_catalog_integrity_reason(store, aggregate) is None
+    ):
+        prediction.append(_researchable_dataset_entry(aggregate))
+    for item in prediction_catalogs:
+        dataset_id = str(item.get("dataset_id", "")).strip()
+        if (
+            dataset_id == "Polymarket-historical"
+            or not dataset_id.startswith("prediction:")
+            or len(prediction) >= 1 + _MAX_RESEARCHABLE_PREDICTION_CONSTITUENTS
+            or _prediction_catalog_integrity_reason(store, item) is not None
+        ):
+            continue
+        prediction.append(_researchable_dataset_entry(item))
+
+    crypto: list[dict[str, Any]] = []
+    for item in complete:
+        if (
+            str(item.get("market_type", "")).strip().lower() != "crypto_spot"
+            or len(crypto) >= _MAX_RESEARCHABLE_CRYPTO_DATASETS
+        ):
+            continue
+        provenance = _crypto_catalog_provenance(store, item)
+        if provenance is not None:
+            crypto.append(_researchable_dataset_entry(item, crypto_provenance=provenance))
+    return {"prediction": prediction, "crypto_spot": crypto}
+
+
+def _persisted_binding_reasons(store: AxiomStore, plan: Any) -> tuple[str, ...]:
+    dataset_id = str(getattr(plan, "dataset_id", "") or "").strip()
+    dataset_version = str(getattr(plan, "dataset_version", "") or "").strip()
+    if not dataset_id:
+        return ("DATASET_NOT_FOUND", "dataset_id must be selected from researchable_datasets")
+    if not dataset_version or dataset_version.casefold() in _DATASET_VERSION_ALIASES:
+        return ("DATASET_NOT_FOUND", "dataset_version must be an exact immutable version")
+    allowed = _researchable_datasets(store)
+    listed = any(
+        str(item.get("dataset_id", "")).strip() == dataset_id
+        and str(item.get("dataset_version", "")).strip() == dataset_version
+        for group in allowed.values()
+        for item in group
+    )
+    if not listed:
+        return (
+            "DATASET_NOT_FOUND",
+            f"no complete historical researchable dataset {dataset_id} at version {dataset_version}",
+        )
+    loader = getattr(store, "load_dataset_catalog", None)
+    catalog = loader(dataset_id, dataset_version) if callable(loader) else None
+    if not isinstance(catalog, Mapping) or not _complete_historical_catalog(catalog):
+        return ("DATASET_NOT_FOUND", f"dataset binding is not a complete historical catalog: {dataset_id}/{dataset_version}")
+    if str(catalog.get("dataset_id", "")).strip() != dataset_id or _catalog_version(catalog) != dataset_version:
+        return ("DATASET_NOT_FOUND", "dataset catalog identity does not match the exact proposal binding")
+    expected_market_type = str(getattr(getattr(plan, "market_type", None), "value", "")).strip().lower()
+    if str(catalog.get("market_type", "")).strip().lower() != expected_market_type:
+        return ("DATASET_NOT_FOUND", "dataset catalog market_type does not match the experiment plan")
+    source_type = str(getattr(plan, "dataset_source_type", "") or "").strip().upper()
+    if source_type and source_type != "HISTORICAL":
+        return ("DATASET_NOT_FOUND", "research proposals may bind only HISTORICAL datasets")
+    timeframe = str(getattr(plan, "dataset_timeframe", "") or "").strip()
+    if timeframe and timeframe != str(catalog.get("timeframe", "")).strip():
+        return ("DATASET_NOT_FOUND", "dataset timeframe does not match the exact catalog")
+    source = str(getattr(plan, "dataset_source", "") or "").strip()
+    if source and source != str(catalog.get("provider", "")).strip():
+        return ("DATASET_NOT_FOUND", "dataset source does not match the exact catalog")
+    if expected_market_type == "prediction":
+        integrity_reason = _prediction_catalog_integrity_reason(store, catalog)
+        if integrity_reason is not None:
+            return ("DATASET_NOT_FOUND", integrity_reason)
+    elif expected_market_type == "crypto_spot":
+        provenance = _crypto_catalog_provenance(store, catalog)
+        if provenance is None:
+            return ("DATASET_NOT_FOUND", "crypto dataset lacks exact persisted universe provenance")
+        required = (
+            str(getattr(plan, "dataset_timeframe", "") or "").strip(),
+            str(getattr(plan, "dataset_source", "") or "").strip(),
+            str(getattr(plan, "dataset_survivorship", "") or "").strip(),
+            str(getattr(plan, "universe_id", "") or "").strip(),
+            str(getattr(plan, "universe_version", "") or "").strip(),
+            str(getattr(plan, "universe_snapshot_hash", "") or "").strip(),
+        )
+        if not all(required):
+            return ("DATASET_NOT_FOUND", "crypto proposals require exact dataset and universe provenance")
+        metadata = catalog.get("metadata")
+        metadata = metadata if isinstance(metadata, Mapping) else {}
+        if (
+            provenance != (
+                required[3],
+                required[4],
+                required[2],
+            )
+            or str(metadata.get("universe_snapshot_hash", "")).strip() != required[5]
+        ):
+            return ("DATASET_NOT_FOUND", "crypto dataset and universe provenance do not match the exact catalog")
+    return ()
+
+
 def research_summary(store: AxiomStore, *, now: datetime | None = None, limit: int = 20) -> dict[str, Any]:
     """Return compact, durable evidence for Hermes and the dashboard."""
     if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
@@ -340,6 +686,7 @@ def research_summary(store: AxiomStore, *, now: datetime | None = None, limit: i
                 for item in queue_items[:limit]
             ],
         },
+        "researchable_datasets": _researchable_datasets(store),
         "gaps": gaps,
     }
 

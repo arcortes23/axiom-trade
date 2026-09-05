@@ -802,7 +802,21 @@ class ExperimentPlan:
         if not isinstance(raw_plan, Mapping):
             raise ExperimentPlanError("INVALID_PLAN", "experiment_plan must be an object")
         plan_document = dict(raw_plan)
-        plan_document.setdefault("hypothesis_id", proposal_id)
+        if proposal.get("dataset_id") is not None:
+            proposal_dataset_id = str(proposal["dataset_id"]).strip()
+            plan_selector = plan_document.get("dataset_selector")
+            if isinstance(plan_selector, Mapping):
+                selector_dataset_id = plan_selector.get("dataset_id")
+                if (
+                    selector_dataset_id is not None
+                    and str(selector_dataset_id).strip() != proposal_dataset_id
+                ):
+                    raise ExperimentPlanError("INVALID_PLAN", "proposal and experiment plan dataset ids differ")
+                plan_selector = dict(plan_selector)
+                plan_selector.setdefault("dataset_id", proposal_dataset_id)
+                plan_document["dataset_selector"] = plan_selector
+            else:
+                plan_document.setdefault("dataset_id", proposal_dataset_id)
         if proposal.get("dataset_version") is not None:
             plan_selector = plan_document.get("dataset_selector")
             plan_version = plan_document.get("dataset_version")

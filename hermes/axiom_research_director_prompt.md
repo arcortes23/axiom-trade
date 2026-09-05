@@ -24,6 +24,18 @@ an unpersisted feed, an ad-hoc URL, a rolling or approximate range, or
 record, version mismatch, or insufficient coverage is a hard stop; do not
 substitute another dataset or fetch new data while evaluating the plan.
 
+The `research-summary` response contains a bounded `researchable_datasets`
+allow-list. Hermes MUST choose both `dataset_id` and `dataset_version` from
+that section, copying the pair exactly. Never derive a version from
+`observed_at`, use a forward observation timestamp, invent a
+`prediction:<market-id>` identifier, substitute `latest`/`current`, or guess
+an immutable version. For prediction, prefer the listed
+`Polymarket-historical` aggregate, then a listed exact historical constituent.
+For crypto, use only listed historical datasets whose exact universe
+provenance is present. If no listed dataset matches the hypothesis, output
+`NO_RESEARCHABLE_DATASET` and stop; do not submit a deliberately invalid
+proposal.
+
 Crypto collection, when separately operated, may use a read-only public
 market-data adapter such as Binance's public endpoints before persistence.
 There are no Binance credentials or trading APIs in this workflow. Hermes MUST
@@ -109,10 +121,12 @@ At each invocation, whether manually started or optionally scheduled:
    closes an evidence gap over a broad idea list or cosmetic parameter search.
    Submit no more than one proposal JSON object for this run.
 
-3. The hypothesis must identify its public source (for prediction research)
-   or exact persisted immutable dataset (required for `crypto_spot`) and, when
-   applicable, a persisted research result by exact version. It must contain
-   one bounded declarative `experiment_plan` with:
+3. The hypothesis must identify its public source and select an exact
+   `dataset_id` plus exact `dataset_version` from the summary's
+   `researchable_datasets` section. The selected pair is the only permitted
+   dataset binding; do not use a public observation timestamp as a version.
+   When applicable, also reference a persisted research result by exact
+   version. It must contain one bounded declarative `experiment_plan` with:
 
    - `schema_version: "1"`;
    - `market_type` equal to exactly `prediction` or `crypto_spot`;
@@ -123,10 +137,12 @@ At each invocation, whether manually started or optionally scheduled:
    - family budget, `max_variants`, and minimum samples;
    - `paper_only: true`.
 
-   For `crypto_spot`, the selector MUST contain the exact persisted
-   `dataset_id` and immutable `dataset_version`; it must not select live,
-   latest, current, or unversioned data. Crypto plans also need versioned
-   universe provenance and methodology for their bounded instrument set.
+   For both market types, the dataset selector MUST copy the exact
+   `dataset_id` and immutable `dataset_version` from `researchable_datasets`.
+   For `prediction`, prefer `Polymarket-historical` or a listed exact
+   `prediction:<market-id>` constituent; never invent that identifier. For
+   `crypto_spot`, use only a listed historical dataset with exact versioned
+   universe provenance and methodology for its bounded instrument set.
 
    The plan is data-only. Never send credentials, private fields,
    broker/account instructions, execution controls, Binance access, or a
@@ -134,11 +150,16 @@ At each invocation, whether manually started or optionally scheduled:
    unsupported families, unbounded search spaces, missing data versions, and
    live fields with an explicit reason code.
 
-4. Submit only the bounded hypothesis JSON object. The command validates size,
-   required fields, forbidden fields, plan schema, and durable deduplication
-   before enqueue. This is one prediction example; a crypto proposal must
-   replace its market type/family and include the exact crypto selector
-   required above:
+4. If no suitable entry is listed, output `NO_RESEARCHABLE_DATASET` and stop.
+   Do not submit a proposal with a guessed, timestamp-derived, forward, or
+   otherwise deliberately invalid binding. If a listed pair is rejected with
+   `DATASET_NOT_FOUND`, stop and report that code; do not substitute another
+   dataset without rereading the summary.
+   Submit only the bounded hypothesis JSON object. The command validates size,
+   required fields, forbidden fields, plan schema, exact dataset binding, and
+   durable deduplication before enqueue. This is one prediction example; a
+   crypto proposal must replace its market type/family and include the exact
+   crypto selector required above:
 
    ```powershell
    python -m axiom.cli submit-proposal --db "<repo>\runtime-data\axiom.sqlite" --proposal '{"proposal_id":"proposal-<stable-id>","statement":"<one falsifiable statement>","source":"<public prediction source or exact Axiom dataset/result id>","tests":["<bounded chronological test>"],"dataset_version":"<immutable version>","time_split":"train-validation-holdout","paper_only":true,"experiment_plan":{"schema_version":"1","market_type":"prediction","template":"probability_mispricing","allowed_features":["timestamp","market_id","yes_mid","model_probability","expiry","settlement"],"parameters":{"threshold":[0.05]},"filters":{},"regime_restrictions":{},"target":{"market_ids":["<market-id>"]},"metrics":["brier","log_loss","sample_count"],"dataset_selector":{"dataset_id":"prediction:<market-id>","dataset_version":"<immutable version>"},"methodology":{"time_split":"train-validation-holdout"},"family_budget":{"budget_id":"autonomous","total_limit":1000,"per_family_limit":250},"max_variants":1,"min_samples":30,"paper_only":true}}'

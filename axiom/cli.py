@@ -1260,6 +1260,10 @@ def _main_impl(argv: Sequence[str] | None = None) -> int:
             print(json.dumps(validation.as_record(), sort_keys=True, indent=2, default=str))
             return 1
         with AxiomStore(args.db) as store:
+            validation = validate_hermes_proposal(proposal, store=store)
+            if not validation.accepted:
+                print(json.dumps(validation.as_record(), sort_keys=True, indent=2, default=str))
+                return 1
             item = DurableResearchBus(store).submit_hypothesis(
                 validation.normalized or {},
                 dedupe_key=validation.proposal_id,
