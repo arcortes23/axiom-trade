@@ -288,6 +288,34 @@ class Phase42DashboardTests(unittest.TestCase):
                 server.stop()
 
 
+    def test_operator_exposes_current_health_and_exact_collector_reason(self) -> None:
+        health = {
+            "grade": "C",
+            "grade_scope": "collector_health",
+            "reason_code": "STALE_MARKETS",
+            "reasons": [{"code": "STALE_MARKETS", "reason": "Two active markets missed the collection threshold."}],
+            "window_start": "2026-01-02T11:00:00+00:00",
+            "window_end": "2026-01-02T12:00:00+00:00",
+            "historical_maturity_grade": "B",
+            "historical_error_count": 3,
+        }
+        operator = DashboardData(data={"dataset-health": health}).operator_data()
+        self.assertEqual(operator["dataset_health"]["grade"], "C")
+        self.assertEqual(operator["health_grade"], "C")
+        self.assertEqual(operator["grade_scope"], "collector_health")
+        self.assertEqual(operator["reason_code"], "STALE_MARKETS")
+        self.assertEqual(operator["reasons"], health["reasons"])
+        self.assertEqual(operator["window_start"], health["window_start"])
+        self.assertEqual(operator["window_end"], health["window_end"])
+        self.assertEqual(operator["source_type"], "FORWARD_COLLECTED")
+        self.assertEqual(operator["historical_maturity_grade"], "B")
+        self.assertEqual(operator["historical_error_count"], 3)
+        collector = operator["components"][1]["detail"]
+        self.assertEqual(collector["reason"], health["reasons"][0]["reason"])
+        self.assertEqual(collector["reason_code"], "STALE_MARKETS")
+        self.assertEqual(collector["reasons"], health["reasons"])
+        self.assertEqual(collector["source_type"], "FORWARD_COLLECTED")
+
     def test_dashboard_populated_state_exposes_coverage_candidates_and_detail(self) -> None:
         with AxiomStore(":memory:") as store:
             store.save_dataset_catalog(
@@ -316,6 +344,38 @@ class Phase42DashboardTests(unittest.TestCase):
                 source_type="FORWARD_COLLECTED",
                 snapshot_id="cycle-v1",
             )
+            forward_now = datetime.now(UTC)
+            store.save_polymarket_snapshot(
+                "fwd-pm:market-1:1",
+                "market-1",
+                forward_now,
+                forward_now,
+                {
+                    "snapshot": {
+                        "market_id": "market-1",
+                        "question": "Will the fixture resolve YES?",
+                        "settlement": "open",
+                        "yes_mid": 0.45,
+                        "liquidity": 100.0,
+                    },
+                    "source_type": "FORWARD_COLLECTED",
+                },
+                quality="ORDER_BOOK_SIMULATED",
+                source_type="FORWARD_COLLECTED",
+            )
+            store.save_polymarket_market_metadata(
+                "market-1",
+                {
+                    "market_id": "market-1",
+                    "question": "Will the fixture resolve YES?",
+                    "active": True,
+                    "closed": False,
+                    "snapshot": {"settlement": "open", "expiry": (forward_now + timedelta(days=1)).isoformat()},
+                },
+                observed_at=forward_now,
+                source_type="FORWARD_COLLECTED",
+            )
+            
             store.save_candidate_lifecycle(
                 "candidate-1",
                 "IDEA",
@@ -337,5 +397,31 @@ class Phase42DashboardTests(unittest.TestCase):
             detail = data.strategy_detail("candidate-1")
             self.assertTrue(detail["available"])
             self.assertEqual(detail["strategy"]["family"], "trend")
+
+    def test_dashboard_historical_only_state_does_not_claim_forward_health(self) -> None:
+        with AxiomStore(":memory:") as store:
+            observed_at = datetime.now(UTC)
+            store.save_polymarket_snapshot(
+                "hist-pm:market-1:1",
+                "market-1",
+                observed_at,
+                observed_at,
+                {
+                    "snapshot": {
+                        "market_id": "market-1",
+                        "question": "Historical-only fixture",
+                        "settlement": "open",
+                        "yes_mid": 0.45,
+                    },
+                    "source_type": "HISTORICAL",
+                },
+                quality="PRICE_PROXY",
+                source_type="HISTORICAL",
+            )
+            data = DashboardData(store=store)
+            health = data.dataset_health()
+            self.assertEqual(health["grade"], "F")
+            self.assertEqual(health["reason_code"], "NO_FORWARD_SNAPSHOTS")
+            self.assertEqual(data.operator_data()["components"][1]["state"], "NOT INITIALIZED")
 if __name__ == "__main__":
     unittest.main()

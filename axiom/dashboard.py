@@ -606,18 +606,25 @@ class DashboardData:
         if self.store is None:
             return {
                 "grade": "F",
+                "grade_scope": "collector_health",
+                "reason_code": "NO_FORWARD_SNAPSHOTS",
+                "reasons": [{"code": "NO_FORWARD_SNAPSHOTS", "reason": "No FORWARD_COLLECTED snapshot is available."}],
+                "window_start": None,
+                "window_end": None,
+                "source_type": "FORWARD_COLLECTED",
+                "historical_maturity_grade": "F",
+                "historical_error_count": 0,
                 "markets": 0,
                 "snapshots": 0,
                 "trades": 0,
                 "collection_errors": 0,
                 "stale_markets": [],
-
                 "gaps": [],
                 "live_execution": False,
             }
         health = getattr(self.store, "polymarket_health", None)
         if not callable(health):
-            return {"grade": "F", "error": "store has no polymarket health method", "live_execution": False}
+            return {"grade": "F", "reason_code": "HEALTH_UNAVAILABLE", "error": "store has no polymarket health method", "live_execution": False}
         return health()
     @staticmethod
     def _normalize_page_response(value: Any, params: Mapping[str, Any]) -> dict[str, Any]:
@@ -1080,12 +1087,15 @@ class DashboardData:
                     seen.add(marker)
                     unique.append(_bounded_value(value))
             return unique[:64]
+        bootstrap_progress = self._bootstrap_progress_rows()
         return {
             **_page_result(rows, page=int(values["page"]), page_size=int(values["page_size"]), total=total),
             "available": bool(total or reports),
             "catalogs": rows,
             "catalog": rows,
             "reports": reports,
+            "bootstrap_progress": bootstrap_progress,
+            "bootstrap_states": bootstrap_progress,
             "universe_version": universe_versions[0] if universe_versions else None,
             "universe_versions": list(dict.fromkeys(str(value) for value in universe_versions))[:32],
             "assets": assets[:64],
@@ -1394,6 +1404,11 @@ class DashboardData:
         else:
             status = "not_started"
         summary = research_summary(self.store, limit=20)
+        try:
+            current_health = self.dataset_health()
+        except Exception as exc:
+            current_health = {"grade": "F", "reason_code": "HEALTH_UNAVAILABLE", "error": str(exc)}
+        health_fields = self._health_status_fields(normalized_workers, current_health if isinstance(current_health, Mapping) else {})
         return {
             "status": status,
             "summary": self.store.dashboard_summary(),
@@ -1403,8 +1418,48 @@ class DashboardData:
             "normalized_workers": normalized_workers,
             "autonomous": summary.get("autonomous", {}),
             "hermes": summary.get("hermes", {}),
-            "health_grade": health_grade or None,
+            "health_grade": health_grade or health_fields["health_grade"],
+            **health_fields,
             "live_execution": False,
+        }
+    def _health_status_fields(self, workers: Sequence[Mapping[str, Any]], health: Mapping[str, Any]) -> dict[str, Any]:
+        grade = str(health.get("grade", "")).upper() or None
+        reasons = health.get("reasons", [])
+        first_reason = reasons[0] if isinstance(reasons, (list, tuple)) and reasons else {}
+        if not isinstance(first_reason, Mapping):
+            first_reason = {}
+        unhealthy = next(
+            (
+                row for row in workers
+                if str(row.get("status", "")).lower() in {"degraded", "stale", "error"}
+            ),
+            None,
+        )
+        worker_name = "health-monitor" if grade and grade not in {"A", "OK", "HEALTHY"} else (
+            str(unhealthy.get("worker_name")) if isinstance(unhealthy, Mapping) else None
+        )
+        worker_payload = unhealthy.get("payload") if isinstance(unhealthy, Mapping) else {}
+        if worker_name == "health-monitor":
+            worker_payload = next(
+                (row.get("payload") for row in workers if str(row.get("worker_name")) == worker_name),
+                {},
+            )
+        payload = worker_payload if isinstance(worker_payload, Mapping) else {}
+        reason = payload.get("degrading_reason") or first_reason.get("reason") or payload.get("last_error") or health.get("error")
+        code = payload.get("reason_code") or first_reason.get("code") or health.get("reason_code")
+        return {
+            "health_grade": grade,
+            "health_reason_code": str(code) if code else None,
+            "health_reasons": list(reasons) if isinstance(reasons, (list, tuple)) else [],
+            "degrading_worker": worker_name,
+            "degrading_reason": str(reason) if reason else None,
+            "historical_maturity_grade": health.get("historical_maturity_grade"),
+            "historical_error_count": health.get("historical_error_count", 0),
+            "health_window": {
+                "start": health.get("window_start"),
+                "end": health.get("window_end"),
+                "seconds": health.get("window_seconds"),
+            },
         }
 
     def system(self) -> dict[str, Any]:
@@ -1647,7 +1702,81 @@ class DashboardData:
             "win_rate": winning_bets / total_bets if total_bets else 0.0,
             "expectancy": total_pnl / total_bets if total_bets else 0.0,
         }
-    def btc_research_data(self, *, catalog_data: Mapping[str, Any] | None = None) -> dict[str, Any]:
+
+    def _bootstrap_progress_rows(self, states: Any | None = None) -> list[dict[str, Any]]:
+        """Expose bounded, per-dataset bootstrap cursors for operator clients."""
+        if states is None:
+            states = (
+                self.store.list_dataset_bootstrap_states(limit=20)
+                if self.store is not None and callable(getattr(self.store, "list_dataset_bootstrap_states", None))
+                else []
+            )
+        if not isinstance(states, (list, tuple)):
+            return []
+        rows: list[dict[str, Any]] = []
+        for item in states[:20]:
+            if not isinstance(item, Mapping):
+                continue
+            payload = item.get("payload")
+            payload = payload if isinstance(payload, Mapping) else {}
+
+            def value(*keys: str) -> Any:
+                return _nested_value(item, payload, keys=keys)
+
+            selected_symbol = value("selected_symbol", "symbol")
+            instrument = value("instrument")
+            symbol = str(selected_symbol or instrument or "").strip()
+            if not symbol:
+                continue
+            errors = value("errors")
+            if not isinstance(errors, (list, tuple)):
+                errors = []
+            requested_start = value("requested_start")
+            requested_end = value("requested_end")
+            next_timestamp = value("next_timestamp")
+            status = str(value("status") or "UNKNOWN").upper()
+            progress = value("progress", "progress_fraction")
+            try:
+                progress = float(progress) if progress is not None else None
+            except (TypeError, ValueError):
+                progress = None
+            if progress is None:
+                start = parse_timestamp(requested_start)
+                end = parse_timestamp(requested_end)
+                cursor = parse_timestamp(next_timestamp)
+                if status in {"COMPLETE", "EMPTY"}:
+                    progress = 1.0
+                elif start is not None and end is not None and cursor is not None and end > start:
+                    progress = max(0.0, min(1.0, (cursor - start).total_seconds() / (end - start).total_seconds()))
+            rows.append(
+                {
+                    "dataset_id": value("dataset_id"),
+                    "symbol": symbol,
+                    "selected_symbol": selected_symbol or None,
+                    "instrument": instrument or symbol,
+                    "timeframe": value("timeframe"),
+                    "status": status,
+                    "requested_start": requested_start,
+                    "requested_end": requested_end,
+                    "next_timestamp": next_timestamp,
+                    "progress": progress,
+                    "progress_fraction": progress,
+                    "records": value("records"),
+                    "records_staged": value("records_staged"),
+                    "retries": value("retries") or 0,
+                    "errors": list(errors)[:32],
+                    "error_count": len(errors),
+                    "updated_at": value("updated_at"),
+                }
+            )
+        return rows
+
+    def btc_research_data(
+        self,
+        *,
+        catalog_data: Mapping[str, Any] | None = None,
+        bootstrap_progress: list[Mapping[str, Any]] | None = None,
+    ) -> dict[str, Any]:
         catalogs_data = catalog_data if isinstance(catalog_data, Mapping) else self.dataset_catalog_data()
         catalogs = catalogs_data.get("historical", [])
         btc_catalogs = [
@@ -1665,12 +1794,15 @@ class DashboardData:
                 if isinstance(report, Mapping) and report.get("kind") == "btc_historical_walk_forward":
                     reports.append({"report_id": item.get("report_id"), "report": report, "created_at": item.get("created_at")})
         latest = reports[0] if reports else None
+        progress = bootstrap_progress if bootstrap_progress is not None else self._bootstrap_progress_rows()
         return {
             "available": bool(btc_catalogs or btc_summary),
             "catalog": btc_catalogs,
             "catalog_summary": btc_summary,
             "latest_report": latest,
             "reports": reports[:20],
+            "bootstrap_progress": progress,
+            "bootstrap_states": progress,
             "live_execution": False,
         }
 
@@ -1934,9 +2066,68 @@ class DashboardData:
                 node_reason = "Worker heartbeat, identity, lock ownership, or health grade is degraded."
             if not node_reason and status.get("health_grade"):
                 node_reason = f"Health monitor grade is {status['health_grade']}."
+        current_health = self.dataset_health()
+        current_health = dict(current_health) if isinstance(current_health, Mapping) else {}
+        current_grade = str(current_health.get("grade", "")).upper()
+        health_grade_scope = current_health.get("grade_scope") or "collector_health"
+        health_reasons = (
+            list(current_health.get("reasons", []))
+            if isinstance(current_health.get("reasons", []), (list, tuple))
+            else []
+        )
+        health_reason_item = health_reasons[0] if health_reasons else {}
+        health_reason_code = (
+            _nested_value(health_reason_item, keys=("code", "reason_code", "error_code"))
+            if isinstance(health_reason_item, Mapping)
+            else None
+        ) or current_health.get("reason_code")
+        if isinstance(health_reason_item, Mapping):
+            health_reason = _nested_value(
+                health_reason_item,
+                keys=("reason", "detail", "message", "human_reason"),
+            )
+        else:
+            health_reason = str(health_reason_item).strip() if health_reason_item else None
+        health_reason = health_reason or current_health.get("error")
+        health_source_type = current_health.get("source_type") or "FORWARD_COLLECTED"
+        health_window_start = current_health.get("window_start")
+        health_window_end = current_health.get("window_end")
+        historical_maturity_grade = current_health.get("historical_maturity_grade")
+        historical_error_count = current_health.get("historical_error_count", 0)
+        dataset_health = {
+            **current_health,
+            "grade": current_grade or current_health.get("grade"),
+            "grade_scope": health_grade_scope,
+            "reason_code": health_reason_code,
+            "reasons": health_reasons,
+            "window_start": health_window_start,
+            "window_end": health_window_end,
+            "source_type": health_source_type,
+            "historical_maturity_grade": historical_maturity_grade,
+            "historical_error_count": historical_error_count,
+        }
         crypto_catalog_count = int(crypto_research.get("total", 0) or 0) if isinstance(crypto_research, Mapping) else 0
         crypto_label = "READY" if crypto_catalog_count else ("UPDATING" if any(str(item.get("status")).upper() == "RUNNING" for item in btc_states) else "NOT INITIALIZED")
-        polymarket_label = "READY" if catalogs.get("forward_count", 0) else ("UPDATING" if any(str(item.get("status")).upper() == "RUNNING" for item in forward_states) else "NOT INITIALIZED")
+        polymarket_label = (
+            "DEGRADED" if current_grade and current_grade not in {"A", "OK", "HEALTHY"} and catalogs.get("forward_count", 0)
+            else ("READY" if catalogs.get("forward_count", 0) else ("UPDATING" if any(str(item.get("status")).upper() == "RUNNING" for item in forward_states) else "NOT INITIALIZED"))
+        )
+        polymarket_reason = health_reason or (
+            "No forward catalog is persisted." if polymarket_label == "NOT INITIALIZED" else None
+        )
+        polymarket_detail = {
+            "forward_catalogs": catalogs.get("forward_count", 0),
+            "grade": current_grade or None,
+            "grade_scope": health_grade_scope,
+            "reason_code": health_reason_code,
+            "reasons": health_reasons,
+            "window_start": health_window_start,
+            "window_end": health_window_end,
+            "source_type": health_source_type,
+            "historical_maturity_grade": historical_maturity_grade,
+            "historical_error_count": historical_error_count,
+            "reason": polymarket_reason,
+        }
         hermes_workers = [
             str(item.get("status", "")).lower()
             for name, item in worker_map.items()
@@ -1961,9 +2152,19 @@ class DashboardData:
             "live_trading": {"status": "Disabled", "enabled": False},
             "canary": CanaryService(self.store).status() if self.store is not None else {"production_live_trading": "DISABLED", "micro_live_canary": "DISARMED", "live_execution": False, "trades": []},
             "paper_risk_engine": {"status": "Active", "enabled": True},
+            "dataset_health": dataset_health,
+            "health_grade": current_grade or None,
+            "grade_scope": health_grade_scope,
+            "reason_code": health_reason_code,
+            "reasons": health_reasons,
+            "window_start": health_window_start,
+            "window_end": health_window_end,
+            "source_type": health_source_type,
+            "historical_maturity_grade": historical_maturity_grade,
+            "historical_error_count": historical_error_count,
             "components": [
                 component("AXIOM NODE", node_label, {"status": node_state, "reason": node_reason}),
-                component("POLYMARKET COLLECTOR", polymarket_label, {"forward_catalogs": catalogs.get("forward_count", 0), "reason": "No forward catalog is persisted." if polymarket_label == "NOT INITIALIZED" else None}),
+                component("POLYMARKET COLLECTOR", polymarket_label, polymarket_detail),
                 component("CRYPTO DATA", crypto_label, {"historical_catalogs": catalogs.get("historical_count", 0), "reason": "No historical catalog is persisted." if crypto_label == "NOT INITIALIZED" else None}),
                 component("HERMES", hermes_label, {**dict(hermes), "execution_state": hermes_label, "reason": hermes_reason}),
                 component("PAPER ENGINE", paper_label, {"states": paper_state_count, "reason": "Waiting for PAPER_FORWARD." if paper_label == "NOT INITIALIZED" else None}),

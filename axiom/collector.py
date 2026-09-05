@@ -412,6 +412,7 @@ class PolymarketCollector:
             snapshot.expiry is not None and snapshot.expiry <= metadata_observed_at
         )
         metadata_payload: dict[str, Any] = {
+            "source_type": "FORWARD_COLLECTED",
             "snapshot": to_record(snapshot),
             "metadata": to_record(metadata) if metadata is not None else None,
             "token_ids": {"yes": snapshot.yes_token_id, "no": snapshot.no_token_id},
@@ -430,6 +431,7 @@ class PolymarketCollector:
             metadata_payload,
             observed_at=metadata_observed_at,
             metadata_hash=metadata_hash,
+            source_type="FORWARD_COLLECTED",
         ):
             counters["metadata_inserted"] += 1
         books_request_started_at = observed_at if point_in_time else ensure_utc(self.clock())
@@ -477,6 +479,7 @@ class PolymarketCollector:
         canonical, source_timestamp = _canonical_snapshot(snapshot, yes_book, no_book)
         quality = ResearchQuality.ORDER_BOOK_SIMULATED if yes_book is not None or no_book is not None else ResearchQuality.PRICE_PROXY
         payload = {
+            "source_type": "FORWARD_COLLECTED",
             "snapshot": to_record(canonical),
             "yes_order_book": to_record(yes_book) if yes_book is not None else None,
             "no_order_book": to_record(no_book) if no_book is not None else None,
@@ -512,6 +515,7 @@ class PolymarketCollector:
             collection_observed_at,
             payload,
             quality=quality,
+            source_type="FORWARD_COLLECTED",
         ):
             counters["snapshots_inserted"] += 1
         else:
@@ -711,6 +715,7 @@ class PolymarketCollector:
         payload = {
             **dict(state),
             "market_id": market_id,
+            "source_type": "FORWARD_COLLECTED",
             "last_attempt_at": observed_at.isoformat(),
             "last_observed_at": observed_at.isoformat(),
             "last_source_timestamp": source_timestamp.isoformat() if source_timestamp else state.get("last_source_timestamp"),

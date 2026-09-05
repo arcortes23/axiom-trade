@@ -28,12 +28,20 @@ from .research_bus import DurableResearchBus, ResearchQueueItem, ResearchQueueSt
 from .robustness import bootstrap_confidence_interval, minimum_sample_check, neighboring_parameter_stability
 from .storage import AxiomStore
 from .strategy import StrategyDefinition, load_strategy
-from .experiment_plan import ExperimentPlan, ExperimentPlanError, MAX_PLAN_VARIANTS
+from .experiment_plan import AUTONOMOUS_BUDGET_ID, ExperimentPlan, ExperimentPlanError, MAX_PLAN_VARIANTS
 
 
 _MAX_QUEUE_RESULT_ITEMS = 64
 _MAX_DATASET_ROWS = 100_000
 _MAX_FORWARD_ROWS = 100_000
+
+
+def _binding_value(value: Any) -> str | None:
+    """Normalize a persisted binding value without turning ``None`` into text."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
 
 
 class AutonomousResearchError(ValueError):
@@ -397,10 +405,13 @@ class AutonomousResearchProcessor:
                 candidate_id,
                 {
                     "status": "IDEA",
+                    "run_id": candidate_id,
                     "candidate_id": candidate_id,
                     "hypothesis_id": plan.hypothesis_id,
                     "plan_id": plan.plan_id,
                     "plan_hash": plan.plan_hash,
+                    "dataset_id": plan.dataset_id,
+                    "dataset_version": plan.dataset_version,
                     "variant": candidate["parameters"],
                     "paper_only": True,
                 },
@@ -425,7 +436,7 @@ class AutonomousResearchProcessor:
                     self.lifecycle.reject(candidate_id, exc.reason, evidence={"reason_detail": exc.detail})
                 result = {"candidate_id": candidate_id, "stage": CandidateStage.REJECTED.value, "reason": exc.detail}
             results.append(result)
-        mutations = self._generate_mutations(plan, prepared, validation_scores, now)
+        mutations = self._generate_mutations(plan, prepared, validation_scores, now, lineage=())
         summary = self._hypothesis_result(plan, results, mutations)
         self.store.save_experiment_plan(
             plan.plan_id,
@@ -457,39 +468,78 @@ class AutonomousResearchProcessor:
                 "GENERATION_DEPTH_EXCEEDED",
                 f"candidate generation {generation} exceeds node limit {self.config.max_generation_depth}",
             )
+        run_record = self.store.load_experiment(candidate_id)
+        if not isinstance(run_record, Mapping):
+            raise AutonomousResearchError(
+                "UNAUTHENTICATED_CANDIDATE",
+                "candidate queue items require a persisted worker-generated run",
+            )
+        persisted_run_id = _binding_value(run_record.get("run_id"))
+        persisted_candidate_id = _binding_value(run_record.get("candidate_id"))
+        if persisted_run_id != candidate_id or persisted_candidate_id != candidate_id:
+            raise AutonomousResearchError(
+                "CANDIDATE_BINDING_MISMATCH",
+                "persisted worker run identity does not match candidate_id",
+            )
         raw_lineage = payload.get("lineage", ())
         if not isinstance(raw_lineage, (list, tuple)) or len(raw_lineage) > 256:
             raise AutonomousResearchError("INVALID_CANDIDATE", "lineage must be a bounded list")
         lineage = tuple(str(value).strip() for value in raw_lineage if str(value).strip())
         plan_id = str(payload.get("plan_id", "")).strip()
         plan_record = self.store.load_experiment_plan(plan_id) if plan_id else None
-        raw_plan = plan_record.get("plan") if isinstance(plan_record, Mapping) else payload.get("experiment_plan")
+        if not isinstance(plan_record, Mapping):
+            raise AutonomousResearchError(
+                "UNAUTHENTICATED_CANDIDATE",
+                "candidate must reference a persisted experiment plan",
+            )
+        raw_plan = plan_record.get("plan")
         if not isinstance(raw_plan, Mapping):
-            raise AutonomousResearchError("INVALID_PLAN", "candidate does not reference a persisted experiment plan")
+            raise AutonomousResearchError("INVALID_PLAN", "persisted candidate experiment plan is invalid")
         try:
             plan = ExperimentPlan.from_mapping(raw_plan, hypothesis_id=str(payload.get("hypothesis_id", "")).strip() or None)
         except ExperimentPlanError as exc:
             raise AutonomousResearchError(exc.reason, exc.detail) from exc
-        if plan_record is None:
-            self.store.save_experiment_plan(
-                plan.plan_id,
-                plan.as_dict(),
-                hypothesis_id=plan.hypothesis_id,
-                plan_hash=plan.plan_hash,
-                status="ACCEPTED",
-                timestamp=now,
+        if plan.max_variants > self.config.max_plan_variants:
+            raise AutonomousResearchError(
+                "EXPERIMENT_BUDGET_EXCEEDED",
+                f"plan requests {plan.max_variants} variants; node limit is {self.config.max_plan_variants}",
             )
+        raw_max_variants = payload.get("max_variants")
+        if raw_max_variants is not None and (
+            isinstance(raw_max_variants, bool)
+            or not isinstance(raw_max_variants, int)
+            or raw_max_variants < 1
+            or raw_max_variants > self.config.max_plan_variants
+            or raw_max_variants > plan.max_variants
+        ):
+            raise AutonomousResearchError(
+                "EXPERIMENT_BUDGET_EXCEEDED",
+                "candidate max_variants exceeds the persisted plan or node limit",
+            )
+        self._validate_worker_candidate_binding(
+            payload,
+            candidate_id=candidate_id,
+            generation=generation,
+            lineage=lineage,
+            plan=plan,
+            plan_record=plan_record,
+            run_record=run_record,
+        )
+        crypto_binding = self._crypto_binding(plan)
         strategy_value = payload.get("strategy", payload.get("strategy_document"))
         if not isinstance(strategy_value, Mapping):
             raise AutonomousResearchError("UNSUPPORTED_STRATEGY_FAMILY", "candidate strategy document is missing")
         try:
             supplied_strategy = load_strategy(strategy_value)
             raw_parameters = payload.get("parameters")
-            parameters = (
-                dict(raw_parameters)
-                if isinstance(raw_parameters, Mapping)
-                else dict(supplied_strategy.parameters)
-            )
+            if not isinstance(raw_parameters, Mapping):
+                raise AutonomousResearchError("CANDIDATE_BINDING_MISMATCH", "candidate parameters are required")
+            parameters = dict(raw_parameters)
+            if dict(supplied_strategy.parameters) != parameters:
+                raise AutonomousResearchError(
+                    "CANDIDATE_BINDING_MISMATCH",
+                    "candidate strategy parameters do not match candidate parameters",
+                )
             strategy = plan.strategy_for(parameters, candidate_id)
             supplied_document = supplied_strategy.to_dict()
             expected_document = strategy.to_dict()
@@ -504,6 +554,58 @@ class AutonomousResearchProcessor:
             raise
         except Exception as exc:
             raise AutonomousResearchError("UNSUPPORTED_STRATEGY_FAMILY", str(exc)) from exc
+        if generation == 0:
+            raise AutonomousResearchError(
+                "UNAUTHENTICATED_CANDIDATE",
+                "generation-zero candidates are produced inline, not accepted from the queue",
+            )
+        else:
+            parent_id = _binding_value(payload.get("parent_id"))
+            if _binding_value(run_record.get("strategy_id")) != candidate_id:
+                raise AutonomousResearchError(
+                    "CANDIDATE_BINDING_MISMATCH",
+                    "mutation strategy identity is not the persisted candidate identity",
+                )
+            persisted_variant = run_record.get("variant")
+            if not isinstance(persisted_variant, Mapping) or dict(persisted_variant) != parameters:
+                raise AutonomousResearchError(
+                    "CANDIDATE_BINDING_MISMATCH",
+                    "mutation parameters do not match the persisted worker variant",
+                )
+            persisted_record_strategy = run_record.get("strategy")
+            if not isinstance(persisted_record_strategy, Mapping):
+                raise AutonomousResearchError(
+                    "CANDIDATE_BINDING_MISMATCH",
+                    "mutation strategy document is missing from the persisted worker run",
+                )
+            stored_document = self.store.load_strategy(candidate_id)
+            if not parent_id or not isinstance(stored_document, Mapping):
+                raise AutonomousResearchError(
+                    "CANDIDATE_BINDING_MISMATCH",
+                    "mutation candidate lacks persisted parent strategy",
+                )
+            try:
+                stored_strategy = load_strategy(stored_document)
+                recorded_strategy = load_strategy(persisted_record_strategy)
+            except Exception as exc:
+                raise AutonomousResearchError("CANDIDATE_BINDING_MISMATCH", "persisted mutation strategy is invalid") from exc
+            supplied_document = supplied_strategy.to_dict()
+            persisted_document = stored_strategy.to_dict()
+            recorded_document = recorded_strategy.to_dict()
+            supplied_document.pop("strategy_id", None)
+            persisted_document.pop("strategy_id", None)
+            recorded_document.pop("strategy_id", None)
+            if supplied_document != persisted_document or supplied_document != recorded_document:
+                raise AutonomousResearchError(
+                    "CANDIDATE_BINDING_MISMATCH",
+                    "mutation strategy does not match the persisted worker strategy",
+                )
+            expected_candidate_id = _mutation_candidate_id(parent_id, generation, stored_strategy)
+            if candidate_id != expected_candidate_id:
+                raise AutonomousResearchError(
+                    "CANDIDATE_BINDING_MISMATCH",
+                    "mutation candidate_id is not deterministic for its parent lineage",
+                )
         rows, split = self._load_split(plan)
         try:
             evaluation = self._evaluate_datasets(plan, strategy, split.train, split.validation)
@@ -511,31 +613,21 @@ class AutonomousResearchProcessor:
             raise
         except (KeyError, TypeError, ValueError) as exc:
             raise AutonomousResearchError("INVALID_DATASET", str(exc)) from exc
+        # Direct candidate submissions do not pass through hypothesis
+        # expansion; reserve their unit inside the queue transaction too.
+        self._reserve_candidate(plan, candidate_id, now)
         current = self.lifecycle.get(candidate_id)
         if current is None:
-            self.lifecycle.register_idea(
-                candidate_id,
-                {
-                    **payload,
-                    "candidate_id": candidate_id,
-                    "plan_id": plan.plan_id,
-                    "plan_hash": plan.plan_hash,
-                    "holdout_used": False,
-                },
-            )
-        if self.store.load_experiment(candidate_id) is None:
-            self.store.save_experiment_if_absent(
-                candidate_id,
-                {
-                    "status": "IDEA",
-                    "candidate_id": candidate_id,
-                    "hypothesis_id": plan.hypothesis_id,
-                    "plan_id": plan.plan_id,
-                    "variant": dict(payload.get("parameters", {})) if isinstance(payload.get("parameters"), Mapping) else {},
-                    "paper_only": True,
-                },
-                strategy_id=strategy.id,
-            )
+            candidate_record = {
+                **payload,
+                "candidate_id": candidate_id,
+                "plan_id": plan.plan_id,
+                "plan_hash": plan.plan_hash,
+                "holdout_used": False,
+            }
+            if crypto_binding is not None:
+                candidate_record["crypto_provenance"] = crypto_binding
+            self.lifecycle.register_idea(candidate_id, candidate_record)
         result = self._advance_candidate(
             plan,
             candidate_id,
@@ -546,6 +638,7 @@ class AutonomousResearchProcessor:
             now=now,
             generation=generation,
             lineage=lineage,
+            crypto_binding=crypto_binding,
         )
         if (
             result.get("stage") in {
@@ -567,10 +660,59 @@ class AutonomousResearchProcessor:
                 ),
                 {candidate_id: _finite(evaluation["validation"].get("expectancy"), 0.0)},
                 now,
+                lineage=lineage,
             )
             if mutation_ids:
                 result = {**dict(result), "mutation_candidates": list(mutation_ids)}
         return result
+
+    def _validate_worker_candidate_binding(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        candidate_id: str,
+        generation: int,
+        lineage: Sequence[str],
+        plan: ExperimentPlan,
+        plan_record: Mapping[str, Any],
+        run_record: Mapping[str, Any],
+    ) -> None:
+        """Accept only candidate payloads created by the durable worker path."""
+        for field, expected in (
+            ("plan_id", plan.plan_id),
+            ("plan_hash", plan.plan_hash),
+            ("dataset_id", plan.dataset_id),
+            ("dataset_version", plan.dataset_version),
+        ):
+            supplied = _binding_value(payload.get(field))
+            persisted = _binding_value(run_record.get(field))
+            if supplied != expected or persisted != expected:
+                raise AutonomousResearchError(
+                    "CANDIDATE_BINDING_MISMATCH",
+                    f"candidate {field} does not match the persisted experiment plan",
+                )
+        if _binding_value(plan_record.get("plan_id")) != plan.plan_id or _binding_value(plan_record.get("plan_hash")) != plan.plan_hash:
+            raise AutonomousResearchError("CANDIDATE_BINDING_MISMATCH", "candidate plan identity is not exact")
+
+        stored_generation = run_record.get("generation")
+        if isinstance(stored_generation, bool) or not isinstance(stored_generation, int) or stored_generation != generation:
+            raise AutonomousResearchError("CANDIDATE_BINDING_MISMATCH", "candidate generation is not the persisted worker generation")
+        stored_lineage = run_record.get("lineage", ())
+        if not isinstance(stored_lineage, (list, tuple)):
+            raise AutonomousResearchError("CANDIDATE_BINDING_MISMATCH", "persisted candidate lineage is invalid")
+        normalized_stored_lineage = tuple(str(value).strip() for value in stored_lineage if str(value).strip())
+        if normalized_stored_lineage != tuple(lineage):
+            raise AutonomousResearchError("CANDIDATE_BINDING_MISMATCH", "candidate lineage is not the persisted worker lineage")
+        if generation == 0:
+            if _binding_value(payload.get("parent_id")) or lineage:
+                raise AutonomousResearchError("CANDIDATE_BINDING_MISMATCH", "generation-zero candidates cannot declare lineage")
+        else:
+            parent_id = _binding_value(payload.get("parent_id"))
+            persisted_parent_id = _binding_value(run_record.get("parent_id"))
+            if not parent_id or parent_id != persisted_parent_id or parent_id not in lineage:
+                raise AutonomousResearchError("CANDIDATE_BINDING_MISMATCH", "mutation parent lineage is not exact")
+            if self.lifecycle.get(parent_id) is None:
+                raise AutonomousResearchError("CANDIDATE_BINDING_MISMATCH", "mutation parent is not persisted")
 
     def _process_report(self, item: ResearchQueueItem, now: datetime) -> Mapping[str, Any]:
         payload = compact_report(item.payload)
@@ -600,6 +742,15 @@ class AutonomousResearchProcessor:
         return response
 
     def _process_experiment_result(self, item: ResearchQueueItem, now: datetime) -> Mapping[str, Any]:
+        """Attach only evidence derived from a persisted, bound paper run.
+
+        Queue payloads are untrusted input.  In particular, ``result`` and
+        ``metrics`` are never copied into lifecycle evidence: a caller can
+        submit either field without having run an experiment.  The queue item
+        must identify an immutable persisted experiment and the exact plan and
+        dataset recorded for the candidate.  Forward metrics are then
+        recomputed from the paper observations, execution events, and ledger.
+        """
         payload = item.payload
         candidate_id = str(payload.get("candidate_id", "")).strip()
         if not candidate_id:
@@ -607,15 +758,53 @@ class AutonomousResearchProcessor:
         candidate = self.lifecycle.get(candidate_id)
         if candidate is None:
             raise AutonomousResearchError("INVALID_RESULT", f"unknown candidate {candidate_id}")
-        result_value = payload.get("result", payload.get("metrics", payload))
-        if not isinstance(result_value, Mapping):
-            raise AutonomousResearchError("INVALID_RESULT", "experiment_result must contain a result mapping")
-        evidence = _compact_evidence(result_value)
+
+        experiment = self.store.load_experiment(candidate_id)
+        if not isinstance(experiment, Mapping):
+            raise AutonomousResearchError(
+                "UNAUTHENTICATED_RESULT",
+                "experiment_result requires a persisted immutable worker run",
+            )
+        self._validate_result_binding(candidate_id, candidate.payload, payload, experiment)
+
+        forward_id = str(candidate.payload.get("forward_test_id", "")).strip()
+        if str(payload.get("forward_test_id", "")).strip() != forward_id:
+            raise AutonomousResearchError(
+                "UNAUTHENTICATED_RESULT",
+                "experiment_result forward_test_id does not match the candidate run",
+            )
+        if candidate.stage is not CandidateStage.PAPER_FORWARD or not forward_id:
+            raise AutonomousResearchError(
+                "UNTRUSTED_RESULT",
+                "experiment_result has no persisted paper forward run to evaluate",
+            )
+        registry = ForwardTestRegistry(self.store)
+        spec = registry.get(forward_id)
+        if spec is None:
+            raise AutonomousResearchError("UNAUTHENTICATED_RESULT", f"missing persisted forward test {forward_id}")
+        self._validate_forward_result_binding(candidate.payload, spec)
+
+        observations = self.store.list_paper_observations(forward_id, limit=_MAX_FORWARD_ROWS)
+        execution_events = self.store.list_paper_execution_events(forward_id, limit=_MAX_FORWARD_ROWS)
+        ledgers = self.store.list_paper_bet_ledger(forward_id, limit=_MAX_FORWARD_ROWS)
+        if not observations and not execution_events and not ledgers:
+            raise AutonomousResearchError(
+                "UNTRUSTED_RESULT",
+                "experiment_result has no persisted paper observations or outcomes",
+            )
+
+        # The caller-supplied result/metrics is intentionally ignored.  This
+        # is the sole evidence path for a queued experiment result.
+        evidence = self._forward_evidence(candidate.as_record(), now)
         evidence["result_attached"] = True
         evidence["holdout_used"] = False
-        candidate = self.lifecycle.record_evidence(candidate_id, evidence, expected_stage=candidate.stage, reason="experiment result attached")
-        if candidate.stage is CandidateStage.PAPER_FORWARD:
-            self._evaluate_forward_candidate(candidate_id, now)
+        candidate = self.lifecycle.record_evidence(
+            candidate_id,
+            evidence,
+            expected_stage=CandidateStage.PAPER_FORWARD,
+            reason="bound paper result evaluated from persisted observations",
+        )
+        self._evaluate_forward_candidate(candidate_id, now)
         response = {
             "accepted": True,
             "kind": "experiment_result",
@@ -623,13 +812,342 @@ class AutonomousResearchProcessor:
             "stage": (self.lifecycle.get(candidate_id) or candidate).stage.value,
             "attached": True,
             "paper_only": True,
+            "evidence_source": "persisted_paper_observations",
         }
         self.store.save_report_if_absent("result-" + item.item_id, {"report_type": "experiment_result", **response})
         return response
 
+    def _validate_result_binding(
+        self,
+        candidate_id: str,
+        candidate_payload: Mapping[str, Any],
+        result_payload: Mapping[str, Any],
+        experiment: Mapping[str, Any],
+    ) -> None:
+        """Require queue identity and immutable plan/dataset bindings to agree."""
+        run_id = str(result_payload.get("run_id", result_payload.get("experiment_id", ""))).strip()
+        if run_id != candidate_id:
+            raise AutonomousResearchError(
+                "UNAUTHENTICATED_RESULT",
+                "experiment_result run_id does not match the persisted worker run",
+            )
+        for identity_field in ("run_id", "experiment_id"):
+            supplied_identity = result_payload.get(identity_field)
+            if supplied_identity is not None and str(supplied_identity).strip() != candidate_id:
+                raise AutonomousResearchError(
+                    "UNAUTHENTICATED_RESULT",
+                    f"experiment_result {identity_field} does not match the persisted worker run",
+                )
+        persisted_run_id = str(experiment.get("run_id", candidate_id)).strip()
+        if persisted_run_id != candidate_id:
+            raise AutonomousResearchError("RESULT_BINDING_MISMATCH", "persisted worker run identity does not match")
+        experiment_candidate = str(experiment.get("candidate_id", candidate_id)).strip()
+        if experiment_candidate != candidate_id:
+            raise AutonomousResearchError("RESULT_BINDING_MISMATCH", "persisted worker run candidate_id does not match")
+
+        plan_id = _binding_value(candidate_payload.get("plan_id"))
+        plan_hash = _binding_value(candidate_payload.get("plan_hash"))
+        dataset_id = _binding_value(candidate_payload.get("dataset_id"))
+        dataset_version = _binding_value(candidate_payload.get("dataset_version"))
+        if not plan_id or not plan_hash or not dataset_version:
+            raise AutonomousResearchError(
+                "RESULT_BINDING_MISMATCH",
+                "candidate lacks exact persisted plan and dataset binding",
+            )
+        for field, expected in (
+            ("plan_id", plan_id),
+            ("plan_hash", plan_hash),
+            ("dataset_id", dataset_id),
+            ("dataset_version", dataset_version),
+        ):
+            supplied = _binding_value(result_payload.get(field))
+            if supplied != expected:
+                raise AutonomousResearchError(
+                    "RESULT_BINDING_MISMATCH",
+                    f"experiment_result {field} does not match the candidate binding",
+                )
+            persisted = _binding_value(experiment.get(field))
+            if persisted != expected:
+                raise AutonomousResearchError(
+                    "RESULT_BINDING_MISMATCH",
+                    f"persisted worker run {field} does not match the candidate binding",
+                )
+
+        plan_record = self.store.load_experiment_plan(plan_id)
+        if not isinstance(plan_record, Mapping):
+            raise AutonomousResearchError("RESULT_BINDING_MISMATCH", f"missing persisted experiment plan {plan_id}")
+        if _binding_value(plan_record.get("plan_hash")) != plan_hash:
+            raise AutonomousResearchError("RESULT_BINDING_MISMATCH", "persisted experiment plan hash does not match")
+        raw_plan = plan_record.get("plan")
+        if not isinstance(raw_plan, Mapping):
+            raise AutonomousResearchError("RESULT_BINDING_MISMATCH", "persisted experiment plan is invalid")
+        try:
+            plan = ExperimentPlan.from_mapping(raw_plan)
+        except ExperimentPlanError as exc:
+            raise AutonomousResearchError("RESULT_BINDING_MISMATCH", str(exc)) from exc
+        if plan.plan_id != plan_id or plan.plan_hash != plan_hash:
+            raise AutonomousResearchError("RESULT_BINDING_MISMATCH", "experiment plan identity is not exact")
+        if _binding_value(plan.dataset_id) != dataset_id or plan.dataset_version != dataset_version:
+            raise AutonomousResearchError("RESULT_BINDING_MISMATCH", "experiment plan dataset binding is not exact")
+
+    @staticmethod
+    def _validate_forward_result_binding(candidate_payload: Mapping[str, Any], spec: Any) -> None:
+        forward_id = str(candidate_payload.get("forward_test_id", "")).strip()
+        if str(getattr(spec, "experiment_id", "")).strip() != forward_id:
+            raise AutonomousResearchError("RESULT_BINDING_MISMATCH", "forward-test identity does not match candidate")
+        config = getattr(spec, "config", {})
+        if not isinstance(config, Mapping):
+            raise AutonomousResearchError("RESULT_BINDING_MISMATCH", "persisted forward-test config is invalid")
+        for field in ("plan_id", "dataset_id", "dataset_version"):
+            expected = _binding_value(candidate_payload.get(field))
+            if _binding_value(config.get(field)) != expected:
+                raise AutonomousResearchError(
+                    "RESULT_BINDING_MISMATCH",
+                    f"forward-test {field} does not match the candidate binding",
+                )
+
+    def _crypto_binding(self, plan: ExperimentPlan) -> dict[str, Any] | None:
+        """Resolve and validate immutable crypto inputs from the persisted store."""
+        if plan.market_type is not MarketType.CRYPTO_SPOT:
+            return None
+        dataset_id = plan.dataset_id
+        dataset_version = plan.dataset_version
+        timeframe = plan.dataset_timeframe
+        source = plan.dataset_source
+        survivorship = plan.dataset_survivorship
+        if not dataset_id or not dataset_version or not timeframe or not source or not survivorship:
+            raise AutonomousResearchError(
+                "INSUFFICIENT_DATA",
+                "crypto plans require exact dataset id, version, timeframe, source, and survivorship provenance",
+            )
+        if dataset_version.lower() in {"latest", "current", "default", "unversioned"}:
+            raise AutonomousResearchError("INSUFFICIENT_DATA", "crypto dataset_version must be immutable and versioned")
+        catalog_loader = getattr(self.store, "load_dataset_catalog", None)
+        if not callable(catalog_loader):
+            raise AutonomousResearchError("INSUFFICIENT_DATA", "crypto research requires a persisted dataset catalog")
+        catalog = catalog_loader(dataset_id, dataset_version)
+        if not isinstance(catalog, Mapping):
+            raise AutonomousResearchError(
+                "INSUFFICIENT_DATA",
+                f"no exact dataset catalog {dataset_id}/{dataset_version}",
+            )
+        catalog_id = str(catalog.get("dataset_id", "")).strip()
+        catalog_version = str(catalog.get("dataset_version", catalog.get("version", ""))).strip()
+        if catalog_id != dataset_id or catalog_version != dataset_version:
+            raise AutonomousResearchError("CRYPTO_PROVENANCE_MISMATCH", "dataset catalog identity does not match the plan")
+        if str(catalog.get("market_type", "")).strip().lower() != MarketType.CRYPTO_SPOT.value:
+            raise AutonomousResearchError("CRYPTO_PROVENANCE_MISMATCH", "dataset catalog market_type is not crypto_spot")
+        catalog_timeframe = str(catalog.get("timeframe", "")).strip()
+        if catalog_timeframe != timeframe:
+            raise AutonomousResearchError("CRYPTO_PROVENANCE_MISMATCH", "dataset timeframe does not match the plan")
+        catalog_source = str(catalog.get("provider", catalog.get("source", ""))).strip()
+        if catalog_source != source:
+            raise AutonomousResearchError("CRYPTO_PROVENANCE_MISMATCH", "dataset source does not match the plan")
+        catalog_source_type = str(catalog.get("source_type", "")).strip().upper()
+        declared_source_type = plan.dataset_source_type
+        if declared_source_type and catalog_source_type != declared_source_type.strip().upper():
+            raise AutonomousResearchError("CRYPTO_PROVENANCE_MISMATCH", "dataset source_type does not match the plan")
+        if catalog_source_type != "HISTORICAL":
+            raise AutonomousResearchError(
+                "CRYPTO_PROVENANCE_MISMATCH",
+                "crypto autonomous research accepts historical datasets only",
+            )
+        catalog_metadata = catalog.get("metadata")
+        catalog_metadata = dict(catalog_metadata) if isinstance(catalog_metadata, Mapping) else {}
+        catalog_survivorship = catalog_metadata.get(
+            "survivorship_bias",
+            catalog_metadata.get("survivorship", catalog_metadata.get("survivorship_label")),
+        )
+        if catalog_survivorship is None or str(catalog_survivorship).strip() != survivorship:
+            raise AutonomousResearchError("CRYPTO_PROVENANCE_MISMATCH", "dataset survivorship provenance does not match the plan")
+
+        universe_id = plan.universe_id
+        universe_version = plan.universe_version
+        universe_hash = plan.universe_snapshot_hash
+        if not universe_id or not universe_version or not universe_hash:
+            raise AutonomousResearchError(
+                "INSUFFICIENT_DATA",
+                "crypto plans require exact persisted universe id, version, and snapshot_hash",
+            )
+        if any(
+            value.lower() in {"latest", "current", "default", "unversioned"}
+            for value in (universe_version, universe_hash)
+        ):
+            raise AutonomousResearchError("INSUFFICIENT_DATA", "crypto universe binding must be immutable and versioned")
+        universe_document = dict(plan.universe or {})
+        universe_dataset_id = str(universe_document.get("dataset_id") or f"universe:{universe_id}").strip()
+        universe_catalog = catalog_loader(universe_dataset_id, universe_version)
+        if not isinstance(universe_catalog, Mapping):
+            raise AutonomousResearchError(
+                "INSUFFICIENT_DATA",
+                f"no exact universe snapshot {universe_dataset_id}/{universe_version}",
+            )
+        if str(universe_catalog.get("dataset_id", "")).strip() != universe_dataset_id:
+            raise AutonomousResearchError("CRYPTO_PROVENANCE_MISMATCH", "universe catalog identity does not match the plan")
+        if str(universe_catalog.get("dataset_version", universe_catalog.get("version", ""))).strip() != universe_version:
+            raise AutonomousResearchError("CRYPTO_PROVENANCE_MISMATCH", "universe version does not match the plan")
+        universe_metadata = universe_catalog.get("metadata")
+        universe_metadata = dict(universe_metadata) if isinstance(universe_metadata, Mapping) else {}
+        persisted_universe_id = str(universe_metadata.get("universe_id", "")).strip()
+        if persisted_universe_id and persisted_universe_id != universe_id:
+            raise AutonomousResearchError("CRYPTO_PROVENANCE_MISMATCH", "universe id does not match the persisted snapshot")
+        persisted_hash = str(
+            universe_metadata.get("snapshot_hash")
+            or universe_metadata.get("content_hash")
+            or universe_catalog.get("snapshot_hash")
+            or ""
+        ).strip()
+        if persisted_hash != universe_hash:
+            raise AutonomousResearchError("CRYPTO_PROVENANCE_MISMATCH", "universe snapshot_hash does not match the persisted snapshot")
+        if universe_metadata.get("point_in_time") is not True:
+            raise AutonomousResearchError("CRYPTO_PROVENANCE_MISMATCH", "universe snapshot is not point-in-time")
+
+        universe_record_loader = getattr(self.store, "load_dataset_record", None)
+        universe_record = (
+            universe_record_loader(universe_dataset_id, universe_version)
+            if callable(universe_record_loader)
+            else None
+        )
+        universe_rows = universe_record.get("records") if isinstance(universe_record, Mapping) else None
+        if isinstance(universe_rows, Mapping):
+            universe_rows = universe_rows.get("records", universe_rows.get("rows", ()))
+        if not isinstance(universe_rows, (list, tuple)):
+            universe_rows = self.store.load_dataset(universe_dataset_id, universe_version)
+        if not isinstance(universe_rows, (list, tuple)):
+            raise AutonomousResearchError("INSUFFICIENT_DATA", "persisted universe snapshot has no bounded records")
+        selected: dict[str, str] = {}
+        for row in universe_rows:
+            if not isinstance(row, Mapping) or not bool(row.get("selected")):
+                continue
+            for key in ("binance_symbol", "symbol", "instrument"):
+                value = row.get(key)
+                if value is not None and _normal_symbol(value):
+                    selected.setdefault(_normal_symbol(value), str(value).strip())
+        declared_values = universe_document.get("instruments")
+        if declared_values is None:
+            declared_values = universe_document.get("symbols")
+        if declared_values is None:
+            declared_values = ()
+        if isinstance(declared_values, str) or not isinstance(declared_values, (list, tuple)):
+            raise AutonomousResearchError(
+                "CRYPTO_PROVENANCE_MISMATCH",
+                "plan universe instruments/symbols must be a bounded list",
+            )
+        if not declared_values:
+            raise AutonomousResearchError(
+                "CRYPTO_PROVENANCE_MISMATCH",
+                "plan universe instruments/symbols must contain at least one symbol",
+            )
+        declared: set[str] = set()
+        for index, value in enumerate(declared_values):
+            normalized = _normal_symbol(value)
+            if value is None or not str(value).strip() or not normalized:
+                raise AutonomousResearchError(
+                    "CRYPTO_PROVENANCE_MISMATCH",
+                    f"plan universe instruments/symbols contains an empty symbol at index {index}",
+                )
+            if normalized in declared:
+                raise AutonomousResearchError(
+                    "CRYPTO_PROVENANCE_MISMATCH",
+                    f"plan universe instruments/symbols contains duplicate normalized symbol {normalized!r}",
+                )
+            declared.add(normalized)
+        persisted = set(selected)
+        if declared != persisted:
+            missing = sorted(persisted - declared)
+            unexpected = sorted(declared - persisted)
+            raise AutonomousResearchError(
+                "CRYPTO_PROVENANCE_MISMATCH",
+                "plan universe instruments do not exactly match persisted selected rows: "
+                f"declared={sorted(declared)!r}; persisted={sorted(persisted)!r}; "
+                f"missing={missing!r}; unexpected={unexpected!r}",
+            )
+
+        target = plan.target_instrument
+        target_key = _normal_symbol(target)
+        if not target_key or target_key not in selected:
+            raise AutonomousResearchError(
+                "CRYPTO_UNIVERSE_MEMBERSHIP_MISMATCH",
+                f"selected instrument {target or '<missing>'} is not a member of the persisted universe",
+            )
+        return {
+            "dataset": {
+                "dataset_id": dataset_id,
+                "dataset_version": dataset_version,
+                "timeframe": catalog_timeframe,
+                "source": catalog_source,
+                "source_type": catalog_source_type,
+                "survivorship_bias": survivorship,
+                "snapshot_id": str(catalog.get("snapshot_id", "")).strip(),
+            },
+            "universe": {
+                "universe_id": universe_id,
+                "universe_version": universe_version,
+                "snapshot_hash": universe_hash,
+                "dataset_id": universe_dataset_id,
+                "snapshot_id": str(universe_catalog.get("snapshot_id", "")).strip(),
+                "methodology": str(universe_document.get("methodology", "")).strip(),
+                "point_in_time": True,
+            },
+            "selected_symbol": selected[target_key],
+        }
+
+    def _load_prediction_dataset_by_version(self, version: str) -> Any | None:
+        """Load a datasetless prediction plan only when its version is unambiguous."""
+        connection = getattr(self.store, "connection", None)
+        execute = getattr(connection, "execute", None)
+        if callable(execute):
+            try:
+                matches = execute(
+                    "SELECT dataset_id, 'datasets' AS source FROM datasets WHERE version=? "
+                    "UNION ALL "
+                    "SELECT dataset_id, 'dataset_catalog' AS source "
+                    "FROM dataset_catalog WHERE dataset_version=? "
+                    "ORDER BY dataset_id, source",
+                    (str(version), str(version)),
+                ).fetchall()
+            except Exception as exc:
+                raise AutonomousResearchError(
+                    "INSUFFICIENT_DATA",
+                    f"immutable dataset lookup failed for version {version}",
+                ) from exc
+            if len(matches) > 1:
+                identities = ", ".join(f"{row[1]}:{row[0]}" for row in matches)
+                raise AutonomousResearchError(
+                    "INSUFFICIENT_DATA",
+                    f"ambiguous immutable datasets at version {version}: {identities}",
+                )
+            if not matches:
+                return None
+            dataset_id = str(matches[0][0]).strip()
+            loader = getattr(self.store, "load_dataset", None)
+            if callable(loader):
+                return loader(dataset_id, version)
+            return None
+
+        finder = getattr(self.store, "load_dataset_by_version", None)
+        if callable(finder):
+            found = finder(version)
+            if isinstance(found, Mapping):
+                found_version = str(found.get("version", found.get("dataset_version", ""))).strip()
+                if found_version == str(version):
+                    return found.get("records")
+        return None
+
     def _load_split(self, plan: ExperimentPlan) -> tuple[list[Mapping[str, Any]], Any]:
         records: Any = None
+        if plan.dataset_version.lower() in {"latest", "current", "default", "unversioned"}:
+            if plan.market_type is MarketType.CRYPTO_SPOT:
+                raise AutonomousResearchError(
+                    "INSUFFICIENT_DATA",
+                    "crypto dataset_version must be immutable and versioned",
+                )
+            raise AutonomousResearchError(
+                "INSUFFICIENT_DATA",
+                "dataset_version must identify an immutable version",
+            )
         if plan.market_type is MarketType.CRYPTO_SPOT:
+            self._crypto_binding(plan)
             if not plan.dataset_id:
                 raise AutonomousResearchError(
                     "INSUFFICIENT_DATA",
@@ -642,7 +1160,7 @@ class AutonomousResearchProcessor:
                     record_version = str(record.get("version", record.get("dataset_version", ""))).strip()
                     if record_version and record_version != plan.dataset_version:
                         raise AutonomousResearchError(
-                            "INSUFFICIENT_DATA",
+                            "CRYPTO_PROVENANCE_MISMATCH",
                             "dataset record version does not match the plan",
                         )
                     records = record.get("records")
@@ -650,12 +1168,8 @@ class AutonomousResearchProcessor:
                 records = self.store.load_dataset(plan.dataset_id, plan.dataset_version)
         elif plan.dataset_id:
             records = self.store.load_dataset(plan.dataset_id, plan.dataset_version)
-        if records is None:
-            finder = getattr(self.store, "load_dataset_by_version", None)
-            if plan.market_type is not MarketType.CRYPTO_SPOT and callable(finder):
-                found = finder(plan.dataset_version)
-                if isinstance(found, Mapping):
-                    records = found.get("records")
+        else:
+            records = self._load_prediction_dataset_by_version(plan.dataset_version)
         if records is None:
             raise AutonomousResearchError(
                 "INSUFFICIENT_DATA",
@@ -896,7 +1410,10 @@ class AutonomousResearchProcessor:
         now: datetime,
         generation: int,
         lineage: Sequence[str],
+        crypto_binding: Mapping[str, Any] | None = None,
     ) -> Mapping[str, Any]:
+        if plan.market_type is MarketType.CRYPTO_SPOT and crypto_binding is None:
+            crypto_binding = self._crypto_binding(plan)
         candidate = self.lifecycle.get(candidate_id)
         if candidate is None:
             raise AutonomousResearchError("INVALID_CANDIDATE", f"candidate {candidate_id} is not registered")
@@ -909,6 +1426,7 @@ class AutonomousResearchProcessor:
             "hypothesis_id": plan.hypothesis_id,
             "plan_id": plan.plan_id,
             "plan_hash": plan.plan_hash,
+            "dataset_id": plan.dataset_id,
             "dataset_version": plan.dataset_version,
             "experiment_family": plan.experiment_family,
             "generation": generation,
@@ -916,6 +1434,8 @@ class AutonomousResearchProcessor:
             "paper_only": True,
             "holdout_used": False,
         }
+        if crypto_binding is not None:
+            base["crypto_provenance"] = dict(crypto_binding)
         if candidate.stage is CandidateStage.IDEA:
             candidate = self.lifecycle.advance(
                 candidate_id,
@@ -1051,6 +1571,9 @@ class AutonomousResearchProcessor:
                     "model_document": dict(model_document),
                 }
             config_hash = _hash_document({"config": forward_config, "risk_limits": risk_snapshot})
+            strategy_hash = _content_hash(strategy.to_dict())
+            model_hash = _content_hash(model_document)
+            frozen_hash = hashlib.sha256("|".join((strategy_hash, model_hash, config_hash)).encode("utf-8")).hexdigest()
             candidate = self.lifecycle.advance(
                 candidate_id,
                 CandidateStage.FROZEN,
@@ -1058,9 +1581,10 @@ class AutonomousResearchProcessor:
                     **robust_evidence,
                     **base,
                     "frozen": True,
-                    "strategy_hash": _content_hash(strategy.to_dict()),
-                    "model_hash": _content_hash(model_document),
+                    "strategy_hash": strategy_hash,
+                    "model_hash": model_hash,
                     "config_hash": config_hash,
+                    "frozen_hash": frozen_hash,
                     "risk_snapshot": risk_snapshot,
                     "dataset_provenance": {
                         "dataset_id": plan.dataset_id,
@@ -1069,7 +1593,7 @@ class AutonomousResearchProcessor:
                         "universe": dict(plan.universe or {}),
                     },
                     "experiment_budget_lineage": {
-                        "budget_id": plan.budget_id,
+                        "budget_id": AUTONOMOUS_BUDGET_ID,
                         "family": plan.experiment_family,
                         "variants_tested": variant_count,
                     },
@@ -1086,6 +1610,7 @@ class AutonomousResearchProcessor:
                     "research_only": True,
                     "execution_capability": "none",
                     "paper_only": True,
+                    "crypto_provenance": dict(crypto_binding or {}),
                 }
             registry = ForwardTestRegistry(self.store)
             spec = registry.register_forward_test(
@@ -1142,11 +1667,20 @@ class AutonomousResearchProcessor:
         prepared: Sequence[Mapping[str, Any]],
         validation_scores: Mapping[str, float],
         now: datetime,
+        *,
+        lineage: Sequence[str] = (),
     ) -> tuple[str, ...]:
         if not self.config.mutation_enabled or self.config.max_children_per_parent <= 0:
             return ()
         if not prepared:
             return ()
+        current = ensure_utc(now)
+        daily_limit = self.config.max_experiments_per_day
+        daily_since: datetime | None = None
+        daily_until: datetime | None = None
+        if daily_limit is not None:
+            daily_since = datetime(current.year, current.month, current.day, tzinfo=timezone.utc)
+            daily_until = daily_since + timedelta(days=1)
         parent = max(prepared, key=lambda item: (validation_scores.get(str(item["candidate_id"]), float("-inf")), str(item["candidate_id"])))
         parent_id = str(parent["candidate_id"])
         lifecycle = self.lifecycle.get(parent_id)
@@ -1166,21 +1700,24 @@ class AutonomousResearchProcessor:
                 and str(record["payload"].get("parent_id", "")) == parent_id
             )
         remaining = max(0, self.config.max_children_per_parent - children)
-        if self.config.max_experiments_per_day is not None:
-            day_start = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
+        if daily_limit is not None:
+            assert daily_since is not None and daily_until is not None
             daily_count = self.store.count_experiment_budget_reservations(
-                plan.budget_id,
-                since=day_start,
-                until=day_start + timedelta(days=1),
+                AUTONOMOUS_BUDGET_ID,
+                since=daily_since,
+                until=daily_until,
             )
-            remaining = min(remaining, max(0, self.config.max_experiments_per_day - daily_count))
+            remaining = min(remaining, max(0, daily_limit - daily_count))
         if remaining <= 0:
             return ()
         strategy = parent["strategy"]
+        # Experiment plans are untrusted input.  The node owns the shared
+        # autonomous budget namespace; never let plan-declared limits poison
+        # its persisted immutable limits.
         budget = ExperimentBudget(
-            budget_id=plan.budget_id,
-            total_limit=min(self.config.total_limit, int(plan.family_budget.get("total_limit", self.config.total_limit))),
-            per_family_limit=min(self.config.family_limit, int(plan.family_budget.get("per_family_limit", self.config.family_limit))),
+            budget_id=AUTONOMOUS_BUDGET_ID,
+            total_limit=self.config.total_limit,
+            per_family_limit=self.config.family_limit,
         )
         engine = DeterministicMutationEngine(store=self.store, lifecycle=self.lifecycle, budget=budget, seed=0)
         try:
@@ -1189,15 +1726,18 @@ class AutonomousResearchProcessor:
                 parent_id=parent_id,
                 generation=generation + 1,
                 max_variants=remaining,
-                family=plan.experiment_family,
                 provenance={
                     "plan_id": plan.plan_id,
                     "hypothesis_id": plan.hypothesis_id,
                     "validation_only": True,
                     "locked_partition_used": False,
+                    "crypto_provenance": dict(self._crypto_binding(plan) or {}),
                 },
-                lineage=tuple(str(value) for value in lifecycle.payload.get("lineage", ())) + (parent_id,),
+                lineage=lineage,
                 timestamp=now,
+                daily_limit=daily_limit,
+                daily_since=daily_since,
+                daily_until=daily_until,
             )
         except (RuntimeError, ValueError):
             return ()
@@ -1210,6 +1750,7 @@ class AutonomousResearchProcessor:
                 "candidate_id": child.candidate_id,
                 "hypothesis_id": plan.hypothesis_id,
                 "plan_id": plan.plan_id,
+                "plan_hash": plan.plan_hash,
                 "experiment_plan": plan.as_dict(),
                 "strategy": child_strategy.to_dict(),
                 "parameters": dict(child_strategy.parameters),
@@ -1218,17 +1759,26 @@ class AutonomousResearchProcessor:
                 "parent_id": child.parent_id,
                 "lineage": list(child.lineage),
                 "dataset_version": plan.dataset_version,
+                "dataset_id": plan.dataset_id,
                 "paper_only": True,
                 "holdout_used": False,
+                "crypto_provenance": dict(self._crypto_binding(plan) or {}),
             }
             self.store.save_strategy_if_absent(child_strategy.id, child_strategy.to_dict())
             self.store.save_experiment_if_absent(
                 child.candidate_id,
                 {
+                    "run_id": child.candidate_id,
                     "status": "IDEA",
+                    "strategy_id": child_strategy.id,
+                    "strategy": child_strategy.to_dict(),
+                    "variant": dict(child_strategy.parameters),
                     "candidate_id": child.candidate_id,
                     "hypothesis_id": plan.hypothesis_id,
                     "plan_id": plan.plan_id,
+                    "plan_hash": plan.plan_hash,
+                    "dataset_id": plan.dataset_id,
+                    "dataset_version": plan.dataset_version,
                     "generation": child.generation,
                     "parent_id": child.parent_id,
                     "lineage": list(child.lineage),
@@ -1247,32 +1797,31 @@ class AutonomousResearchProcessor:
         return tuple(child_ids)
 
     def _reserve_candidate(self, plan: ExperimentPlan, candidate_id: str, now: datetime) -> None:
+        current = ensure_utc(now)
+        daily_since: datetime | None = None
+        daily_until: datetime | None = None
         if self.config.max_experiments_per_day is not None:
-            day_start = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
-            daily_count = self.store.count_experiment_budget_reservations(
-                plan.budget_id,
-                since=day_start,
-                until=day_start + timedelta(days=1),
-            )
-            if daily_count >= self.config.max_experiments_per_day and not self.store.experiment_budget_reservation_exists(
-                plan.budget_id,
-                candidate_id,
-            ):
-                raise AutonomousResearchError(
-                    "EXPERIMENT_DAILY_LIMIT_EXCEEDED",
-                    f"daily experiment limit reached for {day_start.date().isoformat()}",
-                )
+            daily_since = datetime(current.year, current.month, current.day, tzinfo=timezone.utc)
+            daily_until = daily_since + timedelta(days=1)
         try:
             self.store.reserve_experiment_budget(
-                plan.budget_id,
-                total_limit=min(self.config.total_limit, int(plan.family_budget.get("total_limit", self.config.total_limit))),
-                per_family_limit=min(self.config.family_limit, int(plan.family_budget.get("per_family_limit", self.config.family_limit))),
+                AUTONOMOUS_BUDGET_ID,
+                total_limit=self.config.total_limit,
+                per_family_limit=self.config.family_limit,
                 family=plan.experiment_family,
                 reservation_key=candidate_id,
-                timestamp=now,
+                timestamp=current,
+                daily_limit=self.config.max_experiments_per_day,
+                daily_since=daily_since,
+                daily_until=daily_until,
             )
         except RuntimeError as exc:
-            raise AutonomousResearchError("EXPERIMENT_BUDGET_EXCEEDED", str(exc)) from exc
+            reason = (
+                "EXPERIMENT_DAILY_LIMIT_EXCEEDED"
+                if str(exc) == "experiment daily budget exhausted"
+                else "EXPERIMENT_BUDGET_EXCEEDED"
+            )
+            raise AutonomousResearchError(reason, str(exc)) from exc
 
     def _candidate_payload(
         self,
@@ -1708,6 +2257,17 @@ def _candidate_id(plan: ExperimentPlan, parameters: Mapping[str, Any], *, genera
     )
     return "candidate-" + hashlib.sha256(token.encode("utf-8")).hexdigest()[:24]
 
+def _mutation_candidate_id(parent_id: str, generation: int, strategy: StrategyDefinition) -> str:
+    document = strategy.to_dict()
+    document.pop("strategy_id", None)
+    token = json.dumps(
+        {"parent": str(parent_id), "generation": generation, "strategy": document, "seed": 0},
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return "mutation-" + hashlib.sha256(token.encode("utf-8")).hexdigest()[:24]
+
 
 def _normalize_hypothesis_payload(payload: Mapping[str, Any], item: ResearchQueueItem) -> dict[str, Any]:
     result = dict(payload)
@@ -1751,6 +2311,9 @@ def _normalize_row(value: Any) -> dict[str, Any] | None:
 
 def _value(row: Mapping[str, Any], name: str, default: Any = None) -> Any:
     return row.get(name, default)
+
+def _normal_symbol(value: Any) -> str:
+    return str(value).replace("/", "").replace("-", "").replace("_", "").strip().upper()
 
 
 def _time_to_expiry(row: Mapping[str, Any]) -> float:

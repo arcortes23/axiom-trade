@@ -97,6 +97,7 @@ class UniverseConfig:
     duplicate_ids: frozenset[str] = frozenset()
     wrapped_staked_pegged_ids: frozenset[str] = frozenset()
     dataset_id: str | None = None
+    universe_id: str | None = None
 
     def __post_init__(self) -> None:
         top_n = int(self.top_n)
@@ -115,6 +116,18 @@ class UniverseConfig:
             interval = timedelta(seconds=seconds)
         if not math.isfinite(seconds) or seconds <= 0:
             raise ValueError("refresh_interval must be positive")
+        explicit_universe_id = self.universe_id
+        if explicit_universe_id is not None:
+            explicit_universe_id = str(explicit_universe_id).strip()
+            if not explicit_universe_id:
+                raise ValueError("universe_id must not be empty")
+        else:
+            policy = str(self.policy).strip()
+            explicit_universe_id = (
+                TOP_50_MARKET_CAP_BINANCE_USDT
+                if policy == TOP_50_MARKET_CAP_BINANCE_USDT and top_n == 50 and quote == "USDT"
+                else f"TOP_{top_n}_MARKET_CAP_BINANCE_{quote}"
+            )
         object.__setattr__(self, "top_n", top_n)
         object.__setattr__(self, "quote_asset", quote)
         object.__setattr__(self, "refresh_interval", interval)
@@ -122,14 +135,9 @@ class UniverseConfig:
         object.__setattr__(self, "stablecoin_symbols", _normalize_symbols(self.stablecoin_symbols))
         object.__setattr__(self, "duplicate_ids", _normalize_ids(self.duplicate_ids))
         object.__setattr__(self, "wrapped_staked_pegged_ids", _normalize_ids(self.wrapped_staked_pegged_ids))
+        object.__setattr__(self, "universe_id", explicit_universe_id)
         if self.dataset_id is not None and not str(self.dataset_id).strip():
             raise ValueError("dataset_id must not be empty")
-
-    @property
-    def universe_id(self) -> str:
-        if self.policy == TOP_50_MARKET_CAP_BINANCE_USDT and self.top_n == 50 and self.quote_asset == "USDT":
-            return TOP_50_MARKET_CAP_BINANCE_USDT
-        return f"TOP_{self.top_n}_MARKET_CAP_BINANCE_{self.quote_asset}"
 
     @property
     def persisted_dataset_id(self) -> str:
@@ -174,15 +182,64 @@ class UniverseSnapshot:
         return tuple(str(record.get("binance_symbol") or record.get("symbol")) for record in self.selected_records)
 
     def to_provenance(self) -> dict[str, Any]:
-        """Return a JSON-safe provenance object suitable for research inputs."""
+        """Return a JSON-safe provenance object suitable for research inputs.
+
+        Selected symbols are part of the binding.  Consumers may display a
+        newer ``CURRENT_UNIVERSE`` snapshot, but a durable research record must
+        retain the exact version and membership that produced it.
+        """
+        metadata = dict(self.metadata)
+        survivorship = metadata.get("survivorship_bias", SURVIVORSHIP_BIAS_PRESENT)
         return {
             "universe_id": self.universe_id,
+            "universe_version": self.version,
             "version": self.version,
             "snapshot_hash": self.snapshot_hash,
             "observed_at": _iso(self.observed_at) if self.observed_at else None,
             "status": self.status,
             "labels": list(self.labels),
+            "selected_symbols": list(self.selected_symbols),
+            "symbols": list(self.selected_symbols),
+            "methodology": metadata.get("methodology", metadata.get("policy", "unspecified")),
+            "survivorship_bias": survivorship,
         }
+
+    @classmethod
+    def from_record(
+        cls,
+        record: Mapping[str, Any],
+        *,
+        universe_id: str | None = None,
+        default_status: str = "CURRENT",
+    ) -> "UniverseSnapshot":
+        """Rehydrate one exact immutable snapshot record.
+
+        ``version`` is deliberately taken from the supplied record; this
+        method never falls back to the newest catalog entry when a version is
+        present.
+        """
+        metadata = record.get("metadata")
+        metadata = dict(metadata) if isinstance(metadata, Mapping) else {}
+        rows = record.get("records")
+        rows = rows if isinstance(rows, list) else []
+        version_value = record.get("version")
+        if version_value is None:
+            version_value = record.get("dataset_version")
+        snapshot_hash = metadata.get("snapshot_hash") or version_value
+        observed_at = _parse_datetime(metadata.get("observed_at")) or _parse_datetime(record.get("created_at"))
+        status = str(metadata.get("status") or default_status).upper()
+        if status not in {"CURRENT", "STALE"}:
+            status = default_status
+        return cls(
+            universe_id=str(universe_id or metadata.get("universe_id") or record.get("dataset_id") or ""),
+            version=str(version_value) if version_value is not None else None,
+            snapshot_hash=str(snapshot_hash) if snapshot_hash is not None else None,
+            observed_at=observed_at,
+            status=status,
+            records=tuple(row for row in rows if isinstance(row, Mapping)),
+            labels=tuple(metadata.get("labels") or (CURRENT_UNIVERSE, SURVIVORSHIP_BIAS_PRESENT)),
+            metadata=metadata,
+        )
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -333,29 +390,29 @@ class CryptoUniverseBuilder:
 
     refresh = build
 
+    def load_persisted(self, version: str | None = None) -> UniverseSnapshot | None:
+        """Load one exact persisted snapshot (or the latest when omitted)."""
+        record = self.store.load_dataset_record(self.config.persisted_dataset_id, version)
+        if not record:
+            return None
+        return UniverseSnapshot.from_record(record, universe_id=self.config.universe_id)
+
+    def status(self, version: str | None = None) -> dict[str, Any]:
+        """Return catalog/status information without contacting providers."""
+        snapshot = self.load_persisted(version)
+        dataset_id = self.config.persisted_dataset_id
+        return {
+            "universe_id": self.config.universe_id,
+            "dataset_id": dataset_id,
+            "requested_version": version,
+            "latest_version": snapshot.version if version is None and snapshot else None,
+            "snapshot": snapshot.as_dict() if snapshot else None,
+            "versions": self.store.dataset_versions(dataset_id),
+            "labels": [CURRENT_UNIVERSE, SURVIVORSHIP_BIAS_PRESENT],
+        }
+
     def _latest(self) -> UniverseSnapshot | None:
-        loaded = self.store.load_dataset_record(self.config.persisted_dataset_id)
-        if not loaded:
-            return None
-        metadata = loaded.get("metadata")
-        if not isinstance(metadata, Mapping):
-            metadata = {}
-        rows = loaded.get("records")
-        if not isinstance(rows, list):
-            return None
-        observed_at = _parse_datetime(metadata.get("observed_at")) or _parse_datetime(loaded.get("created_at"))
-        version = str(loaded.get("version")) if loaded.get("version") is not None else None
-        snapshot_hash = metadata.get("snapshot_hash") or version
-        return UniverseSnapshot(
-            universe_id=str(metadata.get("universe_id") or self.config.universe_id),
-            version=version,
-            snapshot_hash=str(snapshot_hash) if snapshot_hash is not None else None,
-            observed_at=observed_at,
-            status=str(metadata.get("status") or "CURRENT"),
-            records=tuple(row for row in rows if isinstance(row, Mapping)),
-            labels=tuple(metadata.get("labels") or (CURRENT_UNIVERSE, SURVIVORSHIP_BIAS_PRESENT)),
-            metadata=metadata,
-        )
+        return self.load_persisted()
 
     def _persist(self, records: Sequence[Mapping[str, Any]], version: str, metadata: Mapping[str, Any], observed_at: datetime) -> None:
         dataset_id = self.config.persisted_dataset_id
@@ -384,8 +441,6 @@ class CryptoUniverseBuilder:
                 created_at=observed_at,
                 updated_at=observed_at,
             )
-
-
 UniverseBuilder = CryptoUniverseBuilder
 
 
@@ -399,6 +454,59 @@ def build_crypto_universe(
     now: datetime | None = None,
 ) -> UniverseSnapshot:
     """Convenience wrapper around :class:`CryptoUniverseBuilder`."""
+    return CryptoUniverseBuilder(ranking_provider, binance_provider, store, config=config).build(force=force, now=now)
+
+
+def load_crypto_universe(
+    store: AxiomStore,
+    *,
+    config: UniverseConfig | None = None,
+    universe_id: str | None = None,
+    version: str | None = None,
+) -> UniverseSnapshot | None:
+    """Load a persisted universe, binding to ``version`` when provided."""
+    selected_config = config
+    if selected_config is None:
+        selected_config = UniverseConfig() if universe_id is None else UniverseConfig(universe_id=str(universe_id))
+    record = store.load_dataset_record(selected_config.persisted_dataset_id, version)
+    if not record:
+        return None
+    return UniverseSnapshot.from_record(record, universe_id=selected_config.universe_id)
+
+
+def crypto_universe_status(
+    store: AxiomStore,
+    *,
+    config: UniverseConfig | None = None,
+    universe_id: str | None = None,
+    version: str | None = None,
+) -> dict[str, Any]:
+    """Return persisted universe status without a network refresh."""
+    selected_config = config
+    if selected_config is None:
+        selected_config = UniverseConfig() if universe_id is None else UniverseConfig(universe_id=str(universe_id))
+    snapshot = load_crypto_universe(store, config=selected_config, version=version)
+    return {
+        "universe_id": selected_config.universe_id,
+        "dataset_id": selected_config.persisted_dataset_id,
+        "requested_version": version,
+        "latest_version": snapshot.version if snapshot is not None and version is None else None,
+        "snapshot": snapshot.as_dict() if snapshot is not None else None,
+        "versions": store.dataset_versions(selected_config.persisted_dataset_id),
+        "labels": [CURRENT_UNIVERSE, SURVIVORSHIP_BIAS_PRESENT],
+    }
+
+
+def refresh_crypto_universe(
+    ranking_provider: RankingProvider | Callable[..., Sequence[Mapping[str, Any]]] | Sequence[Mapping[str, Any]],
+    binance_provider: BinanceAdapter | Any,
+    store: AxiomStore,
+    *,
+    config: UniverseConfig | None = None,
+    force: bool = False,
+    now: datetime | None = None,
+) -> UniverseSnapshot:
+    """Refresh the point-in-time universe using public ranking/exchange data."""
     return CryptoUniverseBuilder(ranking_provider, binance_provider, store, config=config).build(force=force, now=now)
 
 
@@ -575,18 +683,18 @@ def _invoke_exchange_symbols(provider: Any, quote_asset: str) -> Sequence[Any] |
         symbols = provider.get("symbols")
         return symbols if isinstance(symbols, list) else None
     return None
-
-
 def _metadata(config: UniverseConfig, observed_at: datetime, version: str | None, status: str) -> dict[str, Any]:
     return {
         "schema_version": UNIVERSE_SCHEMA_VERSION,
         "policy": config.policy,
+        "methodology": "ranked_market_cap_intersection_with_binance_spot",
         "universe_id": config.universe_id,
         "snapshot_hash": version,
         "version": version,
         "observed_at": _iso(observed_at),
         "status": status,
         "labels": [CURRENT_UNIVERSE, SURVIVORSHIP_BIAS_PRESENT],
+        "survivorship_bias": SURVIVORSHIP_BIAS_PRESENT,
         "point_in_time": True,
         "quote_asset": config.quote_asset,
         "top_n": config.top_n,
@@ -647,9 +755,8 @@ def _iso(value: datetime) -> str:
 def _is_fresh(snapshot: UniverseSnapshot, now: datetime, interval: timedelta) -> bool:
     if snapshot.status != "CURRENT" or snapshot.observed_at is None:
         return False
-    age = now - ensure_utc(snapshot.observed_at)
+    age = ensure_utc(now) - ensure_utc(snapshot.observed_at)
     return age >= timedelta(0) and age < interval
-
 
 __all__ = [
     "CoinGeckoRankingProvider",
@@ -663,5 +770,8 @@ __all__ = [
     "UniverseConfig",
     "UniverseSnapshot",
     "build_crypto_universe",
+    "crypto_universe_status",
     "is_leveraged_token_style",
+    "load_crypto_universe",
+    "refresh_crypto_universe",
 ]

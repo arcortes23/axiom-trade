@@ -11,7 +11,12 @@ from typing import Any, Mapping, Sequence
 from decimal import Decimal
 
 from .collector import CollectorConfig, PolymarketCollector
-from .canary import CanaryBlocked, CanaryService, CredentialStore, PolymarketClobV2Venue
+from .canary import (
+    CanaryBlocked,
+    CanaryService,
+    CredentialStore,
+    PolymarketClobV2Venue,
+)
 from .dashboard import DashboardData, DashboardServer
 from .data import BinanceAdapter, PolymarketAdapter, SyntheticCryptoProvider
 from .director import compact_report, research_summary, validate_hermes_proposal
@@ -21,6 +26,7 @@ from .forward import ForwardTestRegistry, _content_hash
 from .node import NodeConfig, ResearchNode
 from .paper_engine import historical_replay_id, run_forward_paper, run_historical_replay
 from .research import run_crypto_research, run_initial_research, write_report
+from .research import run_multi_symbol_crypto_research
 from .research_bus import DurableResearchBus, ResearchBusPermissionError, _validate_payload
 from .strategy import evaluate_signal_record, load_strategy
 from .tracking import ExperimentTracker
@@ -29,7 +35,15 @@ from .bootstrap import (
     BTC_HISTORY_START,
     BTC_INTERVAL_SECONDS,
     HistoricalBootstrapper,
+    crypto_universe_dataset_id,
     run_btc_historical_research,
+)
+from .crypto_universe import (
+    CoinGeckoRankingProvider,
+    UniverseConfig,
+    crypto_universe_status,
+    load_crypto_universe,
+    refresh_crypto_universe,
 )
 
 _SYNTHETIC_START = datetime(2024, 1, 1, tzinfo=timezone.utc)
@@ -169,6 +183,57 @@ def build_parser() -> argparse.ArgumentParser:
     bootstrap.add_argument("--max-attempts", type=int, default=4)
     bootstrap.add_argument("--backoff", type=float, default=0.5)
     bootstrap.add_argument("--output")
+    bootstrap.add_argument("--universe", action="store_true", help="bootstrap the selected immutable crypto universe")
+    bootstrap.add_argument("--crypto-universe", action="store_true", help="bootstrap the latest persisted immutable crypto universe")
+    bootstrap.add_argument("--universe-version", help="exact immutable crypto universe version")
+    bootstrap.add_argument("--universe-id", help="exact immutable crypto universe identity")
+    bootstrap.add_argument("--max-symbols", type=int, default=50)
+    crypto_universe = commands.add_parser("crypto-universe", help="show or refresh the bounded crypto universe")
+    universe_action = crypto_universe.add_mutually_exclusive_group(required=True)
+    universe_action.add_argument("--status", action="store_true", help="show the persisted crypto universe status")
+    universe_action.add_argument("--refresh", action="store_true", help="refresh the bounded crypto universe")
+    crypto_universe.add_argument("--top", dest="top_n", type=int, default=50, help="maximum ranked assets (1-50)")
+    crypto_universe.add_argument("--db", default=DEFAULT_DB_PATH)
+    crypto_universe.add_argument("--timeout", type=float, default=10.0)
+    universe_status = commands.add_parser("universe-status", help="show the persisted crypto universe status")
+    universe_status.add_argument("--db", default=DEFAULT_DB_PATH)
+    universe_status.add_argument("--universe-id")
+    universe_status.add_argument("--universe-version")
+    universe_refresh = commands.add_parser("universe-refresh", help="refresh the bounded crypto universe")
+    universe_refresh.add_argument("--db", default=DEFAULT_DB_PATH)
+    universe_refresh.add_argument("--force", action="store_true")
+    universe_refresh.add_argument("--universe-id")
+    universe_refresh.add_argument("--top-n", type=int, default=50)
+    universe_refresh.add_argument("--quote-asset", default="USDT")
+    universe_refresh.add_argument("--timeout", type=float, default=10.0)
+    universe_research = commands.add_parser("crypto-research-universe", help="research one immutable crypto universe version")
+    universe_research.add_argument("--db", default=DEFAULT_DB_PATH)
+    universe_research.add_argument("--universe-version", required=True)
+    universe_research.add_argument("--universe-id", help="exact immutable crypto universe identity")
+    universe_research.add_argument("--timeframe", default="1d")
+    universe_research.add_argument(
+        "--source-type",
+        choices=("HISTORICAL", "FORWARD_COLLECTED"),
+        default="HISTORICAL",
+    )
+    universe_research.add_argument("--start")
+    universe_research.add_argument("--end")
+    universe_research.add_argument("--output")
+    universe_research.add_argument("--timeout", type=float, default=10.0)
+    crypto_research = commands.add_parser("crypto-research", help="research the exact persisted crypto universe")
+    crypto_research.add_argument("--universe", required=True, help="persisted universe version or latest")
+    crypto_research.add_argument("--universe-id", help="exact immutable crypto universe identity")
+    crypto_research.add_argument("--db", default=DEFAULT_DB_PATH)
+    crypto_research.add_argument("--timeframe", default="1d")
+    crypto_research.add_argument(
+        "--source-type",
+        choices=("HISTORICAL", "FORWARD_COLLECTED"),
+        default="HISTORICAL",
+    )
+    crypto_research.add_argument("--start")
+    crypto_research.add_argument("--end")
+    crypto_research.add_argument("--timeout", type=float, default=10.0)
+    crypto_research.add_argument("--output")
     catalog = commands.add_parser("dataset-catalog", help="list immutable historical and forward dataset catalog records")
     catalog.add_argument("--db", default=DEFAULT_DB_PATH)
     catalog.add_argument("--source", choices=("HISTORICAL", "FORWARD_COLLECTED"))
@@ -285,11 +350,17 @@ def build_parser() -> argparse.ArgumentParser:
     arm.add_argument("--target-notional-usd", type=Decimal, default=Decimal("1.00"))
     arm.add_argument("--expires-hours", type=Decimal, default=Decimal("24"))
     arm.add_argument("--allow-environment", action="store_true")
-    check = commands.add_parser("canary-check", help="perform authenticated checks without placing an order")
+    check = commands.add_parser(
+        "canary-check",
+        aliases=("canary-connectivity-check",),
+        help="perform strict authenticated read-only checks without placing an order",
+    )
     check.add_argument("--db", default=DEFAULT_DB_PATH)
     check.add_argument("--candidate")
     check.add_argument("--market")
+    check.add_argument("--market-id", dest="market")
     check.add_argument("--token")
+    check.add_argument("--asset-id", dest="token")
     check.add_argument("--allow-environment", action="store_true")
     return parser
 def _register_cli_forward_test(args: argparse.Namespace, store: AxiomStore, *, historical: bool = False) -> Any:
@@ -349,6 +420,242 @@ def _resolve_cli_forward_test(args: argparse.Namespace, store: AxiomStore, *, hi
         return spec
     raise ValueError(f"unknown registered forward-test experiment: {args.experiment}")
 
+
+_MAX_CLI_UNIVERSE_SIZE = 50
+
+
+def _validate_cli_universe_size(value: Any) -> int:
+    """Validate a CLI universe bound independently of helper defaults."""
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= _MAX_CLI_UNIVERSE_SIZE:
+        raise ValueError(f"crypto universe size must be an integer from 1 to {_MAX_CLI_UNIVERSE_SIZE}")
+    return value
+
+
+def _load_cli_universe(
+    store: AxiomStore,
+    selector: str | None = None,
+    *,
+    universe_id: str | None = None,
+) -> tuple[Any, str, dict[str, Any], tuple[str, ...]]:
+    """Resolve a selector to one persisted snapshot and immutable provenance."""
+    requested = None if selector is None or selector.strip().lower() == "latest" else selector.strip()
+    explicit_id = str(universe_id).strip() if universe_id else None
+    snapshot = load_crypto_universe(store, universe_id=explicit_id, version=requested)
+    if snapshot is None:
+        label = "latest" if requested is None else requested
+        if explicit_id:
+            label = f"{explicit_id}/{label}"
+        raise ValueError(f"no persisted crypto universe found for {label}")
+    if isinstance(snapshot, Mapping):
+        version_value = snapshot.get("universe_version", snapshot.get("version", snapshot.get("snapshot_hash")))
+        provenance = dict(snapshot)
+        raw_records = snapshot.get("records")
+        if isinstance(raw_records, Sequence) and not isinstance(raw_records, (str, bytes, bytearray)):
+            symbols = tuple(
+                str(row.get("binance_symbol") or row.get("symbol"))
+                for row in raw_records
+                if isinstance(row, Mapping) and row.get("selected", True)
+            )
+        else:
+            symbols = tuple(str(item) for item in snapshot.get("selected_symbols", snapshot.get("symbols", ())))
+    else:
+        version_value = getattr(snapshot, "version", None)
+        provenance_method = getattr(snapshot, "to_provenance", None)
+        provenance = dict(provenance_method()) if callable(provenance_method) else dict(snapshot.as_dict())
+        symbols = tuple(str(item) for item in getattr(snapshot, "selected_symbols", ()))
+    version = str(version_value).strip() if version_value is not None else ""
+    if not version:
+        raise ValueError("persisted crypto universe must have an exact version")
+    loaded_id = str(provenance.get("universe_id") or "").strip()
+    if explicit_id and loaded_id and loaded_id != explicit_id:
+        raise ValueError("persisted crypto universe identity does not match requested universe_id")
+    if explicit_id:
+        loaded_id = explicit_id
+    if not loaded_id:
+        raise ValueError("persisted crypto universe must have an exact universe_id")
+    symbols = tuple(dict.fromkeys(item.strip() for item in symbols if item.strip()))
+    _validate_cli_universe_size(len(symbols))
+    provenance["universe_id"] = loaded_id
+    provenance["universe_version"] = version
+    provenance.setdefault("version", version)
+    provenance.setdefault("snapshot_hash", version)
+    provenance.setdefault("selected_symbols", list(symbols))
+    provenance.setdefault("symbols", list(symbols))
+    return snapshot, version, provenance, symbols
+
+
+def _universe_config(*, universe_id: str | None = None, top_n: int = 50, quote_asset: str = "USDT") -> UniverseConfig:
+    """Build a CLI universe config while retaining custom identity aliases."""
+    _validate_cli_universe_size(top_n)
+    explicit_id = str(universe_id).strip() if universe_id else None
+    return UniverseConfig(top_n=top_n, quote_asset=quote_asset, universe_id=explicit_id)
+
+
+def _snapshot_payload(item: Any) -> Any:
+    return item.as_dict() if hasattr(item, "as_dict") else item
+
+
+def _canonical_cli_symbol(value: Any) -> str:
+    return str(value).replace("/", "").replace("-", "").replace("_", "").strip().upper()
+
+
+def _load_cli_dataset_binding(
+    store: AxiomStore,
+    *,
+    universe_id: str,
+    universe_version: str,
+    symbol: str,
+    timeframe: str,
+    source_type: str,
+) -> dict[str, Any]:
+    """Resolve one symbol to an exact catalog entry without contacting a provider."""
+    timeframe_value = str(timeframe).strip()
+    source_value = str(source_type).strip().upper()
+    if not timeframe_value:
+        raise ValueError("crypto research timeframe must not be empty")
+    if source_value not in {"HISTORICAL", "FORWARD_COLLECTED"}:
+        raise ValueError("crypto research source_type must be HISTORICAL or FORWARD_COLLECTED")
+
+    dataset_id = crypto_universe_dataset_id(universe_id, universe_version, symbol, timeframe_value)
+    catalog_loader = getattr(store, "load_dataset_catalog", None)
+    if not callable(catalog_loader):
+        raise ValueError("crypto research requires a persisted dataset catalog")
+
+    candidates: list[Mapping[str, Any]] = []
+    latest = catalog_loader(dataset_id)
+    if isinstance(latest, Mapping):
+        candidates.append(latest)
+    versions_loader = getattr(store, "dataset_versions", None)
+    if callable(versions_loader):
+        for candidate_version in versions_loader(dataset_id):
+            try:
+                candidate = catalog_loader(dataset_id, str(candidate_version))
+            except TypeError:
+                break
+            if isinstance(candidate, Mapping):
+                candidates.append(candidate)
+
+    matches: list[Mapping[str, Any]] = []
+    for catalog in candidates:
+        catalog_id = str(catalog.get("dataset_id", "")).strip()
+        catalog_version = str(catalog.get("dataset_version", catalog.get("version", ""))).strip()
+        metadata = catalog.get("metadata")
+        metadata = dict(metadata) if isinstance(metadata, Mapping) else {}
+        catalog_timeframe = str(
+            catalog.get("timeframe") or metadata.get("timeframe") or metadata.get("interval") or ""
+        ).strip()
+        catalog_source = str(
+            catalog.get("source_type") or metadata.get("source_type") or ""
+        ).strip().upper()
+        instrument = str(catalog.get("instrument") or metadata.get("instrument") or "").strip()
+        market_type = str(catalog.get("market_type", "")).strip().lower()
+        if (
+            catalog_id != dataset_id
+            or not catalog_version
+            or catalog_version.casefold() in {"latest", "current", "unversioned"}
+            or market_type != "crypto_spot"
+            or catalog_timeframe != timeframe_value
+            or catalog_source != source_value
+            or not instrument
+            or _canonical_cli_symbol(instrument) != _canonical_cli_symbol(symbol)
+        ):
+            continue
+        matches.append(catalog)
+    if matches:
+        catalog = max(
+            matches,
+            key=lambda item: (
+                str(item.get("updated_at") or item.get("created_at") or ""),
+                str(item.get("dataset_version", item.get("version", ""))),
+            ),
+        )
+        catalog_version = str(catalog.get("dataset_version", catalog.get("version", ""))).strip()
+        return {
+            "symbol": symbol,
+            "dataset_id": dataset_id,
+            "dataset_version": catalog_version,
+            "timeframe": timeframe_value,
+            "source_type": source_value,
+            "catalog": dict(catalog),
+        }
+
+    raise ValueError(
+        "missing persisted crypto dataset "
+        f"{dataset_id} for timeframe={timeframe_value} source_type={source_value}"
+    )
+
+
+
+
+def _run_cli_crypto_research(
+    args: argparse.Namespace,
+    store: AxiomStore,
+    *,
+    selector: str,
+    universe_id: str | None = None,
+) -> dict[str, Any]:
+    _, version, provenance, symbols = _load_cli_universe(store, selector, universe_id=universe_id)
+    universe_id = str(provenance.get("universe_id") or "").strip()
+    if not universe_id:
+        raise ValueError("persisted crypto universe must have an exact universe_id")
+    timeframe = str(getattr(args, "timeframe", "1d") or "").strip()
+    source_type = str(getattr(args, "source_type", "HISTORICAL") or "").strip().upper()
+    bindings: dict[str, dict[str, Any]] = {}
+    missing: list[str] = []
+    for symbol in symbols:
+        try:
+            bindings[symbol] = _load_cli_dataset_binding(
+                store,
+                universe_id=universe_id,
+                universe_version=version,
+                symbol=symbol,
+                timeframe=timeframe,
+                source_type=source_type,
+            )
+        except ValueError as exc:
+            missing.append(f"{symbol}: {exc}")
+    if missing:
+        raise ValueError(
+            "missing persisted crypto dataset(s); refusing provider/latest fallback: "
+            + "; ".join(missing)
+        )
+
+    start = _parse_cli_timestamp(getattr(args, "start", None))
+    end = _parse_cli_timestamp(getattr(args, "end", None))
+    if start is not None and end is not None and end < start:
+        raise ValueError("--end must be on or after --start")
+
+    dataset_ids = {symbol: binding["dataset_id"] for symbol, binding in bindings.items()}
+    dataset_versions = {
+        symbol: binding["dataset_version"] for symbol, binding in bindings.items()
+    }
+    timeframes = {symbol: binding["timeframe"] for symbol, binding in bindings.items()}
+    source_types = {symbol: binding["source_type"] for symbol, binding in bindings.items()}
+    payload = run_crypto_research(
+        provider=None,
+        symbols=symbols,
+        store=store,
+        start=start,
+        end=end,
+        timeout=getattr(args, "timeout", 10.0),
+        universe=provenance,
+        universe_provenance=provenance,
+        dataset_id=dataset_ids,
+        dataset_version=dataset_versions,
+        timeframe=timeframes,
+        source_type=source_types,
+    )
+    payload = dict(payload)
+    payload.setdefault("universe_id", universe_id)
+    payload.setdefault("universe_version", version)
+    payload.setdefault("universe_provenance", provenance)
+    payload.setdefault("dataset_bindings", bindings)
+    payload.setdefault(
+        "dataset_provenance",
+        {symbol: dict(binding["catalog"]) for symbol, binding in bindings.items()},
+    )
+    return payload
+
 def _load_json_argument(value: str) -> Any:
     path = Path(value)
     if path.is_file():
@@ -406,34 +713,99 @@ def main(argv: Sequence[str] | None = None) -> int:
             credentials.configure()
         print(json.dumps({"venue": "polymarket", "configured": credentials.configured(allow_environment=getattr(args, "allow_environment", False))}))
         return 0
-    if args.command in {"canary-status", "canary-disarm", "canary-kill", "canary-eligible", "canary-arm", "canary-check"}:
+    if args.command in {
+        "canary-status",
+        "canary-disarm",
+        "canary-kill",
+        "canary-eligible",
+        "canary-arm",
+        "canary-check",
+        "canary-connectivity-check",
+    }:
         try:
             with AxiomStore(args.db) as store:
-                service = CanaryService(store)
+                service = CanaryService(
+                    store,
+                    allow_environment=getattr(args, "allow_environment", False),
+                )
                 if args.command == "canary-status":
                     payload = service.status()
                 elif args.command == "canary-disarm":
-                    service.disarm(); payload = service.status()
+                    service.disarm()
+                    payload = service.status()
                 elif args.command == "canary-kill":
-                    service.kill(); payload = service.status()
+                    service.kill()
+                    payload = service.status()
                 elif args.command == "canary-eligible":
-                    service.mark_eligible(args.candidate); payload = {"candidate": args.candidate, "canary_eligible": True, "live_execution": False}
+                    service.mark_eligible(args.candidate)
+                    payload = {
+                        "candidate": args.candidate,
+                        "canary_eligible": True,
+                        "live_execution": False,
+                    }
                 else:
-                    values = service.credentials.load(allow_environment=args.allow_environment)
-                    venue = PolymarketClobV2Venue(values) if values else None
-                    if args.command == "canary-check":
-                        payload = service.check(candidate_id=args.candidate, venue=venue, market_id=args.market, token_id=args.token, allow_environment=args.allow_environment)
+                    credentials_configured = service.credentials.configured(
+                        allow_environment=args.allow_environment
+                    )
+                    is_connectivity = args.command == "canary-connectivity-check"
+                    # Connectivity constructs a venue backed by fresh
+                    # CredentialStore reads so it can report SDK/geoblock
+                    # diagnostics while still failing closed when absent.
+                    venue = (
+                        PolymarketClobV2Venue(
+                            allow_environment=args.allow_environment,
+                        )
+                        if credentials_configured or is_connectivity
+                        else None
+                    )
+                    if is_connectivity:
+                        payload = service.connectivity_check(
+                            candidate_id=args.candidate,
+                            venue=venue,
+                            market_id=args.market,
+                            token_id=args.token,
+                            allow_environment=args.allow_environment,
+                        )
+                    elif args.command == "canary-check":
+                        payload = service.check(
+                            candidate_id=args.candidate,
+                            venue=venue,
+                            market_id=args.market,
+                            token_id=args.token,
+                            allow_environment=args.allow_environment,
+                        )
                     else:
                         if venue is None:
                             raise CanaryBlocked("CREDENTIALS_NOT_CONFIGURED")
-                        confirmation = input(f"Arm {args.candidate} on Polymarket for ${args.target_notional_usd} until {args.expires_hours}h? Type ARM: ")
+                        confirmation = input(
+                            f"Arm {args.candidate} on Polymarket for "
+                            f"${args.target_notional_usd} until {args.expires_hours}h? "
+                            "Type ARM: "
+                        )
                         if confirmation.strip() != "ARM":
                             raise CanaryBlocked("OPERATOR_CONFIRMATION_REQUIRED")
-                        payload = service.arm(args.candidate, venue=venue, target_notional_usd=args.target_notional_usd, expires_hours=args.expires_hours, credentials_configured=True)
+                        payload = service.arm(
+                            args.candidate,
+                            venue=venue,
+                            target_notional_usd=args.target_notional_usd,
+                            expires_hours=args.expires_hours,
+                            credentials_configured=credentials_configured,
+                        )
             print(json.dumps(payload, sort_keys=True, indent=2, default=str))
             return 0 if payload.get("ready", True) else 1
         except CanaryBlocked as exc:
-            print(json.dumps({"ready": False, "message": "NOT READY FOR MICRO LIVE CANARY", "failures": [str(exc)], "live_execution": False}, sort_keys=True, indent=2))
+            print(
+                json.dumps(
+                    {
+                        "ready": False,
+                        "message": "NOT READY FOR MICRO LIVE CANARY",
+                        "failures": [str(exc)],
+                        "live_execution": False,
+                    },
+                    sort_keys=True,
+                    indent=2,
+                )
+            )
             return 1
     if args.command in {"demo", "synthetic-demo", "research"}:
         result = run_synthetic_research(rows=args.rows, train=args.train, validation=args.validation, holdout=args.holdout, strategy_id=args.strategy)
@@ -459,6 +831,67 @@ def main(argv: Sequence[str] | None = None) -> int:
             write_report(report, args.markdown_output)
         print(json.dumps(payload, sort_keys=True, indent=2))
         return 0
+    if args.command == "crypto-universe":
+        top_n = _validate_cli_universe_size(args.top_n)
+        config = _universe_config(top_n=top_n)
+        with AxiomStore(args.db) as store:
+            if args.status:
+                payload = crypto_universe_status(store, config=config)
+            else:
+                snapshot = refresh_crypto_universe(
+                    CoinGeckoRankingProvider(per_page=top_n, timeout=args.timeout),
+                    BinanceAdapter(timeout=args.timeout),
+                    store,
+                    config=config,
+                    force=True,
+                )
+                payload = _snapshot_payload(snapshot)
+        print(json.dumps(payload, sort_keys=True, indent=2, default=str))
+        return 0
+    if args.command == "universe-status":
+        config = _universe_config(
+            universe_id=args.universe_id,
+            top_n=50,
+        )
+        with AxiomStore(args.db) as store:
+            payload = crypto_universe_status(
+                store,
+                config=config,
+                version=args.universe_version,
+            )
+        print(json.dumps(payload, sort_keys=True, indent=2, default=str))
+        return 0
+    if args.command == "universe-refresh":
+        top_n = _validate_cli_universe_size(args.top_n)
+        config = _universe_config(
+            universe_id=args.universe_id,
+            top_n=top_n,
+            quote_asset=args.quote_asset,
+        )
+        with AxiomStore(args.db) as store:
+            snapshot = refresh_crypto_universe(
+                CoinGeckoRankingProvider(per_page=top_n, timeout=args.timeout),
+                BinanceAdapter(timeout=args.timeout),
+                store,
+                config=config,
+                force=args.force,
+            )
+            payload = _snapshot_payload(snapshot)
+        print(json.dumps(payload, sort_keys=True, indent=2, default=str))
+        return 0
+    if args.command in {"crypto-research", "crypto-research-universe"}:
+        selector = args.universe if args.command == "crypto-research" else args.universe_version
+        with AxiomStore(args.db) as store:
+            payload = _run_cli_crypto_research(
+                args,
+                store,
+                selector=selector,
+                universe_id=args.universe_id,
+            )
+        if args.output:
+            write_report(payload, args.output)
+        print(json.dumps(payload, sort_keys=True, indent=2, default=str))
+        return 0
     if args.command == "bootstrap-history":
         with AxiomStore(args.db) as store:
             bootstrapper = HistoricalBootstrapper(
@@ -471,29 +904,59 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.status:
                 payload = bootstrapper.status()
             else:
-                start = _parse_cli_timestamp(args.start) or BTC_HISTORY_START
-                end = _parse_cli_timestamp(args.end)
-                if end is not None and end < start:
-                    raise ValueError("--end must be on or after --start")
-                selected_crypto = bool(args.crypto or args.all or not (args.crypto or args.polymarket or args.all))
-                selected_polymarket = bool(args.polymarket or args.all or not (args.crypto or args.polymarket or args.all))
-                payload = {}
-                if selected_crypto:
-                    payload["crypto"] = [
-                        item.as_record()
-                        for item in bootstrapper.bootstrap_crypto(
-                            intervals=args.interval or tuple(BTC_INTERVAL_SECONDS),
-                            start=start,
-                            end=end,
-                            full_15m=args.full_15m,
+                universe_mode = bool(args.crypto_universe or args.universe)
+                if universe_mode:
+                    if args.crypto or args.polymarket or args.all:
+                        raise ValueError("--crypto-universe cannot be combined with --crypto, --polymarket, or --all")
+                    max_symbols = _validate_cli_universe_size(args.max_symbols)
+                    snapshot, version, _, _ = _load_cli_universe(
+                        store,
+                        args.universe_version,
+                        universe_id=args.universe_id,
+                    )
+                    start = _parse_cli_timestamp(args.start) or BTC_HISTORY_START
+                    end = _parse_cli_timestamp(args.end)
+                    if end is not None and end < start:
+                        raise ValueError("--end must be on or after --start")
+                    payload = {
+                        "crypto_universe": [
+                            item.as_record()
+                            for item in bootstrapper.bootstrap_crypto_universe(
+                                snapshot,
+                                universe_version=version,
+                                intervals=args.interval or tuple(BTC_INTERVAL_SECONDS),
+                                start=start,
+                                end=end,
+                                full_15m=args.full_15m,
+                                resume=args.resume,
+                                max_symbols=max_symbols,
+                            )
+                        ]
+                    }
+                else:
+                    start = _parse_cli_timestamp(args.start) or BTC_HISTORY_START
+                    end = _parse_cli_timestamp(args.end)
+                    if end is not None and end < start:
+                        raise ValueError("--end must be on or after --start")
+                    selected_crypto = bool(args.crypto or args.all or not (args.crypto or args.polymarket or args.all))
+                    selected_polymarket = bool(args.polymarket or args.all or not (args.crypto or args.polymarket or args.all))
+                    payload = {}
+                    if selected_crypto:
+                        payload["crypto"] = [
+                            item.as_record()
+                            for item in bootstrapper.bootstrap_crypto(
+                                intervals=args.interval or tuple(BTC_INTERVAL_SECONDS),
+                                start=start,
+                                end=end,
+                                full_15m=args.full_15m,
+                                resume=args.resume,
+                            )
+                        ]
+                    if selected_polymarket:
+                        payload["polymarket"] = bootstrapper.bootstrap_polymarket(
+                            max_markets=args.max_markets,
                             resume=args.resume,
-                        )
-                    ]
-                if selected_polymarket:
-                    payload["polymarket"] = bootstrapper.bootstrap_polymarket(
-                        max_markets=args.max_markets,
-                        resume=args.resume,
-                    ).as_record()
+                        ).as_record()
         if args.output:
             Path(args.output).write_text(json.dumps(payload, sort_keys=True, indent=2, default=str), encoding="utf-8")
         print(json.dumps(payload, sort_keys=True, indent=2, default=str))

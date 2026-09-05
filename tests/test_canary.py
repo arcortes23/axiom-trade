@@ -3,10 +3,13 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import json
+import hashlib
+import sys
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
-from axiom.canary import CanaryBlocked, CanaryLimits, CanaryService, CredentialStore, PRODUCTION_LIVE_EXECUTION
+from axiom.canary import CanaryBlocked, CanaryLimits, CanaryService, CredentialStore, PolymarketClobV2Venue, PRODUCTION_LIVE_EXECUTION
 from axiom.cli import main
 from axiom.dashboard import DashboardData, _dashboard_html
 from axiom.storage import AxiomStore
@@ -23,41 +26,127 @@ class FakeCredentials(CredentialStore):
     def load(self, **kwargs): return {name:"test-only" for name in ("private_key","wallet_address","relayer_api_key","relayer_api_key_address")} if self.value else {}
 
 class FakeVenue:
-    def __init__(self, *, blocked=False, close_only=False, minimum="1", ask="0.50", balance="10", accepting=True):
-        self.blocked=blocked; self.close_only=close_only; self.minimum=minimum; self.ask=ask; self._balance=balance; self.accepting=accepting; self.submissions=[]
+    def __init__(self, *, blocked=False, close_only=False, minimum="1", ask="0.50", asks=None, balance="10", accepting=True):
+        self.blocked=blocked; self.close_only=close_only; self.minimum=minimum; self.ask=ask; self.asks=asks if asks is not None else [{"price":ask,"size":"100"}]; self._balance=balance; self.accepting=accepting; self.submissions=[]
     def geoblock(self): return {"blocked":self.blocked,"close_only":self.close_only,"country":"ZZ","region":"T"}
     def connectivity_check(self): return True
-    def market_context(self, market_id, token_id): return {"accepting_orders":self.accepting,"min_order_size":self.minimum,"tick_size":"0.01","bids":[{"price":"0.49","size":"100"}],"asks":[{"price":self.ask,"size":"100"}],"fee_bps":"10"}
+    def market_context(self, market_id, token_id): return {"accepting_orders":self.accepting,"min_order_size":self.minimum,"tick_size":"0.01","bids":[{"price":"0.49","size":"100"}],"asks":self.asks,"fee_bps":"10"}
     def balance(self): return Decimal(self._balance)
     def submit_limit_order(self, **kwargs): self.submissions.append(kwargs); return {"ok":True,"order_id":"fake-order","status":"matched"}
+class CrashGapVenue(FakeVenue):
+    def __init__(self, store):
+        super().__init__()
+        self.store = store
+        self.observed_status = None
+        self.observed_in_transaction = None
+
+    def submit_limit_order(self, **kwargs):
+        self.observed_in_transaction = self.store.connection.in_transaction
+        row = self.store.connection.execute(
+            "SELECT status FROM canary_ledger WHERE signal_id=?",
+            ("crash-gap",),
+        ).fetchone()
+        self.observed_status = row["status"] if row is not None else None
+        raise KeyboardInterrupt("simulated process interruption")
+
 
 class CanaryTests(unittest.TestCase):
+
     def setUp(self):
         self.store=HealthyStore(":memory:"); self.service=CanaryService(self.store,credentials=FakeCredentials(),clock=lambda:T0); self.venue=FakeVenue()
-        payload={"schema_validated":True,"historical_backtest_passed":True,"validation_passed":True,"robustness_passed":True,"frozen_hash":"abc","data_quality_passed":True,"paper_only":True}
+        hash_parts=("strategy-v1","model-v1","config-v1")
+        payload={
+            "schema_validated":True,
+            "historical_backtest_passed":True,
+            "validation_passed":True,
+            "robustness_passed":True,
+            "data_quality_passed":True,
+            "frozen":True,
+            "holdout_used":False,
+            "strategy_hash":hash_parts[0],
+            "model_hash":hash_parts[1],
+            "config_hash":hash_parts[2],
+            "frozen_hash":hashlib.sha256("|".join(hash_parts).encode()).hexdigest(),
+            "forward_evidence":{
+                "forward_duration_seconds":7*86400,
+                "forward_independent_resolved_bets":30,
+                "forward_successful_order_attempts":20,
+                "forward_expectancy":0.1,
+                "forward_confidence_lower_bound":0.0,
+                "forward_stability":0.6,
+                "forward_calibration":0.8,
+                "forward_liquidity":0.0,
+                "forward_max_drawdown":0.2,
+                "forward_regime_count":3,
+            },
+        }
         self.store.save_candidate_lifecycle("C123","IDEA",payload,timestamp=T0)
-        for stage in ("SCHEMA_VALIDATED","BACKTESTED","VALIDATED","ROBUSTNESS_CHECKED","FROZEN"):
+        for stage in ("SCHEMA_VALIDATED","BACKTESTED","VALIDATED","ROBUSTNESS_CHECKED","FROZEN","PAPER_FORWARD","PAPER_PROMOTABLE"):
             self.store.save_candidate_lifecycle("C123",stage,payload,timestamp=T0)
         self.service.mark_eligible("C123")
-    def tearDown(self): self.store.close()
     def arm(self, **kwargs): return self.service.arm("C123",venue=kwargs.pop("venue",self.venue),credentials_configured=True,**kwargs)
-    def submit(self, signal="s1", **kwargs): return self.service.submit(signal_id=signal,candidate_id="C123",market_id="m",token_id="yes",side="BUY",paper_expected_price=Decimal("0.50"),venue=kwargs.pop("venue",self.venue),**kwargs)
+    def submit(self, signal="s1", **kwargs):
+        candidate_id = kwargs.pop("candidate_id", "C123")
+        return self.service.submit(signal_id=signal,candidate_id=candidate_id,market_id="m",token_id="yes",side="BUY",paper_expected_price=Decimal("0.50"),venue=kwargs.pop("venue",self.venue),allow_test_venue=kwargs.pop("allow_test_venue",True),**kwargs)
     def assertBlocked(self, code, fn):
         with self.assertRaisesRegex(CanaryBlocked,code): fn()
 
     def test_default_startup_cannot_trade(self): self.assertBlocked("CANARY_NOT_ARMED",self.submit)
+
+    def test_limits_reject_nonfinite_values(self):
+        for field in ("target_notional_usd", "max_exposure_usd", "max_daily_loss_usd"):
+            with self.assertRaises(ValueError):
+                CanaryLimits(**{field: Decimal("NaN")})
+            with self.assertRaises(ValueError):
+                CanaryLimits(**{field: Decimal("Infinity")})
     def test_missing_credentials_cannot_arm(self):
         service=CanaryService(self.store,credentials=FakeCredentials(False),clock=lambda:T0)
-        self.assertBlocked("CREDENTIALS_NOT_CONFIGURED",lambda:service.arm("C123",venue=self.venue))
+        self.assertBlocked("CREDENTIALS_NOT_CONFIGURED",lambda:service.arm("C123",venue=self.venue,credentials_configured=True))
     def test_hermes_has_no_canary_execution_fields(self):
         from axiom.director import validate_hermes_proposal
         result=validate_hermes_proposal({"proposal_id":"x","statement":"x","source":"x","tests":["x"],"dataset_version":"v","time_split":"train-validation-holdout","paper_only":True,"canary_arm":True})
         self.assertFalse(result.accepted)
     def test_ineligible_candidate_cannot_arm(self): self.assertBlocked("NOT_CANARY_ELIGIBLE",lambda:self.service.arm("other",venue=self.venue,credentials_configured=True))
+    def test_early_lifecycle_stages_cannot_mark_eligible(self):
+        template = dict(self.store.load_candidate_lifecycle("C123")["payload"])
+        for candidate_id, terminal_stage in (("EARLY-FROZEN", "FROZEN"), ("EARLY-FORWARD", "PAPER_FORWARD")):
+            self.store.save_candidate_lifecycle(candidate_id, "IDEA", template, timestamp=T0)
+            for stage in ("SCHEMA_VALIDATED", "BACKTESTED", "VALIDATED", "ROBUSTNESS_CHECKED", "FROZEN", "PAPER_FORWARD"):
+                self.store.save_candidate_lifecycle(candidate_id, stage, template, timestamp=T0)
+                if stage == terminal_stage:
+                    break
+            self.assertBlocked(
+                "CANDIDATE_RESEARCH_GATES_INCOMPLETE",
+                lambda candidate_id=candidate_id: self.service.mark_eligible(candidate_id),
+            )
     def test_expired_arm_cannot_trade(self):
         self.arm(expires_hours=Decimal("0.001")); self.service.clock=lambda:T0+timedelta(hours=1)
         self.assertBlocked("CANARY_NOT_ARMED",self.submit)
     def test_kill_switch_prevents_trading(self): self.arm(); self.service.kill(); self.assertBlocked("CANARY_NOT_ARMED",self.submit)
+    def test_kill_switch_latches_against_rearming(self):
+        self.arm()
+        self.service.kill()
+        self.service.disarm()
+        self.assertEqual(self.service.status()["micro_live_canary"], "KILLED")
+        self.assertBlocked("CANARY_KILLED", self.arm)
+
+    def test_arm_rechecks_kill_latch_before_write(self):
+        service = self.service
+
+        class KillingVenue(FakeVenue):
+            def geoblock(self):
+                service.kill()
+                return super().geoblock()
+
+        self.assertBlocked(
+            "CANARY_KILLED",
+            lambda: service.arm(
+                "C123",
+                venue=KillingVenue(),
+                credentials_configured=True,
+            ),
+        )
+        self.assertEqual(service.status()["micro_live_canary"], "KILLED")
     def test_degraded_collector_prevents_arming(self):
         self.store.polymarket_health=lambda **kwargs:{"grade":"D"}
         self.assertBlocked("COLLECTOR_DEGRADED",self.arm)
@@ -66,15 +155,224 @@ class CanaryTests(unittest.TestCase):
         self.arm(); self.assertBlocked("GEOGRAPHICALLY_BLOCKED",lambda:self.submit(venue=blocked))
     def test_target_is_never_silently_increased(self): self.arm(); result=self.submit(); self.assertLessEqual(Decimal(result["requested_notional"]),Decimal("1.00"))
     def test_market_minimum_exceeding_target_skips(self): self.arm(); venue=FakeVenue(minimum="5",ask="0.50"); self.assertBlocked("VENUE_MINIMUM_EXCEEDS",lambda:self.submit(venue=venue)); self.assertFalse(venue.submissions)
+
+    def test_non_polymarket_venue_requires_explicit_test_opt_in(self):
+        self.arm()
+        self.assertBlocked(
+            "UNSUPPORTED_VENUE",
+            lambda: self.submit(allow_test_venue=False),
+        )
+
+    def test_polymarket_subclass_requires_explicit_test_opt_in(self):
+        class EvilVenue(PolymarketClobV2Venue):
+            def geoblock(self):
+                return {"blocked": False, "close_only": False}
+
+        self.arm()
+        self.assertBlocked(
+            "UNSUPPORTED_VENUE",
+            lambda: self.submit(
+                venue=EvilVenue(),
+                allow_test_venue=False,
+            ),
+        )
     def test_slippage_prevents_submission(self): self.arm(); venue=FakeVenue(ask="0.60"); self.assertBlocked("SLIPPAGE_LIMIT",lambda:self.submit(venue=venue)); self.assertFalse(venue.submissions)
+    def test_unsorted_asks_use_lowest_price_for_readiness_and_submission(self):
+        self.arm()
+        venue = FakeVenue(
+            minimum="2",
+            asks=[
+                {"price": "0.50", "size": "100"},
+                {"price": "0.55", "size": "100"},
+            ],
+        )
+        readiness = self.service.check(
+            candidate_id="C123",
+            venue=venue,
+            market_id="m",
+            token_id="yes",
+        )
+        self.assertTrue(readiness["ready"], readiness)
+
+        self.submit(venue=venue)
+        self.assertEqual(venue.submissions[0]["price"], Decimal("0.50"))
+        evidence = json.loads(
+            self.store.connection.execute(
+                "SELECT evidence_json FROM canary_ledger"
+            ).fetchone()[0]
+        )
+        self.assertEqual(evidence["ask"], "0.50")
+        self.assertEqual(evidence["depth"], venue.asks)
+
+    def test_invalid_asks_fail_closed_for_readiness_and_submission(self):
+        self.arm()
+        for index, asks in enumerate(
+            (
+                [{"price": "NaN", "size": "100"}],
+                [{"price": "0", "size": "100"}],
+                [{"price": "-0.01", "size": "100"}],
+                [{"price": "not-a-price", "size": "100"}],
+            )
+        ):
+            venue = FakeVenue(asks=asks)
+            readiness = self.service.check(
+                candidate_id="C123",
+                venue=venue,
+                market_id="m",
+                token_id="yes",
+            )
+            self.assertFalse(readiness["ready"])
+            self.assertIn("MARKET_CONNECTIVITY_FAILED", readiness["failures"])
+            self.assertBlocked(
+                "INVALID_CANARY_PARAMETERS",
+                lambda index=index, venue=venue: self.submit(
+                    signal=f"invalid-ask-{index}",
+                    venue=venue,
+                ),
+            )
+            self.assertFalse(venue.submissions)
+
+
+    def test_insufficient_balance_blocks_readiness_and_submission(self):
+        self.arm()
+        venue = FakeVenue(balance="0.50")
+        readiness = self.service.check(candidate_id="C123", venue=venue)
+        self.assertFalse(readiness["ready"])
+        self.assertIn("INSUFFICIENT_BALANCE", readiness["failures"])
+        self.assertBlocked("INSUFFICIENT_BALANCE", lambda: self.submit(venue=venue))
+        self.assertFalse(venue.submissions)
+
+    def test_balance_includes_worst_case_fees(self):
+        self.arm()
+        venue = FakeVenue(balance="1.00")
+        self.assertBlocked(
+            "INSUFFICIENT_BALANCE",
+            lambda: self.submit(venue=venue),
+        )
+        self.assertFalse(venue.submissions)
+
+    def test_exposure_limit_includes_worst_case_fees(self):
+        self.arm(limits=CanaryLimits(max_exposure_usd=Decimal("1")))
+        self.assertBlocked("EXPOSURE_LIMIT", self.submit)
+
+    def test_official_venue_rejects_plaintext_credential_mapping(self):
+        with self.assertRaises(TypeError):
+            PolymarketClobV2Venue({"private_key": "not-retained"})
+    def test_read_only_sdk_client_is_closed(self):
+        from axiom.canary import _read_only_operation
+
+        class ClosingClient:
+            wallet = "wallet"
+            wallet_type = "safe"
+
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        client = ClosingClient()
+
+        class RelayerApiKey:
+            def __init__(self, **kwargs):
+                pass
+
+        class SecureClient:
+            @staticmethod
+            def _create(**kwargs):
+                return client
+
+        sdk = SimpleNamespace(RelayerApiKey=RelayerApiKey, SecureClient=SecureClient)
+        values = {
+            "private_key": "key",
+            "wallet_address": "wallet",
+            "relayer_api_key": "api-key",
+            "relayer_api_key_address": "api-address",
+        }
+        with patch.dict(sys.modules, {"polymarket": sdk}), patch.object(
+            PolymarketClobV2Venue,
+            "installed_sdk_version",
+            return_value="0.9.0",
+        ):
+            result = _read_only_operation("account", values)
+        self.assertTrue(result["authenticated"])
+        self.assertTrue(client.closed)
     def test_daily_loss_limit_prevents_submission(self):
-        self.arm(); self.store.connection.execute("INSERT INTO canary_ledger(event_id,signal_id,timestamp,candidate_id,venue,market_id,token_id,side,requested_notional,paper_expected_price,max_price,status,realized_pnl,evidence_json) VALUES('e','old',?,?,?,?,?,?,?,?,?,'RESOLVED','-2.00','{}')",(T0.isoformat(),"C123","polymarket","m0","t","BUY","1",".5",".5")); self.assertBlocked("DAILY_LOSS_LIMIT",self.submit)
+        self.arm(); self.store.connection.execute("INSERT INTO canary_ledger(event_id,signal_id,timestamp,candidate_id,venue,market_id,token_id,side,requested_notional,paper_expected_price,max_price,status,realized_pnl,evidence_json) VALUES('e','old',?,?,?,?,?,?,?,?,?,'RESOLVED','-2.00','{}')",(T0.isoformat(),"C123","polymarket","m0","t","BUY","1",".5",".5")); self.store.connection.commit(); self.assertBlocked("DAILY_LOSS_LIMIT",self.submit)
     def test_exposure_limit_prevents_submission(self):
-        self.arm(limits=CanaryLimits(max_exposure_usd=Decimal("1"))); self.store.connection.execute("INSERT INTO canary_ledger(event_id,signal_id,timestamp,candidate_id,venue,market_id,token_id,side,requested_notional,paper_expected_price,max_price,status,evidence_json) VALUES('e','old',?,?,?,?,?,?,?,?,?,'OPEN','{}')",(T0.isoformat(),"C123","polymarket","m0","t","BUY","1",".5",".5")); self.assertBlocked("EXPOSURE_LIMIT",self.submit)
+        self.arm(limits=CanaryLimits(max_exposure_usd=Decimal("1"))); self.store.connection.execute("INSERT INTO canary_ledger(event_id,signal_id,timestamp,candidate_id,venue,market_id,token_id,side,requested_notional,paper_expected_price,max_price,status,evidence_json) VALUES('e','old',?,?,?,?,?,?,?,?,?,'OPEN','{}')",(T0.isoformat(),"C123","polymarket","m0","t","BUY","1",".5",".5")); self.store.connection.commit(); self.assertBlocked("EXPOSURE_LIMIT",self.submit)
     def test_max_order_count_prevents_submission(self):
         self.arm(limits=CanaryLimits(max_orders_per_day=1)); self.submit("first"); self.assertBlocked("DAILY_ORDER_LIMIT",lambda:self.submit("second"))
+    def test_daily_order_count_excludes_prior_days(self):
+        yesterday = (T0 - timedelta(days=1)).isoformat()
+        self.store.connection.execute(
+            "INSERT INTO canary_ledger(event_id,signal_id,timestamp,candidate_id,venue,market_id,token_id,side,requested_notional,paper_expected_price,max_price,status,evidence_json) "
+            "VALUES('old-day','old-signal',?,?,?,?,?,?,?,?,?,'REJECTED','{}')",
+            (yesterday, "C123", "polymarket", "m0", "t", "BUY", "1", ".5", ".5"),
+        )
+        self.store.connection.commit()
+        self.arm(limits=CanaryLimits(max_orders_per_day=1))
+        self.submit("today")
     def test_duplicate_signal_and_restart_cannot_duplicate(self):
-        self.arm(); self.submit("same"); self.assertBlocked("DUPLICATE_SIGNAL",lambda:CanaryService(self.store,credentials=FakeCredentials(),clock=lambda:T0).submit(signal_id="same",candidate_id="C123",market_id="m",token_id="yes",side="BUY",paper_expected_price=Decimal(".5"),venue=self.venue)); self.assertEqual(len(self.venue.submissions),1)
+        self.arm(); self.submit("same"); self.assertBlocked("DUPLICATE_SIGNAL",lambda:CanaryService(self.store,credentials=FakeCredentials(),clock=lambda:T0).submit(signal_id="same",candidate_id="C123",market_id="m",token_id="yes",side="BUY",paper_expected_price=Decimal(".5"),venue=self.venue,allow_test_venue=True)); self.assertEqual(len(self.venue.submissions),1)
+    def test_reservation_commits_before_sink_and_blocks_interrupted_retry(self):
+        self.arm()
+        venue = CrashGapVenue(self.store)
+        with self.assertRaises(KeyboardInterrupt):
+            self.submit("crash-gap", venue=venue)
+        self.assertTrue(venue.observed_in_transaction)
+        self.assertEqual(venue.observed_status, "RESERVED")
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT status FROM canary_ledger WHERE signal_id='crash-gap'"
+            ).fetchone()[0],
+            "UNKNOWN",
+        )
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT status FROM canary_execution_events"
+            ).fetchone()[0],
+            "UNKNOWN",
+        )
+        self.assertBlocked(
+            "DUPLICATE_SIGNAL",
+            lambda: self.submit("crash-gap"),
+        )
+
+    def test_accepted_execution_status_counts_as_open_exposure(self):
+        self.arm()
+        self.submit("matched")
+        status = self.service.status()
+        self.assertEqual(status["open_positions"], 1)
+        self.assertEqual(status["total_exposure"], 1.0)
+        event_status = self.store.connection.execute(
+            "SELECT status FROM canary_execution_events"
+        ).fetchone()[0]
+        ledger_status = self.store.connection.execute(
+            "SELECT status FROM canary_ledger"
+        ).fetchone()[0]
+        self.assertEqual(event_status, "OPEN")
+        self.assertEqual(ledger_status, "OPEN")
+    def test_different_candidate_cannot_trade_or_write_ledger(self):
+        self.arm()
+        venue = FakeVenue()
+        self.assertBlocked("CANDIDATE_MISMATCH", lambda: self.submit(candidate_id="C999", venue=venue))
+        self.assertFalse(venue.submissions)
+        self.assertEqual(self.store.connection.execute("SELECT COUNT(*) FROM canary_ledger").fetchone()[0], 0)
+    def test_invalid_frozen_binding_cannot_trade(self):
+        self.arm()
+        self.store.connection.execute(
+            "UPDATE canary_eligibility SET frozen_hash=? WHERE candidate_id=?",
+            ("tampered", "C123"),
+        )
+        self.store.connection.commit()
+        self.assertBlocked("CANARY_NOT_ARMED", self.submit)
+        self.assertFalse(self.venue.submissions)
+    def test_armed_readiness_requires_venue(self):
+        self.arm()
+        result = self.service.connectivity_check(candidate_id="C123", venue=None)
+        self.assertFalse(result["ready"])
+        self.assertIn("VENUE_REQUIRED", result["failures"])
     def test_credentials_never_persist_or_render(self):
         self.arm(); self.submit(); dump="\n".join(str(tuple(r)) for r in self.store.connection.iterdump()); dashboard=json.dumps(DashboardData(store=self.store).operator_data(),default=str)+_dashboard_html(); self.assertNotIn("test-only",dump+dashboard)
     def test_paper_and_real_ledgers_are_separate(self):

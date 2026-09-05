@@ -1504,17 +1504,30 @@ class ResearchNode:
             stale_values = health.get("stale_markets", ())
             stale_markets = tuple(islice(iter(stale_values), 32)) if isinstance(stale_values, (list, tuple)) else ()
             stale_market_count = len(stale_values) if isinstance(stale_values, (list, tuple)) else 0
+            reasons = health.get("reasons", ())
+            current_failures = health.get("current_failures", ())
             self.store.save_worker_state(
                 worker_name,
                 "idle" if health_grade in {"A", "OK", "HEALTHY"} else "degraded",
                 {
                     "grade": health.get("grade"),
-                    "evidence_grade": health.get("evidence_maturity", {}).get("grade"),
+                    "reason_code": health.get("reason_code"),
+                    "reasons": list(reasons) if isinstance(reasons, (list, tuple)) else [],
+                    "degrading_reason": (
+                        reasons[0].get("reason") if reasons and isinstance(reasons[0], Mapping) else None
+                    ),
+                    "evidence_grade": health.get("historical_maturity_grade", health.get("evidence_maturity", {}).get("grade")),
+                    "historical_error_count": health.get("historical_error_count", 0),
                     "markets": health.get("markets", 0),
                     "stale_markets": list(stale_markets),
                     "stale_market_count": stale_market_count,
+                    "gaps": health.get("gaps", []),
+                    "current_failures": list(current_failures) if isinstance(current_failures, (list, tuple)) else [],
                     "trades": health.get("trades", 0),
                     "collection_errors": health.get("collection_errors", 0),
+                    "window_start": health.get("window_start"),
+                    "window_end": health.get("window_end"),
+                    "window_seconds": health.get("window_seconds"),
                     "paper_only": True,
                     "live_execution": False,
                 },

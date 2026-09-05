@@ -25,6 +25,7 @@ MAX_PLAN_VARIANTS = 64
 MAX_FEATURES = 64
 MAX_METRICS = 32
 MAX_SAMPLES = 100_000
+AUTONOMOUS_BUDGET_ID = "autonomous"
 
 
 class ExperimentPlanError(ValueError):
@@ -127,9 +128,16 @@ _ALLOWED_FIELDS = frozenset(
         "dataset_selector",
         "dataset_id",
         "dataset_version",
+        "dataset_timeframe",
+        "dataset_source",
+        "dataset_source_type",
+        "survivorship_bias",
         "universe",
         "universe_provenance",
+        "universe_id",
         "universe_version",
+        "universe_snapshot_hash",
+        "snapshot_hash",
         "universe_methodology",
         "methodology",
         "train_validation_methodology",
@@ -372,7 +380,13 @@ def _crypto_universe(
     selector: Mapping[str, Any],
     methodology: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Normalize the explicit, bounded universe provenance for crypto plans."""
+    """Normalize explicit, immutable universe provenance for crypto plans.
+
+    A plan may only refer to a snapshot that a worker can resolve exactly.
+    Resolution against the store is deliberately done by the autonomous
+    processor, but aliases are normalized here so the persisted plan has one
+    canonical shape.
+    """
     candidates = (
         raw.get("universe"),
         raw.get("universe_provenance"),
@@ -382,12 +396,25 @@ def _crypto_universe(
         selector.get("universe_provenance"),
     )
     source = next((value for value in candidates if value is not None), None)
+    if source is None and any(
+        raw.get(name) is not None
+        for name in ("universe_id", "universe_version", "universe_snapshot_hash", "snapshot_hash")
+    ):
+        source = {
+            "universe_id": raw.get("universe_id"),
+            "universe_version": raw.get("universe_version"),
+            "snapshot_hash": raw.get("universe_snapshot_hash", raw.get("snapshot_hash")),
+            "methodology": raw.get("universe_methodology"),
+        }
     if not isinstance(source, Mapping):
         raise ExperimentPlanError(
             "INSUFFICIENT_DATA",
             "crypto_spot plans require versioned universe provenance and methodology",
         )
     value = _as_mapping(source, name="universe")
+    universe_id = value.get("universe_id", value.get("id"))
+    if not isinstance(universe_id, str) or not universe_id.strip():
+        raise ExperimentPlanError("INSUFFICIENT_DATA", "crypto universe_id is required")
     version = value.get("universe_version", value.get("version"))
     if not isinstance(version, str) or not version.strip():
         raise ExperimentPlanError("INSUFFICIENT_DATA", "crypto universe_version is required")
@@ -400,8 +427,18 @@ def _crypto_universe(
     normalized_instruments = _string_list(instruments, name="universe.instruments", limit=1000)
     if not normalized_instruments:
         raise ExperimentPlanError("INSUFFICIENT_DATA", "crypto universe instruments are required")
+    snapshot_hash = value.get(
+        "snapshot_hash",
+        value.get("universe_snapshot_hash", value.get("content_hash", value.get("universe_hash"))),
+    )
+    if snapshot_hash is not None:
+        if not isinstance(snapshot_hash, str) or not snapshot_hash.strip():
+            raise ExperimentPlanError("INSUFFICIENT_DATA", "crypto universe snapshot_hash is required when supplied")
+        if snapshot_hash.strip().lower() in {"latest", "current", "default", "unversioned"}:
+            raise ExperimentPlanError("INSUFFICIENT_DATA", "crypto universe snapshot_hash must be immutable")
     allowed = {
         "universe_id",
+        "id",
         "universe_version",
         "version",
         "methodology",
@@ -411,22 +448,31 @@ def _crypto_universe(
         "symbols",
         "assets",
         "source",
+        "source_type",
         "content_hash",
+        "snapshot_hash",
+        "universe_snapshot_hash",
+        "universe_hash",
+        "dataset_id",
+        "survivorship_bias",
+        "survivorship",
     }
     unknown = sorted(set(value) - allowed)
     if unknown:
         raise ExperimentPlanError("UNSAFE_PLAN_FIELD", f"unsupported universe fields: {unknown}")
     result: dict[str, Any] = {
+        "universe_id": universe_id.strip(),
         "universe_version": version.strip(),
         "methodology": method.strip(),
         "instruments": list(normalized_instruments),
     }
-    if value.get("universe_id") is not None:
-        result["universe_id"] = str(value["universe_id"]).strip()
-    if value.get("source") is not None:
-        result["source"] = str(value["source"]).strip()
-    if value.get("content_hash") is not None:
-        result["content_hash"] = str(value["content_hash"]).strip()
+    if snapshot_hash is not None:
+        result["snapshot_hash"] = snapshot_hash.strip()
+    for key in ("source", "source_type", "dataset_id", "survivorship_bias", "survivorship"):
+        if value.get(key) is not None:
+            result[key] = str(value[key]).strip()
+    if "survivorship" in result and "survivorship_bias" not in result:
+        result["survivorship_bias"] = result.pop("survivorship")
     return result
 
 
@@ -552,6 +598,20 @@ class ExperimentPlan:
             selector["dataset_id"] = str(raw["dataset_id"]).strip()
         if raw.get("dataset_version") is not None:
             selector["dataset_version"] = str(raw["dataset_version"]).strip()
+        for raw_name, selector_name in (
+            ("dataset_timeframe", "timeframe"),
+            ("dataset_source", "source"),
+            ("dataset_source_type", "source_type"),
+            ("survivorship_bias", "survivorship_bias"),
+        ):
+            if raw.get(raw_name) is not None:
+                selector.setdefault(selector_name, str(raw[raw_name]).strip())
+        if selector.get("dataset_version") is None and selector.get("version") is not None:
+            selector["dataset_version"] = str(selector["version"]).strip()
+        if selector.get("source") is None and selector.get("provider") is not None:
+            selector["source"] = str(selector["provider"]).strip()
+        if selector.get("survivorship_bias") is None and selector.get("survivorship") is not None:
+            selector["survivorship_bias"] = str(selector["survivorship"]).strip()
         if not str(selector.get("dataset_version", "")).strip():
             raise ExperimentPlanError("INSUFFICIENT_DATA", "dataset_version is required")
         selector["dataset_version"] = str(selector["dataset_version"]).strip()
@@ -575,7 +635,9 @@ class ExperimentPlan:
 
         budget_value = raw.get("family_budget", raw.get("budget"))
         family_budget = _as_mapping(budget_value, name="family_budget")
-        family_budget.setdefault("budget_id", "autonomous")
+        # Hermes may describe limits, but the worker owns the namespace.  Do
+        # not let a proposal redirect reservations into another budget.
+        family_budget["budget_id"] = AUTONOMOUS_BUDGET_ID
         for name, default in (("total_limit", 1000), ("per_family_limit", 250)):
             value = family_budget.get(name, default)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -761,6 +823,54 @@ class ExperimentPlan:
         value = self.dataset_selector.get("dataset_id")
         return str(value).strip() if value is not None and str(value).strip() else None
 
+    @staticmethod
+    def _selector_text(selector: Mapping[str, Any], *names: str) -> str | None:
+        for name in names:
+            value = selector.get(name)
+            if value is not None and str(value).strip():
+                return str(value).strip()
+        return None
+
+    @property
+    def dataset_timeframe(self) -> str | None:
+        return self._selector_text(self.dataset_selector, "timeframe", "interval")
+
+    @property
+    def dataset_source(self) -> str | None:
+        return self._selector_text(self.dataset_selector, "source", "provider")
+
+    @property
+    def dataset_source_type(self) -> str | None:
+        return self._selector_text(self.dataset_selector, "source_type")
+
+    @property
+    def dataset_survivorship(self) -> str | None:
+        return self._selector_text(self.dataset_selector, "survivorship_bias", "survivorship")
+
+    @property
+    def universe_id(self) -> str | None:
+        if self.universe is None:
+            return None
+        return self._selector_text(self.universe, "universe_id", "id")
+
+    @property
+    def universe_version(self) -> str | None:
+        if self.universe is None:
+            return None
+        return self._selector_text(self.universe, "universe_version", "version")
+
+    @property
+    def universe_snapshot_hash(self) -> str | None:
+        if self.universe is None:
+            return None
+        return self._selector_text(
+            self.universe,
+            "snapshot_hash",
+            "universe_snapshot_hash",
+            "content_hash",
+            "universe_hash",
+        )
+
     @property
     def target_instrument(self) -> str | None:
         value = self.target.get("instrument", self.target.get("symbol"))
@@ -772,7 +882,7 @@ class ExperimentPlan:
 
     @property
     def budget_id(self) -> str:
-        return str(self.family_budget.get("budget_id", "autonomous")).strip() or "autonomous"
+        return AUTONOMOUS_BUDGET_ID
 
     def as_dict(self) -> dict[str, Any]:
         result: dict[str, Any] = {
@@ -861,6 +971,7 @@ class ExperimentPlan:
 
 
 __all__ = [
+    "AUTONOMOUS_BUDGET_ID",
     "ExperimentPlan",
     "ExperimentPlanError",
     "MAX_PLAN_VARIANTS",

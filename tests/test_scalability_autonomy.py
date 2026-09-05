@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 import unittest
 
-from axiom.autonomous import AutonomousResearchConfig, AutonomousResearchProcessor
+from axiom.autonomous import AutonomousResearchConfig, AutonomousResearchError, AutonomousResearchProcessor
 from axiom.domain import MarketType
 from axiom.experiment_plan import ExperimentPlan, ExperimentPlanError
 from axiom.lifecycle import CandidateStage, PromotionCriteria
@@ -23,9 +23,14 @@ def crypto_plan(**overrides: object) -> dict[str, object]:
         "target": {"instrument": "BTC/USDT"},
         "dataset_id": "crypto:BTCUSDT",
         "dataset_version": "btc-v1",
+        "dataset_timeframe": "1h",
+        "dataset_source": "fixture",
+        "dataset_source_type": "HISTORICAL",
+        "survivorship_bias": "SURVIVORSHIP_BIAS_PRESENT",
         "universe": {
             "universe_id": "spot-major",
             "universe_version": "spot-major-v1",
+            "snapshot_hash": "sha256:spot-major-v1-fixture",
             "instruments": ["BTC/USDT"],
             "methodology": "fixed-symbol allowlist",
         },
@@ -39,6 +44,46 @@ def crypto_plan(**overrides: object) -> dict[str, object]:
     }
     plan.update(overrides)
     return plan
+
+
+def seed_crypto_provenance(
+    store: AxiomStore,
+    universe_rows: list[dict[str, object]] | None = None,
+) -> None:
+    store.save_dataset_catalog(
+        "crypto:BTCUSDT",
+        "btc-v1",
+        provider="fixture",
+        instrument="BTCUSDT",
+        market_type=MarketType.CRYPTO_SPOT,
+        timeframe="1h",
+        row_count=12,
+        completeness=1.0,
+        quality="OHLCV",
+        source_type="HISTORICAL",
+        snapshot_id="crypto:BTCUSDT:btc-v1",
+        metadata={"survivorship_bias": "SURVIVORSHIP_BIAS_PRESENT"},
+    )
+    universe_rows = universe_rows if universe_rows is not None else [{"symbol": "BTC/USDT", "selected": True}]
+    store.save_dataset("universe:spot-major", "spot-major-v1", universe_rows)
+    store.save_dataset_catalog(
+        "universe:spot-major",
+        "spot-major-v1",
+        provider="fixture",
+        instrument="BTC/USDT",
+        market_type=MarketType.CRYPTO_SPOT,
+        timeframe="snapshot",
+        row_count=len(universe_rows),
+        completeness=1.0,
+        quality="UNIVERSE",
+        source_type="HISTORICAL",
+        snapshot_id="universe:spot-major:spot-major-v1",
+        metadata={
+            "universe_id": "spot-major",
+            "snapshot_hash": "sha256:spot-major-v1-fixture",
+            "point_in_time": True,
+        },
+    )
 
 
 def crypto_rows(version: str = "btc-v1") -> list[dict[str, object]]:
@@ -81,6 +126,7 @@ class CryptoAutonomyScalabilityTests(unittest.TestCase):
     def test_crypto_worker_uses_backtest_only_and_keeps_locked_holdout_out_of_evidence(self) -> None:
         with AxiomStore(":memory:") as store:
             store.save_dataset("crypto:BTCUSDT", "btc-v1", crypto_rows())
+            seed_crypto_provenance(store)
             bus = DurableResearchBus(store)
             proposal = {
                 "proposal_id": "crypto-scale",
@@ -88,7 +134,6 @@ class CryptoAutonomyScalabilityTests(unittest.TestCase):
                 "source": "immutable fixture",
                 "tests": ["chronological train-validation backtest"],
                 "dataset_version": "btc-v1",
-                "time_split": "train-validation-holdout",
                 "paper_only": True,
                 "experiment_plan": crypto_plan(),
             }
@@ -127,6 +172,63 @@ class CryptoAutonomyScalabilityTests(unittest.TestCase):
             self.assertTrue(cycle.results[0]["research_only"])
             self.assertFalse(lifecycle[0]["payload"]["holdout_used"])
             self.assertNotIn("111.5", str(lifecycle[0]["payload"]["train"]))
+
+    def test_crypto_worker_rejects_subset_universe_before_candidate_lifecycle_writes(self) -> None:
+        with AxiomStore(":memory:") as store:
+            store.save_dataset("crypto:BTCUSDT", "btc-v1", crypto_rows())
+            seed_crypto_provenance(
+                store,
+                universe_rows=[
+                    {"symbol": "BTC/USDT", "selected": True},
+                    {"symbol": "ETH-USDT", "selected": True},
+                ],
+            )
+            bus = DurableResearchBus(store)
+            proposal = {
+                "proposal_id": "crypto-subset",
+                "statement": "A deterministic crypto signal is testable.",
+                "source": "immutable fixture",
+                "tests": ["chronological train-validation backtest"],
+                "dataset_version": "btc-v1",
+                "paper_only": True,
+                "experiment_plan": crypto_plan(hypothesis_id="crypto-subset"),
+            }
+            bus.submit_hypothesis(proposal, available_at=T0, dedupe_key="crypto-subset")
+            processor = AutonomousResearchProcessor(store, bus=bus, clock=lambda: T0)
+
+            cycle = processor.process_pending(now=T0)
+
+            self.assertEqual(cycle.rejected, 1)
+            self.assertEqual(cycle.completed, 0)
+            self.assertEqual(cycle.failed, 0)
+            result = cycle.results[0]
+            self.assertFalse(result["accepted"])
+            self.assertEqual(result["reason_code"], "CRYPTO_PROVENANCE_MISMATCH")
+            self.assertIn("persisted selected rows", result["reason"])
+            self.assertIn("ETHUSDT", result["reason"])
+            self.assertEqual(store.load_candidate_lifecycle(limit=None), [])
+
+    def test_atomic_daily_cap_rejects_second_candidate_and_allows_retry(self) -> None:
+        with AxiomStore(":memory:") as store:
+            processor = AutonomousResearchProcessor(
+                store,
+                config=AutonomousResearchConfig(max_experiments_per_day=1, max_children_per_parent=0),
+                clock=lambda: T0,
+            )
+            plan = ExperimentPlan.from_mapping(crypto_plan())
+
+            processor._reserve_candidate(plan, "candidate-one", T0)
+            with self.assertRaises(AutonomousResearchError) as raised:
+                processor._reserve_candidate(plan, "candidate-two", T0 + timedelta(hours=1))
+
+            self.assertEqual(raised.exception.reason, "EXPERIMENT_DAILY_LIMIT_EXCEEDED")
+            processor._reserve_candidate(plan, "candidate-one", T0 + timedelta(hours=2))
+            self.assertEqual(store.count_experiment_budget_reservations("autonomous", since=T0, until=T0 + timedelta(days=1)), 1)
+            budget = store.load_experiment_budget("autonomous")
+            self.assertIsNotNone(budget)
+            assert budget is not None
+            self.assertEqual(budget["budget"]["used_total"], 1)
+
 
 
 if __name__ == "__main__":

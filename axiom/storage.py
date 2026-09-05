@@ -16,7 +16,7 @@ import threading
 import sqlite3
 from itertools import islice
 from dataclasses import asdict, is_dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Sequence
@@ -26,7 +26,9 @@ _QUEUE_RELEASE_BATCH = 256
 _QUEUE_LINEAGE_LIMIT = 256
 _PAGINATION_PAGE_SIZES = (10, 25, 50, 100)
 _DEFAULT_PAGE_SIZE = 25
-
+_POLYMARKET_SOURCE_TYPES = frozenset({"HISTORICAL", "FORWARD_COLLECTED"})
+_DEFAULT_OPERATIONAL_WINDOW_SECONDS = 3_600.0
+_MAX_OPERATIONAL_WINDOW_SECONDS = 86_400.0
 
 from .domain import (
     CryptoTicker,
@@ -75,9 +77,22 @@ class AxiomStore:
         """Underlying connection for dashboard integrations and read-only queries."""
         return self._conn
     @contextmanager
-    def transaction(self) -> Iterator["AxiomStore"]:
+    def transaction(self, *, immediate: bool = False) -> Iterator["AxiomStore"]:
         """Group several append-only writes into one rollback boundary."""
         with self._lock:
+            if immediate and not self._transaction_depth:
+                self._conn.execute("BEGIN IMMEDIATE")
+                self._transaction_depth += 1
+                try:
+                    yield self
+                except BaseException:
+                    self._conn.rollback()
+                    raise
+                else:
+                    self._conn.commit()
+                finally:
+                    self._transaction_depth -= 1
+                return
             self._transaction_depth += 1
             savepoint = f"axiom_tx_{id(self):x}_{self._transaction_depth}"
             self._conn.execute(f"SAVEPOINT {savepoint}")
@@ -236,6 +251,7 @@ class AxiomStore:
                     observed_at TEXT NOT NULL,
                     metadata_hash TEXT NOT NULL,
                     payload_json TEXT NOT NULL,
+                    source_type TEXT NOT NULL DEFAULT 'FORWARD_COLLECTED',
                     created_at TEXT NOT NULL,
                     PRIMARY KEY (market_id, observed_at, metadata_hash)
                 );
@@ -250,6 +266,7 @@ class AxiomStore:
                     observed_at TEXT NOT NULL,
                     payload_json TEXT NOT NULL,
                     quality TEXT NOT NULL,
+                    source_type TEXT NOT NULL DEFAULT 'FORWARD_COLLECTED',
                     created_at TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_polymarket_snapshots_market_time
@@ -277,6 +294,7 @@ class AxiomStore:
                     kind TEXT NOT NULL,
                     detail TEXT NOT NULL,
                     payload_json TEXT NOT NULL,
+                    source_type TEXT NOT NULL DEFAULT 'FORWARD_COLLECTED',
                     created_at TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_collection_errors_market_time
@@ -470,6 +488,32 @@ class AxiomStore:
             if "updated_at" not in queue_columns:
                 self._conn.execute("ALTER TABLE research_queue ADD COLUMN updated_at TEXT")
                 self._conn.execute("UPDATE research_queue SET updated_at=created_at WHERE updated_at IS NULL")
+            for table in ("polymarket_markets", "polymarket_snapshots", "collection_errors"):
+                columns = {str(row["name"]) for row in self._conn.execute(f"PRAGMA table_info({table})").fetchall()}
+                if "source_type" not in columns:
+                    self._conn.execute(
+                        f"ALTER TABLE {table} ADD COLUMN source_type TEXT NOT NULL DEFAULT 'FORWARD_COLLECTED'"
+                    )
+                # Older payloads carried provenance only in JSON.  Preserve all
+                # rows while making the provenance queryable and deterministic.
+                self._conn.execute(
+                    f"UPDATE {table} SET source_type=CASE "
+                    "WHEN upper(COALESCE(json_extract(payload_json, '$.source_type'), ''))='HISTORICAL' THEN 'HISTORICAL' "
+                    "WHEN upper(COALESCE(json_extract(payload_json, '$.source_type'), ''))='FORWARD_COLLECTED' THEN 'FORWARD_COLLECTED' "
+                    "ELSE COALESCE(NULLIF(upper(source_type), ''), 'FORWARD_COLLECTED') END"
+                )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_polymarket_markets_source_observed "
+                "ON polymarket_markets(source_type, observed_at, market_id)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_polymarket_snapshots_source_observed "
+                "ON polymarket_snapshots(source_type, observed_at, market_id)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_collection_errors_source_observed "
+                "ON collection_errors(source_type, observed_at, market_id)"
+            )
             if "lease_owner" not in queue_columns:
                 self._conn.execute("ALTER TABLE research_queue ADD COLUMN lease_owner TEXT")
             if "result_json" not in queue_columns:
@@ -608,7 +652,7 @@ class AxiomStore:
         with self._lock:
             if version is None:
                 row = self._conn.execute(
-                    "SELECT payload_json FROM datasets WHERE dataset_id=? ORDER BY created_at DESC, version DESC LIMIT 1",
+                    "SELECT payload_json FROM datasets WHERE dataset_id=? ORDER BY created_at DESC,rowid DESC,version DESC LIMIT 1",
                     (str(dataset_id),),
                 ).fetchone()
             else:
@@ -626,7 +670,7 @@ class AxiomStore:
         with self._lock:
             if version is None:
                 row = self._conn.execute(
-                    "SELECT * FROM datasets WHERE dataset_id=? ORDER BY created_at DESC, version DESC LIMIT 1",
+                    "SELECT * FROM datasets WHERE dataset_id=? ORDER BY created_at DESC,rowid DESC,version DESC LIMIT 1",
                     (str(dataset_id),),
                 ).fetchone()
             else:
@@ -813,7 +857,10 @@ class AxiomStore:
             clauses.append("dataset_version=?")
             values.append(str(dataset_version))
         query = "SELECT * FROM dataset_catalog WHERE " + " AND ".join(clauses)
-        query += " ORDER BY updated_at DESC,dataset_version DESC LIMIT 1"
+        # Wall-clock timestamps can collide on fast immutable publishes; rowid
+        # preserves insertion order so an exact tie still returns the newest
+        # catalog rather than selecting by hash text.
+        query += " ORDER BY updated_at DESC,created_at DESC,rowid DESC,dataset_version DESC LIMIT 1"
         with self._lock:
             row = self._conn.execute(query, values).fetchone()
         return _dataset_catalog_record(row) if row is not None else None
@@ -1477,18 +1524,18 @@ class AxiomStore:
     ) -> list[Any]:
         clauses = ["key=?"]
         values: list[Any] = [str(key)]
-        if dataset_id is not None:
-            clauses.append("dataset_id=?")
-            values.append(str(dataset_id))
-        if dataset_version is not None:
-            clauses.append("dataset_version=?")
-            values.append(str(dataset_version))
         if start is not None:
             clauses.append("timestamp>=?")
             values.append(_iso(start))
         if end is not None:
             clauses.append("timestamp<=?")
             values.append(_iso(end))
+        if dataset_id is not None:
+            clauses.append("dataset_id=?")
+            values.append(str(dataset_id))
+        if dataset_version is not None:
+            clauses.append("dataset_version=?")
+            values.append(str(dataset_version))
         if kind is not None:
             clauses.append("kind=?")
             values.append(str(kind))
@@ -1497,16 +1544,10 @@ class AxiomStore:
             if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
                 raise ValueError("limit must be a non-negative integer")
             query += " LIMIT ?"
-            values.append(int(limit))
+            values.append(limit)
         with self._lock:
             rows = self._conn.execute(query, values).fetchall()
         return [_snapshot_from_record(row["kind"], _load(row["payload_json"])) for row in rows]
-
-    def save_order_books(self, key: str, snapshots: Iterable[OrderBookSnapshot], **kwargs: Any) -> int:
-        return self.save_snapshots(key, snapshots, **kwargs)
-
-    def load_order_books(self, key: str, **kwargs: Any) -> list[OrderBookSnapshot]:
-        return [item for item in self.load_snapshots(key, kind="order_book", **kwargs) if isinstance(item, OrderBookSnapshot)]
 
     def save_prediction_snapshots(self, key: str, snapshots: Iterable[PredictionMarketSnapshot], **kwargs: Any) -> int:
         return self.save_snapshots(key, snapshots, **kwargs)
@@ -1521,31 +1562,41 @@ class AxiomStore:
         *,
         observed_at: datetime,
         metadata_hash: str | None = None,
+        source_type: str | None = None,
     ) -> bool:
         identifier = str(market_id).strip()
         if not identifier:
             raise ValueError("market_id is required")
+        source_value = _polymarket_source_type(source_type, payload)
+        if isinstance(payload, Mapping):
+            payload = dict(payload)
+            payload.setdefault("source_type", source_value)
         observed = _iso(observed_at)
         payload_json = _dump(payload)
         digest = str(metadata_hash or hashlib.sha256(payload_json.encode("utf-8")).hexdigest())
         with self._write_context():
             existing = self._conn.execute(
-                "SELECT payload_json FROM polymarket_markets WHERE market_id=? AND metadata_hash=? LIMIT 1",
+                "SELECT payload_json,source_type FROM polymarket_markets WHERE market_id=? AND metadata_hash=? LIMIT 1",
                 (identifier, digest),
             ).fetchone()
             if existing is not None:
                 existing_payload = _load(existing["payload_json"])
-                if isinstance(existing_payload, Mapping):
-                    existing_identity = {key: value for key, value in existing_payload.items() if key != "observed_at"}
-                else:
-                    existing_identity = existing_payload
-                current_identity = {key: value for key, value in payload.items() if key != "observed_at"} if isinstance(payload, Mapping) else payload
-                if _dump(existing_identity) != _dump(current_identity):
+                existing_identity = (
+                    {key: value for key, value in existing_payload.items() if key != "observed_at"}
+                    if isinstance(existing_payload, Mapping)
+                    else existing_payload
+                )
+                current_identity = (
+                    {key: value for key, value in payload.items() if key != "observed_at"}
+                    if isinstance(payload, Mapping)
+                    else payload
+                )
+                if _dump(existing_identity) != _dump(current_identity) or str(existing["source_type"]).upper() != source_value:
                     raise ValueError(f"metadata hash conflicts with stored payload: {identifier}/{digest}")
                 return False
             self._conn.execute(
-                "INSERT INTO polymarket_markets(market_id,observed_at,metadata_hash,payload_json,created_at) VALUES (?,?,?,?,?)",
-                (identifier, observed, digest, payload_json, _now_iso()),
+                "INSERT INTO polymarket_markets(market_id,observed_at,metadata_hash,payload_json,source_type,created_at) VALUES (?,?,?,?,?,?)",
+                (identifier, observed, digest, payload_json, source_value, _now_iso()),
             )
         return True
 
@@ -1558,6 +1609,7 @@ class AxiomStore:
         payload: Any,
         *,
         quality: Any = "ORDER_BOOK_SIMULATED",
+        source_type: str | None = None,
     ) -> bool:
         identifier = str(market_id).strip()
         if not identifier:
@@ -1565,13 +1617,17 @@ class AxiomStore:
         snapshot_key = str(snapshot_id).strip()
         if not snapshot_key:
             raise ValueError("snapshot_id is required")
+        source_value = _polymarket_source_type(source_type, payload)
+        if isinstance(payload, Mapping):
+            payload = dict(payload)
+            payload.setdefault("source_type", source_value)
         source = _iso(source_timestamp)
         observed = _iso(observed_at)
         payload_json = _dump(payload)
         quality_value = _enum_value(quality) or "ORDER_BOOK_SIMULATED"
         with self._write_context():
             existing = self._conn.execute(
-                "SELECT market_id,source_timestamp,observed_at,payload_json,quality FROM polymarket_snapshots WHERE snapshot_id=?",
+                "SELECT market_id,source_timestamp,observed_at,payload_json,quality,source_type FROM polymarket_snapshots WHERE snapshot_id=?",
                 (snapshot_key,),
             ).fetchone()
             if existing is not None:
@@ -1581,12 +1637,13 @@ class AxiomStore:
                     or str(existing["observed_at"]) != observed
                     or str(existing["payload_json"]) != payload_json
                     or str(existing["quality"]) != quality_value
+                    or str(existing["source_type"]).upper() != source_value
                 ):
                     raise ValueError(f"snapshot id conflicts with stored payload: {snapshot_key}")
                 return False
             self._conn.execute(
-                "INSERT INTO polymarket_snapshots(snapshot_id,market_id,source_timestamp,observed_at,payload_json,quality,created_at) VALUES (?,?,?,?,?,?,?)",
-                (snapshot_key, identifier, source, observed, payload_json, quality_value, _now_iso()),
+                "INSERT INTO polymarket_snapshots(snapshot_id,market_id,source_timestamp,observed_at,payload_json,quality,source_type,created_at) VALUES (?,?,?,?,?,?,?,?)",
+                (snapshot_key, identifier, source, observed, payload_json, quality_value, source_value, _now_iso()),
             )
         return True
 
@@ -1650,6 +1707,7 @@ class AxiomStore:
         source_start: datetime | None = None,
         source_end: datetime | None = None,
         source_after: tuple[datetime, str] | None = None,
+        source_type: str | None = None,
         latest: bool = False,
         limit: int | None = None,
     ) -> list[dict[str, Any]]:
@@ -1676,7 +1734,10 @@ class AxiomStore:
             after_timestamp, after_snapshot_id = source_after
             clauses.append("(source_timestamp>? OR (source_timestamp=? AND snapshot_id>?))")
             values.extend([_iso(after_timestamp), _iso(after_timestamp), str(after_snapshot_id)])
-        query = "SELECT snapshot_id,market_id,source_timestamp,observed_at,payload_json,quality FROM polymarket_snapshots"
+        if source_type is not None:
+            clauses.append("source_type=?")
+            values.append(_polymarket_source_type(source_type))
+        query = "SELECT snapshot_id,market_id,source_timestamp,observed_at,payload_json,quality,source_type FROM polymarket_snapshots"
         if clauses:
             query += " WHERE " + " AND ".join(clauses)
         query += (
@@ -1703,14 +1764,15 @@ class AxiomStore:
                 "observed_at": _parse_datetime(row["observed_at"]),
                 "payload": _load(row["payload_json"]),
                 "quality": row["quality"],
+                "source_type": str(row["source_type"]).upper(),
             }
             for row in rows
         ]
-
     def load_latest_polymarket_snapshots(
         self,
         market_ids: Sequence[str] | None = None,
         *,
+        source_type: str | None = None,
         limit: int = 1000,
     ) -> list[dict[str, Any]]:
         if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
@@ -1724,9 +1786,12 @@ class AxiomStore:
             placeholders = ",".join("?" for _ in identifiers)
             clauses.append(f"market_id IN ({placeholders})")
             values.extend(identifiers)
+        if source_type is not None:
+            clauses.append("source_type=?")
+            values.append(_polymarket_source_type(source_type))
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
         query = (
-            "SELECT snapshot_id,market_id,source_timestamp,observed_at,payload_json,quality FROM ("
+            "SELECT snapshot_id,market_id,source_timestamp,observed_at,payload_json,quality,source_type FROM ("
             "SELECT p.*, ROW_NUMBER() OVER (PARTITION BY market_id "
             "ORDER BY observed_at DESC,source_timestamp DESC,snapshot_id DESC) AS row_number "
             "FROM polymarket_snapshots p"
@@ -1744,6 +1809,7 @@ class AxiomStore:
                 "observed_at": _parse_datetime(row["observed_at"]),
                 "payload": _load(row["payload_json"]),
                 "quality": row["quality"],
+                "source_type": str(row["source_type"]).upper(),
             }
             for row in rows
         ]
@@ -1804,18 +1870,24 @@ class AxiomStore:
         kind: str,
         detail: str,
         payload: Any = None,
+        *,
+        source_type: str | None = None,
     ) -> str:
-        body = {"market_id": market_id, "kind": str(kind), "detail": str(detail), "payload": payload}
+        source_value = _polymarket_source_type(source_type, payload)
+        if isinstance(payload, Mapping):
+            payload = dict(payload)
+            payload.setdefault("source_type", source_value)
+        body = {"market_id": market_id, "kind": str(kind), "detail": str(detail), "payload": payload, "source_type": source_value}
         error_id = hashlib.sha256(_dump(body | {"observed_at": _iso(observed_at)}).encode("utf-8")).hexdigest()
         with self._write_context():
             self._conn.execute(
-                "INSERT OR IGNORE INTO collection_errors(error_id,market_id,observed_at,kind,detail,payload_json,created_at) VALUES (?,?,?,?,?,?,?)",
-                (error_id, str(market_id) if market_id is not None else None, _iso(observed_at), str(kind), str(detail), _dump(payload), _now_iso()),
+                "INSERT OR IGNORE INTO collection_errors(error_id,market_id,observed_at,kind,detail,payload_json,source_type,created_at) VALUES (?,?,?,?,?,?,?,?)",
+                (error_id, str(market_id) if market_id is not None else None, _iso(observed_at), str(kind), str(detail), _dump(payload), source_value, _now_iso()),
             )
         return error_id
 
     def list_collection_errors(self, market_id: str | None = None) -> list[dict[str, Any]]:
-        query = "SELECT error_id,market_id,observed_at,kind,detail,payload_json FROM collection_errors"
+        query = "SELECT error_id,market_id,observed_at,kind,detail,payload_json,source_type FROM collection_errors"
         values: tuple[Any, ...] = ()
         if market_id is not None:
             query += " WHERE market_id=?"
@@ -1831,6 +1903,7 @@ class AxiomStore:
                 "kind": row["kind"],
                 "detail": row["detail"],
                 "payload": _load(row["payload_json"]),
+                "source_type": str(row["source_type"]).upper(),
             }
             for row in rows
         ]
@@ -2092,183 +2165,203 @@ class AxiomStore:
         expected_interval_seconds: float = 60.0,
         stale_after_seconds: float | None = None,
         now: datetime | None = None,
+        recent_window_seconds: float | None = None,
+        recent_cycles: int | None = None,
     ) -> dict[str, Any]:
+        """Return current forward-collector health, not historical maturity.
+
+        Historical rows remain available to :meth:`polymarket_evidence_maturity`,
+        but cannot make the operational collector appear healthy.
+        """
         expected = float(expected_interval_seconds)
-        if not math.isfinite(expected) or expected <= 0:
-            raise ValueError("expected_interval_seconds must be finite and positive")
-        stale_after = float(stale_after_seconds if stale_after_seconds is not None else expected * 3.0)
-        if not math.isfinite(stale_after) or stale_after <= 0:
-            raise ValueError("stale_after_seconds must be finite and positive")
-        current = ensure_utc(now or utc_now())
-        with self._lock:
-            current_iso = current.isoformat()
-            snapshot_count = int(
-                self._conn.execute(
-                    "SELECT COUNT(*) AS n FROM polymarket_snapshots "
-                    "WHERE rowid > COALESCE((SELECT MAX(rowid)-? FROM polymarket_snapshots),0) AND observed_at<=?",
-                    (_MAX_LATEST_SCAN_ROWS, current_iso),
-                ).fetchone()["n"]
+        if not math.isfinite(expected) or expected <= 0 or expected > _MAX_OPERATIONAL_WINDOW_SECONDS:
+            raise ValueError(
+                f"expected_interval_seconds must be finite, positive, and <= {_MAX_OPERATIONAL_WINDOW_SECONDS:g}"
             )
+        stale_after = float(stale_after_seconds if stale_after_seconds is not None else expected * 3.0)
+        if not math.isfinite(stale_after) or stale_after <= 0 or stale_after > _MAX_OPERATIONAL_WINDOW_SECONDS:
+            raise ValueError(
+                f"stale_after_seconds must be finite, positive, and <= {_MAX_OPERATIONAL_WINDOW_SECONDS:g}"
+            )
+        window = float(recent_window_seconds if recent_window_seconds is not None else max(_DEFAULT_OPERATIONAL_WINDOW_SECONDS, stale_after * 2.0))
+        if not math.isfinite(window) or window <= 0:
+            raise ValueError("recent_window_seconds must be finite and positive")
+        window = min(window, _MAX_OPERATIONAL_WINDOW_SECONDS)
+        if recent_cycles is not None and (isinstance(recent_cycles, bool) or int(recent_cycles) <= 0):
+            raise ValueError("recent_cycles must be a positive integer")
+        current = ensure_utc(now or utc_now())
+        window_start = current - timedelta(seconds=window)
+        latest_window_seconds = max(window, stale_after)
+        latest_window_start = current - timedelta(seconds=latest_window_seconds)
+        current_iso, window_iso, latest_window_iso = current.isoformat(), window_start.isoformat(), latest_window_start.isoformat()
+        with self._lock:
             latest_rows = self._conn.execute(
                 "SELECT market_id,observed_at,payload_json FROM ("
                 "SELECT market_id,observed_at,payload_json,"
                 "ROW_NUMBER() OVER (PARTITION BY market_id ORDER BY observed_at DESC,source_timestamp DESC,snapshot_id DESC) AS row_number "
-                "FROM polymarket_snapshots "
-                "WHERE rowid > COALESCE((SELECT MAX(rowid)-? FROM polymarket_snapshots),0) AND observed_at<=?) WHERE row_number=1",
-                (_MAX_LATEST_SCAN_ROWS, current_iso),
+                "FROM polymarket_snapshots WHERE source_type='FORWARD_COLLECTED' AND observed_at>=? AND observed_at<=?) WHERE row_number=1",
+                (latest_window_iso, current_iso),
             ).fetchall()
-            gap_count = int(
-                self._conn.execute(
-                    "SELECT COUNT(*) AS n FROM ("
-                    "SELECT market_id,observed_at,"
-                    "LAG(observed_at) OVER (PARTITION BY market_id ORDER BY observed_at,source_timestamp,snapshot_id) AS previous_observed_at "
-                    "FROM polymarket_snapshots "
-                    "WHERE rowid > COALESCE((SELECT MAX(rowid)-? FROM polymarket_snapshots),0) AND observed_at<=?) "
-                    "WHERE previous_observed_at IS NOT NULL "
-                    "AND (julianday(observed_at)-julianday(previous_observed_at))*86400.0>?",
-                    (_MAX_LATEST_SCAN_ROWS, current_iso, expected * 1.5),
-                ).fetchone()["n"]
-            )
-            gap_rows = self._conn.execute(
-                "SELECT market_id,previous_observed_at,observed_at FROM ("
-                "SELECT market_id,observed_at,"
-                "LAG(observed_at) OVER (PARTITION BY market_id ORDER BY observed_at,source_timestamp,snapshot_id) AS previous_observed_at "
-                "FROM polymarket_snapshots "
-                "WHERE rowid > COALESCE((SELECT MAX(rowid)-? FROM polymarket_snapshots),0) AND observed_at<=?) "
-                "WHERE previous_observed_at IS NOT NULL "
-                "AND (julianday(observed_at)-julianday(previous_observed_at))*86400.0>? "
-                "ORDER BY observed_at DESC,market_id LIMIT 64",
-                (_MAX_LATEST_SCAN_ROWS, current_iso, expected * 1.5),
+            recent_rows = self._conn.execute(
+                "SELECT market_id,observed_at FROM polymarket_snapshots "
+                "WHERE source_type='FORWARD_COLLECTED' AND observed_at>=? AND observed_at<=? "
+                "ORDER BY market_id,observed_at,source_timestamp,snapshot_id",
+                (window_iso, current_iso),
             ).fetchall()
-            market_count = int(
-                self._conn.execute(
-                    "SELECT COUNT(*) AS n FROM ("
-                    "SELECT market_id FROM polymarket_markets "
-                    "WHERE rowid > COALESCE((SELECT MAX(rowid)-? FROM polymarket_markets),0) AND observed_at<=? "
-                    "UNION SELECT market_id FROM polymarket_snapshots "
-                    "WHERE rowid > COALESCE((SELECT MAX(rowid)-? FROM polymarket_snapshots),0) AND observed_at<=?)",
-                    (_MAX_LATEST_SCAN_ROWS, current_iso, _MAX_LATEST_SCAN_ROWS, current_iso),
-                ).fetchone()["n"]
-            )
-            trade_count = int(
-                self._conn.execute(
-                    "SELECT COUNT(*) AS n FROM polymarket_trades "
-                    "WHERE rowid > COALESCE((SELECT MAX(rowid)-? FROM polymarket_trades),0) AND timestamp<=?",
-                    (_MAX_LATEST_SCAN_ROWS, current_iso),
-                ).fetchone()["n"]
-            )
-            metadata_count = int(
-                self._conn.execute(
-                    "SELECT COUNT(*) AS n FROM polymarket_markets "
-                    "WHERE rowid > COALESCE((SELECT MAX(rowid)-? FROM polymarket_markets),0) AND observed_at<=?",
-                    (_MAX_LATEST_SCAN_ROWS, current_iso),
-                ).fetchone()["n"]
-            )
-            error_count = int(
-                self._conn.execute(
-                    "SELECT COUNT(*) AS n FROM collection_errors "
-                    "WHERE rowid > COALESCE((SELECT MAX(rowid)-? FROM collection_errors),0) AND observed_at<=?",
-                    (_MAX_LATEST_SCAN_ROWS, current_iso),
-                ).fetchone()["n"]
-            )
-            malformed_count = int(
-                self._conn.execute(
-                    "SELECT COUNT(*) AS n FROM collection_errors "
-                    "WHERE rowid > COALESCE((SELECT MAX(rowid)-? FROM collection_errors),0) AND observed_at<=? "
-                    "AND (lower(kind) LIKE '%malform%' OR lower(kind) LIKE '%parse%')",
-                    (_MAX_LATEST_SCAN_ROWS, current_iso),
-                ).fetchone()["n"]
-            )
-        latest_payload: dict[str, Mapping[str, Any]] = {}
+            error_rows = self._conn.execute(
+                "SELECT error_id,market_id,observed_at,kind,detail,payload_json FROM collection_errors "
+                "WHERE source_type='FORWARD_COLLECTED' AND observed_at>=? AND observed_at<=? "
+                "AND rowid > COALESCE((SELECT MAX(rowid)-? FROM collection_errors WHERE source_type='FORWARD_COLLECTED'),0) "
+                "ORDER BY observed_at,error_id LIMIT 256",
+                (window_iso, current_iso, _MAX_LATEST_SCAN_ROWS),
+            ).fetchall()
+            historical_error_count = int(self._conn.execute(
+                "SELECT COUNT(*) AS n FROM collection_errors WHERE source_type='HISTORICAL' "
+                "AND rowid > COALESCE((SELECT MAX(rowid)-? FROM collection_errors WHERE source_type='HISTORICAL'),0) AND observed_at<=?",
+                (_MAX_EVIDENCE_SCAN_ROWS, current_iso),
+            ).fetchone()["n"])
+            trade_count = int(self._conn.execute(
+                "SELECT COUNT(*) AS n FROM ("
+                "SELECT trade_key FROM polymarket_trades "
+                "WHERE timestamp>=? AND timestamp<=? "
+                "ORDER BY timestamp,trade_key LIMIT ?"
+                ")",
+                (window_iso, current_iso, _MAX_LATEST_SCAN_ROWS),
+            ).fetchone()["n"])
+            metadata_count = int(self._conn.execute(
+                "SELECT COUNT(*) AS n FROM polymarket_markets "
+                "WHERE source_type='FORWARD_COLLECTED' AND observed_at>=? AND observed_at<=?",
+                (latest_window_iso, current_iso),
+            ).fetchone()["n"])
+        tracked = self.tracked_polymarket_markets(active_only=True, now=current, include_payload=True, limit=1000)
+        active_markets = {
+            str(item.get("market_id"))
+            for item in tracked
+            if isinstance(item, Mapping) and item.get("market_id")
+        }
         latest_by_market: dict[str, datetime] = {}
+        latest_payload: dict[str, Mapping[str, Any]] = {}
         for row in latest_rows:
-            timestamp = _parse_datetime(row["observed_at"])
-            if timestamp is None:
+            stamp = _parse_datetime(row["observed_at"])
+            if stamp is None:
                 continue
             market = str(row["market_id"])
-            latest_by_market[market] = timestamp
+            latest_by_market[market] = stamp
             payload = _load(row["payload_json"])
             latest_payload[market] = payload if isinstance(payload, Mapping) else {}
+            if market not in active_markets:
+                snapshot = latest_payload[market].get("snapshot")
+                settlement = str(snapshot.get("settlement", "")).lower() if isinstance(snapshot, Mapping) else ""
+                if settlement not in {"resolved_yes", "resolved_no", "void"}:
+                    active_markets.add(market)
+        current_rows: dict[str, list[datetime]] = {}
+        for row in recent_rows:
+            stamp = _parse_datetime(row["observed_at"])
+            market = str(row["market_id"])
+            if stamp is not None:
+                current_rows.setdefault(market, []).append(stamp)
+                if market not in active_markets:
+                    active_markets.add(market)
         gaps: list[dict[str, Any]] = []
-        for row in gap_rows:
-            previous = _parse_datetime(row["previous_observed_at"])
-            current_stamp = _parse_datetime(row["observed_at"])
-            if previous is None or current_stamp is None:
-                continue
-            gap_seconds = (current_stamp - previous).total_seconds()
-            missing = max(1, int(round(gap_seconds / expected)) - 1)
-            gaps.append(
-                {
-                    "market_id": str(row["market_id"]),
-                    "from": previous.isoformat(),
-                    "to": current_stamp.isoformat(),
-                    "seconds": gap_seconds,
-                    "missing_intervals": missing,
-                }
-            )
+        for market, stamps in current_rows.items():
+            for previous, observed in zip(stamps, stamps[1:]):
+                gap_seconds = (observed - previous).total_seconds()
+                if gap_seconds > expected * 1.5:
+                    gaps.append({
+                        "market_id": market,
+                        "from": previous.isoformat(),
+                        "to": observed.isoformat(),
+                        "seconds": gap_seconds,
+                        "missing_intervals": max(1, int(round(gap_seconds / expected)) - 1),
+                    })
         stale_markets = sorted(
-            market for market, stamp in latest_by_market.items() if (current - stamp).total_seconds() > stale_after
+            market for market in active_markets
+            if market not in latest_by_market or (current - latest_by_market[market]).total_seconds() > stale_after
         )
-        resolved_markets = 0
-        for payload in latest_payload.values():
-            snapshot = payload.get("snapshot") if isinstance(payload, Mapping) else None
-            settlement = str(snapshot.get("settlement", "")).strip().lower() if isinstance(snapshot, Mapping) else ""
-            if settlement in {
-                SettlementState.RESOLVED_YES.value,
-                SettlementState.RESOLVED_NO.value,
-                SettlementState.VOID.value,
-            }:
-                resolved_markets += 1
-        if snapshot_count == 0:
+        current_failures = [
+            {
+                "error_id": row["error_id"],
+                "market_id": row["market_id"],
+                "observed_at": _parse_datetime(row["observed_at"]).isoformat() if _parse_datetime(row["observed_at"]) else None,
+                "kind": row["kind"],
+                "detail": row["detail"],
+                "reason_code": str(row["kind"]).upper(),
+                "reason": str(row["detail"]),
+            }
+            for row in error_rows
+        ]
+        malformed_count = sum("MALFORM" in str(item["kind"]).upper() or "PARSE" in str(item["kind"]).upper() for item in current_failures)
+        reasons: list[dict[str, str]] = []
+        if not current_rows:
+            reasons.append({"code": "NO_FORWARD_SNAPSHOTS", "reason": "No FORWARD_COLLECTED snapshot was observed in the current window."})
+        if stale_markets:
+            reasons.append({"code": "STALE_MARKETS", "reason": f"{len(stale_markets)} active/tracked market(s) have no successful sample within the staleness threshold."})
+        if gaps:
+            reasons.append({"code": "COLLECTION_GAPS", "reason": f"{len(gaps)} in-window collection gap(s) exceed the expected interval."})
+        if malformed_count:
+            reasons.append({"code": "MALFORMED_RECORDS", "reason": f"{malformed_count} malformed current collector record(s)."})
+        if current_failures:
+            reasons.append({"code": "CURRENT_COLLECTION_FAILURES", "reason": f"{len(current_failures)} current collector failure(s) are retained."})
+        if not active_markets and not current_rows:
             grade = "F"
-        elif malformed_count or (latest_by_market and len(stale_markets) / max(1, len(latest_by_market)) > 0.5):
+        elif malformed_count or (stale_markets and len(stale_markets) / max(1, len(active_markets)) > 0.5):
             grade = "D"
-        elif stale_markets or gap_count:
+        elif stale_markets or gaps:
             grade = "C"
-        elif error_count:
+        elif current_failures:
             grade = "B"
         else:
             grade = "A"
-        storage_bytes = _storage_bytes(self._conn, self.path)
-        latest = max(latest_by_market.values(), default=None)
-        return {
+        maturity = self.polymarket_evidence_maturity(now=current)
+        collector = {
             "grade": grade,
             "grade_scope": "collector_health",
-            "collector_health": {
-                "grade": grade,
-                "markets": market_count,
-                "markets_with_snapshots": len(latest_by_market),
-                "snapshots": snapshot_count,
-                "trades": trade_count,
-                "collection_errors": error_count,
-                "malformed_records": malformed_count,
-                "stale_markets": stale_markets,
-                "gaps": gaps,
-                "gap_count": gap_count,
-                "latest_observed_at": latest.isoformat() if latest else None,
-            },
-            "markets": market_count,
+            "reason_code": reasons[0]["code"] if reasons else None,
+            "reasons": reasons,
+            "markets": len(active_markets),
             "markets_with_snapshots": len(latest_by_market),
-            "resolved_markets": resolved_markets,
-            "snapshots": snapshot_count,
-            "trades": trade_count,
             "metadata_records": metadata_count,
-            "collection_errors": error_count,
+            "current_snapshots": sum(len(items) for items in current_rows.values()),
+            "snapshots": sum(len(items) for items in current_rows.values()),
+            "trades": trade_count,
+            "collection_errors": len(current_failures),
+            "current_failures": current_failures,
             "malformed_records": malformed_count,
             "stale_markets": stale_markets,
             "gaps": gaps,
-            "gap_count": gap_count,
-            "latest_observed_at": latest.isoformat() if latest else None,
+            "gap_count": len(gaps),
+            "latest_observed_at": max(latest_by_market.values(), default=None).isoformat() if latest_by_market else None,
+            "window_start": window_start.isoformat(),
+            "window_end": current.isoformat(),
+            "window_seconds": window,
             "expected_interval_seconds": expected,
             "stale_after_seconds": stale_after,
-            "storage_bytes": storage_bytes,
-            "scan_limits": {
-                "latest_rows": _MAX_LATEST_SCAN_ROWS,
-                "gap_sample": 64,
-            },
-            "evidence_maturity": self.polymarket_evidence_maturity(now=current),
         }
-
+        return {
+            "grade": grade,
+            "grade_scope": "collector_health",
+            "reason_code": collector["reason_code"],
+            "reasons": reasons,
+            "collector_health": collector,
+            "markets": collector["markets"],
+            "markets_with_snapshots": collector["markets_with_snapshots"],
+            "metadata_records": collector["metadata_records"],
+            "snapshots": collector["snapshots"],
+            "trades": trade_count,
+            "collection_errors": len(current_failures),
+            "current_failures": current_failures,
+            "stale_markets": stale_markets,
+            "gaps": gaps,
+            "gap_count": len(gaps),
+            "window_start": collector["window_start"],
+            "window_end": collector["window_end"],
+            "window_seconds": window,
+            "historical_error_count": historical_error_count,
+            "historical_maturity_grade": maturity.get("grade"),
+            "evidence_maturity": maturity,
+            "storage_bytes": _storage_bytes(self._conn, self.path),
+            "scan_limits": {"latest_window_seconds": latest_window_seconds, "recent_window_seconds": window, "recent_cycles": recent_cycles, "gap_sample": 64},
+        }
     # Strategy and experiment artifacts -------------------------------
     def save_strategy(self, strategy_id: str, strategy: Any, *, version: str = "1") -> None:
         try:
@@ -3664,6 +3757,9 @@ class AxiomStore:
         reservation_key: str,
         amount: int = 1,
         timestamp: datetime | None = None,
+        daily_limit: int | None = None,
+        daily_since: datetime | None = None,
+        daily_until: datetime | None = None,
     ) -> dict[str, Any]:
         if isinstance(total_limit, bool) or not isinstance(total_limit, int) or total_limit < 0:
             raise ValueError("total_limit must be a non-negative integer")
@@ -3671,6 +3767,27 @@ class AxiomStore:
             raise ValueError("per_family_limit must be a non-negative integer")
         if isinstance(amount, bool) or not isinstance(amount, int) or amount <= 0:
             raise ValueError("amount must be a positive integer")
+        if daily_limit is not None and (
+            isinstance(daily_limit, bool) or not isinstance(daily_limit, int) or daily_limit < 0
+        ):
+            raise ValueError("daily_limit must be a non-negative integer or None")
+        if (daily_since is None) != (daily_until is None):
+            raise ValueError("daily_since and daily_until must be provided together")
+        daily_start: str | None = None
+        daily_end: str | None = None
+        if daily_since is not None and daily_until is not None:
+            if not isinstance(daily_since, datetime) or not isinstance(daily_until, datetime):
+                raise ValueError("daily_since and daily_until must be datetimes")
+            start = ensure_utc(daily_since)
+            end = ensure_utc(daily_until)
+            if start >= end:
+                raise ValueError("daily_since must be before daily_until")
+            daily_start = start.isoformat()
+            daily_end = end.isoformat()
+        if daily_limit is not None and daily_start is None:
+            raise ValueError("daily_since and daily_until are required with daily_limit")
+        if daily_limit is None and daily_start is not None:
+            raise ValueError("daily_limit is required with daily_since and daily_until")
         identifier = str(budget_id)
         family_name = str(family).strip() or "unknown"
         reservation = str(reservation_key).strip()
@@ -3710,6 +3827,15 @@ class AxiomStore:
                     raise RuntimeError("experiment budget exhausted")
                 if used_family + amount > per_family:
                     raise RuntimeError(f"experiment family budget exhausted: {family_name}")
+                if daily_limit is not None:
+                    daily_row = self._conn.execute(
+                        "SELECT COUNT(*) AS n FROM experiment_budget_reservations "
+                        "WHERE budget_id=? AND created_at>=? AND created_at<?",
+                        (identifier, daily_start, daily_end),
+                    ).fetchone()
+                    daily_count = int(daily_row["n"]) if daily_row is not None else 0
+                    if daily_count + amount > daily_limit:
+                        raise RuntimeError("experiment daily budget exhausted")
                 used_total += amount
                 used_by_family[family_name] = used_family + amount
                 self._conn.execute(
@@ -3803,17 +3929,17 @@ class AxiomStore:
         current = ensure_utc(now or utc_now())
         with self._lock:
             metadata_rows = self._conn.execute(
-                "SELECT market_id,observed_at,metadata_hash,payload_json FROM ("
-                "SELECT market_id,observed_at,metadata_hash,payload_json,"
+                "SELECT market_id,observed_at,metadata_hash,payload_json,source_type FROM ("
+                "SELECT market_id,observed_at,metadata_hash,payload_json,source_type,"
                 "ROW_NUMBER() OVER (PARTITION BY market_id ORDER BY observed_at DESC,metadata_hash DESC) AS row_number "
-                "FROM polymarket_markets WHERE observed_at<=?) WHERE row_number=1 ORDER BY market_id LIMIT ?",
+                "FROM polymarket_markets WHERE source_type='FORWARD_COLLECTED' AND observed_at<=?) WHERE row_number=1 ORDER BY market_id LIMIT ?",
                 (current.isoformat(), int(limit)),
             ).fetchall()
             snapshot_rows = self._conn.execute(
-                "SELECT market_id,observed_at,source_timestamp,snapshot_id,payload_json FROM ("
-                "SELECT market_id,observed_at,source_timestamp,snapshot_id,payload_json,"
+                "SELECT market_id,observed_at,source_timestamp,snapshot_id,payload_json,source_type FROM ("
+                "SELECT market_id,observed_at,source_timestamp,snapshot_id,payload_json,source_type,"
                 "ROW_NUMBER() OVER (PARTITION BY market_id ORDER BY observed_at DESC,source_timestamp DESC,snapshot_id DESC) AS row_number "
-                "FROM polymarket_snapshots WHERE observed_at<=?) WHERE row_number=1 ORDER BY market_id LIMIT ?",
+                "FROM polymarket_snapshots WHERE source_type='FORWARD_COLLECTED' AND observed_at<=?) WHERE row_number=1 ORDER BY market_id LIMIT ?",
                 (current.isoformat(), int(limit)),
             ).fetchall()
         metadata_latest: dict[str, tuple[datetime | None, Any]] = {}
@@ -5139,6 +5265,14 @@ def _like_filter(value: Any, columns: Sequence[str]) -> tuple[str, list[Any]]:
     return "(" + " OR ".join(f"lower(CAST({column} AS TEXT)) LIKE ?" for column in columns) + ")", [pattern] * len(columns)
 
 
+def _polymarket_source_type(value: Any = None, payload: Any = None) -> str:
+    candidate = value
+    if candidate is None and isinstance(payload, Mapping):
+        candidate = payload.get("source_type")
+    normalized = str(candidate or "FORWARD_COLLECTED").strip().upper()
+    if normalized not in _POLYMARKET_SOURCE_TYPES:
+        raise ValueError("source_type must be HISTORICAL or FORWARD_COLLECTED")
+    return normalized
 def _enum_value(value: Any) -> str | None:
     if value is None:
         return None

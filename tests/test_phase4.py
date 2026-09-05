@@ -53,7 +53,7 @@ def prediction_rows(*, version: str = "v1", model_probability: float = 0.8) -> l
     return rows
 
 
-def experiment_plan(*, dataset_id: str = "dataset", dataset_version: str = "v1", max_variants: int = 1) -> dict[str, object]:
+def experiment_plan(*, dataset_id: str | None = "dataset", dataset_version: str = "v1", max_variants: int = 1) -> dict[str, object]:
     return {
         "market_type": "prediction",
         "template": "probability_mispricing",
@@ -70,7 +70,7 @@ def experiment_plan(*, dataset_id: str = "dataset", dataset_version: str = "v1",
 def proposal(
     proposal_id: str,
     *,
-    dataset_id: str = "dataset",
+    dataset_id: str | None = "dataset",
     dataset_version: str = "v1",
     model_probability: float | None = None,
     max_variants: int = 1,
@@ -165,9 +165,14 @@ def _register_forward_candidate(
     *,
     proposal_id: str,
     criteria: PromotionCriteria,
+    dataset_id: str | None = "dataset",
 ) -> tuple[AutonomousResearchProcessor, dict[str, object], object]:
     store.save_dataset("dataset", "v1", prediction_rows())
-    item = bus.submit_hypothesis(proposal(proposal_id), available_at=T0, dedupe_key=proposal_id)
+    item = bus.submit_hypothesis(
+        proposal(proposal_id, dataset_id=dataset_id),
+        available_at=T0,
+        dedupe_key=proposal_id,
+    )
     active = processor(store, bus, criteria=criteria)
     cycle = active.process_pending(now=T0)
     if cycle.completed != 1:
@@ -395,6 +400,202 @@ class Phase4AutonomousLoopTests(unittest.TestCase):
         )
         self.assertFalse(validation.accepted)
         self.assertIn("UNSAFE_PLAN_FIELD", validation.reasons)
+    def test_forged_experiment_result_cannot_contaminate_lifecycle_evidence(self) -> None:
+        with AxiomStore(":memory:") as store:
+            bus = DurableResearchBus(store)
+            active, record, _ = _register_forward_candidate(
+                store,
+                bus,
+                proposal_id="forged-experiment-result",
+                criteria=relaxed_criteria(),
+            )
+            candidate_id = str(record["candidate_id"])
+            before = store.load_candidate_lifecycle(candidate_id)
+            self.assertIsNotNone(before)
+            forged = bus.submit_experiment_result(
+                {
+                    "candidate_id": candidate_id,
+                    "result": {
+                        "forward_expectancy": 10_000.0,
+                        "forward_confidence_lower_bound": 10_000.0,
+                        "forward_stability": 1.0,
+                        "forward_calibration": 1.0,
+                        "forward_max_drawdown": 0.0,
+                        "holdout_used": True,
+                        "crypto_provenance": {"dataset_id": "forged"},
+                    },
+                },
+                dedupe_key="experiment-result:forged-experiment-result",
+                available_at=T0,
+            )
+            cycle = active.process_pending(now=T0)
+            self.assertEqual(cycle.rejected, 1)
+            self.assertEqual(cycle.completed, 0)
+            self.assertEqual(cycle.failed, 0)
+            rejected = bus.get(forged.item_id)
+            self.assertIsNotNone(rejected)
+            assert rejected is not None
+            self.assertFalse(rejected.result["accepted"])
+            self.assertEqual(rejected.result["reason_code"], "UNAUTHENTICATED_RESULT")
+            after = store.load_candidate_lifecycle(candidate_id)
+            self.assertEqual(after, before)
+    def test_prediction_result_binding_accepts_absent_dataset_id(self) -> None:
+        with AxiomStore(":memory:") as store:
+            bus = DurableResearchBus(store)
+            active, record, spec = _register_forward_candidate(
+                store,
+                bus,
+                proposal_id="prediction-result-without-dataset-id",
+                criteria=relaxed_criteria(),
+                dataset_id=None,
+            )
+            candidate_id = str(record["candidate_id"])
+            started = T0 + timedelta(hours=1)
+            run_forward_paper(
+                spec,
+                store=store,
+                strategy=record["payload"]["strategy"],
+                model={"field": "model_probability"},
+                observations=[
+                    _observation("datasetless-market", started),
+                    _observation("datasetless-market", started + timedelta(minutes=1), settlement="resolved_yes"),
+                ],
+                now=started + timedelta(minutes=1),
+            )
+            payload = record["payload"]
+            queued = bus.submit_experiment_result(
+                {
+                    "candidate_id": candidate_id,
+                    "run_id": candidate_id,
+                    "experiment_id": candidate_id,
+                    "plan_id": payload["plan_id"],
+                    "plan_hash": payload["plan_hash"],
+                    "dataset_version": payload["dataset_version"],
+                    "forward_test_id": spec.experiment_id,
+                },
+                dedupe_key="experiment-result:prediction-without-dataset-id",
+                available_at=started + timedelta(minutes=1),
+            )
+            cycle = active.process_pending(now=started + timedelta(minutes=1))
+            self.assertEqual(cycle.completed, 1)
+            self.assertEqual(cycle.rejected, 0)
+            self.assertTrue(bus.get(queued.item_id).result["accepted"])
+
+    def test_prediction_datasetless_ambiguity_rejects_before_lifecycle_mutation(self) -> None:
+        with AxiomStore(":memory:") as store:
+            store.save_dataset("prediction-a", "v1", prediction_rows())
+            store.save_dataset_catalog(
+                "prediction-b",
+                "v1",
+                provider="fixture",
+                instrument="prediction-b",
+                market_type="prediction",
+                source_type="HISTORICAL",
+                snapshot_id="snapshot-b",
+            )
+            bus = DurableResearchBus(store)
+            queued = bus.submit_hypothesis(
+                proposal("prediction-ambiguous-version", dataset_id=None),
+                available_at=T0,
+                dedupe_key="prediction-ambiguous-version",
+            )
+            cycle = processor(store, bus).process_pending(now=T0)
+
+            self.assertEqual(cycle.claimed, 1)
+            self.assertEqual(cycle.completed, 0)
+            self.assertEqual(cycle.rejected, 1)
+            self.assertEqual(cycle.failed, 0)
+            rejected = bus.get(queued.item_id)
+            self.assertIsNotNone(rejected)
+            assert rejected is not None
+            self.assertEqual(rejected.status, ResearchQueueStatus.REJECTED)
+            self.assertEqual(rejected.result["reason_code"], "INSUFFICIENT_DATA")
+            self.assertIn("ambiguous immutable datasets at version v1", rejected.result["reason"])
+            self.assertEqual(store.list_experiment_plans(), [])
+            self.assertEqual(store.list_experiments(), [])
+            self.assertEqual(store.load_candidate_lifecycle(limit=None), [])
+
+    def test_prediction_sentinel_dataset_version_is_rejected_before_loading(self) -> None:
+        with AxiomStore(":memory:") as store:
+            store.save_dataset("dataset", "latest", prediction_rows(version="latest"))
+            bus = DurableResearchBus(store)
+            queued = bus.submit_hypothesis(
+                proposal("prediction-latest-version", dataset_id=None, dataset_version="latest"),
+                available_at=T0,
+                dedupe_key="prediction-latest-version",
+            )
+            cycle = processor(store, bus).process_pending(now=T0)
+
+            self.assertEqual(cycle.rejected, 1)
+            self.assertEqual(cycle.failed, 0)
+            rejected = bus.get(queued.item_id)
+            self.assertIsNotNone(rejected)
+            assert rejected is not None
+            self.assertEqual(rejected.result["reason_code"], "INSUFFICIENT_DATA")
+            self.assertEqual(rejected.result["reason"], "dataset_version must identify an immutable version")
+            self.assertEqual(store.list_experiment_plans(), [])
+            self.assertEqual(store.load_candidate_lifecycle(limit=None), [])
+
+    def test_prediction_result_binding_rejects_forged_dataset_id(self) -> None:
+        with AxiomStore(":memory:") as store:
+            bus = DurableResearchBus(store)
+            active, record, spec = _register_forward_candidate(
+                store,
+                bus,
+                proposal_id="prediction-result-forged-dataset-id",
+                criteria=relaxed_criteria(),
+                dataset_id=None,
+            )
+            candidate_id = str(record["candidate_id"])
+            payload = record["payload"]
+            queued = bus.submit_experiment_result(
+                {
+                    "candidate_id": candidate_id,
+                    "run_id": candidate_id,
+                    "experiment_id": candidate_id,
+                    "plan_id": payload["plan_id"],
+                    "plan_hash": payload["plan_hash"],
+                    "dataset_id": "forged-dataset",
+                    "dataset_version": payload["dataset_version"],
+                    "forward_test_id": spec.experiment_id,
+                },
+                dedupe_key="experiment-result:prediction-forged-dataset-id",
+                available_at=T0,
+            )
+            cycle = active.process_pending(now=T0)
+            self.assertEqual(cycle.completed, 0)
+            self.assertEqual(cycle.rejected, 1)
+            self.assertEqual(cycle.failed, 0)
+            rejected = bus.get(queued.item_id)
+            self.assertIsNotNone(rejected)
+            assert rejected is not None
+            self.assertEqual(rejected.result["reason_code"], "RESULT_BINDING_MISMATCH")
+
+
+    def test_plan_budget_limits_cannot_poison_node_owned_autonomous_budget(self) -> None:
+        with AxiomStore(":memory:") as store:
+            store.save_dataset("dataset", "v1", prediction_rows())
+            bus = DurableResearchBus(store)
+            low_limit = proposal("low-limit-plan")
+            low_limit["experiment_plan"]["family_budget"] = {"total_limit": 1, "per_family_limit": 1}
+            normal_limit = proposal("normal-limit-plan")
+            bus.submit_hypothesis(low_limit, available_at=T0, dedupe_key="low-limit-plan")
+            bus.submit_hypothesis(normal_limit, available_at=T0, dedupe_key="normal-limit-plan")
+
+            active = processor(store, bus, max_items=2, max_children=0, criteria=relaxed_criteria())
+            cycle = active.process_pending(now=T0)
+
+            self.assertEqual(cycle.completed, 2)
+            self.assertEqual(cycle.rejected, 0)
+            self.assertEqual(cycle.failed, 0)
+            budget = store.load_experiment_budget("autonomous")
+            self.assertIsNotNone(budget)
+            assert budget is not None
+            self.assertEqual(budget["budget"]["total_limit"], active.config.total_limit)
+            self.assertEqual(budget["budget"]["per_family_limit"], active.config.family_limit)
+            self.assertEqual(budget["budget"]["used_total"], 2)
+
+
     def test_ordering_fields_are_safe_but_order_and_secret_fields_remain_forbidden(self) -> None:
         safe_proposal = proposal("ordering-regression")
         safe_proposal["experiment_plan"]["methodology"] = {
@@ -872,6 +1073,53 @@ class Phase4AutonomousLoopTests(unittest.TestCase):
             self.assertEqual(len(store.list_research_items(status="PENDING", limit=20)), 0)
             self.assertEqual(len(store.load_candidate_lifecycle(limit=None)), 4)
             self.assertEqual(root.item_id.startswith("queue-"), True)
+
+    def test_forged_candidate_parameters_and_identity_are_rejected(self) -> None:
+        with AxiomStore(":memory:") as store:
+            store.save_dataset("dataset", "v1", prediction_rows())
+            bus = DurableResearchBus(store)
+            root = bus.submit_hypothesis(
+                proposal("candidate-binding", max_variants=1),
+                available_at=T0,
+                dedupe_key="candidate-binding-root",
+            )
+            active = processor(store, bus, max_items=1, max_children=1, max_generation=1, criteria=relaxed_criteria())
+            first = active.process_pending(now=T0)
+            self.assertEqual(first.completed, 1)
+            pending = store.list_research_items(status="PENDING", limit=1)
+            self.assertEqual(len(pending), 1)
+            worker_payload = dict(pending[0]["payload"])
+            candidate_id = str(worker_payload["candidate_id"])
+            second = active.process_pending(now=T0)
+            self.assertEqual(second.completed, 1)
+            baseline = store.load_candidate_lifecycle(candidate_id)
+            forged_parameters = dict(worker_payload)
+            forged_parameters["parameters"] = {"threshold": 0.046}
+            forged_strategy = dict(worker_payload["strategy"])
+            forged_strategy["parameters"] = {"threshold": 0.046}
+            forged_parameters["strategy"] = forged_strategy
+            forged = bus.submit_candidate(
+                forged_parameters,
+                available_at=T0,
+                dedupe_key="candidate-binding-forged-parameters",
+            )
+            rejected_parameters = active.process_pending(now=T0)
+            self.assertEqual(rejected_parameters.rejected, 1)
+            self.assertEqual(rejected_parameters.results[0]["reason_code"], "CANDIDATE_BINDING_MISMATCH")
+            self.assertEqual(store.load_candidate_lifecycle(candidate_id), baseline)
+            self.assertEqual(bus.get(forged.item_id).status, ResearchQueueStatus.REJECTED)
+
+            forged_identity = dict(worker_payload)
+            forged_identity["candidate_id"] = "mutation-forged-identity"
+            forged_id_item = bus.submit_candidate(
+                forged_identity,
+                available_at=T0,
+                dedupe_key="candidate-binding-forged-identity",
+            )
+            rejected_identity = active.process_pending(now=T0)
+            self.assertEqual(rejected_identity.rejected, 1)
+            self.assertEqual(rejected_identity.results[0]["reason_code"], "UNAUTHENTICATED_CANDIDATE")
+            self.assertEqual(bus.get(forged_id_item.item_id).status, ResearchQueueStatus.REJECTED)
 
     def test_summary_dashboard_and_report_outputs_are_machine_and_human_readable(self) -> None:
         with AxiomStore(":memory:") as store:

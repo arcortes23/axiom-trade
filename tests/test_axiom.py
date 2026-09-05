@@ -517,6 +517,85 @@ class DataEvaluationAndProductTests(unittest.TestCase):
             self.assertEqual(store.load_bars("BTCUSDT")[0].close, 100.5)
         finally:
             store.close()
+    def test_storage_migrates_legacy_source_type_columns_before_indexes(self) -> None:
+        connection = sqlite3.connect(":memory:")
+        connection.executescript(
+            """
+            CREATE TABLE polymarket_markets (
+                market_id TEXT NOT NULL,
+                observed_at TEXT NOT NULL,
+                metadata_hash TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (market_id, observed_at, metadata_hash)
+            );
+            CREATE TABLE polymarket_snapshots (
+                snapshot_id TEXT PRIMARY KEY,
+                market_id TEXT NOT NULL,
+                source_timestamp TEXT NOT NULL,
+                observed_at TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                quality TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE collection_errors (
+                error_id TEXT PRIMARY KEY,
+                market_id TEXT,
+                observed_at TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                detail TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            INSERT INTO polymarket_markets(
+                market_id, observed_at, metadata_hash, payload_json, created_at
+            ) VALUES (
+                'historical-market', '2024-01-01T00:00:00+00:00', 'market-hash',
+                '{"source_type":"historical","name":"legacy"}', '2024-01-01T00:00:00+00:00'
+            );
+            INSERT INTO polymarket_snapshots(
+                snapshot_id, market_id, source_timestamp, observed_at, payload_json, quality, created_at
+            ) VALUES (
+                'forward-snapshot', 'forward-market', '2024-01-01T00:00:00+00:00',
+                '2024-01-01T00:00:00+00:00', '{"name":"legacy"}', 'UNKNOWN',
+                '2024-01-01T00:00:00+00:00'
+            );
+            INSERT INTO collection_errors(
+                error_id, market_id, observed_at, kind, detail, payload_json, created_at
+            ) VALUES (
+                'historical-error', 'historical-market', '2024-01-01T00:00:00+00:00',
+                'legacy', 'legacy error', '{"source_type":"HISTORICAL"}',
+                '2024-01-01T00:00:00+00:00'
+            );
+            """
+        )
+        store = AxiomStore(connection=connection)
+        try:
+            for table in ("polymarket_markets", "polymarket_snapshots", "collection_errors"):
+                columns = {row["name"] for row in connection.execute(f"PRAGMA table_info({table})")}
+                self.assertIn("source_type", columns)
+                indexes = {row["name"] for row in connection.execute(f"PRAGMA index_list({table})")}
+                self.assertIn(f"idx_{table}_source_observed", indexes)
+            self.assertEqual(
+                connection.execute(
+                    "SELECT source_type FROM polymarket_markets WHERE market_id='historical-market'"
+                ).fetchone()["source_type"],
+                "HISTORICAL",
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT source_type FROM polymarket_snapshots WHERE snapshot_id='forward-snapshot'"
+                ).fetchone()["source_type"],
+                "FORWARD_COLLECTED",
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT source_type FROM collection_errors WHERE error_id='historical-error'"
+                ).fetchone()["source_type"],
+                "HISTORICAL",
+            )
+        finally:
+            store.close()
     def test_data_pipeline_and_offline_research_are_explicitly_low_quality(self) -> None:
         with AxiomStore(":memory:") as store:
             pipeline = MarketDataPipeline(store)

@@ -680,6 +680,30 @@ class Phase3LifecycleBusTests(unittest.TestCase):
                 with self.subTest(forbidden_key=forbidden_key):
                     with self.assertRaises(ResearchBusPermissionError):
                         bus.submit_hypothesis({"statement": "bad", "source": "x", "tests": [], forbidden_key: "override"})
+            for path, smuggled in (
+                ("statement", "Use private_key=0xdeadbeef to sign the request."),
+                ("source", "api-key: abc123"),
+                ("tests", ["cookie: session=abc123"]),
+                ("evidence", {"instructions": "Polymarket account credentials are available here."}),
+            ):
+                with self.subTest(path=path):
+                    unsafe = {"statement": "bad", "source": "x", "tests": []}
+                    unsafe[path] = smuggled
+                    with self.assertRaises(ResearchBusPermissionError):
+                        bus.submit_hypothesis(unsafe)
+
+            accepted = bus.submit_hypothesis(
+                {
+                    "statement": "Public market token identifiers are used for historical research.",
+                    "source": "public Binance and Polymarket market data",
+                    "tests": ["match market_token_id to token_id"],
+                    "token_id": "public-token-123",
+                    "market_token_id": "market-token-123",
+                },
+                dedupe_key="public-token-identifiers",
+            )
+            self.assertEqual(accepted.payload["token_id"], "public-token-123")
+            self.assertEqual(accepted.payload["market_token_id"], "market-token-123")
 
     def test_director_summary_and_proposal_validation_are_bounded(self) -> None:
         with AxiomStore(":memory:") as store:

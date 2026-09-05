@@ -141,16 +141,108 @@ _FORBIDDEN_EXACT_FIELDS = frozenset(
 )
 
 
+_SAFE_IDENTIFIER_FIELDS = frozenset(
+    {
+        "token_id",
+        "token_ids",
+        "market_token_id",
+        "market_token_ids",
+        "yes_token_id",
+        "no_token_id",
+        "clob_token_id",
+        "clob_token_ids",
+    }
+)
+
+
 def _is_forbidden_field(key: Any) -> bool:
     normalized = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", str(key))
     normalized = re.sub(r"[^A-Za-z0-9]+", "_", normalized).strip("_").lower()
+    if normalized in _SAFE_IDENTIFIER_FIELDS:
+        return False
     tokens = frozenset(part for part in normalized.split("_") if part)
     return normalized in _FORBIDDEN_EXACT_FIELDS or bool(tokens & _FORBIDDEN_FIELD_TOKENS)
+
+
+_CREDENTIAL_MARKER_RE = re.compile(
+    r"""(?ix)
+    (?:
+        \bprivate[\s._-]*(?:key|material)\b
+        |\bapi[\s._-]*(?:key|secret)\b
+        |\bclient[\s._-]*secret\b
+        |\bsecret\b
+        |\bpass(?:word|phrase)\b
+        |\baccess[\s._-]*token\b
+        |\brefresh[\s._-]*token\b
+        |\bbearer[\s._-]*token\b
+        |\bwallet[\s._-]*(?:private[\s._-]*(?:key|material)|secret|seed|mnemonic)\b
+        |\b(?:seed|mnemonic)[\s._-]*phrase\b
+        |\b(?:authorization|auth)[\s._-]*header\b
+        |\b(?:set[\s._-]*)?cookie\s*[:=]
+    )
+    """,
+)
+
+_CREDENTIAL_ASSIGNMENT_RE = re.compile(
+    r"""(?ix)
+    (?<![a-z0-9])
+    ["']?
+    (?:
+        private[\s._-]*(?:key|material)
+        |api[\s._-]*(?:key|secret)
+        |client[\s._-]*secret
+        |secret
+        |pass(?:word|phrase)
+        |access[\s._-]*token
+        |refresh[\s._-]*token
+        |bearer[\s._-]*token
+        |wallet[\s._-]*(?:private[\s._-]*(?:key|material)|secret|seed|mnemonic)
+        |(?:seed|mnemonic)[\s._-]*phrase
+        |(?:authorization|auth)[\s._-]*header
+    )
+    ["']?\s*(?:=|:|=>)\s*\S+
+    """,
+)
+
+_VENUE_CREDENTIAL_RE = re.compile(
+    r"""(?ix)
+    (?:
+        \b(?:binance|polymarket)\b[\s\S]{0,120}
+        \b(?:signed?|signature|signing|hmac|credential|credentials|auth(?:entication|orization)?)
+        \b
+        |
+        \b(?:signed?|signature|signing|hmac|credential|credentials|auth(?:entication|orization)?)
+        \b[\s\S]{0,120}\b(?:binance|polymarket)\b
+        |
+        \b(?:binance|polymarket)\b[\s\S]{0,120}
+        \baccount[\s._-]*(?:credential|key|secret|auth|access|sign)
+        \b
+        |
+        \baccount[\s._-]*(?:credential|key|secret|auth|access|sign)
+        \b[\s\S]{0,120}\b(?:binance|polymarket)\b
+    )
+    """,
+)
+
+
+def _contains_credential_marker(value: str) -> bool:
+    return bool(
+        _CREDENTIAL_MARKER_RE.search(value)
+        or _CREDENTIAL_ASSIGNMENT_RE.search(value)
+        or _VENUE_CREDENTIAL_RE.search(value)
+    )
+
+
+def _is_forbidden_string(value: str) -> bool:
+    return _contains_credential_marker(value)
+
 
 _MAX_PAYLOAD_BYTES = 16_384
 _MAX_PAYLOAD_DEPTH = 8
 _MAX_COLLECTION_ITEMS = 256
 _MAX_STRING_LENGTH = 4_096
+
+
 class DurableResearchBus:
     """SQLite-backed queue with dedupe, leases, immutable event history and safe payloads."""
 
@@ -275,6 +367,8 @@ def _validate_payload(value: Mapping[str, Any]) -> dict[str, Any]:
         if isinstance(item, str):
             if len(item) > _MAX_STRING_LENGTH:
                 raise ValueError(f"research payload string is too long: {path}")
+            if _is_forbidden_string(item):
+                raise ResearchBusPermissionError(f"Hermes research bus forbids credential-like content: {path}")
             return item
         if isinstance(item, (int, float, bool)) or item is None:
             if isinstance(item, float) and not math.isfinite(item):

@@ -117,6 +117,9 @@ class DeterministicMutationEngine:
         provenance: Mapping[str, Any] | None = None,
         lineage: Sequence[str] = (),
         timestamp: datetime | None = None,
+        daily_limit: int | None = None,
+        daily_since: datetime | None = None,
+        daily_until: datetime | None = None,
     ) -> tuple[MutationCandidate, ...]:
         if isinstance(max_variants, bool) or not isinstance(max_variants, int) or max_variants < 0:
             raise ValueError("max_variants must be a non-negative integer")
@@ -160,7 +163,7 @@ class DeterministicMutationEngine:
             previous_budget = self.budget
             try:
                 if self.store is not None:
-                    with self.store.transaction():
+                    with self.store.transaction(immediate=True):
                         reservation = self.store.reserve_experiment_budget(
                             self.budget.budget_id,
                             total_limit=self.budget.total_limit,
@@ -168,6 +171,9 @@ class DeterministicMutationEngine:
                             family=family_name,
                             reservation_key=candidate_id,
                             timestamp=timestamp,
+                            daily_limit=daily_limit,
+                            daily_since=daily_since,
+                            daily_until=daily_until,
                         )
                         next_budget = ExperimentBudget(**dict(reservation["budget"]))
                         evidence = {
@@ -202,16 +208,20 @@ class DeterministicMutationEngine:
                     candidate = MutationCandidate(candidate_id, str(parent_id), generation, child, lineage_value, evidence["provenance"])
                     if self.lifecycle is not None:
                         self.lifecycle.register_idea(candidate_id, evidence)
-            except RuntimeError:
+            except RuntimeError as exc:
                 self.budget = previous_budget
-                break
-            except Exception:
-                self.budget = previous_budget
+                if str(exc) in {
+                    "experiment budget exhausted",
+                    "experiment daily budget exhausted",
+                } or str(exc).startswith("experiment family budget exhausted:"):
+                    break
                 raise
             self.budget = next_budget
             candidates.append(candidate)
         if self.store is None:
-            self._persist_budget()
+            self.budget = next_budget if candidates else self.budget
+        elif candidates:
+            self.store.save_experiment_budget(self.budget.budget_id, self.budget.as_record())
         return tuple(candidates)
 
     def _persist_budget(self) -> None:

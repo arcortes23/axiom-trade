@@ -5,6 +5,8 @@ import json
 import unittest
 from urllib.parse import parse_qs, urlparse
 
+from axiom.bootstrap import _coerce_universe_snapshot
+
 from axiom.crypto_universe import (
     CURRENT_UNIVERSE,
     SURVIVORSHIP_BIAS_PRESENT,
@@ -12,6 +14,8 @@ from axiom.crypto_universe import (
     CoinGeckoRankingProvider,
     CryptoUniverseBuilder,
     UniverseConfig,
+    crypto_universe_status,
+    load_crypto_universe,
 )
 from axiom.data.binance import BinanceAdapter
 from axiom.storage import AxiomStore
@@ -87,6 +91,57 @@ class CryptoUniverseTests(unittest.TestCase):
         self.assertEqual(reasons["xrp"], "BINANCE_STATUS_NOT_TRADING")
         self.assertEqual(reasons["cardano"], "BINANCE_SPOT_NOT_ALLOWED")
         self.assertEqual(result.labels, (CURRENT_UNIVERSE, SURVIVORSHIP_BIAS_PRESENT))
+
+
+    def test_custom_universe_id_uses_immutable_namespace_for_refresh_status_and_load(self) -> None:
+        rows = ranked((1, "bitcoin", "btc", "Bitcoin"))
+        exchange = [{"symbol": "BTCUSDT", "baseAsset": "BTC", "quoteAsset": "USDT", "status": "TRADING", "isSpotTradingAllowed": True}]
+        config = UniverseConfig(universe_id="custom-id", top_n=1)
+        self.assertEqual(config.universe_id, "custom-id")
+        self.assertEqual(config.persisted_dataset_id, "universe:custom-id")
+        with AxiomStore(":memory:") as store:
+            refreshed = CryptoUniverseBuilder(StaticRanking(rows), StaticBinance(exchange), store, config=config).build(now=T0)
+            loaded = load_crypto_universe(store, universe_id="custom-id", version=refreshed.version)
+            status = crypto_universe_status(store, universe_id="custom-id")
+            self.assertEqual(refreshed.universe_id, "custom-id")
+            self.assertEqual(loaded, refreshed)
+            self.assertEqual(status["universe_id"], "custom-id")
+            self.assertEqual(status["dataset_id"], "universe:custom-id")
+            self.assertEqual(status["versions"], [refreshed.version])
+
+
+    def test_bootstrap_coercion_requires_exact_persisted_membership(self) -> None:
+        rows = ranked((1, "bitcoin", "btc", "Bitcoin"))
+        exchange = [
+            {
+                "symbol": "BTCUSDT",
+                "baseAsset": "BTC",
+                "quoteAsset": "USDT",
+                "status": "TRADING",
+                "isSpotTradingAllowed": True,
+            }
+        ]
+        with AxiomStore(":memory:") as store:
+            snapshot = CryptoUniverseBuilder(StaticRanking(rows), StaticBinance(exchange), store).build(now=T0)
+            loaded = _coerce_universe_snapshot(store, snapshot, snapshot.version)
+            self.assertIsNotNone(loaded)
+            assert loaded is not None
+            self.assertEqual(loaded.version, snapshot.version)
+            self.assertEqual(loaded.selected_symbols, snapshot.selected_symbols)
+
+            mapping = snapshot.as_dict()
+            accepted = _coerce_universe_snapshot(store, mapping, None)
+            self.assertIsNotNone(accepted)
+            assert accepted is not None
+            self.assertEqual(accepted.version, snapshot.version)
+            self.assertEqual(accepted.records, loaded.records)
+
+            forged = dict(mapping)
+            forged["selected_symbols"] = ["FORGEDUSDT"]
+            forged["symbols"] = ["FORGEDUSDT"]
+            with self.assertRaisesRegex(ValueError, "selected membership"):
+                _coerce_universe_snapshot(store, forged, None)
+
 
     def test_stale_fallback_is_exact_and_versions_are_immutable(self) -> None:
         rows = ranked((1, "bitcoin", "btc", "Bitcoin"))

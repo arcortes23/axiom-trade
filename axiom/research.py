@@ -18,8 +18,10 @@ from typing import Any, Iterable, Mapping, Sequence
 from .attribution import fitness_attribution
 from .backtest import CryptoBacktester
 from .benchmarks import crypto_benchmarks, prediction_benchmarks
+from .bootstrap import crypto_universe_dataset_id
+from .crypto_universe import SURVIVORSHIP_BIAS_PRESENT, UniverseSnapshot, load_crypto_universe
 from .data import BinanceAdapter, PolymarketAdapter
-from .domain import MarketType, PredictionMarketSnapshot, ResearchQuality, SettlementState, SimulationQuality, parse_timestamp, to_record
+from .domain import InstrumentMetadata, MarketType, OHLCVBar, PredictionMarketSnapshot, ResearchQuality, SettlementState, SimulationQuality, ensure_utc, parse_timestamp, to_record
 from .evaluation import evaluate_scores, split_dataset
 from .metrics import calibration_at_horizons
 from .regime import RegimeEngine
@@ -115,8 +117,12 @@ def run_crypto_research(
     symbols: Sequence[str] | Mapping[str, Any] | None = None,
     providers: Mapping[str, Any] | Sequence[Any] | Any | None = None,
     symbol_providers: Mapping[str, Any] | None = None,
-    universe: Mapping[str, Any] | None = None,
+    universe: Mapping[str, Any] | UniverseSnapshot | None = None,
     universe_provenance: Mapping[str, Any] | None = None,
+    dataset_id: str | Mapping[str, Any] | None = None,
+    dataset_version: str | Mapping[str, Any] | None = None,
+    timeframe: str | Mapping[str, Any] = "1d",
+    source_type: str | Mapping[str, Any] = "HISTORICAL",
 ) -> dict[str, Any]:
     """Backtest deterministic crypto families for one symbol.
 
@@ -141,22 +147,52 @@ def run_crypto_research(
             initial_cash=initial_cash,
             store=store,
             timeout=timeout,
+            dataset_id=dataset_id,
+            dataset_version=dataset_version,
+            timeframe=timeframe,
+            source_type=source_type,
         )
-    provider = provider or BinanceAdapter(timeout=timeout)
+    resolved_universe_provenance: dict[str, Any] | None = None
+    if universe is not None or universe_provenance is not None:
+        resolved_universe_provenance = _research_universe_provenance(
+            universe,
+            universe_provenance,
+            store=store,
+            requested_symbols=(symbol,),
+        )
+    dataset_binding = _dataset_binding_requested(dataset_id, dataset_version, timeframe, source_type)
+    bound_dataset: dict[str, Any] | None = None
+    if dataset_binding:
+        bound_dataset = _load_bound_crypto_dataset(
+            store,
+            symbol=symbol,
+            dataset_id=dataset_id,
+            dataset_version=dataset_version,
+            timeframe=timeframe,
+            source_type=source_type,
+        )
     errors: list[str] = []
-    try:
-        bars = tuple(islice(iter(provider.historical_ohlcv(symbol, start=start, end=end, interval="1d")), _MAX_RESEARCH_RECORDS))
-    except Exception as exc:  # network adapters must not abort the report
-        bars = ()
-        errors.append(f"crypto data error: {exc}")
-    _consume_transport_errors(provider, errors, "crypto historical data")
-    source_quality = _research_quality(provider, SimulationQuality.MEDIUM if bars else SimulationQuality.LOW)
-    try:
-        instrument_metadata = provider.metadata(symbol)
-    except Exception as exc:
-        instrument_metadata = None
-        errors.append(f"crypto metadata error: {exc}")
-    _consume_transport_errors(provider, errors, "crypto metadata")
+    if bound_dataset is not None:
+        bars = _bounded_crypto_bars(bound_dataset["bars"], start=start, end=end)
+        source_quality = _quality_value(bound_dataset.get("quality"), SimulationQuality.MEDIUM)
+        provider_name = str(bound_dataset.get("provider") or "persisted-dataset")
+        instrument_metadata = bound_dataset.get("instrument_metadata")
+    else:
+        provider = provider or BinanceAdapter(timeout=timeout)
+        try:
+            bars = tuple(islice(iter(provider.historical_ohlcv(symbol, start=start, end=end, interval="1d")), _MAX_RESEARCH_RECORDS))
+        except Exception as exc:  # network adapters must not abort the report
+            bars = ()
+            errors.append(f"crypto data error: {exc}")
+        _consume_transport_errors(provider, errors, "crypto historical data")
+        source_quality = _research_quality(provider, SimulationQuality.MEDIUM if bars else SimulationQuality.LOW)
+        provider_name = str(getattr(provider, "provider_name", provider.__class__.__name__))
+        try:
+            instrument_metadata = provider.metadata(symbol)
+        except Exception as exc:
+            instrument_metadata = None
+            errors.append(f"crypto metadata error: {exc}")
+        _consume_transport_errors(provider, errors, "crypto metadata")
     coverage = {
         "bars": len(bars),
         "start": bars[0].timestamp.isoformat() if bars else None,
@@ -164,51 +200,33 @@ def run_crypto_research(
     }
     base: dict[str, Any] = {
         "market_type": MarketType.CRYPTO_SPOT.value,
-        "provider": str(getattr(provider, "provider_name", provider.__class__.__name__)),
+        "provider": provider_name,
         "instrument": symbol,
         "instrument_metadata": to_record(instrument_metadata) if instrument_metadata is not None else None,
         "instrument_metadata_available": instrument_metadata is not None,
         "bars": len(bars),
         "historical_coverage": coverage,
-        "dataset_version": "",
+        "dataset_id": bound_dataset["dataset_id"] if bound_dataset is not None else "",
+        "dataset_version": bound_dataset["dataset_version"] if bound_dataset is not None else "",
+        "timeframe": bound_dataset["timeframe"] if bound_dataset is not None else timeframe,
+        "source_type": bound_dataset["source_type"] if bound_dataset is not None else str(source_type).strip().upper(),
         "simulation_quality": source_quality.value,
         "experiments": [],
         "validation": {},
         "errors": errors,
     }
-    if universe_provenance is not None:
-        base["universe_provenance"] = _jsonable(dict(universe_provenance))
+    if bound_dataset is not None:
+        base["dataset_provenance"] = _jsonable(dict(bound_dataset["provenance"]))
+    if resolved_universe_provenance is not None:
+        base["universe_provenance"] = _jsonable(resolved_universe_provenance)
     if len(bars) < 6:
         base["limitations"] = ["fewer than six OHLCV bars; no train/validation/holdout result"]
         return base
 
-    split, version = _chronological_split(bars)
+    split, content_version = _chronological_split(bars)
+    version = bound_dataset["dataset_version"] if bound_dataset is not None else content_version
     base["dataset_version"] = version
     base["benchmarks"] = [item.as_record() for item in crypto_benchmarks(bars, initial_cash=initial_cash, fee_bps=10.0, slippage_bps=5.0, symbol=symbol)]
-    dataset_id = f"crypto:{symbol.replace('/', '').replace('-', '').upper()}"
-    if store is not None:
-        try:
-            existing = store.load_dataset_record(dataset_id, version)
-            with store.transaction():
-                if existing is None:
-                    store.save_dataset(
-                        dataset_id,
-                        version,
-                        bars,
-                        metadata={
-                            "provider": base["provider"],
-                            "instrument": symbol,
-                            "interval": "1d",
-                            "instrument_metadata": base["instrument_metadata"],
-                            "instrument_metadata_available": base["instrument_metadata_available"],
-                        },
-                        quality=_research_quality(provider, SimulationQuality.MEDIUM),
-                    )
-                if not store.load_bars(symbol, dataset_id=dataset_id, dataset_version=version):
-                    store.save_bars(symbol, bars, dataset_id=dataset_id, dataset_version=version)
-        except ValueError as exc:
-            errors.append(str(exc))
-
     families: tuple[tuple[str, dict[str, Any]], ...] = (
         ("dip", {"lookback": 14, "threshold": 0.03}),
         ("momentum", {"lookback": 14, "threshold": 0.03}),
@@ -353,20 +371,24 @@ def run_multi_symbol_crypto_research(
     symbols: Sequence[str] | Mapping[str, Any] | None = None,
     providers: Mapping[str, Any] | Sequence[Any] | Any | None = None,
     *,
+    start: datetime | None = None,
+    end: datetime | None = None,
     provider: Any | None = None,
     symbol_providers: Mapping[str, Any] | None = None,
-    universe: Mapping[str, Any] | None = None,
+    universe: Mapping[str, Any] | UniverseSnapshot | None = None,
     universe_provenance: Mapping[str, Any] | None = None,
     universe_id: Any | None = None,
     universe_version: Any | None = None,
     methodology: Any | None = None,
     survivorship_bias: Any | None = None,
-    start: datetime | None = None,
-    end: datetime | None = None,
     initial_cash: float = 10_000.0,
     store: AxiomStore | None = None,
     timeout: float = 10.0,
     max_symbols: int = 50,
+    dataset_id: str | Mapping[str, Any] | None = None,
+    dataset_version: str | Mapping[str, Any] | None = None,
+    timeframe: str | Mapping[str, Any] = "1d",
+    source_type: str | Mapping[str, Any] = "HISTORICAL",
 ) -> dict[str, Any]:
     """Run deterministic OHLCV research independently for every universe symbol.
 
@@ -380,15 +402,29 @@ def run_multi_symbol_crypto_research(
         raise ValueError("max_symbols must be an integer from 1 to 50")
     if len(requested) > max_symbols:
         raise ValueError(f"crypto research universe exceeds max_symbols={max_symbols}")
+    if _multi_symbol_dataset_binding_requested(dataset_id, dataset_version, timeframe, source_type):
+        _validate_multi_symbol_dataset_bindings(
+            requested,
+            dataset_id=dataset_id,
+            dataset_version=dataset_version,
+            timeframe=timeframe,
+            source_type=source_type,
+        )
     provenance = _research_universe_provenance(
         universe,
         universe_provenance,
+        store=store,
+        requested_symbols=requested,
         universe_id=universe_id,
         universe_version=universe_version,
         methodology=methodology,
         survivorship_bias=survivorship_bias,
     )
     declared_symbols = provenance.get("selected_symbols", provenance.get("symbols"))
+    if declared_symbols is None:
+        provenance["selected_symbols"] = list(requested)
+        provenance["symbols"] = list(requested)
+        declared_symbols = requested
     if isinstance(declared_symbols, Sequence) and not isinstance(declared_symbols, (str, bytes, bytearray)):
         declared = {_canonical_symbol(item) for item in declared_symbols}
         unexpected = sorted(symbol for symbol in requested if _canonical_symbol(symbol) not in declared)
@@ -398,7 +434,24 @@ def run_multi_symbol_crypto_research(
     errors: list[str] = []
     for symbol in requested:
         symbol_provider = _provider_for_symbol(symbol, provider_inputs, provider)
-        if symbol_provider is None:
+        symbol_dataset_id = _symbol_binding_value(dataset_id, symbol)
+        symbol_dataset_version = _symbol_binding_value(dataset_version, symbol)
+        symbol_timeframe = _symbol_binding_value(
+            timeframe,
+            symbol,
+            default=None if isinstance(timeframe, Mapping) else "1d",
+        )
+        symbol_source_type = _symbol_binding_value(
+            source_type,
+            symbol,
+            default=None if isinstance(source_type, Mapping) else "HISTORICAL",
+        )
+        if symbol_provider is None and not _dataset_binding_requested(
+            symbol_dataset_id,
+            symbol_dataset_version,
+            symbol_timeframe,
+            symbol_source_type,
+        ):
             result = _failed_crypto_symbol_result(symbol, "no provider supplied for symbol")
         else:
             try:
@@ -410,10 +463,30 @@ def run_multi_symbol_crypto_research(
                     initial_cash=initial_cash,
                     store=store,
                     timeout=timeout,
-                    universe_provenance=provenance,
+                    dataset_id=symbol_dataset_id,
+                    dataset_version=symbol_dataset_version,
+                    timeframe=symbol_timeframe,
+                    source_type=symbol_source_type,
                 )
             except Exception as exc:  # preserve one bad asset without aborting the universe
                 result = _failed_crypto_symbol_result(symbol, f"crypto research error: {exc}")
+        if symbol_dataset_id is not None:
+            result["dataset_id"] = str(symbol_dataset_id).strip()
+        else:
+            result.setdefault("dataset_id", "")
+        if symbol_dataset_version is not None:
+            result["dataset_version"] = str(symbol_dataset_version).strip()
+        else:
+            result.setdefault("dataset_version", "")
+        if symbol_timeframe is not None:
+            result["timeframe"] = str(symbol_timeframe).strip()
+        else:
+            result.setdefault("timeframe", "")
+        if symbol_source_type is not None:
+            result["source_type"] = str(symbol_source_type).strip().upper()
+        else:
+            result.setdefault("source_type", "")
+        result.setdefault("universe_provenance", _jsonable(provenance))
         experiments = result.get("experiments", ())
         result["status"] = "complete" if experiments else ("failed" if result.get("errors") else "insufficient_data")
         result["symbol"] = symbol
@@ -519,7 +592,18 @@ def run_multi_symbol_crypto_research(
         "live_execution": False,
         "status": "complete" if not failed_symbols else ("failed" if len(failed_symbols) == len(requested) else "partial"),
     }
-    return _jsonable(report)
+    payload = _jsonable(report)
+    if store is not None:
+        report_id = "crypto-research:" + hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()[:24]
+        _save_research_report_if_absent(
+            store,
+            report_id,
+            payload,
+            experiment_id=str(provenance["universe_id"]),
+        )
+    return payload
 
 
 def _research_symbol_inputs(
@@ -578,44 +662,154 @@ def _provider_for_symbol(
 
 
 def _research_universe_provenance(
-    universe: Mapping[str, Any] | None,
+    universe: Mapping[str, Any] | UniverseSnapshot | None,
     supplied: Mapping[str, Any] | None,
     *,
-    universe_id: Any | None,
-    universe_version: Any | None,
-    methodology: Any | None,
-    survivorship_bias: Any | None,
+    store: AxiomStore | None,
+    requested_symbols: Sequence[str] | None = None,
+    universe_id: Any | None = None,
+    universe_version: Any | None = None,
+    methodology: Any | None = None,
+    survivorship_bias: Any | None = None,
 ) -> dict[str, Any]:
+    """Normalize and verify one exact persisted universe binding.
+
+    A caller-supplied mapping is only descriptive input.  The durable identity,
+    version, hash, and selected membership are taken from the exact persisted
+    snapshot and are never resolved through a latest/provider fallback.
+    """
     result: dict[str, Any] = {}
+    sources: list[dict[str, Any]] = []
     for source in (universe, supplied):
-        if source is not None:
-            if not isinstance(source, Mapping):
-                raise TypeError("universe provenance must be a mapping")
-            result.update(dict(source))
-    nested = result.get("provenance")
-    if isinstance(nested, Mapping):
-        merged = dict(nested)
-        merged.update(result)
-        result = merged
-    def choose(explicit: Any | None, *keys: str, default: Any = None) -> Any:
-        if explicit is not None:
-            return explicit
-        for key in keys:
-            if key in result and result[key] not in (None, ""):
-                return result[key]
-        return default
-    resolved_id = choose(universe_id, "universe_id", "id")
-    resolved_version = choose(universe_version, "universe_version", "version", "snapshot_hash", "snapshot_version")
-    if resolved_id in (None, "") or resolved_version in (None, ""):
+        if source is None:
+            continue
+        if isinstance(source, UniverseSnapshot):
+            payload = source.as_dict()
+        elif isinstance(source, Mapping):
+            payload = dict(source)
+        else:
+            raise TypeError("universe provenance must be a mapping or UniverseSnapshot")
+        nested = payload.get("provenance")
+        if isinstance(nested, Mapping):
+            merged = dict(nested)
+            merged.update(payload)
+            payload = merged
+        sources.append(payload)
+        result.update(payload)
+
+    def _text(value: Any) -> str | None:
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
+
+    def _claim(explicit: Any | None, keys: Sequence[str], label: str) -> str | None:
+        values: list[str] = []
+        explicit_value = _text(explicit)
+        if explicit_value is not None:
+            values.append(explicit_value)
+        for source in sources:
+            for key in keys:
+                value = _text(source.get(key))
+                if value is not None:
+                    values.append(value)
+        unique = list(dict.fromkeys(values))
+        if len(unique) > 1:
+            raise ValueError(f"conflicting {label} values in universe provenance")
+        return unique[0] if unique else None
+
+    resolved_id = _claim(universe_id, ("universe_id", "id"), "universe_id")
+    resolved_version = _claim(
+        universe_version,
+        ("universe_version", "version", "snapshot_version"),
+        "universe_version",
+    )
+    if resolved_id is None or resolved_version is None:
         raise ValueError("versioned universe provenance requires universe_id and universe_version")
+    if resolved_version.casefold() in {"latest", "current", "default", "unversioned"}:
+        raise ValueError("universe_version must be immutable and versioned")
+    if store is None:
+        raise ValueError("persisted universe store is required for versioned provenance")
+
+    persisted = load_crypto_universe(store, universe_id=resolved_id, version=resolved_version)
+    if persisted is None:
+        raise ValueError(f"no persisted crypto universe found for {resolved_id}/{resolved_version}")
+    if str(persisted.universe_id).strip() != resolved_id or str(persisted.version or "").strip() != resolved_version:
+        raise ValueError("persisted universe identity does not match supplied universe")
+
+    supplied_hash = _claim(
+        None,
+        ("snapshot_hash", "universe_snapshot_hash", "content_hash", "universe_hash"),
+        "snapshot_hash",
+    )
+    persisted_hash = _text(persisted.snapshot_hash)
+    if persisted_hash is None:
+        raise ValueError("persisted universe snapshot_hash is required")
+    if supplied_hash is not None and supplied_hash != persisted_hash:
+        raise ValueError("universe snapshot_hash does not match persisted snapshot")
+
+    def _members(value: Any, label: str) -> tuple[tuple[str, ...], frozenset[str]]:
+        if isinstance(value, (str, bytes, bytearray)) or not isinstance(value, Sequence):
+            raise ValueError(f"{label} must be a sequence")
+        display = tuple(str(item).strip() for item in value)
+        if any(not item for item in display):
+            raise ValueError(f"{label} must not contain empty symbols")
+        canonical = tuple(_canonical_symbol(item) for item in display)
+        if any(not item for item in canonical) or len(set(canonical)) != len(canonical):
+            raise ValueError(f"{label} must contain unique symbols")
+        return display, frozenset(canonical)
+
+    declared_members: tuple[str, ...] | None = None
+    declared_set: frozenset[str] | None = None
+    for source in sources:
+        for key in ("selected_symbols", "symbols", "instruments"):
+            if key not in source or source[key] is None:
+                continue
+            display, members = _members(source[key], f"universe {key}")
+            if declared_set is not None and members != declared_set:
+                raise ValueError("conflicting selected membership values in universe provenance")
+            if declared_set is None:
+                declared_members, declared_set = display, members
+
+    persisted_members, persisted_set = _members(persisted.selected_symbols, "persisted selected_symbols")
+    if declared_set is not None and declared_set != persisted_set:
+        missing = sorted(persisted_set - declared_set)
+        extra = sorted(declared_set - persisted_set)
+        raise ValueError(
+            "supplied universe selected membership does not match persisted snapshot"
+            f" (missing={missing}, extra={extra})"
+        )
+    if requested_symbols is not None:
+        _, requested_set = _members(requested_symbols, "requested symbols")
+        if requested_set != persisted_set:
+            missing = sorted(persisted_set - requested_set)
+            extra = sorted(requested_set - persisted_set)
+            raise ValueError(
+                "persisted universe selected membership does not match requested symbols"
+                f" (missing={missing}, extra={extra})"
+            )
+
     result["universe_id"] = resolved_id
     result["universe_version"] = resolved_version
-    result["methodology"] = choose(methodology, "methodology", "method", "policy", default="unspecified")
-    result["survivorship_bias"] = choose(
-        survivorship_bias,
-        "survivorship_bias",
-        "survivorship",
-        default="unspecified",
+    if any("version" in source for source in sources):
+        result["version"] = resolved_version
+    result["snapshot_hash"] = persisted_hash
+    output_members = list(declared_members if declared_members is not None else persisted_members)
+    result["selected_symbols"] = output_members
+    if declared_members is None or any("symbols" in source for source in sources):
+        result["symbols"] = list(output_members)
+    result["methodology"] = (
+        _text(methodology)
+        or _text(result.get("methodology"))
+        or _text(result.get("method"))
+        or _text(result.get("policy"))
+        or "unspecified"
+    )
+    result["survivorship_bias"] = (
+        _text(survivorship_bias)
+        or _text(result.get("survivorship_bias"))
+        or _text(result.get("survivorship"))
+        or SURVIVORSHIP_BIAS_PRESENT
     )
     return result
 
@@ -1030,6 +1224,270 @@ def _markdown_document(report: Mapping[str, Any]) -> str:
     else:
         lines.append("- None recorded.")
     return "\n".join(lines).rstrip() + "\n"
+def _save_research_report_if_absent(
+    store: Any,
+    report_id: str,
+    report: Mapping[str, Any],
+    *,
+    experiment_id: str | None = None,
+) -> None:
+    """Persist a deterministic report without turning retries into failures."""
+    save_if_absent = getattr(store, "save_report_if_absent", None)
+    if callable(save_if_absent):
+        try:
+            save_if_absent(report_id, report, experiment_id=experiment_id)
+        except TypeError as first_error:
+            try:
+                save_if_absent(report_id, report)
+            except TypeError:
+                raise first_error
+        return
+
+    save_report = getattr(store, "save_report", None)
+    if not callable(save_report):
+        return
+    try:
+        save_report(report_id, report, experiment_id=experiment_id)
+    except TypeError as first_error:
+        try:
+            save_report(report_id, report)
+        except TypeError:
+            raise first_error
+    except ValueError:
+        loader = getattr(store, "load_report", None)
+        existing = loader(report_id) if callable(loader) else None
+        if existing != report:
+            raise
+
+
+def _symbol_binding_value(value: Any, symbol: str, *, default: Any = None) -> Any:
+    """Resolve a scalar or symbol-keyed binding without changing symbol spelling."""
+    if not isinstance(value, Mapping):
+        return value
+    if symbol in value:
+        return value[symbol]
+    canonical = _canonical_symbol(symbol)
+    for candidate, item in value.items():
+        if _canonical_symbol(candidate) == canonical:
+            return item
+    return default
+
+
+def _multi_symbol_dataset_binding_requested(
+    dataset_id: str | Mapping[str, Any] | None,
+    dataset_version: str | Mapping[str, Any] | None,
+    timeframe: str | Mapping[str, Any],
+    source_type: str | Mapping[str, Any],
+) -> bool:
+    """Return whether any selector makes this run require per-symbol binding."""
+    return any(isinstance(value, Mapping) for value in (dataset_id, dataset_version, timeframe, source_type))
+
+
+def _validate_multi_symbol_dataset_bindings(
+    symbols: Sequence[str],
+    *,
+    dataset_id: str | Mapping[str, Any] | None,
+    dataset_version: str | Mapping[str, Any] | None,
+    timeframe: str | Mapping[str, Any],
+    source_type: str | Mapping[str, Any],
+) -> None:
+    """Reject incomplete or invalid exact bindings before consulting any provider."""
+    failures: list[str] = []
+    for symbol in symbols:
+        symbol_dataset_id = _symbol_binding_value(dataset_id, symbol)
+        symbol_dataset_version = _symbol_binding_value(dataset_version, symbol)
+        symbol_timeframe = _symbol_binding_value(
+            timeframe,
+            symbol,
+            default=None if isinstance(timeframe, Mapping) else "1d",
+        )
+        symbol_source_type = _symbol_binding_value(
+            source_type,
+            symbol,
+            default=None if isinstance(source_type, Mapping) else "HISTORICAL",
+        )
+        identifier = str(symbol_dataset_id or "").strip()
+        version = str(symbol_dataset_version or "").strip()
+        timeframe_value = str(symbol_timeframe or "").strip()
+        source_value = str(symbol_source_type or "").strip().upper()
+        reasons: list[str] = []
+        if not identifier:
+            reasons.append("dataset_id is missing or empty")
+        elif identifier.casefold() in {"latest", "current", "unversioned"}:
+            reasons.append("dataset_id must be an explicit persisted identifier")
+        if not version:
+            reasons.append("dataset_version is missing or empty")
+        elif version.casefold() in {"latest", "current", "unversioned"}:
+            reasons.append("dataset_version must be immutable and versioned")
+        if not timeframe_value:
+            reasons.append("timeframe is missing or empty")
+        if source_value not in {"HISTORICAL", "FORWARD_COLLECTED"}:
+            reasons.append("source_type must be HISTORICAL or FORWARD_COLLECTED")
+        if reasons:
+            failures.append(f"{symbol}: {', '.join(reasons)}")
+    if failures:
+        raise ValueError(
+            "exact dataset binding requires every requested symbol to have valid selectors; "
+            + "; ".join(failures)
+        )
+
+
+def _dataset_binding_requested(
+    dataset_id: str | Mapping[str, Any] | None,
+    dataset_version: str | Mapping[str, Any] | None,
+    timeframe: str | Mapping[str, Any],
+    source_type: str | Mapping[str, Any],
+) -> bool:
+    return (
+        dataset_id is not None
+        or dataset_version is not None
+        or str(timeframe).strip() != "1d"
+        or str(source_type).strip().upper() != "HISTORICAL"
+    )
+
+
+def _bounded_crypto_bars(
+    rows: Sequence[OHLCVBar],
+    *,
+    start: datetime | None,
+    end: datetime | None,
+) -> tuple[OHLCVBar, ...]:
+    """Apply the provider's inclusive UTC bounds before research truncation."""
+    start_utc = ensure_utc(start) if start is not None else None
+    end_utc = ensure_utc(end) if end is not None else None
+    return tuple(
+        islice(
+            (
+                bar
+                for bar in rows
+                if (start_utc is None or ensure_utc(bar.timestamp) >= start_utc)
+                and (end_utc is None or ensure_utc(bar.timestamp) <= end_utc)
+            ),
+            _MAX_RESEARCH_RECORDS,
+        )
+    )
+
+
+def _load_bound_crypto_dataset(
+    store: AxiomStore | None,
+    *,
+    symbol: str,
+    dataset_id: str | None,
+    dataset_version: str | None,
+    timeframe: str,
+    source_type: str,
+) -> dict[str, Any]:
+    if store is None:
+        raise ValueError("an AxiomStore is required for explicit dataset binding")
+    identifier = str(dataset_id or "").strip()
+    version = str(dataset_version or "").strip()
+    timeframe_value = str(timeframe or "").strip()
+    source_value = str(source_type or "").strip().upper()
+    if not identifier or not version:
+        raise ValueError("explicit dataset binding requires dataset_id and dataset_version")
+    if identifier.casefold() in {"latest", "current", "unversioned"} or version.casefold() in {
+        "latest",
+        "current",
+        "unversioned",
+    }:
+        raise ValueError("explicit dataset binding rejects latest or unversioned selectors")
+    if not timeframe_value:
+        raise ValueError("explicit dataset binding requires timeframe")
+    if source_value not in {"HISTORICAL", "FORWARD_COLLECTED"}:
+        raise ValueError("dataset source_type must be HISTORICAL or FORWARD_COLLECTED")
+
+    catalog_loader = getattr(store, "load_dataset_catalog", None)
+    if not callable(catalog_loader):
+        raise ValueError("persisted dataset catalog is required")
+    catalog = catalog_loader(identifier, version)
+    if not isinstance(catalog, Mapping):
+        raise ValueError("persisted dataset catalog is required")
+    metadata = catalog.get("metadata")
+    metadata = dict(metadata) if isinstance(metadata, Mapping) else {}
+
+    def catalog_value(*names: str) -> Any:
+        for name in names:
+            value = catalog.get(name)
+            if value is not None and (not isinstance(value, str) or value.strip()):
+                return value
+        for name in names:
+            value = metadata.get(name)
+            if value is not None and (not isinstance(value, str) or value.strip()):
+                return value
+        return None
+
+    actual_id = str(catalog_value("dataset_id") or "").strip()
+    actual_version = str(catalog_value("dataset_version", "version") or "").strip()
+    if actual_id != identifier or actual_version != version:
+        raise ValueError("persisted dataset identity does not match the requested selector")
+    instrument = str(catalog_value("instrument") or "").strip()
+    if not instrument:
+        raise ValueError("persisted dataset catalog instrument is required")
+    if _canonical_symbol(instrument) != _canonical_symbol(symbol):
+        raise ValueError(f"persisted dataset instrument does not match symbol: {instrument} != {symbol}")
+    market_type = str(catalog_value("market_type") or "").strip().lower()
+    if market_type != MarketType.CRYPTO_SPOT.value:
+        raise ValueError(f"persisted dataset is not crypto spot data: {market_type}")
+    actual_timeframe = str(catalog_value("timeframe", "interval") or "").strip()
+    if not actual_timeframe:
+        raise ValueError("persisted dataset catalog timeframe is required")
+    if actual_timeframe != timeframe_value:
+        raise ValueError(f"persisted dataset timeframe does not match selector: {actual_timeframe} != {timeframe_value}")
+    actual_source = str(catalog_value("source_type") or "").strip().upper()
+    if not actual_source:
+        raise ValueError("persisted dataset catalog source_type is required")
+    if actual_source != source_value:
+        raise ValueError(f"persisted dataset source_type does not match selector: {actual_source} != {source_value}")
+    provenance = dict(catalog)
+
+    # The dataset row is data only.  Its metadata cannot establish provenance
+    # after the exact catalog record has been validated above.
+    record = store.load_dataset_record(identifier, version)
+
+    bars: list[OHLCVBar] = []
+    try:
+        bars = list(store.load_bars(instrument, dataset_id=identifier, dataset_version=version))
+        if not bars and _canonical_symbol(instrument) != _canonical_symbol(symbol):
+            bars = list(store.load_bars(symbol, dataset_id=identifier, dataset_version=version))
+    except (AttributeError, TypeError, ValueError):
+        bars = []
+    if not bars and isinstance(record, Mapping):
+        raw_records = record.get("records", ())
+        if isinstance(raw_records, Sequence) and not isinstance(raw_records, (str, bytes, bytearray)):
+            for raw in raw_records:
+                if isinstance(raw, OHLCVBar):
+                    bars.append(raw)
+                elif isinstance(raw, Mapping):
+                    timestamp = parse_timestamp(raw.get("timestamp"))
+                    if timestamp is None:
+                        raise ValueError("persisted crypto dataset contains a bar without timestamp")
+                    bars.append(
+                        OHLCVBar(
+                            timestamp=timestamp,
+                            open=float(raw["open"]),
+                            high=float(raw["high"]),
+                            low=float(raw["low"]),
+                            close=float(raw["close"]),
+                            volume=float(raw["volume"]),
+                            spread=float(raw["spread"]) if raw.get("spread") is not None else None,
+                            trades=int(raw["trades"]) if raw.get("trades") is not None else None,
+                        )
+                    )
+    if not bars and int(provenance.get("row_count", 0) or 0) > 0:
+        raise ValueError(f"persisted dataset has no bars for symbol: {symbol}")
+    return {
+        "dataset_id": identifier,
+        "dataset_version": version,
+        "timeframe": actual_timeframe,
+        "source_type": actual_source,
+        "provider": provenance.get("provider") or metadata.get("provider"),
+        "quality": provenance.get("quality") or metadata.get("quality"),
+        "instrument_metadata": metadata.get("instrument_metadata"),
+        "bars": tuple(sorted(bars, key=lambda item: item.timestamp)),
+        "provenance": provenance,
+    }
+
+
 
 
 def _markdown_section(value: Any) -> str:

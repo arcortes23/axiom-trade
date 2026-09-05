@@ -17,6 +17,14 @@ from statistics import mean, median, pstdev
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from .backtest import CryptoBacktester
+from .crypto_universe import (
+    CURRENT_UNIVERSE,
+    SURVIVORSHIP_BIAS_PRESENT,
+    UniverseConfig,
+    UniverseSnapshot,
+    load_crypto_universe,
+    refresh_crypto_universe,
+)
 from .data import BinanceAdapter, PolymarketAdapter
 from .data._http import HTTPFetchError
 from .domain import MarketType, OHLCVBar, PredictionMarketSnapshot, ResearchQuality, SettlementState, parse_timestamp, to_record, utc_now
@@ -56,8 +64,15 @@ class BootstrapReport:
     retries: int = 0
     errors: tuple[str, ...] = ()
     metadata: Mapping[str, Any] | None = None
+    universe_id: str | None = None
+    universe_version: str | None = None
+    survivorship_bias: str | None = None
 
     def as_record(self) -> dict[str, Any]:
+        metadata = dict(self.metadata or {})
+        universe_id = self.universe_id or metadata.get("universe_id")
+        universe_version = self.universe_version or metadata.get("universe_version") or metadata.get("version")
+        survivorship_bias = self.survivorship_bias or metadata.get("survivorship_bias")
         return {
             "dataset_id": self.dataset_id,
             "source_type": self.source_type,
@@ -74,7 +89,10 @@ class BootstrapReport:
             "duplicates": self.duplicates,
             "retries": self.retries,
             "errors": list(self.errors),
-            "metadata": _jsonable(dict(self.metadata or {})),
+            "metadata": _jsonable(metadata),
+            "universe_id": universe_id,
+            "universe_version": universe_version,
+            "survivorship_bias": survivorship_bias,
         }
 
 
@@ -305,6 +323,7 @@ def _same_time(left: Any, right: Any) -> bool:
 
 
 def _catalog_report(catalog: Mapping[str, Any], *, status: str = "COMPLETE") -> BootstrapReport:
+    metadata = dict(catalog.get("metadata", {})) if isinstance(catalog.get("metadata"), Mapping) else {}
     return BootstrapReport(
         dataset_id=str(catalog["dataset_id"]),
         source_type=str(catalog.get("source_type", "HISTORICAL")),
@@ -318,8 +337,204 @@ def _catalog_report(catalog: Mapping[str, Any], *, status: str = "COMPLETE") -> 
         end_timestamp=_stamp(catalog.get("end_timestamp")),
         completeness=float(catalog.get("completeness", 0.0)),
         missing_ranges=tuple(catalog.get("missing_ranges", ())),
-        metadata=dict(catalog.get("metadata", {})) if isinstance(catalog.get("metadata"), Mapping) else {},
+        metadata=metadata,
+        universe_id=str(metadata.get("universe_id")) if metadata.get("universe_id") is not None else None,
+        universe_version=str(metadata.get("universe_version") or metadata.get("version")) if metadata.get("universe_version") is not None or metadata.get("version") is not None else None,
+        survivorship_bias=str(metadata.get("survivorship_bias")) if metadata.get("survivorship_bias") is not None else None,
     )
+
+
+def _canonical_bootstrap_symbol(symbol: Any) -> str:
+    return str(symbol).replace("/", "").replace("-", "").replace("_", "").strip().upper()
+
+
+def crypto_universe_dataset_id(universe_id: Any, universe_version: Any, symbol: Any, timeframe: Any) -> str:
+    """Return the stable per-symbol/timeframe dataset binding."""
+    def safe(value: Any) -> str:
+        text = str(value).strip()
+        return "".join(character if character.isalnum() or character in "._-" else "_" for character in text)
+    return f"crypto-universe:{safe(universe_id)}:{safe(universe_version)}:{_canonical_bootstrap_symbol(symbol)}:{safe(timeframe)}"
+
+
+def _listing_start(provider: Any, symbol: str, hint: Any = None) -> datetime | None:
+    candidates: list[Any] = [hint]
+    metadata_method = getattr(provider, "metadata", None)
+    if callable(metadata_method):
+        try:
+            metadata = metadata_method(symbol)
+        except Exception:
+            metadata = None
+        if isinstance(metadata, Mapping):
+            candidates.extend((metadata, metadata.get("extra")))
+        elif metadata is not None:
+            candidates.extend((getattr(metadata, "extra", None), metadata))
+    keys = (
+        "listing_timestamp", "listing_start", "listed_at", "listing_date",
+        "onboardDate", "onboard_date", "first_trade_timestamp", "first_available_timestamp",
+    )
+    def find(value: Any) -> Any:
+        if isinstance(value, Mapping):
+            for key in keys:
+                if value.get(key) not in (None, ""):
+                    return value[key]
+            nested = value.get("extra")
+            if nested is not value:
+                return find(nested)
+        for key in keys:
+            item = getattr(value, key, None) if value is not None else None
+            if item not in (None, ""):
+                return item
+        return None
+    for candidate in candidates:
+        stamp = _stamp(find(candidate))
+        if stamp is not None:
+            return stamp
+    return None
+
+
+def _coerce_universe_snapshot(
+    store: AxiomStore,
+    universe: UniverseSnapshot | Mapping[str, Any] | None,
+    version: str | None,
+) -> UniverseSnapshot | None:
+    if universe is None:
+        return load_crypto_universe(store, version=version)
+    if not isinstance(universe, (UniverseSnapshot, Mapping)):
+        raise TypeError("universe must be a UniverseSnapshot or mapping")
+
+    def _text(value: Any) -> str:
+        return str(value).strip()
+
+    def _symbols(values: Any, name: str) -> tuple[str, ...]:
+        if not isinstance(values, Sequence) or isinstance(values, (str, bytes, bytearray, Mapping)):
+            raise ValueError(f"{name} must be a sequence of symbols")
+        result: list[str] = []
+        for item in values:
+            if item is None:
+                raise ValueError(f"{name} must not contain empty symbols")
+            symbol = _text(item).upper()
+            if not symbol:
+                raise ValueError(f"{name} must not contain empty symbols")
+            result.append(symbol)
+        return tuple(result)
+
+    def _records(values: Any) -> tuple[Mapping[str, Any], ...]:
+        if not isinstance(values, Sequence) or isinstance(values, (str, bytes, bytearray, Mapping)):
+            raise ValueError("records must be a sequence of mappings")
+        result = tuple(item for item in values if isinstance(item, Mapping))
+        if len(result) != len(values):
+            raise ValueError("records must contain only mappings")
+        return result
+
+    supplied_records: tuple[Mapping[str, Any], ...] | None = None
+    supplied_symbols: tuple[str, ...] | None = None
+    supplied_hash: str | None = None
+    if isinstance(universe, UniverseSnapshot):
+        universe_id = _text(universe.universe_id)
+        supplied_version = _text(universe.version) if universe.version is not None else ""
+        supplied_records = tuple(universe.records)
+        supplied_symbols = _symbols(universe.selected_symbols, "selected_symbols")
+        if universe.snapshot_hash is not None:
+            supplied_hash = _text(universe.snapshot_hash)
+            if not supplied_hash:
+                raise ValueError("snapshot_hash must not be empty")
+    else:
+        id_values: list[str] = []
+        for key in ("universe_id", "id"):
+            if key in universe and universe[key] is not None:
+                value = _text(universe[key])
+                if not value:
+                    raise ValueError("universe_id is required")
+                id_values.append(value)
+        if not id_values:
+            raise ValueError("universe_id is required")
+        if len(set(id_values)) != 1:
+            raise ValueError("universe_id fields do not match")
+        universe_id = id_values[0]
+
+        version_values: list[str] = []
+        for key in ("universe_version", "version"):
+            if key in universe and universe[key] is not None:
+                value = _text(universe[key])
+                if value:
+                    version_values.append(value)
+        if len(set(version_values)) != 1:
+            raise ValueError("universe_version fields do not match")
+        supplied_version = version_values[0] if version_values else ""
+
+        if "snapshot_hash" in universe and universe["snapshot_hash"] is not None:
+            supplied_hash = _text(universe["snapshot_hash"])
+            if not supplied_hash:
+                raise ValueError("snapshot_hash must not be empty")
+        if "records" in universe and universe["records"] is not None:
+            supplied_records = _records(universe["records"])
+        symbol_values: list[tuple[str, ...]] = []
+        for key in ("selected_symbols", "symbols"):
+            if key in universe and universe[key] is not None:
+                symbol_values.append(_symbols(universe[key], key))
+        if symbol_values and any(item != symbol_values[0] for item in symbol_values[1:]):
+            raise ValueError("selected symbol fields do not match")
+        if symbol_values:
+            supplied_symbols = symbol_values[0]
+
+    if not universe_id:
+        raise ValueError("universe_id is required")
+    requested_version = _text(version) if version is not None else ""
+    if version is not None and not requested_version:
+        raise ValueError("universe_version is required")
+    if requested_version and supplied_version and requested_version != supplied_version:
+        message = (
+            "universe_version does not match supplied snapshot"
+            if isinstance(universe, UniverseSnapshot)
+            else "universe_version does not match supplied universe"
+        )
+        raise ValueError(message)
+    resolved_version = requested_version or supplied_version
+    if not resolved_version:
+        raise ValueError("versioned universe provenance requires universe_version")
+    if resolved_version.casefold() in {"latest", "current", "default", "unversioned"}:
+        raise ValueError("universe_version must be immutable and versioned")
+
+    persisted = load_crypto_universe(store, universe_id=universe_id, version=resolved_version)
+    if persisted is None:
+        raise ValueError(f"no persisted crypto universe found for {universe_id}/{resolved_version}")
+    if persisted.universe_id != universe_id or persisted.version != resolved_version:
+        raise ValueError("persisted universe identity does not match supplied universe")
+    if supplied_hash is not None and supplied_hash != (persisted.snapshot_hash or ""):
+        raise ValueError("universe snapshot_hash does not match persisted snapshot")
+
+    persisted_symbols = _symbols(persisted.selected_symbols, "persisted selected_symbols")
+    if supplied_symbols is not None and supplied_symbols != persisted_symbols:
+        raise ValueError("universe selected membership does not match persisted snapshot")
+    if supplied_records is not None:
+        supplied_selected = tuple(row for row in supplied_records if bool(row.get("selected", True)))
+        supplied_record_json = json.dumps(
+            _jsonable(supplied_records), sort_keys=True, separators=(",", ":"), allow_nan=False
+        )
+        persisted_record_json = json.dumps(
+            _jsonable(persisted.records), sort_keys=True, separators=(",", ":"), allow_nan=False
+        )
+        selected_record_json = json.dumps(
+            _jsonable(persisted.selected_records), sort_keys=True, separators=(",", ":"), allow_nan=False
+        )
+        selected_only = bool(supplied_records) and all(
+            bool(row.get("selected", True)) for row in supplied_records
+        )
+        if supplied_record_json != persisted_record_json and not (
+            selected_only
+            and json.dumps(
+                _jsonable(supplied_selected), sort_keys=True, separators=(",", ":"), allow_nan=False
+            )
+            == selected_record_json
+        ):
+            raise ValueError("universe records do not match persisted snapshot")
+        supplied_record_symbols = _symbols(
+            tuple(row.get("binance_symbol") or row.get("symbol") for row in supplied_selected),
+            "selected record symbols",
+        )
+        if supplied_record_symbols != persisted_symbols:
+            raise ValueError("universe selected membership does not match persisted snapshot")
+    return persisted
 
 
 class HistoricalBootstrapper:
@@ -388,6 +603,371 @@ class HistoricalBootstrapper:
                 )
             )
         return tuple(output)
+
+    def bootstrap_crypto_universe(
+        self,
+        universe: UniverseSnapshot | Mapping[str, Any] | None = None,
+        *,
+        universe_version: str | None = None,
+        intervals: Sequence[str] = tuple(BTC_INTERVAL_SECONDS),
+        start: datetime = BTC_HISTORY_START,
+        end: datetime | None = None,
+        full_15m: bool = False,
+        resume: bool = False,
+        max_symbols: int = 50,
+    ) -> tuple[BootstrapReport, ...]:
+        """Bootstrap each selected symbol/timeframe with independent state.
+
+        The selected universe is resolved once.  Every durable dataset and
+        cursor carries that exact snapshot version; a later universe refresh
+        therefore cannot silently alter an in-flight or completed bootstrap.
+        """
+        if isinstance(max_symbols, bool) or not isinstance(max_symbols, int) or not 1 <= max_symbols <= 50:
+            raise ValueError("max_symbols must be an integer from 1 to 50")
+        snapshot = _coerce_universe_snapshot(self.store, universe, universe_version)
+        if snapshot is None or snapshot.version is None:
+            raise ValueError("a persisted versioned crypto universe is required")
+        selected = tuple(dict.fromkeys(str(item).strip().upper() for item in snapshot.selected_symbols if str(item).strip()))
+        if not selected:
+            raise ValueError("crypto universe has no selected symbols")
+        if len(selected) > max_symbols:
+            raise ValueError(f"crypto universe exceeds max_symbols={max_symbols}")
+        requested_intervals = tuple(dict.fromkeys(str(item).strip() for item in intervals))
+        unknown = [item for item in requested_intervals if item not in BTC_INTERVAL_SECONDS]
+        if unknown:
+            raise ValueError(f"unsupported crypto interval(s): {', '.join(unknown)}")
+        raw_end = _stamp(end) or _stamp(self.clock())
+        raw_start = _stamp(start) or BTC_HISTORY_START
+        if raw_end is None or raw_start is None:
+            raise ValueError("bootstrap range must contain UTC timestamps")
+        if raw_end < raw_start:
+            raise ValueError("end must be on or after start")
+        by_symbol = {
+            _canonical_bootstrap_symbol(row.get("binance_symbol") or row.get("symbol")): row
+            for row in snapshot.selected_records
+            if row.get("binance_symbol") or row.get("symbol")
+        }
+        reports: list[BootstrapReport] = []
+        for symbol in selected:
+            listing_hint = by_symbol.get(symbol, {}).get("listing_timestamp") if by_symbol.get(symbol) else None
+            listing = _listing_start(self.crypto_provider, symbol, listing_hint)
+            for interval in requested_intervals:
+                interval_start = _align_start(raw_start, BTC_INTERVAL_SECONDS[interval])
+                if listing is not None:
+                    interval_start = max(interval_start, _align_start(listing, BTC_INTERVAL_SECONDS[interval]))
+                if interval == "15m" and not full_15m:
+                    interval_start = max(interval_start, _align_start(raw_end - timedelta(days=365 * 3), BTC_INTERVAL_SECONDS[interval]))
+                interval_end = _align_end(raw_end, BTC_INTERVAL_SECONDS[interval])
+                dataset_id = crypto_universe_dataset_id(snapshot.universe_id, snapshot.version, symbol, interval)
+                reports.append(
+                    self._bootstrap_symbol_interval(
+                        symbol,
+                        interval,
+                        dataset_id=dataset_id,
+                        requested_start=interval_start,
+                        requested_end=interval_end,
+                        resume=bool(resume),
+                        universe=snapshot,
+                        listing_start=listing,
+                    )
+                )
+        return tuple(reports)
+
+    bootstrap_universe = bootstrap_crypto_universe
+    bootstrap_selected_universe = bootstrap_crypto_universe
+
+    def _bootstrap_symbol_interval(
+        self,
+        symbol: str,
+        interval: str,
+        *,
+        dataset_id: str,
+        requested_start: datetime,
+        requested_end: datetime,
+        resume: bool,
+        universe: UniverseSnapshot,
+        listing_start: datetime | None,
+    ) -> BootstrapReport:
+        provider = self.crypto_provider
+        symbol = _canonical_bootstrap_symbol(symbol)
+        step = timedelta(seconds=BTC_INTERVAL_SECONDS[interval])
+        provenance = {
+            "universe_id": universe.universe_id,
+            "universe_version": universe.version,
+            "universe_snapshot_hash": universe.snapshot_hash,
+            "selected_symbol": symbol,
+            "timeframe": interval,
+            "source_type": "HISTORICAL",
+            "survivorship_bias": SURVIVORSHIP_BIAS_PRESENT,
+            "universe_labels": list(universe.labels),
+            "listing_start": listing_start,
+        }
+        errors: list[str] = []
+        retries = 0
+        duplicate_count = 0
+        latest = self.store.load_dataset_catalog(dataset_id)
+        state = self.store.load_dataset_bootstrap_state(dataset_id)
+        state_status = str(state.get("status", "")) if state else ""
+        if state and state_status not in {"COMPLETE", "EMPTY"} and not resume:
+            message = f"{dataset_id} has an incomplete bootstrap; rerun with --resume"
+            return BootstrapReport(
+                dataset_id, "HISTORICAL", _provider_name(provider), symbol, interval, "BLOCKED",
+                None, 0, None, None, 0.0, errors=(message,), metadata=provenance,
+                universe_id=universe.universe_id, universe_version=universe.version,
+                survivorship_bias=SURVIVORSHIP_BIAS_PRESENT,
+            )
+        base_catalog = latest
+        base_version = str(latest["dataset_version"]) if latest else None
+        base_start = _stamp(latest.get("start_timestamp")) if latest else None
+        if base_start is not None and base_start > requested_start:
+            base_catalog = None
+            base_version = None
+        if latest is not None and base_catalog is not None and _same_time(latest.get("end_timestamp"), requested_end):
+            if float(latest.get("completeness", 0.0)) >= 1.0 and not latest.get("missing_ranges"):
+                self.store.save_dataset_bootstrap_state(
+                    dataset_id,
+                    {
+                        **provenance,
+                        "provider": _provider_name(provider),
+                        "instrument": symbol,
+                        "market_type": MarketType.CRYPTO_SPOT.value,
+                        "timeframe": interval,
+                        "requested_start": requested_start,
+                        "requested_end": requested_end,
+                        "next_timestamp": requested_end + step,
+                        "base_version": base_version,
+                        "status": "COMPLETE",
+                        "records": int(latest.get("row_count", 0)),
+                        "message": "already complete",
+                    },
+                )
+                return _catalog_report(latest)
+        cursor = requested_start
+        if state and state_status not in {"COMPLETE", "EMPTY"}:
+            if not _same_time(state.get("requested_start"), requested_start) or not _same_time(state.get("requested_end"), requested_end):
+                message = f"{dataset_id} bootstrap request differs from stored state"
+                return BootstrapReport(
+                    dataset_id, "HISTORICAL", _provider_name(provider), symbol, interval, "BLOCKED",
+                    None, 0, None, None, 0.0, errors=(message,), metadata=provenance,
+                    universe_id=universe.universe_id, universe_version=universe.version,
+                    survivorship_bias=SURVIVORSHIP_BIAS_PRESENT,
+                )
+            if str(state.get("universe_version") or universe.version) != str(universe.version):
+                message = f"{dataset_id} universe version changed; inspect status before resuming"
+                return BootstrapReport(
+                    dataset_id, "HISTORICAL", _provider_name(provider), symbol, interval, "BLOCKED",
+                    None, 0, None, None, 0.0, errors=(message,), metadata=provenance,
+                    universe_id=universe.universe_id, universe_version=universe.version,
+                    survivorship_bias=SURVIVORSHIP_BIAS_PRESENT,
+                )
+            cursor = _stamp(state.get("next_timestamp")) or cursor
+        elif base_catalog is not None:
+            base_end = _stamp(base_catalog.get("end_timestamp"))
+            if base_end is not None and base_end < requested_end and float(base_catalog.get("completeness", 0.0)) >= 1.0 and not base_catalog.get("missing_ranges"):
+                cursor = max(cursor, base_end + step)
+            elif base_catalog.get("missing_ranges"):
+                cursor = requested_start
+        self.store.save_dataset_bootstrap_state(
+            dataset_id,
+            {
+                **provenance,
+                "provider": _provider_name(provider),
+                "instrument": symbol,
+                "market_type": MarketType.CRYPTO_SPOT.value,
+                "timeframe": interval,
+                "requested_start": requested_start,
+                "requested_end": requested_end,
+                "next_timestamp": cursor,
+                "base_version": base_version,
+                "status": "RUNNING",
+                "records_staged": len(self.store.load_dataset_staging_bars(dataset_id)),
+                "errors": errors,
+            },
+        )
+        chunk = step * max(1, min(999, 1000 - 1))
+        fetch_complete = True
+        while cursor <= requested_end:
+            chunk_start = cursor
+            chunk_end = min(requested_end, cursor + chunk - step)
+            call = _call_with_retries(
+                provider,
+                lambda cursor=chunk_start, chunk_end=chunk_end: provider.historical_ohlcv(
+                    symbol, start=cursor, end=chunk_end, interval=interval
+                ),
+                context=f"binance {symbol} {interval} {chunk_start.isoformat()}",
+                max_attempts=self.max_attempts,
+                backoff=self.backoff,
+                sleep=self.sleep,
+            )
+            retries += call.retries
+            errors.extend(call.errors)
+            raw_values = call.value if isinstance(call.value, Sequence) and not isinstance(call.value, (str, bytes, Mapping)) else ()
+            selected = [
+                item for value in raw_values
+                if (item := _bar(value)) is not None and chunk_start <= item.timestamp <= chunk_end
+            ]
+            normalized, duplicates, conflicts = _dedupe_bars(selected)
+            duplicate_count += duplicates
+            if conflicts:
+                errors.append(f"conflicting duplicate bars at {', '.join(conflicts[:8])}")
+            if normalized:
+                try:
+                    staged = self.store.save_dataset_staging_bars(dataset_id, normalized)
+                    duplicate_count += int(staged["duplicates"])
+                except ValueError as exc:
+                    errors.append(str(exc))
+                    fetch_complete = False
+            if call.value is None or (call.errors and not normalized):
+                fetch_complete = False
+                errors.append(f"unfetched range: {chunk_start.isoformat()} to {chunk_end.isoformat()}")
+                self.store.save_dataset_bootstrap_state(
+                    dataset_id,
+                    {
+                        **provenance,
+                        "provider": _provider_name(provider),
+                        "instrument": symbol,
+                        "market_type": MarketType.CRYPTO_SPOT.value,
+                        "timeframe": interval,
+                        "requested_start": requested_start,
+                        "requested_end": requested_end,
+                        "next_timestamp": chunk_start,
+                        "base_version": base_version,
+                        "status": "PARTIAL",
+                        "records_staged": len(self.store.load_dataset_staging_bars(dataset_id)),
+                        "retries": retries,
+                        "errors": list(dict.fromkeys(errors[-32:])),
+                    },
+                )
+                break
+            cursor = chunk_end + step
+            if normalized:
+                cursor = max(cursor, normalized[-1].timestamp + step)
+            self.store.save_dataset_bootstrap_state(
+                dataset_id,
+                {
+                    **provenance,
+                    "provider": _provider_name(provider),
+                    "instrument": symbol,
+                    "market_type": MarketType.CRYPTO_SPOT.value,
+                    "timeframe": interval,
+                    "requested_start": requested_start,
+                    "requested_end": requested_end,
+                    "next_timestamp": cursor,
+                    "base_version": base_version,
+                    "status": "RUNNING" if cursor <= requested_end else "FETCHED",
+                    "records_staged": len(self.store.load_dataset_staging_bars(dataset_id)),
+                    "retries": retries,
+                    "errors": list(dict.fromkeys(errors[-32:])),
+                },
+            )
+        base_bars: tuple[OHLCVBar, ...] = ()
+        if base_catalog is not None:
+            base_bars = tuple(self.store.load_bars(symbol, dataset_id=dataset_id, dataset_version=str(base_catalog["dataset_version"])))
+        staged_bars = tuple(self.store.load_dataset_staging_bars(dataset_id))
+        combined, combined_duplicates, conflicts = _dedupe_bars((*base_bars, *staged_bars))
+        duplicate_count += combined_duplicates
+        if conflicts:
+            errors.append(f"conflicting duplicate bars at {', '.join(conflicts[:8])}")
+        combined = [item for item in combined if requested_start <= item.timestamp <= requested_end]
+        missing, completeness = _missing_ranges(combined, BTC_INTERVAL_SECONDS[interval], requested_start, requested_end)
+        if not combined:
+            status = "PARTIAL" if not fetch_complete else ("FAILED" if errors else "EMPTY")
+            self.store.save_dataset_bootstrap_state(
+                dataset_id,
+                {
+                    **provenance,
+                    "provider": _provider_name(provider),
+                    "instrument": symbol,
+                    "market_type": MarketType.CRYPTO_SPOT.value,
+                    "timeframe": interval,
+                    "requested_start": requested_start,
+                    "requested_end": requested_end,
+                    "next_timestamp": cursor if status == "PARTIAL" else requested_end + step,
+                    "base_version": base_version,
+                    "status": status,
+                    "records": 0,
+                    "retries": retries,
+                    "missing_ranges": list(missing),
+                    "errors": list(dict.fromkeys(errors[-64:])),
+                },
+            )
+            return BootstrapReport(
+                dataset_id, "HISTORICAL", _provider_name(provider), symbol, interval, status,
+                None, 0, None, None, completeness, missing, duplicate_count, retries,
+                tuple(dict.fromkeys(errors)), provenance, universe.universe_id,
+                universe.version, SURVIVORSHIP_BIAS_PRESENT,
+            )
+        version = dataset_version([_bar_identity(item) for item in combined])
+        metadata = {
+            **provenance,
+            "provider": _provider_name(provider),
+            "instrument": symbol,
+            "dataset_id": dataset_id,
+            "immutable_version": version,
+            "requested_start": requested_start,
+            "requested_end": requested_end,
+            "integrity": {
+                "sorted": all(a.timestamp < b.timestamp for a, b in zip(combined, combined[1:])),
+                "duplicates_removed": duplicate_count,
+                "conflicting_duplicates": conflicts,
+                "missing_ranges": list(missing),
+                "completeness": completeness,
+            },
+            "incremental": base_version is not None,
+        }
+        try:
+            with self.store.transaction():
+                if self.store.load_dataset_catalog(dataset_id, version) is None:
+                    self.store.save_bars(symbol, combined, dataset_id=dataset_id, dataset_version=version)
+                    self.store.save_dataset_catalog(
+                        dataset_id, version, provider=_provider_name(provider), instrument=symbol,
+                        market_type=MarketType.CRYPTO_SPOT, timeframe=interval,
+                        start_timestamp=combined[0].timestamp, end_timestamp=combined[-1].timestamp,
+                        row_count=len(combined), completeness=completeness, missing_ranges=missing,
+                        quality="OHLCV", source_type="HISTORICAL", snapshot_id=f"{dataset_id}:{version}",
+                        metadata=metadata,
+                    )
+                self.store.clear_dataset_staging_bars(dataset_id)
+        except ValueError as exc:
+            errors.append(str(exc))
+            return BootstrapReport(
+                dataset_id, "HISTORICAL", _provider_name(provider), symbol, interval, "FAILED",
+                None, len(combined), combined[0].timestamp, combined[-1].timestamp, completeness,
+                missing, duplicate_count, retries, tuple(dict.fromkeys(errors)), metadata,
+                universe.universe_id, universe.version, SURVIVORSHIP_BIAS_PRESENT,
+            )
+        status = "COMPLETE" if fetch_complete and completeness >= 1.0 and not missing else "PARTIAL"
+        retry_cursor = requested_end + step if status == "COMPLETE" else (_stamp(missing[0].get("start")) if missing else cursor)
+        self.store.save_dataset_bootstrap_state(
+            dataset_id,
+            {
+                **provenance,
+                "provider": _provider_name(provider),
+                "instrument": symbol,
+                "market_type": MarketType.CRYPTO_SPOT.value,
+                "timeframe": interval,
+                "requested_start": requested_start,
+                "requested_end": requested_end,
+                "next_timestamp": retry_cursor,
+                "base_version": version,
+                "status": status,
+                "records": len(combined),
+                "dataset_version": version,
+                "retries": retries,
+                "errors": list(dict.fromkeys(errors[-64:])),
+                "missing_ranges": list(missing),
+            },
+        )
+        report = BootstrapReport(
+            dataset_id, "HISTORICAL", _provider_name(provider), symbol, interval, status,
+            version, len(combined), combined[0].timestamp, combined[-1].timestamp,
+            completeness, missing, duplicate_count, retries, tuple(dict.fromkeys(errors)),
+            metadata, universe.universe_id, universe.version, SURVIVORSHIP_BIAS_PRESENT,
+        )
+        self.store.save_report_if_absent(
+            f"historical-bootstrap:{dataset_id}:{version}", report.as_record(), experiment_id=dataset_id
+        )
+        return report
 
     def _bootstrap_crypto_interval(
         self,
