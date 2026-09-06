@@ -1431,6 +1431,7 @@ class AutonomousResearchProcessor:
             "experiment_family": plan.experiment_family,
             "generation": generation,
             "lineage": list(dict.fromkeys([*(str(value) for value in lineage), *([candidate_id] if generation else [])])),
+            "market_type": plan.market_type.value,
             "paper_only": True,
             "holdout_used": False,
         }
@@ -1500,7 +1501,24 @@ class AutonomousResearchProcessor:
             min_observations=plan.min_samples,
             min_trades=plan.min_trades,
         )
+        data_quality = train.get("quality", validation.get("quality"))
+        if isinstance(data_quality, Mapping):
+            quality_passed = data_quality.get("passed")
+            if not isinstance(quality_passed, bool):
+                quality_passed = str(
+                    data_quality.get("label", data_quality.get("quality", ""))
+                ).strip().upper() in {"HIGH", "MEDIUM", "GOOD", "PASS", "PASSED"}
+        else:
+            quality_passed = str(data_quality or "").strip().upper() in {
+                "HIGH",
+                "MEDIUM",
+                "GOOD",
+                "PASS",
+                "PASSED",
+            }
         robust_evidence = {
+            "data_quality": data_quality,
+            "data_quality_passed": bool(quality_passed),
             **base,
             "robustness_passed": bool(sample_check["passed"] and stability_value >= 0.60 and validation_expectancy >= 0.0),
             "minimum_sample_check": sample_check,

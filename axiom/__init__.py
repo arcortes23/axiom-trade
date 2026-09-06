@@ -96,6 +96,8 @@ from .autonomous import (
 from .lifecycle import CandidateLifecycle, CandidateLifecycleManager, CandidateStage, PromotionCriteria
 from .mutations import DeterministicMutationEngine, ExperimentBudget, MutationCandidate
 from .research_bus import DurableResearchBus, ResearchBusPermissionError, ResearchQueueItem, ResearchQueueStatus
+from .ranker import CandidateCanaryRanker
+from .auto_canary import AutonomousCanaryWorker
 from .director import ProposalValidation, compact_report, research_summary, validate_hermes_proposal
 from .bootstrap import (
     BTC_DATASET_IDS,

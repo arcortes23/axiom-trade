@@ -1780,9 +1780,25 @@ class DashboardData:
 
 
     def _candidate_status_fields(self, item: Mapping[str, Any]) -> dict[str, Any]:
+        candidate_id = str(item.get("candidate_id") or "").strip()
         stage = str(item.get("stage") or "").strip().upper()
-        eligibility = self._candidate_canary_eligibility(str(item.get("candidate_id") or "").strip())
-        canary_eligible = eligibility is not None and stage in _CANARY_ELIGIBLE_STAGES
+        eligibility = self._candidate_canary_eligibility(candidate_id)
+        try:
+            validation = CanaryService(self.store, initialize=False).validate_eligibility(candidate_id)
+        except Exception:
+            validation = {"eligible": False, "reason_code": "CANARY_VALIDATION_UNAVAILABLE", "checks": []}
+        binding_present = False
+        if self.store is not None and getattr(self.store, "connection", None) is not None:
+            try:
+                binding_present = self.store.connection.execute(
+                    "SELECT 1 FROM canary_eligibility WHERE candidate_id=?",
+                    (candidate_id,),
+                ).fetchone() is not None
+            except sqlite3.Error:
+                binding_present = False
+        canary_eligible = bool(validation.get("eligible")) and (
+            eligibility is not None or not binding_present
+        ) and stage in _CANARY_ELIGIBLE_STAGES
         if stage == "PAPER_FORWARD":
             paper_forward_status = "ACTIVE"
             paper_status = "PAPER_FORWARD"
@@ -1793,11 +1809,10 @@ class DashboardData:
             paper_forward_status = "NOT_STARTED"
             paper_status = "NOT_STARTED"
         return {
-            # Historical gates are lifecycle evidence; canary eligibility is
-            # the separate persisted binding that authorizes a micro-live test.
-            "historical_gates": "PASSED" if stage in _CANARY_ELIGIBLE_STAGES else "NOT_PASSED",
+            "historical_gates": "PASSED" if validation.get("eligible") else "NOT_PASSED",
+            "historical_gate_reason": validation.get("reason_code"),
             "canary_eligible": canary_eligible,
-            "canary_eligible_at": eligibility.get("eligible_at") if canary_eligible else None,
+            "canary_eligible_at": eligibility.get("eligible_at") if canary_eligible and eligibility else None,
             "canary_status": "ELIGIBLE" if canary_eligible else "NOT_ELIGIBLE",
             "paper_forward": stage in _PAPER_FORWARD_STAGES,
             "paper_forward_status": paper_forward_status,
@@ -2573,7 +2588,7 @@ class DashboardData:
         """Return only the read-only canary status and latest signal."""
         if self.store is None:
             return {
-                "canary": {"production_live_trading": "DISABLED", "micro_live_canary": "DISARMED", "live_execution": False, "trades": []},
+                "canary": {"production_live_trading": "DISABLED", "micro_live_canary": "DISABLED", "live_execution": False, "trades": []},
                 "canary_signal": None,
                 "live_execution": False,
             }
@@ -2603,6 +2618,7 @@ class DashboardData:
         canary_bundle = controls.get("canary", {}) if isinstance(controls, Mapping) else {}
         canary = canary_bundle.get("status", {}) if isinstance(canary_bundle, Mapping) else {}
         latest_signal = canary_bundle.get("latest_signal") if isinstance(canary_bundle, Mapping) else None
+        autonomous_worker = controls.get("autonomous_canary_worker", {}) if isinstance(controls, Mapping) else {}
         try:
             actions = self.store.list_operator_actions(limit=10) if self.store is not None else []
         except Exception:
@@ -2632,56 +2648,77 @@ class DashboardData:
         research_state = state(research)
         bootstrap_state = state(bootstrap)
         hermes_state = state(hermes, "ACTIVE")
+        autonomous_worker_state = state(autonomous_worker)
         components = [
             {"name": "AXIOM NODE", "state": node_state, "detail": node},
             {"name": "POLYMARKET COLLECTOR", "state": collector_state, "detail": collector},
             {"name": "CRYPTO DATA", "state": "READY" if bootstrap_state == "COMPLETE" else "NOT INITIALIZED", "detail": bootstrap},
             {"name": "HERMES", "state": hermes_state, "detail": hermes},
             {"name": "PAPER ENGINE", "state": paper_state, "detail": paper},
+            {"name": "AUTONOMOUS CANARY", "state": autonomous_worker_state, "detail": autonomous_worker},
         ]
-        empty_coverage = {
-            "historical_count": 0,
-            "historical_rows": 0,
-            "forward_count": 0,
-            "forward_rows": 0,
-            "logical_rows": {},
-        }
-        empty_page = {"items": [], "total": 0, "page": 1, "page_size": 25}
+        try:
+            overview = self.store.dashboard_overview_summary(activity_limit=8) if self.store is not None else {}
+        except Exception:
+            overview = {}
+        sql_counts = overview.get("counts", {}) if isinstance(overview, Mapping) else {}
+        stages = overview.get("candidate_stages", {}) if isinstance(overview, Mapping) else {}
+        queue_statuses = overview.get("queue_statuses", {}) if isinstance(overview, Mapping) else {}
+        catalog = overview.get("catalog", {}) if isinstance(overview, Mapping) else {}
+        historical = catalog.get("historical", {}) if isinstance(catalog, Mapping) else {}
+        forward = catalog.get("forward_collected", {}) if isinstance(catalog, Mapping) else {}
+        try:
+            health = self.store.polymarket_health(now=ensure_utc(datetime.now().astimezone())) if self.store is not None else {}
+        except Exception:
+            health = {}
+        candidate_total = sum(int(value) for value in stages.values()) if isinstance(stages, Mapping) else 0
         cards = {
-            "experiments_run": 0,
-            "active_hypotheses": 0,
-            "candidates_alive": 0,
-            "candidate_rejected": 0,
-            "research_rejected": 0,
-            "rejected": 0,
-            "canary_eligible": 0,
-            "paper_forward": 0,
-            "paper_promotable": 0,
+            "experiments_run": int(sql_counts.get("experiments", 0)),
+            "active_hypotheses": int(queue_statuses.get("PENDING", 0)) + int(queue_statuses.get("TESTING", 0)),
+            "candidates_alive": max(0, candidate_total - int(stages.get("REJECTED", 0))),
+            "candidate_rejected": int(stages.get("REJECTED", 0)),
+            "research_rejected": int(queue_statuses.get("REJECTED", 0)),
+            "rejected": int(stages.get("REJECTED", 0)) + int(queue_statuses.get("REJECTED", 0)),
+            "canary_eligible": self._candidate_canary_eligibility_count(),
+            "paper_forward": int(stages.get("PAPER_FORWARD", 0)),
+            "paper_promotable": int(stages.get("PAPER_PROMOTABLE", 0)),
+        }
+        coverage = {
+            "historical_count": int(historical.get("datasets", 0)) if isinstance(historical, Mapping) else 0,
+            "historical_rows": int(historical.get("rows", 0)) if isinstance(historical, Mapping) else 0,
+            "forward_count": int(forward.get("datasets", 0)) if isinstance(forward, Mapping) else 0,
+            "forward_rows": int(forward.get("rows", 0)) if isinstance(forward, Mapping) else 0,
+            "logical_rows": overview.get("logical_rows", {}) if isinstance(overview, Mapping) else {},
         }
         health = {
-            "grade": "UNKNOWN",
+            **(health if isinstance(health, Mapping) else {}),
+            "grade": str((health if isinstance(health, Mapping) else {}).get("grade") or "UNKNOWN").upper(),
             "grade_scope": "collector_health",
-            "reason_code": None,
-            "reasons": [],
             "source_type": "FORWARD_COLLECTED",
         }
+        sql_activity = overview.get("latest_activity", []) if isinstance(overview, Mapping) else []
+        activity = [
+            *[item for item in sql_activity if isinstance(item, Mapping)],
+            *activity,
+        ][:32]
         return {
-            "title": "AXIOM / operator research console",
-            "live_trading": {"status": "Disabled", "enabled": False},
+            "live_trading": {"status": "Disabled", "enabled": False, "production_live_execution": False},
             "canary": canary,
             "canary_signal": latest_signal,
+            "autonomous_canary": canary.get("autonomous", {}) if isinstance(canary, Mapping) else {},
+            "autonomous_canary_worker": autonomous_worker,
             "paper_risk_engine": {"status": "Active", "enabled": True},
             "dataset_health": health,
-            "health_grade": "UNKNOWN",
+            "health_grade": health.get("grade", "UNKNOWN"),
             "grade_scope": "collector_health",
-            "reason_code": None,
-            "reasons": [],
+            "reason_code": health.get("reason_code"),
+            "reasons": health.get("reasons", []),
             "components": components,
             "research_cards": cards,
-            "coverage": empty_coverage,
+            "coverage": coverage,
             "activity": activity,
             "latest_activity": activity,
-            "lifecycle_funnel": {},
+            "lifecycle_funnel": stages,
             "candidate_status": cards,
             "candidates": [],
             "latest_candidates": [],
@@ -2694,7 +2731,7 @@ class DashboardData:
             "collector_health": collector,
             "operator_controls": controls,
             "credentials": controls.get("credentials", {"configured": False, "secret_values_exposed": False, "configuration": "CLI_ONLY"}) if isinstance(controls, Mapping) else {"configured": False, "secret_values_exposed": False, "configuration": "CLI_ONLY"},
-            "counts": {},
+            "counts": sql_counts,
             "raw": {"status": controls},
             "paper_only": True,
             "live_execution": False,
@@ -3063,8 +3100,8 @@ def _dashboard_html(control_token: str | None = None) -> str:
     <section id="view-polymarket" class="view"><article class="panel"><div class="section-title"><h2>Polymarket opportunities</h2><span class="badge warn">price proxy unless timestamped depth exists</span></div><div class="filters"><input id="polymarket-filter" placeholder="Filter questions or markets" aria-label="Filter Polymarket"><select id="polymarket-category"><option value="">All categories</option></select><select id="polymarket-size"><option>25</option><option>50</option><option>100</option></select></div><div id="pm-summary"></div><div id="pm-markets" class="scroll"></div><div id="polymarket-pager" class="pager"></div><p class="page-note">Historical price history is separate from forward order-book observations. No historical depth, spread, fills, or executable quotes are fabricated.</p></article></section>
     <section id="view-candidates" class="view"><article class="panel"><div class="section-title"><h2>CANDIDATES</h2><span id="candidate-total" class="muted"></span></div><div class="filters"><input id="candidates-filter" placeholder="Filter strategy, family, market" aria-label="Filter candidates"><select id="candidates-stage"><option value="">All stages</option></select><select id="candidates-size"><option>25</option><option>50</option><option>100</option></select></div><div id="candidates-table" class="scroll"></div><div id="candidates-pager" class="pager"></div></article></section>
     <article id="candidate-detail" class="panel"><div class="section-title"><h2>Candidate detail</h2><span class="muted">historical → forward → lifecycle</span></div><div class="empty">Select a candidate to inspect evidence.</div></article>
-    <section id="view-hermes" class="view"><article class="panel"><div class="section-title"><h2>Hermes / research loop</h2><span class="badge">no autonomous trading</span></div><div id="hermes-summary"></div><div class="filters"><input id="hermes-filter" placeholder="Filter queue" aria-label="Filter Hermes queue"><select id="hermes-status"><option value="">All statuses</option><option>PENDING</option><option>TESTING</option><option>COMPLETED</option><option>ACCEPTED</option><option>REJECTED</option><option>FAILED</option><option>ERROR</option></select><select id="hermes-size"><option>25</option><option>50</option><option>100</option></select></div><div id="hermes-table" class="scroll"></div><div id="hermes-pager" class="pager"></div><div id="hermes-detail"></div></article></section>
-    <section id="view-canary" class="view"><article class="panel" style="border-color:var(--red)"><div class="section-title"><h2>REAL CANARY MONEY</h2><span class="badge bad">PRODUCTION LIVE TRADING: DISABLED</span></div><div id="canary-controls"></div><div id="canary-summary"></div><div id="canary-trades" class="scroll"></div><p class="notice">Micro-live canary is independent from paper research. No secrets are stored or displayed. Submission remains CLI-only.</p></article></section>
+    <section id="view-hermes" class="view"><article class="panel"><div class="section-title"><h2>Hermes / research loop</h2><span class="badge">research only · no canary control</span></div><div id="hermes-summary"></div><div class="filters"><input id="hermes-filter" placeholder="Filter queue" aria-label="Filter Hermes queue"><select id="hermes-status"><option value="">All statuses</option><option>PENDING</option><option>TESTING</option><option>COMPLETED</option><option>ACCEPTED</option><option>REJECTED</option><option>FAILED</option><option>ERROR</option></select><select id="hermes-size"><option>25</option><option>50</option><option>100</option></select></div><div id="hermes-table" class="scroll"></div><div id="hermes-pager" class="pager"></div><div id="hermes-detail"></div></article></section>
+    <section id="view-canary" class="view"><article class="panel" style="border-color:var(--red)"><div class="section-title"><h2>REAL CANARY MONEY</h2><span class="badge bad">PRODUCTION LIVE TRADING: DISABLED</span></div><div id="canary-controls"></div><div id="canary-summary"></div><div id="canary-trades" class="scroll"></div><p class="notice">Autonomous canary is independent from paper research. No secrets are stored or displayed. It remains prediction-only, bounded at $1 per order, and killable from this console.</p></article></section>
   </main>
   <script>
     const $ = (id) => document.getElementById(id), safe = (v) => String(v ?? "—").replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c])), json = (v) => JSON.stringify(v ?? {}, null, 2);
@@ -3117,7 +3154,7 @@ def _dashboard_html(control_token: str | None = None) -> str:
         const response=await fetch(`/api/v2/candidates/${encodeURIComponent(id)}`,{cache:"no-store"});
         const candidate=await response.json(), provenance=candidate.provenance||{};
         const host=$("candidate-detail"); if(!host)return;
-        host.insertAdjacentHTML("afterbegin",`<article id="candidate-operator-actions" class="panel"><div class="section-title"><h2>CANARY GATES</h2><span class="badge ${statusClass(candidate.canary_status)}">${safe(candidate.canary_status||"NOT_ELIGIBLE")}</span></div><div class="key-value"><span class="key">Market / dataset</span><strong>${safe(provenance.market_type)} · ${safe(provenance.dataset_id)} / ${safe(provenance.dataset_version)}</strong></div><div class="page-note">${controlButton("canary.eligibility.verify","Dry validate",id)} · ${controlButton("canary.eligibility.mark","MARK CANARY ELIGIBLE",id,"MARK CANARY ELIGIBLE")}</div><div id="candidate-control-result" class="page-note"></div></article>`);
+        host.insertAdjacentHTML("afterbegin",`<article id="candidate-operator-actions" class="panel"><div class="section-title"><h2>AUTHORITATIVE ELIGIBILITY</h2><span class="badge ${statusClass(candidate.canary_status)}">${safe(candidate.canary_status||"NOT_ELIGIBLE")}</span></div><div class="key-value"><span class="key">Market / dataset</span><strong>${safe(provenance.market_type)} · ${safe(provenance.dataset_id)} / ${safe(provenance.dataset_version)}</strong></div><p class="page-note">Eligibility is evaluated and persisted by the autonomous ranker. The dashboard cannot mark, arm, or submit a candidate.</p></article>`);
       } catch(error) {}
     }
     async function loadDataset(id,rangePage=1,persist=true) { state.selected=id; state.expanded=true; if(persist)saveState(true); try { const detailResponse=await fetch(`/api/v2/datasets/${encodeURIComponent(id)}`,{cache:"no-store"}),d=await detailResponse.json(),version=d.dataset_version||d.catalog?.dataset_version||"",rangeQuery=new URLSearchParams({page:String(rangePage),page_size:String(state.page_size)}); if(version)rangeQuery.set("dataset_version",version); const rangesResponse=await fetch(`/api/v2/datasets/${encodeURIComponent(id)}/missing-ranges?${rangeQuery}`,{cache:"no-store"}),rangesData=rangesResponse.ok?await rangesResponse.json():{}; const markup=d.available?`<div class="key-value"><span class="key">Dataset</span><strong>${safe(d.dataset_id||id)}</strong></div><div class="key-value"><span class="key">Version</span><strong>${safe(d.dataset_version||d.catalog?.dataset_version)}</strong></div><div class="key-value"><span class="key">Quality</span><span class="badge">${safe(d.catalog?.quality)}</span></div><details open><summary>Health and missing ranges</summary><pre>${safe(json({health:d.health,missing_ranges:arr(rangesData.items)}))}</pre><div id="dataset-ranges-pager" class="pager"></div></details>`:empty("Dataset unavailable",d.error||"Dataset not found"); $("detail").innerHTML=markup; if($("dataset-detail"))$("dataset-detail").innerHTML=markup; if(d.available&&$("dataset-ranges-pager"))pager("dataset-ranges",rangesData); } catch(e) { const markup=empty("Dataset detail unavailable",e.message); $("detail").innerHTML=markup; if($("dataset-detail"))$("dataset-detail").innerHTML=markup; } }
@@ -3130,24 +3167,15 @@ def _dashboard_html(control_token: str | None = None) -> str:
     async function loadCandidate(id,eventPage=1,persist=true) { state.selected=id; state.expanded=true; if(persist)saveState(true); try { const q=new URLSearchParams({page:String(eventPage),page_size:String(state.page_size)}),candidateResponse=await fetch(`/api/v2/candidates/${encodeURIComponent(id)}`,{cache:"no-store"}),r=await fetch(`/api/v2/candidates/${encodeURIComponent(id)}/events?${q}`,{cache:"no-store"}),candidate=candidateResponse.ok?await candidateResponse.json():{},d=await r.json(); const checks=[["Historical gates",candidate.historical_gates||"NOT_PASSED"],["Micro-live canary",candidate.canary_status||"NOT_ELIGIBLE"],["Paper forward status",candidate.paper_forward_status||"NOT_STARTED"],["Paper promotable",candidate.paper_promotable_status||"NOT_YET"]]; const markup=`<div class="key-value"><span class="key">Candidate</span><strong>${safe(candidate.candidate_id||id)}</strong></div><div class="three-col">${checks.map(([label,value])=>`<div class="key-value"><span class="key">${safe(label)}</span><strong><span class="badge ${statusClass(value)}">${safe(value)}</span></strong></div>`).join("")}</div>${arr(d.items).length?`<table><thead><tr><th>Time</th><th>Stage</th><th>Reason</th></tr></thead><tbody>${arr(d.items).map(i=>`<tr><td>${safe(dateText(i.created_at||i.timestamp))}</td><td><span class="badge">${safe(i.stage||i.to_stage)}</span></td><td>${safe(i.reason||i.message)}</td></tr>`).join("")}</tbody></table>`:empty("No lifecycle events","No persisted lifecycle evidence exists for this candidate.")}<div id="candidate-events-pager" class="pager"></div>`; $("detail").innerHTML=markup; if(state.tab==="candidates")$("dataset-detail").innerHTML=markup; if($("candidate-events-pager")){const total=Number(d.total)||0,page=Number(d.page)||1,size=Number(d.page_size)||state.page_size,pages=Number(d.pages)||0,start=total?(page-1)*size+1:0,end=Math.min(page*size,total); $("candidate-events-pager").innerHTML=`<span>Showing ${start}–${end} of ${total}</span><span><button data-page="${page-1}" ${page<=1?"disabled":""}>Previous</button> <button data-page="${page+1}" ${!pages||page>=pages?"disabled":""}>Next</button></span>`; $("candidate-events-pager").querySelectorAll("button").forEach(b=>b.addEventListener("click",()=>loadCandidate(id,Number(b.dataset.page),false)));} } catch(e) { $("detail").innerHTML=empty("Candidate detail unavailable",e.message); } }
     function renderPaper(data) { const p=operator.paper_portfolio||{}; $("portfolio-summary").innerHTML=`<div class="card-grid"><div class="panel"><div class="metric">${p.state_count?Number(p.total_equity||0).toFixed(2):"—"}</div><div class="metric-label">paper equity</div></div><div class="panel"><div class="metric">${p.state_count?Number(p.total_pnl||0).toFixed(2):"—"}</div><div class="metric-label">paper P/L</div></div><div class="panel"><div class="metric">${count(data.total)}</div><div class="metric-label">paper records</div></div><div class="panel"><div class="metric">${p.state_count?`${(Number(p.win_rate||0)*100).toFixed(1)}%`:"—"}</div><div class="metric-label">win rate</div></div></div>`; $("portfolio-states").innerHTML=arr(data.items).length?`<table><thead><tr><th>${sortButton("timestamp","Time")}</th><th>${sortButton("record_type","Type")}</th><th>Experiment</th><th>Market</th><th>Status</th><th>Details</th></tr></thead><tbody>${arr(data.items).map(i=>`<tr><td>${safe(dateText(i.timestamp||i.created_at||i.updated_at))}</td><td>${safe(i.record_type)}</td><td>${safe(i.experiment_id)}</td><td>${safe(i.market_id||i.symbol)}</td><td><span class="badge ${statusClass(i.status)}">${safe(i.status)}</span></td><td><details><summary>view</summary><pre>${safe(json(i))}</pre></details></td></tr>`).join("")}</tbody></table>`:empty("Waiting for PAPER_FORWARD","Paper portfolio initializes only after a candidate enters PAPER_FORWARD and observations are persisted."); pager("paper",data); bindTable(); }
     async function loadPage(tab) { const endpoint={datasets:"datasets",activity:"activity",candidates:"candidates",polymarket:"polymarket",hermes:"hermes","crypto":"crypto-research",portfolio:"paper"}[tab]; if(!endpoint)return; try { current=await fetchV2(endpoint); ({datasets:renderDatasets,activity:renderActivity,candidates:renderCandidates,polymarket:renderPolymarket,hermes:renderHermes,crypto:renderCrypto,portfolio:renderPaper}[tab])(current); } catch(e) { const target={datasets:"datasets-table",activity:"activity-table",candidates:"candidates-table",polymarket:"pm-markets",hermes:"hermes-table",crypto:"crypto-table",portfolio:"portfolio-states"}[tab]; if($(target))$(target).innerHTML=empty("Dashboard data unavailable",e.message); } }
-    function renderCanary(data) { const c=data.canary||{}; $("canary-summary").innerHTML=`<div class="card-grid"><div class="panel"><div class="metric">${safe(c.micro_live_canary||"DISARMED")}</div><div class="metric-label">Micro live canary</div></div><div class="panel"><div class="metric">${safe(c.candidate)}</div><div class="metric-label">Candidate · expires ${safe(dateText(c.expiry))}</div></div><div class="panel"><div class="metric">${safe(c.last_request_status||"NONE")}</div><div class="metric-label">Last request · kill stops new; in-flight not retracted</div></div><div class="panel"><div class="metric">${count(c.today_orders)}</div><div class="metric-label">Today's orders</div></div><div class="panel"><div class="metric">$${Number(c.today_realized_pnl||0).toFixed(2)}</div><div class="metric-label">Today's realized P/L</div></div><div class="panel"><div class="metric">$${Number(c.total_exposure||0).toFixed(2)}</div><div class="metric-label">Total exposure · ${count(c.open_positions)} positions</div></div><div class="panel"><div class="metric">$${Number(c.daily_loss_budget_remaining||0).toFixed(2)}</div><div class="metric-label">Daily loss budget remaining</div></div></div>`; $("canary-trades").innerHTML=arr(c.trades).length?`<table><thead><tr><th>Time (PHT)</th><th>Candidate</th><th>Market</th><th>Side</th><th>Notional</th><th>Paper expected price</th><th>Actual price</th><th>Difference</th><th>Status</th><th>P/L</th></tr></thead><tbody>${arr(c.trades).map(i=>`<tr><td>${safe(dateText(i.timestamp))}</td><td>${safe(i.candidate_id)}</td><td>${safe(i.market_id)}</td><td>${safe(i.side)}</td><td>${safe(i.requested_notional)}</td><td>${safe(i.paper_expected_price)}</td><td>${safe(i.actual_average_price)}</td><td>${safe(i.price_difference)}</td><td>${safe(i.status)}</td><td>${safe(i.realized_pnl)}</td></tr>`).join("")}</tbody></table>`:empty("No real canary trades","Arm an eligible candidate explicitly; paper research continues independently."); }
-    const _renderCanary = renderCanary;
-    renderCanary = (data) => {
-      _renderCanary(data);
-      const signal = data.canary_signal || operator.canary_signal || null;
-      const candidateId = String((data.canary || {}).candidate || (signal || {}).candidate_id || arr(operator.candidates).find(item => item.canary_eligible)?.candidate_id || "");
-      const candidateMarkup = candidateId
-        ? `<div class="key-value"><span class="key">Candidate</span><strong>${safe(candidateId)}</strong></div><div class="key-value"><span class="key">Market / max</span><strong>${safe((signal || {}).market_id || "—")} · $1</strong></div><div class="page-note">${controlButton("canary.eligibility.verify","Verify eligibility",candidateId)} · ${controlButton("canary.eligibility.mark","MARK CANARY ELIGIBLE",candidateId,"MARK CANARY ELIGIBLE")} · ${controlButton("canary.generate_signal","Generate signal",candidateId)} · ${controlButton("canary.arm","ARM $1",candidateId,"ARM")}</div><p class="page-note">Submission is not available here. Use the CLI exact SUBMIT $1 flow.</p>`
-        : `<p class="page-note">No candidate is selected. Candidate-specific signal and arm actions require a persisted candidate; no arbitrary market or token input is accepted.</p>`;
-      $("canary-controls").innerHTML = `<article class="panel"><div class="section-title"><h2>SAFE CANARY CONTROLS</h2><span class="badge warn">persisted signal only</span></div><div class="page-note">${controlButton("canary.connectivity_check","Connectivity check")} · ${controlButton("canary.disarm","DISARM","","DISARM")} · ${controlButton("canary.kill","KILL","","KILL")}</div>${candidateMarkup}</article>`;
-      const canary = data.canary || {};
-      const readiness = signal ? String(signal.status || "READY") : "NO SIGNAL";
-      const orderResult = String(canary.last_request_status || "NO ORDER");
-      const detail = signal
-        ? `<div class="three-col"><div class="key-value"><span class="key">Signal readiness</span><strong>${safe(readiness)}</strong></div><div class="key-value"><span class="key">Market / outcome</span><strong>${safe(signal.market_id)} / ${safe(signal.outcome)}</strong></div><div class="key-value"><span class="key">Expected price</span><strong>${safe(signal.paper_expected_price)}</strong></div><div class="key-value"><span class="key">Generated</span><strong>${safe(dateText(signal.generated_at))}</strong></div><div class="key-value"><span class="key">Signal expiry</span><strong>${safe(dateText(signal.expires_at))}</strong></div><div class="key-value"><span class="key">Order result</span><strong>${safe(orderResult)}</strong></div></div>`
-        : empty("No canary signal", "No eligible, fresh, actionable persisted signal is available.");
-      $("canary-summary").insertAdjacentHTML("beforeend", `<article class="panel"><div class="section-title"><h2>Latest canary signal</h2><span class="badge ${statusClass(readiness)}">${safe(readiness)}</span></div>${detail}<p class="page-note">Signal readiness is independent from order result. Browser controls never submit orders.</p></article>`);
-    };
+    function renderCanary(data) {
+      const c=data.canary||{}, auto=data.autonomous_canary||c.autonomous||{}, risk=c.risk_envelope||{target_notional_usd:"1.00",max_exposure_usd:"5.00",max_daily_loss_usd:"2.00",max_open_positions:3,max_orders_per_day:5,max_slippage_bps:100}, signal=data.canary_signal||operator.canary_signal||null, stateValue=String(c.micro_live_canary||"DISABLED"), enabled=Boolean(auto.enabled);
+      const enable=stateValue==="KILLED"?"":enabled?controlButton("canary.disarm","DISARM","","DISARM"):controlButton("canary.enable_auto","ENABLE AUTO CANARY","","ENABLE AUTO CANARY");
+      $("canary-controls").innerHTML=`<article class="panel"><div class="section-title"><h2>AUTONOMOUS CANARY CONTROL</h2><span class="badge ${statusClass(stateValue)}">${safe(stateValue)}</span></div><div class="page-note">${controlButton("canary.connectivity_check","Connectivity check")} · ${enable} · ${controlButton("canary.kill","KILL","","KILL")}</div><p class="page-note">One confirmation enables the frozen prediction-only $1 envelope. Research, eligibility, ranking, and submission decisions run in the node worker; Hermes cannot change this envelope.</p></article>`;
+      $("canary-summary").innerHTML=`<div class="card-grid"><div class="panel"><div class="metric">${safe(stateValue)}</div><div class="metric-label">Autonomous canary state</div></div><div class="panel"><div class="metric">${safe(auto.selected_candidate||c.candidate||"—")}</div><div class="metric-label">Selected winner</div></div><div class="panel"><div class="metric">${safe(auto.rank||"—")} · ${auto.score==null?"—":Number(auto.score).toFixed(4)}</div><div class="metric-label">Winner rank / score</div></div><div class="panel"><div class="metric">${count(data.research_cards?.canary_eligible)}</div><div class="metric-label">Automatically eligible candidates</div></div><div class="panel"><div class="metric">${safe(auto.next_decision||"—")}</div><div class="metric-label">Next decision</div></div><div class="panel"><div class="metric">${safe(auto.blocker||"NONE")}</div><div class="metric-label">Current blocker</div></div></div><article class="panel"><div class="section-title"><h2>FROZEN RISK ENVELOPE</h2><span class="badge good">PREDICTION ONLY</span></div><div class="three-col">${[["Target notional","$"+risk.target_notional_usd],["Max exposure","$"+risk.max_exposure_usd],["Daily loss","$"+risk.max_daily_loss_usd],["Open positions",risk.max_open_positions],["Orders / day",risk.max_orders_per_day],["Slippage",""+risk.max_slippage_bps+" bps"]].map(([label,value])=>`<div class="key-value"><span class="key">${safe(label)}</span><strong>${safe(value)}</strong></div>`).join("")}</div></article>`;
+      const readiness=signal?String(signal.status||"READY"):"NO SIGNAL", detail=signal?`<div class="three-col"><div class="key-value"><span class="key">Signal readiness</span><strong>${safe(readiness)}</strong></div><div class="key-value"><span class="key">Market / outcome</span><strong>${safe(signal.market_id)} / ${safe(signal.outcome)}</strong></div><div class="key-value"><span class="key">Expected price</span><strong>${safe(signal.paper_expected_price)}</strong></div><div class="key-value"><span class="key">Generated</span><strong>${safe(dateText(signal.generated_at))}</strong></div><div class="key-value"><span class="key">Order result</span><strong>${safe(c.last_request_status||"NO ORDER")}</strong></div></div>`:empty("No actionable signal","The worker will wait for a fresh forward observation; it will not manufacture a trade.");
+      $("canary-summary").insertAdjacentHTML("beforeend",`<article class="panel"><div class="section-title"><h2>WORKER SIGNAL</h2><span class="badge ${statusClass(readiness)}">${safe(readiness)}</span></div>${detail}<p class="page-note">Kill prevents new submissions; an in-flight request is recorded, in-flight not retracted, and never retried automatically.</p></article>`);
+      $("canary-trades").innerHTML=arr(c.trades).length?`<table><thead><tr><th>Time</th><th>Candidate</th><th>Market</th><th>Side</th><th>Status</th><th>Price Δ</th></tr></thead><tbody>${arr(c.trades).map(t=>`<tr><td>${safe(dateText(t.timestamp))}</td><td>${safe(t.candidate_id)}</td><td>${safe(t.market_id)}</td><td>${safe(t.side)}</td><td><span class="badge ${statusClass(t.status)}">${safe(t.status)}</span></td><td>${safe(t.price_difference)}</td></tr>`).join("")}</tbody></table>`:empty("No canary execution evidence","No order has been submitted by the autonomous worker.");
+    }
     function renderBtc(data) { const b=operator.btc||{},summary=b.catalog_summary||{},rows=arr(summary.latest_by_timeframe||summary.timeframes),fallback=arr(b.catalog),catalogRows=rows.length?rows:fallback; $("btc-summary").innerHTML=catalogRows.length?`<div class="three-col"><div class="key-value"><span class="key">Catalog timeframes</span><strong>${count(catalogRows.length)}</strong></div><div class="key-value"><span class="key">Rows observed</span><strong>${count(catalogRows.reduce((total,item)=>total+Number(item.row_count||0),0))}</strong></div><div class="key-value"><span class="key">Latest report</span><strong>${safe(dateText(b.latest_report?.created_at))}</strong></div></div>`:empty("BTC history not initialized","Run bootstrap-history --crypto, then btc-research."); $("btc-experiments").innerHTML=""; }
     async function loadCrypto(symbol,persist=true) { state.selected=symbol; state.expanded=true; if(persist)saveState(true); try { const response=await fetch(`/api/v2/crypto-research/${encodeURIComponent(symbol)}`,{cache:"no-store"}),data=await response.json(); $("crypto-detail").innerHTML=arr(data.items).length?`<details open><summary>Crypto detail · ${safe(symbol)}</summary><div class="three-col"><div class="key-value"><span class="key">Universe version</span><strong>${safe(data.universe_version)}</strong></div><div class="key-value"><span class="key">Strategies</span><strong>${count(arr(data.strategies).length)}</strong></div><div class="key-value"><span class="key">Families</span><strong>${count(arr(data.families).length)}</strong></div></div><pre>${safe(json({catalogs:data.items,reports:data.reports,validation:data.validation,coverage:data.coverage}))}</pre></details>`:empty("Crypto symbol unavailable","No catalog is persisted for this symbol."); } catch(e) { $("crypto-detail").innerHTML=empty("Crypto detail unavailable",e.message); } }
     function renderCrypto(data) { const rows=arr(data.items),symbols=arr(data.symbols),summary={universe_version:data.universe_version,symbols:data.symbol_count??symbols.length,assets:data.asset_count??arr(data.assets).length,catalogs:data.total,reports:arr(data.reports).length}; $("crypto-summary").innerHTML=`<div class="three-col">${[["Universe version",summary.universe_version],["Symbols",summary.symbols],["Assets",summary.assets],["Catalogs",summary.catalogs],["Reports",summary.reports],["Families",arr(data.families).length]].map(([label,value])=>`<div class="key-value"><span class="key">${safe(label)}</span><strong>${safe(value)}</strong></div>`).join("")}</div>`; $("crypto-table").innerHTML=rows.length?`<table><thead><tr><th>Symbol</th><th>Dataset</th><th>Version</th><th>Source</th><th>Coverage</th><th>Strategies</th><th>Experiments</th><th>Validation</th><th>Families</th></tr></thead><tbody>${rows.map(i=>`<tr><td><button class="link crypto-symbol-row" data-symbol="${encodeURIComponent(i.symbol||"")}">${safe(i.symbol)}</button></td><td>${safe(i.dataset_id)}</td><td>${safe(i.dataset_version)}</td><td>${safe(i.source_type)}</td><td>${safe(json(i.coverage))}</td><td>${safe(json(i.strategies))}</td><td>${safe(json(i.experiments))}</td><td>${safe(json(i.validation))}</td><td>${safe(json(i.families))}</td></tr>`).join("")}</tbody></table>`:empty("No crypto catalogs","No crypto catalog or report has been persisted."); pager("crypto",data); document.querySelectorAll(".crypto-symbol-row").forEach(b=>b.addEventListener("click",()=>loadCrypto(decodeURIComponent(b.dataset.symbol)))); }

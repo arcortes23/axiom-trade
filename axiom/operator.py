@@ -45,6 +45,7 @@ _ALLOWED_ACTIONS = frozenset(
         "canary.eligibility.mark",
         "canary.generate_signal",
         "canary.arm",
+        "canary.enable_auto",
         "canary.disarm",
         "canary.kill",
     }
@@ -52,6 +53,7 @@ _ALLOWED_ACTIONS = frozenset(
 _CONFIRMATIONS = {
     "canary.eligibility.mark": "MARK CANARY ELIGIBLE",
     "canary.arm": "ARM",
+    "canary.enable_auto": "ENABLE AUTO CANARY",
     "canary.disarm": "DISARM",
     "canary.kill": "KILL",
 }
@@ -471,7 +473,9 @@ class OperatorControlPlane:
             canary_status = _safe_value(canary.status())
             latest_signal = _safe_value(canary.latest_signal())
         except Exception:
-            canary_status, latest_signal = {"micro_live_canary": "DISARMED"}, None
+            canary_status, latest_signal = {"micro_live_canary": "DISABLED"}, None
+        worker_status = worker("autonomous-canary")
+        autonomous_state = canary_status.get("autonomous") if isinstance(canary_status, Mapping) else {}
         return {
             "node": self._node_status(),
             "bootstrap": self._bootstrap_status(),
@@ -479,8 +483,14 @@ class OperatorControlPlane:
             "collector": worker("polymarket-collector"),
             "paper": {**worker("paper-engine"), "read_only": True, "live_execution": False},
             "research": worker("research-engine"),
+            "autonomous_canary_worker": worker_status,
             "credentials": {"configured": bool(credentials), "secret_values_exposed": False, "configuration": "CLI_ONLY"},
-            "canary": {"status": canary_status, "latest_signal": latest_signal, "submit": "CLI_ONLY"},
+            "canary": {
+                "status": canary_status,
+                "latest_signal": latest_signal,
+                "autonomous": autonomous_state,
+                "submit": "AUTONOMOUS_WORKER" if autonomous_state.get("enabled") else "DISABLED_UNTIL_OPERATOR_ENABLE",
+            },
             "live_execution": False,
             "paper_only": True,
         }
@@ -508,6 +518,8 @@ class OperatorControlPlane:
                 raise OperatorControlError("EXACT_CONFIRMATION_REQUIRED")
             if action_value in {"canary.eligibility.verify", "canary.eligibility.mark", "canary.generate_signal", "canary.arm"}:
                 target_value = _safe_identifier(target_value, "candidate ID")
+            elif action_value == "canary.enable_auto" and target_value:
+                raise OperatorControlError("AUTONOMOUS_CANARY_ACCEPTS_NO_TARGET")
             if action_value == "node.restart":
                 result = {"node": self.restart_node()}
             elif action_value == "bootstrap.start":
@@ -556,6 +568,12 @@ class OperatorControlPlane:
                         target_value,
                         venue=venue,
                     )
+                }
+            elif action_value == "canary.enable_auto":
+                service = CanaryService(self.store, initialize=True)
+                result = {
+                    "canary": service.enable_autonomous_micro_live(),
+                    "confirmation": "ENABLE AUTO CANARY",
                 }
             elif action_value == "canary.disarm":
                 service = CanaryService(self.store, initialize=True)

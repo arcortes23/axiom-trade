@@ -100,12 +100,12 @@ class CollectionCycle:
     markets_attempted: int
     markets_successful: int
     markets_failed: int
-    metadata_inserted: int
-    snapshots_inserted: int
-    snapshot_duplicates: int
-    trades_inserted: int
-    trade_duplicates: int
-    errors: int
+    metadata_inserted: int = 0
+    snapshots_inserted: int = 0
+    snapshot_duplicates: int = 0
+    trades_inserted: int = 0
+    trade_duplicates: int = 0
+    errors: int = 0
     requests: int = 0
     rate_limits: int = 0
     retries: int = 0

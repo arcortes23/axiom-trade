@@ -1,7 +1,9 @@
-"""Always-on, public-data-only Windows research node.
+"""Always-on Windows research and autonomous canary node.
 
-The node owns a durable SQLite state store, a single-process lock, bounded worker
-cycles, and paper-only processing. It has no credentials, broker, or order route.
+The node owns a durable SQLite state store, a single-process lock, bounded
+worker cycles, paper-first research, and one isolated autonomous canary worker.
+The worker cannot access research or collector thread state and never changes
+the production-live execution flag.
 """
 from __future__ import annotations
 
@@ -16,9 +18,8 @@ from pathlib import Path
 import re
 import subprocess
 import threading
-import time
 from typing import Any, Callable, Mapping
-
+import time
 from .collector import CollectionCycle, CollectorConfig, PolymarketCollector
 from .data import PolymarketAdapter
 from .domain import OrderBookSnapshot, ensure_utc, parse_timestamp, to_record, utc_now
@@ -26,11 +27,12 @@ from .forward import ForwardTestRegistry, _content_hash
 from .opportunity import scan_opportunities
 from .paper import CryptoPaperTrader
 from .paper_engine import run_forward_paper
-from .research_bus import DurableResearchBus
 from .storage import AxiomStore
 from .autonomous import AutonomousResearchConfig, AutonomousResearchProcessor
+from .research_bus import DurableResearchBus
 from .lifecycle import PromotionCriteria
 from .strategy import evaluate_signal_record, load_strategy
+from .auto_canary import AutonomousCanaryWorker
 
 
 def _pid_alive(pid: int) -> bool:
@@ -171,6 +173,7 @@ class NodeConfig:
     promotion_criteria: PromotionCriteria = field(default_factory=PromotionCriteria)
     crypto_symbol: str = "BTC/USDT"
     crypto_enabled: bool = True
+    auto_canary_interval_seconds: float = 60.0
 
     def __post_init__(self) -> None:
         db_text = str(self.db_path).strip()
@@ -207,6 +210,9 @@ class NodeConfig:
             raise ValueError("crypto_enabled must be boolean")
         interval = float(self.interval_seconds)
         cooldown = float(self.failure_cooldown_seconds)
+        auto_interval = float(self.auto_canary_interval_seconds)
+        if not math.isfinite(auto_interval) or auto_interval <= 0:
+            raise ValueError("auto_canary_interval_seconds must be finite and positive")
         if not math.isfinite(interval) or interval <= 0:
             raise ValueError("interval_seconds must be finite and positive")
         if isinstance(self.depth, bool) or not isinstance(self.depth, int) or self.depth <= 0:
@@ -320,6 +326,8 @@ class ResearchNode:
         self.opportunity_model = opportunity_model
         self.sleep = sleep
         self.clock = clock
+        self._logger: logging.Logger | None = None
+        self._handler: RotatingFileHandler | None = None
         self.stop_event = threading.Event()
         self._heartbeat_stop = threading.Event()
         self._heartbeat_thread: threading.Thread | None = None
@@ -343,20 +351,24 @@ class ResearchNode:
             "observations": int(crypto_history.get("observations", 0)),
             "fills": int(crypto_history.get("fills", 0)),
         }
-        self._logger: logging.Logger | None = None
-        self._handler: RotatingFileHandler | None = None
-        self._cycles: list[CollectionCycle] = []
-        self._restart_count = 0
-        self._last_status: dict[str, Any] | None = None
         self._worker_condition = threading.Condition()
         self._paper_scheduler_lock = threading.Lock()
         self._collector_thread: threading.Thread | None = None
         self._research_thread: threading.Thread | None = None
         self._health_thread: threading.Thread | None = None
+        self._auto_canary_thread: threading.Thread | None = None
+        self._auto_canary_worker = AutonomousCanaryWorker(
+            self.store,
+            interval_seconds=config.auto_canary_interval_seconds,
+            clock=clock,
+        )
         self._collector_error: str | None = None
         self._research_error: str | None = None
         self._run_cycle_base = 0
         self._research_passes = 0
+        self._cycles: list[CollectionCycle] = []
+        self._restart_count = 0
+        self._last_status: dict[str, Any] | None = None
         self._paper_store: AxiomStore | None = None
         self.collector = PolymarketCollector(
             self.provider,
@@ -494,6 +506,12 @@ class ResearchNode:
                     "paper_only": True,
                     "live_execution": False,
                 },
+                "autonomous-canary": {
+                    "pid": os.getpid(),
+                    "configured_interval_seconds": float(self.config.auto_canary_interval_seconds),
+                    "autonomous": True,
+                    "production_live_execution": False,
+                },
             }
             for worker_name, payload in worker_start_states.items():
                 self.store.save_worker_state(
@@ -520,6 +538,11 @@ class ResearchNode:
                             break
                         self._worker_condition.wait(timeout=0.5)
             cycle_failure = cycle_failure or bool(self._collector_error or self._research_error)
+            status = (
+                "degraded"
+                if cycle_failure
+                else ("stopped" if self.stop_event.is_set() and max_cycles is None else "idle")
+            )
         except KeyboardInterrupt:
             self.stop_event.set()
             raise
@@ -527,14 +550,34 @@ class ResearchNode:
             self.stop_event.set()
             with self._worker_condition:
                 self._worker_condition.notify_all()
-            for worker in (self._collector_thread, self._research_thread, self._health_thread):
+            for worker in (
+                self._collector_thread,
+                self._research_thread,
+                self._health_thread,
+                self._auto_canary_thread,
+            ):
                 if worker is not None:
                     worker.join()
+            self._stop_heartbeat_watchdog()
+            if max_cycles is not None:
+                try:
+                    self.store.save_worker_state(
+                        "autonomous-canary",
+                        "idle",
+                        {
+                            "pid": os.getpid(),
+                            "autonomous": True,
+                            "production_live_execution": False,
+                        },
+                        started_at=self.started_at,
+                        heartbeat_at=ensure_utc(self.clock()),
+                    )
+                except Exception:
+                    pass
             self._collector_thread = None
             self._research_thread = None
             self._health_thread = None
-            self._stop_heartbeat_watchdog()
-            status = "stopped" if self.stop_event.is_set() and max_cycles is None else ("degraded" if cycle_failure else "idle")
+            self._auto_canary_thread = None
             try:
                 self._heartbeat(
                     status,
@@ -590,9 +633,74 @@ class ResearchNode:
             name=f"{self.config.worker_name}-health",
             daemon=True,
         )
+        self._auto_canary_thread = threading.Thread(
+            target=self._auto_canary_worker_loop,
+            name=f"{self.config.worker_name}-autonomous-canary",
+            daemon=True,
+        )
         self._collector_thread.start()
         self._research_thread.start()
         self._health_thread.start()
+        self._auto_canary_thread.start()
+    def _auto_canary_worker_loop(self) -> None:
+        status = "running"
+        try:
+            while not self.stop_event.is_set():
+                result = self._auto_canary_worker.tick()
+                payload = {
+                    "pid": os.getpid(),
+                    "configured_interval_seconds": float(self.config.auto_canary_interval_seconds),
+                    "autonomous": True,
+                    "production_live_execution": False,
+                    "decision": result.get("decision"),
+                    "blocker": result.get("blocker"),
+                    "candidate_id": result.get("candidate_id"),
+                    "signal_id": result.get("signal_id"),
+                }
+                status = "degraded" if result.get("status") == "ERROR" else "running"
+                self.store.save_worker_state(
+                    "autonomous-canary",
+                    status,
+                    payload,
+                    started_at=ensure_utc(self.clock()),
+                    heartbeat_at=ensure_utc(self.clock()),
+                )
+                if self.stop_event.wait(self.config.auto_canary_interval_seconds):
+                    break
+        except Exception as exc:
+            status = "degraded"
+            try:
+                self.store.save_worker_state(
+                    "autonomous-canary",
+                    status,
+                    {
+                        "pid": os.getpid(),
+                        "autonomous": True,
+                        "production_live_execution": False,
+                        "decision": "AUTONOMOUS_WORKER_EXCEPTION",
+                        "blocker": "AUTONOMOUS_WORKER_EXCEPTION",
+                        "error_type": type(exc).__name__,
+                    },
+                    started_at=ensure_utc(self.clock()),
+                    heartbeat_at=ensure_utc(self.clock()),
+                )
+            except Exception:
+                pass
+        finally:
+            try:
+                self.store.save_worker_state(
+                    "autonomous-canary",
+                    "stopped" if self.stop_event.is_set() else status,
+                    {
+                        "pid": os.getpid(),
+                        "autonomous": True,
+                        "production_live_execution": False,
+                    },
+                    started_at=ensure_utc(self.clock()),
+                    heartbeat_at=ensure_utc(self.clock()),
+                )
+            except Exception:
+                pass
 
     def _collector_for_worker(self) -> tuple[PolymarketCollector, AxiomStore | None]:
         """Run collection on the node store while preserving independent cadence."""
