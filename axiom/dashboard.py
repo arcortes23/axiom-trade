@@ -2310,6 +2310,15 @@ class DashboardData:
             if isinstance(item, Mapping)
         ]
         worker_map = {str(item.get("worker_name")): item for item in workers}
+        collector_worker = worker_map.get("polymarket-collector", {})
+        collector_worker_payload = collector_worker.get("payload", {}) if isinstance(collector_worker, Mapping) else {}
+        collector_worker_payload = collector_worker_payload if isinstance(collector_worker_payload, Mapping) else {}
+        paper_worker = worker_map.get("paper-engine", {})
+        paper_worker_payload = paper_worker.get("payload", {}) if isinstance(paper_worker, Mapping) else {}
+        paper_worker_payload = paper_worker_payload if isinstance(paper_worker_payload, Mapping) else {}
+        research_worker = worker_map.get("research-engine", {})
+        research_worker_payload = research_worker.get("payload", {}) if isinstance(research_worker, Mapping) else {}
+        research_worker_payload = research_worker_payload if isinstance(research_worker_payload, Mapping) else {}
         health_worker = worker_map.get("health-monitor", {})
         health_payload = health_worker.get("payload", {}) if isinstance(health_worker, Mapping) else {}
         health_payload = health_payload if isinstance(health_payload, Mapping) else {}
@@ -2317,29 +2326,58 @@ class DashboardData:
         collector_state = self.store.get_collector_state("polymarket") or {}
         collector_state = collector_state if isinstance(collector_state, Mapping) else {}
         collector_detail = {
-            "grade": health_payload.get("grade"),
+            "grade": health_payload.get("grade") or collector_worker_payload.get("grade"),
             "reason_code": health_payload.get("reason_code"),
             "reasons": _bounded_value(health_payload.get("reasons", [])),
             "collection_errors": health_payload.get("collection_errors", 0),
             "top_failure_codes": _bounded_value(health_payload.get("top_failure_codes", [])),
             "stale_market_count": health_payload.get("stale_market_count", len(health_payload.get("stale_markets", []))),
             "gap_count": health_payload.get("gap_count", len(health_payload.get("gaps", []))),
-            "configured_interval_seconds": health_payload.get("configured_interval_seconds") or 60.0,
+            "configured_interval_seconds": (
+                health_payload.get("configured_interval_seconds")
+                or collector_worker_payload.get("configured_interval_seconds")
+                or collector_state.get("configured_interval_seconds")
+                or 60.0
+            ),
             "effective_collection_cadence_seconds": health_payload.get("effective_collection_cadence_seconds"),
-            "stale_after_seconds": health_payload.get("stale_after_seconds") or 180.0,
-            "last_cycle_duration_seconds": collector_state.get("last_cycle_duration_seconds", health_payload.get("last_cycle_duration_seconds")),
-            "last_cycle_started_at": collector_state.get("last_cycle_started_at", health_payload.get("last_cycle_started_at")),
-            "last_cycle_ended_at": collector_state.get("last_cycle_ended_at", health_payload.get("last_cycle_ended_at")),
-            "markets_attempted": collector_state.get("markets_attempted", health_payload.get("last_cycle_markets_attempted", 0)),
-            "markets_successful": collector_state.get("markets_successful", health_payload.get("last_cycle_markets_successful", 0)),
-            "markets_failed": collector_state.get("markets_failed", health_payload.get("last_cycle_markets_failed", 0)),
-            "last_cycle_markets_attempted": collector_state.get("markets_attempted", health_payload.get("last_cycle_markets_attempted", 0)),
-            "last_cycle_markets_successful": collector_state.get("markets_successful", health_payload.get("last_cycle_markets_successful", 0)),
-            "last_cycle_markets_failed": collector_state.get("markets_failed", health_payload.get("last_cycle_markets_failed", 0)),
-            "scheduled_market_count": len(collector_state.get("scheduled_market_ids", []))
-            if isinstance(collector_state.get("scheduled_market_ids"), (list, tuple))
-            else health_payload.get("scheduled_market_count", 0),
-            "last_successful_cycle": health_payload.get("last_successful_cycle"),
+            "stale_after_seconds": (
+                health_payload.get("stale_after_seconds")
+                or collector_worker_payload.get("stale_after_seconds")
+                or collector_state.get("stale_after_seconds")
+                or 180.0
+            ),
+            "last_cycle_duration_seconds": (
+                collector_worker_payload.get("last_cycle_duration_seconds")
+                or collector_state.get("last_cycle_duration_seconds")
+                or health_payload.get("last_cycle_duration_seconds")
+            ),
+            "last_cycle_started_at": (
+                collector_worker_payload.get("last_cycle_started_at")
+                or collector_state.get("last_cycle_started_at")
+                or health_payload.get("last_cycle_started_at")
+            ),
+            "last_cycle_ended_at": (
+                collector_worker_payload.get("last_cycle_ended_at")
+                or collector_state.get("last_cycle_ended_at")
+                or health_payload.get("last_cycle_ended_at")
+            ),
+            "markets_attempted": collector_worker_payload.get("last_cycle_markets_attempted", collector_state.get("markets_attempted", 0)),
+            "markets_successful": collector_worker_payload.get("last_cycle_markets_successful", collector_state.get("markets_successful", 0)),
+            "markets_failed": collector_worker_payload.get("last_cycle_markets_failed", collector_state.get("markets_failed", 0)),
+            "last_cycle_markets_attempted": collector_worker_payload.get("last_cycle_markets_attempted", collector_state.get("markets_attempted", 0)),
+            "last_cycle_markets_successful": collector_worker_payload.get("last_cycle_markets_successful", collector_state.get("markets_successful", 0)),
+            "last_cycle_markets_failed": collector_worker_payload.get("last_cycle_markets_failed", collector_state.get("markets_failed", 0)),
+            "scheduled_market_count": (
+                len(collector_state.get("scheduled_market_ids", []))
+                if isinstance(collector_state.get("scheduled_market_ids"), (list, tuple))
+                else collector_worker_payload.get("scheduled_market_count", health_payload.get("scheduled_market_count", 0))
+            ),
+            "last_successful_cycle": health_payload.get("last_successful_cycle") or collector_worker_payload.get("last_successful_collection_at"),
+            "next_scheduled_collection_at": (
+                collector_worker_payload.get("next_scheduled_collection_at")
+                or collector_state.get("next_scheduled_collection_at")
+            ),
+            "worker_heartbeat_at": collector_worker_payload.get("worker_heartbeat_at") or collector_state.get("worker_heartbeat_at"),
         }
         health_reason = (
             health_payload.get("degrading_reason")
@@ -2375,6 +2413,19 @@ class DashboardData:
         historical = catalog.get("historical", {}) if isinstance(catalog, Mapping) else {}
         forward = catalog.get("forward_collected", {}) if isinstance(catalog, Mapping) else {}
         candidate_canary_count = self._candidate_canary_eligibility_count()
+        paper_detail = dict(paper_worker_payload)
+        paper_detail["paper_forward_candidates"] = stages.get("PAPER_FORWARD", 0) + stages.get("PAPER_PROMOTABLE", 0)
+        paper_detail["status"] = (
+            f"{paper_detail['paper_forward_candidates']} PAPER_FORWARD candidate(s); "
+            f"{paper_worker_payload.get('processed_candidates', 0)} processed this pass; "
+            f"{paper_worker_payload.get('remaining_candidates', 0)} remaining"
+        )
+        research_detail = dict(research_worker_payload)
+        research_detail["status"] = (
+            f"{research_worker_payload.get('passes', 0)} pass(es); "
+            f"{research_worker_payload.get('queue_items_processed', 0)} research item(s) processed"
+        )
+        collector_default_state = "READY" if health_grade in {"A", "OK", "HEALTHY"} else (health_grade or "NOT INITIALIZED")
         components = [
             {
                 "name": "AXIOM NODE",
@@ -2383,7 +2434,7 @@ class DashboardData:
             },
             {
                 "name": "POLYMARKET COLLECTOR",
-                "state": health_grade or worker_state("health-monitor"),
+                "state": worker_state("polymarket-collector", collector_default_state),
                 "detail": collector_detail,
             },
             {
@@ -2398,8 +2449,13 @@ class DashboardData:
             },
             {
                 "name": "PAPER ENGINE",
-                "state": "ACTIVE" if counts.get("paper_state", 0) else "NOT INITIALIZED",
-                "detail": {"states": counts.get("paper_state", 0)},
+                "state": worker_state("paper-engine", "ACTIVE" if counts.get("paper_state", 0) else "NOT INITIALIZED"),
+                "detail": paper_detail,
+            },
+            {
+                "name": "RESEARCH ENGINE",
+                "state": worker_state("research-engine", worker_state("research-queue", "NOT INITIALIZED")),
+                "detail": research_detail,
             },
         ]
         return {
@@ -2885,6 +2941,16 @@ def _dashboard_html() -> str:
     function ensureActivityKind() { const status=$("activity-status"); if(!status||$("activity-kind"))return; const select=document.createElement("select"); select.id="activity-kind"; select.className="facet"; select.dataset.param="kind"; select.setAttribute("aria-label","Filter activity type"); select.innerHTML='<option value="">All activity types</option>'+["bootstrap","dataset","research","lifecycle","collection","collection_error","report"].map(v=>`<option value="${v}">${v.replace("_"," ")}</option>`).join(""); status.parentNode.insertBefore(select,status); }
     fetchV2 = async function(name,signal) { const q=new URLSearchParams(); if(!["overview-summary","canary"].includes(name)){q.set("page",String(state.page));q.set("page_size",String(state.page_size));q.set("direction",state.direction);if(state.filter)q.set("filter",state.filter);if(state.sort)q.set("sort",state.sort);} const controls={datasets:[["datasets-source","source_type"],["datasets-market","market"],["datasets-timeframe","timeframe"],["datasets-quality","quality"]],activity:[["activity-status","status"],["activity-kind","kind"]],candidates:[["candidates-stage","stage"]],polymarket:[["polymarket-category","category"],["polymarket-settlement","settlement"],["polymarket-quality","quality"]],hermes:[["hermes-status","status"]],paper:[["paper-status","status"]]}; for(const [id,key] of (controls[state.tab]||[])){const el=$(id);if(el&&el.value)q.set(key,el.value);} if(state.tab==="crypto"&&$("crypto-symbol")?.value.trim())q.set("symbol",$("crypto-symbol").value.trim()); const url=`/api/v2/${name}${q.toString()?`?${q}`:""}`,response=await fetch(url,{cache:"no-store",signal}); if(!response.ok)throw new Error(`${name} HTTP ${response.status}`); return response.json(); };
     renderOverview = (data) => { renderComponents(data); renderOutcomeCards(data); const c=data.coverage||{},h=data.collector_health||{}; $("coverage").innerHTML=`<div class="three-col"><div class="key-value"><span class="key">Historical datasets</span><strong>${count(c.historical_count)}</strong></div><div class="key-value"><span class="key">Historical rows</span><strong>${count(c.historical_rows)}</strong></div><div class="key-value"><span class="key">Forward datasets</span><strong>${count(c.forward_count)}</strong></div><div class="key-value"><span class="key">Forward rows</span><strong>${count(c.forward_rows)}</strong></div><div class="key-value"><span class="key">Logical observations</span><strong>${count((c.logical_rows||{}).bars)}</strong></div><div class="key-value"><span class="key">Collector errors</span><strong>${count(h.collection_errors)}</strong></div><div class="key-value"><span class="key">Last cycle duration</span><strong>${h.last_cycle_duration_seconds==null?"—":`${Number(h.last_cycle_duration_seconds).toFixed(1)}s`}</strong></div><div class="key-value"><span class="key">Effective cadence</span><strong>${h.effective_collection_cadence_seconds==null?"—":`${Number(h.effective_collection_cadence_seconds).toFixed(1)}s`}</strong></div><div class="key-value"><span class="key">Markets A / S / F</span><strong>${count(h.last_cycle_markets_attempted)} / ${count(h.last_cycle_markets_successful)} / ${count(h.last_cycle_markets_failed)}</strong></div></div><p class="page-note">Configured interval ${safe(h.configured_interval_seconds??"—")}s · stale threshold ${safe(h.stale_after_seconds??"—")}s · last successful cycle ${safe(dateText(h.last_successful_cycle))}</p>`; $("overview-activity").innerHTML=activityMarkup(arr(data.latest_activity||data.activity)); $("overview-candidates").innerHTML=empty("Candidate list is lazy","Open Candidates to load the bounded lifecycle page."); $("raw-overview").textContent=json({counts:data.counts,collector_health:h,latest_outcome:data.hermes_latest_outcome}); };
+    const _renderOverviewScheduling = renderOverview;
+    renderOverview = (data) => {
+      _renderOverviewScheduling(data);
+      const h = data.collector_health || {};
+      const components = Object.fromEntries(arr(data.components).map(item => [item.name, item]));
+      const collector = components["POLYMARKET COLLECTOR"]?.detail || {};
+      const paper = components["PAPER ENGINE"]?.detail || {};
+      const research = components["RESEARCH ENGINE"]?.detail || {};
+      $("coverage").insertAdjacentHTML("beforeend", `<p class="page-note">Next collection ${safe(dateText(h.next_scheduled_collection_at || collector.next_scheduled_collection_at))} · collector heartbeat ${safe(dateText(h.worker_heartbeat_at || collector.worker_heartbeat_at))} · PAPER_FORWARD pass ${safe(paper.status || "—")} · research pass ${safe(research.status || "—")}</p>`);
+    };
     renderDatasets = (data) => { $("dataset-total").textContent=`${count(data.total)} datasets`; const rows=arr(data.items); $("datasets-table").innerHTML=rows.length?`<table><thead><tr>${[["dataset_id","Dataset"],["source_type","Source"],["market_type","Market"],["instrument","Instrument"],["timeframe","Timeframe"],["quality","Quality"],["row_count","Rows"],["updated_at","Updated"]].map(([k,l])=>`<th>${sortButton(k,l)}</th>`).join("")}</tr></thead><tbody>${rows.map(i=>`<tr><td><button class="link dataset" data-id="${encodeURIComponent(i.dataset_id||"")}">${identity(datasetPrimary(i),i.dataset_id,i.dataset_id===datasetPrimary(i)?"":`full ${shortId(i.dataset_id)}`)}</button></td><td>${safe(i.source_type)}</td><td>${safe(i.market_type)}</td><td>${safe(i.instrument)}</td><td>${safe(i.timeframe)}</td><td>${safe(i.quality)}</td><td>${count(i.row_count)}</td><td>${safe(dateText(i.updated_at))}</td></tr>`).join("")}</tbody></table>`:empty("No datasets","No catalog records match the current filters."); pager("datasets",data); bindTable(); };
     renderActivity = (data) => { ensureActivityKind(); $("activity-total").textContent=`${count(data.total)} events`; $("activity-table").innerHTML=arr(data.items).length?`<div class="timeline">${activityMarkup(data.items)}</div>`:empty("No research activity","Durable activity will appear after workers run."); pager("activity",data); bindTable(); };
     renderCrypto = (data) => { const rows=arr(data.items),u=data.bootstrap_universe||{}; $("crypto-summary").innerHTML=`<div class="three-col"><div class="key-value"><span class="key">Universe version</span><strong title="${safe(data.universe_version)}">${safe(shortId(data.universe_version))}${copyButton(data.universe_version)}</strong></div><div class="key-value"><span class="key">Selected universe</span><strong>${count(u.selected_count)}</strong></div><div class="key-value"><span class="key">Bootstrap progress</span><strong>${u.progress==null?"—":(Number(u.progress)*100).toFixed(1)+"%"}</strong></div><div class="key-value"><span class="key">Bootstrap datasets</span><strong>${count(u.dataset_count)}</strong></div><div class="key-value"><span class="key">Bootstrap reports</span><strong>${count(data.bootstrap_report_count??arr(data.bootstrap_reports).length)}</strong></div><div class="key-value"><span class="key">Strategy reports</span><strong>${count(arr(data.strategy_reports||data.reports).length)}</strong></div></div>`; $("crypto-table").innerHTML=rows.length?`<table><thead><tr><th>Symbol</th><th>Dataset</th><th>Source</th><th>Rows</th><th>Quality</th><th>Updated</th></tr></thead><tbody>${rows.map(i=>`<tr><td>${safe(i.symbol||arr(i.symbols)[0])}</td><td>${identity(shortId(i.dataset_id),i.dataset_id,shortId(i.dataset_version))}</td><td>${safe(i.source_type)}</td><td>${count(i.row_count)}</td><td>${safe(i.quality)}</td><td>${safe(dateText(i.updated_at))}</td></tr>`).join("")}</tbody></table>`:empty("No crypto catalogs","Crypto data is separate from strategy research; run the bounded bootstrap or select another symbol."); if(arr(data.bootstrap_progress).length){$("crypto-detail").innerHTML=`<article class="panel"><div class="section-title"><h2>Bootstrap cursors</h2><span class="muted">${count(u.completed_datasets)} complete / ${count(u.dataset_count)} datasets</span></div><div class="scroll"><table><thead><tr><th>Selected symbol</th><th>Timeframe</th><th>Status</th><th>Progress</th><th>Records</th><th>Errors</th></tr></thead><tbody>${arr(data.bootstrap_progress).map(i=>`<tr><td>${safe(i.selected_symbol||i.symbol)}</td><td>${safe(i.timeframe)}</td><td>${safe(i.status)}</td><td>${i.progress==null?"—":(Number(i.progress)*100).toFixed(1)+"%"}</td><td>${count(i.records)}</td><td>${count(i.error_count)}</td></tr>`).join("")}</tbody></table></div></article>`;} else $("crypto-detail").innerHTML=""; pager("crypto",data); bindTable(); };

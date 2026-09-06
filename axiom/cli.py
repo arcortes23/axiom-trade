@@ -309,6 +309,8 @@ def build_parser() -> argparse.ArgumentParser:
     node_run.add_argument("--crypto-source", choices=("public", "synthetic", "disabled"), default="public")
     node_run.add_argument("--crypto-symbol", default="BTC/USDT")
     node_run.add_argument("--research-items", type=int, default=1, help="bounded queue items per node cycle")
+    node_run.add_argument("--paper-candidates", type=int, default=4, help="bounded PAPER_FORWARD candidates per scheduler pass")
+    node_run.add_argument("--paper-observations", type=int, default=64, help="bounded observations per PAPER_FORWARD candidate pass")
     node_run.add_argument("--research-lease", type=float, default=300.0, help="queue lease seconds")
     node_run.add_argument("--experiment-total-limit", type=int, default=1000)
     node_run.add_argument("--experiment-family-limit", type=int, default=250)
@@ -1219,6 +1221,8 @@ def _main_impl(argv: Sequence[str] | None = None) -> int:
                 crypto_enabled=args.crypto_source != "disabled",
                 research_enabled=not args.disable_research,
                 research_max_items_per_cycle=args.research_items,
+                paper_candidates_per_cycle=args.paper_candidates,
+                paper_observations_per_candidate=args.paper_observations,
                 research_lease_seconds=args.research_lease,
                 experiment_total_limit=args.experiment_total_limit,
                 experiment_family_limit=args.experiment_family_limit,

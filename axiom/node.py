@@ -158,6 +158,8 @@ class NodeConfig:
     backup_count: int = 3
     research_enabled: bool = True
     research_max_items_per_cycle: int = 1
+    paper_candidates_per_cycle: int = 4
+    paper_observations_per_candidate: int = 64
     research_lease_seconds: float = 300.0
     experiment_total_limit: int = 1000
     experiment_family_limit: int = 250
@@ -226,6 +228,10 @@ class NodeConfig:
             raise ValueError("backup_count must be a non-negative integer")
         if not isinstance(self.research_enabled, bool):
             raise ValueError("research_enabled must be boolean")
+        if isinstance(self.paper_candidates_per_cycle, bool) or not isinstance(self.paper_candidates_per_cycle, int) or self.paper_candidates_per_cycle <= 0:
+            raise ValueError("paper_candidates_per_cycle must be a positive integer")
+        if isinstance(self.paper_observations_per_candidate, bool) or not isinstance(self.paper_observations_per_candidate, int) or self.paper_observations_per_candidate <= 0:
+            raise ValueError("paper_observations_per_candidate must be a positive integer")
         AutonomousResearchConfig(
             max_items_per_cycle=self.research_max_items_per_cycle,
             lease_seconds=self.research_lease_seconds,
@@ -342,6 +348,16 @@ class ResearchNode:
         self._cycles: list[CollectionCycle] = []
         self._restart_count = 0
         self._last_status: dict[str, Any] | None = None
+        self._worker_condition = threading.Condition()
+        self._paper_scheduler_lock = threading.Lock()
+        self._collector_thread: threading.Thread | None = None
+        self._research_thread: threading.Thread | None = None
+        self._health_thread: threading.Thread | None = None
+        self._collector_error: str | None = None
+        self._research_error: str | None = None
+        self._run_cycle_base = 0
+        self._research_passes = 0
+        self._paper_store: AxiomStore | None = None
         self.collector = PolymarketCollector(
             self.provider,
             self.store,
@@ -437,9 +453,12 @@ class ResearchNode:
             raise
         self.started_at = ensure_utc(self.clock())
         self.stop_event.clear()
-        completed = 0
+        self._collector_error = None
+        self._research_error = None
+        self._cycles.clear()
+        self._run_cycle_base = 0
+        self._research_passes = 0
         cycle_failure = False
-        attempted = 0
         try:
             self.store.save_worker_state(
                 self.config.worker_name,
@@ -453,81 +472,75 @@ class ResearchNode:
                 started_at=self.started_at,
                 heartbeat_at=self.started_at,
             )
-            self._start_heartbeat_watchdog()
-            while max_cycles is None or attempted < max_cycles:
-                if self._external_stop_requested():
-                    break
-                attempted += 1
-                self._heartbeat(
+            worker_start_states = {
+                "polymarket-collector": {
+                    "pid": os.getpid(),
+                    "configured_interval_seconds": float(self.config.interval_seconds),
+                    "paper_only": True,
+                    "live_execution": False,
+                },
+                "paper-engine": {
+                    "pid": os.getpid(),
+                    "candidate_count": 0,
+                    "processed_candidates": 0,
+                    "remaining_candidates": 0,
+                    "paper_only": True,
+                    "live_execution": False,
+                },
+                "research-engine": {"pid": os.getpid(), "paper_only": True, "live_execution": False},
+                "health-monitor": {
+                    "pid": os.getpid(),
+                    "configured_interval_seconds": float(self.config.interval_seconds),
+                    "paper_only": True,
+                    "live_execution": False,
+                },
+            }
+            for worker_name, payload in worker_start_states.items():
+                self.store.save_worker_state(
+                    worker_name,
                     "running",
-                    {
-                        "cycle": completed,
-                        "attempt": attempted,
-                        "restart_count": self._restart_count,
-                        "crypto_paper": dict(self._crypto_status),
-                    },
+                    payload,
+                    started_at=self.started_at,
+                    heartbeat_at=self.started_at,
                 )
-                try:
-                    self._run_crypto_paper()
-                    cycle = self.collector.collect_once()
-                    self._run_opportunity_pipeline()
-                    self._cycles.append(cycle)
-                    if len(self._cycles) > self.config.retain_cycles:
-                        del self._cycles[:-self.config.retain_cycles]
-                    self.bus.resume_expired(now=ensure_utc(self.clock()))
-                    self._run_paper_workers()
-                    self.research_processor.reevaluate_forward_candidates(now=ensure_utc(self.clock()))
-                    self._run_research_queue()
-                    self._run_health_monitor()
-                    completed += 1
-                    cycle_failure = False
-                    self._heartbeat(
-                        "running",
-                        {
-                            "cycle": completed,
-                            "last_collection": cycle.as_record(),
-                            "restart_count": self._restart_count,
-                            "paper_only": True,
-                            "live_execution": False,
-                            "crypto_paper": dict(self._crypto_status),
-                        },
-                    )
-                except Exception as exc:  # worker restart boundary
-                    cycle_failure = True
-                    self._restart_count += 1
-                    self._log(logging.ERROR, "worker cycle failed; restarting: %s", exc)
-                    self._heartbeat(
-                        "degraded",
-                        {
-                            "error": str(exc),
-                            "restart_count": self._restart_count,
-                            "crypto_paper": dict(self._crypto_status),
-                        },
-                    )
-                if max_cycles is not None and attempted >= max_cycles:
-                    self._external_stop_requested()
-                    break
-                deadline = time.monotonic() + float(self.config.interval_seconds)
+            self._start_heartbeat_watchdog()
+            if max_cycles != 0:
+                self._start_worker_threads(max_cycles)
                 while not self.stop_event.is_set():
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        break
-                    if self.stop_event.wait(min(remaining, 0.5)):
-                        break
-                    if self._external_stop_requested():
-                        break
+                    with self._worker_condition:
+                        cycle_count = len(self._cycles) - self._run_cycle_base
+                        research_passes = self._research_passes
+                        collector = self._collector_thread
+                        if max_cycles is not None and cycle_count >= max_cycles and research_passes >= 1:
+                            break
+                        if collector is not None and not collector.is_alive() and (
+                            max_cycles is None or cycle_count < max_cycles
+                        ):
+                            cycle_failure = True
+                            break
+                        self._worker_condition.wait(timeout=0.5)
+            cycle_failure = cycle_failure or bool(self._collector_error or self._research_error)
         except KeyboardInterrupt:
             self.stop_event.set()
             raise
         finally:
+            self.stop_event.set()
+            with self._worker_condition:
+                self._worker_condition.notify_all()
+            for worker in (self._collector_thread, self._research_thread, self._health_thread):
+                if worker is not None:
+                    worker.join()
+            self._collector_thread = None
+            self._research_thread = None
+            self._health_thread = None
             self._stop_heartbeat_watchdog()
-            status = "stopped" if self.stop_event.is_set() else ("degraded" if cycle_failure else "idle")
+            status = "stopped" if self.stop_event.is_set() and max_cycles is None else ("degraded" if cycle_failure else "idle")
             try:
                 self._heartbeat(
                     status,
                     {
-                        "cycles": completed,
-                        "attempts": attempted,
+                        "cycles": len(self._cycles) - self._run_cycle_base,
+                        "attempts": len(self._cycles) - self._run_cycle_base,
                         "restart_count": self._restart_count,
                         "crypto_paper": dict(self._crypto_status),
                     },
@@ -560,6 +573,295 @@ class ResearchNode:
                 self.store.close()
         return list(self._cycles)
 
+    def _start_worker_threads(self, max_cycles: int | None) -> None:
+        self._collector_thread = threading.Thread(
+            target=self._collector_worker_loop,
+            args=(max_cycles,),
+            name=f"{self.config.worker_name}-collector",
+            daemon=True,
+        )
+        self._research_thread = threading.Thread(
+            target=self._research_worker_loop,
+            name=f"{self.config.worker_name}-research",
+            daemon=True,
+        )
+        self._health_thread = threading.Thread(
+            target=self._health_worker_loop,
+            name=f"{self.config.worker_name}-health",
+            daemon=True,
+        )
+        self._collector_thread.start()
+        self._research_thread.start()
+        self._health_thread.start()
+
+    def _collector_for_worker(self) -> tuple[PolymarketCollector, AxiomStore | None]:
+        """Run collection on the node store while preserving independent cadence."""
+        if not isinstance(self.collector, PolymarketCollector):
+            return self.collector, None  # type: ignore[return-value]
+        return self.collector, None
+
+    def _update_collector_schedule(self, store: AxiomStore, next_scheduled: datetime) -> None:
+        state = store.get_collector_state("polymarket") or {}
+        state.update(
+            {
+                "configured_interval_seconds": float(self.config.interval_seconds),
+                "next_scheduled_collection_at": ensure_utc(next_scheduled).isoformat(),
+                "worker_heartbeat_at": ensure_utc(self.clock()).isoformat(),
+            }
+        )
+        store.set_collector_state("polymarket", state)
+
+    def _save_collector_worker_state(
+        self,
+        status: str,
+        *,
+        next_scheduled: datetime | None = None,
+        cycle: CollectionCycle | None = None,
+        error: str | None = None,
+    ) -> None:
+        payload: dict[str, Any] = {
+            "pid": os.getpid(),
+            "configured_interval_seconds": float(self.config.interval_seconds),
+            "next_scheduled_collection_at": (
+                ensure_utc(next_scheduled).isoformat() if next_scheduled is not None else None
+            ),
+            "worker_heartbeat_at": ensure_utc(self.clock()).isoformat(),
+            "paper_only": True,
+            "live_execution": False,
+        }
+        if cycle is not None:
+            payload.update(
+                {
+                    "last_cycle": cycle.as_record(),
+                    "last_cycle_started_at": cycle.started_at.isoformat(),
+                    "last_cycle_ended_at": cycle.ended_at.isoformat(),
+                    "last_cycle_duration_seconds": cycle.duration_seconds,
+                    "last_cycle_markets_attempted": cycle.markets_attempted,
+                    "last_cycle_markets_successful": cycle.markets_successful,
+                    "last_cycle_markets_failed": cycle.markets_failed,
+                    "last_successful_collection_at": cycle.ended_at.isoformat()
+                    if cycle.markets_successful > 0
+                    else None,
+                }
+            )
+        if error:
+            payload["error"] = error
+        self.store.save_worker_state(
+            "polymarket-collector",
+            status,
+            payload,
+            started_at=cycle.started_at if cycle is not None else ensure_utc(self.clock()),
+            heartbeat_at=ensure_utc(self.clock()),
+        )
+
+    def _collector_worker_loop(self, max_cycles: int | None) -> None:
+        collector, owned_store = self._collector_for_worker()
+        completed = 0
+        failed_attempts = 0
+        next_due = time.monotonic()
+        next_scheduled = ensure_utc(self.clock())
+        try:
+            schedule_store = owned_store or self.store
+            self._save_collector_worker_state("running", next_scheduled=next_scheduled)
+            self._update_collector_schedule(schedule_store, next_scheduled)
+            while not self.stop_event.is_set() and (max_cycles is None or completed < max_cycles):
+                if self._external_stop_requested():
+                    break
+                scheduled_for = next_scheduled
+                try:
+                    cycle = collector.collect_once()
+                except Exception as exc:
+                    failed_attempts += 1
+                    self._collector_error = str(exc)
+                    self._log(logging.ERROR, "collector worker cycle failed: %s", exc)
+                    self._save_collector_worker_state(
+                        "degraded",
+                        next_scheduled=scheduled_for,
+                        error=str(exc),
+                    )
+                    if max_cycles is not None and failed_attempts >= max_cycles:
+                        break
+                else:
+                    failed_attempts = 0
+                    self._collector_error = None
+                    with self._worker_condition:
+                        self._cycles.append(cycle)
+                        if len(self._cycles) > self._run_cycle_base + self.config.retain_cycles:
+                            del self._cycles[: -(self.config.retain_cycles)]
+                        completed += 1
+                        self._worker_condition.notify_all()
+                    next_scheduled = cycle.started_at + timedelta(seconds=float(self.config.interval_seconds))
+                    self._update_collector_schedule(schedule_store, next_scheduled)
+                    self._save_collector_worker_state(
+                        "running",
+                        next_scheduled=next_scheduled,
+                        cycle=cycle,
+                    )
+                if max_cycles is not None and completed >= max_cycles:
+                    break
+                next_due += float(self.config.interval_seconds)
+                delay = max(0.0, next_due - time.monotonic())
+                if delay <= 0:
+                    next_due = time.monotonic()
+                    next_scheduled = ensure_utc(self.clock())
+                else:
+                    next_scheduled = ensure_utc(self.clock()) + timedelta(seconds=delay)
+                self._update_collector_schedule(schedule_store, next_scheduled)
+                if self.stop_event.wait(delay):
+                    break
+        finally:
+            final_status = (
+                "stopped"
+                if self.stop_event.is_set() and max_cycles is None
+                else ("degraded" if self._collector_error else "idle")
+            )
+            try:
+                self._save_collector_worker_state(
+                    final_status,
+                    next_scheduled=next_scheduled,
+                    error=self._collector_error,
+                )
+            except Exception:
+                pass
+            if owned_store is not None:
+                owned_store.close()
+            with self._worker_condition:
+                self._worker_condition.notify_all()
+
+    def _research_worker_loop(self) -> None:
+        first_cycle = self._run_cycle_base
+        try:
+            self.store.save_worker_state(
+                "research-engine",
+                "running",
+                {"pid": os.getpid(), "paper_only": True, "live_execution": False},
+                started_at=ensure_utc(self.clock()),
+                heartbeat_at=ensure_utc(self.clock()),
+            )
+            while not self.stop_event.is_set():
+                with self._worker_condition:
+                    while (
+                        not self.stop_event.is_set()
+                        and len(self._cycles) <= first_cycle
+                        and (self._collector_thread is None or self._collector_thread.is_alive())
+                    ):
+                        self._worker_condition.wait(timeout=0.5)
+                    if self.stop_event.is_set():
+                        break
+                    if len(self._cycles) <= first_cycle and self._collector_thread is not None and not self._collector_thread.is_alive():
+                        self._research_error = "collector produced no completed cycle"
+                        break
+                started = ensure_utc(self.clock())
+                try:
+                    cycle_stats = self._run_research_cycle()
+                    self._research_error = None
+                    status = "idle"
+                except Exception as exc:
+                    self._research_error = str(exc)
+                    self._log(logging.ERROR, "research worker cycle failed: %s", exc)
+                    cycle_stats = {"error": str(exc)}
+                    status = "degraded"
+                with self._worker_condition:
+                    self._research_passes += 1
+                    research_passes = self._research_passes
+                    self._worker_condition.notify_all()
+                queue_cycle = cycle_stats.get("research_queue") if isinstance(cycle_stats, Mapping) else None
+                queue_items_processed = (
+                    int(queue_cycle.get("claimed", 0))
+                    if isinstance(queue_cycle, Mapping)
+                    else 0
+                )
+                self.store.save_worker_state(
+                    "research-engine",
+                    status,
+                    {
+                        "pid": os.getpid(),
+                        "cycle": cycle_stats,
+                        "passes": research_passes,
+                        "queue_items_processed": queue_items_processed,
+                        "cycle_started_at": started.isoformat(),
+                        "cycle_ended_at": ensure_utc(self.clock()).isoformat(),
+                        "paper_only": True,
+                        "live_execution": False,
+                    },
+                    started_at=started,
+                    heartbeat_at=ensure_utc(self.clock()),
+                )
+                if self.stop_event.wait(1.0):
+                    break
+        finally:
+            try:
+                self.store.save_worker_state(
+                    "research-engine",
+                    "stopped" if self.stop_event.is_set() else "degraded",
+                    {
+                        "pid": os.getpid(),
+                        "error": self._research_error,
+                        "passes": self._research_passes,
+                        "paper_only": True,
+                        "live_execution": False,
+                    },
+                    started_at=ensure_utc(self.clock()),
+                    heartbeat_at=ensure_utc(self.clock()),
+                )
+            except Exception:
+                pass
+            with self._worker_condition:
+                self._worker_condition.notify_all()
+
+    def _health_worker_loop(self) -> None:
+        seen = self._run_cycle_base
+        try:
+            while not self.stop_event.is_set():
+                with self._worker_condition:
+                    while (
+                        not self.stop_event.is_set()
+                        and len(self._cycles) <= seen
+                        and (self._collector_thread is None or self._collector_thread.is_alive())
+                    ):
+                        self._worker_condition.wait(timeout=0.5)
+                    if self.stop_event.is_set():
+                        break
+                    if len(self._cycles) <= seen and self._collector_thread is not None and not self._collector_thread.is_alive():
+                        break
+                    seen = len(self._cycles)
+                try:
+                    self._run_health_monitor()
+                except Exception as exc:
+                    self._log(logging.ERROR, "health worker cycle failed: %s", exc)
+        finally:
+            try:
+                health_payload: dict[str, Any] = {
+                    "pid": os.getpid(),
+                    "paper_only": True,
+                    "live_execution": False,
+                }
+                for item in self.store.list_worker_states(limit=2048):
+                    if item.get("worker_name") == "health-monitor" and isinstance(item.get("payload"), Mapping):
+                        health_payload = dict(item["payload"])
+                        health_payload.update({"pid": os.getpid(), "paper_only": True, "live_execution": False})
+                        break
+                self.store.save_worker_state(
+                    "health-monitor",
+                    "stopped" if self.stop_event.is_set() or self._collector_error is None else "degraded",
+                    health_payload,
+                    started_at=ensure_utc(self.clock()),
+                    heartbeat_at=ensure_utc(self.clock()),
+                )
+            except Exception:
+                pass
+            with self._worker_condition:
+                self._worker_condition.notify_all()
+
+    def _run_research_cycle(self) -> dict[str, Any]:
+        self._run_crypto_paper()
+        self._run_opportunity_pipeline()
+        self.bus.resume_expired(now=ensure_utc(self.clock()))
+        paper_stats = self._run_paper_workers()
+        self.research_processor.reevaluate_forward_candidates(now=ensure_utc(self.clock()))
+        queue_stats = self._run_research_queue()
+        return {"paper": paper_stats, "research_queue": queue_stats}
+
     def _start_heartbeat_watchdog(self) -> None:
         self._heartbeat_stop.clear()
         interval = max(0.5, min(10.0, max(float(self.config.interval_seconds), 0.5)))
@@ -584,6 +886,7 @@ class ResearchNode:
         def beat() -> None:
             while not self._heartbeat_stop.wait(interval):
                 try:
+                    heartbeat = ensure_utc(self.clock())
                     self.store.save_worker_state(
                         watchdog_name,
                         "running",
@@ -595,7 +898,19 @@ class ResearchNode:
                             "live_execution": False,
                         },
                         started_at=self.started_at,
-                        heartbeat_at=ensure_utc(self.clock()),
+                        heartbeat_at=heartbeat,
+                    )
+                    self.store.save_worker_state(
+                        self.config.worker_name,
+                        "running",
+                        {
+                            "pid": os.getpid(),
+                            "paper_only": True,
+                            "live_execution": False,
+                            "crypto_paper": dict(self._crypto_status),
+                        },
+                        started_at=self.started_at,
+                        heartbeat_at=heartbeat,
                     )
                 except Exception as exc:
                     self._log(logging.WARNING, "heartbeat watchdog update failed: %s", exc)
@@ -634,6 +949,8 @@ class ResearchNode:
 
     def stop(self) -> None:
         self.stop_event.set()
+        with self._worker_condition:
+            self._worker_condition.notify_all()
 
     def status(self) -> dict[str, Any]:
         try:
@@ -701,11 +1018,18 @@ class ResearchNode:
         for worker_name, worker_state in rows.items():
             if worker_name == self.config.worker_name:
                 continue
+            child_payload = worker_state.get("payload")
+            child_pid = child_payload.get("pid") if isinstance(child_payload, Mapping) else None
+            try:
+                if worker_pid and child_pid is not None and int(child_pid) != worker_pid:
+                    continue
+            except (TypeError, ValueError):
+                pass
             child_status = str(worker_state.get("status", "not_started")).lower()
             child_workers[worker_name] = {
                 "status": child_status,
                 "heartbeat_at": worker_state.get("heartbeat_at"),
-                "payload": worker_state.get("payload"),
+                "payload": child_payload,
             }
             child_degraded = child_degraded or child_status in {"degraded", "stale"}
             child_running = child_running or child_status == "running"
@@ -793,6 +1117,8 @@ class ResearchNode:
                 "budget": self.store.load_experiment_budget("autonomous"),
                 "limits": {
                     "items_per_cycle": self.config.research_max_items_per_cycle,
+                    "paper_candidates_per_cycle": self.config.paper_candidates_per_cycle,
+                    "paper_observations_per_candidate": self.config.paper_observations_per_candidate,
                     "total_experiments": self.config.experiment_total_limit,
                     "family_experiments": self.config.experiment_family_limit,
                     "daily_experiments": self.config.max_experiments_per_day,
@@ -997,6 +1323,151 @@ class ResearchNode:
                 "last_error": str(exc),
             }
             self._log(logging.ERROR, "crypto paper cycle failed: %s", exc)
+    def _run_persisted_opportunity_pipeline(self, started: datetime) -> bool:
+        """Scan the collector's newest evidence without issuing a second sweep."""
+        if self.opportunity_model is not None and not isinstance(self.opportunity_model, Mapping):
+            return False
+        collector_state = self.store.get_collector_state("polymarket") or {}
+        has_completed_collection = bool(collector_state.get("last_cycle_ended_at"))
+        latest_rows = self.store.load_latest_polymarket_snapshots(
+            source_type="FORWARD_COLLECTED",
+            limit=self.config.max_markets,
+        )
+        freshness_seconds = max(120.0, float(self.config.interval_seconds) * 2.0)
+        cutoff = started - timedelta(seconds=freshness_seconds)
+        records: list[dict[str, Any]] = []
+        evidence_by_market: dict[str, dict[str, Any]] = {}
+        observed_values: list[datetime] = []
+        for row in latest_rows:
+            observed_at = parse_timestamp(row.get("observed_at"))
+            if observed_at is None or observed_at > started or observed_at < cutoff:
+                continue
+            payload = row.get("payload")
+            if not isinstance(payload, Mapping):
+                continue
+            snapshot = payload.get("snapshot", payload)
+            if not isinstance(snapshot, Mapping):
+                continue
+            market_id = str(row.get("market_id") or snapshot.get("market_id") or "").strip()
+            if not market_id:
+                continue
+            record = dict(snapshot)
+            record["market_id"] = market_id
+            source_timestamp = parse_timestamp(row.get("source_timestamp"))
+            record["timestamp"] = (source_timestamp or observed_at).isoformat()
+            for key in ("yes_order_book", "no_order_book", "available_at"):
+                if key in payload:
+                    record[key] = payload[key]
+            record.setdefault("research_quality", payload.get("research_quality") or row.get("quality"))
+            records.append(record)
+            evidence = payload.get("evidence")
+            evidence_by_market[market_id] = dict(evidence) if isinstance(evidence, Mapping) else {
+                key: payload.get(key)
+                for key in ("request_started_at", "source_timestamp", "provider_timestamp", "response_received_at")
+                if payload.get(key) is not None
+            }
+            observed_values.append(observed_at)
+        if not has_completed_collection and not records:
+            return False
+        worker_name = "opportunity-pipeline"
+        if not records:
+            reason = "no fresh persisted forward evidence is available"
+            self.store.save_worker_state(
+                worker_name,
+                "degraded",
+                {
+                    "markets": 0,
+                    "opportunities": 0,
+                    "inserted": 0,
+                    "degrading_reason": reason,
+                    "last_degrading_reason": reason,
+                    "last_error": reason,
+                    "paper_only": True,
+                    "live_execution": False,
+                },
+                started_at=started,
+                heartbeat_at=ensure_utc(self.clock()),
+            )
+            return True
+        probabilities: dict[str, float] = {}
+        uncertainties: dict[str, float] = {}
+        model_versions: set[str] = set()
+        for record in records:
+            market_id = str(record.get("market_id", "")).strip()
+            if self.opportunity_model is None:
+                estimate = record.get("yes_mid")
+                if estimate is None:
+                    estimate = record.get("yes_ask")
+                version = "market-price-baseline-v1"
+                quality = str(record.get("research_quality") or "PRICE_PROXY")
+                uncertainty = 1.0
+            else:
+                estimate = self.opportunity_model.get(market_id)
+                version = "configured-model"
+                quality = "MODEL_ESTIMATE"
+                uncertainty = 0.0
+            if isinstance(estimate, Mapping):
+                probability_value = estimate.get("probability", estimate.get("yes_probability", estimate.get("prediction")))
+                version = str(estimate.get("model_version", version))
+                quality = str(estimate.get("research_quality", quality))
+                uncertainty = float(estimate.get("uncertainty", uncertainty) or 0.0)
+            else:
+                probability_value = estimate
+            try:
+                probability = float(probability_value)
+                uncertainty = float(uncertainty)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(probability) or not 0.0 <= probability <= 1.0:
+                continue
+            if not math.isfinite(uncertainty) or uncertainty < 0:
+                continue
+            probabilities[market_id] = probability
+            uncertainties[market_id] = uncertainty
+            model_versions.add(version)
+            record.update(
+                {
+                    "model_probability": probability,
+                    "uncertainty": uncertainty,
+                    "model_version": version,
+                    "research_quality": quality,
+                }
+            )
+        opportunities = scan_opportunities(
+            records,
+            probabilities,
+            uncertainties=uncertainties,
+            model_version=sorted(model_versions)[0] if model_versions else "market-price-baseline-v1",
+        )
+        opportunity_records: list[dict[str, Any]] = []
+        for item in opportunities:
+            item_record = item.as_record()
+            evidence = evidence_by_market.get(item.market_id)
+            if evidence:
+                item_record["evidence"] = dict(evidence)
+                for key in ("request_started_at", "source_timestamp", "provider_timestamp", "response_received_at"):
+                    item_record[key] = evidence.get(key)
+            opportunity_records.append(item_record)
+        observed_at = max(observed_values) if observed_values else started
+        inserted = self.store.save_opportunity_snapshots(observed_at, opportunity_records)
+        self.store.save_worker_state(
+            worker_name,
+            "idle",
+            {
+                "markets": len(records),
+                "opportunities": len(opportunities),
+                "inserted": inserted,
+                "model_versions": sorted(model_versions),
+                "source": "persisted_forward_collection",
+                "source_observed_at": observed_at.isoformat(),
+                "paper_only": True,
+                "live_execution": False,
+            },
+            started_at=started,
+            heartbeat_at=ensure_utc(self.clock()),
+        )
+        return True
+
     def _run_opportunity_pipeline(self) -> None:
         worker_name = "opportunity-pipeline"
         started = ensure_utc(self.clock())
@@ -1007,6 +1478,8 @@ class ResearchNode:
             started_at=started,
             heartbeat_at=started,
         )
+        if self._run_persisted_opportunity_pipeline(started):
+            return
         try:
             provider_errors: list[str] = []
             degrading_reasons: list[str] = []
@@ -1296,145 +1769,284 @@ class ResearchNode:
             )
             self._log(logging.ERROR, "opportunity pipeline failed: %s", exc)
 
-    def _run_paper_workers(self) -> None:
-        registry = ForwardTestRegistry(self.store)
-        for spec in registry.list():
-            config = spec.config if isinstance(spec.config, Mapping) else {}
-            if bool(config.get("historical_replay")):
+    def _run_paper_workers(self) -> dict[str, Any]:
+        if not self._paper_scheduler_lock.acquire(blocking=False):
+            return {
+                "candidate_count": 0,
+                "processed_candidates": 0,
+                "successful_candidates": 0,
+                "observations_processed": 0,
+                "fills_inserted": 0,
+                "remaining_candidates": 0,
+                "next_candidate_id": None,
+                "skipped": "scheduler already running",
+            }
+        try:
+            db_path = str(self.config.db_path).strip()
+            if self._paper_store is None and db_path.lower() != ":memory:":
+                with AxiomStore(db_path) as paper_store:
+                    self._paper_store = paper_store
+                    try:
+                        return self._run_paper_workers_locked()
+                    finally:
+                        self._paper_store = None
+            return self._run_paper_workers_locked()
+        finally:
+            self._paper_scheduler_lock.release()
+
+    def _run_paper_workers_locked(self) -> dict[str, Any]:
+        paper_store = self._paper_store or self.store
+        registry = ForwardTestRegistry(paper_store)
+        specs = sorted(
+            (
+                spec
+                for spec in registry.list()
+                if not bool((spec.config if isinstance(spec.config, Mapping) else {}).get("historical_replay"))
+            ),
+            key=lambda spec: (spec.start_timestamp, spec.experiment_id),
+        )
+        scheduler_name = "paper-engine"
+        state = self.store.get_scheduler_state(scheduler_name) or {}
+        if not specs:
+            stats = {
+                "candidate_count": 0,
+                "processed_candidates": 0,
+                "successful_candidates": 0,
+                "observations_processed": 0,
+                "fills_inserted": 0,
+                "remaining_candidates": 0,
+                "next_candidate_id": None,
+            }
+            self.store.set_scheduler_state(scheduler_name, {**state, **stats, "cursor": 0, "last_candidate_id": None})
+            self.store.save_worker_state(
+                scheduler_name,
+                "idle",
+                {"pid": os.getpid(), **stats, "paper_only": True, "live_execution": False},
+                started_at=ensure_utc(self.clock()),
+                heartbeat_at=ensure_utc(self.clock()),
+            )
+            return stats
+        try:
+            cursor = int(state.get("cursor", 0))
+        except (TypeError, ValueError):
+            cursor = 0
+        cursor %= len(specs)
+        last_candidate_id = str(state.get("last_candidate_id", "")).strip()
+        if last_candidate_id:
+            matching = next((index for index, spec in enumerate(specs) if spec.experiment_id == last_candidate_id), None)
+            if matching is not None:
+                cursor = (matching + 1) % len(specs)
+        limit = min(self.config.paper_candidates_per_cycle, len(specs))
+        selected = tuple(specs[(cursor + offset) % len(specs)] for offset in range(limit))
+        next_cursor = (cursor + limit) % len(specs)
+        stats: dict[str, Any] = {
+            "candidate_count": len(specs),
+            "processed_candidates": len(selected),
+            "successful_candidates": 0,
+            "observations_processed": 0,
+            "fills_inserted": 0,
+            "remaining_candidates": max(0, len(specs) - len(selected)),
+            "next_candidate_id": specs[next_cursor].experiment_id if specs else None,
+            "processed_candidate_ids": [spec.experiment_id for spec in selected],
+        }
+        self.store.set_scheduler_state(
+            scheduler_name,
+            {
+                **state,
+                "cursor": next_cursor,
+                "last_candidate_id": selected[-1].experiment_id,
+                "candidate_count": len(specs),
+                "next_candidate_id": stats["next_candidate_id"],
+                "last_reserved_candidate_ids": stats["processed_candidate_ids"],
+                "last_cycle_started_at": ensure_utc(self.clock()).isoformat(),
+            },
+        )
+        started = ensure_utc(self.clock())
+        self.store.save_worker_state(
+            scheduler_name,
+            "running",
+            {
+                "pid": os.getpid(),
+                "candidate_count": len(specs),
+                "processed_candidates": 0,
+                "remaining_candidates": stats["remaining_candidates"],
+                "next_candidate_id": stats["next_candidate_id"],
+                "paper_only": True,
+                "live_execution": False,
+            },
+            started_at=started,
+            heartbeat_at=started,
+        )
+        for spec in selected:
+            result = self._run_single_paper_worker(spec)
+            if result is None:
                 continue
-            worker_name = f"paper:{spec.experiment_id}"
-            started = ensure_utc(self.clock())
+            if "error" not in result:
+                stats["successful_candidates"] += 1
+                stats["observations_processed"] += int(result.get("observations_processed", 0))
+                stats["fills_inserted"] += int(result.get("fills_inserted", 0))
+            self.sleep(0)
+        stats["cycle_ended_at"] = ensure_utc(self.clock()).isoformat()
+        self.store.set_scheduler_state(
+            scheduler_name,
+            {
+                **(self.store.get_scheduler_state(scheduler_name) or state),
+                **stats,
+                "last_cycle_ended_at": stats["cycle_ended_at"],
+            },
+        )
+        self.store.save_worker_state(
+            scheduler_name,
+            "idle",
+            {"pid": os.getpid(), **stats, "paper_only": True, "live_execution": False},
+            started_at=started,
+            heartbeat_at=ensure_utc(self.clock()),
+        )
+        return stats
+
+    def _run_single_paper_worker(self, spec: Any) -> dict[str, Any] | None:
+        worker_name = f"paper:{spec.experiment_id}"
+        started = ensure_utc(self.clock())
+        paper_store = self._paper_store or self.store
+        self.store.save_worker_state(
+            worker_name,
+            "running",
+            {"pid": os.getpid(), "experiment_id": spec.experiment_id, "paper_only": True, "live_execution": False},
+            started_at=started,
+            heartbeat_at=started,
+        )
+        try:
+            config = spec.config if isinstance(spec.config, Mapping) else {}
+            strategy_document = config.get("strategy_document")
+            model_document = config.get("model_document")
+            if not isinstance(strategy_document, Mapping) or not isinstance(model_document, Mapping):
+                raise ValueError("forward test has no persisted executable strategy/model documents")
+            strategy_definition = load_strategy(strategy_document)
+            strategy_hash = _content_hash(strategy_definition.to_dict())
+            if strategy_hash != spec.strategy_hash and _content_hash(strategy_definition) != spec.strategy_hash:
+                raise ValueError("persisted executable documents do not match frozen forward-test hashes")
+            if strategy_definition.market_type.value != "prediction":
+                raise ValueError("node Polymarket workers require a prediction strategy")
+            if "probability" not in model_document and "yes_probability" not in model_document and not (
+                isinstance(model_document.get("field"), str) and model_document["field"].strip()
+            ):
+                raise ValueError("persisted model document is not executable")
+            strategy = _PersistedStrategy(strategy_definition)
+            model = _PersistedProbabilityModel(model_document)
+            market_limit = self.config.max_markets if self.config.max_markets is not None else 1000
+            market_ids = tuple(spec.allowed_markets)[:market_limit]
+            if not market_ids:
+                market_ids = tuple(paper_store.tracked_polymarket_markets(active_only=False, limit=market_limit))
+            state_record = paper_store.load_paper_state(spec.experiment_id) or {}
+            state_payload = state_record.get("state", {})
+            raw_cursors = state_payload.get("cursor_by_market", {}) if isinstance(state_payload, Mapping) else {}
+            cursors = {
+                str(key): parsed
+                for key, value in raw_cursors.items()
+                if (parsed := parse_timestamp(value)) is not None
+            } if isinstance(raw_cursors, Mapping) else {}
+            raw_source_cursors = state_payload.get("source_cursor_by_market", {}) if isinstance(state_payload, Mapping) else {}
+            source_cursors = {
+                str(key): (parsed, str(value.get("snapshot_id")).strip())
+                for key, value in raw_source_cursors.items()
+                if isinstance(value, Mapping)
+                and str(value.get("snapshot_id", "")).strip()
+                and (parsed := parse_timestamp(value.get("timestamp"))) is not None
+            } if isinstance(raw_source_cursors, Mapping) else {}
+            opportunity_by_market: dict[str, list[dict[str, Any]]] = {}
+            opportunity_rows = paper_store.list_opportunity_snapshots(limit=min(4096, max(32, market_limit * 4)))
+            for opportunity_row in opportunity_rows:
+                observed_at = parse_timestamp(opportunity_row.get("observed_at"))
+                if observed_at is not None and observed_at > started:
+                    continue
+                opportunity = opportunity_row.get("opportunity")
+                if not isinstance(opportunity, Mapping):
+                    continue
+                opportunity_market = str(opportunity.get("market_id", "")).strip()
+                if opportunity_market not in market_ids:
+                    continue
+                records_for_market = opportunity_by_market.setdefault(opportunity_market, [])
+                if len(records_for_market) < 2:
+                    records_for_market.append(dict(opportunity))
+            observations: list[dict[str, Any]] = []
+            observation_limit = self.config.paper_observations_per_candidate
+            for market_id in market_ids:
+                if len(observations) >= observation_limit:
+                    break
+                rows = paper_store.load_polymarket_snapshots(
+                    market_id,
+                    source_start=cursors.get(str(market_id), spec.registration_timestamp),
+                    source_end=started,
+                    source_after=source_cursors.get(str(market_id)),
+                    limit=min(512, observation_limit - len(observations)),
+                )
+                for row in rows:
+                    payload = row.get("payload")
+                    if not isinstance(payload, Mapping):
+                        continue
+                    observation = dict(payload.get("snapshot", payload))
+                    observation.setdefault("market_id", market_id)
+                    observation.setdefault("timestamp", row.get("source_timestamp") or row.get("observed_at"))
+                    observation["source_snapshot_id"] = row.get("snapshot_id")
+                    observation["source_timestamp"] = row.get("source_timestamp")
+                    for key in ("yes_order_book", "no_order_book", "available_at"):
+                        if key in payload:
+                            observation[key] = payload[key]
+                    opportunity_records = opportunity_by_market.get(str(market_id), [])
+                    if opportunity_records:
+                        observation["opportunities"] = opportunity_records
+                        yes_opportunity = next(
+                            (item for item in opportunity_records if str(item.get("outcome", "")).lower() == "yes"),
+                            opportunity_records[0],
+                        )
+                        for key in (
+                            "model_probability",
+                            "uncertainty",
+                            "executable_price",
+                            "executable_edge",
+                            "executable_ev",
+                            "research_quality",
+                            "model_version",
+                            "family",
+                            "correlation_group",
+                            "liquidity",
+                        ):
+                            if key in yes_opportunity:
+                                observation.setdefault(f"opportunity_{key}", yes_opportunity[key])
+                    observations.append(observation)
+                    if len(observations) >= observation_limit:
+                        break
+            cycle = run_forward_paper(
+                spec,
+                store=paper_store,
+                strategy=strategy,
+                model=model,
+                observations=observations,
+                now=started,
+            )
+            cycle_payload = cycle.as_record()
             self.store.save_worker_state(
                 worker_name,
-                "running",
-                {"pid": os.getpid(), "experiment_id": spec.experiment_id, "paper_only": True, "live_execution": False},
+                "idle",
+                {"pid": os.getpid(), "experiment_id": spec.experiment_id, "cycle": cycle_payload, "paper_only": True, "live_execution": False},
                 started_at=started,
-                heartbeat_at=started,
+                heartbeat_at=ensure_utc(self.clock()),
             )
-            try:
-                config = spec.config if isinstance(spec.config, Mapping) else {}
-                strategy_document = config.get("strategy_document")
-                model_document = config.get("model_document")
-                if not isinstance(strategy_document, Mapping) or not isinstance(model_document, Mapping):
-                    raise ValueError("forward test has no persisted executable strategy/model documents")
-                strategy_definition = load_strategy(strategy_document)
-                strategy_hash = _content_hash(strategy_definition.to_dict())
-                if strategy_hash != spec.strategy_hash and _content_hash(strategy_definition) != spec.strategy_hash:
-                    raise ValueError("persisted executable documents do not match frozen forward-test hashes")
-                if strategy_definition.market_type.value != "prediction":
-                    raise ValueError("node Polymarket workers require a prediction strategy")
-                if "probability" not in model_document and "yes_probability" not in model_document and not (
-                    isinstance(model_document.get("field"), str) and model_document["field"].strip()
-                ):
-                    raise ValueError("persisted model document is not executable")
-                strategy = _PersistedStrategy(strategy_definition)
-                model = _PersistedProbabilityModel(model_document)
-                market_limit = self.config.max_markets if self.config.max_markets is not None else 1000
-                market_ids = tuple(spec.allowed_markets)[:market_limit]
-                if not market_ids:
-                    market_ids = tuple(self.store.tracked_polymarket_markets(active_only=False, limit=market_limit))
-                state_record = self.store.load_paper_state(spec.experiment_id) or {}
-                state_payload = state_record.get("state", {})
-                raw_cursors = state_payload.get("cursor_by_market", {}) if isinstance(state_payload, Mapping) else {}
-                cursors = {
-                    str(key): parsed
-                    for key, value in raw_cursors.items()
-                    if (parsed := parse_timestamp(value)) is not None
-                } if isinstance(raw_cursors, Mapping) else {}
-                raw_source_cursors = state_payload.get("source_cursor_by_market", {}) if isinstance(state_payload, Mapping) else {}
-                source_cursors = {
-                    str(key): (parsed, str(value.get("snapshot_id")).strip())
-                    for key, value in raw_source_cursors.items()
-                    if isinstance(value, Mapping)
-                    and str(value.get("snapshot_id", "")).strip()
-                    and (parsed := parse_timestamp(value.get("timestamp"))) is not None
-                } if isinstance(raw_source_cursors, Mapping) else {}
-                opportunity_by_market: dict[str, list[dict[str, Any]]] = {}
-                opportunity_rows = self.store.list_opportunity_snapshots(limit=min(4096, max(32, market_limit * 4)))
-                for opportunity_row in opportunity_rows:
-                    observed_at = parse_timestamp(opportunity_row.get("observed_at"))
-                    if observed_at is not None and observed_at > started:
-                        continue
-                    opportunity = opportunity_row.get("opportunity")
-                    if not isinstance(opportunity, Mapping):
-                        continue
-                    opportunity_market = str(opportunity.get("market_id", "")).strip()
-                    if opportunity_market not in market_ids:
-                        continue
-                    records_for_market = opportunity_by_market.setdefault(opportunity_market, [])
-                    if len(records_for_market) < 2:
-                        records_for_market.append(dict(opportunity))
-                observations: list[dict[str, Any]] = []
-                for market_id in market_ids:
-                    rows = self.store.load_polymarket_snapshots(
-                        market_id,
-                        source_start=cursors.get(str(market_id), spec.registration_timestamp),
-                        source_end=started,
-                        source_after=source_cursors.get(str(market_id)),
-                        limit=512,
-                    )
-                    for row in rows:
-                        payload = row.get("payload")
-                        if not isinstance(payload, Mapping):
-                            continue
-                        observation = dict(payload.get("snapshot", payload))
-                        observation.setdefault("market_id", market_id)
-                        observation.setdefault("timestamp", row.get("source_timestamp") or row.get("observed_at"))
-                        observation["source_snapshot_id"] = row.get("snapshot_id")
-                        observation["source_timestamp"] = row.get("source_timestamp")
-                        for key in ("yes_order_book", "no_order_book", "available_at"):
-                            if key in payload:
-                                observation[key] = payload[key]
-                        opportunity_records = opportunity_by_market.get(str(market_id), [])
-                        if opportunity_records:
-                            observation["opportunities"] = opportunity_records
-                            yes_opportunity = next(
-                                (item for item in opportunity_records if str(item.get("outcome", "")).lower() == "yes"),
-                                opportunity_records[0],
-                            )
-                            for key in (
-                                "model_probability",
-                                "uncertainty",
-                                "executable_price",
-                                "executable_edge",
-                                "executable_ev",
-                                "research_quality",
-                                "model_version",
-                                "family",
-                                "correlation_group",
-                                "liquidity",
-                            ):
-                                if key in yes_opportunity:
-                                    observation.setdefault(f"opportunity_{key}", yes_opportunity[key])
-                        observations.append(observation)
-                cycle = run_forward_paper(
-                    spec,
-                    store=self.store,
-                    strategy=strategy,
-                    model=model,
-                    observations=observations,
-                    now=started,
-                )
-                self.store.save_worker_state(
-                    worker_name,
-                    "idle",
-                    {"pid": os.getpid(), "experiment_id": spec.experiment_id, "cycle": cycle.as_record(), "paper_only": True, "live_execution": False},
-                    started_at=started,
-                    heartbeat_at=ensure_utc(self.clock()),
-                )
-            except Exception as exc:
-                self.store.save_worker_state(
-                    worker_name,
-                    "degraded",
-                    {"pid": os.getpid(), "experiment_id": spec.experiment_id, "error": str(exc), "paper_only": True, "live_execution": False},
-                    started_at=started,
-                    heartbeat_at=ensure_utc(self.clock()),
-                )
-                self._log(logging.ERROR, "paper worker failed for %s: %s", spec.experiment_id, exc)
+            return cycle_payload
+        except Exception as exc:
+            self.store.save_worker_state(
+                worker_name,
+                "degraded",
+                {"pid": os.getpid(), "experiment_id": spec.experiment_id, "error": str(exc), "paper_only": True, "live_execution": False},
+                started_at=started,
+                heartbeat_at=ensure_utc(self.clock()),
+            )
+            self._log(logging.ERROR, "paper worker failed for %s: %s", spec.experiment_id, exc)
+            return {"error": str(exc)}
 
 
 
-    def _run_research_queue(self) -> None:
+    def _run_research_queue(self) -> dict[str, Any]:
         worker_name = "research-queue"
         started = ensure_utc(self.clock())
         self.store.save_worker_state(
@@ -1474,6 +2086,7 @@ class ResearchNode:
                 started_at=started,
                 heartbeat_at=ensure_utc(self.clock()),
             )
+            return dict(cycle_record)
         except Exception as exc:
             self.store.save_worker_state(
                 worker_name,
@@ -1483,6 +2096,7 @@ class ResearchNode:
                 heartbeat_at=ensure_utc(self.clock()),
             )
             self._log(logging.ERROR, "research queue processor failed: %s", exc)
+            return {"error": str(exc)}
 
     def _run_health_monitor(self) -> None:
         worker_name = "health-monitor"
@@ -1534,6 +2148,10 @@ class ResearchNode:
                     "last_cycle_markets_attempted": health.get("last_cycle_markets_attempted", 0),
                     "last_cycle_markets_successful": health.get("last_cycle_markets_successful", 0),
                     "last_cycle_markets_failed": health.get("last_cycle_markets_failed", 0),
+                    "last_cycle_started_at": health.get("last_cycle_started_at"),
+                    "last_cycle_ended_at": health.get("last_cycle_ended_at"),
+                    "next_scheduled_collection_at": health.get("next_scheduled_collection_at"),
+                    "worker_heartbeat_at": health.get("worker_heartbeat_at"),
                     "window_start": health.get("window_start"),
                     "window_end": health.get("window_end"),
                     "paper_only": True,

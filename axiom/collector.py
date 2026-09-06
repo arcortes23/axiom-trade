@@ -299,6 +299,7 @@ class PolymarketCollector:
                 "last_cycle_started_at": started.isoformat(),
                 "last_cycle_ended_at": ended.isoformat(),
                 "last_cycle_duration_seconds": cycle.duration_seconds,
+                "configured_interval_seconds": self.config.interval_seconds,
                 "scheduled_market_ids": list(ids),
                 "markets_seen": len(ids),
                 "stale_after_seconds": self.config.stale_after_seconds,

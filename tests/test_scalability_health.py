@@ -31,9 +31,11 @@ class _HealthProvider:
     def __init__(self, market_timestamp: datetime, book_timestamp: datetime) -> None:
         self.market_timestamp = market_timestamp
         self.book_timestamp = book_timestamp
+        self.market_calls = 0
         self.book_calls = 0
 
     def markets(self, active: bool = True, *, limit: int | None = None):
+        self.market_calls += 1
         return (self._market(),)
 
     def order_books(self, market_id: str, depth: int = 20):
@@ -90,6 +92,27 @@ class ScalabilityHealthTests(unittest.TestCase):
         )
         node._run_opportunity_pipeline()
         return store
+    def test_opportunity_pipeline_reuses_fresh_forward_evidence_without_resweep(self) -> None:
+        provider = _HealthProvider(T0, T0)
+        with AxiomStore(":memory:") as store:
+            node = ResearchNode(
+                NodeConfig(":memory:", crypto_enabled=False, max_markets=1),
+                provider=provider,
+                opportunity_model={"health-market": 0.8},
+                store=store,
+                clock=lambda: T0,
+                sleep=lambda _: None,
+            )
+            node.collector.collect_once(now=T0)
+            self.assertEqual(provider.market_calls, 1)
+            self.assertEqual(provider.book_calls, 1)
+            node._run_opportunity_pipeline()
+            self.assertEqual(provider.market_calls, 1)
+            self.assertEqual(provider.book_calls, 1)
+            opportunities = store.list_opportunity_snapshots(limit=10)
+            self.assertTrue(opportunities)
+            self.assertEqual(opportunities[0]["opportunity"]["source_timestamp"], T0.isoformat())
+
     def test_node_collection_uses_live_observation_time(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             database_path = f"{temporary_directory}/node.sqlite3"

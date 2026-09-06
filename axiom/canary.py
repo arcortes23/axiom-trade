@@ -1229,23 +1229,34 @@ class CanaryService:
         return result
 
     def get_signal(self, signal_id: str) -> Mapping[str, Any] | None:
-        row = self.store.connection.execute(
-            "SELECT * FROM canary_signals WHERE signal_id=?", (str(signal_id).strip(),)
-        ).fetchone()
+        connection = self.store.connection
+        lock = getattr(self.store, "_lock", None)
+        if lock is None:
+            row = connection.execute(
+                "SELECT * FROM canary_signals WHERE signal_id=?", (str(signal_id).strip(),)
+            ).fetchone()
+        else:
+            with lock:
+                row = connection.execute(
+                    "SELECT * FROM canary_signals WHERE signal_id=?", (str(signal_id).strip(),)
+                ).fetchone()
         return self._signal_from_row(row) if row is not None else None
 
     def latest_signal(self, candidate_id: str | None = None) -> Mapping[str, Any] | None:
+        connection = self.store.connection
+        lock = getattr(self.store, "_lock", None)
+        query = "SELECT * FROM canary_signals"
+        parameters: tuple[Any, ...] = ()
+        if candidate_id is not None:
+            query += " WHERE candidate_id=?"
+            parameters = (str(candidate_id).strip(),)
+        query += " ORDER BY generated_at DESC,signal_id DESC LIMIT 1"
         try:
-            if candidate_id is None:
-                row = self.store.connection.execute(
-                    "SELECT * FROM canary_signals ORDER BY generated_at DESC,signal_id DESC LIMIT 1"
-                ).fetchone()
+            if lock is None:
+                row = connection.execute(query, parameters).fetchone()
             else:
-                row = self.store.connection.execute(
-                    "SELECT * FROM canary_signals WHERE candidate_id=? "
-                    "ORDER BY generated_at DESC,signal_id DESC LIMIT 1",
-                    (str(candidate_id).strip(),),
-                ).fetchone()
+                with lock:
+                    row = connection.execute(query, parameters).fetchone()
         except sqlite3.OperationalError as exc:
             if "no such table" not in str(exc).lower():
                 raise
@@ -1551,10 +1562,23 @@ class CanaryService:
                     (state, now, generation + 1),
                 )
     def status(self) -> dict[str, Any]:
+        connection = self.store.connection
+        lock = getattr(self.store, "_lock", None)
+
+        def _fetchone(query: str, parameters: tuple[Any, ...] = ()) -> Any:
+            if lock is None:
+                return connection.execute(query, parameters).fetchone()
+            with lock:
+                return connection.execute(query, parameters).fetchone()
+
+        def _fetchall(query: str, parameters: tuple[Any, ...] = ()) -> list[Any]:
+            if lock is None:
+                return connection.execute(query, parameters).fetchall()
+            with lock:
+                return connection.execute(query, parameters).fetchall()
+
         try:
-            row = self.store.connection.execute(
-                "SELECT * FROM canary_control WHERE singleton=1"
-            ).fetchone()
+            row = _fetchone("SELECT * FROM canary_control WHERE singleton=1")
         except sqlite3.OperationalError as exc:
             if "no such table" not in str(exc).lower():
                 raise
@@ -1589,8 +1613,16 @@ class CanaryService:
         except (TypeError, ValueError, json.JSONDecodeError):
             state = "KILLED"
         if state=="ARMED":
-            expected=self._integrity(str(data.get("candidate_id") or ""),str(data.get("venue") or ""),str(data.get("expires_at") or ""),limits)
-            eligible=self.store.connection.execute("SELECT candidate_id,frozen_hash,evidence_json FROM canary_eligibility WHERE candidate_id=?",(data.get("candidate_id"),)).fetchone()
+            expected=self._integrity(
+                str(data.get("candidate_id") or ""),
+                str(data.get("venue") or ""),
+                str(data.get("expires_at") or ""),
+                limits,
+            )
+            eligible = _fetchone(
+                "SELECT candidate_id,frozen_hash,evidence_json FROM canary_eligibility WHERE candidate_id=?",
+                (data.get("candidate_id"),),
+            )
             if not self._eligibility_is_bound(str(data.get("candidate_id") or ""), eligible) or expected!=data.get("integrity_hash"):
                 state="KILLED"
             elif not data.get("expires_at"):
@@ -1604,26 +1636,21 @@ class CanaryService:
                     if expired:
                         state="DISARMED"
         start=now.replace(hour=0,minute=0,second=0,microsecond=0).isoformat()
-        trades = [
-            dict(x)
-            for x in self.store.connection.execute(
-                "SELECT l.timestamp,l.candidate_id,l.market_id,l.side,"
-                "l.requested_notional,l.paper_expected_price,e.actual_average_price,"
-                "CASE WHEN e.actual_average_price IS NOT NULL THEN "
-                "CAST(e.actual_average_price AS REAL)-CAST(l.paper_expected_price AS REAL) "
-                "END price_difference,COALESCE(e.status,l.status) status,"
-                "l.realized_pnl FROM canary_ledger l LEFT JOIN "
-                "canary_execution_events e ON e.execution_event_id=("
-                "SELECT e2.execution_event_id FROM canary_execution_events e2 "
-                "WHERE e2.canary_event_id=l.event_id ORDER BY e2.timestamp DESC,"
-                "e2.execution_event_id DESC LIMIT 1) ORDER BY l.timestamp DESC LIMIT 100"
-            )
-        ]
-        last_request_status = (
-            str(trades[0].get("status") or "").upper() if trades else None
-        )
         active_states = "('RESERVED','SUBMITTING','UNKNOWN','OPEN','PARTIAL','SUBMITTED')"
-        aggregates = self.store.connection.execute(
+        trades = [dict(x) for x in _fetchall(
+            "SELECT l.timestamp,l.candidate_id,l.market_id,l.side,"
+            "l.requested_notional,l.paper_expected_price,e.actual_average_price,"
+            "CASE WHEN e.actual_average_price IS NOT NULL THEN "
+            "CAST(e.actual_average_price AS REAL)-CAST(l.paper_expected_price AS REAL) "
+            "END price_difference,COALESCE(e.status,l.status) status,"
+            "l.realized_pnl FROM canary_ledger l LEFT JOIN "
+            "canary_execution_events e ON e.execution_event_id=("
+            "SELECT e2.execution_event_id FROM canary_execution_events e2 "
+            "WHERE e2.canary_event_id=l.event_id ORDER BY e2.timestamp DESC,"
+            "e2.execution_event_id DESC LIMIT 1) ORDER BY l.timestamp DESC LIMIT 100"
+        )]
+        last_request_status = str(trades[0].get("status") or "").upper() if trades else None
+        aggregates = _fetchone(
             "SELECT COALESCE(SUM(CASE WHEN timestamp>=? THEN 1 ELSE 0 END),0) orders,"
             "COALESCE(SUM(CASE WHEN status IN " + active_states
             + " THEN CAST(requested_notional AS REAL) ELSE 0 END),0) exposure,"
@@ -1633,7 +1660,7 @@ class CanaryService:
             "ELSE 0 END),0) pnl FROM canary_ledger WHERE timestamp>=? OR status IN "
             + active_states,
             (start, start, start),
-        ).fetchone()
+        )
         try:
             control_generation = int(data.get("control_generation") or 0)
         except (TypeError, ValueError):

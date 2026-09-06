@@ -458,6 +458,11 @@ class AxiomStore:
                     state_json TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS scheduler_state (
+                    scheduler_name TEXT PRIMARY KEY,
+                    state_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS collection_errors (
                     error_id TEXT PRIMARY KEY,
                     market_id TEXT,
@@ -2149,6 +2154,22 @@ class AxiomStore:
                 "ON CONFLICT(collector_name) DO UPDATE SET state_json=excluded.state_json,updated_at=excluded.updated_at",
                 (str(collector_name), _dump(dict(state)), _now_iso()),
             )
+    def get_scheduler_state(self, scheduler_name: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT state_json FROM scheduler_state WHERE scheduler_name=?", (str(scheduler_name),)
+            ).fetchone()
+        return _load(row["state_json"]) if row else None
+
+    def set_scheduler_state(self, scheduler_name: str, state: Mapping[str, Any]) -> None:
+        if not str(scheduler_name).strip() or not isinstance(state, Mapping):
+            raise ValueError("scheduler_name and state mapping are required")
+        with self._write_context():
+            self._conn.execute(
+                "INSERT INTO scheduler_state(scheduler_name,state_json,updated_at) VALUES (?,?,?) "
+                "ON CONFLICT(scheduler_name) DO UPDATE SET state_json=excluded.state_json,updated_at=excluded.updated_at",
+                (str(scheduler_name), _dump(dict(state)), _now_iso()),
+            )
 
     def save_collection_error(
         self,
@@ -2460,6 +2481,18 @@ class AxiomStore:
         Historical rows remain available to :meth:`polymarket_evidence_maturity`,
         but cannot make the operational collector appear healthy.
         """
+        configured_state = self.get_collector_state("polymarket") or {}
+        configured_interval = (
+            configured_state.get("configured_interval_seconds")
+            if isinstance(configured_state, Mapping)
+            else None
+        )
+        try:
+            configured_interval_value = float(configured_interval)
+        except (TypeError, ValueError):
+            configured_interval_value = 0.0
+        if math.isfinite(configured_interval_value) and 0 < configured_interval_value <= _MAX_OPERATIONAL_WINDOW_SECONDS:
+            expected_interval_seconds = configured_interval_value
         expected = float(expected_interval_seconds)
         if not math.isfinite(expected) or expected <= 0 or expected > _MAX_OPERATIONAL_WINDOW_SECONDS:
             raise ValueError(
@@ -2704,6 +2737,9 @@ class AxiomStore:
             "last_cycle_markets_successful": latest_cycle_payload.get("markets_successful", 0),
             "last_cycle_markets_failed": latest_cycle_payload.get("markets_failed", 0),
             "last_successful_cycle": last_successful_at.isoformat() if hasattr(last_successful_at, "isoformat") else last_successful_at,
+            "worker_name": "polymarket-collector",
+            "worker_heartbeat_at": collector_state.get("worker_heartbeat_at"),
+            "next_scheduled_collection_at": collector_state.get("next_scheduled_collection_at"),
         }
         return {
             "grade": grade,
@@ -2721,11 +2757,20 @@ class AxiomStore:
             "top_failure_codes": top_failure_codes,
             "scheduled_market_count": collector["scheduled_market_count"],
             "effective_collection_cadence_seconds": collector["effective_collection_cadence_seconds"],
+            "configured_interval_seconds": collector["configured_interval_seconds"],
+            "expected_interval_seconds": collector["expected_interval_seconds"],
+            "stale_after_seconds": collector["stale_after_seconds"],
+            "last_cycle_started_at": collector["last_cycle_started_at"],
+            "last_cycle_ended_at": collector["last_cycle_ended_at"],
             "last_cycle_duration_seconds": collector["last_cycle_duration_seconds"],
             "last_successful_cycle": collector["last_successful_cycle"],
             "last_cycle_markets_attempted": collector["last_cycle_markets_attempted"],
             "last_cycle_markets_successful": collector["last_cycle_markets_successful"],
             "last_cycle_markets_failed": collector["last_cycle_markets_failed"],
+            "worker_name": collector["worker_name"],
+            "worker_heartbeat_at": collector["worker_heartbeat_at"],
+            "next_scheduled_collection_at": collector["next_scheduled_collection_at"],
+            "last_successful_collection_at": collector["last_successful_cycle"],
             "stale_markets": stale_markets,
             "gaps": gaps,
             "window_start": collector["window_start"],
@@ -5601,7 +5646,9 @@ class AxiomStore:
             ).fetchall()
             worker_rows = self._conn.execute(
                 "SELECT worker_name,status,payload_json,heartbeat_at,updated_at "
-                "FROM worker_state ORDER BY updated_at DESC,worker_name ASC LIMIT 32"
+                "FROM worker_state "
+                "ORDER BY CASE WHEN worker_name IN ('polymarket-collector','paper-engine','research-engine','health-monitor','axiom-node') THEN 0 ELSE 1 END, "
+                "updated_at DESC,worker_name ASC LIMIT 32"
             ).fetchall()
             latest_queue_row = self._conn.execute(
                 "SELECT * FROM research_queue ORDER BY updated_at DESC,item_id DESC LIMIT 1"
