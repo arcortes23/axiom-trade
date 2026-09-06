@@ -463,6 +463,36 @@ class AxiomStore:
                     state_json TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS operator_config (
+                    config_key TEXT PRIMARY KEY,
+                    value_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS operator_jobs (
+                    job_name TEXT PRIMARY KEY,
+                    status TEXT NOT NULL,
+                    payload_json TEXT NOT NULL DEFAULT '{}',
+                    pid INTEGER,
+                    started_at TEXT,
+                    updated_at TEXT NOT NULL,
+                    last_error TEXT,
+                    resumable INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE INDEX IF NOT EXISTS idx_operator_jobs_updated
+                    ON operator_jobs(updated_at, job_name);
+                CREATE TABLE IF NOT EXISTS operator_actions (
+                    action_id TEXT PRIMARY KEY,
+                    action TEXT NOT NULL,
+                    target TEXT NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    success INTEGER NOT NULL,
+                    reason TEXT NOT NULL DEFAULT '',
+                    result_json TEXT NOT NULL DEFAULT '{}'
+                );
+                CREATE INDEX IF NOT EXISTS idx_operator_actions_timestamp
+                    ON operator_actions(timestamp, action_id);
+                CREATE INDEX IF NOT EXISTS idx_operator_actions_action_target
+                    ON operator_actions(action, target, timestamp);
                 CREATE TABLE IF NOT EXISTS collection_errors (
                     error_id TEXT PRIMARY KEY,
                     market_id TEXT,
@@ -2170,6 +2200,166 @@ class AxiomStore:
                 "ON CONFLICT(scheduler_name) DO UPDATE SET state_json=excluded.state_json,updated_at=excluded.updated_at",
                 (str(scheduler_name), _dump(dict(state)), _now_iso()),
             )
+    def get_operator_config(self, config_key: str, default: Any = None) -> Any:
+        key = str(config_key).strip()
+        if not key:
+            raise ValueError("config_key is required")
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT value_json FROM operator_config WHERE config_key=?", (key,)
+            ).fetchone()
+        return _load(row["value_json"]) if row is not None else default
+
+    def set_operator_config(self, config_key: str, value: Any) -> None:
+        key = str(config_key).strip()
+        if not key:
+            raise ValueError("config_key is required")
+        encoded = _dump(value)
+        if len(encoded) > 16_384:
+            raise ValueError("operator config value is too large")
+        with self._write_context():
+            self._conn.execute(
+                "INSERT INTO operator_config(config_key,value_json,updated_at) VALUES (?,?,?) "
+                "ON CONFLICT(config_key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at",
+                (key, encoded, _now_iso()),
+            )
+
+    def get_operator_job(self, job_name: str) -> dict[str, Any] | None:
+        name = str(job_name).strip()
+        if not name:
+            raise ValueError("job_name is required")
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM operator_jobs WHERE job_name=?", (name,)
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "job_name": row["job_name"],
+            "status": row["status"],
+            "payload": _load(row["payload_json"]),
+            "pid": row["pid"],
+            "started_at": _parse_datetime(row["started_at"]),
+            "updated_at": _parse_datetime(row["updated_at"]),
+            "last_error": row["last_error"],
+            "resumable": bool(row["resumable"]),
+        }
+
+    def set_operator_job(
+        self,
+        job_name: str,
+        status: str,
+        payload: Mapping[str, Any] | None = None,
+        *,
+        pid: int | None = None,
+        started_at: datetime | None = None,
+        last_error: str | None = None,
+        resumable: bool = False,
+        timestamp: datetime | None = None,
+    ) -> None:
+        name = str(job_name).strip()
+        state = str(status).strip().upper()
+        if not name or not state:
+            raise ValueError("job_name and status are required")
+        body = dict(payload or {})
+        encoded = _dump(body)
+        if len(encoded) > 64_000:
+            raise ValueError("operator job payload is too large")
+        updated = timestamp or utc_now()
+        with self._write_context():
+            self._conn.execute(
+                "INSERT INTO operator_jobs(job_name,status,payload_json,pid,started_at,updated_at,last_error,resumable) "
+                "VALUES (?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(job_name) DO UPDATE SET status=excluded.status,payload_json=excluded.payload_json,"
+                "pid=excluded.pid,started_at=COALESCE(excluded.started_at,operator_jobs.started_at),"
+                "updated_at=excluded.updated_at,last_error=excluded.last_error,resumable=excluded.resumable",
+                (
+                    name,
+                    state,
+                    encoded,
+                    int(pid) if pid is not None else None,
+                    _iso(started_at) if started_at is not None else None,
+                    _iso(updated),
+                    str(last_error)[:2_000] if last_error else None,
+                    1 if resumable else 0,
+                ),
+            )
+
+    def list_operator_jobs(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM operator_jobs ORDER BY updated_at DESC,job_name"
+            ).fetchall()
+        return [
+            {
+                "job_name": row["job_name"],
+                "status": row["status"],
+                "payload": _load(row["payload_json"]),
+                "pid": row["pid"],
+                "started_at": _parse_datetime(row["started_at"]),
+                "updated_at": _parse_datetime(row["updated_at"]),
+                "last_error": row["last_error"],
+                "resumable": bool(row["resumable"]),
+            }
+            for row in rows
+        ]
+
+    def record_operator_action(
+        self,
+        action: str,
+        target: str,
+        *,
+        success: bool,
+        reason: str = "",
+        result: Mapping[str, Any] | None = None,
+        timestamp: datetime | None = None,
+    ) -> str:
+        action_value = str(action).strip()[:160]
+        target_value = str(target).strip()[:512]
+        reason_value = str(reason or "")[:2_000]
+        result_body = dict(result or {})
+        encoded = _dump(result_body)
+        if len(encoded) > 64_000:
+            raise ValueError("operator action result is too large")
+        at = _iso(timestamp or utc_now())
+        action_id = "operator:" + hashlib.sha256(
+            _dump(
+                {
+                    "action": action_value,
+                    "target": target_value,
+                    "timestamp": at,
+                    "result": result_body,
+                }
+            ).encode("utf-8")
+        ).hexdigest()
+        with self._write_context():
+            self._conn.execute(
+                "INSERT OR IGNORE INTO operator_actions(action_id,action,target,timestamp,success,reason,result_json) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (action_id, action_value, target_value, at, 1 if success else 0, reason_value, encoded),
+            )
+        return action_id
+
+    def list_operator_actions(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+            raise ValueError("limit must be a non-negative integer")
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM operator_actions ORDER BY timestamp DESC,action_id DESC LIMIT ?",
+                (int(limit),),
+            ).fetchall()
+        return [
+            {
+                "action_id": row["action_id"],
+                "action": row["action"],
+                "target": row["target"],
+                "timestamp": _parse_datetime(row["timestamp"]),
+                "success": bool(row["success"]),
+                "reason": row["reason"],
+                "result": _load(row["result_json"]),
+            }
+            for row in rows
+        ]
 
     def save_collection_error(
         self,
@@ -4944,6 +5134,16 @@ class AxiomStore:
                     'Collection error: ' || kind || ' (' || detail || ')',
                     payload_json, 'collection','collection_error',kind,NULL,market_id
                 FROM collection_errors
+                UNION ALL
+                SELECT
+                    'operator', timestamp, 'operator:' || action_id,
+                    'Operator action ' || action || ' on ' || target || ' ' ||
+                        CASE WHEN success=1 THEN 'succeeded' ELSE 'failed' END,
+                    json_object('success',success,'reason',reason,'result',json(result_json)),
+                    'operator','operator',
+                    CASE WHEN success=1 THEN 'SUCCEEDED' ELSE 'FAILED' END,
+                    action,NULL
+                FROM operator_actions
             )
         """
         clauses: list[str] = []

@@ -9,6 +9,7 @@ import math
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 from decimal import Decimal
+import webbrowser
 
 from .collector import CollectorConfig, PolymarketCollector
 from .canary import (
@@ -17,6 +18,7 @@ from .canary import (
     CredentialStore,
     PolymarketClobV2Venue,
 )
+from .operator import OperatorControlPlane
 from .dashboard import DashboardData, DashboardServer
 from .data import BinanceAdapter, PolymarketAdapter, SyntheticCryptoProvider
 from .director import compact_report, research_summary, validate_hermes_proposal
@@ -161,6 +163,12 @@ def build_parser() -> argparse.ArgumentParser:
     dashboard.add_argument("--port", type=int, default=8080)
     dashboard.add_argument("--db", default=DEFAULT_DB_PATH, help="SQLite operational database path")
     dashboard.add_argument("--once", action="store_true", help="bind and stop after readiness smoke check")
+    operator = commands.add_parser("operator", help="supervise one paper node and its localhost operator dashboard")
+    operator.add_argument("--db", default=DEFAULT_DB_PATH, help="canonical SQLite operational database path")
+    operator.add_argument("--port", type=int, default=8080)
+    operator.add_argument("--open-browser", action="store_true")
+    operator.add_argument("--hermes-job-id")
+    operator.add_argument("--once", action="store_true", help="bind and stop after readiness smoke check")
     historical = commands.add_parser("historical", help="run public Binance and Polymarket research")
     historical.add_argument("--markets", type=int, default=20, help="maximum resolved prediction markets to inspect")
     historical.add_argument("--timeout", type=float, default=10.0)
@@ -1274,6 +1282,37 @@ def _main_impl(argv: Sequence[str] | None = None) -> int:
             )
             payload = {"validation": validation.as_record(), "queue_item": item.as_record(), "live_execution": False}
         print(json.dumps(payload, sort_keys=True, indent=2, default=str))
+        return 0
+    if args.command == "operator":
+        dashboard_store = AxiomStore(args.db)
+        control = OperatorControlPlane(
+            dashboard_store,
+            db_path=args.db,
+            hermes_job_id=args.hermes_job_id,
+        )
+        if dashboard_store.get_operator_config("hermes_research_job_id", None) is None:
+            control.configure_hermes_job_id(control.hermes_job_id)
+        server: DashboardServer | None = None
+        try:
+            node_status = control.ensure_node()
+            server = DashboardServer(
+                "127.0.0.1",
+                args.port,
+                data=DashboardData(store=dashboard_store, control=control),
+            )
+            server.start()
+            print(f"Axiom operator: {server.url} · node {node_status.get('status')}")
+            if args.open_browser and server.url:
+                webbrowser.open(server.url)
+            if args.once:
+                return 0
+            server.serve_forever()
+        except KeyboardInterrupt:
+            return 0
+        finally:
+            if server is not None:
+                server.stop()
+            dashboard_store.close()
         return 0
     if args.command == "dashboard" and getattr(args, "dashboard_command", None) in {None, "start"}:
         dashboard_store = AxiomStore(args.db) if args.db else None

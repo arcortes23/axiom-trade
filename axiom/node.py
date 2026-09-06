@@ -2056,11 +2056,11 @@ class ResearchNode:
             started_at=started,
             heartbeat_at=started,
         )
+        control = self.store.get_scheduler_state("hermes-control") or {}
+        control = control if isinstance(control, Mapping) else {}
+        hermes_paused = str(control.get("status", "ACTIVE")).upper() == "PAUSED"
         try:
-            if self.config.research_enabled:
-                cycle = self.research_processor.process_pending(worker=worker_name, now=started)
-                cycle_record = cycle.as_record()
-            else:
+            if not self.config.research_enabled:
                 cycle_record = {
                     "released": 0,
                     "claimed": 0,
@@ -2071,10 +2071,25 @@ class ResearchNode:
                     "disabled": True,
                     "paper_only": True,
                 }
+            elif hermes_paused:
+                cycle_record = {
+                    "released": 0,
+                    "claimed": 0,
+                    "completed": 0,
+                    "rejected": 0,
+                    "failed": 0,
+                    "results": [],
+                    "paused": True,
+                    "job_id": control.get("job_id"),
+                    "paper_only": True,
+                }
+            else:
+                cycle = self.research_processor.process_pending(worker=worker_name, now=started)
+                cycle_record = cycle.as_record()
             stats = self.bus.stats()
             self.store.save_worker_state(
                 worker_name,
-                "idle",
+                "paused" if hermes_paused else ("disabled" if not self.config.research_enabled else "idle"),
                 {
                     "dispatcher": "autonomous-research-processor",
                     "pending": int(stats.get("PENDING", 0)),

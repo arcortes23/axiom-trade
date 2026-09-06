@@ -1366,34 +1366,78 @@ class CanaryService:
             allow_environment=allow_environment,
         )
 
-    def mark_eligible(self, candidate_id: str) -> None:
-        record = self.store.load_candidate_lifecycle(candidate_id)
+    def validate_eligibility(self, candidate_id: str) -> dict[str, Any]:
+        """Return the authoritative dry-run result for canary eligibility."""
+        identifier = str(candidate_id).strip()
+        record = self.store.load_candidate_lifecycle(identifier)
         if not record or record.get("stage") not in _CANARY_ELIGIBLE_STAGES:
-            raise CanaryBlocked("CANDIDATE_RESEARCH_GATES_INCOMPLETE")
+            return {
+                "candidate_id": identifier,
+                "eligible": False,
+                "checks": [
+                    {"name": "Lifecycle stage", "passed": False, "detail": "Candidate is not frozen or paper-promotable."}
+                ],
+                "reason_code": "CANDIDATE_RESEARCH_GATES_INCOMPLETE",
+            }
         payload = self._merged_lifecycle_payload(record)
         if payload is None:
-            raise CanaryBlocked("CANDIDATE_RESEARCH_GATES_INCOMPLETE")
-
-        required_true = (
-            "schema_validated",
-            "historical_backtest_passed",
-            "validation_passed",
-            "robustness_passed",
-            "data_quality_passed",
-        )
-        if (
-            any(payload.get(name) is not True for name in required_true)
-            or payload.get("holdout_used") is not False
-            or payload.get("frozen") is not True
-            or bool(payload.get("critical_error"))
+            return {
+                "candidate_id": identifier,
+                "eligible": False,
+                "checks": [
+                    {"name": "Lifecycle evidence", "passed": False, "detail": "Persisted lifecycle evidence is unavailable."}
+                ],
+                "reason_code": "CANDIDATE_RESEARCH_GATES_INCOMPLETE",
+            }
+        checks: list[dict[str, Any]] = []
+        for label, key in (
+            ("Schema", "schema_validated"),
+            ("Historical backtest", "historical_backtest_passed"),
+            ("Validation", "validation_passed"),
+            ("Robustness", "robustness_passed"),
+            ("Data quality", "data_quality_passed"),
         ):
-            raise CanaryBlocked("CANDIDATE_RESEARCH_GATES_INCOMPLETE")
-
+            passed = payload.get(key) is True
+            checks.append({"name": label, "passed": passed, "detail": "Passed" if passed else f"{key} is not true."})
+        holdout_passed = payload.get("holdout_used") is False
+        checks.append({
+            "name": "Holdout leakage",
+            "passed": holdout_passed,
+            "detail": "Holdout was not used." if holdout_passed else "Holdout evidence is missing or was used.",
+        })
+        frozen_passed = payload.get("frozen") is True
         frozen_hash = self._lifecycle_frozen_hash(record)
-        if frozen_hash is None:
-            raise CanaryBlocked("CANDIDATE_RESEARCH_GATES_INCOMPLETE")
+        hashes_passed = frozen_passed and frozen_hash is not None
+        checks.append({
+            "name": "Frozen hashes",
+            "passed": hashes_passed,
+            "detail": "Frozen binding is present." if hashes_passed else "Frozen flag or immutable hash is missing.",
+        })
+        no_critical_error = not bool(payload.get("critical_error"))
+        checks.append({
+            "name": "Critical errors",
+            "passed": no_critical_error,
+            "detail": "No critical error recorded." if no_critical_error else "A critical error is recorded.",
+        })
+        eligible = all(bool(item["passed"]) for item in checks)
+        return {
+            "candidate_id": identifier,
+            "eligible": eligible,
+            "checks": checks,
+            "reason_code": None if eligible else "CANDIDATE_RESEARCH_GATES_INCOMPLETE",
+            "frozen_hash": frozen_hash if hashes_passed else None,
+        }
 
-        # Keep the persisted values verbatim: eligibility is a binding, not a
+    def mark_eligible(self, candidate_id: str) -> None:
+        validation = self.validate_eligibility(candidate_id)
+        if not validation.get("eligible"):
+            raise CanaryBlocked(str(validation.get("reason_code") or "CANDIDATE_RESEARCH_GATES_INCOMPLETE"))
+        record = self.store.load_candidate_lifecycle(candidate_id)
+        payload = self._merged_lifecycle_payload(record) if record else None
+        frozen_hash = validation.get("frozen_hash")
+        if payload is None or not frozen_hash:
+            raise CanaryBlocked("CANDIDATE_RESEARCH_GATES_INCOMPLETE")
+        # Keep persisted values verbatim: eligibility is a binding, not a
         # re-derived summary that can silently lose additive forward evidence.
         evidence = dict(payload)
         evidence["frozen_hash"] = frozen_hash
