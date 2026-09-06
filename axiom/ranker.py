@@ -9,6 +9,8 @@ from typing import Any, Mapping
 from .canary import CanaryService
 from .domain import ensure_utc, utc_now
 from .storage import AxiomStore
+from .lifecycle import CandidateLifecycleManager, CandidateStage
+from .data_quality import evaluate_prediction_data_quality, persisted_quality_fields
 
 
 class CandidateCanaryRanker:
@@ -18,18 +20,21 @@ class CandidateCanaryRanker:
     forward evidence already persisted on the candidate.  The locked holdout
     partition is intentionally not read by this class.
     """
-
-    FORMULA_VERSION = "validation-weighted-v1"
+    FORMULA_VERSION = "validation-weighted-v2-fidelity"
+    # score = sum(weight * component) / sum(weight for available components).
+    # Fidelity is a separate weighted component; PRICE_PROXY is never treated
+    # as timestamped depth and cannot compensate for failed gates.
     WEIGHTS = {
-        "expectancy": 0.20,
-        "confidence_lower_bound": 0.15,
-        "robustness": 0.15,
+        "expectancy": 0.18,
+        "confidence_lower_bound": 0.14,
+        "robustness": 0.14,
         "sample": 0.10,
         "execution_feasibility": 0.10,
-        "data_quality": 0.10,
-        "calibration": 0.10,
-        "drawdown": 0.05,
-        "liquidity": 0.05,
+        "historical_data_integrity": 0.10,
+        "execution_fidelity_score": 0.08,
+        "calibration": 0.06,
+        "drawdown": 0.03,
+        "liquidity": 0.02,
         "forward_expectancy": 0.05,
     }
     _STAGES = frozenset({"FROZEN", "PAPER_FORWARD"})
@@ -176,10 +181,22 @@ class CandidateCanaryRanker:
         cls,
         payload: Mapping[str, Any],
         frozen_hash: str | None,
+        quality: Mapping[str, Any] | None = None,
     ) -> tuple[dict[str, Any] | None, str | None, dict[str, Any]]:
         versions = cls._versions(payload, str(frozen_hash or ""))
         if not frozen_hash:
             return None, "FROZEN_HASH_MISSING", versions
+        legacy_quality = cls._quality(
+            payload, "validation_data_quality", "data_quality", "quality", "data_quality_passed"
+        )
+        if isinstance(quality, Mapping) and quality.get("applicable"):
+            integrity_score = (
+                1.0 if quality.get("historical_data_integrity_passed") else None
+            )
+            fidelity_score = cls._number(quality.get("historical_execution_fidelity_score"))
+        else:
+            integrity_score = legacy_quality
+            fidelity_score = cls._number(payload.get("execution_fidelity_score", legacy_quality))
         required = {
             "expectancy": cls._number(cls._value(payload, "validation_expectancy", "expectancy")),
             "confidence_lower_bound": cls._number(
@@ -192,17 +209,17 @@ class CandidateCanaryRanker:
             "execution_feasibility": cls._quality(
                 payload, "validation_execution_quality", "execution_quality"
             ),
-            "data_quality": cls._quality(
-                payload, "validation_data_quality", "data_quality", "quality", "data_quality_passed"
-            ),
+            "historical_data_integrity": integrity_score,
+            "execution_fidelity_score": fidelity_score,
         }
         missing = [name for name, value in required.items() if value is None]
         if missing:
             return None, "RANKING_EVIDENCE_MISSING:" + ",".join(missing), versions
-        if required["sample_count"] == 0 or required["trade_count"] == 0:
-            return None, "RANKING_EVIDENCE_EMPTY_SAMPLE", versions
         plan = payload.get("experiment_plan") if isinstance(payload.get("experiment_plan"), Mapping) else {}
         min_samples = cls._number(plan.get("min_independent_samples", plan.get("min_samples", 30))) or 30.0
+        min_trades = cls._number(plan.get("min_trades", 0)) or 0.0
+        if required["sample_count"] < min_samples or required["trade_count"] < min_trades:
+            return None, "RANKING_EVIDENCE_BELOW_MINIMUM_SAMPLE", versions
         forward_evidence = payload.get("forward_evidence")
         forward_expectancy = cls._number(payload.get("forward_expectancy"))
         if forward_expectancy is None and isinstance(forward_evidence, Mapping):
@@ -213,7 +230,8 @@ class CandidateCanaryRanker:
             "robustness": cls._clamp(float(required["robustness"])),
             "sample": cls._clamp(float(required["sample_count"]) / max(1.0, min_samples * 2.0)),
             "execution_feasibility": cls._clamp(float(required["execution_feasibility"])),
-            "data_quality": cls._clamp(float(required["data_quality"])),
+            "historical_data_integrity": cls._clamp(float(required["historical_data_integrity"])),
+            "execution_fidelity_score": cls._clamp(float(required["execution_fidelity_score"])),
             "calibration": cls._clamp(float(required["calibration"])),
         }
         optional: dict[str, float] = {}
@@ -229,6 +247,7 @@ class CandidateCanaryRanker:
         weights = {key: cls.WEIGHTS[key] for key in components}
         total_weight = sum(weights.values())
         score = sum(components[key] * weights[key] for key in components) / total_weight
+        fidelity_penalty = 1.0 - float(components["execution_fidelity_score"])
         evidence = {
             "raw": {
                 "validation_expectancy": required["expectancy"],
@@ -238,11 +257,18 @@ class CandidateCanaryRanker:
                 "validation_sample_count": required["sample_count"],
                 "validation_trade_count": required["trade_count"],
                 "validation_execution_quality": required["execution_feasibility"],
-                "validation_data_quality": required["data_quality"],
+                "historical_data_integrity": required["historical_data_integrity"],
+                "historical_execution_fidelity": (
+                    quality.get("historical_execution_fidelity")
+                    if isinstance(quality, Mapping) else payload.get("historical_execution_fidelity")
+                ),
+                "fidelity_penalty": fidelity_penalty,
+                "execution_fidelity_score": required["execution_fidelity_score"],
                 "validation_max_drawdown": drawdown,
                 "validation_liquidity": liquidity,
                 "forward_expectancy": forward_expectancy,
             },
+            "fidelity_penalty": fidelity_penalty,
             "components": components,
             "weights": weights,
             "total_score": score,
@@ -253,6 +279,35 @@ class CandidateCanaryRanker:
     def _candidate_records(self) -> list[Mapping[str, Any]]:
         records = self.store.load_candidate_lifecycle(limit=10000)
         return [item for item in records if isinstance(item, Mapping)] if isinstance(records, list) else []
+    def _persist_quality_projection(
+        self,
+        record: Mapping[str, Any],
+        payload: Mapping[str, Any],
+        quality: Mapping[str, Any],
+    ) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
+        if not quality.get("applicable"):
+            return record, payload
+        evidence = persisted_quality_fields(quality)
+        if all(payload.get(key) == value for key, value in evidence.items()):
+            return record, payload
+        stage = str(record.get("stage") or "")
+        if stage not in self._STAGES:
+            return record, payload
+        try:
+            lifecycle = CandidateLifecycleManager(self.store)
+            lifecycle.record_evidence(
+                str(record.get("candidate_id") or ""),
+                evidence,
+                expected_stage=stage,
+                reason="data-quality policy re-evaluation",
+            )
+        except (KeyError, RuntimeError, ValueError):
+            return record, payload
+        refreshed = self.store.load_candidate_lifecycle(str(record.get("candidate_id") or ""))
+        if not isinstance(refreshed, Mapping) or not isinstance(refreshed.get("payload"), Mapping):
+            return record, payload
+        return refreshed, refreshed["payload"]
+
 
     def evaluate_and_select(self, now: datetime | None = None) -> dict[str, Any]:
         timestamp = ensure_utc(now or self.clock())
@@ -262,6 +317,8 @@ class CandidateCanaryRanker:
             payload = record.get("payload")
             if not candidate_id or not isinstance(payload, Mapping) or str(record.get("stage")) not in self._STAGES:
                 continue
+            quality = evaluate_prediction_data_quality(self.store, payload)
+            record, payload = self._persist_quality_projection(record, payload, quality)
             if self._prediction_market(payload) not in {"prediction", "polymarket", "prediction_market"}:
                 self.service.invalidate_eligibility(candidate_id, "PREDICTION_MARKET_ONLY")
                 continue
@@ -274,7 +331,11 @@ class CandidateCanaryRanker:
             except Exception:
                 self.service.invalidate_eligibility(candidate_id, "ELIGIBILITY_BINDING_PERSIST_FAILED")
                 continue
-            evidence, reason, versions = self._rank_evidence(payload, validation.get("frozen_hash"))
+            evidence, reason, versions = self._rank_evidence(
+                payload,
+                validation.get("frozen_hash"),
+                quality=quality,
+            )
             if evidence is None:
                 candidates.append({
                     "candidate_id": candidate_id,

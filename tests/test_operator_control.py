@@ -127,6 +127,33 @@ class OperatorControlTests(unittest.TestCase):
             thread.join(2)
 
     def _seed_candidate(self, candidate_id: str = "candidate-1") -> None:
+        dataset_timestamp = datetime(2025, 1, 1, tzinfo=timezone.utc)
+        self.store.save_dataset(
+            "dataset-1",
+            "dataset-v1",
+            [{"timestamp": dataset_timestamp.isoformat(), "price": 0.5, "source_type": "HISTORICAL"}],
+        )
+        self.store.save_dataset_catalog(
+            "dataset-1",
+            "dataset-v1",
+            provider="polymarket",
+            instrument="POLYMARKET",
+            market_type="prediction",
+            timeframe="event",
+            start_timestamp=dataset_timestamp,
+            end_timestamp=dataset_timestamp,
+            row_count=1,
+            completeness=1.0,
+            quality="PRICE_PROXY",
+            source_type="HISTORICAL",
+            snapshot_id="dataset-1:dataset-v1",
+            metadata={
+                "provider": "polymarket",
+                "source_type": "HISTORICAL",
+                "research_quality": "PRICE_PROXY",
+                "historical_order_book_available": False,
+            },
+        )
         strategy_hash = "strategy-hash"
         model_hash = "model-hash"
         config_hash = "config-hash"
@@ -139,8 +166,14 @@ class OperatorControlTests(unittest.TestCase):
             "instrument": "MARKET-1",
             "dataset_id": "dataset-1",
             "dataset_version": "dataset-v1",
-            "source_type": "FORWARD_COLLECTED",
-            "timeframe": "live",
+            "dataset_provenance": {
+                "dataset_id": "dataset-1",
+                "dataset_version": "dataset-v1",
+                "source_type": "HISTORICAL",
+                "time_split": "train-validation-holdout",
+            },
+            "source_type": "HISTORICAL",
+            "timeframe": "event",
             "strategy_hash": strategy_hash,
             "model_hash": model_hash,
             "config_hash": config_hash,
@@ -150,13 +183,20 @@ class OperatorControlTests(unittest.TestCase):
             "validation_passed": True,
             "robustness_passed": True,
             "data_quality_passed": True,
+            "minimum_sample_check": {
+                "passed": True,
+                "count": 30,
+                "trades": 0,
+                "min_observations": 30,
+                "min_trades": 0,
+                "checks": {"observations": True, "trades": True},
+            },
             "holdout_used": False,
             "frozen": True,
             "critical_error": None,
         }
         self.store.save_candidate_lifecycle(candidate_id, "IDEA", payload)
         self.store.save_candidate_lifecycle(candidate_id, "FROZEN", payload, from_stage="IDEA")
-
     def test_candidate_provenance_is_explicit_and_complete(self) -> None:
         self._seed_candidate()
         data = DashboardData(store=self.store, control=self.control)

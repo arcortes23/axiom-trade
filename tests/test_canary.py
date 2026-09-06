@@ -759,6 +759,18 @@ class CanarySignalTests(unittest.TestCase):
                 "timestamp": T0.isoformat(),
                 "yes_mid": price,
                 "yes_ask": price,
+                "yes_order_book": {
+                    "asks": [{"price": price, "size": "100"}],
+                    "bids": [],
+                    "timestamp": T0.isoformat(),
+                    "token_id": "yes",
+                },
+                "no_order_book": {
+                    "asks": [{"price": price, "size": "100"}],
+                    "bids": [],
+                    "timestamp": T0.isoformat(),
+                    "token_id": "no",
+                },
                 "no_ask": price,
                 "yes_token_id": "yes",
                 "no_token_id": "no",

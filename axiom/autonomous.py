@@ -27,6 +27,7 @@ from .mutations import DeterministicMutationEngine, ExperimentBudget
 from .research_bus import DurableResearchBus, ResearchQueueItem, ResearchQueueStatus
 from .robustness import bootstrap_confidence_interval, minimum_sample_check, neighboring_parameter_stability
 from .storage import AxiomStore
+from .data_quality import evaluate_prediction_data_quality, persisted_quality_fields
 from .strategy import StrategyDefinition, load_strategy
 from .experiment_plan import AUTONOMOUS_BUDGET_ID, ExperimentPlan, ExperimentPlanError, MAX_PLAN_VARIANTS
 
@@ -1428,6 +1429,12 @@ class AutonomousResearchProcessor:
             "plan_hash": plan.plan_hash,
             "dataset_id": plan.dataset_id,
             "dataset_version": plan.dataset_version,
+            "dataset_provenance": {
+                "dataset_id": plan.dataset_id,
+                "dataset_version": plan.dataset_version,
+                "time_split": plan.methodology.get("time_split"),
+                "universe": dict(plan.universe or {}),
+            },
             "experiment_family": plan.experiment_family,
             "generation": generation,
             "lineage": list(dict.fromkeys([*(str(value) for value in lineage), *([candidate_id] if generation else [])])),
@@ -1502,24 +1509,32 @@ class AutonomousResearchProcessor:
             min_trades=plan.min_trades,
         )
         data_quality = train.get("quality", validation.get("quality"))
-        if isinstance(data_quality, Mapping):
-            quality_passed = data_quality.get("passed")
-            if not isinstance(quality_passed, bool):
-                quality_passed = str(
-                    data_quality.get("label", data_quality.get("quality", ""))
-                ).strip().upper() in {"HIGH", "MEDIUM", "GOOD", "PASS", "PASSED"}
+        policy_quality = evaluate_prediction_data_quality(
+            self.store,
+            {
+                **base,
+                "data_quality": data_quality,
+                "validation_execution_quality": validation.get("quality"),
+            },
+        )
+        if policy_quality.get("applicable"):
+            quality_passed = bool(policy_quality.get("canary_data_quality_acceptable"))
         else:
-            quality_passed = str(data_quality or "").strip().upper() in {
-                "HIGH",
-                "MEDIUM",
-                "GOOD",
-                "PASS",
-                "PASSED",
-            }
+            if isinstance(data_quality, Mapping):
+                quality_passed = data_quality.get("passed")
+                if not isinstance(quality_passed, bool):
+                    quality_passed = str(
+                        data_quality.get("label", data_quality.get("quality", ""))
+                    ).strip().upper() in {"HIGH", "MEDIUM", "GOOD", "PASS", "PASSED"}
+            else:
+                quality_passed = str(data_quality or "").strip().upper() in {
+                    "HIGH", "MEDIUM", "GOOD", "PASS", "PASSED",
+                }
         robust_evidence = {
+            **base,
             "data_quality": data_quality,
             "data_quality_passed": bool(quality_passed),
-            **base,
+            **persisted_quality_fields(policy_quality),
             "robustness_passed": bool(sample_check["passed"] and stability_value >= 0.60 and validation_expectancy >= 0.0),
             "minimum_sample_check": sample_check,
             "validation_stability": stability_value,

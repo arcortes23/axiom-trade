@@ -22,6 +22,12 @@ from typing import Any, Mapping, Protocol
 
 from .domain import ensure_utc, parse_timestamp, utc_now
 from .storage import AxiomStore
+from .data_quality import (
+    CURRENT_ORDER_BOOK,
+    CURRENT_ORDER_BOOK_REQUIRED,
+    evaluate_prediction_data_quality,
+    persisted_quality_fields,
+)
 
 SUPPORTED_POLYMARKET_SDK = "0.9"
 _OFFICIAL_GEOBLOCK_URL = "https://polymarket.com/api/geoblock"
@@ -889,6 +895,61 @@ class CanaryService:
     def _eligibility_is_bound(self, candidate_id: str, eligibility: Mapping[str, Any] | None) -> bool:
         return _canary_eligibility_is_bound(self.store, candidate_id, eligibility)
     @staticmethod
+    def _minimum_sample_check_passed(payload: Mapping[str, Any]) -> bool:
+        evidence = payload.get("minimum_sample_check")
+        if not isinstance(evidence, Mapping) or evidence.get("passed") is not True:
+            return False
+        checks = evidence.get("checks")
+        if not isinstance(checks, Mapping) or not checks or not all(value is True for value in checks.values()):
+            return False
+
+        def integer(name: str, default: int | None = None) -> int | None:
+            value = evidence.get(name, default)
+            if isinstance(value, bool):
+                return None
+            if isinstance(value, float) and not value.is_integer():
+                return None
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError):
+                return None
+            return parsed if parsed >= 0 else None
+        count = integer("count")
+        trades = integer("trades")
+        minimum_observations = integer("min_observations", 30)
+        minimum_trades = integer("min_trades", 0)
+        if (
+            count is None
+            or trades is None
+            or minimum_observations is None
+            or minimum_trades is None
+            or count < minimum_observations
+            or trades < minimum_trades
+        ):
+            return False
+        plan = payload.get("experiment_plan")
+        if isinstance(plan, Mapping):
+            for name, fallback in (
+                ("min_independent_samples", "min_samples"),
+                ("min_trades", None),
+            ):
+                expected = plan.get(name)
+                if expected is None and fallback is not None:
+                    expected = plan.get(fallback)
+                if expected is None:
+                    continue
+                if isinstance(expected, bool):
+                    return False
+                if isinstance(expected, float) and not expected.is_integer():
+                    return False
+                try:
+                    expected_int = int(expected)
+                except (TypeError, ValueError):
+                    return False
+                if expected_int < 0 or (count if name != "min_trades" else trades) < expected_int:
+                    return False
+        return True
+    @staticmethod
     def autonomous_limits() -> dict[str, Any]:
         """Return the immutable operator risk envelope as a fresh mapping."""
         return dict(AUTONOMOUS_CANARY_LIMITS)
@@ -1061,35 +1122,11 @@ class CanaryService:
         frozen_hash = self._lifecycle_frozen_hash(lifecycle)
         if payload is None or frozen_hash is None:
             raise CanaryBlocked("CANDIDATE_FROZEN_BINDING_INVALID")
-        gate_aliases = {
-            "schema_validated": ("schema_validated", "schema_valid"),
-            "historical_backtest_passed": ("historical_backtest_passed", "backtest_complete"),
-            "validation_passed": ("validation_passed", "validation_complete"),
-            "robustness_passed": ("robustness_passed",),
-        }
-        def _quality_passed() -> bool:
-            direct = payload.get("data_quality_passed")
-            if isinstance(direct, bool):
-                return direct
-            value = payload.get("data_quality", payload.get("quality"))
-            if isinstance(value, Mapping):
-                if isinstance(value.get("passed"), bool):
-                    return value["passed"]
-                value = value.get("label", value.get("quality", value.get("score")))
-            return isinstance(value, str) and value.strip().upper() in {
-                "HIGH", "MEDIUM", "GOOD", "PASS", "PASSED",
-                "ORDER_BOOK_SIMULATED", "OHLCV_SIMULATED", "PRICE_PROXY", "MODEL_ESTIMATE",
-            }
-        gates_complete = all(
-            any(payload.get(alias) is True for alias in aliases)
-            for aliases in gate_aliases.values()
-        ) and _quality_passed()
-        if (
-            not gates_complete
-            or payload.get("holdout_used") is not False
-            or payload.get("frozen") is not True
-            or bool(payload.get("critical_error"))
-        ):
+        quality = evaluate_prediction_data_quality(self.store, payload)
+        validation = self.validate_eligibility(identifier)
+        if not validation.get("eligible"):
+            raise CanaryBlocked("CANDIDATE_RESEARCH_GATES_INCOMPLETE")
+        if not quality.get("canary_data_quality_acceptable"):
             raise CanaryBlocked("CANDIDATE_RESEARCH_GATES_INCOMPLETE")
 
         forward_test: Mapping[str, Any] | None = None
@@ -1167,9 +1204,9 @@ class CanaryService:
             "model_document": dict(model_document),
             "forward_test": forward_test,
             "forward_config": forward_config,
+            "data_quality": quality,
             "risk_limits": risk_limits,
         }
-
     @staticmethod
     def _signal_observation(row: Mapping[str, Any]) -> dict[str, Any] | None:
         raw_payload = row.get("payload")
@@ -1182,6 +1219,13 @@ class CanaryService:
         observation["source_snapshot_id"] = row.get("snapshot_id")
         observation["source_timestamp"] = row.get("source_timestamp")
         observation["observed_at"] = row.get("observed_at")
+        observation["source_type"] = str(
+            row.get("source_type") or raw_payload.get("source_type") or ""
+        ).strip().upper()
+        observation.setdefault(
+            "research_quality",
+            row.get("quality") or raw_payload.get("research_quality") or raw_payload.get("quality"),
+        )
         for key in (
             "yes_order_book",
             "no_order_book",
@@ -1199,6 +1243,34 @@ class CanaryService:
             if key in raw_payload:
                 observation[key] = raw_payload[key]
         return observation
+
+    @staticmethod
+    def _current_order_book(
+        observation: Mapping[str, Any],
+        outcome: str,
+        *,
+        now: datetime,
+        token_id: str | None = None,
+    ) -> Mapping[str, Any] | None:
+        if str(observation.get("source_type", "")).upper() != "FORWARD_COLLECTED":
+            return None
+        book = observation.get(f"{outcome}_order_book")
+        if not isinstance(book, Mapping) or not isinstance(book.get("asks"), list) or not book["asks"]:
+            return None
+        book_timestamp = parse_timestamp(book.get("timestamp"))
+        source_timestamp = parse_timestamp(observation.get("source_timestamp"))
+        if (
+            book_timestamp is None
+            or source_timestamp is None
+            or book_timestamp > now
+            or (now - book_timestamp).total_seconds() > CANARY_SIGNAL_MAX_AGE_SECONDS
+            or book_timestamp != source_timestamp
+        ):
+            return None
+        book_token = str(book.get("token_id") or "").strip()
+        if token_id and book_token and book_token != str(token_id).strip():
+            return None
+        return book
 
     def _forward_snapshot_rows(self, market_id: str, *, limit: int = 512) -> list[dict[str, Any]]:
         rows = self.store.load_polymarket_snapshots(
@@ -1266,11 +1338,17 @@ class CanaryService:
         deterministic signal record.  It never constructs a venue or makes a
         network request.
         """
+        now = ensure_utc(self.clock())
         try:
             binding = self._candidate_signal_binding(candidate_id)
         except CanaryBlocked:
             return None
-        now = ensure_utc(self.clock())
+        try:
+            health_grade = str(self.store.polymarket_health(now=now).get("grade", "F")).upper()
+        except Exception:
+            return None
+        if health_grade not in {"A", "B"}:
+            return None
         payload = binding["payload"]
         forward_test = binding.get("forward_test")
         market_values: Any = (
@@ -1340,13 +1418,18 @@ class CanaryService:
             token_id = str(token_id or "").strip()
             if not token_id:
                 continue
+            current_book = self._current_order_book(
+                current_observation,
+                outcome,
+                now=now,
+                token_id=token_id,
+            )
+            if current_book is None:
+                continue
             raw_price = current_observation.get(f"{outcome}_ask")
             if raw_price is None:
-                order_book = current_observation.get(f"{outcome}_order_book")
                 try:
-                    raw_price = _best_ask_price(
-                        order_book.get("asks") if isinstance(order_book, Mapping) else None
-                    )
+                    raw_price = _best_ask_price(current_book.get("asks"))
                 except (TypeError, ValueError, ArithmeticError):
                     continue
             try:
@@ -1377,6 +1460,9 @@ class CanaryService:
                 "model_probability": current_observation.get("model_probability"),
                 "market_price": str(expected_price),
                 "research_quality": current_observation.get("research_quality"),
+                "current_execution_evidence": CURRENT_ORDER_BOOK,
+                "current_order_book_timestamp": current_book.get("timestamp"),
+                "current_order_book_source": "FORWARD_COLLECTED",
                 "source_observed_at": (
                     current_row.get("observed_at").isoformat()
                     if isinstance(current_row.get("observed_at"), datetime)
@@ -1530,6 +1616,17 @@ class CanaryService:
             self._set_signal_status(signal_id, "STALE", reason="SOURCE_OBSERVATION_STALE")
             raise CanaryBlocked("CANARY_SIGNAL_STALE")
         source_row, observation = current
+        if (
+            self._current_order_book(
+                observation,
+                str(signal.get("outcome", "")).strip().lower(),
+                now=now,
+                token_id=str(signal.get("token_id") or ""),
+            )
+            is None
+        ):
+            self._invalidate_signal(signal_id, "CURRENT_ORDER_BOOK_REQUIRED")
+            raise CanaryBlocked("CURRENT_ORDER_BOOK_REQUIRED")
         if str(source_row.get("snapshot_id")) != str(signal.get("source_snapshot_id")):
             self._invalidate_signal(signal_id, "SOURCE_OBSERVATION_CHANGED")
             raise CanaryBlocked("CANARY_SIGNAL_NO_LONGER_VALID")
@@ -1618,26 +1715,25 @@ class CanaryService:
                         "data_quality_passed",
                         "data_quality",
                         "holdout_used",
+                        "dataset_id",
+                        "dataset_version",
                     )
                 )
+                and str(payload.get("market_type", "")).strip().lower() != "prediction"
             )
         except sqlite3.Error:
             legacy_eligibility = False
-        def _data_quality_passed() -> bool:
-            direct = payload.get("data_quality_passed")
-            if isinstance(direct, bool):
-                return direct
-            value = payload.get("data_quality", payload.get("quality"))
-            if isinstance(value, Mapping):
-                if isinstance(value.get("passed"), bool):
-                    return value["passed"]
-                value = value.get("label", value.get("quality", value.get("score")))
-            if isinstance(value, str):
-                return value.strip().upper() in {
-                    "HIGH", "MEDIUM", "GOOD", "PASS", "PASSED",
-                    "ORDER_BOOK_SIMULATED", "OHLCV_SIMULATED", "PRICE_PROXY", "MODEL_ESTIMATE",
-                }
-            return False
+        quality = evaluate_prediction_data_quality(self.store, payload)
+        if legacy_eligibility and not quality.get("applicable"):
+            quality = {
+                **quality,
+                "historical_data_integrity": "PASS",
+                "historical_data_integrity_passed": True,
+                "historical_execution_fidelity": "LEGACY_UNSPECIFIED",
+                "canary_data_quality_acceptable": True,
+                "canary_data_quality_status": "CANARY_DATA_QUALITY_ACCEPTABLE_LEGACY",
+                "reasons": [],
+            }
         gate_aliases = {
             "schema_validated": ("schema_validated", "schema_valid"),
             "historical_backtest_passed": ("historical_backtest_passed", "backtest_complete"),
@@ -1650,14 +1746,53 @@ class CanaryService:
             ("Historical backtest", "historical_backtest_passed"),
             ("Validation", "validation_passed"),
             ("Robustness", "robustness_passed"),
-            ("Data quality", "data_quality_passed"),
         ):
-            passed = (
-                _data_quality_passed()
-                if key == "data_quality_passed"
-                else any(payload.get(alias) is True for alias in gate_aliases[key])
-            ) or legacy_eligibility
+            passed = any(payload.get(alias) is True for alias in gate_aliases[key]) or legacy_eligibility
             checks.append({"name": label, "passed": passed, "detail": "Passed" if passed else f"{key} is not true."})
+        integrity_passed = bool(quality.get("historical_data_integrity_passed")) or legacy_eligibility
+        checks.append({
+            "name": "Historical data integrity",
+            "passed": integrity_passed,
+            "detail": "Exact immutable historical dataset is complete and non-empty."
+            if integrity_passed
+            else "; ".join(quality.get("reasons") or ["Historical dataset integrity is unproven."]),
+        })
+        fidelity = str(quality.get("historical_execution_fidelity") or "UNKNOWN")
+        quality_passed = bool(quality.get("canary_data_quality_acceptable")) or legacy_eligibility
+        fidelity_passed = (
+            fidelity in {"PRICE_PROXY", "TIMESTAMPED_DEPTH"}
+            or legacy_eligibility
+            or (not quality.get("applicable") and quality_passed)
+        )
+        checks.append({
+            "name": "Historical execution fidelity",
+            "passed": fidelity_passed,
+            "detail": (
+                f"{fidelity} · LIMITED" if fidelity == "PRICE_PROXY"
+                else fidelity if fidelity_passed else "Historical execution fidelity is unavailable."
+            ),
+        })
+        checks.append({
+            "name": "Canary data quality",
+            "passed": quality_passed,
+            "detail": str(
+                quality.get("canary_data_quality_status") or "CANARY_DATA_QUALITY_UNACCEPTABLE"
+            ),
+        })
+        sample_passed = (
+            legacy_eligibility
+            or (not quality.get("applicable") and quality_passed)
+            or self._minimum_sample_check_passed(payload)
+        )
+        checks.append({
+            "name": "Minimum samples and trades",
+            "passed": sample_passed,
+            "detail": (
+                "Minimum observations and trades passed."
+                if sample_passed
+                else "Explicit minimum observation/trade evidence is missing or failed."
+            ),
+        })
         holdout_passed = payload.get("holdout_used") is False or legacy_eligibility
         checks.append({
             "name": "Holdout leakage",
@@ -1685,6 +1820,8 @@ class CanaryService:
             "checks": checks,
             "reason_code": None if eligible else "CANDIDATE_RESEARCH_GATES_INCOMPLETE",
             "frozen_hash": frozen_hash if hashes_passed else None,
+            "data_quality": quality,
+            **persisted_quality_fields(quality),
         }
 
     def mark_eligible(self, candidate_id: str) -> None:
@@ -2666,6 +2803,18 @@ class CanaryService:
         # All venue/network reads complete before the short writer
         # transactions below.  SQLite only fences persisted canary state.
         preflight_snapshot = self.status()
+        if preflight_snapshot.get("micro_live_canary") == AUTONOMOUS_MICRO_LIVE:
+            stored_signal = self.get_signal(signal_id)
+            stored_evidence = (
+                stored_signal.get("evidence", {})
+                if isinstance(stored_signal, Mapping)
+                else {}
+            )
+            if (
+                not isinstance(stored_evidence, Mapping)
+                or stored_evidence.get("current_execution_evidence") != CURRENT_ORDER_BOOK
+            ):
+                block("CURRENT_ORDER_BOOK_REQUIRED")
         if str(self.store.polymarket_health(now=now).get("grade", "F")).upper() not in {"A", "B"}:
             block("COLLECTOR_DEGRADED")
         limits = enforce_controls(preflight_snapshot)
