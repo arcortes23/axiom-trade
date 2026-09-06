@@ -463,11 +463,21 @@ class OperatorControlPlane:
                 "heartbeat_at": row.get("heartbeat_at"),
                 "started_at": row.get("started_at"),
             }
-        credentials = False
         try:
-            credentials = CredentialStore().configured(allow_environment=False)
-        except Exception:
-            credentials = False
+            projected_credentials = CredentialStore().safe_projection(
+                allow_environment=False
+            )
+            if isinstance(projected_credentials, Mapping):
+                configured = bool(projected_credentials.get("configured"))
+            else:
+                configured = False
+        except BaseException:
+            configured = False
+        credentials = {
+            "configured": configured,
+            "status": "CONFIGURED" if configured else "NOT CONFIGURED",
+            "secret_values_exposed": False,
+        }
         canary = CanaryService(self.store, initialize=False)
         try:
             canary_status = _safe_value(canary.status())
@@ -484,7 +494,7 @@ class OperatorControlPlane:
             "paper": {**worker("paper-engine"), "read_only": True, "live_execution": False},
             "research": worker("research-engine"),
             "autonomous_canary_worker": worker_status,
-            "credentials": {"configured": bool(credentials), "secret_values_exposed": False, "configuration": "CLI_ONLY"},
+            "credentials": credentials,
             "canary": {
                 "status": canary_status,
                 "latest_signal": latest_signal,

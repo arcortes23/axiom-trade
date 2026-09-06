@@ -18,6 +18,7 @@ from pathlib import Path
 import re
 import secrets
 import sqlite3
+from . import canary as canary_module
 from .canary import CanaryService, _canary_eligibility_is_bound
 import subprocess
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -1905,6 +1906,36 @@ class DashboardData:
             "updated_at": item.get("updated_at"),
             **self._candidate_status_fields(item),
         }
+    @staticmethod
+    def _compact_candidate_value(value: Any) -> Any:
+        """Keep overview display values scalar and bounded."""
+        if isinstance(value, (Mapping, list, tuple, set, frozenset)):
+            return "<complex>"
+        normalized = _jsonable(value)
+        if isinstance(normalized, (Mapping, list, tuple, set, frozenset)):
+            return "<complex>"
+        if isinstance(normalized, str):
+            return normalized[:256]
+        return normalized
+
+    def _compact_candidate_display_row(self, item: Mapping[str, Any]) -> dict[str, Any]:
+        """Project only the columns rendered by the overview latest-candidates table."""
+        row = self._candidate_row(item)
+        return {
+            key: self._compact_candidate_value(row.get(key))
+            for key in (
+                "candidate_id",
+                "strategy_id",
+                "family",
+                "market",
+                "stage",
+                "historical_gates",
+                "canary_status",
+                "paper_forward_status",
+                "paper_promotable_status",
+                "updated_at",
+            )
+        }
 
     def _activity_feed(self, *, limit: int = 50) -> list[dict[str, Any]]:
         if self.store is None:
@@ -2491,22 +2522,37 @@ class DashboardData:
         latest_signal = canary_service.latest_signal()
         latest_queue = aggregate.get("latest_queue_item") if isinstance(aggregate, Mapping) else None
         latest_outcome = None
-        if isinstance(latest_queue, Mapping) and _is_terminal_hermes_status(latest_queue.get("status")):
+        if isinstance(latest_queue, Mapping) and _is_terminal_hermes_status(
+            latest_queue.get("status")
+        ):
+            outcome = _hermes_row(latest_queue)
             latest_outcome = {
-                "time": latest_queue.get("updated_at") or latest_queue.get("created_at"),
-                "item_id": latest_queue.get("item_id"),
-                "status": latest_queue.get("status"),
-                "reason_code": latest_queue.get("reason_code"),
-                "outcome_type": latest_queue.get("outcome_type"),
-                "outcome_label": latest_queue.get("outcome_label"),
-                "human_reason": latest_queue.get("human_reason"),
-                "dataset_id": latest_queue.get("dataset_id"),
-                "dataset_version": latest_queue.get("dataset_version"),
-                "family": latest_queue.get("family"),
+                "time": outcome.get("time"),
+                "item_id": outcome.get("item_id"),
+                "status": outcome.get("status"),
+                "reason_code": outcome.get("reason_code"),
+                "outcome_type": outcome.get("outcome_type"),
+                "outcome_label": outcome.get("outcome_label"),
+                "human_reason": outcome.get("human_reason"),
+                "dataset_id": outcome.get("dataset_id"),
+                "dataset_version": outcome.get("dataset_version"),
+                "family": outcome.get("family"),
             }
         historical = catalog.get("historical", {}) if isinstance(catalog, Mapping) else {}
         forward = catalog.get("forward_collected", {}) if isinstance(catalog, Mapping) else {}
         candidate_canary_count = self._candidate_canary_eligibility_count()
+        latest_candidates: list[dict[str, Any]] = []
+        try:
+            candidate_page = self.paginate_candidate_lifecycle(
+                {"page": 1, "page_size": 10, "sort": "updated_at", "direction": "desc"}
+            )
+            latest_candidates = [
+                self._compact_candidate_display_row(item)
+                for item in candidate_page.get("items", [])
+                if isinstance(item, Mapping)
+            ][:10]
+        except (AttributeError, TypeError, ValueError, sqlite3.Error):
+            latest_candidates = []
         paper_detail = dict(paper_worker_payload)
         paper_detail["paper_forward_candidates"] = stages.get("PAPER_FORWARD", 0) + stages.get("PAPER_PROMOTABLE", 0)
         paper_detail["status"] = (
@@ -2577,9 +2623,12 @@ class DashboardData:
             },
             "activity": aggregate.get("latest_activity", []),
             "latest_activity": aggregate.get("latest_activity", []),
+            "latest_candidates": latest_candidates,
+            "candidates": latest_candidates,
             "lifecycle_funnel": stages,
             "candidate_status": {
                 "canary_eligible": candidate_canary_count,
+                "rankable": canary_status.get("rankable_count", 0) if isinstance(canary_status, Mapping) else 0,
                 "paper_forward": stages.get("PAPER_FORWARD", 0) + stages.get("PAPER_PROMOTABLE", 0),
                 "paper_promotable": stages.get("PAPER_PROMOTABLE", 0),
             },
@@ -2600,157 +2649,131 @@ class DashboardData:
         }
 
     def canary_data(self) -> dict[str, Any]:
-        """Return only the read-only canary status and latest signal."""
+        credentials = canary_module.CredentialStore().safe_projection(allow_environment=False)
         if self.store is None:
-            return {
-                "canary": {"production_live_trading": "DISABLED", "micro_live_canary": "DISABLED", "live_execution": False, "trades": []},
-                "canary_signal": None,
+            canary = {
+                "production_live_trading": "DISABLED",
+                "micro_live_canary": "DISABLED",
+                "display_state": "DISABLED",
+                "control_state": "DISABLED",
+                "candidate": None,
+                "winner_id": None,
+                "winner_rank": None,
+                "winner_score": None,
+                "selection_reason": None,
+                "eligible_count": 0,
+                "rankable_count": 0,
+                "historical_data_integrity": "UNKNOWN",
+                "historical_execution_fidelity": "UNKNOWN",
+                "current_execution_evidence": "CURRENT_ORDER_BOOK_REQUIRED",
+                "risk_envelope": {},
+                "risk_limits": {},
+                "real_execution_events": 0,
+                "execution_event_count": 0,
+                "autonomous": {
+                    "enabled": False,
+                    "selected_candidate": None,
+                    "rank": None,
+                    "score": None,
+                    "selection_reason": None,
+                    "eligible_count": 0,
+                    "rankable_count": 0,
+                    "historical_data_integrity": "UNKNOWN",
+                    "historical_execution_fidelity": "UNKNOWN",
+                    "current_execution_evidence": "CURRENT_ORDER_BOOK_REQUIRED",
+                    "next_decision": "ENABLE AUTO CANARY",
+                    "blocker": "AUTONOMOUS_CANARY_DISABLED",
+                },
+                "trades": [],
                 "live_execution": False,
             }
-        service = CanaryService(self.store, initialize=False)
+            signal = None
+        else:
+            service = CanaryService(self.store, initialize=False)
+            canary = service.status()
+            signal = service.latest_signal()
+        autonomous = canary.get("autonomous", {}) if isinstance(canary, Mapping) else {}
+        autonomous = dict(autonomous) if isinstance(autonomous, Mapping) else {}
+        eligible_count = int(canary.get("eligible_count", 0) or 0)
+        rankable_count = int(canary.get("rankable_count", 0) or 0)
+        execution_events = int(canary.get("real_execution_events", 0) or 0)
+        # These additive keys let the browser render the persisted projection
+        # without consulting the control response or requiring a worker tick.
+        autonomous.setdefault("eligible_count", eligible_count)
+        autonomous.setdefault("rankable_count", rankable_count)
+        autonomous.setdefault(
+            "historical_data_integrity",
+            canary.get("historical_data_integrity", "UNKNOWN"),
+        )
+        autonomous.setdefault(
+            "historical_execution_fidelity",
+            canary.get("historical_execution_fidelity", "UNKNOWN"),
+        )
+        autonomous.setdefault(
+            "current_execution_evidence",
+            canary.get("current_execution_evidence", "CURRENT_ORDER_BOOK_REQUIRED"),
+        )
+        autonomous.setdefault("selection_reason", canary.get("selection_reason"))
+        autonomous.setdefault("rank", canary.get("winner_rank"))
+        autonomous.setdefault("score", canary.get("winner_score"))
+        autonomous.setdefault("selected_candidate", canary.get("winner_id"))
+        candidate_status = {
+            "canary_eligible": eligible_count,
+            "rankable": rankable_count,
+        }
         return {
-            "canary": service.status(),
-            "canary_signal": service.latest_signal(),
+            "canary": canary,
+            "autonomous_canary": autonomous,
+            "canary_signal": signal,
+            "research_cards": {"canary_eligible": eligible_count},
+            "candidate_status": candidate_status,
+            "credentials": credentials,
+            "real_execution_events": execution_events,
             "live_execution": False,
         }
 
     def _operator_control_data(self) -> dict[str, Any]:
-        """Return a bounded overview for the supervised operator process.
-
-        The legacy overview aggregates every historical surface and can take
-        tens of seconds while the node is writing the canonical database.
-        Controls must remain responsive, so the supervised launcher uses
-        worker state plus durable control records here; detail tabs retain
-        their existing paginated endpoints.
-        """
+        """Merge responsive controls into the bounded persisted overview."""
         controls = self.control.status() if self.control is not None else {}
-        node = controls.get("node", {}) if isinstance(controls, Mapping) else {}
-        bootstrap = controls.get("bootstrap", {}) if isinstance(controls, Mapping) else {}
-        hermes = controls.get("hermes", {}) if isinstance(controls, Mapping) else {}
-        collector = controls.get("collector", {}) if isinstance(controls, Mapping) else {}
-        paper = controls.get("paper", {}) if isinstance(controls, Mapping) else {}
-        research = controls.get("research", {}) if isinstance(controls, Mapping) else {}
-        canary_bundle = controls.get("canary", {}) if isinstance(controls, Mapping) else {}
-        canary = canary_bundle.get("status", {}) if isinstance(canary_bundle, Mapping) else {}
-        latest_signal = canary_bundle.get("latest_signal") if isinstance(canary_bundle, Mapping) else None
-        autonomous_worker = controls.get("autonomous_canary_worker", {}) if isinstance(controls, Mapping) else {}
+        controls = dict(controls) if isinstance(controls, Mapping) else {}
         try:
-            actions = self.store.list_operator_actions(limit=10) if self.store is not None else []
-        except Exception:
-            actions = []
-        activity = [
-            {
-                "kind": "operator",
-                "timestamp": item.get("timestamp"),
-                "message": f"Operator action {item.get('action')} on {item.get('target') or 'system'} "
-                f"{'succeeded' if item.get('success') else 'failed'}",
-                "details": {
-                    "action": item.get("action"),
-                    "target": item.get("target"),
-                    "reason": item.get("reason"),
-                },
+            persisted = self.overview_summary()
+        except (AttributeError, TypeError, ValueError, sqlite3.Error):
+            persisted = {}
+        result = dict(persisted) if isinstance(persisted, Mapping) else {}
+
+        # ``overview_summary`` is authoritative for every research surface.
+        # Controls are additive and must never replace persisted cards, rows,
+        # candidate selections, lifecycle values, or canary evidence.
+        result["operator_controls"] = controls
+        result["autonomous_canary_worker"] = controls.get(
+            "autonomous_canary_worker", {}
+        )
+        canary = result.get("canary")
+        if isinstance(canary, Mapping):
+            result.setdefault(
+                "real_execution_events",
+                canary.get("real_execution_events", canary.get("execution_event_count", 0)),
+            )
+            result.setdefault("autonomous_canary", canary.get("autonomous", {}))
+        credentials = controls.get("credentials")
+        if isinstance(credentials, Mapping):
+            configured = bool(credentials.get("configured"))
+            result["credentials"] = {
+                "configured": configured,
+                "status": (
+                    "CONFIGURED" if configured else "NOT CONFIGURED"
+                ),
+                "secret_values_exposed": False,
             }
-            for item in actions
-            if isinstance(item, Mapping)
-        ]
-
-        def state(item: Any, default: str = "NOT_STARTED") -> str:
-            return str(item.get("status") or default).upper() if isinstance(item, Mapping) else default
-
-        node_state = state(node, "STOPPED")
-        collector_state = state(collector)
-        paper_state = state(paper)
-        research_state = state(research)
-        bootstrap_state = state(bootstrap)
-        hermes_state = state(hermes, "ACTIVE")
-        autonomous_worker_state = state(autonomous_worker)
-        components = [
-            {"name": "AXIOM NODE", "state": node_state, "detail": node},
-            {"name": "POLYMARKET COLLECTOR", "state": collector_state, "detail": collector},
-            {"name": "CRYPTO DATA", "state": "READY" if bootstrap_state == "COMPLETE" else "NOT INITIALIZED", "detail": bootstrap},
-            {"name": "HERMES", "state": hermes_state, "detail": hermes},
-            {"name": "PAPER ENGINE", "state": paper_state, "detail": paper},
-            {"name": "AUTONOMOUS CANARY", "state": autonomous_worker_state, "detail": autonomous_worker},
-        ]
-        try:
-            overview = self.store.dashboard_overview_summary(activity_limit=8) if self.store is not None else {}
-        except Exception:
-            overview = {}
-        sql_counts = overview.get("counts", {}) if isinstance(overview, Mapping) else {}
-        stages = overview.get("candidate_stages", {}) if isinstance(overview, Mapping) else {}
-        queue_statuses = overview.get("queue_statuses", {}) if isinstance(overview, Mapping) else {}
-        catalog = overview.get("catalog", {}) if isinstance(overview, Mapping) else {}
-        historical = catalog.get("historical", {}) if isinstance(catalog, Mapping) else {}
-        forward = catalog.get("forward_collected", {}) if isinstance(catalog, Mapping) else {}
-        try:
-            health = self.store.polymarket_health(now=ensure_utc(datetime.now().astimezone())) if self.store is not None else {}
-        except Exception:
-            health = {}
-        candidate_total = sum(int(value) for value in stages.values()) if isinstance(stages, Mapping) else 0
-        cards = {
-            "experiments_run": int(sql_counts.get("experiments", 0)),
-            "active_hypotheses": int(queue_statuses.get("PENDING", 0)) + int(queue_statuses.get("TESTING", 0)),
-            "candidates_alive": max(0, candidate_total - int(stages.get("REJECTED", 0))),
-            "candidate_rejected": int(stages.get("REJECTED", 0)),
-            "research_rejected": int(queue_statuses.get("REJECTED", 0)),
-            "rejected": int(stages.get("REJECTED", 0)) + int(queue_statuses.get("REJECTED", 0)),
-            "canary_eligible": self._candidate_canary_eligibility_count(),
-            "paper_forward": int(stages.get("PAPER_FORWARD", 0)),
-            "paper_promotable": int(stages.get("PAPER_PROMOTABLE", 0)),
-        }
-        coverage = {
-            "historical_count": int(historical.get("datasets", 0)) if isinstance(historical, Mapping) else 0,
-            "historical_rows": int(historical.get("rows", 0)) if isinstance(historical, Mapping) else 0,
-            "forward_count": int(forward.get("datasets", 0)) if isinstance(forward, Mapping) else 0,
-            "forward_rows": int(forward.get("rows", 0)) if isinstance(forward, Mapping) else 0,
-            "logical_rows": overview.get("logical_rows", {}) if isinstance(overview, Mapping) else {},
-        }
-        health = {
-            **(health if isinstance(health, Mapping) else {}),
-            "grade": str((health if isinstance(health, Mapping) else {}).get("grade") or "UNKNOWN").upper(),
-            "grade_scope": "collector_health",
-            "source_type": "FORWARD_COLLECTED",
-        }
-        sql_activity = overview.get("latest_activity", []) if isinstance(overview, Mapping) else []
-        activity = [
-            *[item for item in sql_activity if isinstance(item, Mapping)],
-            *activity,
-        ][:32]
-        return {
-            "live_trading": {"status": "Disabled", "enabled": False, "production_live_execution": False},
-            "canary": canary,
-            "canary_signal": latest_signal,
-            "autonomous_canary": canary.get("autonomous", {}) if isinstance(canary, Mapping) else {},
-            "autonomous_canary_worker": autonomous_worker,
-            "paper_risk_engine": {"status": "Active", "enabled": True},
-            "dataset_health": health,
-            "health_grade": health.get("grade", "UNKNOWN"),
-            "grade_scope": "collector_health",
-            "reason_code": health.get("reason_code"),
-            "reasons": health.get("reasons", []),
-            "components": components,
-            "research_cards": cards,
-            "coverage": coverage,
-            "activity": activity,
-            "latest_activity": activity,
-            "lifecycle_funnel": stages,
-            "candidate_status": cards,
-            "candidates": [],
-            "latest_candidates": [],
-            "btc": {"catalog": [], "catalog_summary": {}},
-            "crypto_research": {"items": [], "total": 0, "symbols": []},
-            "hermes_latest_outcome": None,
-            "hermes": hermes,
-            "polymarket": {"markets": [], "items": [], "total": 0},
-            "paper_portfolio": paper,
-            "collector_health": collector,
-            "operator_controls": controls,
-            "credentials": controls.get("credentials", {"configured": False, "secret_values_exposed": False, "configuration": "CLI_ONLY"}) if isinstance(controls, Mapping) else {"configured": False, "secret_values_exposed": False, "configuration": "CLI_ONLY"},
-            "counts": sql_counts,
-            "raw": {"status": controls},
-            "paper_only": True,
-            "live_execution": False,
-        }
+        else:
+            result["credentials"] = canary_module.CredentialStore().safe_projection(
+                allow_environment=False
+            )
+        # Keep control-only status available without colliding with the
+        # persisted ``raw`` research payload.
+        result.setdefault("control_status", controls)
+        return result
 
     def operator_data(self) -> dict[str, Any]:
         configured = self._configured("operator")
@@ -2933,22 +2956,43 @@ class DashboardData:
         canary_status = (
             canary_service.status()
             if canary_service is not None
-            else {
-                "production_live_trading": "DISABLED",
-                "micro_live_canary": "DISARMED",
-                "live_execution": False,
-                "trades": [],
-            }
+            else self.canary_data()["canary"]
         )
         latest_canary_signal = (
             canary_service.latest_signal() if canary_service is not None else None
         )
         operator_controls = self.control.status() if self.control is not None else {}
+        candidate_status["rankable"] = int(canary_status.get("rankable_count", 0) or 0)
+        autonomous_canary = (
+            canary_status.get("autonomous", {})
+            if isinstance(canary_status, Mapping)
+            else {}
+        )
+        raw_credentials = (
+            operator_controls.get("credentials")
+            if isinstance(operator_controls, Mapping)
+            else None
+        )
+        if isinstance(raw_credentials, Mapping):
+            configured = bool(raw_credentials.get("configured"))
+            credentials = {
+                "configured": configured,
+                "status": "CONFIGURED" if configured else "NOT CONFIGURED",
+                "secret_values_exposed": False,
+            }
+        else:
+            credentials = canary_module.CredentialStore().safe_projection(
+                allow_environment=False
+            )
         return {
             "title": "AXIOM / operator research console",
             "live_trading": {"status": "Disabled", "enabled": False},
             "canary": canary_status,
             "canary_signal": latest_canary_signal,
+            "autonomous_canary": autonomous_canary,
+            "real_execution_events": int(
+                canary_status.get("real_execution_events", 0) or 0
+            ),
             "paper_risk_engine": {"status": "Active", "enabled": True},
             "dataset_health": dataset_health,
             "health_grade": current_grade or None,
@@ -2985,13 +3029,14 @@ class DashboardData:
             "lifecycle_funnel": stages,
             "candidate_status": candidate_status,
             "candidates": candidate_rows,
+            "latest_candidates": candidate_rows,
             "btc": self.btc_research_data(catalog_data=catalogs),
             "crypto_research": crypto_research,
             "hermes_latest_outcome": latest_hermes_outcome,
             "polymarket": self.polymarket_research_data(catalog_data=catalogs, current_data=polymarket_current),
             "paper_portfolio": paper,
             "operator_controls": operator_controls,
-            "credentials": operator_controls.get("credentials", {"configured": False, "secret_values_exposed": False, "configuration": "CLI_ONLY"}) if isinstance(operator_controls, Mapping) else {"configured": False, "secret_values_exposed": False, "configuration": "CLI_ONLY"},
+            "credentials": credentials,
             "hermes": hermes,
             "raw": {
                 "summary": summary,
@@ -3123,7 +3168,7 @@ def _dashboard_html(control_token: str | None = None) -> str:
     const count = (v) => Number.isFinite(Number(v)) ? String(v) : "0", phtDateFormatter = new Intl.DateTimeFormat("en-PH-u-hc-h23", { timeZone:"Asia/Manila", year:"numeric", month:"2-digit", day:"2-digit", hour:"2-digit", minute:"2-digit", second:"2-digit", hourCycle:"h23" }), dateText = (v) => { if(!v || typeof v !== "string" || !/(?:Z|[+-][0-9]{2}:[0-9]{2})$/.test(v)) return "—"; const date = new Date(v); if(Number.isNaN(date.getTime())) return "—"; const parts = Object.fromEntries(phtDateFormatter.formatToParts(date).filter(i => i.type !== "literal").map(i => [i.type, i.value])); return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}:${parts.second} PHT`; }, arr = (v) => Array.isArray(v) ? v : [];
     const empty = (title,body) => `<div class="empty"><strong>${safe(title)}</strong>${safe(body)}</div>`, statusClass = (v) => { const s=String(v||"").toUpperCase(); return ["READY","RUNNING","ACTIVE","COMPLETE","COMPLETED","HEALTHY","ELIGIBLE","PASSED","PROMOTABLE","A","B"].includes(s)?"good":["DEGRADED","STOPPED","UPDATING","SUBMITTING","UNKNOWN","C"].includes(s)?"warn":["ERROR","STALE","REJECTED","KILLED","D","F"].includes(s)?"bad":""; };
     let params = new URLSearchParams(location.search); const state = { tab: params.get("tab") || "overview", page: Math.max(1,Number(params.get("page")||1)), page_size: [10,25,50,100].includes(Number(params.get("page_size"))) ? Number(params.get("page_size")) : 25, filter: params.get("filter") || "", sort: params.get("sort") || "", direction: params.get("direction") === "asc" ? "asc" : "desc", selected: params.get("selected") || "", expanded: params.get("expanded") === "1" };
-    let operator = {}, current = {}, loadInFlight = false;
+    let operator = {}, current = {}, loadInFlight = false, operatorControlsRendered = false;
     const controlToken = document.querySelector('meta[name="axiom-control-token"]')?.content || "";
     function controlButton(action,label,target="",confirmation="") { return `<button class="link control-action" data-control-action="${safe(action)}" data-control-target="${safe(target)}" data-control-confirm="${safe(confirmation)}">${safe(label)}</button>`; }
     async function controlPost(action,target="",confirmation="") {
@@ -3141,7 +3186,11 @@ def _dashboard_html(control_token: str | None = None) -> str:
     }
     function renderOperatorControls(data) {
       const controls=data.operator_controls||{};
-      if(!Object.keys(controls).length){$("operator-controls").innerHTML=empty("Operator controls unavailable","Launch with python -m axiom.cli operator to enable typed localhost controls.");return;}
+      if(!Object.keys(controls).length){
+        if(!operatorControlsRendered)$("operator-controls").innerHTML=empty("Operator controls unavailable","Launch with python -m axiom.cli operator to enable typed localhost controls.");
+        return;
+      }
+      operatorControlsRendered=true;
       const n=controls.node||{},b=controls.bootstrap||{},h=controls.hermes||{},p=controls.paper||{},c=controls.collector||{},cred=controls.credentials||{};
       const progress=b.total_datasets?`${count(b.completed_datasets)} / ${count(b.total_datasets)} datasets`:"—";
       $("operator-controls").innerHTML=[
@@ -3181,14 +3230,17 @@ def _dashboard_html(control_token: str | None = None) -> str:
     function renderHermes(data) { const h=operator.hermes||{},latest=operator.hermes_latest_outcome||{}; $("hermes-summary").innerHTML=`<div class="three-col"><div class="key-value"><span class="key">Submitted</span><strong>${count(h.submitted)}</strong></div><div class="key-value"><span class="key">Accepted</span><strong>${count(h.accepted)}</strong></div><div class="key-value"><span class="key">Pending</span><strong>${count(h.pending)}</strong></div><div class="key-value"><span class="key">Latest outcome</span><strong>${safe(latest.outcome_label||latest.status||"—")}</strong></div><div class="key-value"><span class="key">Selected dataset</span><strong>${safe(latest.dataset_id||"—")} / ${safe(latest.dataset_version||"—")}</strong></div></div><p class="page-note">Hermes status reflects queue execution state, not integration availability. ${safe(h.reason||"")}</p>`; $("hermes-table").innerHTML=arr(data.items).length?`<table><thead><tr>${[["item_id","Item"],["item_type","Type"],["status","Status"],["created_at","Created"]].map(([k,l])=>`<th>${sortButton(k,l)}</th>`).join("")}</tr></thead><tbody>${arr(data.items).map(i=>`<tr><td><button class="link hermes-item" data-id="${encodeURIComponent(i.item_id||"")}">${safe(i.item_id)}</button></td><td>${safe(i.item_type)}</td><td><span class="badge ${statusClass(i.status)}">${safe(i.status)}</span></td><td>${safe(dateText(i.created_at||i.updated_at))}</td></tr>`).join("")}</tbody></table>`:empty("Hermes not initialized","Start the research node or submit a paper-only proposal."); pager("hermes",data); bindTable(); document.querySelectorAll(".hermes-item").forEach(b=>b.addEventListener("click",()=>loadHermes(decodeURIComponent(b.dataset.id)))); if(state.tab==="hermes"&&state.selected)loadHermes(state.selected,false); }
     async function loadCandidate(id,eventPage=1,persist=true) { state.selected=id; state.expanded=true; if(persist)saveState(true); try { const q=new URLSearchParams({page:String(eventPage),page_size:String(state.page_size)}),candidateResponse=await fetch(`/api/v2/candidates/${encodeURIComponent(id)}`,{cache:"no-store"}),r=await fetch(`/api/v2/candidates/${encodeURIComponent(id)}/events?${q}`,{cache:"no-store"}),candidate=candidateResponse.ok?await candidateResponse.json():{},d=await r.json(); const checks=[["Historical gates",candidate.historical_gates||"NOT_PASSED"],["Historical data integrity",candidate.historical_data_integrity||"FAIL"],["Historical execution fidelity",candidate.historical_execution_fidelity||"UNKNOWN"],["Canary data quality",candidate.canary_data_quality_gate||"NOT PASSED"],["Production evidence",candidate.production_evidence||"INSUFFICIENT"],["Micro-live canary",candidate.canary_status||"NOT_ELIGIBLE"],["Paper forward status",candidate.paper_forward_status||"NOT_STARTED"],["Paper promotable",candidate.paper_promotable_status||"NOT_YET"]]; const markup=`<div class="key-value"><span class="key">Candidate</span><strong>${safe(candidate.candidate_id||id)}</strong></div><div class="three-col">${checks.map(([label,value])=>`<div class="key-value"><span class="key">${safe(label)}</span><strong><span class="badge ${statusClass(value)}">${safe(value)}</span></strong></div>`).join("")}</div>${arr(d.items).length?`<table><thead><tr><th>Time</th><th>Stage</th><th>Reason</th></tr></thead><tbody>${arr(d.items).map(i=>`<tr><td>${safe(dateText(i.created_at||i.timestamp))}</td><td><span class="badge">${safe(i.stage||i.to_stage)}</span></td><td>${safe(i.reason||i.message)}</td></tr>`).join("")}</tbody></table>`:empty("No lifecycle events","No persisted lifecycle evidence exists for this candidate.")}<div id="candidate-events-pager" class="pager"></div>`; $("detail").innerHTML=markup; if(state.tab==="candidates")$("dataset-detail").innerHTML=markup; if($("candidate-events-pager")){const total=Number(d.total)||0,page=Number(d.page)||1,size=Number(d.page_size)||state.page_size,pages=Number(d.pages)||0,start=total?(page-1)*size+1:0,end=Math.min(page*size,total); $("candidate-events-pager").innerHTML=`<span>Showing ${start}–${end} of ${total}</span><span><button data-page="${page-1}" ${page<=1?"disabled":""}>Previous</button> <button data-page="${page+1}" ${!pages||page>=pages?"disabled":""}>Next</button></span>`; $("candidate-events-pager").querySelectorAll("button").forEach(b=>b.addEventListener("click",()=>loadCandidate(id,Number(b.dataset.page),false)));} } catch(e) { $("detail").innerHTML=empty("Candidate detail unavailable",e.message); } }
     function renderPaper(data) { const p=operator.paper_portfolio||{}; $("portfolio-summary").innerHTML=`<div class="card-grid"><div class="panel"><div class="metric">${p.state_count?Number(p.total_equity||0).toFixed(2):"—"}</div><div class="metric-label">paper equity</div></div><div class="panel"><div class="metric">${p.state_count?Number(p.total_pnl||0).toFixed(2):"—"}</div><div class="metric-label">paper P/L</div></div><div class="panel"><div class="metric">${count(data.total)}</div><div class="metric-label">paper records</div></div><div class="panel"><div class="metric">${p.state_count?`${(Number(p.win_rate||0)*100).toFixed(1)}%`:"—"}</div><div class="metric-label">win rate</div></div></div>`; $("portfolio-states").innerHTML=arr(data.items).length?`<table><thead><tr><th>${sortButton("timestamp","Time")}</th><th>${sortButton("record_type","Type")}</th><th>Experiment</th><th>Market</th><th>Status</th><th>Details</th></tr></thead><tbody>${arr(data.items).map(i=>`<tr><td>${safe(dateText(i.timestamp||i.created_at||i.updated_at))}</td><td>${safe(i.record_type)}</td><td>${safe(i.experiment_id)}</td><td>${safe(i.market_id||i.symbol)}</td><td><span class="badge ${statusClass(i.status)}">${safe(i.status)}</span></td><td><details><summary>view</summary><pre>${safe(json(i))}</pre></details></td></tr>`).join("")}</tbody></table>`:empty("Waiting for PAPER_FORWARD","Paper portfolio initializes only after a candidate enters PAPER_FORWARD and observations are persisted."); pager("paper",data); bindTable(); }
-    async function loadPage(tab) { const endpoint={datasets:"datasets",activity:"activity",candidates:"candidates",polymarket:"polymarket",hermes:"hermes","crypto":"crypto-research",portfolio:"paper"}[tab]; if(!endpoint)return; try { current=await fetchV2(endpoint); ({datasets:renderDatasets,activity:renderActivity,candidates:renderCandidates,polymarket:renderPolymarket,hermes:renderHermes,crypto:renderCrypto,portfolio:renderPaper}[tab])(current); } catch(e) { const target={datasets:"datasets-table",activity:"activity-table",candidates:"candidates-table",polymarket:"pm-markets",hermes:"hermes-table",crypto:"crypto-table",portfolio:"portfolio-states"}[tab]; if($(target))$(target).innerHTML=empty("Dashboard data unavailable",e.message); } }
     function renderCanary(data) {
-      const c=data.canary||{}, auto=data.autonomous_canary||c.autonomous||{}, risk=c.risk_envelope||{target_notional_usd:"1.00",max_exposure_usd:"5.00",max_daily_loss_usd:"2.00",max_open_positions:3,max_orders_per_day:5,max_slippage_bps:100}, signal=data.canary_signal||operator.canary_signal||null, stateValue=String(c.micro_live_canary||"DISABLED"), enabled=Boolean(auto.enabled);
+      const c=data.canary||{}, auto=data.autonomous_canary||c.autonomous||{}, risk=c.risk_envelope||c.risk_limits||{}, signal=data.canary_signal||null;
+      const backendState=String(c.micro_live_canary||"DISABLED"), stateValue=backendState==="KILLED"?"KILLED":Boolean(auto.enabled)?"ENABLED":"DISABLED";
+      const enabled=Boolean(auto.enabled), winner=auto.selected_candidate||c.winner_id||"—", manualCandidate=backendState==="ARMED"&&c.candidate?`<div class="panel"><div class="metric">${safe(c.candidate)}</div><div class="metric-label">Manual armed candidate</div></div>`:"";
       const enable=stateValue==="KILLED"?"":enabled?controlButton("canary.disarm","DISARM","","DISARM"):controlButton("canary.enable_auto","ENABLE AUTO CANARY","","ENABLE AUTO CANARY");
+      const credentials=data.credentials||{}, eligible=data.research_cards?.canary_eligible??c.eligible_count??auto.eligible_count??0, rankable=data.candidate_status?.rankable??c.rankable_count??auto.rankable_count??0, events=data.real_execution_events??c.real_execution_events??c.execution_event_count??0;
+      const riskMarkup=Object.entries(risk).map(([key,value])=>`<div class="key-value"><span class="key">${safe(key.replaceAll("_"," "))}</span><strong>${safe(value)}</strong></div>`).join("")||empty("Risk envelope unavailable","No frozen risk limits are persisted.");
       $("canary-controls").innerHTML=`<article class="panel"><div class="section-title"><h2>AUTONOMOUS CANARY CONTROL</h2><span class="badge ${statusClass(stateValue)}">${safe(stateValue)}</span></div><div class="page-note">${controlButton("canary.connectivity_check","Connectivity check")} · ${enable} · ${controlButton("canary.kill","KILL","","KILL")}</div><p class="page-note">One confirmation enables the frozen prediction-only $1 envelope. Research, eligibility, ranking, and submission decisions run in the node worker; Hermes cannot change this envelope.</p></article>`;
-      $("canary-summary").innerHTML=`<div class="card-grid"><div class="panel"><div class="metric">${safe(stateValue)}</div><div class="metric-label">Autonomous canary state</div></div><div class="panel"><div class="metric">${safe(auto.selected_candidate||c.candidate||"—")}</div><div class="metric-label">Selected winner</div></div><div class="panel"><div class="metric">${safe(auto.rank||"—")} · ${auto.score==null?"—":Number(auto.score).toFixed(4)}</div><div class="metric-label">Winner rank / score</div></div><div class="panel"><div class="metric">${count(data.research_cards?.canary_eligible)}</div><div class="metric-label">Automatically eligible candidates</div></div><div class="panel"><div class="metric">${safe(auto.next_decision||"—")}</div><div class="metric-label">Next decision</div></div><div class="panel"><div class="metric">${safe(auto.blocker||"NONE")}</div><div class="metric-label">Current blocker</div></div></div><article class="panel"><div class="section-title"><h2>FROZEN RISK ENVELOPE</h2><span class="badge good">PREDICTION ONLY</span></div><div class="three-col">${[["Target notional","$"+risk.target_notional_usd],["Max exposure","$"+risk.max_exposure_usd],["Daily loss","$"+risk.max_daily_loss_usd],["Open positions",risk.max_open_positions],["Orders / day",risk.max_orders_per_day],["Slippage",""+risk.max_slippage_bps+" bps"]].map(([label,value])=>`<div class="key-value"><span class="key">${safe(label)}</span><strong>${safe(value)}</strong></div>`).join("")}</div></article>`;
-      const readiness=signal?String(signal.status||"READY"):"NO SIGNAL", detail=signal?`<div class="three-col"><div class="key-value"><span class="key">Signal readiness</span><strong>${safe(readiness)}</strong></div><div class="key-value"><span class="key">Market / outcome</span><strong>${safe(signal.market_id)} / ${safe(signal.outcome)}</strong></div><div class="key-value"><span class="key">Expected price</span><strong>${safe(signal.paper_expected_price)}</strong></div><div class="key-value"><span class="key">Generated</span><strong>${safe(dateText(signal.generated_at))}</strong></div><div class="key-value"><span class="key">Order result</span><strong>${safe(c.last_request_status||"NO ORDER")}</strong></div></div>`:empty("No actionable signal","The worker will wait for a fresh forward observation; it will not manufacture a trade.");
-      $("canary-summary").insertAdjacentHTML("beforeend",`<article class="panel"><div class="section-title"><h2>WORKER SIGNAL</h2><span class="badge ${statusClass(readiness)}">${safe(readiness)}</span></div>${detail}<p class="page-note">Kill prevents new submissions; an in-flight request is recorded, in-flight not retracted, and never retried automatically.</p></article>`);
+      $("canary-summary").innerHTML=`<div class="card-grid"><div class="panel"><div class="metric">${safe(stateValue)}</div><div class="metric-label">Autonomous canary state</div></div><div class="panel"><div class="metric">${safe(winner)}</div><div class="metric-label">Selected winner</div></div>${manualCandidate}<div class="panel"><div class="metric">${safe(auto.rank??c.winner_rank??"—")} · ${safe(auto.score??c.winner_score??"—")}</div><div class="metric-label">Winner rank / score</div></div><div class="panel"><div class="metric">${count(eligible)}</div><div class="metric-label">Eligible candidates</div></div><div class="panel"><div class="metric">${count(rankable)}</div><div class="metric-label">Rankable candidates</div></div><div class="panel"><div class="metric">${safe(auto.selection_reason||c.selection_reason||"—")}</div><div class="metric-label">Selection reason</div></div><div class="panel"><div class="metric">${safe(auto.historical_data_integrity||c.historical_data_integrity||"UNKNOWN")}</div><div class="metric-label">Historical data integrity</div></div><div class="panel"><div class="metric">${safe(auto.historical_execution_fidelity||c.historical_execution_fidelity||"UNKNOWN")}</div><div class="metric-label">Historical execution fidelity</div></div><div class="panel"><div class="metric">${safe(auto.current_execution_evidence||c.current_execution_evidence||"UNKNOWN")}</div><div class="metric-label">Current execution evidence</div></div><div class="panel"><div class="metric">${safe(auto.next_decision||"—")}</div><div class="metric-label">Next decision</div></div><div class="panel"><div class="metric">${safe(auto.blocker||"—")}</div><div class="metric-label">Blocker</div></div><div class="panel"><div class="metric">${credentials.configured?"CONFIGURED":"NOT CONFIGURED"}</div><div class="metric-label">Credentials</div></div><div class="panel"><div class="metric">${count(events)}</div><div class="metric-label">Real execution events</div></div></div><article class="panel"><div class="section-title"><h2>Risk envelope</h2><span class="badge">FROZEN</span></div><div class="three-col">${riskMarkup}</div></article>`;
+      const readiness=signal?String(signal.status||"READY"):"NO SIGNAL", detail=signal?`<div class="three-col"><div class="key-value"><span class="key">Signal readiness</span><strong>${safe(readiness)}</strong></div><div class="key-value"><span class="key">Market / outcome</span><strong>${safe(signal.market_id)} / ${safe(signal.outcome)}</strong></div><div class="key-value"><span class="key">Expected price</span><strong>${safe(signal.paper_expected_price)}</strong></div><div class="key-value"><span class="key">Generated</span><strong>${safe(dateText(signal.generated_at))}</strong></div><div class="key-value"><span class="key">Order result</span><strong>${safe(c.last_request_status||"NO ORDER")}</strong></div></div>`:empty("No latest signal","No persisted signal is available.");
+      $("canary-summary").insertAdjacentHTML("beforeend",`<article class="panel"><div class="section-title"><h2>Latest signal</h2><span class="badge ${statusClass(readiness)}">${safe(readiness)}</span></div>${detail}<p class="page-note">Kill prevents new submissions; an in-flight request is recorded, in-flight not retracted, and never retried automatically.</p></article>`);
       $("canary-trades").innerHTML=arr(c.trades).length?`<table><thead><tr><th>Time</th><th>Candidate</th><th>Market</th><th>Side</th><th>Status</th><th>Price Δ</th></tr></thead><tbody>${arr(c.trades).map(t=>`<tr><td>${safe(dateText(t.timestamp))}</td><td>${safe(t.candidate_id)}</td><td>${safe(t.market_id)}</td><td>${safe(t.side)}</td><td><span class="badge ${statusClass(t.status)}">${safe(t.status)}</span></td><td>${safe(t.price_difference)}</td></tr>`).join("")}</tbody></table>`:empty("No canary execution evidence","No order has been submitted by the autonomous worker.");
     }
     function renderBtc(data) { const b=operator.btc||{},summary=b.catalog_summary||{},rows=arr(summary.latest_by_timeframe||summary.timeframes),fallback=arr(b.catalog),catalogRows=rows.length?rows:fallback; $("btc-summary").innerHTML=catalogRows.length?`<div class="three-col"><div class="key-value"><span class="key">Catalog timeframes</span><strong>${count(catalogRows.length)}</strong></div><div class="key-value"><span class="key">Rows observed</span><strong>${count(catalogRows.reduce((total,item)=>total+Number(item.row_count||0),0))}</strong></div><div class="key-value"><span class="key">Latest report</span><strong>${safe(dateText(b.latest_report?.created_at))}</strong></div></div>`:empty("BTC history not initialized","Run bootstrap-history --crypto, then btc-research."); $("btc-experiments").innerHTML=""; }
@@ -3196,15 +3248,52 @@ def _dashboard_html(control_token: str | None = None) -> str:
     function renderCrypto(data) { const rows=arr(data.items),symbols=arr(data.symbols),summary={universe_version:data.universe_version,symbols:data.symbol_count??symbols.length,assets:data.asset_count??arr(data.assets).length,catalogs:data.total,reports:arr(data.reports).length}; $("crypto-summary").innerHTML=`<div class="three-col">${[["Universe version",summary.universe_version],["Symbols",summary.symbols],["Assets",summary.assets],["Catalogs",summary.catalogs],["Reports",summary.reports],["Families",arr(data.families).length]].map(([label,value])=>`<div class="key-value"><span class="key">${safe(label)}</span><strong>${safe(value)}</strong></div>`).join("")}</div>`; $("crypto-table").innerHTML=rows.length?`<table><thead><tr><th>Symbol</th><th>Dataset</th><th>Version</th><th>Source</th><th>Coverage</th><th>Strategies</th><th>Experiments</th><th>Validation</th><th>Families</th></tr></thead><tbody>${rows.map(i=>`<tr><td><button class="link crypto-symbol-row" data-symbol="${encodeURIComponent(i.symbol||"")}">${safe(i.symbol)}</button></td><td>${safe(i.dataset_id)}</td><td>${safe(i.dataset_version)}</td><td>${safe(i.source_type)}</td><td>${safe(json(i.coverage))}</td><td>${safe(json(i.strategies))}</td><td>${safe(json(i.experiments))}</td><td>${safe(json(i.validation))}</td><td>${safe(json(i.families))}</td></tr>`).join("")}</tbody></table>`:empty("No crypto catalogs","No crypto catalog or report has been persisted."); pager("crypto",data); document.querySelectorAll(".crypto-symbol-row").forEach(b=>b.addEventListener("click",()=>loadCrypto(decodeURIComponent(b.dataset.symbol)))); }
     function renderOutcomeCards(data) { const cards=data.research_cards||{}, latest=data.hermes_latest_outcome||cards.newest_hermes_outcome||{}, latestLabel=latest.outcome_label||latest.status||"—"; $("research-cards").innerHTML=[["experiments_run","Experiments run"],["active_hypotheses","Active hypotheses"],["candidates_alive","Candidates alive"],["candidate_rejected","Candidate Rejected"],["research_rejected","Research Rejected"],["canary_eligible","Canary eligible"],["paper_forward","Paper forward"],["paper_promotable","Paper promotable"]].map(([k,l])=>`<article class="panel"><div class="metric">${count(cards[k])}</div><div class="metric-label">${l}</div></article>`).join("")+`<article class="panel"><div class="metric">${safe(latestLabel)}</div><div class="metric-label">Newest Hermes outcome · ${safe(latest.item_id||"none")}</div><div class="page-note">Dataset: ${safe(latest.dataset_id||"—")} / ${safe(latest.dataset_version||"—")}</div>${latest.human_reason?`<p class="page-note">${safe(latest.human_reason)}</p>`:""}</article>`; }
     const _renderOverview=renderOverview; renderOverview=(data)=>{_renderOverview(data);renderOutcomeCards(data);};
-    async function load() { if(loadInFlight)return; loadInFlight=true; try { const response=await fetch("/api/operator",{cache:"no-store"}); if(!response.ok)throw new Error(`operator HTTP ${response.status}`); operator=await response.json(); renderOverview(operator); renderCrypto(operator.crypto_research||{}); renderCanary(operator); if(!["overview","crypto","canary"].includes(state.tab))await loadPage(state.tab); } catch(e) { $("component-grid").innerHTML=empty("Dashboard unavailable",e.message); } finally { loadInFlight=false; } }
     const VIEW_ENDPOINT = {overview:"overview-summary",canary:"canary",datasets:"datasets",activity:"activity",candidates:"candidates",polymarket:"polymarket",hermes:"hermes",crypto:"crypto-research",portfolio:"paper"};
     const VIEW_TARGET = {datasets:"datasets-table",activity:"activity-table",candidates:"candidates-table",polymarket:"pm-markets",hermes:"hermes-table",crypto:"crypto-table",portfolio:"portfolio-states"};
     const VIEW_CADENCE = {overview:10000,canary:15000,datasets:30000,activity:15000,candidates:30000,polymarket:30000,hermes:30000,crypto:30000,portfolio:30000};
     let activeController = null, detailController = null, refreshGeneration = 0, nextRefreshAt = 0, slowRefreshTimer = null, startupPending = true;
+    const REFRESH_TIMEOUT_MS = 8000;
+    const lastGood = {overview:null,canary:null,controls:null};
+    let lastSuccessful = 0;
+    function refreshError(error) {
+      if(error?.name==="AbortError") return "request cancelled";
+      if(error?.name==="TimeoutError") return "request timed out";
+      return "request unavailable";
+    }
+    async function fetchWithTimeout(url, options={}) {
+      const controller = new AbortController();
+      const parent = options.signal;
+      let timedOut = false;
+      const abort = () => controller.abort();
+      if(parent) {
+        if(parent.aborted) controller.abort();
+        else parent.addEventListener("abort", abort, {once:true});
+      }
+      const timeout = setTimeout(() => {timedOut=true;controller.abort();}, REFRESH_TIMEOUT_MS);
+      try {
+        const response = await fetch(url, {...options, signal:controller.signal});
+        if(!response.ok) throw new Error(`${url} HTTP ${response.status}`);
+        return await response.json();
+      } catch(error) {
+        if(timedOut) {
+          const timeoutError = new Error("refresh request timed out");
+          timeoutError.name = "TimeoutError";
+          throw timeoutError;
+        }
+        throw error;
+      } finally {
+        clearTimeout(timeout);
+        if(parent) parent.removeEventListener("abort", abort);
+      }
+    }
     // Shared status classifier covers readiness, degradation, and terminal grades.
     function refreshCadence(tab) { return VIEW_CADENCE[tab] || 30000; }
     function refreshNote(tab) { const view=$(`view-${tab}`); if(!view)return null; let note=view.querySelector(".refresh-note"); if(!note){ const title=view.querySelector(".section-title"); if(!title)return null; note=document.createElement("span"); note.className="refresh-note"; title.appendChild(note); } return note; }
     function refreshMessage(tab,message,slow=false) { const note=refreshNote(tab); if(note){note.textContent=message||"";note.classList.toggle("slow",slow);} }
+    function clearRefreshing(tab) {
+      const note=refreshNote(tab);
+      if(note && note.textContent==="Refreshing…")refreshMessage(tab,"");
+    }
     function shortId(value) { const text=String(value??""); return text.length>30?`${text.slice(0,13)}…${text.slice(-11)}`:text||"—"; }
     function copyButton(value) { const text=String(value??""); return text?`<span role="button" tabindex="0" class="copy" data-copy="${safe(text)}" title="Copy full value">copy</span>`:""; }
     function identity(primary,full,secondary="") { return `<span class="identity" title="${safe(full||primary)}"><span class="identity-main">${safe(primary||"—")}${copyButton(full||primary)}</span>${secondary?`<span class="identity-sub">${safe(secondary)}</span>`:""}</span>`; }
@@ -3214,29 +3303,139 @@ def _dashboard_html(control_token: str | None = None) -> str:
     function activityMarkup(rows) { return compactActivityRows(rows).map(item=>{const suffix=item.count>1?` ×${item.count}`:"";const detail=item.events.length>1?` <details><summary>${item.events.length} adjacent bootstrap events</summary><pre>${safe(json(item.events))}</pre></details>`:(item.details&&Object.keys(item.details).length?` <details><summary>details</summary><pre>${safe(json(item.details))}</pre></details>`:"");return `<div class="activity-compact"><div class="timeline-item"><span class="timeline-time">${safe(dateText(item.timestamp))}</span><span class="timeline-kind">${safe(item.kind)}${suffix}</span><span>${safe(item.message)}${detail}</span></div></div>`; }).join("")||empty("No research activity","Durable activity will appear after workers run."); }
     function ensureActivityKind() { const status=$("activity-status"); if(!status||$("activity-kind"))return; const select=document.createElement("select"); select.id="activity-kind"; select.className="facet"; select.dataset.param="kind"; select.setAttribute("aria-label","Filter activity type"); select.innerHTML='<option value="">All activity types</option>'+["bootstrap","dataset","research","lifecycle","collection","collection_error","report","operator"].map(v=>`<option value="${v}">${v.replace("_"," ")}</option>`).join(""); status.parentNode.insertBefore(select,status); }
     fetchV2 = async function(name,signal) { const q=new URLSearchParams(); if(!["overview-summary","canary"].includes(name)){q.set("page",String(state.page));q.set("page_size",String(state.page_size));q.set("direction",state.direction);if(state.filter)q.set("filter",state.filter);if(state.sort)q.set("sort",state.sort);} const controls={datasets:[["datasets-source","source_type"],["datasets-market","market"],["datasets-timeframe","timeframe"],["datasets-quality","quality"]],activity:[["activity-status","status"],["activity-kind","kind"]],candidates:[["candidates-stage","stage"]],polymarket:[["polymarket-category","category"],["polymarket-settlement","settlement"],["polymarket-quality","quality"]],hermes:[["hermes-status","status"]],paper:[["paper-status","status"]]}; for(const [id,key] of (controls[state.tab]||[])){const el=$(id);if(el&&el.value)q.set(key,el.value);} if(state.tab==="crypto"&&$("crypto-symbol")?.value.trim())q.set("symbol",$("crypto-symbol").value.trim()); const url=`/api/v2/${name}${q.toString()?`?${q}`:""}`,response=await fetch(url,{cache:"no-store",signal}); if(!response.ok)throw new Error(`${name} HTTP ${response.status}`); return response.json(); };
+    const _fetchV2 = fetchV2;
+    async function fetchV2Bounded(name, parentSignal) {
+      const controller = new AbortController();
+      let timedOut = false;
+      const abort = () => controller.abort();
+      if(parentSignal) {
+        if(parentSignal.aborted) controller.abort();
+        else parentSignal.addEventListener("abort", abort, {once:true});
+      }
+      const timeout = setTimeout(() => {timedOut=true;controller.abort();}, REFRESH_TIMEOUT_MS);
+      try {
+        return await _fetchV2(name, controller.signal);
+      } catch(error) {
+        if(timedOut) {
+          const timeoutError = new Error("refresh request timed out");
+          timeoutError.name = "TimeoutError";
+          throw timeoutError;
+        }
+        throw error;
+      } finally {
+        clearTimeout(timeout);
+        if(parentSignal) parentSignal.removeEventListener("abort", abort);
+      }
+    }
     renderOverview = (data) => { renderComponents(data); renderOutcomeCards(data); const c=data.coverage||{},h=data.collector_health||{}; $("coverage").innerHTML=`<div class="three-col"><div class="key-value"><span class="key">Historical datasets</span><strong>${count(c.historical_count)}</strong></div><div class="key-value"><span class="key">Historical rows</span><strong>${count(c.historical_rows)}</strong></div><div class="key-value"><span class="key">Forward datasets</span><strong>${count(c.forward_count)}</strong></div><div class="key-value"><span class="key">Forward rows</span><strong>${count(c.forward_rows)}</strong></div><div class="key-value"><span class="key">Logical observations</span><strong>${count((c.logical_rows||{}).bars)}</strong></div><div class="key-value"><span class="key">Collector errors</span><strong>${count(h.collection_errors)}</strong></div><div class="key-value"><span class="key">Last cycle duration</span><strong>${h.last_cycle_duration_seconds==null?"—":`${Number(h.last_cycle_duration_seconds).toFixed(1)}s`}</strong></div><div class="key-value"><span class="key">Effective cadence</span><strong>${h.effective_collection_cadence_seconds==null?"—":`${Number(h.effective_collection_cadence_seconds).toFixed(1)}s`}</strong></div><div class="key-value"><span class="key">Markets A / S / F</span><strong>${count(h.last_cycle_markets_attempted)} / ${count(h.last_cycle_markets_successful)} / ${count(h.last_cycle_markets_failed)}</strong></div></div><p class="page-note">Configured interval ${safe(h.configured_interval_seconds??"—")}s · stale threshold ${safe(h.stale_after_seconds??"—")}s · last successful cycle ${safe(dateText(h.last_successful_cycle))}</p>`; $("overview-activity").innerHTML=activityMarkup(arr(data.latest_activity||data.activity)); $("overview-candidates").innerHTML=empty("Candidate list is lazy","Open Candidates to load the bounded lifecycle page."); $("raw-overview").textContent=json({counts:data.counts,collector_health:h,latest_outcome:data.hermes_latest_outcome}); };
     const _renderOverviewScheduling = renderOverview;
     renderOverview = (data) => {
       _renderOverviewScheduling(data);
-      renderOperatorControls(data);
+      if(Object.prototype.hasOwnProperty.call(data,"operator_controls")||!operatorControlsRendered)renderOperatorControls(data);
       const h = data.collector_health || {};
       const components = Object.fromEntries(arr(data.components).map(item => [item.name, item]));
       const collector = components["POLYMARKET COLLECTOR"]?.detail || {};
       const paper = components["PAPER ENGINE"]?.detail || {};
       const research = components["RESEARCH ENGINE"]?.detail || {};
       $("coverage").insertAdjacentHTML("beforeend", `<p class="page-note">Next collection ${safe(dateText(h.next_scheduled_collection_at || collector.next_scheduled_collection_at))} · collector heartbeat ${safe(dateText(h.worker_heartbeat_at || collector.worker_heartbeat_at))} · PAPER_FORWARD pass ${safe(paper.status || "—")} · research pass ${safe(research.status || "—")}</p>`);
+      const latestCandidates = arr(data.latest_candidates || data.candidates);
+      $("overview-candidates").innerHTML = latestCandidates.length
+        ? tableCandidates(latestCandidates, false)
+        : empty("No candidates yet", "No persisted lifecycle candidates are available.");
+      const funnel = data.lifecycle_funnel || {};
+      const max = Math.max(1, ...Object.values(funnel).map(Number));
+      $("funnel").innerHTML = Object.entries(funnel).map(([k, v]) => `<div class="funnel-row"><span>${safe(k)}</span><span class="funnel-track"><span class="funnel-bar" style="width:${Math.min(100, Number(v) / max * 100)}%"></span></span><span class="right">${count(v)}</span></div>`).join("") || empty("No candidate lifecycle", "Hermes hypotheses appear after a durable queue item is processed.");
     };
     renderDatasets = (data) => { $("dataset-total").textContent=`${count(data.total)} datasets`; const rows=arr(data.items); $("datasets-table").innerHTML=rows.length?`<table><thead><tr>${[["dataset_id","Dataset"],["source_type","Source"],["market_type","Market"],["instrument","Instrument"],["timeframe","Timeframe"],["quality","Quality"],["row_count","Rows"],["updated_at","Updated"]].map(([k,l])=>`<th>${sortButton(k,l)}</th>`).join("")}</tr></thead><tbody>${rows.map(i=>`<tr><td><button class="link dataset" data-id="${encodeURIComponent(i.dataset_id||"")}">${identity(datasetPrimary(i),i.dataset_id,i.dataset_id===datasetPrimary(i)?"":`full ${shortId(i.dataset_id)}`)}</button></td><td>${safe(i.source_type)}</td><td>${safe(i.market_type)}</td><td>${safe(i.instrument)}</td><td>${safe(i.timeframe)}</td><td>${safe(i.quality)}</td><td>${count(i.row_count)}</td><td>${safe(dateText(i.updated_at))}</td></tr>`).join("")}</tbody></table>`:empty("No datasets","No catalog records match the current filters."); pager("datasets",data); bindTable(); };
     renderActivity = (data) => { ensureActivityKind(); $("activity-total").textContent=`${count(data.total)} events`; $("activity-table").innerHTML=arr(data.items).length?`<div class="timeline">${activityMarkup(data.items)}</div>`:empty("No research activity","Durable activity will appear after workers run."); pager("activity",data); bindTable(); };
     renderCrypto = (data) => { const rows=arr(data.items),u=data.bootstrap_universe||{}; $("crypto-summary").innerHTML=`<div class="three-col"><div class="key-value"><span class="key">Universe version</span><strong title="${safe(data.universe_version)}">${safe(shortId(data.universe_version))}${copyButton(data.universe_version)}</strong></div><div class="key-value"><span class="key">Selected universe</span><strong>${count(u.selected_count)}</strong></div><div class="key-value"><span class="key">Bootstrap progress</span><strong>${u.progress==null?"—":(Number(u.progress)*100).toFixed(1)+"%"}</strong></div><div class="key-value"><span class="key">Bootstrap datasets</span><strong>${count(u.dataset_count)}</strong></div><div class="key-value"><span class="key">Bootstrap reports</span><strong>${count(data.bootstrap_report_count??arr(data.bootstrap_reports).length)}</strong></div><div class="key-value"><span class="key">Strategy reports</span><strong>${count(arr(data.strategy_reports||data.reports).length)}</strong></div></div>`; $("crypto-table").innerHTML=rows.length?`<table><thead><tr><th>Symbol</th><th>Dataset</th><th>Source</th><th>Rows</th><th>Quality</th><th>Updated</th></tr></thead><tbody>${rows.map(i=>`<tr><td>${safe(i.symbol||arr(i.symbols)[0])}</td><td>${identity(shortId(i.dataset_id),i.dataset_id,shortId(i.dataset_version))}</td><td>${safe(i.source_type)}</td><td>${count(i.row_count)}</td><td>${safe(i.quality)}</td><td>${safe(dateText(i.updated_at))}</td></tr>`).join("")}</tbody></table>`:empty("No crypto catalogs","Crypto data is separate from strategy research; run the bounded bootstrap or select another symbol."); if(arr(data.bootstrap_progress).length){$("crypto-detail").innerHTML=`<article class="panel"><div class="section-title"><h2>Bootstrap cursors</h2><span class="muted">${count(u.completed_datasets)} complete / ${count(u.dataset_count)} datasets</span></div><div class="scroll"><table><thead><tr><th>Selected symbol</th><th>Timeframe</th><th>Status</th><th>Progress</th><th>Records</th><th>Errors</th></tr></thead><tbody>${arr(data.bootstrap_progress).map(i=>`<tr><td>${safe(i.selected_symbol||i.symbol)}</td><td>${safe(i.timeframe)}</td><td>${safe(i.status)}</td><td>${i.progress==null?"—":(Number(i.progress)*100).toFixed(1)+"%"}</td><td>${count(i.records)}</td><td>${count(i.error_count)}</td></tr>`).join("")}</tbody></table></div></article>`;} else $("crypto-detail").innerHTML=""; pager("crypto",data); bindTable(); };
     renderPolymarket = (data) => { const items=arr(data.items),categories=[...new Set(items.map(i=>i.category).filter(Boolean))].sort(),cat=$("polymarket-category"),old=cat.value||params.get("category")||""; cat.innerHTML=`<option value="">All categories</option>${categories.map(c=>`<option value="${safe(c)}">${safe(c)}</option>`).join("")}`;if(old&&!categories.includes(old))cat.insertAdjacentHTML("beforeend",`<option value="${safe(old)}">${safe(old)}</option>`);cat.value=old;const quality=items.map(i=>i.quality_label||i.quality).find(Boolean)||"—";$("pm-summary").innerHTML=`<div class="three-col"><div class="key-value"><span class="key">Markets</span><strong>${count(data.total)}</strong></div><div class="key-value"><span class="key">Evidence quality</span><strong>${safe(quality)}</strong></div><div class="key-value"><span class="key">Execution</span><strong>SIMULATED ONLY</strong></div></div>`;$("pm-markets").innerHTML=items.length?`<table><thead><tr><th>Market</th><th>Question</th><th>Category</th><th>Quality</th><th>Settlement</th><th>Observed</th></tr></thead><tbody>${items.map(i=>`<tr><td>${identity(shortId(i.market_id),i.market_id)}</td><td title="${safe(i.question||"")}">${safe(i.question||"—")}</td><td>${safe(i.category)}</td><td><strong>${safe(i.quality_label||i.quality||"UNKNOWN")}</strong><span class="quality-context">${safe(i.quality_context||"")}</span></td><td>${safe(i.settlement)}</td><td>${safe(dateText(i.observed_at))}</td></tr>`).join("")}</tbody></table>`:empty("No Polymarket observations","No persisted market page matches the current filters.");pager("polymarket",data);bindTable(); };
-    renderHermes = (data) => { const items=arr(data.items),statuses={}; for(const i of items){const s=String(i.status||"UNKNOWN").toUpperCase();statuses[s]=(statuses[s]||0)+1;} $("hermes-summary").innerHTML=`<div class="three-col"><div class="key-value"><span class="key">Queue items</span><strong>${count(data.total)}</strong></div><div class="key-value"><span class="key">Visible statuses</span><strong>${safe(Object.entries(statuses).map(([k,v])=>`${k} ${v}`).join(" · ")||"—")}</strong></div><div class="key-value"><span class="key">Execution</span><strong>PAPER ONLY</strong></div></div>`; $("hermes-table").innerHTML=items.length?`<table><thead><tr><th>Queue item</th><th>Family</th><th>Dataset / version</th><th>Status</th><th>Outcome</th><th>Updated</th></tr></thead><tbody>${items.map(i=>`<tr><td><button class="link hermes" data-id="${encodeURIComponent(i.item_id||"")}">${identity(shortId(i.item_id),i.item_id,i.item_type||"")}</button></td><td>${safe(i.family)}</td><td>${identity(shortId(i.dataset_id),i.dataset_id,shortId(i.dataset_version))}</td><td><span class="badge ${statusClass(i.status)}">${safe(i.status)}</span></td><td>${safe(i.outcome_label||i.reason_code||"—")}</td><td>${safe(dateText(i.time||i.updated_at))}</td></tr>`).join("")}</tbody></table>`:empty("Hermes queue empty","Submit a bounded paper-only proposal to populate the research loop.");pager("hermes",data);bindTable();document.querySelectorAll(".hermes").forEach(b=>b.addEventListener("click",()=>loadHermes(decodeURIComponent(b.dataset.id)))); };
     function detailSection(title,value) { if(value==null||value===""||(Array.isArray(value)&&!value.length))return ""; return `<section class="detail-section"><h3>${safe(title)}</h3>${typeof value==="string"||typeof value==="number"?`<div>${safe(value)}</div>`:`<pre>${safe(json(value))}</pre>`}</section>`; }
     loadHermes = async function(id,persist=true) { state.selected=id;state.expanded=true;if(persist)saveState(true);if(detailController)detailController.abort();detailController=new AbortController();try{const response=await fetch(`/api/v2/hermes/${encodeURIComponent(id)}`,{cache:"no-store",signal:detailController.signal});if(!response.ok)throw new Error(`Hermes HTTP ${response.status}`);const d=await response.json(),item=arr(d.items)[0]||d.item||{};$("hermes-detail").innerHTML=d.available?`<article class="panel"><div class="section-title"><h2>Proposal detail</h2><span class="badge ${statusClass(d.status||item.status)}">${safe(d.status||item.status||"UNKNOWN")}</span></div><div class="detail-grid">${detailSection("Statement",d.statement)}<div class="detail-section"><h3>Exact dataset and family</h3><div class="key-value"><span class="key">Dataset ID</span><strong>${identity(shortId(d.dataset_id||item.dataset_id),d.dataset_id||item.dataset_id)}</strong></div><div class="key-value"><span class="key">Dataset version</span><strong>${identity(shortId(d.dataset_version||item.dataset_version),d.dataset_version||item.dataset_version)}</strong></div><div class="key-value"><span class="key">Family</span><strong>${safe(d.family||item.family)}</strong></div></div>${detailSection("Parameters / experiment plan",d.plan)}${detailSection("Submission validation and tests",d.tests)}${detailSection("Queue lifecycle",d.lifecycle_events)}${detailSection("Terminal result",d.final_result)}${d.rejection?detailSection("Rejection code and reason",d.rejection):""}</div><details><summary>raw proposal evidence</summary><pre>${safe(json(d))}</pre></details></article>`:empty("Hermes item unavailable",d.error||"The queue item was not found.");}catch(error){if(error.name!=="AbortError")$("hermes-detail").innerHTML=empty("Hermes detail unavailable",error.message);} };
     renderPaper = (data) => { const s=data.candidate_portfolio_summary||{},portfolios=arr(data.candidate_portfolios),t=data.paper_telemetry||{}; $("portfolio-summary").innerHTML=`<div class="card-grid"><div class="panel"><div class="metric">${portfolios.length?Number(s.total_equity||0).toFixed(2):"—"}</div><div class="metric-label">candidate paper equity</div></div><div class="panel"><div class="metric">${portfolios.length?Number(s.total_pnl||0).toFixed(2):"—"}</div><div class="metric-label">candidate paper P/L</div></div><div class="panel"><div class="metric">${count(portfolios.length)}</div><div class="metric-label">candidate portfolios</div></div><div class="panel"><div class="metric">${count(t.observation_records)}</div><div class="metric-label">paper telemetry observations</div></div><div class="panel"><div class="metric">${count(t.execution_events)}</div><div class="metric-label">paper execution events</div></div><div class="panel"><div class="metric">${count(t.resolved_bets)}</div><div class="metric-label">paper ledger bets</div></div></div><p class="page-note">Telemetry is persisted observation/execution history. Candidate portfolios are lifecycle-linked PAPER_FORWARD/PAPER_PROMOTABLE states only.</p>`; $("portfolio-states").innerHTML=arr(data.items).length?`<table><thead><tr><th>Record</th><th>Experiment</th><th>Market</th><th>Status</th><th>Timestamp</th></tr></thead><tbody>${arr(data.items).map(i=>`<tr><td>${safe(i.record_type)} · ${identity(shortId(i.record_id),i.record_id)}</td><td>${safe(i.experiment_id)}</td><td>${safe(i.market_id)}</td><td>${safe(i.status||i.resolution||i.outcome)}</td><td>${safe(dateText(i.timestamp))}</td></tr>`).join("")}</tbody></table>`:empty("No paper telemetry","No paper observations, execution events, or ledger records are persisted.");pager("paper",data);bindTable(); };
-    loadPage = async function(tab,force=false) { if(tab!==state.tab||!VIEW_ENDPOINT[tab]||document.hidden||loadInFlight||(!force&&Date.now()<nextRefreshAt))return; const generation=++refreshGeneration,controller=new AbortController();activeController=controller;loadInFlight=true;refreshMessage(tab,"");slowRefreshTimer=setTimeout(()=>{if(generation===refreshGeneration)refreshMessage(tab,"Refreshing…",true);},2000);try{const data=(tab==="overview"||tab==="canary")?await (async()=>{const response=await fetch("/api/operator",{cache:"no-store",signal:controller.signal});if(!response.ok)throw new Error(`operator HTTP ${response.status}`);operator=await response.json();return operator;})():await fetchV2(VIEW_ENDPOINT[tab],controller.signal);if(generation!==refreshGeneration||tab!==state.tab)return;current=data;({overview:renderOverview,canary:renderCanary,datasets:renderDatasets,activity:renderActivity,candidates:renderCandidates,polymarket:renderPolymarket,hermes:renderHermes,crypto:renderCrypto,portfolio:renderPaper}[tab])(data);refreshMessage(tab,`Updated · ${new Date().toLocaleTimeString()}`);}catch(error){if(error.name!=="AbortError"&&generation===refreshGeneration)refreshMessage(tab,"Refresh failed · showing last successful content",true);}finally{clearTimeout(slowRefreshTimer);if(generation===refreshGeneration){activeController=null;loadInFlight=false;nextRefreshAt=Date.now()+refreshCadence(tab);}} };
-    activate = function(tab,push=true) { if(!VIEW_ENDPOINT[tab])tab="overview";if(tab!==state.tab){state.selected="";state.expanded=false;state.filter="";state.sort="";state.direction="desc";state.page=1;}state.tab=tab;document.querySelectorAll(".tab").forEach(b=>b.classList.toggle("active",b.dataset.view===tab));document.querySelectorAll(".view").forEach(v=>v.classList.toggle("active",v.id===`view-${tab}`));if($("candidate-detail"))$("candidate-detail").style.display=tab==="candidates"?"block":"none";if($("detail"))$("detail").style.display=tab==="overview"?"block":"none";if(activeController)activeController.abort();if(detailController)detailController.abort();activeController=null;loadInFlight=false;refreshGeneration++;nextRefreshAt=0;saveState(push);setTimeout(()=>loadPage(tab,true),0); };
-    load = async function() { if(startupPending){startupPending=false;return;} if(document.hidden||loadInFlight)return; return loadPage(state.tab,false); };
+    loadPage = async function(tab,force=false) {
+      if(tab!==state.tab||!VIEW_ENDPOINT[tab]||document.hidden||loadInFlight||(!force&&Date.now()<nextRefreshAt))return;
+      const generation=++refreshGeneration,controller=new AbortController();
+      activeController=controller; loadInFlight=true; refreshMessage(tab,"");
+      slowRefreshTimer=setTimeout(()=>{if(generation===refreshGeneration)refreshMessage(tab,"Refreshing…",true);},2000);
+      const renderPersisted=async(kind,url,render,target)=>{
+        try {
+          const data=await fetchWithTimeout(url,{cache:"no-store",signal:controller.signal});
+          if(generation!==refreshGeneration)return;
+          lastGood[kind]=data; lastSuccessful=Date.now();
+          render(data);
+          refreshMessage(target,`Updated · ${new Date().toLocaleTimeString()}`);
+        } catch(error) {
+          if(generation!==refreshGeneration||error?.name==="AbortError")return;
+          if(lastGood[kind])render(lastGood[kind]);
+          refreshMessage(target,`Refresh failed (${refreshError(error)}) · showing last successful content`,true);
+        }
+      };
+      try {
+        if(tab==="overview"||tab==="canary") {
+          await Promise.all([
+            renderPersisted("overview","/api/v2/overview-summary",renderOverview,"overview"),
+            renderPersisted("canary","/api/v2/canary",renderCanary,"canary"),
+            (async()=>{
+              try {
+                const controls=await fetchWithTimeout("/api/operator",{cache:"no-store",signal:controller.signal});
+                if(generation!==refreshGeneration)return;
+                lastGood.controls=controls;
+                operator=controls;
+                renderOperatorControls({operator_controls:controls.operator_controls||controls});
+              } catch(error) {
+                if(generation!==refreshGeneration||error?.name==="AbortError")return;
+                if(lastGood.controls) {
+                  operator=lastGood.controls;
+                  renderOperatorControls({operator_controls:operator.operator_controls||operator});
+                }
+                refreshMessage(tab,`Refresh failed (${refreshError(error)}) · showing last successful content`,true);
+              }
+            })()
+          ]);
+        } else {
+          const data=await fetchV2Bounded(VIEW_ENDPOINT[tab],controller.signal);
+          if(generation!==refreshGeneration)return;
+          lastGood[tab]=data; lastSuccessful=Date.now(); current=data;
+          ({datasets:renderDatasets,activity:renderActivity,candidates:renderCandidates,polymarket:renderPolymarket,hermes:renderHermes,crypto:renderCrypto,portfolio:renderPaper}[tab])(data);
+          refreshMessage(tab,`Updated · ${new Date().toLocaleTimeString()}`);
+        }
+      } catch(error) {
+        if(generation===refreshGeneration&&error?.name!=="AbortError") {
+          if(lastGood[tab])({overview:renderOverview,canary:renderCanary,datasets:renderDatasets,activity:renderActivity,candidates:renderCandidates,polymarket:renderPolymarket,hermes:renderHermes,crypto:renderCrypto,portfolio:renderPaper}[tab])(lastGood[tab]);
+          refreshMessage(tab,`Refresh failed (${refreshError(error)}) · showing last successful content`,true);
+        }
+      } finally {
+        clearRefreshing(tab);
+        clearTimeout(slowRefreshTimer);
+        if(activeController===controller) {
+          activeController=null;
+          loadInFlight=false;
+        }
+        if(generation===refreshGeneration)nextRefreshAt=Date.now()+refreshCadence(tab);
+      }
+    };
+    activate = function(tab,push=true) {
+      if(!VIEW_ENDPOINT[tab])tab="overview";
+      if(tab!==state.tab){state.selected="";state.expanded=false;state.filter="";state.sort="";state.direction="desc";state.page=1;}
+      state.tab=tab;
+      document.querySelectorAll(".tab").forEach(b=>b.classList.toggle("active",b.dataset.view===tab));
+      document.querySelectorAll(".view").forEach(v=>v.classList.toggle("active",v.id===`view-${tab}`));
+      if($("candidate-detail"))$("candidate-detail").style.display=tab==="candidates"?"block":"none";
+      if($("detail"))$("detail").style.display=tab==="overview"?"block":"none";
+      if(activeController)activeController.abort();
+      if(detailController)detailController.abort();
+      refreshGeneration++;
+      nextRefreshAt=0;
+      saveState(push);
+      const schedule=()=>{if(state.tab!==tab)return;if(loadInFlight){setTimeout(schedule,25);return;}loadPage(tab,true);};
+      setTimeout(schedule,0);
+    };
+    load = async function() {
+      if(startupPending){startupPending=false;return;}
+      if(document.hidden||loadInFlight)return;
+      return loadPage(state.tab,false);
+    };
     document.addEventListener("click",async event=>{const button=event.target.closest?.(".control-action");if(!button)return;const action=button.dataset.controlAction||"",target=button.dataset.controlTarget||"",expected=button.dataset.controlConfirm||"";if(expected){const typed=window.prompt(`Type ${expected} to continue`);if(typed!==expected){$("control-result").textContent=`${action} cancelled: exact confirmation required`;return;}}const result=await controlPost(action,target,expected);const local=$("candidate-control-result");if(local&&target===state.selected)local.textContent=result.ok?`${action} completed`:`${action} blocked: ${result.reason||"CONTROL_FAILED"}`;});
     ensureActivityKind(); if($("crypto-symbol")){const oldSymbol=$("crypto-symbol"),newSymbol=oldSymbol.cloneNode(true);oldSymbol.replaceWith(newSymbol);newSymbol.addEventListener("input",()=>{state.page=1;saveState(true);loadPage("crypto",true);});} document.addEventListener("click",event=>{const button=event.target.closest?.(".copy");if(!button)return;navigator.clipboard?.writeText(button.dataset.copy||"").then(()=>{button.textContent="copied";setTimeout(()=>button.textContent="copy",1200);}).catch(()=>{});}); document.addEventListener("visibilitychange",()=>{if(document.hidden){if(activeController)activeController.abort();}else{nextRefreshAt=0;load();}});
     ensureFacets(); document.querySelectorAll(".tab").forEach(b=>b.addEventListener("click",()=>activate(b.dataset.view))); document.querySelectorAll("[data-link]").forEach(b=>b.addEventListener("click",e=>{e.preventDefault();activate(b.dataset.link)})); document.querySelectorAll(".filters input,.filters select").forEach(el=>el.addEventListener(el.tagName==="INPUT"?"input":"change",()=>{if(el.id.endsWith("-size")){const n=Number(el.value);if([10,25,50,100].includes(n)){state.page_size=n;document.querySelectorAll('select[id$="-size"]').forEach(s=>s.value=String(n));}} else if(el.id.includes("-filter"))state.filter=el.value;state.page=1;saveState(true);loadPage(state.tab)})); window.addEventListener("popstate",()=>{const q=new URLSearchParams(location.search),nextTab=q.get("tab")||"overview",changed=nextTab!==state.tab;params=q;state.tab=nextTab;state.page=Math.max(1,Number(q.get("page")||1));state.page_size=[10,25,50,100].includes(Number(q.get("page_size")))?Number(q.get("page_size")):25;state.filter=changed?"":q.get("filter")||"";state.sort=changed?"":q.get("sort")||"";state.direction=changed?"desc":q.get("direction")==="asc"?"asc":"desc";state.selected=changed?"":q.get("selected")||"";state.expanded=changed?false:q.get("expanded")==="1";restoreFacets();activate(state.tab,false)}); load(); activate(state.tab,false); const refreshHandle=setInterval(load,10000); window.addEventListener("beforeunload",()=>clearInterval(refreshHandle));

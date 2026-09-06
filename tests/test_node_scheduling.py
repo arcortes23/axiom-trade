@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import sqlite3
 import tempfile
 import threading
 import time
@@ -140,24 +141,141 @@ class SchedulerScaleTests(unittest.TestCase):
 
                 node._run_single_paper_worker = slow_paper_worker  # type: ignore[method-assign]
                 node._run_research_queue = slow_research_queue  # type: ignore[method-assign]
+                def disabled_auto_canary_tick(*, now: datetime | None = None) -> dict[str, Any]:
+                    return {
+                        "status": "DISABLED",
+                        "decision": "AUTONOMOUS_CANARY_DISABLED",
+                        "blocker": "AUTONOMOUS_CANARY_DISABLED",
+                    }
+
+                node._auto_canary_worker.tick = disabled_auto_canary_tick  # type: ignore[method-assign]
+                store.connection.execute(
+                    """
+                    CREATE TABLE canary_selection (
+                        singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                        ranking_run_id TEXT NOT NULL,
+                        candidate_id TEXT,
+                        rank INTEGER,
+                        total_score REAL,
+                        component_scores_json TEXT NOT NULL,
+                        evidence_versions_json TEXT NOT NULL,
+                        reason TEXT NOT NULL,
+                        selected_at TEXT NOT NULL
+                    )
+                    """
+                )
+                store.connection.execute(
+                    """
+                    INSERT INTO canary_selection(
+                        singleton,ranking_run_id,candidate_id,rank,total_score,
+                        component_scores_json,evidence_versions_json,reason,selected_at
+                    ) VALUES (1,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        "persisted-ranking-run",
+                        "persisted-candidate",
+                        1,
+                        0.875,
+                        '{"raw":{"historical_data_integrity":"PASS","historical_execution_fidelity":"PRICE_PROXY","current_execution_evidence":"CURRENT_ORDER_BOOK_REQUIRED"}}',
+                        '{"dataset_version":"persisted-v1"}',
+                        "SELECTED_WINNER",
+                        T0.isoformat(),
+                    ),
+                )
+                store.connection.commit()
+
+                class LockProbe:
+                    def __init__(self) -> None:
+                        self._lock = threading.RLock()
+                        self._state_lock = threading.Lock()
+                        self._owner: int | None = None
+                        self._depth = 0
+
+                    def acquire(self, *args: Any, **kwargs: Any) -> bool:
+                        acquired = self._lock.acquire(*args, **kwargs)
+                        if acquired:
+                            owner = threading.get_ident()
+                            with self._state_lock:
+                                if self._owner == owner:
+                                    self._depth += 1
+                                else:
+                                    self._owner = owner
+                                    self._depth = 1
+                        return acquired
+
+                    def release(self) -> None:
+                        with self._state_lock:
+                            self._lock.release()
+                            if self._owner == threading.get_ident():
+                                self._depth -= 1
+                                if self._depth == 0:
+                                    self._owner = None
+
+                    def __enter__(self) -> "LockProbe":
+                        self.acquire()
+                        return self
+
+                    def __exit__(self, exc_type: Any, exc_value: Any, traceback_value: Any) -> None:
+                        self.release()
+
+                    def held_by_current_thread(self) -> bool:
+                        with self._state_lock:
+                            return self._owner == threading.get_ident() and self._depth > 0
+
+                original_lock = store._lock
+                lock_probe = LockProbe()
+                store._lock = lock_probe  # type: ignore[assignment]
+
+                def authorize_canary_selection(
+                    _action: int,
+                    table: str | None,
+                    _column: str | None,
+                    _database: str | None,
+                    _source: str | None,
+                ) -> int:
+                    if (
+                        _action == sqlite3.SQLITE_READ
+                        and table == "canary_selection"
+                        and not lock_probe.held_by_current_thread()
+                    ):
+                        return sqlite3.SQLITE_DENY
+                    return sqlite3.SQLITE_OK
+
+                store.connection.set_authorizer(authorize_canary_selection)
+                try:
+                    locked_overview = DashboardData(store=store).overview_summary()
+                    self.assertEqual(locked_overview["canary"]["winner_id"], "persisted-candidate")
+                finally:
+                    store.connection.set_authorizer(None)
+                    store._lock = original_lock
+
+                reader_started = threading.Event()
                 reader_stop = threading.Event()
-                reader_errors: list[BaseException] = []
+                reader_errors: list[str] = []
 
                 def dashboard_reader() -> None:
+                    reader_started.set()
                     while not reader_stop.is_set():
                         try:
                             overview = DashboardData(store=store).overview_summary()
                             self.assertIn("components", overview)
                         except BaseException as exc:  # pragma: no cover - assertion captured for main thread
-                            reader_errors.append(traceback.format_exc())
+                            reader_errors.append(
+                                f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"
+                            )
                             return
 
                 reader = threading.Thread(target=dashboard_reader, daemon=True)
                 reader.start()
-                node.run(max_cycles=6)
-                reader_stop.set()
-                reader.join(timeout=2.0)
-                self.assertFalse(reader_errors)
+                try:
+                    self.assertTrue(reader_started.wait(timeout=2.0))
+                    node.run(max_cycles=6)
+                finally:
+                    reader_stop.set()
+                    reader.join(timeout=2.0)
+                    self.assertFalse(reader.is_alive())
+
+                self.assertFalse(reader_errors, "\n".join(reader_errors))
                 self.assertEqual(len(collector.calls), 6)
                 self.assertTrue(paper_started)
                 self.assertTrue(paper_finished)
@@ -169,6 +287,13 @@ class SchedulerScaleTests(unittest.TestCase):
                 self.assertEqual(store.get_collector_state("polymarket")["markets_seen"], 100)
 
                 overview = DashboardData(store=store).overview_summary()
+                canary = overview["canary"]
+                self.assertEqual(canary["winner_id"], "persisted-candidate")
+                self.assertEqual(canary["winner_score"], 0.875)
+                self.assertEqual(canary["selection_reason"], "SELECTED_WINNER")
+                self.assertEqual(canary["eligible_count"], 0)
+                self.assertEqual(canary["rankable_count"], 0)
+                self.assertEqual(canary["execution_event_count"], 0)
                 components = {item["name"]: item for item in overview["components"]}
                 self.assertIn("POLYMARKET COLLECTOR", components)
                 self.assertIn("PAPER ENGINE", components)

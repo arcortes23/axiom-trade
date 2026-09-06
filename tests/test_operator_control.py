@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 from pathlib import Path
@@ -13,9 +13,10 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 from types import SimpleNamespace
 
-from axiom.canary import CanaryService
+from axiom.canary import AUTONOMOUS_CANARY_LIMITS, CanaryService, CredentialStore
 from axiom.dashboard import DashboardData, DashboardServer, _DashboardHandler
 from axiom.operator import BOOTSTRAP_JOB_NAME, OperatorControlPlane
+from axiom.ranker import CandidateCanaryRanker
 from axiom.storage import AxiomStore
 
 
@@ -126,14 +127,21 @@ class OperatorControlTests(unittest.TestCase):
             thread = self.control._bootstrap_threads[BOOTSTRAP_JOB_NAME]
             thread.join(2)
 
-    def _seed_candidate(self, candidate_id: str = "candidate-1") -> None:
+    def _seed_candidate(
+        self,
+        candidate_id: str = "candidate-1",
+        *,
+        store: AxiomStore | None = None,
+        timestamp: datetime | None = None,
+    ) -> None:
+        target = store or self.store
         dataset_timestamp = datetime(2025, 1, 1, tzinfo=timezone.utc)
-        self.store.save_dataset(
+        target.save_dataset(
             "dataset-1",
             "dataset-v1",
             [{"timestamp": dataset_timestamp.isoformat(), "price": 0.5, "source_type": "HISTORICAL"}],
         )
-        self.store.save_dataset_catalog(
+        target.save_dataset_catalog(
             "dataset-1",
             "dataset-v1",
             provider="polymarket",
@@ -195,8 +203,200 @@ class OperatorControlTests(unittest.TestCase):
             "frozen": True,
             "critical_error": None,
         }
-        self.store.save_candidate_lifecycle(candidate_id, "IDEA", payload)
-        self.store.save_candidate_lifecycle(candidate_id, "FROZEN", payload, from_stage="IDEA")
+        target.save_candidate_lifecycle(candidate_id, "IDEA", payload, timestamp=timestamp)
+        target.save_candidate_lifecycle(candidate_id, "FROZEN", payload, from_stage="IDEA", timestamp=timestamp)
+    def test_dashboard_restart_hydrates_persisted_overview_and_canary(self) -> None:
+        restart_db = str(Path(self.tempdir.name) / "restart.sqlite")
+        timestamp = datetime(2026, 1, 2, 12, tzinfo=timezone.utc)
+        secrets = ("FAKE_PRIVATE_KEY", "FAKE_WALLET_ADDRESS", "FAKE_RELAYER_KEY")
+        credentials = Mock()
+        credentials.configured.return_value = True
+        credentials.load.return_value = {
+            "private_key": secrets[0],
+            "wallet_address": secrets[1],
+            "relayer_api_key": secrets[2],
+        }
+        credentials.safe_projection.return_value = {
+            "configured": True,
+            "status": "CONFIGURED",
+            "secret_values_exposed": False,
+        }
+
+        with patch("axiom.storage._now_iso", return_value=timestamp.isoformat()):
+            with AxiomStore(restart_db) as original_store:
+                original_control = OperatorControlPlane(original_store)
+                original_dashboard = DashboardData(store=original_store, control=original_control)
+                self._seed_candidate("winner", store=original_store, timestamp=timestamp)
+                winner = original_store.load_candidate_lifecycle("winner")
+                self.assertIsInstance(winner, dict)
+                winner_payload = dict(winner["payload"])
+
+                def rankable_payload(candidate_id: str, score: float) -> dict[str, object]:
+                    return {
+                        **winner_payload,
+                        "candidate_id": candidate_id,
+                        "validation_expectancy": score,
+                        "validation_confidence_lower_bound": score,
+                        "validation_stability": 0.90,
+                        "validation_calibration": 0.90,
+                        "validation_sample_count": 100,
+                        "validation_trade_count": 50,
+                        "validation_execution_quality": 0.90,
+                    }
+
+                winner_payload = rankable_payload("winner", 0.42)
+                original_store.save_candidate_lifecycle(
+                    "winner",
+                    "FROZEN",
+                    winner_payload,
+                    from_stage="FROZEN",
+                    timestamp=timestamp,
+                )
+                runner_payload = rankable_payload("runner", 0.21)
+                original_store.save_candidate_lifecycle("runner", "IDEA", runner_payload, timestamp=timestamp)
+                original_store.save_candidate_lifecycle(
+                    "runner",
+                    "FROZEN",
+                    runner_payload,
+                    from_stage="IDEA",
+                    timestamp=timestamp,
+                )
+
+                canary_service = CanaryService(original_store, clock=lambda: timestamp)
+                ranking = CandidateCanaryRanker(
+                    original_store,
+                    service=canary_service,
+                    clock=lambda: timestamp,
+                ).evaluate_and_select(timestamp)
+                self.assertEqual(ranking["selected_candidate"], "winner")
+                selected = ranking["selected"]
+                self.assertIsInstance(selected, dict)
+                selected_score = selected["total_score"]
+                self.assertIsInstance(selected_score, float)
+
+                # Use the typed operator action to persist the disabled state and
+                # its restart-safe autonomous decision/blocker.
+                self.assertTrue(original_control.execute("canary.disarm", confirm="DISARM")["ok"])
+
+                queue_item = original_store.enqueue_research_item(
+                    "hypothesis",
+                    {
+                        "dataset_id": "dataset-1",
+                        "dataset_version": "dataset-v1",
+                        "family": "test-family",
+                        "reason_code": "HERMES_FIXTURE_COMPLETE",
+                    },
+                    dedupe_key="hermes-restart-fixture",
+                    source="hermes",
+                    author="fixture",
+                    item_id="hermes-restart-item",
+                    available_at=timestamp,
+                )
+                self.assertEqual(queue_item["status"], "PENDING")
+                claimed = original_store.claim_research_item("hermes-fixture", now=timestamp)
+                self.assertIsNotNone(claimed)
+                original_store.complete_research_item(
+                    "hermes-restart-item",
+                    "COMPLETED",
+                    result={
+                        "dataset_id": "dataset-1",
+                        "dataset_version": "dataset-v1",
+                        "family": "test-family",
+                        "reason_code": "HERMES_FIXTURE_COMPLETE",
+                    },
+                    now=timestamp + timedelta(seconds=1),
+                    worker="hermes-fixture",
+                )
+
+            # The context boundary above closes the original store before the
+            # fresh objects below are created.
+            with AxiomStore(restart_db) as reopened_store:
+                reopened_control = OperatorControlPlane(reopened_store)
+                reopened_dashboard = DashboardData(store=reopened_store, control=reopened_control)
+                before_hydration_changes = reopened_store.connection.total_changes
+                with patch("axiom.operator.CredentialStore", return_value=credentials), patch(
+                    "axiom.canary.CredentialStore", return_value=credentials
+                ):
+                    overview = reopened_dashboard.overview_summary()
+                    operator = reopened_dashboard.operator_data()
+                    canary = reopened_dashboard.canary_data()
+                self.assertEqual(reopened_store.connection.total_changes, before_hydration_changes)
+
+        self.assertLessEqual(len(overview["latest_activity"]), 8)
+        self.assertEqual(overview["coverage"]["historical_count"], 1)
+        self.assertEqual(overview["coverage"]["historical_rows"], 1)
+        self.assertEqual(overview["lifecycle_funnel"]["FROZEN"], 2)
+        self.assertTrue(overview["latest_activity"])
+        self.assertEqual(overview["research_cards"]["canary_eligible"], 2)
+        self.assertEqual(
+            {item["candidate_id"] for item in overview["latest_candidates"]},
+            {"winner", "runner"},
+        )
+        overview_hermes = overview["hermes_latest_outcome"]
+        self.assertIsInstance(overview_hermes, dict)
+        self.assertEqual(overview_hermes["status"], "COMPLETED")
+        self.assertEqual(overview_hermes["outcome_type"], "EXPERIMENT_COMPLETED")
+
+        self.assertEqual(operator["research_cards"]["canary_eligible"], 2)
+        self.assertEqual(operator["coverage"]["historical_count"], 1)
+        self.assertEqual(operator["coverage"]["historical_rows"], 1)
+        self.assertEqual(operator["lifecycle_funnel"]["FROZEN"], 2)
+        latest_candidates = operator["latest_candidates"]
+        self.assertLessEqual(len(latest_candidates), 10)
+        self.assertEqual(
+            {item["candidate_id"] for item in latest_candidates},
+            {"winner", "runner"},
+        )
+        hermes_outcome = operator["hermes_latest_outcome"]
+        self.assertIsInstance(hermes_outcome, dict)
+        self.assertEqual(hermes_outcome["status"], "COMPLETED")
+        self.assertEqual(hermes_outcome["outcome_type"], "EXPERIMENT_COMPLETED")
+        self.assertEqual(hermes_outcome["reason_code"], "HERMES_FIXTURE_COMPLETE")
+        self.assertEqual(hermes_outcome["dataset_id"], "dataset-1")
+        self.assertEqual(hermes_outcome["dataset_version"], "dataset-v1")
+        self.assertTrue(any(item["kind"] == "research" for item in operator["latest_activity"]))
+
+        status = canary["canary"]
+        self.assertEqual(status["micro_live_canary"], "DISARMED")
+        self.assertEqual(status["display_state"], "DISABLED")
+        self.assertEqual(status["risk_envelope"], dict(AUTONOMOUS_CANARY_LIMITS))
+        self.assertEqual(status["risk_limits"], dict(AUTONOMOUS_CANARY_LIMITS))
+        self.assertEqual(status["eligible_count"], 2)
+        self.assertEqual(status["rankable_count"], 2)
+        self.assertEqual(status["execution_event_count"], 0)
+        self.assertEqual(status["real_execution_events"], 0)
+        self.assertEqual(status["trades"], [])
+        self.assertIsNone(canary["canary_signal"])
+        self.assertEqual(canary["research_cards"]["canary_eligible"], 2)
+        self.assertEqual(canary["candidate_status"]["rankable"], 2)
+        self.assertEqual(canary["real_execution_events"], 0)
+
+        autonomous = canary["autonomous_canary"]
+        self.assertEqual(autonomous["selected_candidate"], "winner")
+        self.assertEqual(autonomous["rank"], 1)
+        self.assertEqual(autonomous["score"], selected_score)
+        self.assertEqual(autonomous["selection_reason"], "SELECTED_WINNER")
+        self.assertEqual(autonomous["eligible_count"], 2)
+        self.assertEqual(autonomous["rankable_count"], 2)
+        self.assertEqual(autonomous["historical_data_integrity"], "PASS")
+        self.assertEqual(autonomous["historical_execution_fidelity"], "PRICE_PROXY · LIMITED")
+        self.assertEqual(autonomous["current_execution_evidence"], "CURRENT_ORDER_BOOK_REQUIRED")
+        self.assertEqual(autonomous["next_decision"], "ENABLE AUTO CANARY")
+        self.assertEqual(autonomous["blocker"], "AUTONOMOUS_CANARY_DISABLED")
+
+        for payload in (operator, canary):
+            projected = payload["credentials"]
+            self.assertEqual(
+                set(projected),
+                {"configured", "status", "secret_values_exposed"},
+            )
+            self.assertTrue(projected["configured"])
+            self.assertEqual(projected["status"], "CONFIGURED")
+            self.assertFalse(projected["secret_values_exposed"])
+        encoded = json.dumps({"operator": operator, "canary": canary}, default=str)
+        for secret in secrets:
+            self.assertNotIn(secret, encoded)
+
     def test_candidate_provenance_is_explicit_and_complete(self) -> None:
         self._seed_candidate()
         data = DashboardData(store=self.store, control=self.control)
@@ -260,6 +460,79 @@ class OperatorControlTests(unittest.TestCase):
         self.assertGreaterEqual(len(actions), 2)
         activity = self.store.paginate_research_activity(kind="operator", page_size=25)
         self.assertGreaterEqual(activity["total"], 2)
+    def test_manual_arm_target_is_distinct_from_persisted_autonomous_winner(self) -> None:
+        timestamp = datetime(2026, 1, 2, 12, tzinfo=timezone.utc)
+        self._seed_candidate("A", timestamp=timestamp)
+        candidate_b = dict(self.store.load_candidate_lifecycle("A")["payload"])
+        candidate_b["candidate_id"] = "B"
+        self.store.save_candidate_lifecycle(
+            "B",
+            "IDEA",
+            candidate_b,
+            timestamp=timestamp,
+        )
+        self.store.save_candidate_lifecycle(
+            "B",
+            "FROZEN",
+            candidate_b,
+            from_stage="IDEA",
+            timestamp=timestamp,
+        )
+        credentials = Mock()
+        credentials.configured.return_value = True
+        service = CanaryService(
+            self.store,
+            credentials=credentials,
+            clock=lambda: timestamp,
+        )
+        service.mark_eligible("A")
+        service.mark_eligible("B")
+        self.store.polymarket_health = lambda **_: {"grade": "A", "errors": 0}
+        with self.store.connection:
+            self.store.connection.execute(
+                "INSERT INTO canary_selection("
+                "singleton,ranking_run_id,candidate_id,rank,total_score,"
+                "component_scores_json,evidence_versions_json,reason,selected_at) "
+                "VALUES(1,?,?,?,?,?,?,?,?)",
+                (
+                    "rank-manual-target",
+                    "B",
+                    1,
+                    0.99,
+                    "{}",
+                    "{}",
+                    "SELECTED_WINNER",
+                    timestamp.isoformat(),
+                ),
+            )
+
+        class ArmVenue:
+            @staticmethod
+            def geoblock() -> dict[str, bool]:
+                return {"blocked": False, "close_only": False}
+
+        armed = service.arm("A", venue=ArmVenue(), credentials_configured=True)
+        self.assertEqual(armed["candidate"], "A")
+        self.assertEqual(armed["autonomous"]["selected_candidate"], "B")
+
+        check_a = service.check(candidate_id="A", venue=ArmVenue())
+        check_b = service.check(candidate_id="B", venue=ArmVenue())
+        self.assertNotIn("CANDIDATE_NOT_ARMED", check_a["failures"])
+        self.assertIn("CANDIDATE_NOT_ARMED", check_b["failures"])
+
+        with patch.object(
+            CredentialStore,
+            "safe_projection",
+            return_value={
+                "configured": False,
+                "status": "NOT CONFIGURED",
+                "secret_values_exposed": False,
+            },
+        ):
+            dashboard = DashboardData(store=self.store, control=self.control).canary_data()
+        self.assertEqual(dashboard["canary"]["candidate"], "A")
+        self.assertEqual(dashboard["autonomous_canary"]["selected_candidate"], "B")
+
 
     def test_get_dashboard_is_side_effect_free_and_survives_control_failure(self) -> None:
         before_changes = self.store.connection.total_changes

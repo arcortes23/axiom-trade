@@ -17,6 +17,7 @@ import math
 import sqlite3
 import queue
 import threading
+import time
 from urllib.request import Request, urlopen
 from typing import Any, Mapping, Protocol
 
@@ -62,6 +63,20 @@ _ENV_NAMES = {
     "relayer_api_key": "POLYMARKET_RELAYER_API_KEY",
     "relayer_api_key_address": "POLYMARKET_RELAYER_API_KEY_ADDRESS",
 }
+_SAFE_PROBE_TTL_SECONDS = 30.0
+_SAFE_PROBE_LOCK = threading.Lock()
+_SAFE_PROBE_CACHE: dict[tuple[type[Any], bool], tuple[float, bool]] = {}
+_SAFE_PROBE_GENERATIONS: dict[tuple[type[Any], bool], int] = {}
+_SAFE_PROBE_IN_FLIGHT: tuple[tuple[type[Any], bool], threading.Event, int] | None = None
+
+
+def _invalidate_safe_projection_cache(credential_type: type[Any]) -> None:
+    """Forget metadata cached before a credential configuration change."""
+    with _SAFE_PROBE_LOCK:
+        for allow_environment in (False, True):
+            key = (credential_type, allow_environment)
+            _SAFE_PROBE_GENERATIONS[key] = _SAFE_PROBE_GENERATIONS.get(key, 0) + 1
+            _SAFE_PROBE_CACHE.pop(key, None)
 
 
  
@@ -497,6 +512,7 @@ class CredentialStore:
                 value = ""
             if value:
                 keyring.set_password(self.service, name, value)
+        _invalidate_safe_projection_cache(type(self))
 
     def load(self, *, allow_environment: bool = False) -> dict[str, str]:
         values: dict[str, str] = {}
@@ -520,6 +536,85 @@ class CredentialStore:
 
     def configured(self, *, allow_environment: bool = False) -> bool:
         return bool(self.load(allow_environment=allow_environment))
+
+    def safe_projection(
+        self,
+        *,
+        allow_environment: bool = False,
+        timeout_seconds: float = 0.25,
+    ) -> dict[str, Any]:
+        """Return cached credential metadata without exposing values or blocking reads."""
+        global _SAFE_PROBE_IN_FLIGHT
+        try:
+            timeout = max(0.01, min(float(timeout_seconds), 2.0))
+        except (TypeError, ValueError):
+            timeout = 0.25
+
+        key = (type(self), bool(allow_environment))
+        start_probe = False
+        event: threading.Event | None = None
+        generation = 0
+        with _SAFE_PROBE_LOCK:
+            now = time.monotonic()
+            cached = _SAFE_PROBE_CACHE.get(key)
+            if cached is not None and now - cached[0] < _SAFE_PROBE_TTL_SECONDS:
+                configured = bool(cached[1])
+            else:
+                in_flight = _SAFE_PROBE_IN_FLIGHT
+                if in_flight is None:
+                    event = threading.Event()
+                    generation = _SAFE_PROBE_GENERATIONS.get(key, 0)
+                    _SAFE_PROBE_IN_FLIGHT = (key, event, generation)
+                    start_probe = True
+                else:
+                    # A probe for another key still occupies the one global
+                    # keyring worker; wait for it, then use this key's safe
+                    # cached value (or false before its first completion).
+                    event = in_flight[1]
+                configured = False
+
+        if event is not None:
+            if start_probe:
+                def invoke() -> None:
+                    global _SAFE_PROBE_IN_FLIGHT
+                    try:
+                        result = bool(
+                            self.configured(allow_environment=allow_environment)
+                        )
+                    except BaseException:
+                        result = False
+                    finished = time.monotonic()
+                    with _SAFE_PROBE_LOCK:
+                        if _SAFE_PROBE_GENERATIONS.get(key, 0) == generation:
+                            _SAFE_PROBE_CACHE[key] = (finished, result)
+                        current = _SAFE_PROBE_IN_FLIGHT
+                        if current is not None and current[1] is event:
+                            _SAFE_PROBE_IN_FLIGHT = None
+                        event.set()
+
+                worker = threading.Thread(
+                    target=invoke,
+                    name="axiom-canary-credential-probe",
+                    daemon=True,
+                )
+                try:
+                    worker.start()
+                except BaseException:
+                    with _SAFE_PROBE_LOCK:
+                        current = _SAFE_PROBE_IN_FLIGHT
+                        if current is not None and current[1] is event:
+                            _SAFE_PROBE_IN_FLIGHT = None
+                        event.set()
+            event.wait(timeout)
+            with _SAFE_PROBE_LOCK:
+                cached = _SAFE_PROBE_CACHE.get(key)
+                configured = bool(cached[1]) if cached is not None else False
+
+        return {
+            "configured": configured,
+            "status": "CONFIGURED" if configured else "NOT CONFIGURED",
+            "secret_values_exposed": False,
+        }
 
 
 
@@ -964,11 +1059,24 @@ class CanaryService:
                 )
 
     def _selection_record(self) -> dict[str, Any] | None:
+        connection = self.store.connection
+        lock = getattr(self.store, "_lock", None)
         try:
-            row = self.store.connection.execute(
-                "SELECT * FROM canary_selection WHERE singleton=1"
-            ).fetchone()
-        except sqlite3.OperationalError:
+            if lock is None:
+                row = connection.execute(
+                    "SELECT * FROM canary_selection WHERE singleton=1"
+                ).fetchone()
+            else:
+                # The shared store connection is also used by node writers.
+                # Keep this read under its lock so sqlite calls cannot race
+                # even while WAL permits readers and writers to overlap.
+                with lock:
+                    row = connection.execute(
+                        "SELECT * FROM canary_selection WHERE singleton=1"
+                    ).fetchone()
+        except sqlite3.OperationalError as exc:
+            if "no such table" not in str(exc).lower():
+                raise
             return None
         if row is None:
             return None
@@ -2045,11 +2153,171 @@ class CanaryService:
                 raise
             row = None
         now = ensure_utc(self.clock())
+        selection = self._selection_record()
+
+        def _safe_count(query: str) -> int:
+            try:
+                result = _fetchone(query)
+            except sqlite3.OperationalError:
+                return 0
+            try:
+                return int(result["n"]) if result is not None else 0
+            except (KeyError, TypeError, ValueError):
+                return 0
+
+        def _validated_eligibility_count() -> int:
+            query = (
+                "SELECT e.candidate_id,e.frozen_hash,e.evidence_json "
+                "FROM canary_eligibility AS e "
+                "JOIN candidate_lifecycle AS c ON c.candidate_id=e.candidate_id "
+                "WHERE c.stage IN ('FROZEN','PAPER_FORWARD','PAPER_PROMOTABLE')"
+            )
+            try:
+                rows = _fetchall(query)
+            except sqlite3.Error:
+                return 0
+            count = 0
+            for eligibility in rows:
+                try:
+                    candidate_id = str(eligibility["candidate_id"] or "").strip()
+                    if candidate_id and self._eligibility_is_bound(candidate_id, eligibility):
+                        count += 1
+                except Exception:
+                    continue
+            return count
+
+        eligible_count = _validated_eligibility_count()
+        rankable_count = _safe_count(
+            "SELECT COUNT(*) AS n FROM canary_rankings WHERE total_score IS NOT NULL"
+        )
+        execution_event_count = _safe_count(
+            "SELECT COUNT(*) AS n FROM canary_execution_events"
+        )
+
+        winner_id = (
+            str(selection.get("candidate_id")).strip()
+            if selection and selection.get("candidate_id")
+            else None
+        )
+        winner_quality: dict[str, Any] = {
+            "historical_data_integrity": "UNKNOWN",
+            "historical_execution_fidelity": "UNKNOWN",
+            "current_execution_evidence": "CURRENT_ORDER_BOOK_REQUIRED",
+        }
+        if winner_id:
+            try:
+                lifecycle = self.store.load_candidate_lifecycle(winner_id)
+            except (AttributeError, TypeError, ValueError, sqlite3.Error):
+                lifecycle = None
+            payload = lifecycle.get("payload") if isinstance(lifecycle, Mapping) else {}
+            payload = payload if isinstance(payload, Mapping) else {}
+            components = selection.get("component_scores") if selection else {}
+            components = components if isinstance(components, Mapping) else {}
+            raw_quality = components.get("raw")
+            raw_quality = raw_quality if isinstance(raw_quality, Mapping) else {}
+            sources = (payload, raw_quality)
+
+            def _first_quality(*names: str, default: Any = None) -> Any:
+                for source in sources:
+                    for name in names:
+                        value = source.get(name)
+                        if value is not None and value != "":
+                            return value
+                return default
+
+            integrity = _first_quality(
+                "historical_data_integrity",
+                "historical_integrity",
+                default="UNKNOWN",
+            )
+            if isinstance(integrity, bool):
+                integrity = "PASS" if integrity else "FAIL"
+            elif isinstance(integrity, (int, float)):
+                integrity = "PASS" if float(integrity) >= 1.0 else "FAIL"
+            fidelity = str(
+                _first_quality(
+                    "historical_execution_fidelity",
+                    "fidelity_label",
+                    default="UNKNOWN",
+                )
+            )
+            if fidelity.upper() == "PRICE_PROXY" and "LIMITED" not in fidelity.upper():
+                fidelity = "PRICE_PROXY · LIMITED"
+            current_execution = _first_quality(
+                "current_execution_evidence",
+                "execution_evidence",
+                default="CURRENT_ORDER_BOOK_REQUIRED",
+            )
+            winner_quality = {
+                "historical_data_integrity": str(integrity),
+                "historical_execution_fidelity": str(fidelity),
+                "current_execution_evidence": str(current_execution),
+            }
+        selection_reason = (
+            str(selection.get("reason") or "")
+            if isinstance(selection, Mapping)
+            else ""
+        )
+        selection_reason = selection_reason or None
+        risk_envelope = self.autonomous_limits()
+        autonomous_state = None
+        try:
+            autonomous_state = _fetchone(
+                "SELECT last_tick_at,next_decision,blocker,last_signal_id,worker_status "
+                "FROM canary_autonomous_state WHERE singleton=1"
+            )
+        except sqlite3.OperationalError:
+            autonomous_state = None
+
+        disabled_auto = {
+            "enabled": False,
+            "selected_candidate": winner_id,
+            "ranking_run_id": selection.get("ranking_run_id") if selection else None,
+            "rank": selection.get("rank") if selection else None,
+            "score": selection.get("total_score") if selection else None,
+            "selection_reason": selection_reason,
+            "eligible_count": eligible_count,
+            "rankable_count": rankable_count,
+            **winner_quality,
+            "next_decision": (
+                autonomous_state["next_decision"]
+                if autonomous_state is not None
+                else "ENABLE AUTO CANARY"
+            ),
+            "blocker": (
+                autonomous_state["blocker"]
+                if autonomous_state is not None
+                else "AUTONOMOUS_CANARY_DISABLED"
+            ),
+            "last_tick_at": (
+                autonomous_state["last_tick_at"]
+                if autonomous_state is not None
+                else None
+            ),
+            "last_signal_id": (
+                autonomous_state["last_signal_id"]
+                if autonomous_state is not None
+                else None
+            ),
+            "worker_status": (
+                autonomous_state["worker_status"]
+                if autonomous_state is not None
+                else "IDLE"
+            ),
+        }
+
+        display_state = "DISABLED"
         if row is None:
             return {
                 "production_live_trading": "DISABLED",
                 "micro_live_canary": "DISABLED",
+                "display_state": display_state,
+                "control_state": "DISABLED",
                 "candidate": None,
+                "winner_id": winner_id,
+                "winner_rank": selection.get("rank") if selection else None,
+                "winner_score": selection.get("total_score") if selection else None,
+                "selection_reason": selection_reason,
                 "venue": None,
                 "expiry": None,
                 "control_generation": 0,
@@ -2060,19 +2328,20 @@ class CanaryService:
                 "open_positions": 0,
                 "daily_loss_budget_remaining": float(DEFAULT_DAILY_LOSS_USD),
                 "limits": self._limits_record(CanaryLimits()),
-                "risk_envelope": self.autonomous_limits(),
-                "autonomous": {
-                    "enabled": False,
-                    "selected_candidate": None,
-                    "next_decision": "ENABLE AUTO CANARY",
-                    "blocker": "AUTONOMOUS_CANARY_DISABLED",
-                },
-                "live_execution": False,
+                "risk_envelope": risk_envelope,
+                "risk_limits": risk_envelope,
+                "eligible_count": eligible_count,
+                "rankable_count": rankable_count,
+                "real_execution_events": execution_event_count,
+                "execution_event_count": execution_event_count,
+                **winner_quality,
+                "autonomous": disabled_auto,
+                "selected_winner": selection,
                 "trades": [],
+                "live_execution": False,
                 "kill_semantics": "KILL_PREVENTS_NEW_SUBMISSIONS; IN_FLIGHT_REQUESTS_ARE_NOT_RETRACTED",
             }
         data=dict(row); state=str(data.get("state") or "DISABLED").upper()
-        selection = self._selection_record()
         limits: dict[str, Any] = {}
         try:
             parsed_limits = json.loads(data.get("limits_json") or "{}")
@@ -2108,14 +2377,6 @@ class CanaryService:
             expected = self._integrity("", AUTONOMOUS_CANARY_VENUE, "", limits)
             if limits != self.autonomous_limits() or expected != data.get("integrity_hash"):
                 state = "KILLED"
-        autonomous_state = None
-        try:
-            autonomous_state = _fetchone(
-                "SELECT last_tick_at,next_decision,blocker,last_signal_id,worker_status "
-                "FROM canary_autonomous_state WHERE singleton=1"
-            )
-        except sqlite3.OperationalError:
-            autonomous_state = None
         start=now.replace(hour=0,minute=0,second=0,microsecond=0).isoformat()
         active_states = "('RESERVED','SUBMITTING','UNKNOWN','OPEN','PARTIAL','SUBMITTED')"
         trades = [dict(x) for x in _fetchall(
@@ -2147,36 +2408,61 @@ class CanaryService:
         except (TypeError, ValueError):
             state = "KILLED"
             control_generation = 0
+        control_candidate = (
+            str(data.get("candidate_id")).strip()
+            if data.get("candidate_id")
+            else None
+        )
         selected_candidate = (
-            selection.get("candidate_id")
-            if state == AUTONOMOUS_MICRO_LIVE and selection
-            else data.get("candidate_id")
+            winner_id if state == AUTONOMOUS_MICRO_LIVE else control_candidate
         )
         auto_enabled = state == AUTONOMOUS_MICRO_LIVE
+        if state == "KILLED":
+            display_state = "KILLED"
+        elif state in {"ARMED", AUTONOMOUS_MICRO_LIVE}:
+            display_state = "ENABLED"
+        else:
+            display_state = "DISABLED"
         auto_payload = {
+            **disabled_auto,
             "enabled": auto_enabled,
-            "selected_candidate": selected_candidate,
-            "ranking_run_id": selection.get("ranking_run_id") if selection else None,
-            "rank": selection.get("rank") if selection else None,
-            "score": selection.get("total_score") if selection else None,
+            "selected_candidate": winner_id,
             "next_decision": (
                 autonomous_state["next_decision"]
-                if autonomous_state is not None
-                else ("WAITING_FOR_NEXT_DECISION" if auto_enabled else "ENABLE AUTO CANARY")
+                if autonomous_state is not None and (auto_enabled or state == "KILLED")
+                else "KILL_LATCHED" if state == "KILLED" else "ENABLE AUTO CANARY"
             ),
             "blocker": (
                 autonomous_state["blocker"]
-                if autonomous_state is not None
-                else ("NO_ELIGIBLE_CANDIDATE" if auto_enabled and not selected_candidate else None)
+                if autonomous_state is not None and (auto_enabled or state == "KILLED")
+                else "CANARY_KILLED" if state == "KILLED" else "AUTONOMOUS_CANARY_DISABLED"
             ),
-            "last_tick_at": autonomous_state["last_tick_at"] if autonomous_state is not None else None,
-            "last_signal_id": autonomous_state["last_signal_id"] if autonomous_state is not None else None,
-            "worker_status": autonomous_state["worker_status"] if autonomous_state is not None else "IDLE",
+            "last_tick_at": (
+                autonomous_state["last_tick_at"]
+                if autonomous_state is not None
+                else None
+            ),
+            "last_signal_id": (
+                autonomous_state["last_signal_id"]
+                if autonomous_state is not None
+                else None
+            ),
+            "worker_status": (
+                autonomous_state["worker_status"]
+                if autonomous_state is not None
+                else "IDLE"
+            ),
         }
         return {
             "production_live_trading": "DISABLED",
             "micro_live_canary": state,
+            "display_state": display_state,
+            "control_state": state,
             "candidate": selected_candidate,
+            "winner_id": winner_id,
+            "winner_rank": selection.get("rank") if selection else None,
+            "winner_score": selection.get("total_score") if selection else None,
+            "selection_reason": selection_reason,
             "venue": data.get("venue"),
             "expiry": data.get("expires_at"),
             "control_generation": control_generation,
@@ -2185,12 +2471,18 @@ class CanaryService:
             "today_realized_pnl": float(aggregates["pnl"]),
             "total_exposure": float(aggregates["exposure"]),
             "open_positions": int(aggregates["positions"]),
+            "limits": limits,
+            "risk_envelope": risk_envelope,
+            "risk_limits": risk_envelope,
+            "eligible_count": eligible_count,
+            "rankable_count": rankable_count,
+            "real_execution_events": execution_event_count,
+            "execution_event_count": execution_event_count,
+            **winner_quality,
             "daily_loss_budget_remaining": max(
                 0,
                 float(limits.get("max_daily_loss_usd", 2)) + float(aggregates["pnl"]),
             ),
-            "limits": limits,
-            "risk_envelope": self.autonomous_limits(),
             "autonomous": auto_payload,
             "selected_winner": selection,
             "trades": trades,

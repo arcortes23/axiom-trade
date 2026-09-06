@@ -174,6 +174,81 @@ class CanaryTests(unittest.TestCase):
             loaded["relayer_api_key_address"],
             "existing-relayer-address",
         )
+    def test_safe_projection_single_flight_is_bounded_and_secret_free(self):
+        class ProbeCredentialStore(CredentialStore):
+            pass
+
+        probe_started = threading.Event()
+        release_probe = threading.Event()
+        probe_finished = threading.Event()
+        probe_lock = threading.Lock()
+        probe_calls = 0
+        results = [None] * 4
+        errors = []
+        completed = [threading.Event() for _ in results]
+        barrier = threading.Barrier(len(results))
+
+        def blocked_configured(_credentials, **_kwargs):
+            nonlocal probe_calls
+            with probe_lock:
+                probe_calls += 1
+            probe_started.set()
+            release_probe.wait(2)
+            probe_finished.set()
+            return True
+
+        def project(index):
+            try:
+                barrier.wait()
+                results[index] = ProbeCredentialStore().safe_projection(
+                    timeout_seconds=0.05
+                )
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                completed[index].set()
+
+        with patch.object(CredentialStore, "configured", blocked_configured):
+            threads = [
+                threading.Thread(target=project, args=(index,))
+                for index in range(len(results))
+            ]
+            for thread in threads:
+                thread.start()
+            try:
+                self.assertTrue(probe_started.wait(1))
+                for done in completed:
+                    self.assertTrue(done.wait(0.5))
+                self.assertFalse(release_probe.is_set())
+                self.assertEqual(probe_calls, 1)
+                self.assertFalse(errors)
+                expected_keys = {
+                    "configured",
+                    "status",
+                    "secret_values_exposed",
+                }
+                for projection in results:
+                    self.assertIsNotNone(projection)
+                    self.assertEqual(set(projection), expected_keys)
+                    self.assertFalse(projection["configured"])
+                    self.assertEqual(projection["status"], "NOT CONFIGURED")
+                    self.assertFalse(projection["secret_values_exposed"])
+                    self.assertNotIn("private", json.dumps(projection).lower())
+                release_probe.set()
+                self.assertTrue(probe_finished.wait(1))
+                cached = ProbeCredentialStore().safe_projection(timeout_seconds=0.05)
+            finally:
+                release_probe.set()
+                for thread in threads:
+                    thread.join(1)
+
+        self.assertEqual(set(cached), expected_keys)
+        self.assertTrue(cached["configured"])
+        self.assertEqual(cached["status"], "CONFIGURED")
+        self.assertFalse(cached["secret_values_exposed"])
+        self.assertNotIn("private", json.dumps(cached).lower())
+
+
 
     def test_hermes_has_no_canary_execution_fields(self):
         from axiom.director import validate_hermes_proposal
@@ -249,6 +324,44 @@ class CanaryTests(unittest.TestCase):
             "CANDIDATE_NOT_CANARY_ELIGIBLE",
             lambda: self.service.arm("C123", venue=self.venue, credentials_configured=True),
         )
+    def test_public_counts_exclude_tampered_eligibility_binding(self):
+        payload = dict(self.store.load_candidate_lifecycle("C123")["payload"])
+        self.store.save_candidate_lifecycle(
+            "STALE",
+            "IDEA",
+            {**payload, "candidate_id": "STALE"},
+            timestamp=T0,
+        )
+        self.store.save_candidate_lifecycle(
+            "STALE",
+            "FROZEN",
+            {**payload, "candidate_id": "STALE"},
+            from_stage="IDEA",
+            timestamp=T0,
+        )
+        self.service.mark_eligible("STALE")
+        with self.store.connection:
+            self.store.connection.execute(
+                "UPDATE canary_eligibility SET frozen_hash=? WHERE candidate_id=?",
+                ("tampered-binding", "STALE"),
+            )
+
+        status = self.service.status()
+        self.assertEqual(status["eligible_count"], 1)
+        with patch.object(
+            CredentialStore,
+            "safe_projection",
+            return_value={
+                "configured": False,
+                "status": "NOT CONFIGURED",
+                "secret_values_exposed": False,
+            },
+        ):
+            dashboard = DashboardData(store=self.store).canary_data()
+        self.assertEqual(dashboard["canary"]["eligible_count"], 1)
+        self.assertEqual(dashboard["research_cards"]["canary_eligible"], 1)
+        self.assertEqual(dashboard["candidate_status"]["canary_eligible"], 1)
+
 
     def test_expired_arm_cannot_trade(self):
         self.arm(expires_hours=Decimal("0.001")); self.service.clock=lambda:T0+timedelta(hours=1)

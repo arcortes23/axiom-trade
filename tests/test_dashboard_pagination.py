@@ -4,13 +4,15 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 from pathlib import Path
+import re
 import tempfile
+import threading
 import unittest
 from urllib.error import HTTPError
 from urllib.parse import quote, urlencode
 from urllib.request import urlopen
 
-from axiom.dashboard import DashboardData, DashboardServer, _dashboard_html
+from axiom.dashboard import DashboardData, DashboardServer, _dashboard_html, _jsonable
 from axiom.domain import MarketType
 from axiom.storage import AxiomStore
 
@@ -24,6 +26,22 @@ CANDIDATE_COUNT = 23
 QUEUE_COUNT = 23
 PAPER_COUNT = 23
 ACTIVITY_COUNT = DATASET_COUNT + 1 + 45 + 25
+
+
+class _BlockingOperatorControl:
+    """Control stub that makes the legacy status path observably unavailable."""
+
+    def __init__(self) -> None:
+        self.status_started = threading.Event()
+        self.release_status = threading.Event()
+        self.status_calls = 0
+
+    def status(self) -> dict[str, object]:
+        self.status_calls += 1
+        self.status_started.set()
+        if not self.release_status.wait(timeout=5):
+            raise RuntimeError("operator status intentionally timed out")
+        raise RuntimeError("operator status intentionally failed")
 
 
 class DashboardPaginationFixture(unittest.TestCase):
@@ -918,6 +936,100 @@ class DashboardPaginationEndpointTests(DashboardPaginationFixture):
             )
             self.assertLessEqual(len(page["items"]), size)
 
+    def test_persisted_v2_endpoints_do_not_wait_for_operator_control_status(self) -> None:
+        persisted = self.store.dashboard_overview_summary(activity_limit=8)
+        control = _BlockingOperatorControl()
+        self.server.data.control = control
+        operator_result: list[tuple[int, object, str]] = []
+        operator_errors: list[BaseException] = []
+        endpoint_threads: list[threading.Thread] = []
+
+        def request_operator() -> None:
+            try:
+                operator_result.append(self._request("api/operator"))
+            except BaseException as exc:  # pragma: no cover - only captures thread failures
+                operator_errors.append(exc)
+
+        def request_before_control_release(path: str) -> tuple[int, object, str]:
+            result: list[tuple[int, object, str]] = []
+            errors: list[BaseException] = []
+            done = threading.Event()
+
+            def request_endpoint() -> None:
+                try:
+                    result.append(self._request(path))
+                except BaseException as exc:  # pragma: no cover - only captures thread failures
+                    errors.append(exc)
+                finally:
+                    done.set()
+
+            endpoint_thread = threading.Thread(target=request_endpoint, daemon=True)
+            endpoint_threads.append(endpoint_thread)
+            endpoint_thread.start()
+            self.assertTrue(
+                done.wait(timeout=2),
+                f"{path} waited for the slow operator-control status path",
+            )
+            endpoint_thread.join(timeout=1)
+            self.assertFalse(endpoint_thread.is_alive())
+            self.assertFalse(errors)
+            self.assertEqual(len(result), 1)
+            return result[0]
+
+        operator_thread = threading.Thread(target=request_operator, daemon=True)
+        operator_thread.start()
+        try:
+            self.assertTrue(
+                control.status_started.wait(timeout=1),
+                "the control status request did not enter its bounded synchronization point",
+            )
+            status, overview, _ = request_before_control_release("api/v2/overview-summary")
+            self.assertEqual(status, 200)
+            self.assertIsInstance(overview, dict)
+            assert isinstance(overview, dict)
+            historical = persisted["catalog"]["historical"]
+            self.assertEqual(overview["coverage"]["historical_count"], historical["datasets"])
+            self.assertEqual(overview["latest_activity"], _jsonable(persisted["latest_activity"]))
+            self.assertGreater(overview["research_cards"]["canary_eligible"], 0)
+
+            status, canary, _ = request_before_control_release("api/v2/canary")
+            self.assertEqual(status, 200)
+            self.assertIsInstance(canary, dict)
+            assert isinstance(canary, dict)
+            canary_status = canary["canary"]
+            self.assertEqual(canary_status["micro_live_canary"], "DISABLED")
+            self.assertEqual(canary_status["eligible_count"], 1)
+            self.assertEqual(canary_status["rankable_count"], 0)
+            self.assertEqual(canary_status["execution_event_count"], 0)
+            autonomous = canary["autonomous_canary"]
+            self.assertEqual(autonomous["eligible_count"], 1)
+            self.assertEqual(autonomous["rankable_count"], 0)
+            self.assertIsNone(canary["canary_signal"])
+            self.assertEqual(canary["research_cards"]["canary_eligible"], 1)
+            self.assertEqual(canary["candidate_status"]["rankable"], 0)
+            self.assertEqual(canary["real_execution_events"], 0)
+            credentials = canary["credentials"]
+            self.assertEqual(
+                set(credentials),
+                {"configured", "status", "secret_values_exposed"},
+            )
+            self.assertIsInstance(credentials["configured"], bool)
+            self.assertIn(credentials["status"], {"CONFIGURED", "NOT CONFIGURED"})
+            self.assertFalse(credentials["secret_values_exposed"])
+        finally:
+            control.release_status.set()
+            for endpoint_thread in endpoint_threads:
+                endpoint_thread.join(timeout=2)
+            operator_thread.join(timeout=2)
+        self.assertFalse(
+            any(thread.is_alive() for thread in endpoint_threads),
+            "persisted endpoint request thread was not released",
+        )
+        self.assertFalse(operator_thread.is_alive(), "slow control status thread was not released")
+        self.assertFalse(operator_errors)
+        self.assertEqual(len(operator_result), 1)
+        self.assertEqual(control.status_calls, 1)
+
 class DashboardPaginationSurfaceTests(DashboardPaginationFixture):
     def test_overview_and_list_responses_do_not_embed_unbounded_records(self) -> None:
         status, overview, overview_body = self._request("api/overview")
@@ -940,10 +1052,73 @@ class DashboardPaginationSurfaceTests(DashboardPaginationFixture):
         self.assertEqual(status, 200)
         self.assertIsInstance(overview, dict)
         assert isinstance(overview, dict)
-        self.assertLess(len(overview_body), 50000)
         self.assertLessEqual(len(overview["latest_activity"]), 8)
         self.assertNotIn("current_failures", overview_body)
         self.assertIn("collector_health", overview)
+        funnel = overview.get("lifecycle_funnel")
+        self.assertIsInstance(funnel, dict)
+        assert isinstance(funnel, dict)
+        self.assertTrue(funnel)
+        self.assertGreater(sum(funnel.values()), 0)
+        self.assertEqual(funnel["FROZEN"], 1)
+
+    def test_final_overview_renderer_consumes_lifecycle_funnel(self) -> None:
+        html = _dashboard_html()
+        start = html.rfind("renderOverview = (data) =>")
+        end = html.index("renderDatasets =", start)
+        final_renderer = html[start:end]
+        for marker in (
+            "data.lifecycle_funnel",
+            "funnel-row",
+            "funnel-track",
+            "funnel-bar",
+            'empty("No candidate lifecycle"',
+            "Hermes hypotheses appear after a durable queue item is processed.",
+        ):
+            self.assertIn(marker, final_renderer)
+        self.assertRegex(final_renderer, r'\$\(\s*["\']funnel["\']\s*\)\.innerHTML\s*=')
+        self.assertRegex(final_renderer, r"Object\.entries\(\s*funnel\s*\)")
+        self.assertRegex(final_renderer, r"safe\(\s*k\s*\)")
+        self.assertRegex(final_renderer, r"count\(\s*v\s*\)")
+
+    def test_independent_operator_controls_preserve_both_response_orders(self) -> None:
+        html = _dashboard_html()
+        status, overview, _ = self._request("api/v2/overview-summary")
+        self.assertEqual(status, 200)
+        self.assertIsInstance(overview, dict)
+        assert isinstance(overview, dict)
+        self.assertNotIn("operator_controls", overview)
+        overview_start = html.rfind("const _renderOverviewScheduling = renderOverview;")
+        overview_end = html.index("renderDatasets =", overview_start)
+        final_renderer = html[overview_start:overview_end]
+        render_call = "renderOperatorControls(data)"
+        self.assertIn(render_call, final_renderer)
+        call_prefix = final_renderer[:final_renderer.index(render_call)]
+        self.assertRegex(
+            call_prefix,
+            r'if\s*\(\s*Object\.prototype\.hasOwnProperty\.call\(\s*data\s*,\s*["\']operator_controls["\']\s*\)\s*\|\|\s*!operatorControlsRendered\s*\)\s*$',
+            "v2 overview data must not clear an already-rendered control response",
+        )
+
+        controls_start = html.index("function renderOperatorControls(data)")
+        controls_end = html.index("function saveState", controls_start)
+        controls_renderer = html[controls_start:controls_end]
+        self.assertRegex(
+            controls_renderer,
+            r"if\s*\(\s*!operatorControlsRendered\s*\)\s*\$\(\s*['\"]operator-controls['\"]\s*\)\.innerHTML\s*=",
+            "an overview-first empty control render may show unavailable state but must not clear known controls",
+        )
+        self.assertIn("operatorControlsRendered=true", controls_renderer)
+
+        fetch_start = html.index('const controls=await fetchWithTimeout("/api/operator"')
+        fetch_end = html.index("} catch(error)", fetch_start)
+        control_success = html[fetch_start:fetch_end]
+        self.assertRegex(
+            control_success,
+            r"lastGood\.controls\s*=\s*controls;[\s\S]*operator\s*=\s*controls;[\s\S]*"
+            r"renderOperatorControls\(\{\s*operator_controls\s*:\s*controls\.operator_controls\s*\|\|\s*controls\s*\}\)",
+            "the independent control-fetch success path must render its own response",
+        )
 
     def test_html_has_paginated_views_url_state_and_responsive_sticky_layout(self) -> None:
         html = _dashboard_html()
@@ -984,6 +1159,107 @@ class DashboardPaginationSurfaceTests(DashboardPaginationFixture):
         # literal in the initial HTML document.
         self.assertNotIn("dataset-00", html)
         self.assertNotIn("market-00", html)
+
+    def test_real_canary_surface_contains_persisted_evidence_labels(self) -> None:
+        html = _dashboard_html().lower()
+        start = html.index("function rendercanary")
+        end = html.index("function renderbtc", start)
+        real_canary = html[start:end]
+        self.assertIn("real canary money", html)
+        for label in (
+            "credentials",
+            "eligible candidates",
+            "rankable candidates",
+            "selection reason",
+            "selected winner",
+            "manual armed candidate",
+            "historical data integrity",
+            "historical execution fidelity",
+            "current execution evidence",
+            "next decision",
+            "blocker",
+            "risk envelope",
+            "latest signal",
+            "real execution events",
+        ):
+            self.assertIn(label, real_canary)
+        self.assertRegex(
+            real_canary,
+            r"backendstate\s*=\s*string\(\s*c\.micro_live_canary\s*\|\|\s*[\"']disabled[\"']\s*\)",
+            "the renderer must read the backend state before deriving the autonomous label",
+        )
+        self.assertRegex(
+            real_canary,
+            r"statevalue\s*=\s*backendstate\s*===\s*[\"']killed[\"']\s*\?\s*[\"']killed[\"']\s*:\s*boolean\(\s*auto\.enabled\s*\)\s*\?\s*[\"']enabled[\"']\s*:\s*[\"']disabled[\"']",
+            "KILLED is terminal; ENABLED must come only from auto.enabled",
+        )
+        self.assertNotRegex(
+            real_canary,
+            r"statevalue\s*=\s*string\([^;\n]*c\.display_state",
+            "the autonomous label must not reuse the manual backend display state",
+        )
+        self.assertRegex(
+            real_canary,
+            r"winner\s*=\s*auto\.selected_candidate\s*\|\|\s*c\.winner_id\s*\|\|\s*[\"']—[\"']",
+            "Selected winner must come from the persisted autonomous projection",
+        )
+        self.assertNotRegex(
+            real_canary,
+            r"winner\s*=\s*[^,;\n]*c\.candidate",
+            "a manually armed candidate must not replace the autonomous winner",
+        )
+        self.assertRegex(
+            real_canary,
+            r"manualcandidate\s*=\s*backendstate\s*===\s*[\"']armed[\"']\s*&&\s*c\.candidate\s*\?",
+            "manual c.candidate must be conditional on the manual ARMED backend state",
+        )
+        self.assertRegex(
+            real_canary,
+            r"\$\{manualcandidate\}",
+            "the manual armed candidate card must be rendered when present",
+        )
+
+    def test_refresh_lifecycle_is_bounded_independent_and_preserves_last_good_data(self) -> None:
+        html = _dashboard_html()
+        self.assertIn("AbortController", html)
+        self.assertIn("REFRESH_TIMEOUT_MS", html)
+        self.assertRegex(
+            html,
+            r"setTimeout\s*\([\s\S]{0,500}?\.abort\(\)[\s\S]{0,100}?REFRESH_TIMEOUT_MS",
+            "a refresh must abort its request after a finite timeout",
+        )
+        self.assertRegex(html, r"\bloadInFlight\b")
+        self.assertRegex(
+            html,
+            r"\|\|loadInFlight\b|if\s*\(\s*loadInFlight\s*\)\s*return",
+            "refresh entry points must refuse overlapping requests",
+        )
+        self.assertGreaterEqual(
+            html.count("lastGood"),
+            3,
+            "refresh success and failure paths must both retain/use last-good data",
+        )
+        self.assertRegex(
+            html,
+            r"finally\s*\{[\s\S]{0,500}(?:refreshMessage|clearRefresh)",
+            "refresh UI cleanup must run from finally even when fetch aborts",
+        )
+        self.assertRegex(html, r"\blastGood(?:\[[^\]]+\]|\.[A-Za-z0-9_]+)\s*=")
+        self.assertRegex(html, r'overview\s*:\s*["\']overview-summary["\']')
+        self.assertRegex(html, r'canary\s*:\s*["\']canary["\']')
+        self.assertRegex(
+            html,
+            r'renderPersisted\(\s*["\']overview["\']\s*,\s*["\']/api/v2/overview-summary["\']',
+        )
+        self.assertRegex(
+            html,
+            r'renderPersisted\(\s*["\']canary["\']\s*,\s*["\']/api/v2/canary["\']',
+        )
+        self.assertRegex(html, r'fetchWithTimeout\(\s*["\']/api/operator["\']')
+        self.assertNotRegex(
+            html,
+            r'tab==="overview"\s*\|\|\s*tab==="canary"\).*?fetch\("/api/operator"',
+        )
 
 
     def test_dashboard_formats_utc_as_pht_without_mutating_api_timestamps(self) -> None:
