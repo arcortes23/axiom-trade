@@ -754,6 +754,251 @@ def _canary_document_hash(value: Any) -> str | None:
     return "sha256:" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
+_CANARY_QUALIFICATION_SCHEMA = "canary-qualification-v1"
+_CANARY_QUALIFICATION_MARKERS = frozenset(
+    {"schema", "schema_version", "qualification_schema", "qualification_hash"}
+)
+_CANARY_FORWARD_RANKING_FIELDS = frozenset(
+    {
+        "forward_expectancy",
+        "forward_confidence_lower_bound",
+        "forward_stability",
+        "forward_calibration",
+        "forward_duration_seconds",
+        "forward_independent_resolved_bets",
+        "forward_successful_order_attempts",
+        "forward_regime_count",
+        "forward_observations_without_signal",
+        "observations_without_signal",
+    }
+)
+_CANARY_TELEMETRY_WORDS = (
+    "duration",
+    "observation",
+    "fill",
+    "trade",
+    "order_attempt",
+    "liquidity",
+    "drawdown",
+    "spread",
+    "requested",
+    "filled",
+    "quantity",
+)
+_CANARY_QUALIFICATION_KEYS = frozenset(
+    {
+        "candidate_id",
+        "market_type",
+        "market",
+        "strategy_id",
+        "instrument",
+        "timeframe",
+        "source_type",
+        "dataset_id",
+        "dataset_version",
+        "dataset_provenance",
+        "strategy_hash",
+        "model_hash",
+        "config_hash",
+        "frozen_hash",
+        "frozen",
+        "schema_validated",
+        "schema_valid",
+        "historical_backtest_passed",
+        "backtest_complete",
+        "validation_passed",
+        "validation_complete",
+        "robustness_passed",
+        "holdout_used",
+        "experiment_plan",
+        "minimum_sample_check",
+        "data_quality",
+        "data_quality_passed",
+        "forward_test_id",
+        "historical_data_integrity",
+        "historical_data_integrity_passed",
+        "historical_execution_fidelity",
+        "historical_execution_fidelity_score",
+        "current_execution_evidence",
+        "historical_provenance_complete",
+        "historical_rows_nonempty",
+        "historical_no_forward_contamination",
+        "canary_data_quality_acceptable",
+        "canary_data_quality_status",
+        "production_evidence_status",
+        "historical_dataset_row_count",
+    }
+)
+
+
+def _canary_qualification_value(
+    value: Any,
+    *,
+    key: str = "",
+    preserve_telemetry: bool = False,
+) -> Any:
+    """Copy JSON evidence while removing mutable paper-forward telemetry."""
+    preserve_telemetry = preserve_telemetry or key in {
+        "minimum_sample_check",
+        "dataset_provenance",
+        "experiment_plan",
+    } or key.lower().startswith(("validation_", "historical_", "robustness_"))
+    if isinstance(value, Mapping):
+        return {
+            str(name): _canary_qualification_value(
+                item,
+                key=str(name),
+                preserve_telemetry=preserve_telemetry,
+            )
+            for name, item in value.items()
+            if not (
+                str(name).lower().startswith("forward_")
+                or (
+                    not preserve_telemetry
+                    and str(name).lower() not in _CANARY_QUALIFICATION_KEYS
+                    and any(word in str(name).lower() for word in _CANARY_TELEMETRY_WORDS)
+                )
+            )
+        }
+    if isinstance(value, list):
+        return [
+            _canary_qualification_value(
+                item,
+                key=key,
+                preserve_telemetry=preserve_telemetry,
+            )
+            for item in value
+        ]
+    if isinstance(value, tuple):
+        return [
+            _canary_qualification_value(
+                item,
+                key=key,
+                preserve_telemetry=preserve_telemetry,
+            )
+            for item in value
+        ]
+    return value
+
+
+def _canary_qualification_projection(
+    candidate_id: str,
+    payload: Mapping[str, Any],
+    *,
+    frozen_hash: str | None = None,
+    quality: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Project lifecycle evidence onto the immutable qualification contract."""
+    identifier = str(candidate_id).strip()
+    body = payload if isinstance(payload, Mapping) else {}
+    result: dict[str, Any] = {
+        "schema": _CANARY_QUALIFICATION_SCHEMA,
+        "schema_version": _CANARY_QUALIFICATION_SCHEMA,
+        "qualification_schema": _CANARY_QUALIFICATION_SCHEMA,
+        "candidate_id": identifier,
+    }
+    verified_frozen_hash = frozen_hash if isinstance(frozen_hash, str) and frozen_hash else body.get("frozen_hash")
+    if isinstance(verified_frozen_hash, str) and verified_frozen_hash:
+        result["frozen_hash"] = verified_frozen_hash
+    for key, value in body.items():
+        name = str(key)
+        lower = name.lower()
+        if name in _CANARY_QUALIFICATION_MARKERS or name == "forward_evidence":
+            continue
+        if lower.startswith("forward_"):
+            continue
+        if name not in _CANARY_QUALIFICATION_KEYS and not lower.startswith(
+            ("validation_", "historical_", "robustness_")
+        ):
+            continue
+        result[name] = _canary_qualification_value(value, key=name)
+    if isinstance(quality, Mapping):
+        derived_quality = _canary_qualification_value(
+            persisted_quality_fields(quality)
+        )
+        if isinstance(derived_quality, Mapping):
+            # Lifecycle evidence is authoritative; derived quality only fills
+            # fields absent from the current immutable qualification payload.
+            for name, value in derived_quality.items():
+                result.setdefault(str(name), value)
+    return result
+
+
+def _canary_qualification_hash(projection: Mapping[str, Any]) -> str | None:
+    body = dict(projection)
+    body.pop("qualification_hash", None)
+    return _canary_document_hash(body)
+
+
+def _canary_ranking_snapshot_hash(
+    candidate_id: str,
+    stage: str,
+    payload: Mapping[str, Any],
+    *,
+    qualification_hash: str | None,
+    quality: Mapping[str, Any] | None = None,
+) -> str | None:
+    """Hash every mutable input that can affect a persisted ranking."""
+    body = payload if isinstance(payload, Mapping) else {}
+    ranking: dict[str, Any] = {}
+    for key, value in body.items():
+        name = str(key)
+        lower = name.lower()
+        if name == "forward_evidence":
+            if isinstance(value, Mapping):
+                ranking[name] = {
+                    str(item): _canary_qualification_value(raw, key=str(item))
+                    for item, raw in value.items()
+                    if str(item) in _CANARY_FORWARD_RANKING_FIELDS
+                }
+            continue
+        if (
+            lower.startswith("validation_")
+            or lower.startswith("historical_")
+            or lower.startswith("robustness_")
+            or name in (
+                {
+                    "experiment_plan",
+                    "minimum_sample_check",
+                    "holdout_used",
+                    "mutation_cluster",
+                    "cluster_key",
+                    "lineage",
+                    "root_candidate_id",
+                    "parent_id",
+                    "experiment_family",
+                    "family",
+                    "forward_expectancy",
+                    "observations_without_signal",
+                }
+                | _CANARY_FORWARD_RANKING_FIELDS
+            )
+        ):
+            ranking[name] = _canary_qualification_value(value, key=name)
+    nested_validation = body.get("validation")
+    if isinstance(nested_validation, Mapping):
+        # CandidateRanker reads validation metrics from this nested mapping;
+        # bind the complete immutable mapping so any such mutation invalidates
+        # a persisted ranking snapshot.
+        ranking["validation"] = _canary_qualification_value(
+            nested_validation,
+            key="validation",
+            preserve_telemetry=True,
+        )
+    if isinstance(quality, Mapping):
+        ranking["data_quality"] = _canary_qualification_value(
+            persisted_quality_fields(quality)
+        )
+    return _canary_document_hash(
+        {
+            "candidate_id": str(candidate_id),
+            "stage": str(stage),
+            "qualification_hash": qualification_hash,
+            "ranking_inputs": ranking,
+        }
+    )
+
+
 def _canary_lifecycle_frozen_hash(store: AxiomStore, record: Mapping[str, Any] | None) -> str | None:
     """Return the verified frozen binding recorded by a lifecycle row."""
     if not isinstance(record, Mapping) or record.get("stage") not in _CANARY_ELIGIBLE_STAGES:
@@ -832,38 +1077,133 @@ def _canary_lifecycle_frozen_hash(store: AxiomStore, record: Mapping[str, Any] |
     return frozen_hash
 
 
+def _canary_eligibility_binding_result(
+    store: AxiomStore,
+    candidate_id: str,
+    eligibility: Mapping[str, Any] | None,
+    *,
+    record: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return a reasoned binding result without treating stored PASS as a gate."""
+    identifier = str(candidate_id).strip()
+    result: dict[str, Any] = {
+        "candidate_id": identifier,
+        "bound": False,
+        "valid": False,
+        "legacy": False,
+        "reevaluation_required": False,
+        "qualification_hash": None,
+        "reason_code": "ELIGIBILITY_MISSING",
+    }
+    if eligibility is None:
+        return result
+    try:
+        row = dict(eligibility)
+        evidence = json.loads(str(row.get("evidence_json") or ""))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        result["reason_code"] = "ELIGIBILITY_INVALID"
+        return result
+    if not isinstance(evidence, Mapping):
+        result["reason_code"] = "ELIGIBILITY_INVALID"
+        return result
+    if record is None:
+        try:
+            record = store.load_candidate_lifecycle(identifier)
+        except Exception:
+            record = None
+    if not isinstance(record, Mapping):
+        result["reason_code"] = "LIFECYCLE_REJECTED"
+        return result
+    stage = str(record.get("stage") or "")
+    if stage == "REJECTED":
+        result["reason_code"] = "LIFECYCLE_REJECTED"
+        return result
+    if stage not in _CANARY_ELIGIBLE_STAGES:
+        result["reason_code"] = "ELIGIBILITY_INVALID"
+        return result
+    payload = _canary_merged_lifecycle_payload(record)
+    frozen_hash = _canary_lifecycle_frozen_hash(store, record)
+    stored_frozen_hash = row.get("frozen_hash")
+    if (
+        not isinstance(stored_frozen_hash, str)
+        or not stored_frozen_hash
+        or frozen_hash is None
+        or stored_frozen_hash != frozen_hash
+    ):
+        result["reason_code"] = "QUALIFICATION_CHANGED"
+        return result
+    quality = evaluate_prediction_data_quality(store, payload or {})
+    current_projection = _canary_qualification_projection(
+        identifier,
+        payload or {},
+        frozen_hash=frozen_hash,
+        quality=quality,
+    )
+    expected_hash = _canary_qualification_hash(current_projection)
+    result["qualification_hash"] = expected_hash
+    marker_values = [
+        evidence.get(name)
+        for name in ("schema", "schema_version", "qualification_schema")
+        if name in evidence
+    ]
+    if marker_values and any(value != _CANARY_QUALIFICATION_SCHEMA for value in marker_values):
+        result["reason_code"] = "ELIGIBILITY_INVALID"
+        return result
+    stored_schema = evidence.get("schema") or evidence.get("schema_version") or evidence.get(
+        "qualification_schema"
+    )
+    if stored_schema != _CANARY_QUALIFICATION_SCHEMA and "qualification_hash" in evidence:
+        result["reason_code"] = "ELIGIBILITY_INVALID"
+        return result
+    if stored_schema == _CANARY_QUALIFICATION_SCHEMA:
+        stored_hash = evidence.get("qualification_hash")
+        if not isinstance(stored_hash, str) or stored_hash != expected_hash:
+            result["reason_code"] = "QUALIFICATION_CHANGED"
+            return result
+        stored_projection = dict(evidence)
+        stored_projection.pop("qualification_hash", None)
+        if stored_projection != current_projection:
+            result["reason_code"] = "QUALIFICATION_CHANGED"
+            return result
+        result.update({"bound": True, "valid": True, "reason_code": None})
+        return result
+    legacy_frozen_hash = evidence.get("frozen_hash")
+    if (
+        not isinstance(legacy_frozen_hash, str)
+        or not legacy_frozen_hash
+        or legacy_frozen_hash != frozen_hash
+    ):
+        result["reason_code"] = "QUALIFICATION_CHANGED"
+        return result
+    legacy_projection = _canary_qualification_projection(
+        identifier,
+        evidence,
+        frozen_hash=frozen_hash,
+        quality=quality,
+    )
+    if legacy_projection != current_projection:
+        result["reason_code"] = "QUALIFICATION_CHANGED"
+        return result
+    result.update(
+        {
+            "bound": True,
+            "valid": True,
+            "legacy": True,
+            "reevaluation_required": True,
+            "reason_code": "REEVALUATION_REQUIRED",
+        }
+    )
+    return result
+
 def _canary_eligibility_is_bound(
     store: AxiomStore,
     candidate_id: str,
     eligibility: Mapping[str, Any] | None,
 ) -> bool:
-    """Verify eligibility and its frozen hash still bind to the lifecycle."""
-    if eligibility is None:
-        return False
-    try:
-        eligibility = dict(eligibility)
-    except (TypeError, ValueError):
-        return False
-    frozen_hash = eligibility.get("frozen_hash")
-    if not isinstance(frozen_hash, str) or not frozen_hash:
-        return False
-    try:
-        evidence = json.loads(str(eligibility.get("evidence_json") or ""))
-    except (TypeError, ValueError, json.JSONDecodeError):
-        return False
-    if not isinstance(evidence, Mapping) or evidence.get("frozen_hash") != frozen_hash:
-        return False
-    try:
-        record = store.load_candidate_lifecycle(candidate_id)
-    except Exception:
-        return False
-    payload = _canary_merged_lifecycle_payload(record)
-    return (
-        _canary_lifecycle_frozen_hash(store, record) == frozen_hash
-        and payload is not None
-        and dict(evidence) == payload
+    """Shared boolean wrapper around the reasoned qualification binding."""
+    return bool(
+        _canary_eligibility_binding_result(store, candidate_id, eligibility).get("bound")
     )
-
 
 class CanaryService:
     def __init__(
@@ -883,7 +1223,7 @@ class CanaryService:
             self._initialize()
 
     def _initialize(self) -> None:
-        with self.store.connection:
+        with self.store._lock, self.store.connection:
             self.store.connection.executescript("""
             CREATE TABLE IF NOT EXISTS canary_control (
               singleton INTEGER PRIMARY KEY CHECK(singleton=1), state TEXT NOT NULL,
@@ -957,6 +1297,12 @@ class CanaryService:
                     "ALTER TABLE canary_control ADD COLUMN control_generation "
                     "INTEGER NOT NULL DEFAULT 0"
                 )
+            # Rows created by the pre-generation schema used zero as the
+            # implicit value.  Generation zero is not a valid control fence.
+            self.store.connection.execute(
+                "UPDATE canary_control SET control_generation=1 "
+                "WHERE control_generation=0"
+            )
             columns = {
                 str(row["name"])
                 for row in self.store.connection.execute("PRAGMA table_info(canary_ledger)")
@@ -966,10 +1312,36 @@ class CanaryService:
                     "ALTER TABLE canary_ledger ADD COLUMN control_generation "
                     "INTEGER NOT NULL DEFAULT 0"
                 )
-            self.store.connection.execute(
-                "UPDATE canary_control SET control_generation=1 "
-                "WHERE control_generation < 1"
-            )
+            for table, additions in (
+                (
+                    "canary_rankings",
+                    (
+                        ("qualification_hash", "TEXT"),
+                        ("ranking_snapshot_hash", "TEXT"),
+                    ),
+                ),
+                (
+                    "canary_selection",
+                    (
+                        ("ranking_timestamp", "TEXT"),
+                        ("qualification_hash", "TEXT"),
+                        ("ranking_snapshot_hash", "TEXT"),
+                        ("selection_status", "TEXT NOT NULL DEFAULT 'NONE'"),
+                        ("selection_valid", "INTEGER NOT NULL DEFAULT 0"),
+                        ("selection_invalidation_reason", "TEXT"),
+                        ("last_selected_candidate", "TEXT"),
+                    ),
+                ),
+            ):
+                table_columns = {
+                    str(row["name"])
+                    for row in self.store.connection.execute(f"PRAGMA table_info({table})")
+                }
+                for column, declaration in additions:
+                    if column not in table_columns:
+                        self.store.connection.execute(
+                            f"ALTER TABLE {table} ADD COLUMN {column} {declaration}"
+                        )
 
     @staticmethod
     def _integrity(candidate: str, venue: str, expires: str, limits: Mapping[str, Any]) -> str:
@@ -986,6 +1358,20 @@ class CanaryService:
 
     def _lifecycle_frozen_hash(self, record: Mapping[str, Any] | None) -> str | None:
         return _canary_lifecycle_frozen_hash(self.store, record)
+
+    def _eligibility_binding_result(
+        self,
+        candidate_id: str,
+        eligibility: Mapping[str, Any] | None,
+        *,
+        record: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return _canary_eligibility_binding_result(
+            self.store,
+            candidate_id,
+            eligibility,
+            record=record,
+        )
 
     def _eligibility_is_bound(self, candidate_id: str, eligibility: Mapping[str, Any] | None) -> bool:
         return _canary_eligibility_is_bound(self.store, candidate_id, eligibility)
@@ -1153,9 +1539,13 @@ class CanaryService:
                 except (TypeError, ValueError):
                     raise CanaryBlocked("CANARY_CONTROL_CORRUPT") from None
                 selection = connection.execute(
-                    "SELECT candidate_id FROM canary_selection WHERE singleton=1"
+                    "SELECT * FROM canary_selection WHERE singleton=1"
                 ).fetchone()
-                candidate_id = selection["candidate_id"] if selection else None
+                candidate_id = None
+                if selection is not None:
+                    selection_state = self._selection_validation(dict(selection))
+                    if selection_state.get("selection_valid"):
+                        candidate_id = selection_state.get("selected_candidate")
                 connection.execute(
                     "INSERT INTO canary_control("
                     "singleton,state,candidate_id,venue,armed_at,expires_at,"
@@ -1224,14 +1614,36 @@ class CanaryService:
             "WHERE candidate_id=?",
             (identifier,),
         ).fetchone()
-        if not self._eligibility_is_bound(identifier, eligibility):
+        binding = self._eligibility_binding_result(
+            identifier,
+            eligibility,
+            record=lifecycle,
+        )
+        if not binding.get("bound"):
             raise CanaryBlocked("CANDIDATE_NOT_CANARY_ELIGIBLE")
+        if binding.get("reevaluation_required"):
+            try:
+                self.mark_eligible(identifier)
+            except Exception as exc:
+                raise CanaryBlocked("CANDIDATE_NOT_CANARY_ELIGIBLE") from exc
+            lifecycle = self.store.load_candidate_lifecycle(identifier)
+            eligibility = self.store.connection.execute(
+                "SELECT candidate_id,frozen_hash,evidence_json FROM canary_eligibility "
+                "WHERE candidate_id=?",
+                (identifier,),
+            ).fetchone()
+            if not self._eligibility_binding_result(
+                identifier,
+                eligibility,
+                record=lifecycle,
+            ).get("bound"):
+                raise CanaryBlocked("CANDIDATE_NOT_CANARY_ELIGIBLE")
         payload = self._merged_lifecycle_payload(lifecycle)
         frozen_hash = self._lifecycle_frozen_hash(lifecycle)
         if payload is None or frozen_hash is None:
             raise CanaryBlocked("CANDIDATE_FROZEN_BINDING_INVALID")
         quality = evaluate_prediction_data_quality(self.store, payload)
-        validation = self.validate_eligibility(identifier)
+        validation = self.validate_eligibility(identifier, _record=lifecycle)
         if not validation.get("eligible"):
             raise CanaryBlocked("CANDIDATE_RESEARCH_GATES_INCOMPLETE")
         if not quality.get("canary_data_quality_acceptable"):
@@ -1778,16 +2190,25 @@ class CanaryService:
             allow_environment=allow_environment,
         )
 
-    def validate_eligibility(self, candidate_id: str) -> dict[str, Any]:
+    def validate_eligibility(
+        self,
+        candidate_id: str,
+        *,
+        _record: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """Return the authoritative dry-run result for canary eligibility."""
         identifier = str(candidate_id).strip()
-        record = self.store.load_candidate_lifecycle(identifier)
+        record = _record if _record is not None else self.store.load_candidate_lifecycle(identifier)
         if not record or record.get("stage") not in _CANARY_ELIGIBLE_STAGES:
             return {
                 "candidate_id": identifier,
                 "eligible": False,
                 "checks": [
-                    {"name": "Lifecycle stage", "passed": False, "detail": "Candidate is not frozen or paper-promotable."}
+                    {
+                        "name": "Lifecycle stage",
+                        "passed": False,
+                        "detail": "Candidate is not frozen or paper-promotable.",
+                    }
                 ],
                 "reason_code": "CANDIDATE_RESEARCH_GATES_INCOMPLETE",
             }
@@ -1797,54 +2218,21 @@ class CanaryService:
                 "candidate_id": identifier,
                 "eligible": False,
                 "checks": [
-                    {"name": "Lifecycle evidence", "passed": False, "detail": "Persisted lifecycle evidence is unavailable."}
+                    {
+                        "name": "Lifecycle evidence",
+                        "passed": False,
+                        "detail": "Persisted lifecycle evidence is unavailable.",
+                    }
                 ],
                 "reason_code": "CANDIDATE_RESEARCH_GATES_INCOMPLETE",
             }
-        legacy_eligibility = False
-        try:
-            existing_eligibility = self.store.connection.execute(
-                "SELECT candidate_id,frozen_hash,evidence_json FROM canary_eligibility WHERE candidate_id=?",
-                (identifier,),
-            ).fetchone()
-            legacy_eligibility = (
-                existing_eligibility is not None
-                and self._eligibility_is_bound(identifier, existing_eligibility)
-                and not any(
-                    key in payload
-                    for key in (
-                        "schema_validated",
-                        "schema_valid",
-                        "historical_backtest_passed",
-                        "backtest_complete",
-                        "validation_passed",
-                        "validation_complete",
-                        "robustness_passed",
-                        "data_quality_passed",
-                        "data_quality",
-                        "holdout_used",
-                        "dataset_id",
-                        "dataset_version",
-                    )
-                )
-                and str(payload.get("market_type", "")).strip().lower() != "prediction"
-            )
-        except sqlite3.Error:
-            legacy_eligibility = False
         quality = evaluate_prediction_data_quality(self.store, payload)
-        if legacy_eligibility and not quality.get("applicable"):
-            quality = {
-                **quality,
-                "historical_data_integrity": "PASS",
-                "historical_data_integrity_passed": True,
-                "historical_execution_fidelity": "LEGACY_UNSPECIFIED",
-                "canary_data_quality_acceptable": True,
-                "canary_data_quality_status": "CANARY_DATA_QUALITY_ACCEPTABLE_LEGACY",
-                "reasons": [],
-            }
         gate_aliases = {
             "schema_validated": ("schema_validated", "schema_valid"),
-            "historical_backtest_passed": ("historical_backtest_passed", "backtest_complete"),
+            "historical_backtest_passed": (
+                "historical_backtest_passed",
+                "backtest_complete",
+            ),
             "validation_passed": ("validation_passed", "validation_complete"),
             "robustness_passed": ("robustness_passed",),
         }
@@ -1855,113 +2243,237 @@ class CanaryService:
             ("Validation", "validation_passed"),
             ("Robustness", "robustness_passed"),
         ):
-            passed = any(payload.get(alias) is True for alias in gate_aliases[key]) or legacy_eligibility
-            checks.append({"name": label, "passed": passed, "detail": "Passed" if passed else f"{key} is not true."})
-        integrity_passed = bool(quality.get("historical_data_integrity_passed")) or legacy_eligibility
-        checks.append({
-            "name": "Historical data integrity",
-            "passed": integrity_passed,
-            "detail": "Exact immutable historical dataset is complete and non-empty."
-            if integrity_passed
-            else "; ".join(quality.get("reasons") or ["Historical dataset integrity is unproven."]),
-        })
+            passed = any(payload.get(alias) is True for alias in gate_aliases[key])
+            checks.append(
+                {
+                    "name": label,
+                    "passed": passed,
+                    "detail": "Passed" if passed else f"{key} is not true.",
+                }
+            )
+        quality_applicable = quality.get("applicable") is True
+        payload_dataset_id = str(payload.get("dataset_id") or "").strip()
+        payload_dataset_version = str(payload.get("dataset_version") or "").strip()
+        quality_dataset_id = str(quality.get("dataset_id") or "").strip()
+        quality_dataset_version = str(quality.get("dataset_version") or "").strip()
+        exact_dataset_quality = (
+            quality_applicable
+            and bool(payload_dataset_id and payload_dataset_version)
+            and quality_dataset_id == payload_dataset_id
+            and quality_dataset_version == payload_dataset_version
+            and quality.get("historical_data_integrity_passed") is True
+            and quality.get("historical_provenance_complete") is True
+            and quality.get("historical_rows_nonempty") is True
+            and quality.get("historical_no_forward_contamination") is True
+            and quality.get("canary_data_quality_acceptable") is True
+        )
+        integrity_passed = exact_dataset_quality
+        checks.append(
+            {
+                "name": "Historical data integrity",
+                "passed": integrity_passed,
+                "detail": "Exact immutable historical dataset is complete and non-empty."
+                if integrity_passed
+                else "; ".join(
+                    quality.get("reasons")
+                    or ["Exact historical dataset quality is unproven."]
+                ),
+            }
+        )
         fidelity = str(quality.get("historical_execution_fidelity") or "UNKNOWN")
-        quality_passed = bool(quality.get("canary_data_quality_acceptable")) or legacy_eligibility
-        fidelity_passed = (
-            fidelity in {"PRICE_PROXY", "TIMESTAMPED_DEPTH"}
-            or legacy_eligibility
-            or (not quality.get("applicable") and quality_passed)
+        lifecycle_quality_passed = payload.get("data_quality_passed") is True
+        quality_passed = exact_dataset_quality and lifecycle_quality_passed
+        fidelity_passed = exact_dataset_quality and fidelity in {
+            "PRICE_PROXY",
+            "TIMESTAMPED_DEPTH",
+        }
+        checks.append(
+            {
+                "name": "Historical execution fidelity",
+                "passed": fidelity_passed,
+                "detail": (
+                    f"{fidelity} · LIMITED"
+                    if fidelity == "PRICE_PROXY" and fidelity_passed
+                    else fidelity
+                    if fidelity_passed
+                    else "Historical execution fidelity is unavailable."
+                ),
+            }
         )
-        checks.append({
-            "name": "Historical execution fidelity",
-            "passed": fidelity_passed,
-            "detail": (
-                f"{fidelity} · LIMITED" if fidelity == "PRICE_PROXY"
-                else fidelity if fidelity_passed else "Historical execution fidelity is unavailable."
-            ),
-        })
-        checks.append({
-            "name": "Canary data quality",
-            "passed": quality_passed,
-            "detail": str(
-                quality.get("canary_data_quality_status") or "CANARY_DATA_QUALITY_UNACCEPTABLE"
-            ),
-        })
-        sample_passed = (
-            legacy_eligibility
-            or (not quality.get("applicable") and quality_passed)
-            or self._minimum_sample_check_passed(payload)
+        checks.append(
+            {
+                "name": "Canary data quality",
+                "passed": quality_passed,
+                "detail": str(
+                    quality.get("canary_data_quality_status")
+                    or "CANARY_DATA_QUALITY_UNACCEPTABLE"
+                ),
+            }
         )
-        checks.append({
-            "name": "Minimum samples and trades",
-            "passed": sample_passed,
-            "detail": (
-                "Minimum observations and trades passed."
-                if sample_passed
-                else "Explicit minimum observation/trade evidence is missing or failed."
-            ),
-        })
-        holdout_passed = payload.get("holdout_used") is False or legacy_eligibility
-        checks.append({
-            "name": "Holdout leakage",
-            "passed": holdout_passed,
-            "detail": "Holdout was not used." if holdout_passed else "Holdout evidence is missing or was used.",
-        })
-        frozen_passed = payload.get("frozen") is True or legacy_eligibility
+        sample_passed = exact_dataset_quality and self._minimum_sample_check_passed(payload)
+        checks.append(
+            {
+                "name": "Minimum samples and trades",
+                "passed": sample_passed,
+                "detail": (
+                    "Minimum observations and trades passed."
+                    if sample_passed
+                    else "Explicit minimum observation/trade evidence is missing or failed."
+                ),
+            }
+        )
+        holdout_passed = payload.get("holdout_used") is False
+        checks.append(
+            {
+                "name": "Holdout leakage",
+                "passed": holdout_passed,
+                "detail": (
+                    "Holdout was not used."
+                    if holdout_passed
+                    else "Holdout evidence is missing or was used."
+                ),
+            }
+        )
+        frozen_passed = payload.get("frozen") is True
         frozen_hash = self._lifecycle_frozen_hash(record)
         hashes_passed = frozen_passed and frozen_hash is not None
-        checks.append({
-            "name": "Frozen hashes",
-            "passed": hashes_passed,
-            "detail": "Frozen binding is present." if hashes_passed else "Frozen flag or immutable hash is missing.",
-        })
+        checks.append(
+            {
+                "name": "Frozen hashes",
+                "passed": hashes_passed,
+                "detail": (
+                    "Frozen binding is present."
+                    if hashes_passed
+                    else "Frozen flag or immutable hash is missing."
+                ),
+            }
+        )
         no_critical_error = not bool(payload.get("critical_error"))
-        checks.append({
-            "name": "Critical errors",
-            "passed": no_critical_error,
-            "detail": "No critical error recorded." if no_critical_error else "A critical error is recorded.",
-        })
+        checks.append(
+            {
+                "name": "Critical errors",
+                "passed": no_critical_error,
+                "detail": (
+                    "No critical error recorded."
+                    if no_critical_error
+                    else "A critical error is recorded."
+                ),
+            }
+        )
         eligible = all(bool(item["passed"]) for item in checks)
+        qualification = _canary_qualification_projection(
+            identifier,
+            payload,
+            frozen_hash=frozen_hash if hashes_passed else None,
+            quality=quality,
+        )
+        qualification_hash = _canary_qualification_hash(qualification)
+        existing_binding = None
+        try:
+            existing_binding = self.store.connection.execute(
+                "SELECT candidate_id,frozen_hash,evidence_json FROM canary_eligibility "
+                "WHERE candidate_id=?",
+                (identifier,),
+            ).fetchone()
+        except sqlite3.Error:
+            existing_binding = None
+        binding = self._eligibility_binding_result(
+            identifier,
+            existing_binding,
+            record=record,
+        )
         return {
             "candidate_id": identifier,
             "eligible": eligible,
             "checks": checks,
             "reason_code": None if eligible else "CANDIDATE_RESEARCH_GATES_INCOMPLETE",
             "frozen_hash": frozen_hash if hashes_passed else None,
+            "qualification": qualification,
+            "qualification_hash": qualification_hash,
+            "binding": binding,
             "data_quality": quality,
             **persisted_quality_fields(quality),
         }
 
     def mark_eligible(self, candidate_id: str) -> None:
-        validation = self.validate_eligibility(candidate_id)
+        identifier = str(candidate_id).strip()
+        initial = self.store.load_candidate_lifecycle(identifier)
+        validation = self.validate_eligibility(identifier, _record=initial)
         if not validation.get("eligible"):
-            raise CanaryBlocked(str(validation.get("reason_code") or "CANDIDATE_RESEARCH_GATES_INCOMPLETE"))
-        record = self.store.load_candidate_lifecycle(candidate_id)
-        payload = self._merged_lifecycle_payload(record) if record else None
-        frozen_hash = validation.get("frozen_hash")
-        if payload is None or not frozen_hash:
-            raise CanaryBlocked("CANDIDATE_RESEARCH_GATES_INCOMPLETE")
-        # Keep persisted values verbatim: eligibility is a binding, not a
-        # re-derived summary that can silently lose additive forward evidence.
-        evidence = dict(payload)
-        evidence["frozen_hash"] = frozen_hash
-        try:
-            evidence_json = json.dumps(evidence, sort_keys=True, allow_nan=False)
-        except (TypeError, ValueError):
-            raise CanaryBlocked("CANDIDATE_RESEARCH_GATES_INCOMPLETE") from None
-        with self.store.connection:
-            self.store.connection.execute(
-                "INSERT INTO canary_eligibility(candidate_id,eligible_at,frozen_hash,evidence_json) "
-                "VALUES(?,?,?,?) ON CONFLICT(candidate_id) DO UPDATE SET "
-                "eligible_at=excluded.eligible_at,frozen_hash=excluded.frozen_hash,"
-                "evidence_json=excluded.evidence_json",
-                (
-                    candidate_id,
-                    ensure_utc(self.clock()).isoformat(),
-                    frozen_hash,
-                    evidence_json,
-                ),
+            raise CanaryBlocked(
+                str(
+                    validation.get("reason_code")
+                    or "CANDIDATE_RESEARCH_GATES_INCOMPLETE"
+                )
             )
+        if not isinstance(initial, Mapping):
+            raise CanaryBlocked("CANDIDATE_RESEARCH_GATES_INCOMPLETE")
+        with self.store._lock:
+            connection = self.store.connection
+            if connection.in_transaction:
+                raise CanaryBlocked("CANARY_TRANSACTION_ACTIVE")
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                current = self.store.load_candidate_lifecycle(identifier)
+                if (
+                    not isinstance(current, Mapping)
+                    or current.get("stage") != initial.get("stage")
+                    or current.get("payload") != initial.get("payload")
+                    or current.get("updated_at") != initial.get("updated_at")
+                ):
+                    raise CanaryBlocked("ELIGIBILITY_SNAPSHOT_CHANGED")
+                validation = self.validate_eligibility(identifier, _record=current)
+                if not validation.get("eligible"):
+                    raise CanaryBlocked(
+                        str(
+                            validation.get("reason_code")
+                            or "CANDIDATE_RESEARCH_GATES_INCOMPLETE"
+                        )
+                    )
+                payload = self._merged_lifecycle_payload(current)
+                frozen_hash = validation.get("frozen_hash")
+                quality = validation.get("data_quality")
+                if payload is None or not isinstance(frozen_hash, str) or not frozen_hash:
+                    raise CanaryBlocked("CANDIDATE_RESEARCH_GATES_INCOMPLETE")
+                projection = _canary_qualification_projection(
+                    identifier,
+                    payload,
+                    frozen_hash=frozen_hash,
+                    quality=quality if isinstance(quality, Mapping) else None,
+                )
+                qualification_hash = _canary_qualification_hash(projection)
+                if not qualification_hash:
+                    raise CanaryBlocked("CANDIDATE_RESEARCH_GATES_INCOMPLETE")
+                evidence = {
+                    **projection,
+                    "qualification_hash": qualification_hash,
+                }
+                try:
+                    evidence_json = json.dumps(
+                        evidence,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    )
+                except (TypeError, ValueError):
+                    raise CanaryBlocked("CANDIDATE_RESEARCH_GATES_INCOMPLETE") from None
+                connection.execute(
+                    "INSERT INTO canary_eligibility(candidate_id,eligible_at,frozen_hash,evidence_json) "
+                    "VALUES(?,?,?,?) ON CONFLICT(candidate_id) DO UPDATE SET "
+                    "eligible_at=excluded.eligible_at,frozen_hash=excluded.frozen_hash,"
+                    "evidence_json=excluded.evidence_json",
+                    (
+                        identifier,
+                        ensure_utc(self.clock()).isoformat(),
+                        frozen_hash,
+                        evidence_json,
+                    ),
+                )
+                connection.commit()
+            except BaseException:
+                if connection.in_transaction:
+                    connection.rollback()
+                raise
 
     def arm(
         self,
@@ -2003,13 +2515,39 @@ class CanaryService:
             limits = limits or CanaryLimits(
                 target_notional_usd=Decimal(target_notional_usd)
             )
+            record = self.store.load_candidate_lifecycle(str(candidate_id))
             eligible = connection.execute(
                 "SELECT candidate_id,frozen_hash,evidence_json "
                 "FROM canary_eligibility WHERE candidate_id=?",
                 (candidate_id,),
             ).fetchone()
-            if not self._eligibility_is_bound(candidate_id, eligible):
+            binding = self._eligibility_binding_result(
+                str(candidate_id),
+                eligible,
+                record=record,
+            )
+            if not binding.get("bound"):
                 raise CanaryBlocked("CANDIDATE_NOT_CANARY_ELIGIBLE")
+            if binding.get("reevaluation_required"):
+                self.mark_eligible(str(candidate_id))
+                eligible = connection.execute(
+                    "SELECT candidate_id,frozen_hash,evidence_json "
+                    "FROM canary_eligibility WHERE candidate_id=?",
+                    (candidate_id,),
+                ).fetchone()
+                record = self.store.load_candidate_lifecycle(str(candidate_id))
+                binding = self._eligibility_binding_result(
+                    str(candidate_id),
+                    eligible,
+                    record=record,
+                )
+                if not binding.get("bound") or binding.get("reevaluation_required"):
+                    raise CanaryBlocked("CANDIDATE_NOT_CANARY_ELIGIBLE")
+            if not self.validate_eligibility(
+                str(candidate_id),
+                _record=record,
+            ).get("eligible"):
+                raise CanaryBlocked("CANDIDATE_RESEARCH_GATES_INCOMPLETE")
             health = self.store.polymarket_health(now=now)
             if str(health.get("grade", "F")).upper() not in {"A", "B"}:
                 raise CanaryBlocked("COLLECTOR_DEGRADED")
@@ -2130,7 +2668,232 @@ class CanaryService:
                         now,
                     ),
                 )
+    def _selection_validation(
+        self, selection: Mapping[str, Any] | None
+    ) -> dict[str, Any]:
+        """Validate a persisted selection while holding the store read lock."""
+        lock = getattr(self.store, "_lock", None)
+        if lock is None:
+            return self._selection_validation_locked(selection)
+        with lock:
+            return self._selection_validation_locked(selection)
+
+    def _selection_validation_locked(
+        self, selection: Mapping[str, Any] | None
+    ) -> dict[str, Any]:
+        """Validate persisted selection against one locked lifecycle snapshot."""
+
+        def none_state(historical_id: str | None = None) -> dict[str, Any]:
+            return {
+                "selection_status": "NONE",
+                "selection_valid": False,
+                "selection_invalidation_reason": None,
+                "selected_candidate": None,
+                "last_selected_candidate": historical_id,
+            }
+
+        def missing_schema(exc: sqlite3.OperationalError) -> bool:
+            message = str(exc).lower()
+            return "no such table" in message or "no such column" in message
+
+        def text_value(value: Any) -> str | None:
+            if value is None:
+                return None
+            text = str(value).strip()
+            return text or None
+
+        def mapping_json(value: Any) -> Mapping[str, Any] | None:
+            try:
+                parsed = json.loads(str(value) if value is not None else "")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return None
+            return parsed if isinstance(parsed, Mapping) and parsed else None
+
+        if not isinstance(selection, Mapping):
+            return none_state()
+        current_id = text_value(selection.get("candidate_id"))
+        selection_last_selected = text_value(
+            selection.get("last_selected_candidate")
+        )
+        historical_id = selection_last_selected or current_id or None
+        if not current_id:
+            return {
+                "selection_status": "STALE" if historical_id else "NONE",
+                "selection_valid": False,
+                "selection_invalidation_reason": (
+                    selection.get("selection_invalidation_reason")
+                    or ("REEVALUATION_REQUIRED" if historical_id else None)
+                ),
+                "selected_candidate": None,
+                "last_selected_candidate": historical_id,
+            }
+
+        selection_run_id = text_value(selection.get("ranking_run_id"))
+        selection_timestamp = text_value(selection.get("ranking_timestamp"))
+        selection_selected_at = text_value(selection.get("selected_at"))
+        selection_qualification_hash = text_value(
+            selection.get("qualification_hash")
+        )
+        selection_ranking_hash = text_value(
+            selection.get("ranking_snapshot_hash")
+        )
+        selection_metadata_valid = bool(
+            current_id
+            and selection_run_id
+            and selection_timestamp
+            and selection_qualification_hash
+            and selection_ranking_hash
+            and selection_selected_at
+            and selection.get("selection_status") == "CURRENT"
+            and selection.get("selection_valid") == 1
+        )
+
+        try:
+            lifecycle = self.store.load_candidate_lifecycle(current_id)
+        except (AttributeError, TypeError, ValueError, sqlite3.Error):
+            lifecycle = None
+        if not isinstance(lifecycle, Mapping) or str(lifecycle.get("stage")) == "REJECTED":
+            reason = "LIFECYCLE_REJECTED"
+        elif str(lifecycle.get("stage")) not in _CANARY_ELIGIBLE_STAGES:
+            reason = "ELIGIBILITY_INVALID"
+        else:
+            try:
+                eligibility = self.store.connection.execute(
+                    "SELECT candidate_id,frozen_hash,evidence_json "
+                    "FROM canary_eligibility WHERE candidate_id=?",
+                    (current_id,),
+                ).fetchone()
+            except sqlite3.OperationalError as exc:
+                if missing_schema(exc):
+                    return none_state(historical_id)
+                raise
+            binding = self._eligibility_binding_result(
+                current_id,
+                eligibility,
+                record=lifecycle,
+            )
+            if not binding.get("bound"):
+                reason = str(binding.get("reason_code") or "ELIGIBILITY_INVALID")
+            elif binding.get("reevaluation_required"):
+                reason = "REEVALUATION_REQUIRED"
+            else:
+                validation = self.validate_eligibility(current_id, _record=lifecycle)
+                if not validation.get("eligible"):
+                    reason = "ELIGIBILITY_INVALID"
+                else:
+                    try:
+                        row = self.store.connection.execute(
+                            "SELECT * FROM canary_rankings WHERE candidate_id=?",
+                            (current_id,),
+                        ).fetchone()
+                    except sqlite3.OperationalError as exc:
+                        if missing_schema(exc):
+                            return none_state(historical_id)
+                        raise
+                    ranking = dict(row) if row is not None else None
+                    ranking_score = ranking.get("total_score") if ranking else None
+                    selection_component_scores = mapping_json(
+                        selection.get("component_scores_json")
+                    )
+                    selection_evidence_versions = mapping_json(
+                        selection.get("evidence_versions_json")
+                    )
+                    ranking_component_scores = mapping_json(
+                        ranking.get("component_scores_json") if ranking else None
+                    )
+                    ranking_evidence_versions = mapping_json(
+                        ranking.get("evidence_versions_json") if ranking else None
+                    )
+                    if (
+                        ranking is None
+                        or ranking_score is None
+                        or selection_component_scores is None
+                        or selection_evidence_versions is None
+                        or ranking_component_scores is None
+                        or ranking_evidence_versions is None
+                    ):
+                        reason = "REEVALUATION_REQUIRED"
+                    else:
+                        payload = self._merged_lifecycle_payload(lifecycle) or {}
+                        quality = evaluate_prediction_data_quality(self.store, payload)
+                        expected_ranking_hash = _canary_ranking_snapshot_hash(
+                            current_id,
+                            str(lifecycle.get("stage") or ""),
+                            payload,
+                            qualification_hash=str(
+                                binding.get("qualification_hash") or ""
+                            ),
+                            quality=quality,
+                        )
+                        ranking_candidate_id = text_value(ranking.get("candidate_id"))
+                        ranking_run_id = text_value(ranking.get("ranking_run_id"))
+                        ranking_timestamp = text_value(
+                            ranking.get("ranking_timestamp")
+                        )
+                        ranking_qualification_hash = text_value(
+                            ranking.get("qualification_hash")
+                        )
+                        ranking_snapshot_hash = text_value(
+                            ranking.get("ranking_snapshot_hash")
+                        )
+                        if not selection_qualification_hash:
+                            reason = "REEVALUATION_REQUIRED"
+                        elif selection_qualification_hash != binding.get(
+                            "qualification_hash"
+                        ):
+                            reason = "QUALIFICATION_CHANGED"
+                        elif not selection_ranking_hash:
+                            reason = "REEVALUATION_REQUIRED"
+                        elif selection_ranking_hash != expected_ranking_hash:
+                            reason = "RANKING_EVIDENCE_CHANGED"
+                        elif ranking_qualification_hash != selection_qualification_hash:
+                            reason = "QUALIFICATION_CHANGED"
+                        elif ranking_snapshot_hash != selection_ranking_hash:
+                            reason = "RANKING_EVIDENCE_CHANGED"
+                        elif not selection_metadata_valid:
+                            reason = "REEVALUATION_REQUIRED"
+                        elif (
+                            ranking.get("selected") != 1
+                            or ranking_candidate_id != current_id
+                            or ranking_run_id != selection_run_id
+                            or ranking_timestamp != selection_timestamp
+                            or selection_selected_at != selection_timestamp
+                            or selection_selected_at != ranking_timestamp
+                            or selection.get("rank") != ranking.get("rank")
+                            or selection.get("total_score") != ranking.get("total_score")
+                            or selection.get("component_scores_json")
+                            != ranking.get("component_scores_json")
+                            or selection.get("evidence_versions_json")
+                            != ranking.get("evidence_versions_json")
+                            or selection.get("reason") != "SELECTED_WINNER"
+                            or ranking.get("reason") != ""
+                        ):
+                            reason = "REEVALUATION_REQUIRED"
+                        else:
+                            return {
+                                "selection_status": "CURRENT",
+                                "selection_valid": True,
+                                "selection_invalidation_reason": None,
+                                "selected_candidate": current_id,
+                                "last_selected_candidate": historical_id,
+                            }
+        return {
+            "selection_status": "STALE",
+            "selection_valid": False,
+            "selection_invalidation_reason": reason,
+            "selected_candidate": None,
+            "last_selected_candidate": historical_id,
+        }
+
+
     def status(self) -> dict[str, Any]:
+        lock = getattr(self.store, "_lock", None)
+        if lock is None:
+            return self._status_locked()
+        with lock:
+            return self._status_locked()
+
+    def _status_locked(self) -> dict[str, Any]:
         connection = self.store.connection
         lock = getattr(self.store, "_lock", None)
 
@@ -2146,6 +2909,28 @@ class CanaryService:
             with lock:
                 return connection.execute(query, parameters).fetchall()
 
+        def _optional_fetchone(
+            query: str, parameters: tuple[Any, ...] = ()
+        ) -> Any:
+            try:
+                return _fetchone(query, parameters)
+            except sqlite3.OperationalError as exc:
+                message = str(exc).lower()
+                if "no such table" in message or "no such column" in message:
+                    return None
+                raise
+
+        def _optional_fetchall(
+            query: str, parameters: tuple[Any, ...] = ()
+        ) -> list[Any]:
+            try:
+                return _fetchall(query, parameters)
+            except sqlite3.OperationalError as exc:
+                message = str(exc).lower()
+                if "no such table" in message or "no such column" in message:
+                    return []
+                raise
+
         try:
             row = _fetchone("SELECT * FROM canary_control WHERE singleton=1")
         except sqlite3.OperationalError as exc:
@@ -2153,7 +2938,15 @@ class CanaryService:
                 raise
             row = None
         now = ensure_utc(self.clock())
-        selection = self._selection_record()
+        if lock is None:
+            selection = self._selection_record()
+            selection_state = self._selection_validation(selection)
+        else:
+            # Keep the persisted winner row and every lifecycle/ranking read
+            # used to validate it in one store-locked snapshot.
+            with lock:
+                selection = self._selection_record()
+                selection_state = self._selection_validation(selection)
 
         def _safe_count(query: str) -> int:
             try:
@@ -2165,7 +2958,7 @@ class CanaryService:
             except (KeyError, TypeError, ValueError):
                 return 0
 
-        def _validated_eligibility_count() -> int:
+        def _validated_eligibility_rows() -> list[Any]:
             query = (
                 "SELECT e.candidate_id,e.frozen_hash,e.evidence_json "
                 "FROM canary_eligibility AS e "
@@ -2175,38 +2968,98 @@ class CanaryService:
             try:
                 rows = _fetchall(query)
             except sqlite3.Error:
-                return 0
-            count = 0
+                return []
+            valid: list[Any] = []
             for eligibility in rows:
                 try:
                     candidate_id = str(eligibility["candidate_id"] or "").strip()
-                    if candidate_id and self._eligibility_is_bound(candidate_id, eligibility):
-                        count += 1
+                    record = self.store.load_candidate_lifecycle(candidate_id)
+                    binding = self._eligibility_binding_result(
+                        candidate_id,
+                        eligibility,
+                        record=record,
+                    )
+                    if (
+                        candidate_id
+                        and binding.get("bound")
+                        and self.validate_eligibility(
+                            candidate_id,
+                            _record=record,
+                        ).get("eligible")
+                    ):
+                        valid.append(eligibility)
                 except Exception:
                     continue
-            return count
+            return valid
 
-        eligible_count = _validated_eligibility_count()
-        rankable_count = _safe_count(
+        eligibility_raw_count = _safe_count(
+            "SELECT COUNT(*) AS n FROM canary_eligibility"
+        )
+        eligible_count = len(_validated_eligibility_rows())
+        rankable_raw_count = _safe_count(
             "SELECT COUNT(*) AS n FROM canary_rankings WHERE total_score IS NOT NULL"
         )
+        rankable_rows = _optional_fetchall(
+            "SELECT * FROM canary_rankings WHERE total_score IS NOT NULL"
+        )
+        rankable_count = 0
+        for ranking_row in rankable_rows:
+            try:
+                candidate_id = str(ranking_row["candidate_id"] or "").strip()
+                record = self.store.load_candidate_lifecycle(candidate_id)
+                if not isinstance(record, Mapping):
+                    continue
+                binding_row = _optional_fetchone(
+                    "SELECT candidate_id,frozen_hash,evidence_json "
+                    "FROM canary_eligibility WHERE candidate_id=?",
+                    (candidate_id,),
+                )
+                binding = self._eligibility_binding_result(
+                    candidate_id,
+                    binding_row,
+                    record=record,
+                )
+                if not binding.get("bound") or binding.get("reevaluation_required"):
+                    continue
+                if not self.validate_eligibility(
+                    candidate_id,
+                    _record=record,
+                ).get("eligible"):
+                    continue
+                payload = self._merged_lifecycle_payload(record) or {}
+                quality = evaluate_prediction_data_quality(self.store, payload)
+                expected_hash = _canary_ranking_snapshot_hash(
+                    candidate_id,
+                    str(record.get("stage") or ""),
+                    payload,
+                    qualification_hash=str(binding.get("qualification_hash") or ""),
+                    quality=quality,
+                )
+                if (
+                    ranking_row["qualification_hash"] == binding.get("qualification_hash")
+                    and ranking_row["ranking_snapshot_hash"] == expected_hash
+                ):
+                    rankable_count += 1
+            except Exception:
+                continue
         execution_event_count = _safe_count(
             "SELECT COUNT(*) AS n FROM canary_execution_events"
         )
 
-        winner_id = (
-            str(selection.get("candidate_id")).strip()
-            if selection and selection.get("candidate_id")
-            else None
-        )
+        winner_id = selection_state["selected_candidate"]
+        last_selected_candidate = selection_state["last_selected_candidate"]
+        selection_status = selection_state["selection_status"]
+        selection_valid = bool(selection_state["selection_valid"])
+        selection_invalidation_reason = selection_state["selection_invalidation_reason"]
+        quality_candidate_id = winner_id or last_selected_candidate
         winner_quality: dict[str, Any] = {
             "historical_data_integrity": "UNKNOWN",
             "historical_execution_fidelity": "UNKNOWN",
             "current_execution_evidence": "CURRENT_ORDER_BOOK_REQUIRED",
         }
-        if winner_id:
+        if quality_candidate_id:
             try:
-                lifecycle = self.store.load_candidate_lifecycle(winner_id)
+                lifecycle = self.store.load_candidate_lifecycle(quality_candidate_id)
             except (AttributeError, TypeError, ValueError, sqlite3.Error):
                 lifecycle = None
             payload = lifecycle.get("payload") if isinstance(lifecycle, Mapping) else {}
@@ -2258,7 +3111,11 @@ class CanaryService:
             if isinstance(selection, Mapping)
             else ""
         )
-        selection_reason = selection_reason or None
+        selection_reason = (
+            str(selection_invalidation_reason)
+            if selection_invalidation_reason
+            else selection_reason or None
+        )
         risk_envelope = self.autonomous_limits()
         autonomous_state = None
         try:
@@ -2269,14 +3126,34 @@ class CanaryService:
         except sqlite3.OperationalError:
             autonomous_state = None
 
+        ranking_run_id = selection.get("ranking_run_id") if selection else None
+        ranking_timestamp = selection.get("ranking_timestamp") if selection else None
+        if selection and not ranking_timestamp:
+            try:
+                latest_ranking = _fetchone(
+                    "SELECT ranking_run_id,ranking_timestamp FROM canary_rankings "
+                    "WHERE selected=1 ORDER BY ranking_timestamp DESC LIMIT 1"
+                )
+            except sqlite3.Error:
+                latest_ranking = None
+            if latest_ranking is not None:
+                ranking_run_id = ranking_run_id or latest_ranking["ranking_run_id"]
+                ranking_timestamp = latest_ranking["ranking_timestamp"]
         disabled_auto = {
             "enabled": False,
             "selected_candidate": winner_id,
-            "ranking_run_id": selection.get("ranking_run_id") if selection else None,
+            "last_selected_candidate": last_selected_candidate,
+            "ranking_run_id": ranking_run_id,
+            "ranking_timestamp": ranking_timestamp,
             "rank": selection.get("rank") if selection else None,
             "score": selection.get("total_score") if selection else None,
             "selection_reason": selection_reason,
+            "selection_status": selection_status,
+            "selection_valid": selection_valid,
+            "selection_invalidation_reason": selection_invalidation_reason,
+            "eligibility_raw_count": eligibility_raw_count,
             "eligible_count": eligible_count,
+            "rankable_raw_count": rankable_raw_count,
             "rankable_count": rankable_count,
             **winner_quality,
             "next_decision": (
@@ -2305,6 +3182,18 @@ class CanaryService:
                 else "IDLE"
             ),
         }
+        selection_audit = dict(selection) if isinstance(selection, Mapping) else None
+        if selection_audit is not None:
+            selection_audit.update(
+                {
+                    "candidate_id": winner_id or last_selected_candidate,
+                    "selection_status": selection_status,
+                    "selection_valid": selection_valid,
+                    "selection_invalidation_reason": selection_invalidation_reason,
+                    "selected_candidate": winner_id,
+                    "last_selected_candidate": last_selected_candidate,
+                }
+            )
 
         display_state = "DISABLED"
         if row is None:
@@ -2313,11 +3202,22 @@ class CanaryService:
                 "micro_live_canary": "DISABLED",
                 "display_state": display_state,
                 "control_state": "DISABLED",
-                "candidate": None,
+                "candidate": winner_id,
                 "winner_id": winner_id,
-                "winner_rank": selection.get("rank") if selection else None,
-                "winner_score": selection.get("total_score") if selection else None,
+                "winner_rank": selection.get("rank") if winner_id and selection else None,
+                "winner_score": selection.get("total_score") if winner_id and selection else None,
                 "selection_reason": selection_reason,
+                "selection_status": selection_status,
+                "selection_valid": selection_valid,
+                "selection_invalidation_reason": selection_invalidation_reason,
+                "selected_candidate": winner_id,
+                "last_selected_candidate": last_selected_candidate,
+                "ranking_run_id": ranking_run_id,
+                "ranking_timestamp": ranking_timestamp,
+                "eligibility_raw_count": eligibility_raw_count,
+                "eligible_count": eligible_count,
+                "rankable_raw_count": rankable_raw_count,
+                "rankable_count": rankable_count,
                 "venue": None,
                 "expiry": None,
                 "control_generation": 0,
@@ -2330,13 +3230,11 @@ class CanaryService:
                 "limits": self._limits_record(CanaryLimits()),
                 "risk_envelope": risk_envelope,
                 "risk_limits": risk_envelope,
-                "eligible_count": eligible_count,
-                "rankable_count": rankable_count,
                 "real_execution_events": execution_event_count,
                 "execution_event_count": execution_event_count,
                 **winner_quality,
                 "autonomous": disabled_auto,
-                "selected_winner": selection,
+                "selected_winner": selection_audit,
                 "trades": [],
                 "live_execution": False,
                 "kill_semantics": "KILL_PREVENTS_NEW_SUBMISSIONS; IN_FLIGHT_REQUESTS_ARE_NOT_RETRACTED",
@@ -2350,36 +3248,48 @@ class CanaryService:
             limits = dict(parsed_limits)
         except (TypeError, ValueError, json.JSONDecodeError):
             state = "KILLED"
-        if state=="ARMED":
-            expected=self._integrity(
+        if state == "ARMED":
+            expected = self._integrity(
                 str(data.get("candidate_id") or ""),
                 str(data.get("venue") or ""),
                 str(data.get("expires_at") or ""),
                 limits,
             )
-            eligible = _fetchone(
-                "SELECT candidate_id,frozen_hash,evidence_json FROM canary_eligibility WHERE candidate_id=?",
-                (data.get("candidate_id"),),
+            candidate = str(data.get("candidate_id") or "")
+            eligible = _optional_fetchone(
+                "SELECT candidate_id,frozen_hash,evidence_json "
+                "FROM canary_eligibility WHERE candidate_id=?",
+                (candidate,),
             )
-            if not self._eligibility_is_bound(str(data.get("candidate_id") or ""), eligible) or expected!=data.get("integrity_hash"):
-                state="KILLED"
+            lifecycle = self.store.load_candidate_lifecycle(candidate)
+            bound = self._eligibility_binding_result(
+                candidate,
+                eligible,
+                record=lifecycle,
+            ).get("bound")
+            gates_pass = self.validate_eligibility(
+                candidate,
+                _record=lifecycle,
+            ).get("eligible")
+            if not bound or not gates_pass or expected != data.get("integrity_hash"):
+                state = "KILLED"
             elif not data.get("expires_at"):
-                state="DISARMED"
+                state = "DISARMED"
             else:
                 try:
-                    expired = ensure_utc(datetime.fromisoformat(data["expires_at"]))<=now
+                    expired = ensure_utc(datetime.fromisoformat(data["expires_at"])) <= now
                 except (TypeError, ValueError):
                     state = "KILLED"
                 else:
                     if expired:
-                        state="DISARMED"
+                        state = "DISARMED"
         elif state == AUTONOMOUS_MICRO_LIVE:
             expected = self._integrity("", AUTONOMOUS_CANARY_VENUE, "", limits)
             if limits != self.autonomous_limits() or expected != data.get("integrity_hash"):
                 state = "KILLED"
         start=now.replace(hour=0,minute=0,second=0,microsecond=0).isoformat()
         active_states = "('RESERVED','SUBMITTING','UNKNOWN','OPEN','PARTIAL','SUBMITTED')"
-        trades = [dict(x) for x in _fetchall(
+        trades = [dict(x) for x in _optional_fetchall(
             "SELECT l.timestamp,l.candidate_id,l.market_id,l.side,"
             "l.requested_notional,l.paper_expected_price,e.actual_average_price,"
             "CASE WHEN e.actual_average_price IS NOT NULL THEN "
@@ -2392,7 +3302,7 @@ class CanaryService:
             "e2.execution_event_id DESC LIMIT 1) ORDER BY l.timestamp DESC LIMIT 100"
         )]
         last_request_status = str(trades[0].get("status") or "").upper() if trades else None
-        aggregates = _fetchone(
+        aggregates = _optional_fetchone(
             "SELECT COALESCE(SUM(CASE WHEN timestamp>=? THEN 1 ELSE 0 END),0) orders,"
             "COALESCE(SUM(CASE WHEN status IN " + active_states
             + " THEN CAST(requested_notional AS REAL) ELSE 0 END),0) exposure,"
@@ -2403,6 +3313,13 @@ class CanaryService:
             + active_states,
             (start, start, start),
         )
+        if aggregates is None:
+            aggregates = {
+                "orders": 0,
+                "exposure": 0,
+                "positions": 0,
+                "pnl": 0,
+            }
         try:
             control_generation = int(data.get("control_generation") or 0)
         except (TypeError, ValueError):
@@ -2460,9 +3377,16 @@ class CanaryService:
             "control_state": state,
             "candidate": selected_candidate,
             "winner_id": winner_id,
-            "winner_rank": selection.get("rank") if selection else None,
-            "winner_score": selection.get("total_score") if selection else None,
+            "winner_rank": selection.get("rank") if winner_id and selection else None,
+            "winner_score": selection.get("total_score") if winner_id and selection else None,
             "selection_reason": selection_reason,
+            "selection_status": selection_status,
+            "selection_valid": selection_valid,
+            "selection_invalidation_reason": selection_invalidation_reason,
+            "selected_candidate": winner_id,
+            "last_selected_candidate": last_selected_candidate,
+            "ranking_run_id": ranking_run_id,
+            "ranking_timestamp": ranking_timestamp,
             "venue": data.get("venue"),
             "expiry": data.get("expires_at"),
             "control_generation": control_generation,
@@ -2474,7 +3398,9 @@ class CanaryService:
             "limits": limits,
             "risk_envelope": risk_envelope,
             "risk_limits": risk_envelope,
+            "eligibility_raw_count": eligibility_raw_count,
             "eligible_count": eligible_count,
+            "rankable_raw_count": rankable_raw_count,
             "rankable_count": rankable_count,
             "real_execution_events": execution_event_count,
             "execution_event_count": execution_event_count,
@@ -2484,7 +3410,7 @@ class CanaryService:
                 float(limits.get("max_daily_loss_usd", 2)) + float(aggregates["pnl"]),
             ),
             "autonomous": auto_payload,
-            "selected_winner": selection,
+            "selected_winner": selection_audit,
             "trades": trades,
             "live_execution": False,
             "kill_semantics": "KILL_PREVENTS_NEW_SUBMISSIONS; IN_FLIGHT_REQUESTS_ARE_NOT_RETRACTED",
@@ -3253,9 +4179,17 @@ class CanaryService:
                     block("CANARY_NOT_ARMED")
                 if control_state == AUTONOMOUS_MICRO_LIVE:
                     selected = connection.execute(
-                        "SELECT candidate_id FROM canary_selection WHERE singleton=1"
+                        "SELECT * FROM canary_selection WHERE singleton=1"
                     ).fetchone()
-                    if selected is None or str(selected["candidate_id"] or "") != candidate_id:
+                    selected_state = (
+                        self._selection_validation(dict(selected))
+                        if selected is not None
+                        else {}
+                    )
+                    if (
+                        not selected_state.get("selection_valid")
+                        or selected_state.get("selected_candidate") != candidate_id
+                    ):
                         block("AUTO_CANARY_CANDIDATE_NOT_SELECTED")
                 elif str(control["candidate_id"]) != candidate_id:
                     block("CANDIDATE_MISMATCH")

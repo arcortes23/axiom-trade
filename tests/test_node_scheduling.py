@@ -244,7 +244,15 @@ class SchedulerScaleTests(unittest.TestCase):
                 store.connection.set_authorizer(authorize_canary_selection)
                 try:
                     locked_overview = DashboardData(store=store).overview_summary()
-                    self.assertEqual(locked_overview["canary"]["winner_id"], "persisted-candidate")
+                    locked_canary = locked_overview["canary"]
+                    self.assertIsNone(locked_canary["winner_id"])
+                    self.assertIsNone(locked_canary["selected_candidate"])
+                    self.assertEqual(locked_canary["last_selected_candidate"], "persisted-candidate")
+                    self.assertEqual(locked_canary["selection_status"], "STALE")
+                    self.assertEqual(
+                        locked_canary["selection_invalidation_reason"], "LIFECYCLE_REJECTED"
+                    )
+                    self.assertFalse(locked_canary["selection_valid"])
                 finally:
                     store.connection.set_authorizer(None)
                     store._lock = original_lock
@@ -288,9 +296,16 @@ class SchedulerScaleTests(unittest.TestCase):
 
                 overview = DashboardData(store=store).overview_summary()
                 canary = overview["canary"]
-                self.assertEqual(canary["winner_id"], "persisted-candidate")
-                self.assertEqual(canary["winner_score"], 0.875)
-                self.assertEqual(canary["selection_reason"], "SELECTED_WINNER")
+                self.assertIsNone(canary["winner_id"])
+                self.assertIsNone(canary["selected_candidate"])
+                self.assertEqual(canary["last_selected_candidate"], "persisted-candidate")
+                self.assertIsNone(canary["winner_score"])
+                self.assertEqual(canary["selection_reason"], "LIFECYCLE_REJECTED")
+                self.assertEqual(
+                    canary["selection_invalidation_reason"], "LIFECYCLE_REJECTED"
+                )
+                self.assertEqual(canary["selection_status"], "STALE")
+                self.assertFalse(canary["selection_valid"])
                 self.assertEqual(canary["eligible_count"], 0)
                 self.assertEqual(canary["rankable_count"], 0)
                 self.assertEqual(canary["execution_event_count"], 0)

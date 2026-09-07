@@ -6,8 +6,14 @@ import json
 import math
 from typing import Any, Mapping
 
-from .canary import CanaryService
+from .canary import (
+    CanaryService,
+    _canary_qualification_hash,
+    _canary_qualification_projection,
+    _canary_ranking_snapshot_hash,
+)
 from .domain import ensure_utc, utc_now
+
 from .storage import AxiomStore
 from .lifecycle import CandidateLifecycleManager, CandidateStage
 from .data_quality import evaluate_prediction_data_quality, persisted_quality_fields
@@ -309,143 +315,418 @@ class CandidateCanaryRanker:
         return refreshed, refreshed["payload"]
 
 
+    def _snapshot_hashes(
+        self,
+        record: Mapping[str, Any],
+        payload: Mapping[str, Any],
+        quality: Mapping[str, Any],
+        frozen_hash: str,
+    ) -> tuple[dict[str, Any], str, str] | None:
+        qualification = _canary_qualification_projection(
+            str(record.get("candidate_id") or ""),
+            payload,
+            frozen_hash=frozen_hash,
+            quality=quality,
+        )
+        qualification_hash = _canary_qualification_hash(qualification)
+        ranking_snapshot_hash = _canary_ranking_snapshot_hash(
+            str(record.get("candidate_id") or ""),
+            str(record.get("stage") or ""),
+            payload,
+            qualification_hash=qualification_hash,
+            quality=quality,
+        )
+        if not qualification_hash or not ranking_snapshot_hash:
+            return None
+        return qualification, qualification_hash, ranking_snapshot_hash
+
     def evaluate_and_select(self, now: datetime | None = None) -> dict[str, Any]:
         timestamp = ensure_utc(now or self.clock())
         candidates: list[dict[str, Any]] = []
-        for record in self._candidate_records():
-            candidate_id = str(record.get("candidate_id") or "").strip()
-            payload = record.get("payload")
-            if not candidate_id or not isinstance(payload, Mapping) or str(record.get("stage")) not in self._STAGES:
+        invalidated_reasons: dict[str, str] = {}
+        for original_record in self._candidate_records():
+            candidate_id = str(original_record.get("candidate_id") or "").strip()
+            if not candidate_id:
+                continue
+            stage = str(original_record.get("stage") or "")
+            payload = original_record.get("payload")
+            if stage not in self._STAGES or not isinstance(payload, Mapping):
+                invalidated_reasons[candidate_id] = (
+                    "LIFECYCLE_REJECTED"
+                    if stage == "REJECTED"
+                    else "ELIGIBILITY_INVALID"
+                )
+                self.service.invalidate_eligibility(
+                    candidate_id,
+                    invalidated_reasons[candidate_id],
+                )
                 continue
             quality = evaluate_prediction_data_quality(self.store, payload)
-            record, payload = self._persist_quality_projection(record, payload, quality)
-            if self._prediction_market(payload) not in {"prediction", "polymarket", "prediction_market"}:
-                self.service.invalidate_eligibility(candidate_id, "PREDICTION_MARKET_ONLY")
+            record, payload = self._persist_quality_projection(
+                original_record,
+                payload,
+                quality,
+            )
+            if self._prediction_market(payload) not in {
+                "prediction",
+                "polymarket",
+                "prediction_market",
+            }:
+                invalidated_reasons[candidate_id] = "PREDICTION_MARKET_ONLY"
+                self.service.invalidate_eligibility(
+                    candidate_id,
+                    invalidated_reasons[candidate_id],
+                )
                 continue
-            validation = self.service.validate_eligibility(candidate_id)
+            validation = self.service.validate_eligibility(
+                candidate_id,
+                _record=record,
+            )
             if not validation.get("eligible"):
-                self.service.invalidate_eligibility(candidate_id, str(validation.get("reason_code") or "GATES_INCOMPLETE"))
+                binding_reason = (
+                    validation.get("binding", {}).get("reason_code")
+                    if isinstance(validation.get("binding"), Mapping)
+                    else None
+                )
+                invalidated_reasons[candidate_id] = (
+                    str(binding_reason)
+                    if binding_reason in {
+                        "QUALIFICATION_CHANGED",
+                        "ELIGIBILITY_MISSING",
+                        "ELIGIBILITY_INVALID",
+                    }
+                    else "ELIGIBILITY_INVALID"
+                )
+                self.service.invalidate_eligibility(
+                    candidate_id,
+                    invalidated_reasons[candidate_id],
+                )
                 continue
             try:
                 self.service.mark_eligible(candidate_id)
             except Exception:
-                self.service.invalidate_eligibility(candidate_id, "ELIGIBILITY_BINDING_PERSIST_FAILED")
+                invalidated_reasons[candidate_id] = "ELIGIBILITY_INVALID"
+                self.service.invalidate_eligibility(
+                    candidate_id,
+                    invalidated_reasons[candidate_id],
+                )
                 continue
+            record = self.store.load_candidate_lifecycle(candidate_id)
+            payload = (
+                self.service._merged_lifecycle_payload(record)
+                if isinstance(record, Mapping)
+                else None
+            )
+            if not isinstance(record, Mapping) or not isinstance(payload, Mapping):
+                invalidated_reasons[candidate_id] = "ELIGIBILITY_INVALID"
+                self.service.invalidate_eligibility(
+                    candidate_id,
+                    invalidated_reasons[candidate_id],
+                )
+                continue
+            quality = evaluate_prediction_data_quality(self.store, payload)
+            frozen_hash = str(validation.get("frozen_hash") or "")
+            hashes = self._snapshot_hashes(
+                record,
+                payload,
+                quality,
+                frozen_hash,
+            )
+            if hashes is None:
+                invalidated_reasons[candidate_id] = "ELIGIBILITY_INVALID"
+                self.service.invalidate_eligibility(
+                    candidate_id,
+                    invalidated_reasons[candidate_id],
+                )
+                continue
+            _, qualification_hash, ranking_snapshot_hash = hashes
             evidence, reason, versions = self._rank_evidence(
                 payload,
-                validation.get("frozen_hash"),
+                frozen_hash,
                 quality=quality,
             )
-            if evidence is None:
-                candidates.append({
-                    "candidate_id": candidate_id,
-                    "payload": dict(payload),
-                    "evidence": None,
-                    "reason": reason or "RANKING_EVIDENCE_MISSING",
-                    "versions": versions,
-                })
-                continue
-            cluster_key = self._cluster_key(candidate_id, payload, versions)
-            candidates.append({
+            versions.update(
+                {
+                    "qualification_hash": qualification_hash,
+                    "ranking_snapshot_hash": ranking_snapshot_hash,
+                }
+            )
+            item: dict[str, Any] = {
                 "candidate_id": candidate_id,
                 "payload": dict(payload),
+                "record": record,
+                "quality": quality,
                 "evidence": evidence,
-                "reason": "",
+                "reason": reason or "RANKING_EVIDENCE_MISSING",
                 "versions": versions,
-                "cluster_key": cluster_key,
-            })
+                "qualification_hash": qualification_hash,
+                "ranking_snapshot_hash": ranking_snapshot_hash,
+            }
+            if evidence is not None:
+                item["reason"] = ""
+                item["cluster_key"] = self._cluster_key(
+                    candidate_id,
+                    payload,
+                    versions,
+                )
+            candidates.append(item)
 
-        ranked = [item for item in candidates if item["evidence"] is not None]
-        ranked.sort(
-            key=lambda item: (
-                -float(item["evidence"]["total_score"]),
-                -float(item["evidence"]["raw"]["validation_confidence_lower_bound"]),
-                -float(item["evidence"]["raw"]["validation_expectancy"]),
-                str(item["candidate_id"]),
-            )
-        )
-        representatives: dict[str, dict[str, Any]] = {}
-        for item in ranked:
-            representatives.setdefault(str(item["cluster_key"]), item)
-        selected_representatives = sorted(
-            representatives.values(),
-            key=lambda item: (
-                -float(item["evidence"]["total_score"]),
-                -float(item["evidence"]["raw"]["validation_confidence_lower_bound"]),
-                -float(item["evidence"]["raw"]["validation_expectancy"]),
-                str(item["candidate_id"]),
-            ),
-        )
-        rank_by_id = {str(item["candidate_id"]): index for index, item in enumerate(selected_representatives, start=1)}
-        selected_id = str(selected_representatives[0]["candidate_id"]) if selected_representatives else None
-        evidence_seed = [
-            (str(item["candidate_id"]), item["versions"], float(item["evidence"]["total_score"]))
-            for item in selected_representatives
-        ]
-        run_id = "rank-" + hashlib.sha256(
-            json.dumps(evidence_seed, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
-        ).hexdigest()[:24]
-        persisted = []
-        for item in candidates:
-            evidence = item["evidence"]
-            candidate_id = str(item["candidate_id"])
-            representative = bool(evidence is not None and representatives.get(str(item.get("cluster_key"))) is item)
-            selected = candidate_id == selected_id and representative
-            if evidence is not None and not representative:
-                reason = "DIVERSITY_CLUSTER_NON_REPRESENTATIVE"
-            else:
-                reason = str(item["reason"])
-            persisted.append({
-                "candidate_id": candidate_id,
-                "ranking_run_id": run_id,
-                "ranking_timestamp": timestamp.isoformat(),
-                "rank": int(rank_by_id.get(candidate_id, 0)),
-                "total_score": float(evidence["total_score"]) if evidence is not None else None,
-                "component_scores_json": json.dumps(evidence or {}, sort_keys=True, allow_nan=False),
-                "evidence_versions_json": json.dumps(item["versions"], sort_keys=True, allow_nan=False),
-                "cluster_key": str(item.get("cluster_key") or ""),
-                "cluster_representative": int(representative),
-                "selected": int(selected),
-                "reason": reason,
-            })
+        changed_ids: set[str] = set()
+        stable: list[dict[str, Any]] = []
         with self.store._lock:
-            with self.store.connection:
-                self.store.connection.execute("DELETE FROM canary_rankings")
-                self.store.connection.executemany(
+            connection = self.store.connection
+            if connection.in_transaction:
+                raise RuntimeError("ranking transaction already active")
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                for item in candidates:
+                    candidate_id = str(item["candidate_id"])
+                    current = self.store.load_candidate_lifecycle(candidate_id)
+                    if not isinstance(current, Mapping):
+                        changed_ids.add(candidate_id)
+                        continue
+                    current_payload = self.service._merged_lifecycle_payload(current)
+                    if not isinstance(current_payload, Mapping):
+                        changed_ids.add(candidate_id)
+                        continue
+                    current_quality = evaluate_prediction_data_quality(
+                        self.store,
+                        current_payload,
+                    )
+                    current_validation = self.service.validate_eligibility(
+                        candidate_id,
+                        _record=current,
+                    )
+                    current_frozen_hash = str(
+                        current_validation.get("frozen_hash") or ""
+                    )
+                    current_hashes = self._snapshot_hashes(
+                        current,
+                        current_payload,
+                        current_quality,
+                        current_frozen_hash,
+                    )
+                    if (
+                        not current_validation.get("eligible")
+                        or current_hashes is None
+                        or current_hashes[1] != item["qualification_hash"]
+                        or current_hashes[2] != item["ranking_snapshot_hash"]
+                    ):
+                        changed_ids.add(candidate_id)
+                        continue
+                    stable.append(item)
+
+                ranked = [item for item in stable if item["evidence"] is not None]
+                ranked.sort(
+                    key=lambda item: (
+                        -float(item["evidence"]["total_score"]),
+                        -float(
+                            item["evidence"]["raw"][
+                                "validation_confidence_lower_bound"
+                            ]
+                        ),
+                        -float(item["evidence"]["raw"]["validation_expectancy"]),
+                        str(item["candidate_id"]),
+                    )
+                )
+                representatives: dict[str, dict[str, Any]] = {}
+                for item in ranked:
+                    representatives.setdefault(str(item["cluster_key"]), item)
+                selected_representatives = sorted(
+                    representatives.values(),
+                    key=lambda item: (
+                        -float(item["evidence"]["total_score"]),
+                        -float(
+                            item["evidence"]["raw"][
+                                "validation_confidence_lower_bound"
+                            ]
+                        ),
+                        -float(item["evidence"]["raw"]["validation_expectancy"]),
+                        str(item["candidate_id"]),
+                    ),
+                )
+                rank_by_id = {
+                    str(item["candidate_id"]): index
+                    for index, item in enumerate(selected_representatives, start=1)
+                }
+                selected_id = (
+                    str(selected_representatives[0]["candidate_id"])
+                    if selected_representatives
+                    else None
+                )
+                evidence_seed = [
+                    (
+                        str(item["candidate_id"]),
+                        item["versions"],
+                        float(item["evidence"]["total_score"]),
+                    )
+                    for item in selected_representatives
+                ]
+                run_id = "rank-" + hashlib.sha256(
+                    json.dumps(
+                        evidence_seed,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    ).encode("utf-8")
+                ).hexdigest()[:24]
+                persisted: list[dict[str, Any]] = []
+                for item in stable:
+                    evidence = item["evidence"]
+                    candidate_id = str(item["candidate_id"])
+                    representative = bool(
+                        evidence is not None
+                        and representatives.get(str(item.get("cluster_key"))) is item
+                    )
+                    selected = candidate_id == selected_id and representative
+                    if evidence is not None and not representative:
+                        reason = "DIVERSITY_CLUSTER_NON_REPRESENTATIVE"
+                    else:
+                        reason = str(item["reason"])
+                    persisted.append(
+                        {
+                            "candidate_id": candidate_id,
+                            "ranking_run_id": run_id,
+                            "ranking_timestamp": timestamp.isoformat(),
+                            "rank": int(rank_by_id.get(candidate_id, 0)),
+                            "total_score": (
+                                float(evidence["total_score"])
+                                if evidence is not None
+                                else None
+                            ),
+                            "component_scores_json": json.dumps(
+                                evidence or {},
+                                sort_keys=True,
+                                allow_nan=False,
+                            ),
+                            "evidence_versions_json": json.dumps(
+                                item["versions"],
+                                sort_keys=True,
+                                allow_nan=False,
+                            ),
+                            "cluster_key": str(item.get("cluster_key") or ""),
+                            "cluster_representative": int(representative),
+                            "selected": int(selected),
+                            "reason": reason,
+                            "qualification_hash": item["qualification_hash"],
+                            "ranking_snapshot_hash": item["ranking_snapshot_hash"],
+                        }
+                    )
+                previous = connection.execute(
+                    "SELECT candidate_id,last_selected_candidate "
+                    "FROM canary_selection WHERE singleton=1"
+                ).fetchone()
+                previous_id = (
+                    str(
+                        previous["candidate_id"]
+                        or previous["last_selected_candidate"]
+                        or ""
+                    ).strip()
+                    if previous is not None
+                    else ""
+                )
+                historical_id = (
+                    previous_id
+                    if previous_id and previous_id != selected_id
+                    else selected_id or previous_id or None
+                )
+                if selected_id:
+                    selection_status = "CURRENT"
+                    selection_valid = 1
+                    invalidation_reason = None
+                elif historical_id:
+                    selection_status = "STALE"
+                    selection_valid = 0
+                    if previous_id in changed_ids:
+                        invalidation_reason = "RANKING_EVIDENCE_CHANGED"
+                    elif previous_id in invalidated_reasons:
+                        invalidation_reason = invalidated_reasons[previous_id]
+                    elif previous_id:
+                        lifecycle = self.store.load_candidate_lifecycle(previous_id)
+                        if (
+                            not isinstance(lifecycle, Mapping)
+                            or str(lifecycle.get("stage")) == "REJECTED"
+                        ):
+                            invalidation_reason = "LIFECYCLE_REJECTED"
+                        else:
+                            invalidation_reason = "REEVALUATION_REQUIRED"
+                    else:
+                        invalidation_reason = "REEVALUATION_REQUIRED"
+                else:
+                    selection_status = "NONE"
+                    selection_valid = 0
+                    invalidation_reason = None
+                connection.execute("DELETE FROM canary_rankings")
+                connection.executemany(
                     "INSERT INTO canary_rankings(candidate_id,ranking_run_id,ranking_timestamp,rank,total_score,"
-                    "component_scores_json,evidence_versions_json,cluster_key,cluster_representative,selected,reason) "
+                    "component_scores_json,evidence_versions_json,cluster_key,cluster_representative,selected,reason,"
+                    "qualification_hash,ranking_snapshot_hash) "
                     "VALUES(:candidate_id,:ranking_run_id,:ranking_timestamp,:rank,:total_score,:component_scores_json,"
-                    ":evidence_versions_json,:cluster_key,:cluster_representative,:selected,:reason)",
+                    ":evidence_versions_json,:cluster_key,:cluster_representative,:selected,:reason,"
+                    ":qualification_hash,:ranking_snapshot_hash)",
                     persisted,
                 )
                 winner = next((item for item in persisted if item["selected"]), None)
-                self.store.connection.execute(
-                    "INSERT INTO canary_selection(singleton,ranking_run_id,candidate_id,rank,total_score,"
-                    "component_scores_json,evidence_versions_json,reason,selected_at) VALUES(1,?,?,?,?,?,?,?,?) "
+                connection.execute(
+                    "INSERT INTO canary_selection(singleton,ranking_run_id,ranking_timestamp,candidate_id,rank,total_score,"
+                    "component_scores_json,evidence_versions_json,reason,selected_at,qualification_hash,"
+                    "ranking_snapshot_hash,selection_status,selection_valid,selection_invalidation_reason,"
+                    "last_selected_candidate) VALUES(1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
                     "ON CONFLICT(singleton) DO UPDATE SET ranking_run_id=excluded.ranking_run_id,"
-                    "candidate_id=excluded.candidate_id,rank=excluded.rank,total_score=excluded.total_score,"
+                    "ranking_timestamp=excluded.ranking_timestamp,candidate_id=excluded.candidate_id,"
+                    "rank=excluded.rank,total_score=excluded.total_score,"
                     "component_scores_json=excluded.component_scores_json,evidence_versions_json=excluded.evidence_versions_json,"
-                    "reason=excluded.reason,selected_at=excluded.selected_at",
+                    "reason=excluded.reason,selected_at=excluded.selected_at,"
+                    "qualification_hash=excluded.qualification_hash,ranking_snapshot_hash=excluded.ranking_snapshot_hash,"
+                    "selection_status=excluded.selection_status,selection_valid=excluded.selection_valid,"
+                    "selection_invalidation_reason=excluded.selection_invalidation_reason,"
+                    "last_selected_candidate=excluded.last_selected_candidate",
                     (
                         run_id,
+                        timestamp.isoformat(),
                         winner["candidate_id"] if winner else None,
                         winner["rank"] if winner else None,
                         winner["total_score"] if winner else None,
                         winner["component_scores_json"] if winner else "{}",
                         winner["evidence_versions_json"] if winner else "{}",
-                        "SELECTED_WINNER" if winner else "NO_ELIGIBLE_RANKABLE_CANDIDATE",
+                        "SELECTED_WINNER" if winner else str(invalidation_reason or "NO_ELIGIBLE_RANKABLE_CANDIDATE"),
                         timestamp.isoformat(),
+                        winner["qualification_hash"] if winner else None,
+                        winner["ranking_snapshot_hash"] if winner else None,
+                        selection_status,
+                        selection_valid,
+                        invalidation_reason,
+                        historical_id,
                     ),
                 )
-        self.service.bind_autonomous_selection(selected_id)
+                connection.commit()
+            except BaseException:
+                if connection.in_transaction:
+                    connection.rollback()
+                raise
+        with self.store._lock:
+            self.service.bind_autonomous_selection(selected_id)
+            public_status = self.service.status()
+            selected_snapshot = self.current_selection()
+            rankings_snapshot = self.rankings()
         return {
             "ranking_run_id": run_id,
             "evaluated_at": timestamp.isoformat(),
-            "selected_candidate": selected_id,
-            "selected": self.current_selection(),
-            "rankings": self.rankings(),
-            "eligible_count": self.eligible_count(),
-            "rankable_count": len(ranked),
+            "ranking_timestamp": timestamp.isoformat(),
+            "winner_id": public_status.get("winner_id"),
+            "selected_candidate": public_status.get("selected_candidate"),
+            "last_selected_candidate": public_status.get("last_selected_candidate"),
+            "selection_status": public_status.get("selection_status"),
+            "selection_valid": public_status.get("selection_valid"),
+            "selection_invalidation_reason": public_status.get(
+                "selection_invalidation_reason"
+            ),
+            "selected": selected_snapshot,
+            "rankings": rankings_snapshot,
+            "eligibility_raw_count": public_status.get("eligibility_raw_count", 0),
+            "eligible_count": public_status.get("eligible_count", 0),
+            "rankable_raw_count": public_status.get("rankable_raw_count", 0),
+            "rankable_count": public_status.get("rankable_count", 0),
             "holdout_used": False,
             "formula_version": self.FORMULA_VERSION,
         }
@@ -458,31 +739,39 @@ class CandidateCanaryRanker:
 
     def rankings(self, *, limit: int = 100) -> list[dict[str, Any]]:
         bounded = max(1, min(int(limit), 1000))
-        rows = self.store.connection.execute(
-            "SELECT * FROM canary_rankings ORDER BY CASE WHEN rank=0 THEN 1 ELSE 0 END,rank,total_score DESC,candidate_id LIMIT ?",
-            (bounded,),
-        ).fetchall()
-        result = []
-        for row in rows:
-            item = dict(row)
-            for key in ("component_scores_json", "evidence_versions_json"):
-                try:
-                    value = json.loads(item.get(key) or "{}")
-                except (TypeError, ValueError, json.JSONDecodeError):
-                    value = {}
-                item[key.removesuffix("_json")] = value
-            result.append(item)
-        return result
+        with self.store._lock:
+            rows = self.store.connection.execute(
+                "SELECT * FROM canary_rankings ORDER BY CASE WHEN rank=0 THEN 1 ELSE 0 END,rank,total_score DESC,candidate_id LIMIT ?",
+                (bounded,),
+            ).fetchall()
+            result = []
+            for row in rows:
+                item = dict(row)
+                for key in ("component_scores_json", "evidence_versions_json"):
+                    try:
+                        value = json.loads(item.get(key) or "{}")
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        value = {}
+                    item[key.removesuffix("_json")] = value
+                result.append(item)
+            return result
 
     def current_selection(self) -> dict[str, Any] | None:
-        return self.service._selection_record()
+        # Keep the selection record and its validation on one store snapshot.
+        # AxiomStore's lock is reentrant because both helpers may acquire it
+        # while loading their constituent rows.
+        with self.store._lock:
+            selection = self.service._selection_record()
+            if not isinstance(selection, Mapping):
+                return None
+            state = self.service._selection_validation(selection)
+            return selection if state.get("selection_valid") else None
 
     def current_winner(self) -> dict[str, Any] | None:
         return self.current_selection()
 
     def eligible_count(self) -> int:
-        row = self.store.connection.execute("SELECT COUNT(*) AS n FROM canary_eligibility").fetchone()
-        return int(row["n"] if row is not None else 0)
+        return int(self.service.status().get("eligible_count") or 0)
 
 
 __all__ = ["CandidateCanaryRanker"]

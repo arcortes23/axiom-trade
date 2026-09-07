@@ -183,24 +183,49 @@ def evaluate_prediction_data_quality(store: Any, payload: Mapping[str, Any]) -> 
         fidelity = _fidelity(catalog, body)
         base["historical_execution_fidelity"] = fidelity
         base["historical_execution_fidelity_score"] = EXECUTION_FIDELITY_SCORES.get(fidelity)
-        records = None
-        try:
-            cache = getattr(store, "_prediction_quality_records_cache", None)
-            if not isinstance(cache, dict):
-                cache = {}
-                setattr(store, "_prediction_quality_records_cache", cache)
-            cache_key = (dataset_id, dataset_version)
-            if cache_key in cache:
-                records = cache[cache_key]
+        records_ok = False
+        row_count = 0
+        cache_key = (dataset_id, dataset_version)
+
+        def load_record_integrity() -> tuple[bool, int]:
+            records_cache = getattr(store, "_prediction_quality_records_cache", None)
+            if not isinstance(records_cache, dict):
+                records_cache = {}
+                setattr(store, "_prediction_quality_records_cache", records_cache)
+            integrity_cache = getattr(store, "_prediction_quality_integrity_cache", None)
+            if not isinstance(integrity_cache, dict):
+                integrity_cache = {}
+                setattr(store, "_prediction_quality_integrity_cache", integrity_cache)
+            cached = integrity_cache.get(cache_key)
+            if cached is not None:
+                return cached
+            records_cached = cache_key in records_cache
+            if records_cached:
+                records = records_cache[cache_key]
             else:
                 records = store.load_dataset(dataset_id, dataset_version)
-                cache[cache_key] = records
+            cached = _records_are_historical(records)
+            if not records_cached:
+                records_cache[cache_key] = records
+            integrity_cache[cache_key] = cached
+            return cached
+
+        try:
+            lock = getattr(store, "_lock", None)
+            if lock is not None and callable(getattr(lock, "__enter__", None)):
+                with lock:
+                    records_ok, row_count = load_record_integrity()
+            elif lock is not None and callable(getattr(lock, "acquire", None)):
+                lock.acquire()
+                try:
+                    records_ok, row_count = load_record_integrity()
+                finally:
+                    lock.release()
+            else:
+                records_ok, row_count = load_record_integrity()
         except Exception:
-            try:
-                records = store.load_dataset(dataset_id, dataset_version)
-            except Exception:
-                records = None
-        records_ok, row_count = _records_are_historical(records)
+            # Failed loads/scans remain uncached so a later evaluation can retry.
+            records_ok, row_count = False, 0
         expected_count = catalog.get("row_count")
         rows_nonempty = records_ok and row_count > 0 and row_count == expected_count
         base["historical_rows_nonempty"] = rows_nonempty

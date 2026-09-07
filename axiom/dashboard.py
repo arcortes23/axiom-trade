@@ -444,6 +444,97 @@ def _number_or_zero(value: Any) -> float:
         return 0.0
     return number if math.isfinite(number) else 0.0
 
+_CANARY_SELECTION_STATUSES = frozenset({"CURRENT", "STALE", "NONE"})
+_CANARY_STATUS_FIELDS = (
+    "eligibility_raw_count",
+    "eligible_count",
+    "rankable_raw_count",
+    "rankable_count",
+    "ranking_run_id",
+    "ranking_timestamp",
+    "selection_status",
+    "selection_valid",
+    "selection_invalidation_reason",
+    "selected_candidate",
+    "last_selected_candidate",
+)
+
+
+def _canary_status_projection(status: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Normalize the immutable selection status contract for dashboard consumers."""
+    source = dict(status) if isinstance(status, Mapping) else {}
+    nested = source.get("autonomous")
+    nested = nested if isinstance(nested, Mapping) else {}
+
+    def value(name: str, default: Any = None) -> Any:
+        # An explicit top-level ``None`` is authoritative and must not be
+        # replaced by historical nested data.
+        if name in source:
+            return source[name]
+        return nested.get(name, default)
+
+    def count(name: str) -> int:
+        try:
+            return max(0, int(value(name, 0) or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    selection_status = str(value("selection_status", "NONE") or "NONE").strip().upper()
+    if selection_status not in _CANARY_SELECTION_STATUSES:
+        selection_status = "NONE"
+    selection_valid = value("selection_valid", False) is True
+    selected_candidate = value("selected_candidate")
+    if selected_candidate is not None:
+        selected_candidate = str(selected_candidate).strip() or None
+    if not (selection_valid and selection_status == "CURRENT"):
+        selected_candidate = None
+    last_selected_candidate = value("last_selected_candidate")
+    if last_selected_candidate is not None:
+        last_selected_candidate = str(last_selected_candidate).strip() or None
+    projection = dict(source)
+    projection.update(
+        {
+            "eligibility_raw_count": count("eligibility_raw_count"),
+            "eligible_count": count("eligible_count"),
+            "rankable_raw_count": count("rankable_raw_count"),
+            "rankable_count": count("rankable_count"),
+            "ranking_run_id": value("ranking_run_id"),
+            "ranking_timestamp": value("ranking_timestamp"),
+            "selection_status": selection_status,
+            "selection_valid": selection_valid,
+            "selection_invalidation_reason": value("selection_invalidation_reason"),
+            "selected_candidate": selected_candidate,
+            "last_selected_candidate": last_selected_candidate,
+        }
+    )
+    # ``winner_id`` remains current-only. Historical selections are represented
+    # by ``last_selected_candidate`` and never become executable again.
+    projection["winner_id"] = (
+        selected_candidate if selection_valid and selection_status == "CURRENT" else None
+    )
+    if not (selection_valid and selection_status == "CURRENT"):
+        projection["winner_rank"] = None
+        projection["winner_score"] = None
+    selected_winner = projection.get("selected_winner")
+    if isinstance(selected_winner, Mapping):
+        selected_winner = dict(selected_winner)
+        selected_winner["selection_status"] = selection_status
+        selected_winner["selection_valid"] = selection_valid
+        selected_winner["selection_invalidation_reason"] = projection[
+            "selection_invalidation_reason"
+        ]
+        projection["selected_winner"] = selected_winner
+    autonomous = projection.get("autonomous")
+    autonomous = dict(autonomous) if isinstance(autonomous, Mapping) else {}
+    autonomous.update({name: projection[name] for name in _CANARY_STATUS_FIELDS})
+    autonomous["winner_id"] = projection["winner_id"]
+    if not (selection_valid and selection_status == "CURRENT"):
+        autonomous["rank"] = None
+        autonomous["score"] = None
+    projection["autonomous"] = autonomous
+    return projection
+
+
 class DashboardData:
     """Dashboard data facade plus the local control-plane projection."""
 
@@ -2516,7 +2607,7 @@ class DashboardData:
 
         crypto_ready = int(catalog.get("historical", {}).get("datasets", 0) or 0) > 0 if isinstance(catalog.get("historical"), Mapping) else False
         canary_service = CanaryService(self.store, initialize=False)
-        canary_status = canary_service.status()
+        canary_status = _canary_status_projection(canary_service.status())
         latest_signal = canary_service.latest_signal()
         latest_queue = aggregate.get("latest_queue_item") if isinstance(aggregate, Mapping) else None
         latest_outcome = None
@@ -2649,7 +2740,7 @@ class DashboardData:
     def canary_data(self) -> dict[str, Any]:
         credentials = canary_module.CredentialStore().safe_projection(allow_environment=False)
         if self.store is None:
-            canary = {
+            canary: Mapping[str, Any] = {
                 "production_live_trading": "DISABLED",
                 "micro_live_canary": "DISABLED",
                 "display_state": "DISABLED",
@@ -2659,8 +2750,17 @@ class DashboardData:
                 "winner_rank": None,
                 "winner_score": None,
                 "selection_reason": None,
+                "eligibility_raw_count": 0,
                 "eligible_count": 0,
+                "rankable_raw_count": 0,
                 "rankable_count": 0,
+                "ranking_run_id": None,
+                "ranking_timestamp": None,
+                "selection_status": "NONE",
+                "selection_valid": False,
+                "selection_invalidation_reason": None,
+                "selected_candidate": None,
+                "last_selected_candidate": None,
                 "historical_data_integrity": "UNKNOWN",
                 "historical_execution_fidelity": "UNKNOWN",
                 "current_execution_evidence": "CURRENT_ORDER_BOOK_REQUIRED",
@@ -2670,15 +2770,6 @@ class DashboardData:
                 "execution_event_count": 0,
                 "autonomous": {
                     "enabled": False,
-                    "selected_candidate": None,
-                    "rank": None,
-                    "score": None,
-                    "selection_reason": None,
-                    "eligible_count": 0,
-                    "rankable_count": 0,
-                    "historical_data_integrity": "UNKNOWN",
-                    "historical_execution_fidelity": "UNKNOWN",
-                    "current_execution_evidence": "CURRENT_ORDER_BOOK_REQUIRED",
                     "next_decision": "ENABLE AUTO CANARY",
                     "blocker": "AUTONOMOUS_CANARY_DISABLED",
                 },
@@ -2690,34 +2781,18 @@ class DashboardData:
             service = CanaryService(self.store, initialize=False)
             canary = service.status()
             signal = service.latest_signal()
-        autonomous = canary.get("autonomous", {}) if isinstance(canary, Mapping) else {}
-        autonomous = dict(autonomous) if isinstance(autonomous, Mapping) else {}
-        eligible_count = int(canary.get("eligible_count", 0) or 0)
-        rankable_count = int(canary.get("rankable_count", 0) or 0)
+        canary = _canary_status_projection(canary)
+        autonomous = canary["autonomous"]
+        eligible_count = canary["eligible_count"]
+        rankable_count = canary["rankable_count"]
         execution_events = int(canary.get("real_execution_events", 0) or 0)
-        # These additive keys let the browser render the persisted projection
-        # without consulting the control response or requiring a worker tick.
-        autonomous.setdefault("eligible_count", eligible_count)
-        autonomous.setdefault("rankable_count", rankable_count)
-        autonomous.setdefault(
-            "historical_data_integrity",
-            canary.get("historical_data_integrity", "UNKNOWN"),
-        )
-        autonomous.setdefault(
-            "historical_execution_fidelity",
-            canary.get("historical_execution_fidelity", "UNKNOWN"),
-        )
-        autonomous.setdefault(
-            "current_execution_evidence",
-            canary.get("current_execution_evidence", "CURRENT_ORDER_BOOK_REQUIRED"),
-        )
-        autonomous.setdefault("selection_reason", canary.get("selection_reason"))
-        autonomous.setdefault("rank", canary.get("winner_rank"))
-        autonomous.setdefault("score", canary.get("winner_score"))
-        autonomous.setdefault("selected_candidate", canary.get("winner_id"))
         candidate_status = {
+            "eligibility_raw_count": canary["eligibility_raw_count"],
             "canary_eligible": eligible_count,
+            "eligible_count": eligible_count,
+            "rankable_raw_count": canary["rankable_raw_count"],
             "rankable": rankable_count,
+            "rankable_count": rankable_count,
         }
         persisted_connectivity: Any = None
         if self.store is not None:
@@ -2729,17 +2804,25 @@ class DashboardData:
             except (AttributeError, TypeError, ValueError, sqlite3.Error):
                 persisted_connectivity = None
         connectivity = _stored_connectivity_projection(persisted_connectivity)
-        return {
+        projection = {
             "canary": canary,
             "autonomous_canary": autonomous,
             "canary_signal": signal,
             "connectivity": connectivity,
-            "research_cards": {"canary_eligible": eligible_count},
+            "research_cards": {
+                "canary_eligible": eligible_count,
+                "eligible_count": eligible_count,
+                "eligibility_raw_count": canary["eligibility_raw_count"],
+                "rankable_count": rankable_count,
+                "rankable_raw_count": canary["rankable_raw_count"],
+            },
             "candidate_status": candidate_status,
             "credentials": credentials,
             "real_execution_events": execution_events,
             "live_execution": False,
         }
+        projection.update({name: canary[name] for name in _CANARY_STATUS_FIELDS})
+        return projection
 
     def _operator_control_data(self) -> dict[str, Any]:
         """Merge responsive controls into the bounded persisted overview."""
@@ -2962,7 +3045,7 @@ class DashboardData:
         canary_service = (
             CanaryService(self.store, initialize=False) if self.store is not None else None
         )
-        canary_status = (
+        canary_status = _canary_status_projection(
             canary_service.status()
             if canary_service is not None
             else self.canary_data()["canary"]
@@ -3265,15 +3348,16 @@ def _dashboard_html(control_token: str | None = None) -> str:
       const c=data.canary||{}, auto=data.autonomous_canary||c.autonomous||{}, risk=c.risk_envelope||c.risk_limits||{}, signal=data.canary_signal||null, connectivity=data.connectivity??c.connectivity??null;
       renderCanaryConnectivity(connectivity);
       const backendState=String(c.micro_live_canary||"DISABLED"), stateValue=backendState==="KILLED"?"KILLED":Boolean(auto.enabled)?"ENABLED":"DISABLED";
-      const enabled=Boolean(auto.enabled), winner=auto.selected_candidate||c.winner_id||"—", winnerRaw=winner==="—"?"":winner, eligible=Number(data.research_cards?.canary_eligible??c.eligible_count??auto.eligible_count??0)||0, rankable=Number(data.candidate_status?.rankable??c.rankable_count??auto.rankable_count??0)||0, events=data.real_execution_events??c.real_execution_events??c.execution_event_count??0, manualCandidate=backendState==="ARMED"&&c.candidate?`<div class="panel"><div class="metric">${safe(c.candidate)}</div><div class="metric-label">Manual armed candidate</div></div>`:"";
+      const enabled=Boolean(auto.enabled), selectionStatus=String(c.selection_status||"NONE").toUpperCase(), selectionValid=c.selection_valid===true, currentCandidate=selectionValid&&selectionStatus==="CURRENT"?c.selected_candidate||"": "", currentWinnerId=c.winner_id||"", historicalCandidate=c.last_selected_candidate||"", selectionLabel=selectionStatus==="STALE"?"STALE · REEVALUATION REQUIRED":selectionStatus==="CURRENT"?"CURRENT":"NONE", rawEligible=Number(c.eligibility_raw_count)||0, eligible=Number(c.eligible_count)||0, rawRankable=Number(c.rankable_raw_count)||0, rankable=Number(c.rankable_count)||0, events=data.real_execution_events??c.real_execution_events??c.execution_event_count??0, manualCandidate=backendState==="ARMED"&&c.candidate?`<div class="panel"><div class="metric">${safe(c.candidate)}</div><div class="metric-label">Manual armed candidate</div></div>`:"";
       const connectivityReady=connectivity?.ready===true, connectivityBlocker=connectivityReady?"":arr(connectivity?.failure_codes)[0]||"CONNECTIVITY_BLOCKED";
-      const autonomousBlocker=!connectivity?"CONNECTIVITY_CHECK_REQUIRED":!connectivityReady?connectivityBlocker:backendState==="KILLED"?"CANARY_KILLED":!winnerRaw||eligible<=0||rankable<=0?"NO_ELIGIBLE_RANKABLE_CANDIDATE":String(auto.blocker||"AUTONOMOUS_CANARY_DISABLED");
-      const autoReady=connectivityReady&&backendState!=="KILLED"&&!enabled&&Boolean(winnerRaw)&&eligible>0&&rankable>0;
+      const selectionReason=c.selection_invalidation_reason||"", selectionBlocker=selectionValid&&currentCandidate?"":(selectionReason||(selectionStatus==="STALE"?"REEVALUATION_REQUIRED":selectionStatus==="NONE"?"NO_CURRENT_SELECTION":"SELECTION_INVALID"));
+      const autonomousBlocker=!connectivity?"CONNECTIVITY_CHECK_REQUIRED":!connectivityReady?connectivityBlocker:backendState==="KILLED"?"CANARY_KILLED":selectionBlocker||String(auto.blocker||"AUTONOMOUS_CANARY_DISABLED");
+      const autoReady=connectivityReady&&backendState!=="KILLED"&&!enabled&&selectionValid&&Boolean(currentCandidate);
       const enable=stateValue==="KILLED"?"":enabled?controlButton("canary.disarm","DISARM","","DISARM"):controlButton("canary.enable_auto","ENABLE AUTO CANARY","","ENABLE AUTO CANARY");
       const riskMarkup=Object.entries(risk).map(([key,value])=>`<div class="key-value"><span class="key">${safe(key.replaceAll("_"," "))}</span><strong>${safe(value)}</strong></div>`).join("")||empty("Risk envelope unavailable","No frozen risk limits are persisted.");
-      const selectionReason=auto.selection_reason??c.selection_reason, historicalIntegrity=auto.historical_data_integrity??c.historical_data_integrity, executionFidelity=auto.historical_execution_fidelity??c.historical_execution_fidelity, currentEvidence=auto.current_execution_evidence??c.current_execution_evidence, nextDecision=auto.next_decision??"—", blocker=auto.blocker??"—";
+      const currentRank=selectionValid&&selectionStatus==="CURRENT"?auto.rank:"—", currentScore=selectionValid&&selectionStatus==="CURRENT"?auto.score:"—", selectionReasonLabel=c.selection_reason||"—", historicalMarkup=historicalCandidate?`<div class="panel"><div class="metric">${safe(historicalCandidate)}</div><div class="metric-label">Selected winner · Historical selected ID</div><p class="page-note"><span class="badge ${statusClass(selectionStatus)}">${safe(selectionLabel)}</span></p></div>`:"";
       $("canary-controls").innerHTML=`<article class="panel"><div class="section-title"><h2>AUTONOMOUS CANARY CONTROL</h2><span class="badge ${statusClass(stateValue)}">${safe(stateValue)}</span></div><p class="page-note"><strong>${safe(autoReady?"AUTO CANARY READY TO ENABLE":`AUTO CANARY BLOCKED: ${autonomousBlocker}`)}</strong></p><div class="page-note">${controlButton("canary.connectivity_check","Connectivity check")} · ${enable} · ${controlButton("canary.kill","KILL","","KILL")}</div><p class="page-note">One confirmation enables the frozen prediction-only $1 envelope. Research, eligibility, ranking, and submission decisions run in the node worker; Hermes cannot change this envelope.</p></article>`;
-      $("canary-summary").innerHTML=`<div class="card-grid"><div class="panel"><div class="metric">${safe(stateValue)}</div><div class="metric-label">Autonomous canary state</div></div><div class="panel"><div class="metric">${safe(winner)}</div><div class="metric-label">Selected winner</div></div>${manualCandidate}<div class="panel"><div class="metric">${safe(auto.rank??c.winner_rank??"—")} · ${safe(auto.score??c.winner_score??"—")}</div><div class="metric-label">Winner rank / score</div></div><div class="panel"><div class="metric">${count(eligible)}</div><div class="metric-label">Eligible candidates</div></div><div class="panel"><div class="metric">${count(rankable)}</div><div class="metric-label">Rankable candidates</div></div><div class="panel"><div class="metric">${count(events)}</div><div class="metric-label">Real execution events</div></div></div><article class="panel"><div class="section-title"><h2>Autonomous readiness</h2><span class="badge ${statusClass(autonomousBlocker)}">${safe(autoReady?"READY":autonomousBlocker)}</span></div><div class="three-col"><div class="key-value"><span class="key">Selection reason</span><strong>${safe(selectionReason)}</strong></div><div class="key-value"><span class="key">Historical data integrity</span><strong>${safe(historicalIntegrity)}</strong></div><div class="key-value"><span class="key">Historical execution fidelity</span><strong>${safe(executionFidelity)}</strong></div><div class="key-value"><span class="key">Current execution evidence</span><strong>${safe(currentEvidence)}</strong></div><div class="key-value"><span class="key">Next decision</span><strong>${safe(nextDecision)}</strong></div><div class="key-value"><span class="key">Blocker</span><strong>${safe(blocker)}</strong></div></div></article><article class="panel"><div class="section-title"><h2>Risk envelope</h2><span class="badge warn">bounded $1</span></div>${riskMarkup}</article>`;
+      $("canary-summary").innerHTML=`<div class="card-grid"><div class="panel"><div class="metric">${safe(stateValue)}</div><div class="metric-label">Autonomous canary state</div></div>${currentCandidate?`<div class="panel"><div class="metric">${safe(currentCandidate)}</div><div class="metric-label">Selected winner · Current selection</div><p class="page-note"><span class="badge ${statusClass(selectionStatus)}">${safe(selectionLabel)}</span></p></div>`:historicalMarkup||`<div class="panel"><div class="metric">—</div><div class="metric-label">Current selection</div><p class="page-note"><span class="badge ${statusClass(selectionStatus)}">${safe(selectionLabel)}</span></p></div>`}${manualCandidate}<div class="panel"><div class="metric">${safe(currentRank)} · ${safe(currentScore)}</div><div class="metric-label">Current rank / score</div></div><div class="panel"><div class="metric">${count(rawEligible)}</div><div class="metric-label">Eligible candidates (raw)</div></div><div class="panel"><div class="metric">${count(eligible)}</div><div class="metric-label">Eligible candidates (validated)</div></div><div class="panel"><div class="metric">${count(rawRankable)}</div><div class="metric-label">Rankable candidates (raw)</div></div><div class="panel"><div class="metric">${count(rankable)}</div><div class="metric-label">Rankable candidates (validated)</div></div><div class="panel"><div class="metric">${count(events)}</div><div class="metric-label">Real execution events</div></div></div><article class="panel"><div class="section-title"><h2>Autonomous readiness</h2><span class="badge ${statusClass(autonomousBlocker)}">${safe(autoReady?"READY":autonomousBlocker)}</span></div><div class="three-col"><div class="key-value"><span class="key">Selection status</span><strong>${safe(selectionLabel)}</strong></div><div class="key-value"><span class="key">Selection valid</span><strong>${safe(selectionValid)}</strong></div><div class="key-value"><span class="key">Current selection</span><strong>${safe(currentCandidate||"—")}</strong></div><div class="key-value"><span class="key">Historical selection</span><strong>${safe(historicalCandidate||"—")}</strong></div><div class="key-value"><span class="key">Selection reason</span><strong>${safe(selectionReasonLabel)}</strong></div><div class="key-value"><span class="key">Invalidation reason</span><strong>${safe(selectionReason||"—")}</strong></div><div class="key-value"><span class="key">Last ranking run ID</span><strong>${safe(c.ranking_run_id||"—")}</strong></div><div class="key-value"><span class="key">Last ranking timestamp</span><strong>${safe(dateText(c.ranking_timestamp))}</strong></div><div class="key-value"><span class="key">Historical data integrity</span><strong>${safe(c.historical_data_integrity||"UNKNOWN")}</strong></div><div class="key-value"><span class="key">Historical execution fidelity</span><strong>${safe(c.historical_execution_fidelity||"UNKNOWN")}</strong></div><div class="key-value"><span class="key">Current execution evidence</span><strong>${safe(c.current_execution_evidence||"CURRENT_ORDER_BOOK_REQUIRED")}</strong></div><div class="key-value"><span class="key">Next decision</span><strong>${safe(auto.next_decision||"—")}</strong></div><div class="key-value"><span class="key">Blocker</span><strong>${safe(selectionReason||auto.blocker||"—")}</strong></div></div></article><article class="panel"><div class="section-title"><h2>Risk envelope</h2><span class="badge warn">bounded $1</span></div>${riskMarkup}</article>`;
       const readiness=signal?String(signal.status||"READY"):"NO SIGNAL", detail=signal?`<div class="three-col"><div class="key-value"><span class="key">Signal readiness</span><strong>${safe(readiness)}</strong></div><div class="key-value"><span class="key">Market / outcome</span><strong>${safe(signal.market_id)} / ${safe(signal.outcome)}</strong></div><div class="key-value"><span class="key">Expected price</span><strong>${safe(signal.paper_expected_price)}</strong></div><div class="key-value"><span class="key">Generated</span><strong>${safe(dateText(signal.generated_at))}</strong></div><div class="key-value"><span class="key">Order result</span><strong>${safe(c.last_request_status||"NO ORDER")}</strong></div></div>`:empty("No latest signal","No persisted signal is available.");
       $("canary-summary").insertAdjacentHTML("beforeend",`<article class="panel"><div class="section-title"><h2>Latest signal</h2><span class="badge ${statusClass(readiness)}">${safe(readiness)}</span></div>${detail}<p class="page-note">Kill prevents new submissions; an in-flight request is recorded, in-flight not retracted, and never retried automatically.</p></article>`);
       $("canary-trades").innerHTML=arr(c.trades).length?`<table><thead><tr><th>Time</th><th>Candidate</th><th>Market</th><th>Side</th><th>Status</th><th>Price Δ</th></tr></thead><tbody>${arr(c.trades).map(t=>`<tr><td>${safe(dateText(t.timestamp))}</td><td>${safe(t.candidate_id)}</td><td>${safe(t.market_id)}</td><td>${safe(t.side)}</td><td><span class="badge ${statusClass(t.status)}">${safe(t.status)}</span></td><td>${safe(t.price_difference)}</td></tr>`).join("")}</tbody></table>`:empty("No canary execution evidence","No order has been submitted by the autonomous worker.");
@@ -3407,10 +3491,9 @@ def _dashboard_html(control_token: str | None = None) -> str:
         }
       };
       try {
-        if(tab==="overview"||tab==="canary") {
+        if(tab==="overview") {
           await Promise.all([
             renderPersisted("overview","/api/v2/overview-summary",renderOverview,"overview"),
-            renderPersisted("canary","/api/v2/canary",renderCanary,"canary"),
             (async()=>{
               try {
                 const controls=await fetchWithTimeout("/api/operator",{cache:"no-store",signal:controller.signal});
@@ -3428,6 +3511,8 @@ def _dashboard_html(control_token: str | None = None) -> str:
               }
             })()
           ]);
+        } else if(tab==="canary") {
+          await renderPersisted("canary","/api/v2/canary",renderCanary,"canary");
         } else {
           const data=await fetchV2Bounded(VIEW_ENDPOINT[tab],controller.signal);
           if(generation!==refreshGeneration)return;

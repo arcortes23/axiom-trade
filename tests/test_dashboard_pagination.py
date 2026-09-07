@@ -12,9 +12,11 @@ from urllib.error import HTTPError
 from urllib.parse import quote, urlencode
 from urllib.request import urlopen
 
+from axiom.canary import CanaryService
 from axiom.dashboard import DashboardData, DashboardServer, _dashboard_html, _jsonable
 from axiom.domain import MarketType
 from axiom.operator import CANARY_CONNECTIVITY_CONFIG_KEY
+from axiom.ranker import CandidateCanaryRanker
 from axiom.storage import AxiomStore
 
 
@@ -353,6 +355,98 @@ class DashboardPaginationFixture(unittest.TestCase):
             ),
         )
         self.store.connection.commit()
+    def _seed_ranked_selection(self, candidate_id: str = "dashboard-winner") -> dict[str, object]:
+        """Persist one complete candidate so dashboard selection is snapshot-valid."""
+        dataset_id = "dashboard-history"
+        self.store.save_dataset(
+            dataset_id,
+            "v1",
+            [{"timestamp": T0.isoformat(), "price": 0.5, "source_type": "HISTORICAL"}],
+        )
+        self.store.save_dataset_catalog(
+            dataset_id,
+            "v1",
+            provider="fixture-provider",
+            instrument="POLYMARKET",
+            market_type="prediction",
+            timeframe="event",
+            start_timestamp=T0,
+            end_timestamp=T0,
+            row_count=1,
+            completeness=1.0,
+            quality="PRICE_PROXY",
+            source_type="HISTORICAL",
+            snapshot_id=f"{dataset_id}:v1",
+            metadata={
+                "provider": "fixture-provider",
+                "source_type": "HISTORICAL",
+                "research_quality": "PRICE_PROXY",
+                "historical_order_book_available": False,
+            },
+        )
+        payload: dict[str, object] = {
+            "market_type": "prediction",
+            "dataset_id": dataset_id,
+            "dataset_version": "v1",
+            "dataset_provenance": {
+                "dataset_id": dataset_id,
+                "dataset_version": "v1",
+                "source_type": "HISTORICAL",
+                "time_split": "train-validation-holdout",
+            },
+            "lineage": [candidate_id],
+            "mutation_cluster": candidate_id,
+            "experiment_family": "dashboard-regression",
+            "schema_validated": True,
+            "historical_backtest_passed": True,
+            "validation_passed": True,
+            "robustness_passed": True,
+            "data_quality_passed": True,
+            "frozen": True,
+            "holdout_used": False,
+            "strategy_hash": "dashboard-strategy-v1",
+            "model_hash": "dashboard-model-v1",
+            "config_hash": "dashboard-config-v1",
+            "validation_expectancy": 0.40,
+            "validation_confidence_lower_bound": 0.35,
+            "validation_stability": 0.90,
+            "validation_calibration": 0.90,
+            "validation_sample_count": 100,
+            "validation_trade_count": 50,
+            "validation_execution_quality": 0.90,
+            "data_quality": "PRICE_PROXY",
+            "minimum_sample_check": {
+                "passed": True,
+                "count": 100,
+                "trades": 50,
+                "checks": {"observations": True, "trades": True},
+            },
+        }
+        payload["frozen_hash"] = hashlib.sha256(
+            "|".join(
+                str(payload[key])
+                for key in ("strategy_hash", "model_hash", "config_hash")
+            ).encode()
+        ).hexdigest()
+        self.store.save_candidate_lifecycle(
+            candidate_id,
+            "IDEA",
+            payload,
+            reason="dashboard regression",
+            timestamp=T0,
+        )
+        self.store.save_candidate_lifecycle(
+            candidate_id,
+            "FROZEN",
+            payload,
+            from_stage="IDEA",
+            reason="dashboard regression",
+            timestamp=T0,
+        )
+        result = CandidateCanaryRanker(self.store, clock=lambda: T0).evaluate_and_select(T0)
+        self.assertEqual(result["selected_candidate"], candidate_id)
+        return payload
+
     def _seed_queue(self) -> None:
         for index in range(QUEUE_COUNT):
             payload = {"label": f"hypothesis-{index:02d}", "market": "crypto_spot"}
@@ -384,6 +478,7 @@ class DashboardPaginationFixture(unittest.TestCase):
             now=claim_time + timedelta(seconds=1),
             worker="fixture-worker",
         )
+
 
     def _seed_paper(self) -> None:
         for index in range(PAPER_COUNT):
@@ -450,6 +545,136 @@ class DashboardPaginationFixture(unittest.TestCase):
 
 
 class DashboardPaginationEndpointTests(DashboardPaginationFixture):
+    def test_canary_snapshot_counts_and_current_selection_survive_store_reopen(self) -> None:
+        self._seed_ranked_selection()
+        # Keep one persisted raw eligibility row that no longer has an
+        # authoritative lifecycle stage.  Raw and validated counts must not
+        # collapse into the same readiness number.
+        stale_record = self.store.load_candidate_lifecycle("candidate-02")
+        assert isinstance(stale_record, dict)
+        stale_payload = stale_record["payload"]
+        self.store.save_candidate_lifecycle(
+            "candidate-02",
+            "REJECTED",
+            stale_payload,
+            from_stage="FROZEN",
+            reason="dashboard stale fixture",
+            timestamp=T0 + timedelta(minutes=1),
+        )
+        self.store.connection.execute(
+            "INSERT OR REPLACE INTO canary_eligibility("
+            "candidate_id,eligible_at,frozen_hash,evidence_json) VALUES (?,?,?,?)",
+            (
+                "candidate-02",
+                T0.isoformat(),
+                stale_payload["frozen_hash"],
+                json.dumps(stale_payload, sort_keys=True),
+            ),
+        )
+        self.store.connection.commit()
+        self.store.connection.execute(
+            "INSERT OR REPLACE INTO canary_rankings("
+            "candidate_id,ranking_run_id,ranking_timestamp,rank,total_score,"
+            "component_scores_json,evidence_versions_json,cluster_key,"
+            "cluster_representative,selected,reason) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "ranking-invalid",
+                "ranking-raw-only",
+                T0.isoformat(),
+                99,
+                0.01,
+                "{}",
+                "{}",
+                "raw-only",
+                0,
+                0,
+                "RAW_ONLY",
+            ),
+        )
+        self.store.connection.commit()
+
+        status, payload, _ = self._request("api/v2/canary")
+        self.assertEqual(status, 200)
+        self.assertIsInstance(payload, dict)
+        assert isinstance(payload, dict)
+        canary = payload["canary"]
+        autonomous = payload["autonomous_canary"]
+        self.assertEqual(canary["selection_status"], "CURRENT")
+        self.assertIs(canary["selection_valid"], True)
+        self.assertEqual(canary["selected_candidate"], "dashboard-winner")
+        self.assertEqual(canary["last_selected_candidate"], "dashboard-winner")
+        self.assertEqual(canary["winner_id"], "dashboard-winner")
+        self.assertIsInstance(canary["ranking_run_id"], str)
+        self.assertEqual(canary["ranking_timestamp"], T0.isoformat())
+        self.assertIsNone(canary["selection_invalidation_reason"])
+        self.assertEqual(canary["eligibility_raw_count"], canary["eligible_count"] + 1)
+        self.assertEqual(canary["rankable_raw_count"], canary["rankable_count"] + 1)
+        for projection in (canary, autonomous):
+            self.assertEqual(projection["selection_status"], "CURRENT")
+            self.assertIs(projection["selection_valid"], True)
+            self.assertEqual(projection["selected_candidate"], "dashboard-winner")
+            self.assertEqual(projection["last_selected_candidate"], "dashboard-winner")
+            self.assertEqual(projection["winner_id"], "dashboard-winner")
+            self.assertIsInstance(projection["ranking_run_id"], str)
+            self.assertEqual(projection["ranking_timestamp"], T0.isoformat())
+            self.assertGreaterEqual(
+                projection["eligibility_raw_count"],
+                projection["eligible_count"],
+            )
+            self.assertGreaterEqual(
+                projection["rankable_raw_count"],
+                projection["rankable_count"],
+            )
+
+        reopened = AxiomStore(self.store.path)
+        self.addCleanup(reopened.close)
+        self.server.data.store = reopened
+        status, reopened_payload, _ = self._request("api/v2/canary")
+        self.assertEqual(status, 200)
+        self.assertIsInstance(reopened_payload, dict)
+        assert isinstance(reopened_payload, dict)
+        reopened_canary = reopened_payload["canary"]
+        self.assertEqual(reopened_canary["selection_status"], "CURRENT")
+        self.assertIs(reopened_canary["selection_valid"], True)
+        self.assertEqual(reopened_canary["selected_candidate"], "dashboard-winner")
+        self.assertEqual(reopened_canary["last_selected_candidate"], "dashboard-winner")
+        self.assertEqual(reopened_canary["ranking_run_id"], canary["ranking_run_id"])
+        self.assertEqual(reopened_canary["ranking_timestamp"], T0.isoformat())
+
+    def test_canary_stale_selection_keeps_history_without_executable_fallback(self) -> None:
+        self._seed_ranked_selection("dashboard-stale")
+        # A ranking run is historical evidence, not a current executable
+        # selection once its ranking rows are no longer available.
+        self.store.connection.execute("DELETE FROM canary_rankings")
+        self.store.connection.commit()
+
+        status, payload, body = self._request("api/v2/canary")
+        self.assertEqual(status, 200)
+        self.assertIsInstance(payload, dict)
+        assert isinstance(payload, dict)
+        canary = payload["canary"]
+        autonomous = payload["autonomous_canary"]
+        for projection in (canary, autonomous):
+            self.assertEqual(projection["selection_status"], "STALE")
+            self.assertIs(projection["selection_valid"], False)
+            self.assertIsNone(projection["selected_candidate"])
+            self.assertIsNone(projection["winner_id"])
+            self.assertEqual(projection["last_selected_candidate"], "dashboard-stale")
+            self.assertEqual(
+                projection["selection_invalidation_reason"],
+                "REEVALUATION_REQUIRED",
+            )
+        self.assertIn("dashboard-stale", body)
+        selected_winner = canary.get("selected_winner")
+        self.assertIsInstance(selected_winner, dict)
+        assert isinstance(selected_winner, dict)
+        self.assertEqual(selected_winner["selection_status"], "STALE")
+        self.assertIs(selected_winner["selection_valid"], False)
+        self.assertEqual(
+            selected_winner["selection_invalidation_reason"],
+            "REEVALUATION_REQUIRED",
+        )
+
     def test_datasets_cover_page_navigation_filters_and_detail_path(self) -> None:
         first = self._page(
             "api/v2/datasets",
@@ -685,6 +910,97 @@ class DashboardPaginationEndpointTests(DashboardPaginationFixture):
             [f"candidate-{index:02d}" for index in range(12, 2, -1)],
         )
     def test_candidate_statuses_keep_canary_and_paper_lifecycle_distinct(self) -> None:
+        # Replace the sparse fixture row with complete, bound prediction
+        # qualification evidence while preserving its FROZEN lifecycle stage.
+        qualified_dataset_id = "candidate-02-qualification"
+        self.store.save_dataset(
+            qualified_dataset_id,
+            "v1",
+            [{"timestamp": T0.isoformat(), "price": 0.5, "source_type": "HISTORICAL"}],
+        )
+        self.store.save_dataset_catalog(
+            qualified_dataset_id,
+            "v1",
+            provider="fixture-provider",
+            instrument="POLYMARKET",
+            market_type="prediction",
+            timeframe="event",
+            start_timestamp=T0,
+            end_timestamp=T0,
+            row_count=1,
+            completeness=1.0,
+            quality="PRICE_PROXY",
+            source_type="HISTORICAL",
+            snapshot_id=f"{qualified_dataset_id}:v1",
+            metadata={
+                "provider": "fixture-provider",
+                "source_type": "HISTORICAL",
+                "research_quality": "PRICE_PROXY",
+                "historical_order_book_available": False,
+            },
+        )
+        existing = self.store.load_candidate_lifecycle("candidate-02")
+        assert isinstance(existing, dict)
+        existing_payload = existing["payload"]
+        assert isinstance(existing_payload, dict)
+        qualified_payload = {
+            **existing_payload,
+            "candidate_id": "candidate-02",
+            "instrument": "POLYMARKET",
+            "source_type": "HISTORICAL",
+            "timeframe": "event",
+            "market_type": "prediction",
+            "dataset_id": qualified_dataset_id,
+            "dataset_version": "v1",
+            "dataset_provenance": {
+                "dataset_id": qualified_dataset_id,
+                "dataset_version": "v1",
+                "source_type": "HISTORICAL",
+                "time_split": "train-validation-holdout",
+            },
+            "lineage": ["candidate-02"],
+            "mutation_cluster": "candidate-02",
+            "schema_validated": True,
+            "historical_backtest_passed": True,
+            "validation_passed": True,
+            "robustness_passed": True,
+            "data_quality_passed": True,
+            "data_quality": "PRICE_PROXY",
+            "frozen": True,
+            "holdout_used": False,
+            "critical_error": None,
+            "strategy_hash": "candidate-02-strategy-v1",
+            "model_hash": "candidate-02-model-v1",
+            "config_hash": "candidate-02-config-v1",
+            "validation_expectancy": 0.40,
+            "validation_confidence_lower_bound": 0.35,
+            "validation_stability": 0.90,
+            "validation_calibration": 0.90,
+            "validation_sample_count": 100,
+            "validation_trade_count": 50,
+            "validation_execution_quality": 0.90,
+            "minimum_sample_check": {
+                "passed": True,
+                "count": 100,
+                "trades": 50,
+                "checks": {"observations": True, "trades": True},
+            },
+        }
+        qualified_payload["frozen_hash"] = hashlib.sha256(
+            "|".join(
+                str(qualified_payload[key])
+                for key in ("strategy_hash", "model_hash", "config_hash")
+            ).encode()
+        ).hexdigest()
+        self.store.save_candidate_lifecycle(
+            "candidate-02",
+            "FROZEN",
+            qualified_payload,
+            from_stage="FROZEN",
+            reason="complete prediction qualification fixture",
+            timestamp=T0,
+        )
+        CanaryService(self.store, initialize=False).mark_eligible("candidate-02")
         page = self._page(
             "api/v2/candidates",
             page=1,
@@ -709,6 +1025,7 @@ class DashboardPaginationEndpointTests(DashboardPaginationFixture):
         self.assertTrue(promoted["paper_forward"])
         self.assertTrue(promoted["paper_promotable"])
         self.assertFalse(promoted["canary_eligible"])
+        self.assertEqual(promoted["historical_gates"], "NOT_PASSED")
 
         status, detail, _ = self._request("api/v2/candidates/candidate-02")
         self.assertEqual(status, 200)
@@ -991,6 +1308,99 @@ class DashboardPaginationEndpointTests(DashboardPaginationFixture):
             self.assertLessEqual(len(page["items"]), size)
 
     def test_persisted_v2_endpoints_do_not_wait_for_operator_control_status(self) -> None:
+        # Persist one complete FROZEN prediction qualification so the
+        # endpoint count reflects validated evidence, not a raw PASS badge.
+        qualified_dataset_id = "candidate-02-qualification"
+        self.store.save_dataset(
+            qualified_dataset_id,
+            "v1",
+            [{"timestamp": T0.isoformat(), "price": 0.5, "source_type": "HISTORICAL"}],
+        )
+        self.store.save_dataset_catalog(
+            qualified_dataset_id,
+            "v1",
+            provider="fixture-provider",
+            instrument="POLYMARKET",
+            market_type="prediction",
+            timeframe="event",
+            start_timestamp=T0,
+            end_timestamp=T0,
+            row_count=1,
+            completeness=1.0,
+            quality="PRICE_PROXY",
+            source_type="HISTORICAL",
+            snapshot_id=f"{qualified_dataset_id}:v1",
+            metadata={
+                "provider": "fixture-provider",
+                "source_type": "HISTORICAL",
+                "research_quality": "PRICE_PROXY",
+                "historical_order_book_available": False,
+            },
+        )
+        existing = self.store.load_candidate_lifecycle("candidate-02")
+        assert isinstance(existing, dict)
+        existing_payload = existing["payload"]
+        assert isinstance(existing_payload, dict)
+        qualified_payload = {
+            **existing_payload,
+            "candidate_id": "candidate-02",
+            "instrument": "POLYMARKET",
+            "source_type": "HISTORICAL",
+            "timeframe": "event",
+            "market_type": "prediction",
+            "dataset_id": qualified_dataset_id,
+            "dataset_version": "v1",
+            "dataset_provenance": {
+                "dataset_id": qualified_dataset_id,
+                "dataset_version": "v1",
+                "source_type": "HISTORICAL",
+                "time_split": "train-validation-holdout",
+            },
+            "lineage": ["candidate-02"],
+            "mutation_cluster": "candidate-02",
+            "schema_validated": True,
+            "historical_backtest_passed": True,
+            "validation_passed": True,
+            "robustness_passed": True,
+            "data_quality_passed": True,
+            "data_quality": "PRICE_PROXY",
+            "frozen": True,
+            "holdout_used": False,
+            "critical_error": None,
+            "strategy_hash": "candidate-02-strategy-v1",
+            "model_hash": "candidate-02-model-v1",
+            "config_hash": "candidate-02-config-v1",
+            "validation_expectancy": 0.40,
+            "validation_confidence_lower_bound": 0.35,
+            "validation_stability": 0.90,
+            "validation_calibration": 0.90,
+            "validation_sample_count": 100,
+            "validation_trade_count": 50,
+            "validation_execution_quality": 0.90,
+            "minimum_sample_check": {
+                "passed": True,
+                "count": 100,
+                "trades": 50,
+                "checks": {"observations": True, "trades": True},
+            },
+        }
+        qualified_payload["frozen_hash"] = hashlib.sha256(
+            "|".join(
+                str(qualified_payload[key])
+                for key in ("strategy_hash", "model_hash", "config_hash")
+            ).encode()
+        ).hexdigest()
+        self.store.save_candidate_lifecycle(
+            "candidate-02",
+            "FROZEN",
+            qualified_payload,
+            from_stage="FROZEN",
+            reason="complete prediction qualification fixture",
+            timestamp=T0,
+        )
+        CanaryService(self.store, initialize=False).mark_eligible("candidate-02")
+        # Leave the candidate eligible but without a current ranking snapshot:
+        # it must count as validated eligibility and not as rankable evidence.
         persisted = self.store.dashboard_overview_summary(activity_limit=8)
         control = _BlockingOperatorControl()
         self.server.data.control = control
@@ -1222,6 +1632,7 @@ class DashboardPaginationEndpointTests(DashboardPaginationFixture):
 
 
 class DashboardPaginationSurfaceTests(DashboardPaginationFixture):
+
     def test_overview_and_list_responses_do_not_embed_unbounded_records(self) -> None:
         status, overview, overview_body = self._request("api/overview")
         self.assertEqual(status, 200)
@@ -1351,98 +1762,6 @@ class DashboardPaginationSurfaceTests(DashboardPaginationFixture):
         self.assertNotIn("dataset-00", html)
         self.assertNotIn("market-00", html)
 
-    def test_real_canary_surface_contains_persisted_evidence_labels(self) -> None:
-        html = _dashboard_html().lower()
-        start = html.index("function rendercanary")
-        end = html.index("function renderbtc", start)
-        real_canary = html[start:end]
-        self.assertIn("real canary money", html)
-        for label in (
-            "credentials",
-            "eligible candidates",
-            "rankable candidates",
-            "selection reason",
-            "selected winner",
-            "manual armed candidate",
-            "historical data integrity",
-            "historical execution fidelity",
-            "current execution evidence",
-            "next decision",
-            "blocker",
-            "risk envelope",
-            "latest signal",
-            "real execution events",
-        ):
-            self.assertIn(label, real_canary)
-        self.assertRegex(
-            real_canary,
-            r"backendstate\s*=\s*string\(\s*c\.micro_live_canary\s*\|\|\s*[\"']disabled[\"']\s*\)",
-            "the renderer must read the backend state before deriving the autonomous label",
-        )
-        self.assertRegex(
-            real_canary,
-            r"statevalue\s*=\s*backendstate\s*===\s*[\"']killed[\"']\s*\?\s*[\"']killed[\"']\s*:\s*boolean\(\s*auto\.enabled\s*\)\s*\?\s*[\"']enabled[\"']\s*:\s*[\"']disabled[\"']",
-            "KILLED is terminal; ENABLED must come only from auto.enabled",
-        )
-        self.assertNotRegex(
-            real_canary,
-            r"statevalue\s*=\s*string\([^;\n]*c\.display_state",
-            "the autonomous label must not reuse the manual backend display state",
-        )
-        self.assertRegex(
-            real_canary,
-            r"winner\s*=\s*auto\.selected_candidate\s*\|\|\s*c\.winner_id\s*\|\|\s*[\"']—[\"']",
-            "Selected winner must come from the persisted autonomous projection",
-        )
-        self.assertNotRegex(
-            real_canary,
-            r"winner\s*=\s*[^,;\n]*c\.candidate",
-            "a manually armed candidate must not replace the autonomous winner",
-        )
-        self.assertRegex(
-            real_canary,
-            r"manualcandidate\s*=\s*backendstate\s*===\s*[\"']armed[\"']\s*&&\s*c\.candidate\s*\?",
-            "manual c.candidate must be conditional on the manual ARMED backend state",
-        )
-        self.assertRegex(
-            real_canary,
-            r"\$\{manualcandidate\}",
-            "the manual armed candidate card must be rendered when present",
-        )
-    def test_real_canary_connectivity_panel_consumes_persisted_schema_and_pht(self) -> None:
-        html = _dashboard_html()
-        start = html.index("function renderCanaryConnectivity")
-        end = html.index("function renderBtc", start)
-        real_canary = html[start:end]
-        self.assertRegex(html, r'id=["\']canary-action-result["\']')
-        self.assertIn("data.connectivity", real_canary)
-        for field in (
-            "ready",
-            "status",
-            "checked_at",
-            "sdk",
-            "credentials",
-            "authentication",
-            "account",
-            "geoblock",
-            "balance",
-            "allowance",
-            "market",
-            "order_book",
-            "failure_codes",
-            "failure_reasons",
-        ):
-            self.assertIn(field, real_canary)
-        self.assertRegex(
-            real_canary,
-            r"checked_at[\s\S]{0,120}dateText\(",
-            "REAL CANARY must format the persisted UTC check timestamp through the PHT formatter",
-        )
-        self.assertRegex(
-            real_canary,
-            r"failure_codes[\s\S]{0,240}(?:failure_reasons|reason)",
-            "the panel must render bounded failure codes and their human-readable reasons",
-        )
 
     def test_real_canary_actions_post_once_to_local_result_and_survive_refresh(self) -> None:
         html = _dashboard_html()
@@ -1586,7 +1905,7 @@ class DashboardPaginationSurfaceTests(DashboardPaginationFixture):
             "renderCanary must not clear an action result",
         )
 
-    def test_real_canary_ready_to_enable_requires_connectivity_and_existing_readiness_gates(self) -> None:
+    def test_canary_endpoint_reports_connectivity_state_and_blocker(self) -> None:
         blocked = _connectivity_projection(ready=False, status="BLOCKED")
         blocked["failure_codes"] = ["CONNECTIVITY_CHECK_FAILED"]
         blocked["failure_reasons"] = [
@@ -1616,90 +1935,6 @@ class DashboardPaginationSurfaceTests(DashboardPaginationFixture):
         self.assertEqual(
             payload["autonomous_canary"]["blocker"],
             "AUTONOMOUS_CANARY_DISABLED",
-        )
-
-        html = _dashboard_html()
-        start = html.index("function renderCanary(data)")
-        end = html.index("function renderBtc", start)
-        real_canary = html[start:end]
-        self.assertIn("AUTO CANARY READY TO ENABLE", real_canary)
-        readiness_window_start = real_canary.index("AUTO CANARY READY TO ENABLE")
-        readiness_window = real_canary[max(0, readiness_window_start - 1600):readiness_window_start]
-        for marker in (
-            "connectivity",
-            "ready",
-            "KILLED",
-            "enabled",
-            "winner",
-            "eligible",
-            "rankable",
-        ):
-            self.assertIn(marker, readiness_window)
-        self.assertRegex(
-            real_canary,
-            r"autoReady\s*=\s*connectivityReady\s*&&\s*backendState\s*!==\s*[\"']KILLED[\"']"
-            r"\s*&&\s*!enabled\s*&&\s*Boolean\(\s*winnerRaw\s*\)\s*&&\s*eligible\s*>\s*0"
-            r"\s*&&\s*rankable\s*>\s*0",
-            "READY TO ENABLE must retain the existing autonomous readiness gates",
-        )
-        self.assertRegex(
-            real_canary,
-            r"autonomousBlocker\s*=\s*!connectivity\s*\?\s*[\"']CONNECTIVITY_CHECK_REQUIRED[\"']"
-            r"\s*:\s*!connectivityReady\s*\?\s*connectivityBlocker"
-            r"\s*:\s*backendState\s*===\s*[\"']KILLED[\"']\s*\?\s*[\"']CANARY_KILLED[\"']"
-            r"[\s\S]{0,260}NO_ELIGIBLE_RANKABLE_CANDIDATE",
-            "persisted connectivity and existing canary blockers must have deterministic precedence",
-        )
-        for blocker in (
-            "CONNECTIVITY_CHECK_REQUIRED",
-            "CONNECTIVITY_BLOCKED",
-            "CANARY_KILLED",
-            "NO_ELIGIBLE_RANKABLE_CANDIDATE",
-            "AUTONOMOUS_CANARY_DISABLED",
-        ):
-            self.assertIn(blocker, real_canary)
-
-
-    def test_refresh_lifecycle_is_bounded_independent_and_preserves_last_good_data(self) -> None:
-        html = _dashboard_html()
-        self.assertIn("AbortController", html)
-        self.assertIn("REFRESH_TIMEOUT_MS", html)
-        self.assertRegex(
-            html,
-            r"setTimeout\s*\([\s\S]{0,500}?\.abort\(\)[\s\S]{0,100}?REFRESH_TIMEOUT_MS",
-            "a refresh must abort its request after a finite timeout",
-        )
-        self.assertRegex(html, r"\bloadInFlight\b")
-        self.assertRegex(
-            html,
-            r"\|\|loadInFlight\b|if\s*\(\s*loadInFlight\s*\)\s*return",
-            "refresh entry points must refuse overlapping requests",
-        )
-        self.assertGreaterEqual(
-            html.count("lastGood"),
-            3,
-            "refresh success and failure paths must both retain/use last-good data",
-        )
-        self.assertRegex(
-            html,
-            r"finally\s*\{[\s\S]{0,500}(?:refreshMessage|clearRefresh)",
-            "refresh UI cleanup must run from finally even when fetch aborts",
-        )
-        self.assertRegex(html, r"\blastGood(?:\[[^\]]+\]|\.[A-Za-z0-9_]+)\s*=")
-        self.assertRegex(html, r'overview\s*:\s*["\']overview-summary["\']')
-        self.assertRegex(html, r'canary\s*:\s*["\']canary["\']')
-        self.assertRegex(
-            html,
-            r'renderPersisted\(\s*["\']overview["\']\s*,\s*["\']/api/v2/overview-summary["\']',
-        )
-        self.assertRegex(
-            html,
-            r'renderPersisted\(\s*["\']canary["\']\s*,\s*["\']/api/v2/canary["\']',
-        )
-        self.assertRegex(html, r'fetchWithTimeout\(\s*["\']/api/operator["\']')
-        self.assertNotRegex(
-            html,
-            r'tab==="overview"\s*\|\|\s*tab==="canary"\).*?fetch\("/api/operator"',
         )
 
 

@@ -95,14 +95,77 @@ def _blocked_submit_worker(database_path, entered, release, results):
 class CanaryTests(unittest.TestCase):
 
     def setUp(self):
-        self.store=HealthyStore(":memory:"); self.service=CanaryService(self.store,credentials=FakeCredentials(),clock=lambda:T0); self.venue=FakeVenue()
+        self.store=HealthyStore(":memory:")
+        self.store.save_dataset(
+            "prediction-history",
+            "v1",
+            [{"timestamp": T0.isoformat(), "price": 0.5, "source_type": "HISTORICAL"}],
+        )
+        self.store.save_dataset_catalog(
+            "prediction-history",
+            "v1",
+            provider="polymarket",
+            instrument="POLYMARKET",
+            market_type="prediction",
+            timeframe="event",
+            start_timestamp=T0,
+            end_timestamp=T0,
+            row_count=1,
+            completeness=1.0,
+            quality="PRICE_PROXY",
+            source_type="HISTORICAL",
+            snapshot_id="prediction-history:v1",
+            metadata={
+                "provider": "polymarket",
+                "source_type": "HISTORICAL",
+                "research_quality": "PRICE_PROXY",
+                "historical_order_book_available": False,
+            },
+        )
+        self.service=CanaryService(self.store,credentials=FakeCredentials(),clock=lambda:T0); self.venue=FakeVenue()
         hash_parts=("strategy-v1","model-v1","config-v1")
         payload={
+            "market_type":"prediction",
+            "source_type":"HISTORICAL",
+            "dataset_id":"prediction-history",
+            "dataset_version":"v1",
+            "dataset_provenance":{
+                "dataset_id":"prediction-history",
+                "dataset_version":"v1",
+                "provider":"polymarket",
+                "instrument":"POLYMARKET",
+                "market_type":"prediction",
+                "timeframe":"event",
+                "source_type":"HISTORICAL",
+                "snapshot_id":"prediction-history:v1",
+                "time_split":"train-validation-holdout",
+            },
             "schema_validated":True,
             "historical_backtest_passed":True,
             "validation_passed":True,
             "robustness_passed":True,
             "data_quality_passed":True,
+            "data_quality":"PRICE_PROXY",
+            "validation_expectancy":0.10,
+            "validation_confidence_lower_bound":0.05,
+            "validation_stability":0.90,
+            "validation_calibration":0.90,
+            "validation_execution_quality":0.90,
+            "validation_sample_count":100,
+            "validation_trade_count":20,
+            "minimum_sample_check":{
+                "passed":True,
+                "count":100,
+                "trades":20,
+                "min_observations":30,
+                "min_trades":10,
+                "checks":{"observations":True,"trades":True},
+            },
+            "experiment_plan":{
+                "policy_version":"canary-sample-policy-v1",
+                "min_independent_samples":30,
+                "min_trades":10,
+            },
             "frozen":True,
             "holdout_used":False,
             "strategy_hash":hash_parts[0],
@@ -255,9 +318,8 @@ class CanaryTests(unittest.TestCase):
         result=validate_hermes_proposal({"proposal_id":"x","statement":"x","source":"x","tests":["x"],"dataset_version":"v","time_split":"train-validation-holdout","paper_only":True,"canary_arm":True})
         self.assertFalse(result.accepted)
     def test_ineligible_candidate_cannot_arm(self): self.assertBlocked("NOT_CANARY_ELIGIBLE",lambda:self.service.arm("other",venue=self.venue,credentials_configured=True))
-    def test_frozen_and_paper_forward_stages_can_mark_eligible_without_promotion(self):
+    def test_frozen_and_paper_forward_stages_store_bounded_qualification_evidence(self):
         template = dict(self.store.load_candidate_lifecycle("C123")["payload"])
-        template.pop("forward_evidence", None)
         progression = (
             "SCHEMA_VALIDATED",
             "BACKTESTED",
@@ -265,6 +327,18 @@ class CanaryTests(unittest.TestCase):
             "ROBUSTNESS_CHECKED",
             "FROZEN",
             "PAPER_FORWARD",
+        )
+        telemetry_fields = (
+            "forward_duration_seconds",
+            "forward_independent_resolved_bets",
+            "forward_successful_order_attempts",
+            "forward_expectancy",
+            "forward_confidence_lower_bound",
+            "forward_stability",
+            "forward_calibration",
+            "forward_liquidity",
+            "forward_max_drawdown",
+            "forward_regime_count",
         )
         for candidate_id, terminal_stage in (
             ("ELIGIBLE-FROZEN", "FROZEN"),
@@ -285,8 +359,100 @@ class CanaryTests(unittest.TestCase):
             self.assertIsNotNone(row)
             self.assertEqual(lifecycle["stage"], terminal_stage)
             self.assertNotEqual(lifecycle["stage"], "PAPER_PROMOTABLE")
-            self.assertEqual(row["frozen_hash"], template["frozen_hash"])
-            self.assertEqual(json.loads(row["evidence_json"]), lifecycle["payload"])
+            evidence = json.loads(row["evidence_json"])
+            self.assertEqual(evidence["schema"], "canary-qualification-v1")
+            self.assertEqual(evidence["schema_version"], "canary-qualification-v1")
+            self.assertEqual(evidence["qualification_schema"], "canary-qualification-v1")
+            self.assertEqual(evidence["candidate_id"], candidate_id)
+            self.assertEqual(row["frozen_hash"], evidence["frozen_hash"])
+            self.assertIsInstance(evidence["qualification_hash"], str)
+            self.assertTrue(evidence["qualification_hash"])
+            required_fields = (
+                "market_type",
+                "source_type",
+                "dataset_id",
+                "dataset_version",
+                "dataset_provenance",
+                "strategy_hash",
+                "model_hash",
+                "config_hash",
+                "frozen_hash",
+                "frozen",
+                "holdout_used",
+                "validation_expectancy",
+                "validation_confidence_lower_bound",
+                "validation_stability",
+                "validation_calibration",
+                "validation_execution_quality",
+                "validation_sample_count",
+                "validation_trade_count",
+                "experiment_plan",
+                "minimum_sample_check",
+                "data_quality",
+                "data_quality_passed",
+            )
+            for key in required_fields:
+                with self.subTest(candidate_id=candidate_id, field=key):
+                    self.assertIn(key, evidence)
+                    self.assertEqual(evidence[key], template[key])
+            self.assertEqual(
+                self.store.load_dataset("prediction-history", "v1"),
+                [{"timestamp": T0.isoformat(), "price": 0.5, "source_type": "HISTORICAL"}],
+            )
+            catalog = self.store.load_dataset_catalog("prediction-history", "v1")
+            self.assertEqual(
+                {
+                    key: catalog[key]
+                    for key in (
+                        "dataset_id",
+                        "dataset_version",
+                        "provider",
+                        "instrument",
+                        "market_type",
+                        "timeframe",
+                        "row_count",
+                        "completeness",
+                        "quality",
+                        "source_type",
+                        "snapshot_id",
+                    )
+                },
+                {
+                    "dataset_id": "prediction-history",
+                    "dataset_version": "v1",
+                    "provider": "polymarket",
+                    "instrument": "POLYMARKET",
+                    "market_type": "prediction",
+                    "timeframe": "event",
+                    "row_count": 1,
+                    "completeness": 1.0,
+                    "quality": "PRICE_PROXY",
+                    "source_type": "HISTORICAL",
+                    "snapshot_id": "prediction-history:v1",
+                },
+            )
+            quality_fields = {
+                "historical_data_integrity": "PASS",
+                "historical_data_integrity_passed": True,
+                "historical_execution_fidelity": "PRICE_PROXY",
+                "historical_execution_fidelity_score": 0.35,
+                "current_execution_evidence": "CURRENT_ORDER_BOOK_REQUIRED",
+                "historical_provenance_complete": True,
+                "historical_rows_nonempty": True,
+                "historical_no_forward_contamination": True,
+                "canary_data_quality_acceptable": True,
+                "canary_data_quality_status": "CANARY_DATA_QUALITY_ACCEPTABLE_LIMITED",
+                "production_evidence_status": "INSUFFICIENT",
+                "historical_dataset_row_count": 1,
+            }
+            for key, value in quality_fields.items():
+                with self.subTest(candidate_id=candidate_id, field=key):
+                    self.assertIn(key, evidence)
+                    self.assertEqual(evidence[key], value)
+            serialized = json.dumps(evidence)
+            self.assertNotIn("forward_evidence", evidence)
+            for field in telemetry_fields:
+                self.assertNotIn(field, serialized)
 
     def test_rejected_candidate_cannot_mark_eligible(self):
         template = dict(self.store.load_candidate_lifecycle("C123")["payload"])
@@ -312,18 +478,344 @@ class CanaryTests(unittest.TestCase):
                 "CANDIDATE_RESEARCH_GATES_INCOMPLETE",
                 lambda candidate_id=candidate_id: self.service.mark_eligible(candidate_id),
             )
-
-    def test_lifecycle_evidence_change_invalidates_existing_eligibility(self):
+    def test_legacy_eligibility_evidence_must_bind_verified_frozen_hash(self):
+        candidate_id = "LEGACY-MISSING-FROZEN-HASH"
         payload = dict(self.store.load_candidate_lifecycle("C123")["payload"])
-        payload["forward_evidence"] = {
-            **payload["forward_evidence"],
-            "observation_marker": "changed-after-eligibility",
-        }
-        self.store.save_candidate_lifecycle("C123", "PAPER_PROMOTABLE", payload, timestamp=T0)
+        self.store.save_candidate_lifecycle(candidate_id, "IDEA", payload, timestamp=T0)
+        self.store.save_candidate_lifecycle(candidate_id, "FROZEN", payload, timestamp=T0)
+        self.service.mark_eligible(candidate_id)
+        row = self.store.connection.execute(
+            "SELECT evidence_json FROM canary_eligibility WHERE candidate_id=?",
+            (candidate_id,),
+        ).fetchone()
+        legacy_evidence = json.loads(row["evidence_json"])
+        for key in ("schema", "schema_version", "qualification_schema", "qualification_hash", "frozen_hash"):
+            legacy_evidence.pop(key, None)
+        self.store.connection.execute(
+            "UPDATE canary_eligibility SET evidence_json=? WHERE candidate_id=?",
+            (json.dumps(legacy_evidence, sort_keys=True), candidate_id),
+        )
+        self.store.connection.commit()
+
+        validation = self.service.validate_eligibility(candidate_id)
+        self.assertFalse(validation["binding"]["bound"])
+        self.assertEqual(validation["binding"]["reason_code"], "QUALIFICATION_CHANGED")
         self.assertBlocked(
             "CANDIDATE_NOT_CANARY_ELIGIBLE",
-            lambda: self.service.arm("C123", venue=self.venue, credentials_configured=True),
+            lambda: self.service.arm(
+                candidate_id,
+                venue=self.venue,
+                credentials_configured=True,
+            ),
         )
+
+    def test_no_dataset_prediction_candidate_is_rejected(self):
+        candidate_id = "NO-DATASET-CANARY"
+        payload = dict(self.store.load_candidate_lifecycle("C123")["payload"])
+        for key in ("dataset_id", "dataset_version", "dataset_provenance"):
+            payload.pop(key)
+        self.store.save_candidate_lifecycle(candidate_id, "IDEA", payload, timestamp=T0)
+        self.store.save_candidate_lifecycle(candidate_id, "FROZEN", payload, timestamp=T0)
+
+        validation = self.service.validate_eligibility(candidate_id)
+        self.assertFalse(validation["eligible"])
+        self.assertFalse(validation["historical_data_integrity_passed"])
+        self.assertIn(
+            "HISTORICAL_DATASET_VERSION_NOT_FOUND",
+            validation["data_quality"]["reasons"],
+        )
+        self.assertBlocked(
+            "CANDIDATE_RESEARCH_GATES_INCOMPLETE",
+            lambda: self.service.mark_eligible(candidate_id),
+        )
+
+    def test_migrated_pre_column_control_row_starts_at_generation_one(self):
+        legacy_store = HealthyStore(":memory:")
+        try:
+            legacy_store.connection.executescript(
+                """
+                CREATE TABLE canary_control (
+                  singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                  state TEXT NOT NULL,
+                  candidate_id TEXT,
+                  venue TEXT,
+                  armed_at TEXT,
+                  expires_at TEXT,
+                  limits_json TEXT NOT NULL,
+                  integrity_hash TEXT NOT NULL,
+                  updated_at TEXT NOT NULL
+                );
+                INSERT INTO canary_control(
+                  singleton,state,candidate_id,venue,armed_at,expires_at,
+                  limits_json,integrity_hash,updated_at
+                ) VALUES(1,'DISARMED',NULL,NULL,NULL,NULL,'{}','','2026-01-02T12:00:00+00:00');
+                """
+            )
+            legacy_store.connection.commit()
+            CanaryService(
+                legacy_store,
+                credentials=FakeCredentials(),
+                clock=lambda: T0,
+            )
+            row = legacy_store.connection.execute(
+                "SELECT control_generation FROM canary_control WHERE singleton=1"
+            ).fetchone()
+            self.assertEqual(row["control_generation"], 1)
+        finally:
+            legacy_store.close()
+
+    def test_schema_initialization_migration_holds_store_lock(self):
+        legacy_store = HealthyStore(":memory:")
+        try:
+            legacy_store.connection.executescript(
+                """
+                CREATE TABLE canary_control (
+                  singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                  state TEXT NOT NULL,
+                  candidate_id TEXT,
+                  venue TEXT,
+                  armed_at TEXT,
+                  expires_at TEXT,
+                  limits_json TEXT NOT NULL,
+                  integrity_hash TEXT NOT NULL,
+                  updated_at TEXT NOT NULL
+                );
+                INSERT INTO canary_control(
+                  singleton,state,candidate_id,venue,armed_at,expires_at,
+                  limits_json,integrity_hash,updated_at
+                ) VALUES(1,'DISARMED',NULL,NULL,NULL,NULL,'{}','','2026-01-02T12:00:00+00:00');
+                """
+            )
+            legacy_store.connection.commit()
+            service = CanaryService(
+                legacy_store,
+                credentials=FakeCredentials(),
+                clock=lambda: T0,
+                initialize=False,
+            )
+            migration_started = threading.Event()
+            release_migration = threading.Event()
+            writer_attempted = threading.Event()
+            writer_acquired = threading.Event()
+            result = {}
+
+            def trace(statement):
+                normalized = " ".join(statement.split()).upper()
+                if normalized.startswith("UPDATE CANARY_CONTROL SET CONTROL_GENERATION=1 "):
+                    migration_started.set()
+                    release_migration.wait()
+
+            def initialize():
+                try:
+                    service._initialize()
+                except BaseException as exc:
+                    result["error"] = exc
+
+            def competing_writer():
+                lock = legacy_store._lock
+                acquired = lock.acquire(blocking=False)
+                writer_attempted.set()
+                if not acquired:
+                    return
+                try:
+                    writer_acquired.set()
+                finally:
+                    lock.release()
+
+            legacy_store.connection.set_trace_callback(trace)
+            initializer = threading.Thread(target=initialize)
+            writer = None
+            initializer.start()
+            try:
+                self.assertTrue(migration_started.wait(timeout=2))
+                writer = threading.Thread(target=competing_writer)
+                writer.start()
+                self.assertTrue(writer_attempted.wait(timeout=2))
+                self.assertFalse(writer_acquired.is_set())
+                release_migration.set()
+                initializer.join(timeout=2)
+                writer.join(timeout=2)
+            finally:
+                release_migration.set()
+                initializer.join(timeout=2)
+                if writer is not None:
+                    writer.join(timeout=2)
+            legacy_store.connection.set_trace_callback(None)
+            self.assertFalse(initializer.is_alive())
+            self.assertIsNotNone(writer)
+            self.assertFalse(writer.is_alive())
+            self.assertNotIn("error", result)
+            self.assertFalse(writer_acquired.is_set())
+        finally:
+            legacy_store.close()
+
+    def test_status_projection_read_is_serialized_against_concurrent_writer(self):
+        self.store.connection.execute(
+            "INSERT INTO canary_selection("
+            "singleton,ranking_run_id,candidate_id,rank,total_score,"
+            "component_scores_json,evidence_versions_json,reason,selected_at,"
+            "ranking_timestamp,qualification_hash,ranking_snapshot_hash,"
+            "selection_status,selection_valid,selection_invalidation_reason,"
+            "last_selected_candidate"
+            ") VALUES(1,'run-1','C123',1,0.1,'{}','{}','test',?,?,?,?,?,1,NULL,'C123')",
+            (
+                T0.isoformat(),
+                T0.isoformat(),
+                "qualification-hash",
+                "ranking-hash",
+                "CURRENT",
+            ),
+        )
+        self.store.connection.commit()
+        read_started = threading.Event()
+        release_read = threading.Event()
+        writer_attempted = threading.Event()
+        writer_acquired = threading.Event()
+        result = {}
+        original_limits_record = self.service._limits_record
+
+        def gated_limits_record(limits):
+            read_started.set()
+            if not release_read.wait(2):
+                raise AssertionError("status projection was not released")
+            return original_limits_record(limits)
+
+        def read_status():
+            try:
+                result["status"] = self.service.status()
+            except BaseException as exc:
+                result["error"] = exc
+
+        def competing_writer():
+            lock = self.store._lock
+            acquired = lock.acquire(blocking=False)
+            writer_attempted.set()
+            if not acquired:
+                return
+            try:
+                writer_acquired.set()
+                self.store.connection.execute(
+                    "UPDATE canary_selection SET candidate_id='MIXED' WHERE singleton=1"
+                )
+                self.store.connection.commit()
+            finally:
+                lock.release()
+
+        with patch.object(self.service, "_limits_record", gated_limits_record):
+            reader = threading.Thread(target=read_status)
+            reader.start()
+            self.assertTrue(read_started.wait(1))
+            writer = threading.Thread(target=competing_writer)
+            writer.start()
+            self.assertTrue(writer_attempted.wait(1))
+            self.assertFalse(writer_acquired.is_set())
+            release_read.set()
+            reader.join(2)
+            writer.join(2)
+
+        self.assertFalse(reader.is_alive())
+        self.assertFalse(writer.is_alive())
+        self.assertNotIn("error", result)
+        self.assertIn("status", result)
+        self.assertFalse(writer_acquired.is_set())
+
+    def test_paper_forward_telemetry_update_preserves_eligibility_binding(self):
+        payload = dict(self.store.load_candidate_lifecycle("C123")["payload"])
+        before = json.loads(
+            self.store.connection.execute(
+                "SELECT evidence_json FROM canary_eligibility WHERE candidate_id='C123'"
+            ).fetchone()[0]
+        )
+        payload["forward_evidence"] = {
+            **payload["forward_evidence"],
+            "forward_duration_seconds": 30 * 86400,
+            "forward_independent_resolved_bets": 300,
+            "forward_successful_order_attempts": 240,
+            "observations_without_signal": 17,
+        }
+        self.store.save_candidate_lifecycle(
+            "C123",
+            "PAPER_PROMOTABLE",
+            payload,
+            timestamp=T0,
+        )
+        after = json.loads(
+            self.store.connection.execute(
+                "SELECT evidence_json FROM canary_eligibility WHERE candidate_id='C123'"
+            ).fetchone()[0]
+        )
+        self.assertEqual(after["qualification_hash"], before["qualification_hash"])
+
+        validation = self.service.validate_eligibility("C123")
+        self.assertTrue(validation["eligible"], validation)
+        self.arm()
+        self.assertEqual(self.service.status()["micro_live_canary"], "ARMED")
+
+    def test_current_hard_gate_blocks_even_with_immutable_binding(self):
+        payload = dict(self.store.load_candidate_lifecycle("C123")["payload"])
+        payload["critical_error"] = "runtime-failure"
+        self.store.save_candidate_lifecycle(
+            "C123",
+            "PAPER_PROMOTABLE",
+            payload,
+            timestamp=T0,
+        )
+        self.assertBlocked(
+            "CANDIDATE_(?:NOT_CANARY_ELIGIBLE|RESEARCH_GATES_INCOMPLETE)",
+            self.arm,
+        )
+        self.assertFalse(self.venue.submissions)
+
+    def test_rejected_lifecycle_blocks_even_with_immutable_binding(self):
+        payload = dict(self.store.load_candidate_lifecycle("C123")["payload"])
+        self.store.save_candidate_lifecycle(
+            "C123",
+            "REJECTED",
+            payload,
+            timestamp=T0,
+        )
+        self.assertBlocked(
+            "CANDIDATE_NOT_CANARY_ELIGIBLE",
+            self.arm,
+        )
+        self.assertFalse(self.venue.submissions)
+
+    def test_submission_binding_rejects_hash_mutations(self):
+        payload = dict(self.store.load_candidate_lifecycle("C123")["payload"])
+        for key in ("strategy_hash", "model_hash", "config_hash"):
+            with self.subTest(key=key):
+                changed = dict(payload)
+                changed[key] = f"mutated-{key}"
+                changed["frozen_hash"] = hashlib.sha256(
+                    "|".join(
+                        changed[name]
+                        for name in ("strategy_hash", "model_hash", "config_hash")
+                    ).encode()
+                ).hexdigest()
+                self.store.save_candidate_lifecycle(
+                    "C123",
+                    "PAPER_PROMOTABLE",
+                    changed,
+                    timestamp=T0,
+                )
+                self.assertBlocked(
+                    "CANDIDATE_NOT_CANARY_ELIGIBLE",
+                    self.arm,
+                )
+    def test_restart_preserves_valid_eligibility_binding(self):
+        restarted = CanaryService(
+            self.store,
+            credentials=FakeCredentials(),
+            clock=lambda: T0,
+        )
+        validation = restarted.validate_eligibility("C123")
+        self.assertTrue(validation["eligible"], validation)
+        restarted.arm(
+            "C123",
+            venue=self.venue,
+            credentials_configured=True,
+        )
+        self.assertEqual(restarted.status()["micro_live_canary"], "ARMED")
     def test_public_counts_exclude_tampered_eligibility_binding(self):
         payload = dict(self.store.load_candidate_lifecycle("C123")["payload"])
         self.store.save_candidate_lifecycle(
@@ -804,6 +1296,58 @@ class CanarySignalTests(unittest.TestCase):
     def setUp(self):
         self.now = T0
         self.store = HealthyStore(":memory:")
+        self.store.save_dataset(
+            "prediction-history",
+            "v1",
+            [{"timestamp": T0.isoformat(), "price": 0.5, "source_type": "HISTORICAL"}],
+        )
+        self.store.save_dataset_catalog(
+            "prediction-history",
+            "v1",
+            provider="polymarket",
+            instrument="POLYMARKET",
+            market_type="prediction",
+            timeframe="event",
+            start_timestamp=T0,
+            end_timestamp=T0,
+            row_count=1,
+            completeness=1.0,
+            quality="PRICE_PROXY",
+            source_type="HISTORICAL",
+            snapshot_id="prediction-history:v1",
+            metadata={
+                "provider": "polymarket",
+                "source_type": "HISTORICAL",
+                "research_quality": "PRICE_PROXY",
+                "historical_order_book_available": False,
+            },
+        )
+        self.store.save_dataset(
+            "prediction-history",
+            "v2",
+            [{"timestamp": T0.isoformat(), "price": 0.5, "source_type": "HISTORICAL"}],
+        )
+        self.store.save_dataset_catalog(
+            "prediction-history",
+            "v2",
+            provider="polymarket",
+            instrument="POLYMARKET",
+            market_type="prediction",
+            timeframe="event",
+            start_timestamp=T0,
+            end_timestamp=T0,
+            row_count=1,
+            completeness=1.0,
+            quality="PRICE_PROXY",
+            source_type="HISTORICAL",
+            snapshot_id="prediction-history:v2",
+            metadata={
+                "provider": "polymarket",
+                "source_type": "HISTORICAL",
+                "research_quality": "PRICE_PROXY",
+                "historical_order_book_available": False,
+            },
+        )
         self.service = CanaryService(
             self.store,
             credentials=FakeCredentials(),
@@ -833,11 +1377,34 @@ class CanarySignalTests(unittest.TestCase):
         model_hash = self.service._document_hash(self.model)
         config_hash = "config-hash"
         payload = {
+            "market_type": "prediction",
+            "source_type": "HISTORICAL",
+            "dataset_id": "prediction-history",
+            "dataset_version": "v1",
+            "dataset_provenance": {
+                "dataset_id": "prediction-history",
+                "dataset_version": "v1",
+                "source_type": "HISTORICAL",
+                "time_split": "train-validation-holdout",
+            },
             "schema_validated": True,
             "historical_backtest_passed": True,
             "validation_passed": True,
             "robustness_passed": True,
             "data_quality_passed": True,
+            "data_quality": "PRICE_PROXY",
+            "validation_expectancy": 0.10,
+            "validation_confidence_lower_bound": 0.05,
+            "validation_stability": 0.90,
+            "validation_calibration": 0.90,
+            "validation_sample_count": 100,
+            "validation_trade_count": 50,
+            "minimum_sample_check": {
+                "passed": True,
+                "count": 100,
+                "trades": 50,
+                "checks": {"observations": True, "trades": True},
+            },
             "frozen": True,
             "holdout_used": False,
             "strategy_hash": strategy_hash,
@@ -903,8 +1470,8 @@ class CanarySignalTests(unittest.TestCase):
             source_type="FORWARD_COLLECTED",
         )
 
-    def _signal(self):
-        signal = self.service.generate_signal("C")
+    def _signal(self, candidate_id="C"):
+        signal = self.service.generate_signal(candidate_id)
         self.assertIsNotNone(signal)
         assert signal is not None
         return signal
@@ -970,6 +1537,89 @@ class CanarySignalTests(unittest.TestCase):
             self.service.get_signal(signal["signal_id"])["status"],
             "NO_LONGER_VALID",
         )
+    def test_signal_submission_rejects_strategy_model_config_hash_mutations(self):
+        parts = {
+            "strategy_hash": "mutated-strategy-hash",
+            "model_hash": "mutated-model-hash",
+            "config_hash": "mutated-config-hash",
+        }
+        for key, value in parts.items():
+            with self.subTest(key=key):
+                candidate_id = f"mutated-{key}"
+                self._add_candidate(candidate_id)
+                signal = self._signal(candidate_id)
+                self._arm(candidate_id)
+                changed = dict(self.store.load_candidate_lifecycle(candidate_id)["payload"])
+                changed[key] = value
+                changed["frozen_hash"] = hashlib.sha256(
+                    "|".join(
+                        changed[name]
+                        for name in ("strategy_hash", "model_hash", "config_hash")
+                    ).encode()
+                ).hexdigest()
+                self.store.save_candidate_lifecycle(
+                    candidate_id,
+                    "FROZEN",
+                    changed,
+                    timestamp=T0,
+                )
+                venue = FakeVenue()
+                with self.assertRaises(CanaryBlocked):
+                    self.service.submit_signal(
+                        signal["signal_id"],
+                        venue=venue,
+                        allow_test_venue=True,
+                    )
+                self.assertFalse(venue.submissions)
+
+    def test_signal_submission_rejects_historical_dataset_version_mutation(self):
+        signal = self._signal()
+        self._arm()
+        changed = dict(self.store.load_candidate_lifecycle("C")["payload"])
+        changed["dataset_version"] = "v2"
+        changed["dataset_provenance"] = {
+            **changed["dataset_provenance"],
+            "dataset_version": "v2",
+        }
+        self.store.save_candidate_lifecycle("C", "FROZEN", changed, timestamp=T0)
+        venue = FakeVenue()
+        with self.assertRaises(CanaryBlocked):
+            self.service.submit_signal(
+                signal["signal_id"],
+                venue=venue,
+                allow_test_venue=True,
+            )
+        self.assertFalse(venue.submissions)
+
+    def test_signal_submission_rejects_qualification_evidence_mutation(self):
+        signal = self._signal()
+        self._arm()
+        changed = dict(self.store.load_candidate_lifecycle("C")["payload"])
+        changed["validation_confidence_lower_bound"] = 0.06
+        self.store.save_candidate_lifecycle("C", "FROZEN", changed, timestamp=T0)
+        venue = FakeVenue()
+        with self.assertRaises(CanaryBlocked):
+            self.service.submit_signal(
+                signal["signal_id"],
+                venue=venue,
+                allow_test_venue=True,
+            )
+        self.assertFalse(venue.submissions)
+
+    def test_new_service_instance_preserves_valid_signal_binding(self):
+        restarted = CanaryService(
+            self.store,
+            credentials=FakeCredentials(),
+            clock=lambda: self.now,
+        )
+        validation = restarted.validate_eligibility("C")
+        self.assertTrue(validation["eligible"], validation)
+        restarted.arm(
+            "C",
+            venue=FakeVenue(),
+            credentials_configured=True,
+        )
+        self.assertEqual(restarted.status()["micro_live_canary"], "ARMED")
 
     def test_expired_signal_is_rejected(self):
         signal = self._signal()

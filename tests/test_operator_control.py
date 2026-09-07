@@ -1342,8 +1342,33 @@ class OperatorControlTests(unittest.TestCase):
     def test_manual_arm_target_is_distinct_from_persisted_autonomous_winner(self) -> None:
         timestamp = datetime(2026, 1, 2, 12, tzinfo=timezone.utc)
         self._seed_candidate("A", timestamp=timestamp)
-        candidate_b = dict(self.store.load_candidate_lifecycle("A")["payload"])
-        candidate_b["candidate_id"] = "B"
+        candidate_a = dict(self.store.load_candidate_lifecycle("A")["payload"])
+
+        def rankable_payload(candidate_id: str, score: float) -> dict[str, object]:
+            payload = {
+                **candidate_a,
+                "candidate_id": candidate_id,
+                "mutation_cluster": f"cluster-{candidate_id}",
+                "lineage": [candidate_id],
+                "validation_expectancy": score,
+                "validation_confidence_lower_bound": score,
+                "validation_stability": 0.90,
+                "validation_calibration": 0.90,
+                "validation_sample_count": 100,
+                "validation_trade_count": 50,
+                "validation_execution_quality": 0.90,
+            }
+            return payload
+
+        candidate_a = rankable_payload("A", 0.21)
+        self.store.save_candidate_lifecycle(
+            "A",
+            "FROZEN",
+            candidate_a,
+            from_stage="FROZEN",
+            timestamp=timestamp,
+        )
+        candidate_b = rankable_payload("B", 0.99)
         self.store.save_candidate_lifecycle(
             "B",
             "IDEA",
@@ -1364,26 +1389,18 @@ class OperatorControlTests(unittest.TestCase):
             credentials=credentials,
             clock=lambda: timestamp,
         )
-        service.mark_eligible("A")
-        service.mark_eligible("B")
         self.store.polymarket_health = lambda **_: {"grade": "A", "errors": 0}
-        with self.store.connection:
-            self.store.connection.execute(
-                "INSERT INTO canary_selection("
-                "singleton,ranking_run_id,candidate_id,rank,total_score,"
-                "component_scores_json,evidence_versions_json,reason,selected_at) "
-                "VALUES(1,?,?,?,?,?,?,?,?)",
-                (
-                    "rank-manual-target",
-                    "B",
-                    1,
-                    0.99,
-                    "{}",
-                    "{}",
-                    "SELECTED_WINNER",
-                    timestamp.isoformat(),
-                ),
-            )
+
+        ranking = CandidateCanaryRanker(
+            self.store,
+            service=service,
+            clock=lambda: timestamp,
+        ).evaluate_and_select(timestamp)
+        self.assertEqual(ranking["selected_candidate"], "B")
+        self.assertEqual(ranking["winner_id"], "B")
+        self.assertEqual(ranking["selection_status"], "CURRENT")
+        self.assertTrue(ranking["selection_valid"])
+        self.assertEqual(ranking["selected"]["candidate_id"], "B")
 
         class ArmVenue:
             @staticmethod
@@ -1392,7 +1409,15 @@ class OperatorControlTests(unittest.TestCase):
 
         armed = service.arm("A", venue=ArmVenue(), credentials_configured=True)
         self.assertEqual(armed["candidate"], "A")
+        self.assertEqual(armed["selected_candidate"], "B")
+        self.assertEqual(armed["selection_status"], "CURRENT")
+        self.assertTrue(armed["selection_valid"])
         self.assertEqual(armed["autonomous"]["selected_candidate"], "B")
+        self.assertEqual(armed["autonomous"]["last_selected_candidate"], "B")
+        self.assertIsInstance(armed["selected_winner"], dict)
+        self.assertEqual(armed["selected_winner"]["candidate_id"], "B")
+        self.assertEqual(armed["selected_winner"]["selected_candidate"], "B")
+        self.assertEqual(armed["selected_winner"]["last_selected_candidate"], "B")
 
         check_a = service.check(candidate_id="A", venue=ArmVenue())
         check_b = service.check(candidate_id="B", venue=ArmVenue())
@@ -1410,7 +1435,16 @@ class OperatorControlTests(unittest.TestCase):
         ):
             dashboard = DashboardData(store=self.store, control=self.control).canary_data()
         self.assertEqual(dashboard["canary"]["candidate"], "A")
+        self.assertEqual(dashboard["canary"]["selected_candidate"], "B")
+        self.assertEqual(dashboard["canary"]["selection_status"], "CURRENT")
+        self.assertTrue(dashboard["canary"]["selection_valid"])
         self.assertEqual(dashboard["autonomous_canary"]["selected_candidate"], "B")
+        self.assertEqual(dashboard["autonomous_canary"]["last_selected_candidate"], "B")
+        self.assertEqual(dashboard["canary"]["selected_winner"]["candidate_id"], "B")
+        self.assertEqual(dashboard["canary"]["selected_winner"]["selected_candidate"], "B")
+        self.assertEqual(
+            dashboard["canary"]["selected_winner"]["last_selected_candidate"], "B"
+        )
 
 
     def test_get_dashboard_is_side_effect_free_and_survives_control_failure(self) -> None:

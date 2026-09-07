@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 import hashlib
 import json
+import threading
 import unittest
 from unittest.mock import Mock, patch
 
@@ -16,6 +17,7 @@ from axiom.canary import (
     CredentialStore,
 )
 from axiom.dashboard import DashboardData
+from axiom.lifecycle import CandidateLifecycleManager, CandidateStage
 from axiom.node import NodeConfig, ResearchNode
 from axiom.operator import (
     CANARY_CONNECTIVITY_CONFIG_KEY,
@@ -25,6 +27,7 @@ from axiom.operator import (
 from axiom.ranker import CandidateCanaryRanker
 from axiom.storage import AxiomStore
 from axiom.data_quality import PRICE_PROXY, TIMESTAMPED_DEPTH, evaluate_prediction_data_quality
+
 
 
 T0 = datetime(2026, 1, 2, 12, tzinfo=timezone.utc)
@@ -261,6 +264,79 @@ class AutonomousWorkflowTests(unittest.TestCase):
                 "historical_order_book_available": historical_order_book_available,
             },
         )
+    def save_forward_canary_snapshot(self, snapshot_id: str = "selection-binding-snapshot") -> None:
+        self.store.save_polymarket_snapshot(
+            snapshot_id,
+            "market-1",
+            T0,
+            T0,
+            {
+                "source_type": "FORWARD_COLLECTED",
+                "snapshot": {
+                    "market_id": "market-1",
+                    "timestamp": T0.isoformat(),
+                    "yes_ask": "0.50",
+                    "yes_order_book": {
+                        "asks": [{"price": "0.50", "size": "100"}],
+                        "bids": [],
+                        "timestamp": T0.isoformat(),
+                        "token_id": "yes",
+                    },
+                    "no_order_book": {
+                        "asks": [{"price": "0.50", "size": "100"}],
+                        "bids": [],
+                        "timestamp": T0.isoformat(),
+                        "token_id": "no",
+                    },
+                    "yes_token_id": "yes",
+                    "no_ask": "0.50",
+                    "no_token_id": "no",
+                    "settlement": "open",
+                },
+                "active": True,
+                "settlement": "open",
+            },
+            source_type="FORWARD_COLLECTED",
+        )
+
+    def insert_selection_snapshot(
+        self,
+        baseline: dict[str, object],
+        *,
+        omitted: frozenset[str] = frozenset(),
+        updates: dict[str, object] | None = None,
+    ) -> None:
+        row = dict(baseline)
+        row.update(updates or {})
+        columns = (
+            "ranking_run_id",
+            "ranking_timestamp",
+            "candidate_id",
+            "rank",
+            "total_score",
+            "component_scores_json",
+            "evidence_versions_json",
+            "reason",
+            "selected_at",
+            "qualification_hash",
+            "ranking_snapshot_hash",
+            "selection_status",
+            "selection_valid",
+            "selection_invalidation_reason",
+            "last_selected_candidate",
+        )
+        persisted = tuple(column for column in columns if column not in omitted)
+        placeholders = ",".join("?" for _ in persisted)
+        with self.store.connection:
+            self.store.connection.execute("DELETE FROM canary_selection WHERE singleton=1")
+            self.store.connection.execute(
+                "INSERT INTO canary_selection(singleton,"
+                + ",".join(persisted)
+                + ") VALUES(1,"
+                + placeholders
+                + ")",
+                tuple(row[column] for column in persisted),
+            )
 
     def test_ranker_automatically_binds_eligible_prediction_candidates(self):
         self.seed_candidate("winner", cluster="cluster-a", score=0.40)
@@ -301,6 +377,116 @@ class AutonomousWorkflowTests(unittest.TestCase):
         self.assertEqual(rows["weak"]["cluster_representative"], 0)
         self.assertEqual(rows["weak"]["reason"], "DIVERSITY_CLUSTER_NON_REPRESENTATIVE")
         self.assertEqual(ranker.current_winner()["candidate_id"], "strong")
+
+
+    def test_winner_switch_keeps_new_selection_current_and_exposes_previous_history(self):
+        self.seed_candidate("first-winner", cluster="cluster-a", score=0.40)
+        ranker = CandidateCanaryRanker(self.store, clock=lambda: T0)
+
+        first = ranker.evaluate_and_select(T0)
+        self.assertEqual(first["selected_candidate"], "first-winner")
+        self.assertEqual(first["selection_status"], "CURRENT")
+        self.assertTrue(first["selection_valid"])
+
+        self.seed_candidate("new-winner", cluster="cluster-b", score=0.90)
+        switched = ranker.evaluate_and_select(T0)
+
+        self.assertEqual(switched["selected_candidate"], "new-winner")
+        self.assertEqual(switched["winner_id"], "new-winner")
+        self.assertEqual(switched["last_selected_candidate"], "first-winner")
+        self.assertEqual(switched["selection_status"], "CURRENT")
+        self.assertTrue(switched["selection_valid"])
+        self.assertIsNone(switched["selection_invalidation_reason"])
+        self.assertEqual(switched["selected"]["candidate_id"], "new-winner")
+        self.assertEqual(
+            switched["selected"]["last_selected_candidate"],
+            "first-winner",
+        )
+        self.assertEqual(self.service.status()["selected_candidate"], "new-winner")
+        self.assertEqual(
+            self.service.status()["last_selected_candidate"],
+            "first-winner",
+        )
+        self.assertEqual(ranker.current_selection()["candidate_id"], "new-winner")
+
+    def test_rankings_read_is_serialized_against_concurrent_writer(self):
+        self.seed_candidate("ranking-lock", score=0.40)
+        ranker = CandidateCanaryRanker(self.store, clock=lambda: T0)
+        ranker.evaluate_and_select(T0)
+
+        entered = threading.Event()
+        release = threading.Event()
+        writer_attempted = threading.Event()
+        writer_acquired = threading.Event()
+        reader_ident = None
+        result = {}
+        original_lock = self.store._lock
+
+        class GatedLock:
+            def acquire(self, blocking=True, timeout=-1):
+                if not blocking:
+                    acquired = original_lock.acquire(False)
+                elif timeout == -1:
+                    acquired = original_lock.acquire()
+                else:
+                    acquired = original_lock.acquire(True, timeout)
+                if acquired and threading.get_ident() == reader_ident:
+                    entered.set()
+                    if not release.wait(timeout=2):
+                        raise AssertionError("ranking read was not released")
+                return acquired
+
+            def release(self):
+                original_lock.release()
+
+            def __enter__(self):
+                self.acquire()
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                self.release()
+                return False
+
+        gated_lock = GatedLock()
+        self.store._lock = gated_lock
+
+        def read_rankings():
+            nonlocal reader_ident
+            reader_ident = threading.get_ident()
+            try:
+                result["rows"] = ranker.rankings()
+            except BaseException as exc:
+                result["error"] = exc
+
+        def competing_writer():
+            acquired = gated_lock.acquire(blocking=False)
+            writer_attempted.set()
+            if not acquired:
+                return
+            try:
+                writer_acquired.set()
+            finally:
+                gated_lock.release()
+
+        reader = threading.Thread(target=read_rankings)
+        reader.start()
+        try:
+            self.assertTrue(entered.wait(timeout=2))
+            writer = threading.Thread(target=competing_writer)
+            writer.start()
+            self.assertTrue(writer_attempted.wait(timeout=2))
+            writer.join(timeout=2)
+            self.assertFalse(writer_acquired.is_set())
+            release.set()
+            reader.join(timeout=2)
+        finally:
+            release.set()
+            reader.join(timeout=2)
+            self.store._lock = original_lock
+
+        self.assertFalse(reader.is_alive())
+        self.assertNotIn("error", result)
+        self.assertEqual([row["candidate_id"] for row in result["rows"]], ["ranking-lock"])
 
     def test_dashboard_uses_authoritative_service_gate_projection(self):
         payload = self.seed_candidate("gated")
@@ -353,6 +539,27 @@ class AutonomousWorkflowTests(unittest.TestCase):
         self.assertFalse(validation["eligible"])
         self.assertFalse(validation["historical_data_integrity_passed"])
         self.assertIn("HISTORICAL_PROVENANCE_INCOMPLETE", validation["data_quality"]["reasons"])
+    def test_missing_historical_dataset_version_rejects_prediction_canary(self):
+        payload = candidate_payload(
+            "missing-dataset",
+            dataset_id="missing-prediction-history",
+            dataset_version="v404",
+        )
+        self.store.save_candidate_lifecycle("missing-dataset", "IDEA", payload, timestamp=T0)
+        self.store.save_candidate_lifecycle("missing-dataset", "FROZEN", payload, timestamp=T0)
+
+        validation = self.service.validate_eligibility("missing-dataset")
+        self.assertFalse(validation["eligible"])
+        self.assertFalse(validation["historical_data_integrity_passed"])
+        self.assertIn(
+            "HISTORICAL_DATASET_VERSION_NOT_FOUND",
+            validation["data_quality"]["reasons"],
+        )
+
+        result = CandidateCanaryRanker(self.store, clock=lambda: T0).evaluate_and_select(T0)
+        self.assertEqual(result["selection_status"], "NONE")
+        self.assertIsNone(result["selected_candidate"])
+
 
     def test_forward_contamination_blocks_prediction_canary(self):
         self.save_quality_dataset(
@@ -533,9 +740,529 @@ class AutonomousWorkflowTests(unittest.TestCase):
         disabled = worker.tick(now=T0)
         self.assertEqual(disabled["status"], "DISABLED")
         self.service.enable_autonomous_micro_live()
+
         blocked = worker.tick(now=T0)
         self.assertEqual(blocked["blocker"], "NO_ELIGIBLE_RANKABLE_CANDIDATE")
         self.assertEqual(calls, [])
+    def test_ranker_re_evaluates_legacy_full_payload_into_qualification_binding(self):
+        payload = self.seed_candidate("legacy")
+        legacy_evidence = {
+            **payload,
+            "forward_duration_seconds": 999_999,
+            "forward_observations": 100_000,
+            "forward_fills": 100_000,
+            "forward_trades": 100_000,
+            "forward_order_attempts": 100_000,
+            "forward_liquidity": 100_000,
+            "forward_max_drawdown": 0.01,
+            "forward_spread": 0.01,
+            "forward_requested_quantity": 100_000,
+            "forward_filled_quantity": 100_000,
+        }
+        with self.store.connection:
+            self.store.connection.execute(
+                "INSERT INTO canary_eligibility(candidate_id,eligible_at,frozen_hash,evidence_json) "
+                "VALUES(?,?,?,?)",
+                (
+                    "legacy",
+                    T0.isoformat(),
+                    payload["frozen_hash"],
+                    json.dumps(legacy_evidence, sort_keys=True),
+                ),
+            )
+        before = self.store.connection.execute(
+            "SELECT evidence_json FROM canary_eligibility WHERE candidate_id=?",
+            ("legacy",),
+        ).fetchone()
+        self.assertNotEqual(json.loads(before["evidence_json"]).get("schema"), "canary-qualification-v1")
+
+        result = CandidateCanaryRanker(self.store, clock=lambda: T0).evaluate_and_select(T0)
+        evidence_row = self.store.connection.execute(
+            "SELECT evidence_json FROM canary_eligibility WHERE candidate_id=?",
+            ("legacy",),
+        ).fetchone()
+        evidence = json.loads(evidence_row["evidence_json"])
+        self.assertEqual(evidence["schema"], "canary-qualification-v1")
+        self.assertEqual(evidence["candidate_id"], "legacy")
+        self.assertEqual(evidence["frozen_hash"], payload["frozen_hash"])
+        self.assertNotIn("forward_duration_seconds", evidence)
+        self.assertNotIn("forward_observations", evidence)
+
+        ranking_row = self.store.connection.execute(
+            "SELECT qualification_hash,ranking_snapshot_hash FROM canary_rankings "
+            "WHERE candidate_id=?",
+            ("legacy",),
+        ).fetchone()
+        self.assertTrue(ranking_row["qualification_hash"])
+        self.assertTrue(ranking_row["ranking_snapshot_hash"])
+        self.assertEqual(result["eligibility_raw_count"], 1)
+        self.assertEqual(result["eligible_count"], 1)
+        self.assertEqual(result["rankable_raw_count"], 1)
+        self.assertEqual(result["rankable_count"], 1)
+
+    def test_rejected_candidate_is_not_executable_after_ranker_tick(self):
+        payload = self.seed_candidate("rejected", executable=True, score=0.90)
+        ranker = CandidateCanaryRanker(self.store, clock=lambda: T0)
+        initial = ranker.evaluate_and_select(T0)
+        self.assertEqual(initial["selected_candidate"], "rejected")
+
+        CandidateLifecycleManager(self.store).reject(
+            "rejected",
+            "hard research gate failed",
+            expected_stage=CandidateStage.FROZEN,
+        )
+        result = ranker.evaluate_and_select(T0)
+        self.assertIsNone(result["selected_candidate"])
+        self.assertFalse(result["selection_valid"])
+        self.assertEqual(result["selection_invalidation_reason"], "LIFECYCLE_REJECTED")
+        self.assertEqual(result["eligible_count"], 0)
+        self.assertEqual(result["rankable_count"], 0)
+        self.assertIsNone(self.service.generate_signal("rejected"))
+        self.assertIsNone(self.service.status()["winner_id"])
+
+    def test_concurrent_paper_lifecycle_update_never_publishes_mixed_current_selection(self):
+        payload = self.seed_candidate("paper-race", score=0.40)
+        paper_payload = {**payload, "forward_expectancy": 0.40}
+        self.store.save_candidate_lifecycle(
+            "paper-race",
+            "PAPER_FORWARD",
+            paper_payload,
+            from_stage="FROZEN",
+            timestamp=T0,
+        )
+        ranker = CandidateCanaryRanker(self.store, clock=lambda: T0)
+        entered = threading.Event()
+        release = threading.Event()
+        result_holder = {}
+        original_rank_evidence = ranker._rank_evidence
+        first_call = True
+
+        def blocked_rank_evidence(payload, frozen_hash, quality=None):
+            nonlocal first_call
+            if first_call:
+                first_call = False
+                entered.set()
+                if not release.wait(timeout=5):
+                    raise AssertionError("ranking barrier was not released")
+            return original_rank_evidence(payload, frozen_hash, quality=quality)
+
+        ranker._rank_evidence = blocked_rank_evidence
+
+        def run_ranker():
+            try:
+                result_holder["result"] = ranker.evaluate_and_select(T0)
+            except BaseException as exc:
+                result_holder["error"] = exc
+
+        ranking_thread = threading.Thread(target=run_ranker)
+        ranking_thread.start()
+        try:
+            self.assertTrue(entered.wait(timeout=5))
+            CandidateLifecycleManager(self.store).record_evidence(
+                "paper-race",
+                {
+                    "forward_expectancy": -0.40,
+                    "forward_duration_seconds": 123,
+                    "forward_observations": 456,
+                },
+                expected_stage=CandidateStage.PAPER_FORWARD,
+                reason="concurrent paper update",
+            )
+        finally:
+            release.set()
+            ranking_thread.join(timeout=5)
+        self.assertFalse(ranking_thread.is_alive())
+        self.assertNotIn("error", result_holder)
+        raced = result_holder["result"]
+        raced_selection = ranker.current_selection()
+        raced_rows = {
+            row["candidate_id"]: row
+            for row in ranker.rankings()
+        }
+
+        # A bounded retry may publish a fresh current selection; if it does,
+        # it must be identical to a clean post-update ranking, never a mixed
+        # pre-update ranking paired with post-update lifecycle evidence.
+        clean = CandidateCanaryRanker(self.store, clock=lambda: T0).evaluate_and_select(T0)
+        clean_rows = {
+            row["candidate_id"]: row
+            for row in CandidateCanaryRanker(self.store, clock=lambda: T0).rankings()
+        }
+        if raced["selection_status"] == "CURRENT":
+            self.assertEqual(raced["selected_candidate"], clean["selected_candidate"])
+            self.assertIsNotNone(raced_selection)
+            self.assertEqual(
+                raced_rows["paper-race"]["ranking_snapshot_hash"],
+                clean_rows["paper-race"]["ranking_snapshot_hash"],
+            )
+        else:
+            self.assertFalse(raced["selection_valid"])
+            self.assertNotEqual(raced["selection_status"], "CURRENT")
+            self.assertIsNone(raced["selected_candidate"])
+
+    def test_ranking_relevant_forward_change_stales_selection_until_reevaluation(self):
+        self.seed_candidate("forward-change", score=0.40)
+        lifecycle = CandidateLifecycleManager(self.store)
+        lifecycle.record_evidence(
+            "forward-change",
+            {"forward_expectancy": 0.40},
+            expected_stage=CandidateStage.FROZEN,
+            reason="seed ranking-relevant forward evidence",
+        )
+        ranker = CandidateCanaryRanker(self.store, clock=lambda: T0)
+        first = ranker.evaluate_and_select(T0)
+        old_row = self.store.connection.execute(
+            "SELECT qualification_hash,ranking_snapshot_hash FROM canary_rankings "
+            "WHERE candidate_id=?",
+            ("forward-change",),
+        ).fetchone()
+        self.assertEqual(first["selection_status"], "CURRENT")
+        self.assertTrue(first["selection_valid"])
+
+        lifecycle.record_evidence(
+            "forward-change",
+            {
+                "forward_expectancy": -0.40,
+                "forward_duration_seconds": 1,
+                "forward_observations": 999,
+            },
+            expected_stage=CandidateStage.FROZEN,
+            reason="ranking-relevant forward evidence changed",
+        )
+        stale = self.service.status()
+        self.assertEqual(stale["selection_status"], "STALE")
+        self.assertFalse(stale["selection_valid"])
+        self.assertEqual(stale["selection_invalidation_reason"], "RANKING_EVIDENCE_CHANGED")
+        self.assertIsNone(stale["selected_candidate"])
+        self.assertIsNone(stale["winner_id"])
+        last_selected = stale["last_selected_candidate"]
+        self.assertEqual(
+            last_selected.get("candidate_id") if isinstance(last_selected, dict) else last_selected,
+            "forward-change",
+        )
+
+        refreshed = CandidateCanaryRanker(self.store, clock=lambda: T0).evaluate_and_select(T0)
+        new_row = self.store.connection.execute(
+            "SELECT qualification_hash,ranking_snapshot_hash FROM canary_rankings "
+            "WHERE candidate_id=?",
+            ("forward-change",),
+        ).fetchone()
+        self.assertEqual(refreshed["selection_status"], "CURRENT")
+        self.assertTrue(refreshed["selection_valid"])
+        self.assertEqual(refreshed["selected_candidate"], "forward-change")
+        self.assertEqual(old_row["qualification_hash"], new_row["qualification_hash"])
+        self.assertNotEqual(old_row["ranking_snapshot_hash"], new_row["ranking_snapshot_hash"])
+    def test_nested_validation_ranking_input_change_stales_selection_until_reevaluation(self):
+        self.seed_candidate("nested-validation", score=0.40)
+        lifecycle = CandidateLifecycleManager(self.store)
+        lifecycle.record_evidence(
+            "nested-validation",
+            {"validation": {"liquidity": 0.20}},
+            expected_stage=CandidateStage.FROZEN,
+            reason="seed nested ranking evidence",
+        )
+        ranker = CandidateCanaryRanker(self.store, clock=lambda: T0)
+        first = ranker.evaluate_and_select(T0)
+        old_row = self.store.connection.execute(
+            "SELECT qualification_hash,ranking_snapshot_hash,total_score "
+            "FROM canary_rankings WHERE candidate_id=?",
+            ("nested-validation",),
+        ).fetchone()
+        self.assertEqual(first["selection_status"], "CURRENT")
+        self.assertTrue(first["selection_valid"])
+        self.assertIsNotNone(old_row)
+
+        lifecycle.record_evidence(
+            "nested-validation",
+            {"validation": {"liquidity": 0.80}},
+            expected_stage=CandidateStage.FROZEN,
+            reason="nested ranking evidence changed",
+        )
+        stale = self.service.status()
+        self.assertEqual(stale["selection_status"], "STALE")
+        self.assertFalse(stale["selection_valid"])
+        self.assertEqual(stale["selection_invalidation_reason"], "RANKING_EVIDENCE_CHANGED")
+        self.assertIsNone(stale["selected_candidate"])
+        self.assertIsNone(stale["winner_id"])
+
+        refreshed = CandidateCanaryRanker(self.store, clock=lambda: T0).evaluate_and_select(T0)
+        new_row = self.store.connection.execute(
+            "SELECT qualification_hash,ranking_snapshot_hash,total_score "
+            "FROM canary_rankings WHERE candidate_id=?",
+            ("nested-validation",),
+        ).fetchone()
+        self.assertEqual(refreshed["selection_status"], "CURRENT")
+        self.assertTrue(refreshed["selection_valid"])
+        self.assertEqual(refreshed["selected_candidate"], "nested-validation")
+        self.assertEqual(old_row["qualification_hash"], new_row["qualification_hash"])
+        self.assertNotEqual(old_row["ranking_snapshot_hash"], new_row["ranking_snapshot_hash"])
+        self.assertNotEqual(old_row["total_score"], new_row["total_score"])
+
+
+    def test_new_ranker_instance_preserves_persisted_selection_semantics(self):
+        self.seed_candidate("restart-alpha", score=0.30)
+        self.seed_candidate("restart-beta", score=0.20)
+        first_ranker = CandidateCanaryRanker(self.store, clock=lambda: T0)
+        first = first_ranker.evaluate_and_select(T0)
+        first_rows = first_ranker.rankings()
+        second_ranker = CandidateCanaryRanker(self.store, clock=lambda: T0)
+        second = second_ranker.evaluate_and_select(T0)
+        second_rows = second_ranker.rankings()
+
+        self.assertEqual(first["selected_candidate"], second["selected_candidate"])
+        self.assertEqual(first["ranking_run_id"], second["ranking_run_id"])
+        self.assertEqual(first["ranking_timestamp"], second["ranking_timestamp"])
+        self.assertEqual(first["selection_status"], "CURRENT")
+        self.assertTrue(first["selection_valid"])
+        self.assertEqual(
+            [(row["candidate_id"], row["qualification_hash"], row["ranking_snapshot_hash"]) for row in first_rows],
+            [(row["candidate_id"], row["qualification_hash"], row["ranking_snapshot_hash"]) for row in second_rows],
+        )
+    def test_untampered_atomic_selection_is_current_when_rows_match(self):
+        candidate_id = "atomic-current"
+        self.seed_candidate(candidate_id, executable=True, score=0.40)
+        ranker = CandidateCanaryRanker(self.store, clock=lambda: T0)
+        result = ranker.evaluate_and_select(T0)
+        selection = dict(
+            self.store.connection.execute(
+                "SELECT * FROM canary_selection WHERE singleton=1"
+            ).fetchone()
+        )
+        ranking = dict(
+            self.store.connection.execute(
+                "SELECT * FROM canary_rankings WHERE candidate_id=?",
+                (candidate_id,),
+            ).fetchone()
+        )
+
+        self.assertEqual(result["selection_status"], "CURRENT")
+        self.assertTrue(result["selection_valid"])
+        self.assertEqual(result["selected_candidate"], candidate_id)
+        self.assertEqual(result["winner_id"], candidate_id)
+        self.assertEqual(ranking["selected"], 1)
+        self.assertIsNotNone(ranking["total_score"])
+        for field in (
+            "candidate_id",
+            "ranking_run_id",
+            "ranking_timestamp",
+            "rank",
+            "total_score",
+            "component_scores_json",
+            "evidence_versions_json",
+            "qualification_hash",
+            "ranking_snapshot_hash",
+        ):
+            self.assertTrue(selection[field])
+            self.assertEqual(selection[field], ranking[field])
+        self.assertEqual(selection["reason"], "SELECTED_WINNER")
+        self.assertEqual(ranking["reason"], "")
+        self.assertEqual(selection["selection_status"], "CURRENT")
+        self.assertEqual(selection["selection_valid"], 1)
+        self.assertEqual(selection["last_selected_candidate"], candidate_id)
+        self.assertEqual(selection["selected_at"], ranking["ranking_timestamp"])
+        self.assertEqual(self.service.status()["selection_status"], "CURRENT")
+        self.assertIsNotNone(ranker.current_selection())
+        self.assertIsNotNone(ranker.current_winner())
+
+    def test_selection_metadata_tampering_cannot_bind_autonomous_canary(self):
+        candidate_id = "selection-binding"
+        self.seed_candidate(candidate_id, executable=True, score=0.40)
+        self.save_forward_canary_snapshot()
+        ranker = CandidateCanaryRanker(self.store, clock=lambda: T0)
+        initial = ranker.evaluate_and_select(T0)
+        self.assertEqual(initial["selection_status"], "CURRENT")
+        self.assertTrue(initial["selection_valid"])
+        baseline_selection = dict(
+            self.store.connection.execute(
+                "SELECT * FROM canary_selection WHERE singleton=1"
+            ).fetchone()
+        )
+        baseline_ranking = dict(
+            self.store.connection.execute(
+                "SELECT * FROM canary_rankings WHERE candidate_id=?",
+                (candidate_id,),
+            ).fetchone()
+        )
+        signal = self.service.generate_signal(candidate_id)
+        self.assertIsNotNone(signal)
+        signal_id = str(signal["signal_id"])
+
+        cases = (
+            ("selection qualification hash omitted", frozenset({"qualification_hash"}), {}, {}),
+            ("selection ranking hash omitted", frozenset({"ranking_snapshot_hash"}), {}, {}),
+            ("ranking run empty", frozenset(), {"ranking_run_id": ""}, {}),
+            ("selection run tampered", frozenset(), {"ranking_run_id": "selection-run-tamper"}, {}),
+            ("ranking run disagrees", frozenset(), {}, {"ranking_run_id": "ranking-run-tamper"}),
+            ("ranking timestamp omitted", frozenset({"ranking_timestamp"}), {}, {}),
+            ("selection timestamp tampered", frozenset(), {"ranking_timestamp": "selection-time-tamper"}, {}),
+            ("ranking timestamp disagrees", frozenset(), {}, {"ranking_timestamp": "ranking-time-tamper"}),
+            ("selected-at empty", frozenset(), {"selected_at": ""}, {}),
+            ("selection status omitted", frozenset({"selection_status"}), {}, {}),
+            ("selection valid omitted", frozenset({"selection_valid"}), {}, {}),
+            ("selection status tampered", frozenset(), {"selection_status": "STALE"}, {}),
+            ("selection valid flag tampered", frozenset(), {"selection_valid": 0}, {}),
+            ("ranking row is not selected", frozenset(), {}, {"selected": 0}),
+            (
+                "selection qualification hash disagrees",
+                frozenset(),
+                {"qualification_hash": "selection-qualification-tamper"},
+                {},
+            ),
+            (
+                "selection ranking hash disagrees",
+                frozenset(),
+                {"ranking_snapshot_hash": "selection-ranking-tamper"},
+                {},
+            ),
+            (
+                "ranking qualification hash disagrees",
+                frozenset(),
+                {},
+                {"qualification_hash": "ranking-qualification-tamper"},
+            ),
+            (
+                "ranking snapshot hash disagrees",
+                frozenset(),
+                {},
+                {"ranking_snapshot_hash": "ranking-snapshot-tamper"},
+            ),
+            (
+                "selection rank disagrees",
+                frozenset(),
+                {"rank": baseline_selection["rank"] + 1},
+                {},
+            ),
+            (
+                "ranking rank disagrees",
+                frozenset(),
+                {},
+                {"rank": baseline_ranking["rank"] + 1},
+            ),
+            (
+                "selection total score disagrees",
+                frozenset(),
+                {"total_score": baseline_selection["total_score"] + 0.123},
+                {},
+            ),
+            (
+                "ranking total score disagrees",
+                frozenset(),
+                {},
+                {"total_score": baseline_ranking["total_score"] + 0.123},
+            ),
+            (
+                "selection component scores disagree",
+                frozenset(),
+                {"component_scores_json": json.dumps({"tampered": True}, sort_keys=True)},
+                {},
+            ),
+            (
+                "ranking component scores disagree",
+                frozenset(),
+                {},
+                {"component_scores_json": json.dumps({"tampered": True}, sort_keys=True)},
+            ),
+            (
+                "selection evidence versions disagree",
+                frozenset(),
+                {"evidence_versions_json": json.dumps({"tampered": True}, sort_keys=True)},
+                {},
+            ),
+            (
+                "ranking evidence versions disagree",
+                frozenset(),
+                {},
+                {"evidence_versions_json": json.dumps({"tampered": True}, sort_keys=True)},
+            ),
+            (
+                "selection reason disagrees",
+                frozenset(),
+                {"reason": "selection-reason-tamper"},
+                {},
+            ),
+            (
+                "ranking reason disagrees",
+                frozenset(),
+                {},
+                {"reason": "ranking-reason-tamper"},
+            ),
+        )
+        for label, omitted, selection_updates, ranking_updates in cases:
+            with self.subTest(label=label):
+                self.insert_selection_snapshot(
+                    baseline_selection,
+                    omitted=omitted,
+                    updates=selection_updates,
+                )
+                with self.store.connection:
+                    self.store.connection.execute(
+                        "UPDATE canary_rankings SET ranking_run_id=?,ranking_timestamp=?,"
+                        "rank=?,total_score=?,component_scores_json=?,evidence_versions_json=?,"
+                        "selected=?,reason=?,qualification_hash=?,ranking_snapshot_hash=? "
+                        "WHERE candidate_id=?",
+                        (
+                            baseline_ranking["ranking_run_id"],
+                            baseline_ranking["ranking_timestamp"],
+                            baseline_ranking["rank"],
+                            baseline_ranking["total_score"],
+                            baseline_ranking["component_scores_json"],
+                            baseline_ranking["evidence_versions_json"],
+                            baseline_ranking["selected"],
+                            baseline_ranking["reason"],
+                            baseline_ranking["qualification_hash"],
+                            baseline_ranking["ranking_snapshot_hash"],
+                            candidate_id,
+                        ),
+                    )
+                    for column, value in ranking_updates.items():
+                        self.store.connection.execute(
+                            f"UPDATE canary_rankings SET {column}=? WHERE candidate_id=?",
+                            (value, candidate_id),
+                        )
+
+                stale = self.service.status()
+                self.assertEqual(stale["selection_status"], "STALE")
+                self.assertFalse(stale["selection_valid"])
+                self.assertIsNone(stale["selected_candidate"])
+                self.assertIsNone(stale["winner_id"])
+                self.assertEqual(stale["last_selected_candidate"], candidate_id)
+                self.assertIsNone(ranker.current_selection())
+                self.assertIsNone(ranker.current_winner())
+
+                self.service.disarm()
+                enabled = self.service.enable_autonomous_micro_live()
+                control = self.store.connection.execute(
+                    "SELECT candidate_id FROM canary_control WHERE singleton=1"
+                ).fetchone()
+                self.assertIsNone(control["candidate_id"])
+                self.assertIsNone(enabled["candidate"])
+                self.assertIsNone(enabled["winner_id"])
+
+                with self.store.connection:
+                    self.store.connection.execute(
+                        "UPDATE canary_signals SET status='READY',reason=NULL "
+                        "WHERE signal_id=?",
+                        (signal_id,),
+                    )
+                venue = TestVenue()
+                with self.assertRaises(CanaryBlocked):
+                    self.service.submit_signal(signal_id, venue=venue)
+                self.assertEqual(venue.submissions, [])
+
+    def test_disabled_autonomous_tick_has_no_signals_submissions_or_orders_across_cycles(self):
+        self.seed_candidate("disabled-executable", executable=True, score=0.90)
+        venue = TestVenue()
+        worker = AutonomousCanaryWorker(
+            self.store,
+            clock=lambda: T0,
+            venue_factory=lambda: venue,
+        )
+        results = [worker.tick(now=T0) for _ in range(3)]
+        self.assertEqual([result["status"] for result in results], ["DISABLED"] * 3)
+        self.assertEqual(venue.submissions, [])
+        for table in ("canary_signals", "canary_ledger", "canary_execution_events"):
+            count = self.store.connection.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()["n"]
+            self.assertEqual(count, 0, table)
     def test_hermes_cannot_change_autonomous_risk_controls(self):
         self.service.enable_autonomous_micro_live()
         before = self.service.status()

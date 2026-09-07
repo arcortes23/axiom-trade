@@ -1066,6 +1066,8 @@ class OperatorControlPlane:
             canary_status, latest_signal = {"micro_live_canary": "DISABLED"}, None
         worker_status = worker("autonomous-canary")
         autonomous_state = canary_status.get("autonomous") if isinstance(canary_status, Mapping) else {}
+        if not isinstance(autonomous_state, Mapping):
+            autonomous_state = {}
         latest_connectivity = _stored_connectivity_projection(
             self.store.get_operator_config(CANARY_CONNECTIVITY_CONFIG_KEY, None)
         )
