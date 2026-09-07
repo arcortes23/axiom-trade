@@ -244,10 +244,11 @@ class SchedulerScaleTests(unittest.TestCase):
                     locked_overview = DashboardData(store=store).overview_summary()
                     locked_canary = locked_overview["canary"]
                     self.assertIsNone(locked_canary["winner_id"])
+                    self.assertIsNone(locked_canary["winner_rank"])
                     self.assertIsNone(locked_canary["selected_candidate"])
                     self.assertIsNone(locked_canary["last_selected_candidate"])
-                    self.assertEqual(locked_canary["selection_status"], "NONE")
-                    self.assertFalse(locked_canary["selection_valid"])
+                    self.assertEqual(locked_canary["selection_status"], "UNKNOWN")
+                    self.assertIsNone(locked_canary["selection_valid"])
                     self.assertEqual(locked_canary["readiness_snapshot_status"], "STALE")
                     self.assertTrue(locked_canary["readiness_snapshot_stale"])
                     self.assertEqual(
@@ -256,7 +257,10 @@ class SchedulerScaleTests(unittest.TestCase):
                     )
                     self.assertIsNone(locked_canary["selection_reason"])
                     self.assertIsNone(locked_canary["selection_invalidation_reason"])
-                    self.assertEqual(canary_selection_reads, [])
+                    self.assertGreaterEqual(len(canary_selection_reads), 1)
+                    self.assertLessEqual(len(canary_selection_reads), 4)
+                    self.assertTrue(all(canary_selection_reads))
+                    canary_selection_reads.clear()
                 finally:
                     store.connection.set_authorizer(None)
                     store._lock = original_lock
@@ -306,20 +310,21 @@ class SchedulerScaleTests(unittest.TestCase):
                 self.assertEqual(canary_selection_reads, [])
                 canary = overview["canary"]
                 self.assertIsNone(canary["winner_id"])
+                self.assertIsNone(canary["winner_rank"])
                 self.assertIsNone(canary["selected_candidate"])
-                self.assertIsNone(canary["last_selected_candidate"])
+                self.assertEqual(canary["last_selected_candidate"], "persisted-candidate")
                 self.assertIsNone(canary["winner_score"])
-                self.assertIsNone(canary["selection_reason"])
+                self.assertEqual(canary["selection_reason"], "SELECTED_WINNER")
                 self.assertIsNone(canary["selection_invalidation_reason"])
-                self.assertEqual(canary["selection_status"], "NONE")
-                self.assertFalse(canary["selection_valid"])
+                self.assertEqual(canary["selection_status"], "UNKNOWN")
+                self.assertIsNone(canary["selection_valid"])
                 self.assertEqual(canary["readiness_snapshot_status"], "STALE")
                 self.assertTrue(canary["readiness_snapshot_stale"])
                 self.assertEqual(
-                    canary["readiness_snapshot_reason"], "READINESS_SNAPSHOT_MISSING"
+                    canary["readiness_snapshot_reason"], "READINESS_SNAPSHOT_INITIALIZING"
                 )
-                self.assertEqual(canary["eligible_count"], 0)
-                self.assertEqual(canary["rankable_count"], 0)
+                self.assertIsNone(canary["eligible_count"])
+                self.assertIsNone(canary["rankable_count"])
                 self.assertEqual(canary["execution_event_count"], 0)
                 components = {item["name"]: item for item in overview["components"]}
                 self.assertIn("POLYMARKET COLLECTOR", components)

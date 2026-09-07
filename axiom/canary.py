@@ -52,12 +52,105 @@ AUTONOMOUS_CANARY_LIMITS = {
     "max_orders_per_day": DEFAULT_MAX_ORDERS_PER_DAY,
     "max_slippage_bps": DEFAULT_MAX_SLIPPAGE_BPS,
 }
-
+_UNSET = object()
 CANARY_SUBMISSION_TIMEOUT_SECONDS = 15.0
 CANARY_SIGNAL_TTL_SECONDS = 60.0
 CANARY_SIGNAL_MAX_AGE_SECONDS = 60.0
 CANARY_READINESS_SNAPSHOT_MAX_AGE_SECONDS = 60.0
 _CANARY_ELIGIBLE_STAGES = frozenset({"FROZEN", "PAPER_FORWARD", "PAPER_PROMOTABLE"})
+_CANARY_LAST_GOOD_MISSING_REASONS = frozenset(
+    {
+        "MISSING",
+        "INITIALIZING",
+        "INVALID",
+        "NO_PERSISTED",
+        "READINESS_SNAPSHOT_MISSING",
+        "READINESS_SNAPSHOT_INITIALIZING",
+        "READINESS_SNAPSHOT_INVALID",
+        "NO_PERSISTED_SNAPSHOT",
+    }
+)
+_CANARY_LAST_GOOD_EVIDENCE_FIELDS = (
+    "eligibility_raw_count",
+    "eligible_count",
+    "rankable_raw_count",
+    "rankable_count",
+    "ranking_run_id",
+    "ranking_timestamp",
+    "winner_rank",
+    "winner_score",
+    "rank",
+    "score",
+)
+
+
+def _canary_has_last_good(
+    payload: Mapping[str, Any] | None,
+    *,
+    reason: Any = None,
+    projection_version: Any = None,
+    readiness_status: Any = None,
+    readiness_stale: Any = None,
+) -> bool:
+    """Return whether a persisted canary projection has usable prior evidence.
+
+    The readiness reason fences heuristic evidence: initializing, missing,
+    invalid, and non-persisted rows cannot become "last good" merely because
+    they contain legacy selection metadata.  An explicitly CURRENT row or a
+    positive projection version is already successful evidence.  Older rows
+    predate the projection version column, so their persisted counts/rank/score
+    remain valid evidence.
+    """
+    if not isinstance(payload, Mapping):
+        return False
+    raw_reason = payload.get("readiness_snapshot_reason") if reason is None else reason
+    normalized_reason = str(raw_reason or "").strip().upper()
+    raw_status = (
+        payload.get("readiness_snapshot_status")
+        if readiness_status is None
+        else readiness_status
+    )
+    status = str(raw_status or "").strip().upper()
+    stale = (
+        payload.get("readiness_snapshot_stale")
+        if readiness_stale is None
+        else readiness_stale
+    )
+    current = status == "CURRENT" and stale in (False, 0, "0", "false", "FALSE")
+    if current:
+        return True
+
+    raw_version = payload.get("readiness_snapshot_version")
+    if projection_version is not None:
+        try:
+            parsed_external_version = (
+                None
+                if isinstance(projection_version, bool)
+                else int(projection_version)
+            )
+        except (TypeError, ValueError):
+            parsed_external_version = None
+        if parsed_external_version is not None and parsed_external_version > 0:
+            raw_version = projection_version
+    if isinstance(raw_version, bool):
+        raw_version = None
+    try:
+        parsed_version = int(raw_version) if raw_version is not None else 0
+    except (TypeError, ValueError):
+        parsed_version = 0
+    if parsed_version > 0:
+        return True
+
+    if normalized_reason in _CANARY_LAST_GOOD_MISSING_REASONS:
+        return False
+    nested = payload.get("autonomous")
+    sources = (payload, nested) if isinstance(nested, Mapping) else (payload,)
+    return any(
+        source.get(name) is not None
+        for source in sources
+        for name in _CANARY_LAST_GOOD_EVIDENCE_FIELDS
+    )
+
 _MANDATORY_SECRET_NAMES = ("private_key", "wallet_address")
 _OPTIONAL_SECRET_NAMES = ("relayer_api_key", "relayer_api_key_address")
 _SECRET_NAMES = _MANDATORY_SECRET_NAMES + _OPTIONAL_SECRET_NAMES
@@ -1087,6 +1180,7 @@ def _canary_eligibility_binding_result(
     eligibility: Mapping[str, Any] | None,
     *,
     record: Mapping[str, Any] | None = None,
+    verify_attestation: bool = True,
 ) -> dict[str, Any]:
     """Return a reasoned binding result without treating stored PASS as a gate."""
     identifier = str(candidate_id).strip()
@@ -1136,7 +1230,11 @@ def _canary_eligibility_binding_result(
     ):
         result["reason_code"] = "QUALIFICATION_CHANGED"
         return result
-    quality = evaluate_prediction_data_quality(store, payload or {})
+    quality = evaluate_prediction_data_quality(
+        store,
+        payload or {},
+        verify_attestation=verify_attestation,
+    )
     current_projection = _canary_qualification_projection(
         identifier,
         payload or {},
@@ -1252,6 +1350,8 @@ class CanaryService:
               FOREIGN KEY(canary_event_id) REFERENCES canary_ledger(event_id));
             CREATE INDEX IF NOT EXISTS idx_canary_execution_events_order
               ON canary_execution_events(canary_event_id, timestamp);
+            CREATE INDEX IF NOT EXISTS idx_canary_execution_events_time
+              ON canary_execution_events(timestamp, execution_event_id);
             CREATE INDEX IF NOT EXISTS idx_canary_ledger_time ON canary_ledger(timestamp, event_id);
             CREATE TABLE IF NOT EXISTS canary_signals (
               signal_id TEXT PRIMARY KEY, candidate_id TEXT NOT NULL,
@@ -1289,7 +1389,16 @@ class CanaryService:
               singleton INTEGER PRIMARY KEY CHECK(singleton=1),
               last_tick_at TEXT, next_decision TEXT NOT NULL,
               blocker TEXT, last_signal_id TEXT, worker_status TEXT NOT NULL,
-              updated_at TEXT NOT NULL
+              updated_at TEXT NOT NULL,
+              last_tick_started_at TEXT,
+              last_tick_completed_at TEXT,
+              last_successful_tick TEXT,
+              last_error_code TEXT,
+              consecutive_failures INTEGER NOT NULL DEFAULT 0,
+              next_retry_at TEXT,
+              candidates_evaluated INTEGER,
+              signals_generated INTEGER,
+              orders_attempted INTEGER
             );
             CREATE TABLE IF NOT EXISTS canary_readiness_snapshot (
               singleton INTEGER PRIMARY KEY CHECK(singleton=1),
@@ -1344,6 +1453,27 @@ class CanaryService:
                         ("selection_valid", "INTEGER NOT NULL DEFAULT 0"),
                         ("selection_invalidation_reason", "TEXT"),
                         ("last_selected_candidate", "TEXT"),
+                    ),
+                ),
+                (
+                    "canary_autonomous_state",
+                    (
+                        ("last_tick_started_at", "TEXT"),
+                        ("last_tick_completed_at", "TEXT"),
+                        ("last_successful_tick", "TEXT"),
+                        ("last_error_code", "TEXT"),
+                        ("consecutive_failures", "INTEGER NOT NULL DEFAULT 0"),
+                        ("next_retry_at", "TEXT"),
+                        ("candidates_evaluated", "INTEGER"),
+                        ("signals_generated", "INTEGER"),
+                        ("orders_attempted", "INTEGER"),
+                    ),
+                ),
+                (
+                    "canary_readiness_snapshot",
+                    (
+                        ("source_control_generation", "INTEGER"),
+                        ("projection_version", "INTEGER NOT NULL DEFAULT 0"),
                     ),
                 ),
             ):
@@ -1438,22 +1568,8 @@ class CanaryService:
                 readiness_snapshot_reason='CONTROL_CHANGED'
               WHERE singleton=1;
             END;
-            CREATE TRIGGER IF NOT EXISTS canary_readiness_stale_autonomous
-            AFTER INSERT ON canary_autonomous_state BEGIN
-              UPDATE canary_readiness_snapshot SET
-                readiness_snapshot_status='STALE',
-                readiness_snapshot_stale=1,
-                readiness_snapshot_reason='AUTONOMOUS_DECISION'
-              WHERE singleton=1;
-            END;
-            CREATE TRIGGER IF NOT EXISTS canary_readiness_stale_autonomous_update
-            AFTER UPDATE ON canary_autonomous_state BEGIN
-              UPDATE canary_readiness_snapshot SET
-                readiness_snapshot_status='STALE',
-                readiness_snapshot_stale=1,
-                readiness_snapshot_reason='AUTONOMOUS_DECISION'
-              WHERE singleton=1;
-            END;
+            DROP TRIGGER IF EXISTS canary_readiness_stale_autonomous;
+            DROP TRIGGER IF EXISTS canary_readiness_stale_autonomous_update;
             CREATE TRIGGER IF NOT EXISTS canary_readiness_stale_signal
             AFTER INSERT ON canary_signals BEGIN
               UPDATE canary_readiness_snapshot SET
@@ -1535,13 +1651,15 @@ class CanaryService:
               WHERE singleton=1;
             END;
             """)
-            initial_payload = self._readiness_snapshot_default()
+            initial_payload = self._initial_readiness_payload()
             initial_now = ensure_utc(self.clock()).isoformat()
+            initial_generation = initial_payload.get("control_generation")
             self.store.connection.execute(
                 "INSERT OR IGNORE INTO canary_readiness_snapshot("
                 "singleton,payload_json,readiness_snapshot_status,"
                 "readiness_snapshot_stale,readiness_snapshot_reason,"
-                "readiness_snapshot_updated_at) VALUES(1,?,?,?,?,?)",
+                "readiness_snapshot_updated_at,source_control_generation,"
+                "projection_version) VALUES(1,?,?,?,?,?,?,?)",
                 (
                     json.dumps(
                         initial_payload,
@@ -1553,6 +1671,8 @@ class CanaryService:
                     1,
                     "READINESS_SNAPSHOT_INITIALIZING",
                     initial_now,
+                    initial_generation,
+                    0,
                 ),
             )
 
@@ -1576,34 +1696,43 @@ class CanaryService:
             "rank": None,
             "score": None,
             "selection_reason": None,
-            "selection_status": "NONE",
-            "selection_valid": False,
+            "selection_status": "UNKNOWN",
+            "selection_valid": None,
             "selection_invalidation_reason": None,
-            "eligibility_raw_count": 0,
-            "eligible_count": 0,
-            "rankable_raw_count": 0,
-            "rankable_count": 0,
+            "eligibility_raw_count": None,
+            "eligible_count": None,
+            "rankable_raw_count": None,
+            "rankable_count": None,
             "historical_data_integrity": "UNKNOWN",
             "historical_execution_fidelity": "UNKNOWN",
-            "current_execution_evidence": "CURRENT_ORDER_BOOK_REQUIRED",
-            "next_decision": "ENABLE AUTO CANARY",
-            "blocker": "AUTONOMOUS_CANARY_DISABLED",
+            "current_execution_evidence": "UNKNOWN",
+            "next_decision": None,
+            "blocker": None,
             "last_tick_at": None,
+            "last_tick_started_at": None,
+            "last_tick_completed_at": None,
+            "last_successful_tick": None,
+            "last_error_code": None,
+            "consecutive_failures": None,
+            "next_retry_at": None,
+            "candidates_evaluated": None,
+            "signals_generated": None,
+            "orders_attempted": None,
             "last_signal_id": None,
-            "worker_status": "IDLE",
+            "worker_status": "UNKNOWN",
         }
         return {
             "production_live_trading": "DISABLED",
-            "micro_live_canary": "DISABLED",
-            "display_state": "DISABLED",
-            "control_state": "DISABLED",
+            "micro_live_canary": "UNKNOWN",
+            "display_state": "UNKNOWN",
+            "control_state": "UNKNOWN",
             "candidate": None,
             "winner_id": None,
             "winner_rank": None,
             "winner_score": None,
             "selection_reason": None,
-            "selection_status": "NONE",
-            "selection_valid": False,
+            "selection_status": "UNKNOWN",
+            "selection_valid": None,
             "selection_invalidation_reason": None,
             "selected_candidate": None,
             "last_selected_candidate": None,
@@ -1611,32 +1740,215 @@ class CanaryService:
             "ranking_timestamp": None,
             "venue": None,
             "expiry": None,
-            "control_generation": 0,
+            "control_generation": None,
             "last_request_status": None,
-            "today_orders": 0,
-            "today_realized_pnl": 0.0,
-            "total_exposure": 0.0,
-            "open_positions": 0,
+            "today_orders": None,
+            "today_realized_pnl": None,
+            "total_exposure": None,
+            "open_positions": None,
             "limits": limits,
             "risk_envelope": risk,
             "risk_limits": dict(risk),
-            "eligibility_raw_count": 0,
-            "eligible_count": 0,
-            "rankable_raw_count": 0,
-            "rankable_count": 0,
-            "real_execution_events": 0,
-            "execution_event_count": 0,
+            "eligibility_raw_count": None,
+            "eligible_count": None,
+            "rankable_raw_count": None,
+            "rankable_count": None,
+            "real_execution_events": None,
+            "execution_event_count": None,
             "historical_data_integrity": "UNKNOWN",
             "historical_execution_fidelity": "UNKNOWN",
-            "current_execution_evidence": "CURRENT_ORDER_BOOK_REQUIRED",
-            "daily_loss_budget_remaining": float(DEFAULT_DAILY_LOSS_USD),
+            "current_execution_evidence": "UNKNOWN",
+            "daily_loss_budget_remaining": None,
             "autonomous": autonomous,
             "selected_winner": None,
             "latest_signal": None,
             "trades": [],
             "live_execution": False,
+            "readiness_evaluation_error_code": None,
+            "readiness_snapshot_version": None,
             "kill_semantics": "KILL_PREVENTS_NEW_SUBMISSIONS; IN_FLIGHT_REQUESTS_ARE_NOT_RETRACTED",
         }
+    def _initial_readiness_payload(self) -> dict[str, Any]:
+        """Project only durable control/selection metadata at startup.
+
+        This path intentionally does not validate candidates or run ranking/data
+        quality checks.  Counts and eligibility claims remain unknown until a
+        bounded authoritative publication completes.
+        """
+        payload = self._readiness_snapshot_default()
+        connection = self.store.connection
+        lock = getattr(self.store, "_lock", None)
+
+        def fetchone(query: str) -> Any:
+            try:
+                if lock is None:
+                    return connection.execute(query).fetchone()
+                with lock:
+                    return connection.execute(query).fetchone()
+            except sqlite3.OperationalError:
+                return None
+
+        control = fetchone(
+            "SELECT state,candidate_id,venue,expires_at,control_generation,"
+            "updated_at,limits_json FROM canary_control WHERE singleton=1"
+        )
+        selection = fetchone(
+            # ``canary_selection`` predates the readiness projection columns.
+            # Read only the stable singleton fields so a cold-start display
+            # can retain the durable candidate as history without treating
+            # it as a current, validated selection.
+            "SELECT candidate_id,rank,total_score,reason,selected_at "
+            "FROM canary_selection WHERE singleton=1"
+        )
+        autonomous = fetchone(
+            "SELECT last_tick_at,last_tick_started_at,last_tick_completed_at,"
+            "last_successful_tick,last_error_code,consecutive_failures,next_retry_at,"
+            "candidates_evaluated,signals_generated,orders_attempted,next_decision,"
+            "blocker,last_signal_id,worker_status FROM canary_autonomous_state "
+            "WHERE singleton=1"
+        )
+        if control is not None:
+            state = str(control["state"] or "UNKNOWN").upper()
+            payload["micro_live_canary"] = state
+            payload["control_state"] = state
+            payload["display_state"] = (
+                "ENABLED" if state in {"ARMED", AUTONOMOUS_MICRO_LIVE}
+                else "KILLED" if state == "KILLED"
+                else "DISABLED" if state in {"DISARMED", "DISABLED"}
+                else "UNKNOWN"
+            )
+            payload["candidate"] = control["candidate_id"]
+            payload["venue"] = control["venue"]
+            payload["expiry"] = control["expires_at"]
+            try:
+                payload["control_generation"] = int(control["control_generation"])
+            except (TypeError, ValueError):
+                payload["control_generation"] = None
+            try:
+                limits = json.loads(control["limits_json"] or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                limits = None
+            if isinstance(limits, Mapping):
+                payload["limits"] = self._readiness_snapshot_sanitize(limits, key="limits")
+        if selection is not None:
+            historical_candidate = selection["candidate_id"]
+            payload["selected_candidate"] = None
+            payload["last_selected_candidate"] = historical_candidate
+            payload["winner_id"] = None
+            payload["winner_rank"] = None
+            payload["winner_score"] = None
+            payload["selection_reason"] = (
+                str(selection["reason"] or "") or None
+            )
+            payload["ranking_run_id"] = None
+            payload["ranking_timestamp"] = None
+            payload["selection_status"] = "UNKNOWN"
+            payload["selection_valid"] = None
+            payload["selection_invalidation_reason"] = None
+        if autonomous is not None:
+            auto = payload["autonomous"]
+            auto.update(
+                {
+                    key: autonomous[key]
+                    for key in (
+                        "last_tick_at",
+                        "last_tick_started_at",
+                        "last_tick_completed_at",
+                        "last_successful_tick",
+                        "last_error_code",
+                        "consecutive_failures",
+                        "next_retry_at",
+                        "candidates_evaluated",
+                        "signals_generated",
+                        "orders_attempted",
+                        "next_decision",
+                        "blocker",
+                        "last_signal_id",
+                        "worker_status",
+                    )
+                }
+            )
+        # Keep the nested autonomous object a complete legacy projection even
+        # before the first authoritative evaluation.  Selection values are
+        # durable metadata and are safe to copy here; qualification counts
+        # and quality fields remain their UNKNOWN/null defaults.
+        auto = payload.get("autonomous")
+        if isinstance(auto, Mapping):
+            auto = dict(auto)
+            auto.update(
+                {
+                    "enabled": payload["micro_live_canary"] == AUTONOMOUS_MICRO_LIVE,
+                    "selected_candidate": payload["selected_candidate"],
+                    "last_selected_candidate": payload["last_selected_candidate"],
+                    "ranking_run_id": payload["ranking_run_id"],
+                    "ranking_timestamp": payload["ranking_timestamp"],
+                    "rank": payload["winner_rank"],
+                    "score": payload["winner_score"],
+                    "selection_reason": payload["selection_reason"],
+                    "selection_status": payload["selection_status"],
+                    "selection_valid": payload["selection_valid"],
+                    "selection_invalidation_reason": payload[
+                        "selection_invalidation_reason"
+                    ],
+                }
+            )
+            payload["autonomous"] = auto
+        return payload
+    def upsert_initializing_readiness_snapshot(
+        self,
+        *,
+        timestamp: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Persist a truthful cold-start projection without qualification work.
+
+        Startup may expose durable control, historical selection, and worker
+        metadata, but it must not claim that selection or data-quality
+        evaluation succeeded.  Resetting the projection version also fences
+        any prior successful row so this initializer can never become
+        last-good evidence.
+        """
+        when = ensure_utc(timestamp or self.clock()).isoformat()
+
+        def operation() -> dict[str, Any]:
+            with self.store.transaction(immediate=True):
+                payload = self._initial_readiness_payload()
+                encoded = json.dumps(
+                    payload,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                )
+                self.store.connection.execute(
+                    "INSERT INTO canary_readiness_snapshot("
+                    "singleton,payload_json,readiness_snapshot_status,"
+                    "readiness_snapshot_stale,readiness_snapshot_reason,"
+                    "readiness_snapshot_updated_at,source_control_generation,"
+                    "projection_version) VALUES(1,?,?,?,?,?,?,?) "
+                    "ON CONFLICT(singleton) DO UPDATE SET "
+                    "payload_json=excluded.payload_json,"
+                    "readiness_snapshot_status=excluded.readiness_snapshot_status,"
+                    "readiness_snapshot_stale=excluded.readiness_snapshot_stale,"
+                    "readiness_snapshot_reason=excluded.readiness_snapshot_reason,"
+                    "readiness_snapshot_updated_at=excluded.readiness_snapshot_updated_at,"
+                    "source_control_generation=excluded.source_control_generation,"
+                    "projection_version=excluded.projection_version",
+                    (
+                        encoded,
+                        "STALE",
+                        1,
+                        "READINESS_SNAPSHOT_INITIALIZING",
+                        when,
+                        payload.get("control_generation"),
+                        0,
+                    ),
+                )
+                return dict(payload)
+
+        sqlite_retry(
+            operation,
+            operation_name="upsert initializing canary readiness snapshot",
+        )
+        return self.readiness_snapshot()
 
     @staticmethod
     def _readiness_snapshot_sanitize(
@@ -1697,11 +2009,24 @@ class CanaryService:
         payload: dict[str, Any] = {}
         for name in fields:
             value = source.get(name, defaults[name])
+            if name == "autonomous" and isinstance(value, Mapping):
+                # Older snapshots may contain only the fields that happened to
+                # be populated at the time.  Keep the nested legacy contract
+                # complete without doing an authoritative read.
+                value = {**defaults["autonomous"], **dict(value)}
             sanitized = cls._readiness_snapshot_sanitize(
                 value,
                 key=name,
                 limit=100 if name == "trades" else 64,
             )
+            if name == "autonomous":
+                # ``_readiness_snapshot_sanitize`` omits null mapping values;
+                # restore contract keys so initializing state remains
+                # explicitly UNKNOWN/null rather than disappearing.
+                sanitized = {
+                    **defaults["autonomous"],
+                    **(sanitized if isinstance(sanitized, Mapping) else {}),
+                }
             payload[name] = defaults[name] if sanitized is None and value is not None else sanitized
         if latest_signal is None:
             latest_signal = source.get("latest_signal")
@@ -1713,46 +2038,205 @@ class CanaryService:
         trades = payload.get("trades")
         payload["trades"] = list(trades[:100]) if isinstance(trades, list) else []
         return payload
+    def _patch_autonomous_snapshot(self) -> None:
+        """Patch autonomous liveness fields without requalifying selection."""
+        fields = (
+            "last_tick_at",
+            "last_tick_started_at",
+            "last_tick_completed_at",
+            "last_successful_tick",
+            "last_error_code",
+            "consecutive_failures",
+            "next_retry_at",
+            "candidates_evaluated",
+            "signals_generated",
+            "orders_attempted",
+            "next_decision",
+            "blocker",
+            "last_signal_id",
+            "worker_status",
+        )
+
+        def operation() -> None:
+            with self.store.transaction(immediate=True):
+                state = self.store.connection.execute(
+                    "SELECT "
+                    + ",".join(fields)
+                    + " FROM canary_autonomous_state WHERE singleton=1"
+                ).fetchone()
+                if state is None:
+                    return
+                row = self.store.connection.execute(
+                    "SELECT payload_json,readiness_snapshot_status,"
+                    "readiness_snapshot_stale,readiness_snapshot_reason,"
+                    "readiness_snapshot_updated_at "
+                    "FROM canary_readiness_snapshot WHERE singleton=1"
+                ).fetchone()
+                if row is None:
+                    payload = self._readiness_snapshot_default()
+                    status = "STALE"
+                    stale = 1
+                    reason = "READINESS_SNAPSHOT_INITIALIZING"
+                    updated_at = ensure_utc(self.clock()).isoformat()
+                    insert = True
+                else:
+                    try:
+                        parsed = json.loads(str(row["payload_json"] or ""))
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        # Never replace a malformed persisted qualification
+                        # payload with an autonomous-only default.
+                        return
+                    if not isinstance(parsed, Mapping):
+                        return
+                    payload = self._readiness_snapshot_payload(parsed)
+                    status = str(row["readiness_snapshot_status"] or "STALE")
+                    stale = int(row["readiness_snapshot_stale"] or 0)
+                    reason = str(
+                        row["readiness_snapshot_reason"]
+                        or "READINESS_SNAPSHOT_INITIALIZING"
+                    )[:256]
+                    updated_at = str(
+                        row["readiness_snapshot_updated_at"]
+                        or ensure_utc(self.clock()).isoformat()
+                    )
+                    insert = False
+                auto = payload.get("autonomous")
+                auto = (
+                    {**self._readiness_snapshot_default()["autonomous"], **dict(auto)}
+                    if isinstance(auto, Mapping)
+                    else dict(self._readiness_snapshot_default()["autonomous"])
+                )
+                auto.update({name: state[name] for name in fields})
+                payload["autonomous"] = auto
+                encoded = json.dumps(
+                    payload,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                )
+                if insert:
+                    self.store.connection.execute(
+                        "INSERT INTO canary_readiness_snapshot("
+                        "singleton,payload_json,readiness_snapshot_status,"
+                        "readiness_snapshot_stale,readiness_snapshot_reason,"
+                        "readiness_snapshot_updated_at) VALUES(1,?,?,?,?,?)",
+                        (encoded, status, stale, reason, updated_at),
+                    )
+                else:
+                    # Deliberately do not touch status, stale, reason, or
+                    # timestamp: autonomous updates are not qualification.
+                    self.store.connection.execute(
+                        "UPDATE canary_readiness_snapshot SET payload_json=? "
+                        "WHERE singleton=1",
+                        (encoded,),
+                    )
+
+        try:
+            sqlite_retry(
+                operation,
+                operation_name="patch canary autonomous readiness snapshot",
+            )
+        except Exception:
+            _LOGGER.debug(
+                "canary autonomous readiness snapshot patch failed",
+                exc_info=True,
+            )
 
     @staticmethod
-    def _readiness_snapshot_stale_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    def _readiness_snapshot_has_last_good(payload: Mapping[str, Any]) -> bool:
+        """Return whether ``payload`` came from a successful publication."""
+        return _canary_has_last_good(payload)
+
+
+    @staticmethod
+    def _readiness_snapshot_stale_payload(
+        payload: Mapping[str, Any],
+        *,
+        preserve_last_good: bool = False,
+    ) -> dict[str, Any]:
         result = dict(payload)
+        # A stale projection may no longer assert qualification or execute a
+        # selection, but a previously successful publication is still useful
+        # operator evidence.  Only an initializing/missing/invalid
+        # never-evaluated payload is allowed to lose its counts.
+        if not preserve_last_good:
+            result["eligibility_raw_count"] = None
+            result["eligible_count"] = None
+            result["rankable_raw_count"] = None
+            result["rankable_count"] = None
+        historical_candidate = (
+            result.get("last_selected_candidate")
+            or result.get("selected_candidate")
+            or result.get("winner_id")
+        )
         current = (
             result.get("selection_valid") is True
             or result.get("selected_candidate") is not None
             or result.get("winner_id") is not None
         )
+        if historical_candidate is not None:
+            result["last_selected_candidate"] = historical_candidate
         if current:
-            result["selection_status"] = "STALE"
-            result["selection_valid"] = False
-            result["selection_invalidation_reason"] = (
-                result.get("selection_invalidation_reason") or "READINESS_SNAPSHOT_STALE"
-            )
+            if preserve_last_good:
+                result["selection_status"] = "STALE"
+                result["selection_valid"] = False
+                result["selection_invalidation_reason"] = (
+                    result.get("selection_invalidation_reason") or "READINESS_SNAPSHOT_STALE"
+                )
+            else:
+                result["selection_status"] = "UNKNOWN"
+                result["selection_valid"] = None
+                result["selection_invalidation_reason"] = result.get(
+                    "selection_invalidation_reason"
+                )
             result["selected_candidate"] = None
             result["winner_id"] = None
             result["winner_rank"] = None
             result["winner_score"] = None
+        elif not preserve_last_good and str(result.get("selection_status") or "").upper() in {
+            "CURRENT",
+            "STALE",
+            "NONE",
+        }:
+            result["selection_status"] = "UNKNOWN"
+            result["selection_valid"] = None
+
         selected_winner = result.get("selected_winner")
         if isinstance(selected_winner, Mapping):
             winner = dict(selected_winner)
-            winner["selection_status"] = "STALE"
-            winner["selection_valid"] = False
+            winner["candidate_id"] = historical_candidate
+            winner["selection_status"] = "STALE" if preserve_last_good else "UNKNOWN"
+            winner["selection_valid"] = False if preserve_last_good else None
             winner["selected_candidate"] = None
+            winner["last_selected_candidate"] = historical_candidate
             winner["winner_id"] = None
-            winner["selection_invalidation_reason"] = (
-                result.get("selection_invalidation_reason") or "READINESS_SNAPSHOT_STALE"
+            winner["winner_rank"] = None
+            winner["winner_score"] = None
+            winner["selection_invalidation_reason"] = result.get(
+                "selection_invalidation_reason"
             )
             result["selected_winner"] = winner
         autonomous = result.get("autonomous")
         if isinstance(autonomous, Mapping):
             auto = dict(autonomous)
-            auto["selection_status"] = result.get("selection_status", "STALE")
-            auto["selection_valid"] = False
+            auto["selection_status"] = result.get(
+                "selection_status",
+                "STALE" if preserve_last_good else "UNKNOWN",
+            )
+            auto["selection_valid"] = False if preserve_last_good else None
             auto["selected_candidate"] = None
+            auto["last_selected_candidate"] = historical_candidate
             auto["winner_id"] = None
+            auto["winner_rank"] = None
+            auto["winner_score"] = None
             auto["selection_invalidation_reason"] = result.get(
                 "selection_invalidation_reason"
             )
+            if not preserve_last_good:
+                auto["eligibility_raw_count"] = None
+                auto["eligible_count"] = None
+                auto["rankable_raw_count"] = None
+                auto["rankable_count"] = None
             result["autonomous"] = auto
         return result
     def _readiness_snapshot_failure_safe_payload(
@@ -1761,16 +2245,82 @@ class CanaryService:
         *,
         reason: str,
         updated_at: str | None = None,
+        error_code: str | None = None,
+        projection_version: Any = None,
+        readiness_status: Any = None,
+        readiness_stale: Any = None,
+        readiness_reason: Any = None,
     ) -> dict[str, Any]:
-        """Return a fail-closed projection when publication cannot complete."""
+        persisted_projection_version = projection_version
+        persisted_readiness_status = readiness_status
+        persisted_readiness_stale = readiness_stale
+        persisted_readiness_reason = readiness_reason
+        if (
+            payload is None
+            or persisted_projection_version is None
+            or persisted_readiness_status is None
+            or persisted_readiness_stale is None
+            or persisted_readiness_reason is None
+        ):
+            try:
+                lock = getattr(self.store, "_lock", None)
+                if lock is None:
+                    row = self.store.connection.execute(
+                        "SELECT payload_json,projection_version,"
+                        "readiness_snapshot_status,readiness_snapshot_stale,"
+                        "readiness_snapshot_reason "
+                        "FROM canary_readiness_snapshot WHERE singleton=1"
+                    ).fetchone()
+                else:
+                    with lock:
+                        row = self.store.connection.execute(
+                            "SELECT payload_json,projection_version,"
+                            "readiness_snapshot_status,readiness_snapshot_stale,"
+                            "readiness_snapshot_reason "
+                            "FROM canary_readiness_snapshot WHERE singleton=1"
+                        ).fetchone()
+                if row is not None:
+                    if payload is None:
+                        parsed = json.loads(str(row["payload_json"] or ""))
+                        if isinstance(parsed, Mapping):
+                            payload = parsed
+                    if persisted_projection_version is None:
+                        persisted_projection_version = row["projection_version"]
+                    if persisted_readiness_status is None:
+                        persisted_readiness_status = row["readiness_snapshot_status"]
+                    if persisted_readiness_stale is None:
+                        persisted_readiness_stale = row["readiness_snapshot_stale"]
+                    if persisted_readiness_reason is None:
+                        persisted_readiness_reason = row["readiness_snapshot_reason"]
+            except (sqlite3.Error, TypeError, ValueError, json.JSONDecodeError):
+                payload = None
         try:
-            bounded = self._readiness_snapshot_payload(payload)
+            bounded = self._readiness_snapshot_payload(
+                payload if isinstance(payload, Mapping) else self._readiness_snapshot_default()
+            )
         except Exception:
             bounded = self._readiness_snapshot_default()
-        result = self._readiness_snapshot_stale_payload(bounded)
+        preserve_last_good = _canary_has_last_good(
+            bounded,
+            reason=(
+                persisted_readiness_reason
+                if persisted_readiness_reason is not None
+                else reason
+            ),
+            projection_version=persisted_projection_version,
+            readiness_status=persisted_readiness_status,
+            readiness_stale=persisted_readiness_stale,
+        )
+        result = self._readiness_snapshot_stale_payload(
+            bounded,
+            preserve_last_good=preserve_last_good,
+        )
         result["readiness_snapshot_status"] = "STALE"
         result["readiness_snapshot_stale"] = True
         result["readiness_snapshot_reason"] = str(reason or "READINESS_SNAPSHOT_STALE")[:256]
+        result["readiness_evaluation_error_code"] = (
+            str(error_code)[:64] if error_code else None
+        )
         result["readiness_snapshot_updated_at"] = (
             str(updated_at) if updated_at else ensure_utc(self.clock()).isoformat()
         )
@@ -1783,10 +2333,137 @@ class CanaryService:
                     "readiness_snapshot_stale": True,
                     "readiness_snapshot_reason": result["readiness_snapshot_reason"],
                     "readiness_snapshot_updated_at": result["readiness_snapshot_updated_at"],
+                    "readiness_evaluation_error_code": result[
+                        "readiness_evaluation_error_code"
+                    ],
                 }
             )
             result["autonomous"] = autonomous
         return result
+    def _readiness_projection_version(self) -> int:
+        """Read the persisted projection fence without an authoritative scan."""
+        lock = getattr(self.store, "_lock", None)
+        try:
+            if lock is None:
+                row = self.store.connection.execute(
+                    "SELECT projection_version FROM canary_readiness_snapshot "
+                    "WHERE singleton=1"
+                ).fetchone()
+            else:
+                with lock:
+                    row = self.store.connection.execute(
+                        "SELECT projection_version FROM canary_readiness_snapshot "
+                        "WHERE singleton=1"
+                    ).fetchone()
+            if row is None:
+                return 0
+            value = row["projection_version"]
+            if isinstance(value, bool):
+                return 0
+            return int(value or 0)
+        except (sqlite3.Error, TypeError, ValueError, OverflowError):
+            # An unavailable fence must never authorize a destructive failure
+            # publication.  No valid projection uses a negative version.
+            return -1
+
+    def _persist_evaluation_failure(
+        self,
+        *,
+        error_code: str,
+        updated_at: str | None = None,
+        expected_projection_version: int | None = None,
+    ) -> dict[str, Any]:
+        """Fence a failed evaluation while retaining the prior selection."""
+        now = updated_at or ensure_utc(self.clock()).isoformat()
+
+        def unchanged_payload(row: Any) -> dict[str, Any]:
+            try:
+                parsed = json.loads(str(row["payload_json"] or ""))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                parsed = None
+            if isinstance(parsed, Mapping):
+                return dict(parsed)
+            return self._readiness_snapshot_default()
+
+        try:
+            with self.store.transaction(immediate=True):
+                row = self.store.connection.execute(
+                    "SELECT payload_json,projection_version,"
+                    "readiness_snapshot_status,readiness_snapshot_stale,"
+                    "readiness_snapshot_reason "
+                    "FROM canary_readiness_snapshot WHERE singleton=1"
+                ).fetchone()
+                if row is None:
+                    current_version = 0
+                else:
+                    try:
+                        current_version = int(row["projection_version"] or 0)
+                    except (TypeError, ValueError, OverflowError):
+                        current_version = -1
+                expected_version = (
+                    current_version
+                    if expected_projection_version is None
+                    else (
+                        -1
+                        if isinstance(expected_projection_version, bool)
+                        else int(expected_projection_version)
+                    )
+                )
+                try:
+                    parsed = json.loads(str(row["payload_json"])) if row else None
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    parsed = None
+                result = self._readiness_snapshot_failure_safe_payload(
+                    parsed if isinstance(parsed, Mapping) else self._initial_readiness_payload(),
+                    reason="EVALUATION_FAILED",
+                    updated_at=now,
+                    error_code=error_code,
+                    projection_version=(row["projection_version"] if row else None),
+                    readiness_status=(row["readiness_snapshot_status"] if row else None),
+                    readiness_stale=(row["readiness_snapshot_stale"] if row else None),
+                    readiness_reason=(row["readiness_snapshot_reason"] if row else None),
+                )
+                encoded = json.dumps(
+                    result,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                )
+                if row is None:
+                    updated = None
+                else:
+                    updated = self.store.connection.execute(
+                        "UPDATE canary_readiness_snapshot SET payload_json=?,"
+                        "readiness_snapshot_status='STALE',readiness_snapshot_stale=1,"
+                        "readiness_snapshot_reason=?,readiness_snapshot_updated_at=? "
+                        "WHERE singleton=1 AND projection_version=?",
+                        (
+                            encoded,
+                            "EVALUATION_FAILED",
+                            now,
+                            expected_version,
+                        ),
+                    )
+                if updated is not None and updated.rowcount == 1:
+                    return result
+                current = self.store.connection.execute(
+                    "SELECT payload_json FROM canary_readiness_snapshot "
+                    "WHERE singleton=1"
+                ).fetchone()
+                if current is not None:
+                    # A newer publication won the race.  Do not expose or
+                    # persist the stale failure projection over that snapshot.
+                    return unchanged_payload(current)
+                return result
+        except Exception:
+            _LOGGER.exception("failed to persist canary evaluation failure")
+            return self._readiness_snapshot_failure_safe_payload(
+                None,
+                reason="EVALUATION_FAILED",
+                updated_at=now,
+                error_code=error_code,
+            )
+
 
     def publish_readiness_snapshot(
         self,
@@ -1802,6 +2479,7 @@ class CanaryService:
         if not snapshot_reason:
             snapshot_reason = "AUTHORITATIVE_UPDATE"
         payload: dict[str, Any] | None = None
+        expected_projection_version = self._readiness_projection_version()
         try:
             def operation() -> dict[str, Any]:
                 nonlocal payload
@@ -1829,6 +2507,73 @@ class CanaryService:
                             }
                         )
                         projected["autonomous"] = autonomous
+                    source_generation = projected.get("control_generation")
+                    try:
+                        previous_row = self.store.connection.execute(
+                            "SELECT source_control_generation,projection_version,"
+                            "payload_json,readiness_snapshot_status,"
+                            "readiness_snapshot_stale,readiness_snapshot_reason,"
+                            "readiness_snapshot_updated_at "
+                            "FROM canary_readiness_snapshot WHERE singleton=1"
+                        ).fetchone()
+                        previous_version = (
+                            int(previous_row["projection_version"] or 0)
+                            if previous_row is not None else 0
+                        )
+                        previous_generation = (
+                            int(previous_row["source_control_generation"])
+                            if previous_row is not None
+                            and previous_row["source_control_generation"] is not None
+                            else None
+                        )
+                    except (sqlite3.Error, TypeError, ValueError):
+                        previous_row = None
+                        previous_version = 0
+                        previous_generation = None
+                    # Only a newer CURRENT projection fences this write.  A
+                    # stale predecessor must never win over a successful
+                    # authoritative publication, even when its control
+                    # generation is newer.
+                    if (
+                        source_generation is not None
+                        and previous_generation is not None
+                        and int(source_generation) < previous_generation
+                        and previous_row is not None
+                        and str(
+                            previous_row["readiness_snapshot_status"] or ""
+                        ).upper()
+                        == "CURRENT"
+                        and str(
+                            previous_row["readiness_snapshot_stale"] or ""
+                        ).strip().lower()
+                        in {"0", "false"}
+                    ):
+                        try:
+                            previous_payload = json.loads(
+                                str(previous_row["payload_json"] or "")
+                            )
+                        except (TypeError, ValueError, json.JSONDecodeError):
+                            previous_payload = self._initial_readiness_payload()
+                        if isinstance(previous_payload, Mapping):
+                            fenced = self._readiness_snapshot_payload(previous_payload)
+                            fenced["readiness_snapshot_status"] = str(
+                                previous_row["readiness_snapshot_status"] or "STALE"
+                            )
+                            fenced["readiness_snapshot_stale"] = bool(
+                                previous_row["readiness_snapshot_stale"]
+                            )
+                            fenced["readiness_snapshot_reason"] = str(
+                                previous_row["readiness_snapshot_reason"]
+                                or "READINESS_SNAPSHOT_STALE"
+                            )[:256]
+                            fenced["readiness_snapshot_updated_at"] = (
+                                previous_row["readiness_snapshot_updated_at"]
+                            )
+                            fenced["readiness_snapshot_version"] = previous_version
+                            payload = dict(fenced)
+                            return dict(fenced)
+                    projection_version = previous_version + 1
+                    projected["readiness_snapshot_version"] = projection_version
                     encoded = json.dumps(
                         projected,
                         sort_keys=True,
@@ -1839,14 +2584,25 @@ class CanaryService:
                         "INSERT INTO canary_readiness_snapshot("
                         "singleton,payload_json,readiness_snapshot_status,"
                         "readiness_snapshot_stale,readiness_snapshot_reason,"
-                        "readiness_snapshot_updated_at) VALUES(1,?,?,?,?,?) "
+                        "readiness_snapshot_updated_at,source_control_generation,"
+                        "projection_version) VALUES(1,?,?,?,?,?,?,?) "
                         "ON CONFLICT(singleton) DO UPDATE SET "
                         "payload_json=excluded.payload_json,"
                         "readiness_snapshot_status=excluded.readiness_snapshot_status,"
                         "readiness_snapshot_stale=excluded.readiness_snapshot_stale,"
                         "readiness_snapshot_reason=excluded.readiness_snapshot_reason,"
-                        "readiness_snapshot_updated_at=excluded.readiness_snapshot_updated_at",
-                        (encoded, "CURRENT", 0, snapshot_reason, now),
+                        "readiness_snapshot_updated_at=excluded.readiness_snapshot_updated_at,"
+                        "source_control_generation=excluded.source_control_generation,"
+                        "projection_version=excluded.projection_version",
+                        (
+                            encoded,
+                            "CURRENT",
+                            0,
+                            snapshot_reason,
+                            now,
+                            source_generation,
+                            projection_version,
+                        ),
                     )
                     payload = dict(projected)
                     return dict(projected)
@@ -1863,14 +2619,18 @@ class CanaryService:
                     "canary readiness snapshot publication exhausted retries reason=%s",
                     snapshot_reason,
                 )
-            else:
-                _LOGGER.exception(
-                    "canary readiness snapshot publication failed reason=%s",
-                    snapshot_reason,
+                return self._readiness_snapshot_failure_safe_payload(
+                    payload,
+                    reason="READINESS_SNAPSHOT_PUBLICATION_FAILED",
                 )
-            return self._readiness_snapshot_failure_safe_payload(
-                payload,
-                reason="READINESS_SNAPSHOT_PUBLICATION_FAILED",
+            _LOGGER.exception(
+                "canary readiness snapshot evaluation failed reason=%s",
+                snapshot_reason,
+            )
+            error_code = str(type(exc).__name__).upper()[:64] or "UNKNOWN"
+            return self._persist_evaluation_failure(
+                error_code=error_code,
+                expected_projection_version=expected_projection_version,
             )
 
 
@@ -1883,7 +2643,7 @@ class CanaryService:
                 row = self.store.connection.execute(
                     "SELECT payload_json,readiness_snapshot_status,"
                     "readiness_snapshot_stale,readiness_snapshot_reason,"
-                    "readiness_snapshot_updated_at "
+                    "readiness_snapshot_updated_at,projection_version "
                     "FROM canary_readiness_snapshot WHERE singleton=1"
                 ).fetchone()
             else:
@@ -1891,7 +2651,7 @@ class CanaryService:
                     row = self.store.connection.execute(
                         "SELECT payload_json,readiness_snapshot_status,"
                         "readiness_snapshot_stale,readiness_snapshot_reason,"
-                        "readiness_snapshot_updated_at "
+                        "readiness_snapshot_updated_at,projection_version "
                         "FROM canary_readiness_snapshot WHERE singleton=1"
                     ).fetchone()
         except sqlite3.OperationalError:
@@ -1900,6 +2660,7 @@ class CanaryService:
         updated_at = now.isoformat()
         payload: dict[str, Any]
         current = False
+        projection_was_successful = False
         if row is not None:
             raw_payload = row["payload_json"]
             try:
@@ -1912,37 +2673,66 @@ class CanaryService:
                 and "selection_status" in parsed
             ):
                 payload = self._readiness_snapshot_payload(parsed)
+                try:
+                    projection_version = int(row["projection_version"] or 0)
+                except (TypeError, ValueError):
+                    projection_version = 0
+                try:
+                    row_stale = int(row["readiness_snapshot_stale"] or 0)
+                except (TypeError, ValueError):
+                    row_stale = -1
                 row_updated = row["readiness_snapshot_updated_at"]
-                if isinstance(row_updated, str) and row_updated:
-                    updated_at = row_updated
+                projection_was_successful = False
                 reason = str(
                     row["readiness_snapshot_reason"] or "READINESS_SNAPSHOT_STALE"
                 )[:256]
-                try:
-                    age = (now - ensure_utc(datetime.fromisoformat(updated_at))).total_seconds()
-                    current = (
-                        str(row["readiness_snapshot_status"] or "").upper() == "CURRENT"
-                        and int(row["readiness_snapshot_stale"] or 0) == 0
-                        and age >= 0
-                        and age <= CANARY_READINESS_SNAPSHOT_MAX_AGE_SECONDS
-                    )
-                    if age < 0:
-                        reason = "READINESS_SNAPSHOT_INVALID"
-                    elif age > CANARY_READINESS_SNAPSHOT_MAX_AGE_SECONDS:
-                        reason = "READINESS_SNAPSHOT_TOO_OLD"
-                except (TypeError, ValueError, OverflowError):
+                projection_was_successful = _canary_has_last_good(
+                    payload,
+                    reason=reason,
+                    projection_version=projection_version,
+                    readiness_status=row["readiness_snapshot_status"],
+                    readiness_stale=row["readiness_snapshot_stale"],
+                )
+                if not isinstance(row_updated, str) or not row_updated:
                     current = False
+                    projection_was_successful = False
                     reason = "READINESS_SNAPSHOT_INVALID"
+                else:
+                    updated_at = row_updated
+                    try:
+                        age = (
+                            now - ensure_utc(datetime.fromisoformat(updated_at))
+                        ).total_seconds()
+                        current = (
+                            str(row["readiness_snapshot_status"] or "").upper()
+                            == "CURRENT"
+                            and int(row["readiness_snapshot_stale"] or 0) == 0
+                            and age >= 0
+                            and age <= CANARY_READINESS_SNAPSHOT_MAX_AGE_SECONDS
+                        )
+                        if age < 0:
+                            current = False
+                            projection_was_successful = False
+                            reason = "READINESS_SNAPSHOT_INVALID"
+                        elif age > CANARY_READINESS_SNAPSHOT_MAX_AGE_SECONDS:
+                            reason = "READINESS_SNAPSHOT_TOO_OLD"
+                    except (TypeError, ValueError, OverflowError):
+                        current = False
+                        projection_was_successful = False
+                        reason = "READINESS_SNAPSHOT_INVALID"
             else:
-                payload = self._readiness_snapshot_default()
+                payload = self._initial_readiness_payload()
                 row_updated = row["readiness_snapshot_updated_at"]
                 if isinstance(row_updated, str) and row_updated:
                     updated_at = row_updated
                 reason = "READINESS_SNAPSHOT_INVALID"
         else:
-            payload = self._readiness_snapshot_default()
+            payload = self._initial_readiness_payload()
         if not current:
-            payload = self._readiness_snapshot_stale_payload(payload)
+            payload = self._readiness_snapshot_stale_payload(
+                payload,
+                preserve_last_good=projection_was_successful,
+            )
         payload["readiness_snapshot_status"] = "CURRENT" if current else "STALE"
         payload["readiness_snapshot_stale"] = not current
         payload["readiness_snapshot_reason"] = (
@@ -1973,9 +2763,14 @@ class CanaryService:
             def operation() -> None:
                 with self.store.transaction(immediate=True):
                     row = self.store.connection.execute(
-                        "SELECT payload_json FROM canary_readiness_snapshot "
+                        "SELECT payload_json,readiness_snapshot_status,"
+                        "readiness_snapshot_stale FROM canary_readiness_snapshot "
                         "WHERE singleton=1"
                     ).fetchone()
+                    # This callback runs after the lifecycle mutation commits.
+                    # A CURRENT row does not prove that its publication
+                    # included the mutation, so invalidate it unless the
+                    # caller explicitly republishes after this callback.
                     if row is None:
                         payload = self._readiness_snapshot_default()
                         payload["selection_invalidation_reason"] = snapshot_reason
@@ -2089,8 +2884,287 @@ class CanaryService:
                 updated_at=now,
             )
     def status(self) -> dict[str, Any]:
-        """Return the cheap persisted dashboard projection."""
+        """Return the cheap persisted readiness projection."""
         return self.readiness_snapshot()
+
+    def status_report(self) -> dict[str, Any]:
+        """Return a bounded, read-only operator report without schema work.
+
+        Unlike ``authoritative_status`` this method never validates candidates,
+        ranks data, loads datasets, or mutates the database.  It is suitable
+        for cold-start CLI/dashboard reads and reports unknown values honestly
+        when durable state is absent.
+        """
+        connection = self.store.connection
+        lock = getattr(self.store, "_lock", None)
+
+        def fetchone(query: str, parameters: tuple[Any, ...] = ()) -> Any:
+            try:
+                if lock is None:
+                    return connection.execute(query, parameters).fetchone()
+                with lock:
+                    return connection.execute(query, parameters).fetchone()
+            except sqlite3.Error:
+                return None
+
+        control_row = fetchone(
+            "SELECT state,candidate_id,venue,expires_at,control_generation,"
+            "updated_at FROM canary_control WHERE singleton=1"
+        )
+        if control_row is None:
+            control = {
+                "state": "UNKNOWN",
+                "candidate": None,
+                "venue": None,
+                "expires_at": None,
+                "generation": None,
+                "updated_at": None,
+            }
+        else:
+            try:
+                generation = int(control_row["control_generation"])
+            except (TypeError, ValueError):
+                generation = None
+            control = {
+                "state": str(control_row["state"] or "UNKNOWN").upper(),
+                "candidate": control_row["candidate_id"],
+                "venue": control_row["venue"],
+                "expires_at": control_row["expires_at"],
+                "generation": generation,
+                "updated_at": control_row["updated_at"],
+            }
+
+        projection = self.readiness_snapshot()
+        latest_signal = projection.get("latest_signal")
+        try:
+            queried_signal = self.latest_signal()
+        except Exception:
+            queried_signal = None
+        if queried_signal is not None:
+            latest_signal = queried_signal
+        latest_signal = self._readiness_snapshot_sanitize(
+            latest_signal,
+            key="latest_signal",
+            limit=1,
+        )
+        legacy_aliases = (
+            "production_live_trading",
+            "micro_live_canary",
+            "display_state",
+            "control_state",
+            "candidate",
+            "winner_id",
+            "winner_rank",
+            "winner_score",
+            "selection_reason",
+            "selection_status",
+            "selection_valid",
+            "selection_invalidation_reason",
+            "selected_candidate",
+            "last_selected_candidate",
+            "ranking_run_id",
+            "ranking_timestamp",
+            "venue",
+            "expiry",
+            "control_generation",
+            "last_request_status",
+            "today_orders",
+            "today_realized_pnl",
+            "total_exposure",
+            "open_positions",
+            "limits",
+            "risk_envelope",
+            "risk_limits",
+            "eligibility_raw_count",
+            "eligible_count",
+            "rankable_raw_count",
+            "rankable_count",
+            "real_execution_events",
+            "execution_event_count",
+            "historical_data_integrity",
+            "historical_execution_fidelity",
+            "current_execution_evidence",
+            "daily_loss_budget_remaining",
+            "autonomous",
+            "selected_winner",
+            "latest_signal",
+            "trades",
+            "rank",
+            "score",
+            "next_decision",
+            "blocker",
+            "last_signal_id",
+            "worker_status",
+            "consecutive_failures",
+            "live_execution",
+            "readiness_evaluation_error_code",
+            "readiness_snapshot_version",
+            "readiness_snapshot_status",
+            "readiness_snapshot_stale",
+            "readiness_snapshot_reason",
+            "readiness_snapshot_updated_at",
+            "kill_semantics",
+        )
+        autonomous_projection = projection.get("autonomous")
+        autonomous_projection = (
+            autonomous_projection
+            if isinstance(autonomous_projection, Mapping)
+            else {}
+        )
+        legacy_projection = {
+            name: (
+                projection[name]
+                if name in projection
+                else autonomous_projection.get(name)
+            )
+            for name in legacy_aliases
+            if name in projection or name in autonomous_projection
+        }
+        legacy_projection["latest_signal"] = latest_signal
+        readiness = {
+            "status": projection.get("readiness_snapshot_status", "STALE"),
+            "stale": bool(projection.get("readiness_snapshot_stale", True)),
+            "reason": str(
+                projection.get("readiness_snapshot_reason")
+                or "READINESS_SNAPSHOT_MISSING"
+            )[:256],
+            "updated_at": projection.get("readiness_snapshot_updated_at"),
+            "version": projection.get("readiness_snapshot_version"),
+            "micro_live_canary": projection.get("micro_live_canary", "UNKNOWN"),
+            "control_state": projection.get("control_state", "UNKNOWN"),
+            "candidate": projection.get("candidate"),
+            "selected_candidate": projection.get("selected_candidate"),
+            "last_selected_candidate": projection.get("last_selected_candidate"),
+            "selection_status": projection.get("selection_status", "UNKNOWN"),
+            "selection_valid": projection.get("selection_valid"),
+            "selection_invalidation_reason": projection.get(
+                "selection_invalidation_reason"
+            ),
+            "eligibility_raw_count": projection.get("eligibility_raw_count"),
+            "eligible_count": projection.get("eligible_count"),
+            "rankable_raw_count": projection.get("rankable_raw_count"),
+            "rankable_count": projection.get("rankable_count"),
+            "latest_signal": latest_signal,
+        }
+        readiness.update(legacy_projection)
+        readiness["latest_signal"] = latest_signal
+        readiness["readiness_snapshot_version"] = projection.get(
+            "readiness_snapshot_version"
+        )
+
+        worker_row = fetchone(
+            "SELECT last_tick_at,last_tick_started_at,last_tick_completed_at,"
+            "last_successful_tick,last_error_code,consecutive_failures,next_retry_at,"
+            "candidates_evaluated,signals_generated,orders_attempted,next_decision,"
+            "blocker,last_signal_id,worker_status FROM canary_autonomous_state "
+            "WHERE singleton=1"
+        )
+        worker_keys = (
+            "last_tick_at",
+            "last_tick_started_at",
+            "last_tick_completed_at",
+            "last_successful_tick",
+            "last_error_code",
+            "consecutive_failures",
+            "next_retry_at",
+            "candidates_evaluated",
+            "signals_generated",
+            "orders_attempted",
+            "next_decision",
+            "blocker",
+            "last_signal_id",
+            "worker_status",
+        )
+        worker = (
+            {key: worker_row[key] for key in worker_keys}
+            if worker_row is not None
+            else {key: None for key in worker_keys}
+        )
+        if worker_row is None:
+            worker["worker_status"] = "UNKNOWN"
+
+        now = ensure_utc(self.clock())
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+        aggregates = fetchone(
+            "SELECT COUNT(*) AS orders,"
+            "COALESCE(SUM(CAST(realized_pnl AS REAL)),0) AS realized_pnl "
+            "FROM canary_ledger WHERE timestamp>=?",
+            (start,),
+        )
+        exposure = fetchone(
+            "SELECT COALESCE(SUM(CAST(requested_notional AS REAL)),0) AS exposure,"
+            "COUNT(DISTINCT market_id) AS open_positions FROM canary_ledger "
+            "WHERE status IN ('RESERVED','SUBMITTING','UNKNOWN','OPEN','PARTIAL','SUBMITTED')"
+        )
+        event_count = fetchone(
+            "SELECT COUNT(*) AS n FROM canary_execution_events WHERE timestamp>=?",
+            (start,),
+        )
+        latest = fetchone(
+            "SELECT status FROM canary_ledger ORDER BY timestamp DESC,event_id DESC LIMIT 1"
+        )
+        execution = {
+            "today_orders": int(aggregates["orders"]) if aggregates is not None else 0,
+            "today_realized_pnl": (
+                float(aggregates["realized_pnl"]) if aggregates is not None else 0.0
+            ),
+            "total_exposure": float(exposure["exposure"]) if exposure is not None else 0.0,
+            "open_positions": (
+                int(exposure["open_positions"]) if exposure is not None else 0
+            ),
+            "execution_event_count": int(event_count["n"]) if event_count is not None else 0,
+            "last_request_status": (
+                str(latest["status"]).upper() if latest is not None else None
+            ),
+        }
+        for key, value in worker.items():
+            if key in legacy_aliases:
+                legacy_projection[key] = value
+        for key, value in execution.items():
+            if key in legacy_aliases:
+                legacy_projection[key] = value
+        control_state = str(control.get("state") or "UNKNOWN").upper()
+        display_state = (
+            "ENABLED"
+            if control_state in {"ARMED", AUTONOMOUS_MICRO_LIVE}
+            else "KILLED"
+            if control_state == "KILLED"
+            else "DISABLED"
+            if control_state in {"DISARMED", "DISABLED"}
+            else "UNKNOWN"
+        )
+        legacy_projection.update(
+            {
+                "micro_live_canary": control_state,
+                "control_state": control_state,
+                "display_state": display_state,
+                "candidate": control.get("candidate"),
+                "venue": control.get("venue"),
+                "expiry": control.get("expires_at"),
+                "control_generation": control.get("generation"),
+            }
+        )
+        autonomous = legacy_projection.get("autonomous")
+        autonomous = dict(autonomous) if isinstance(autonomous, Mapping) else {}
+        autonomous.update(
+            {
+                "enabled": control_state in {"ARMED", AUTONOMOUS_MICRO_LIVE},
+                "control_state": control_state,
+                "micro_live_canary": control_state,
+            }
+        )
+        legacy_projection["autonomous"] = autonomous
+        readiness.update(legacy_projection)
+        readiness["latest_signal"] = latest_signal
+        return {
+            **legacy_projection,
+            "latest_signal": latest_signal,
+            "control": control,
+            "authoritative_control": dict(control),
+            "readiness": readiness,
+            "worker": worker,
+            "execution": execution,
+        }
 
 
     @staticmethod
@@ -2115,12 +3189,14 @@ class CanaryService:
         eligibility: Mapping[str, Any] | None,
         *,
         record: Mapping[str, Any] | None = None,
+        verify_attestation: bool = True,
     ) -> dict[str, Any]:
         return _canary_eligibility_binding_result(
             self.store,
             candidate_id,
             eligibility,
             record=record,
+            verify_attestation=verify_attestation,
         )
 
     def _eligibility_is_bound(self, candidate_id: str, eligibility: Mapping[str, Any] | None) -> bool:
@@ -2185,7 +3261,13 @@ class CanaryService:
         """Return the immutable operator risk envelope as a fresh mapping."""
         return dict(AUTONOMOUS_CANARY_LIMITS)
 
-    def invalidate_eligibility(self, candidate_id: str, reason: str = "") -> None:
+    def invalidate_eligibility(
+        self,
+        candidate_id: str,
+        reason: str = "",
+        *,
+        publish_readiness: bool = True,
+    ) -> None:
         """Remove a stale eligibility binding; never changes lifecycle state."""
         with self.store._lock:
             with self.store.connection:
@@ -2193,9 +3275,10 @@ class CanaryService:
                     "DELETE FROM canary_eligibility WHERE candidate_id=?",
                     (str(candidate_id),),
                 )
-        self.publish_readiness_snapshot(
-            reason=reason or "ELIGIBILITY_INVALIDATED"
-        )
+        if publish_readiness:
+            self.publish_readiness_snapshot(
+                reason=reason or "ELIGIBILITY_INVALIDATED"
+            )
     def _selection_record(self) -> dict[str, Any] | None:
         connection = self.store.connection
         lock = getattr(self.store, "_lock", None)
@@ -2235,28 +3318,83 @@ class CanaryService:
         signal_id: str | None = None,
         worker_status: str = "IDLE",
         timestamp: datetime | None = None,
+        last_tick_started_at: str | None | object = _UNSET,
+        last_tick_completed_at: str | None | object = _UNSET,
+        last_successful_tick: str | None | object = _UNSET,
+        last_error_code: str | None | object = _UNSET,
+        consecutive_failures: int | None | object = _UNSET,
+        next_retry_at: str | None | object = _UNSET,
+        candidates_evaluated: int | None | object = _UNSET,
+        signals_generated: int | None | object = _UNSET,
+        orders_attempted: int | None | object = _UNSET,
+        publish: bool = False,
     ) -> None:
         when = ensure_utc(timestamp or self.clock()).isoformat()
+        metadata = {
+            "last_tick_started_at": last_tick_started_at,
+            "last_tick_completed_at": last_tick_completed_at,
+            "last_successful_tick": last_successful_tick,
+            "last_error_code": last_error_code,
+            "consecutive_failures": consecutive_failures,
+            "next_retry_at": next_retry_at,
+            "candidates_evaluated": candidates_evaluated,
+            "signals_generated": signals_generated,
+            "orders_attempted": orders_attempted,
+        }
+        for key, value in tuple(metadata.items()):
+            if value is _UNSET:
+                continue
+            if key.endswith("_at") or key == "last_successful_tick":
+                metadata[key] = str(value) if value is not None else None
+            elif key == "last_error_code":
+                metadata[key] = str(value)[:128] if value is not None else None
+            else:
+                try:
+                    parsed = int(value) if value is not None else None
+                except (TypeError, ValueError):
+                    parsed = None
+                metadata[key] = max(0, parsed) if parsed is not None else None
         with self.store._lock:
             with self.store.connection:
+                columns = [
+                    "singleton",
+                    "last_tick_at",
+                    "next_decision",
+                    "blocker",
+                    "last_signal_id",
+                    "worker_status",
+                    "updated_at",
+                ]
+                values: list[Any] = [
+                    1,
+                    when,
+                    str(next_decision)[:256],
+                    str(blocker)[:256] if blocker else None,
+                    str(signal_id)[:256] if signal_id else None,
+                    str(worker_status)[:64],
+                    when,
+                ]
+                for key, value in metadata.items():
+                    if value is not _UNSET:
+                        columns.append(key)
+                        values.append(value)
+                placeholders = ",".join("?" for _ in columns)
+                updates = [
+                    f"{key}=excluded.{key}"
+                    for key in columns
+                    if key != "singleton"
+                ]
                 self.store.connection.execute(
-                    "INSERT INTO canary_autonomous_state("
-                    "singleton,last_tick_at,next_decision,blocker,last_signal_id,"
-                    "worker_status,updated_at) VALUES(1,?,?,?,?,?,?) "
-                    "ON CONFLICT(singleton) DO UPDATE SET "
-                    "last_tick_at=excluded.last_tick_at,next_decision=excluded.next_decision,"
-                    "blocker=excluded.blocker,last_signal_id=excluded.last_signal_id,"
-                    "worker_status=excluded.worker_status,updated_at=excluded.updated_at",
-                    (
-                        when,
-                        str(next_decision),
-                        str(blocker) if blocker else None,
-                        str(signal_id) if signal_id else None,
-                        str(worker_status),
-                        when,
-                    ),
+                    f"INSERT INTO canary_autonomous_state({','.join(columns)}) "
+                    f"VALUES({placeholders}) ON CONFLICT(singleton) DO UPDATE SET "
+                    + ",".join(updates),
+                    tuple(values),
                 )
-        self.publish_readiness_snapshot(reason="AUTONOMOUS_DECISION")
+        # Keep the singleton display projection in sync immediately, but do
+        # not make a heartbeat look like a new qualification/publication.
+        self._patch_autonomous_snapshot()
+        if publish:
+            self.publish_readiness_snapshot(reason="AUTONOMOUS_DECISION")
     def enable_autonomous_micro_live(self) -> Mapping[str, Any]:
         """Enable the single autonomous $1 canary envelope.
 
@@ -2328,7 +3466,13 @@ class CanaryService:
                         (now.isoformat(),),
                     )
         return self.publish_readiness_snapshot(reason="AUTONOMOUS_ENABLED")
-    def bind_autonomous_selection(self, candidate_id: str | None) -> None:
+
+    def bind_autonomous_selection(
+        self,
+        candidate_id: str | None,
+        *,
+        publish_readiness: bool = True,
+    ) -> None:
         """Fence the selected winner into autonomous control metadata."""
         identifier = str(candidate_id).strip() if candidate_id else None
         now = ensure_utc(self.clock()).isoformat()
@@ -2352,7 +3496,8 @@ class CanaryService:
                     "control_generation=? WHERE singleton=1 AND state=?",
                     (identifier, now, generation + 1, AUTONOMOUS_MICRO_LIVE),
                 )
-        self.publish_readiness_snapshot(reason="AUTONOMOUS_SELECTION_CHANGED")
+        if publish_readiness:
+            self.publish_readiness_snapshot(reason="AUTONOMOUS_SELECTION_CHANGED")
 
     def _candidate_signal_binding(self, candidate_id: str) -> dict[str, Any]:
         """Load the candidate's immutable executable documents and binding."""
@@ -2949,6 +4094,7 @@ class CanaryService:
         candidate_id: str,
         *,
         _record: Mapping[str, Any] | None = None,
+        _verify_attestation: bool = True,
     ) -> dict[str, Any]:
         """Return the authoritative dry-run result for canary eligibility."""
         identifier = str(candidate_id).strip()
@@ -2980,7 +4126,11 @@ class CanaryService:
                 ],
                 "reason_code": "CANDIDATE_RESEARCH_GATES_INCOMPLETE",
             }
-        quality = evaluate_prediction_data_quality(self.store, payload)
+        quality = evaluate_prediction_data_quality(
+            self.store,
+            payload,
+            verify_attestation=_verify_attestation,
+        )
         gate_aliases = {
             "schema_validated": ("schema_validated", "schema_valid"),
             "historical_backtest_passed": (
@@ -3149,7 +4299,118 @@ class CanaryService:
             **persisted_quality_fields(quality),
         }
 
-    def mark_eligible(self, candidate_id: str) -> None:
+    def _batch_mark_eligible_prevalidated(
+        self,
+        entries: list[Mapping[str, Any]],
+    ) -> set[str]:
+        """Persist caller-attested eligibility rows in one fenced transaction.
+
+        Ranking performs all quality and gate evaluation before entering this
+        transaction.  The write path only checks the lifecycle snapshot and
+        immutable frozen hash, then stores the already-computed qualification
+        evidence.  This keeps batch ranking from taking one writer lock per
+        candidate or evaluating historical quality while that lock is held.
+        """
+        if not entries:
+            return set()
+        prepared: list[dict[str, Any]] = []
+        for entry in entries:
+            candidate_id = str(entry.get("candidate_id") or "").strip()
+            initial = entry.get("record")
+            validation = entry.get("validation")
+            qualification = (
+                validation.get("qualification")
+                if isinstance(validation, Mapping)
+                else None
+            )
+            qualification_hash = (
+                validation.get("qualification_hash")
+                if isinstance(validation, Mapping)
+                else None
+            )
+            frozen_hash = (
+                validation.get("frozen_hash")
+                if isinstance(validation, Mapping)
+                else None
+            )
+            if (
+                not candidate_id
+                or not isinstance(initial, Mapping)
+                or not isinstance(validation, Mapping)
+                or validation.get("eligible") is not True
+                or not isinstance(qualification, Mapping)
+                or not isinstance(qualification_hash, str)
+                or not qualification_hash
+                or not isinstance(frozen_hash, str)
+                or not frozen_hash
+            ):
+                continue
+            evidence = {**qualification, "qualification_hash": qualification_hash}
+            try:
+                evidence_json = json.dumps(
+                    evidence,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                )
+            except (TypeError, ValueError):
+                continue
+            prepared.append(
+                {
+                    "candidate_id": candidate_id,
+                    "initial": initial,
+                    "frozen_hash": frozen_hash,
+                    "evidence_json": evidence_json,
+                }
+            )
+        if not prepared:
+            return set()
+        connection = self.store.connection
+        persisted: set[str] = set()
+        eligible_at = ensure_utc(self.clock()).isoformat()
+        with self.store._lock:
+            if connection.in_transaction:
+                raise CanaryBlocked("CANARY_TRANSACTION_ACTIVE")
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                for item in prepared:
+                    candidate_id = str(item["candidate_id"])
+                    initial = item["initial"]
+                    current = self.store.load_candidate_lifecycle(candidate_id)
+                    if (
+                        not isinstance(current, Mapping)
+                        or current.get("stage") != initial.get("stage")
+                        or current.get("payload") != initial.get("payload")
+                        or current.get("updated_at") != initial.get("updated_at")
+                        or self._lifecycle_frozen_hash(current) != item["frozen_hash"]
+                    ):
+                        continue
+                    connection.execute(
+                        "INSERT INTO canary_eligibility(candidate_id,eligible_at,frozen_hash,evidence_json) "
+                        "VALUES(?,?,?,?) ON CONFLICT(candidate_id) DO UPDATE SET "
+                        "eligible_at=excluded.eligible_at,frozen_hash=excluded.frozen_hash,"
+                        "evidence_json=excluded.evidence_json",
+                        (
+                            candidate_id,
+                            eligible_at,
+                            item["frozen_hash"],
+                            item["evidence_json"],
+                        ),
+                    )
+                    persisted.add(candidate_id)
+                connection.commit()
+            except BaseException:
+                if connection.in_transaction:
+                    connection.rollback()
+                raise
+        return persisted
+
+    def mark_eligible(
+        self,
+        candidate_id: str,
+        *,
+        publish_readiness: bool = True,
+    ) -> None:
         identifier = str(candidate_id).strip()
         initial = self.store.load_candidate_lifecycle(identifier)
         validation = self.validate_eligibility(identifier, _record=initial)
@@ -3228,7 +4489,8 @@ class CanaryService:
                 if connection.in_transaction:
                     connection.rollback()
                 raise
-        self.publish_readiness_snapshot(reason="ELIGIBILITY_CHANGED")
+        if publish_readiness:
+            self.publish_readiness_snapshot(reason="ELIGIBILITY_CHANGED")
     def arm(
         self,
         candidate_id: str,
@@ -3279,6 +4541,7 @@ class CanaryService:
                 str(candidate_id),
                 eligible,
                 record=record,
+                verify_attestation=False,
             )
             if not binding.get("bound"):
                 raise CanaryBlocked("CANDIDATE_NOT_CANARY_ELIGIBLE")
@@ -3294,12 +4557,14 @@ class CanaryService:
                     str(candidate_id),
                     eligible,
                     record=record,
+                    verify_attestation=False,
                 )
                 if not binding.get("bound") or binding.get("reevaluation_required"):
                     raise CanaryBlocked("CANDIDATE_NOT_CANARY_ELIGIBLE")
             if not self.validate_eligibility(
                 str(candidate_id),
                 _record=record,
+                _verify_attestation=False,
             ).get("eligible"):
                 raise CanaryBlocked("CANDIDATE_RESEARCH_GATES_INCOMPLETE")
             health = self.store.polymarket_health(now=now)
@@ -3528,13 +4793,18 @@ class CanaryService:
                 current_id,
                 eligibility,
                 record=lifecycle,
+                verify_attestation=False,
             )
             if not binding.get("bound"):
                 reason = str(binding.get("reason_code") or "ELIGIBILITY_INVALID")
             elif binding.get("reevaluation_required"):
                 reason = "REEVALUATION_REQUIRED"
             else:
-                validation = self.validate_eligibility(current_id, _record=lifecycle)
+                validation = self.validate_eligibility(
+                    current_id,
+                    _record=lifecycle,
+                    _verify_attestation=False,
+                )
                 if not validation.get("eligible"):
                     reason = "ELIGIBILITY_INVALID"
                 else:
@@ -3572,7 +4842,11 @@ class CanaryService:
                         reason = "REEVALUATION_REQUIRED"
                     else:
                         payload = self._merged_lifecycle_payload(lifecycle) or {}
-                        quality = evaluate_prediction_data_quality(self.store, payload)
+                        quality = evaluate_prediction_data_quality(
+                            self.store,
+                            payload,
+                            verify_attestation=False,
+                        )
                         expected_ranking_hash = _canary_ranking_snapshot_hash(
                             current_id,
                             str(lifecycle.get("stage") or ""),
@@ -3735,6 +5009,7 @@ class CanaryService:
                         candidate_id,
                         eligibility,
                         record=record,
+                        verify_attestation=False,
                     )
                     if (
                         candidate_id
@@ -3742,6 +5017,7 @@ class CanaryService:
                         and self.validate_eligibility(
                             candidate_id,
                             _record=record,
+                            _verify_attestation=False,
                         ).get("eligible")
                     ):
                         valid.append(eligibility)
@@ -3775,16 +5051,22 @@ class CanaryService:
                     candidate_id,
                     binding_row,
                     record=record,
+                    verify_attestation=False,
                 )
                 if not binding.get("bound") or binding.get("reevaluation_required"):
                     continue
                 if not self.validate_eligibility(
                     candidate_id,
                     _record=record,
+                    _verify_attestation=False,
                 ).get("eligible"):
                     continue
                 payload = self._merged_lifecycle_payload(record) or {}
-                quality = evaluate_prediction_data_quality(self.store, payload)
+                quality = evaluate_prediction_data_quality(
+                    self.store,
+                    payload,
+                    verify_attestation=False,
+                )
                 expected_hash = _canary_ranking_snapshot_hash(
                     candidate_id,
                     str(record.get("stage") or ""),
@@ -3867,17 +5149,15 @@ class CanaryService:
             str(selection.get("reason") or "")
             if isinstance(selection, Mapping)
             else ""
-        )
-        selection_reason = (
-            str(selection_invalidation_reason)
-            if selection_invalidation_reason
-            else selection_reason or None
-        )
+        ) or None
         risk_envelope = self.autonomous_limits()
         autonomous_state = None
         try:
             autonomous_state = _fetchone(
-                "SELECT last_tick_at,next_decision,blocker,last_signal_id,worker_status "
+                "SELECT last_tick_at,last_tick_started_at,last_tick_completed_at,"
+                "last_successful_tick,last_error_code,consecutive_failures,next_retry_at,"
+                "candidates_evaluated,signals_generated,orders_attempted,"
+                "next_decision,blocker,last_signal_id,worker_status "
                 "FROM canary_autonomous_state WHERE singleton=1"
             )
         except sqlite3.OperationalError:
@@ -3937,6 +5217,42 @@ class CanaryService:
                 autonomous_state["worker_status"]
                 if autonomous_state is not None
                 else "IDLE"
+            ),
+            "last_tick_started_at": (
+                autonomous_state["last_tick_started_at"]
+                if autonomous_state is not None else None
+            ),
+            "last_tick_completed_at": (
+                autonomous_state["last_tick_completed_at"]
+                if autonomous_state is not None else None
+            ),
+            "last_successful_tick": (
+                autonomous_state["last_successful_tick"]
+                if autonomous_state is not None else None
+            ),
+            "last_error_code": (
+                autonomous_state["last_error_code"]
+                if autonomous_state is not None else None
+            ),
+            "consecutive_failures": (
+                autonomous_state["consecutive_failures"]
+                if autonomous_state is not None else None
+            ),
+            "next_retry_at": (
+                autonomous_state["next_retry_at"]
+                if autonomous_state is not None else None
+            ),
+            "candidates_evaluated": (
+                autonomous_state["candidates_evaluated"]
+                if autonomous_state is not None else None
+            ),
+            "signals_generated": (
+                autonomous_state["signals_generated"]
+                if autonomous_state is not None else None
+            ),
+            "orders_attempted": (
+                autonomous_state["orders_attempted"]
+                if autonomous_state is not None else None
             ),
         }
         selection_audit = dict(selection) if isinstance(selection, Mapping) else None
@@ -4023,10 +5339,12 @@ class CanaryService:
                 candidate,
                 eligible,
                 record=lifecycle,
+                verify_attestation=False,
             ).get("bound")
             gates_pass = self.validate_eligibility(
                 candidate,
                 _record=lifecycle,
+                _verify_attestation=False,
             ).get("eligible")
             if not bound or not gates_pass or expected != data.get("integrity_hash"):
                 state = "KILLED"

@@ -19,7 +19,7 @@ import re
 import secrets
 import sqlite3
 from . import canary as canary_module
-from .canary import CanaryService, _canary_eligibility_is_bound
+from .canary import CanaryService, _canary_eligibility_is_bound, _canary_has_last_good
 import subprocess
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread
@@ -315,6 +315,98 @@ def _nested_value(*sources: Mapping[str, Any], keys: tuple[str, ...]) -> Any:
             if value is not None and value != "":
                 return value
     return None
+def _display_value_missing(value: Any) -> bool:
+    """Return whether a persisted display value is absent rather than falsy."""
+    return value is None or (isinstance(value, str) and not value.strip())
+def _signal_projection(value: Any) -> dict[str, Any] | None:
+    """Return a non-empty public signal mapping, or the explicit missing value."""
+    if not isinstance(value, Mapping) or not value:
+        return None
+    projected = dict(value)
+    return projected or None
+
+
+def _canonical_blocker(*sources: Mapping[str, Any] | None) -> Any:
+    """Return the first present blocker across bounded report sections."""
+    for source in sources:
+        if not isinstance(source, Mapping):
+            continue
+        value = source.get("blocker")
+        if not _display_value_missing(value):
+            return value
+    return None
+def _canary_control_state(*sources: Mapping[str, Any] | None) -> str:
+    """Return the bounded control state represented by an authoritative report."""
+    states: list[str] = []
+    for source in sources:
+        if not isinstance(source, Mapping):
+            continue
+        for key in ("state", "control_state", "micro_live_canary"):
+            value = source.get(key)
+            if _display_value_missing(value):
+                continue
+            state = str(value).strip().upper()
+            if state:
+                states.append(state)
+    if "KILLED" in states:
+        return "KILLED"
+    for state in states:
+        if state in {"DISABLED", "DISARMED"}:
+            return state
+    for state in states:
+        if state != "UNKNOWN":
+            return state
+    return "UNKNOWN"
+
+
+def _normalized_canary_blocker(
+    blocker: Any,
+    *control_sources: Mapping[str, Any] | None,
+) -> Any:
+    """Fill only absent blockers from the authoritative control state."""
+    if not _display_value_missing(blocker):
+        return blocker
+    control_state = _canary_control_state(*control_sources)
+    if control_state in {"DISABLED", "DISARMED"}:
+        return "AUTONOMOUS_CANARY_DISABLED"
+    if control_state == "UNKNOWN":
+        return "AUTONOMOUS_CONTROL_UNKNOWN"
+    return blocker
+
+
+
+
+
+
+def _merge_persisted_values(
+    persisted: Mapping[str, Any] | None,
+    *sections: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Merge report sections without replacing non-null persisted values."""
+    merged = dict(persisted) if isinstance(persisted, Mapping) else {}
+    for section in sections:
+        if not isinstance(section, Mapping):
+            continue
+        for key, value in section.items():
+            if key not in merged or _display_value_missing(merged[key]):
+                merged[key] = value
+    return merged
+
+
+def _patch_non_missing_values(
+    target: Mapping[str, Any] | None,
+    *sections: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Patch a bounded projection only with present values from later sections."""
+    merged = dict(target) if isinstance(target, Mapping) else {}
+    for section in sections:
+        if not isinstance(section, Mapping):
+            continue
+        for key, value in section.items():
+            if not _display_value_missing(value):
+                merged[key] = value
+    return merged
+
 
 
 def _hermes_reason_code(row: Mapping[str, Any], result: Mapping[str, Any], payload: Mapping[str, Any]) -> str | None:
@@ -444,7 +536,7 @@ def _number_or_zero(value: Any) -> float:
         return 0.0
     return number if math.isfinite(number) else 0.0
 
-_CANARY_SELECTION_STATUSES = frozenset({"CURRENT", "STALE", "NONE"})
+_CANARY_SELECTION_STATUSES = frozenset({"CURRENT", "STALE", "NONE", "UNKNOWN"})
 _CANARY_STATUS_FIELDS = (
     "eligibility_raw_count",
     "eligible_count",
@@ -455,6 +547,7 @@ _CANARY_STATUS_FIELDS = (
     "selection_status",
     "selection_valid",
     "selection_invalidation_reason",
+    "selection_reason",
     "selected_candidate",
     "last_selected_candidate",
 )
@@ -472,14 +565,16 @@ def _canary_status_projection(status: Mapping[str, Any] | None) -> dict[str, Any
     nested = source.get("autonomous")
     nested = nested if isinstance(nested, Mapping) else {}
     # Keep the persisted top-level display payload (including readiness
-    # metadata) while normalizing the stable selection fields below.
     projection = dict(source)
     def value(name: str, default: Any = None) -> Any:
-        # An explicit top-level ``None`` is authoritative and must not be
-        # replaced by historical nested data.
-        if name in source:
-            return source[name]
-        return nested.get(name, default)
+        # Report sections can contain sparse aliases.  Keep a non-missing
+        # nested/persisted value rather than letting a section-level null erase
+        # it during normalization.
+        candidate = source.get(name) if name in source else None
+        if not _display_value_missing(candidate):
+            return candidate
+        candidate = nested.get(name)
+        return candidate if not _display_value_missing(candidate) else default
     projection.update(
         {
             "readiness_snapshot_status": value(
@@ -495,24 +590,74 @@ def _canary_status_projection(status: Mapping[str, Any] | None) -> dict[str, Any
         }
     )
 
-    def count(name: str) -> int:
-        try:
-            return max(0, int(value(name, 0) or 0))
-        except (TypeError, ValueError):
-            return 0
+    readiness_status = str(
+        projection.get("readiness_snapshot_status") or "STALE"
+    ).strip().upper()
+    readiness_reason = str(
+        projection.get("readiness_snapshot_reason") or "READINESS_SNAPSHOT_MISSING"
+    ).strip().upper()
+    readiness_stale = projection.get("readiness_snapshot_stale", True)
+    readiness_current = (
+        readiness_status == "CURRENT"
+        and readiness_stale in (False, 0, "0", "false", "FALSE")
+    )
 
-    selection_status = str(value("selection_status", "NONE") or "NONE").strip().upper()
+    raw_version = value("readiness_snapshot_version")
+    try:
+        projection_version = (
+            0 if isinstance(raw_version, bool) else int(raw_version or 0)
+        )
+    except (TypeError, ValueError):
+        projection_version = 0
+    has_last_good = _canary_has_last_good(
+        projection,
+        reason=readiness_reason,
+        projection_version=projection_version,
+        readiness_status=readiness_status,
+        readiness_stale=readiness_stale,
+    )
+
+    def count(name: str) -> int | None:
+        if not has_last_good:
+            return None
+        raw = value(name)
+        if raw is None or isinstance(raw, bool):
+            return None
+        try:
+            parsed = int(raw)
+        except (TypeError, ValueError):
+            return None
+        return parsed if parsed >= 0 else None
+    selection_status = str(
+        value("selection_status", "UNKNOWN") or "UNKNOWN"
+    ).strip().upper()
+    if not has_last_good and selection_status in {"CURRENT", "STALE", "NONE"}:
+        selection_status = "UNKNOWN"
     if selection_status not in _CANARY_SELECTION_STATUSES:
-        selection_status = "NONE"
-    selection_valid = value("selection_valid", False) is True
+        selection_status = "UNKNOWN"
+    raw_selection_valid = value("selection_valid")
+    if selection_status == "UNKNOWN":
+        selection_valid: bool | None = None
+    elif (
+        raw_selection_valid is True
+        and has_last_good
+        and readiness_current
+        and selection_status == "CURRENT"
+    ):
+        selection_valid = True
+    else:
+        selection_valid = False
+    if has_last_good and not readiness_current and selection_status == "CURRENT":
+        selection_status = "STALE"
+        selection_valid = False
     selected_candidate = value("selected_candidate")
     if selected_candidate is not None:
         selected_candidate = str(selected_candidate).strip() or None
-    if not (selection_valid and selection_status == "CURRENT"):
-        selected_candidate = None
     last_selected_candidate = value("last_selected_candidate")
     if last_selected_candidate is not None:
         last_selected_candidate = str(last_selected_candidate).strip() or None
+    if not (selection_valid is True and selection_status == "CURRENT"):
+        selected_candidate = None
     projection.update(
         {
             "eligibility_raw_count": count("eligibility_raw_count"),
@@ -524,31 +669,37 @@ def _canary_status_projection(status: Mapping[str, Any] | None) -> dict[str, Any
             "selection_status": selection_status,
             "selection_valid": selection_valid,
             "selection_invalidation_reason": value("selection_invalidation_reason"),
+            "selection_reason": value("selection_reason"),
             "selected_candidate": selected_candidate,
             "last_selected_candidate": last_selected_candidate,
-            "latest_signal": (
-                dict(value("latest_signal"))
-                if isinstance(value("latest_signal"), Mapping)
-                else None
-            ),
+            "latest_signal": _signal_projection(value("latest_signal")),
+            "next_decision": value("next_decision"),
+            "blocker": value("blocker"),
         }
     )
     # ``winner_id`` remains current-only. Historical selections are represented
     # by ``last_selected_candidate`` and never become executable again.
-    projection["winner_id"] = (
-        selected_candidate if selection_valid and selection_status == "CURRENT" else None
-    )
-    if not (selection_valid and selection_status == "CURRENT"):
+    current_selection = selection_valid is True and selection_status == "CURRENT"
+    projection["winner_id"] = selected_candidate if current_selection else None
+    if not current_selection:
         projection["winner_rank"] = None
         projection["winner_score"] = None
     selected_winner = projection.get("selected_winner")
     if isinstance(selected_winner, Mapping):
         selected_winner = dict(selected_winner)
+        selected_winner["candidate_id"] = (
+            selected_candidate if current_selection else last_selected_candidate
+        )
         selected_winner["selection_status"] = selection_status
         selected_winner["selection_valid"] = selection_valid
         selected_winner["selection_invalidation_reason"] = projection[
             "selection_invalidation_reason"
         ]
+        selected_winner["selected_candidate"] = selected_candidate
+        selected_winner["last_selected_candidate"] = last_selected_candidate
+        selected_winner["winner_id"] = projection["winner_id"]
+        selected_winner["winner_rank"] = projection.get("winner_rank")
+        selected_winner["winner_score"] = projection.get("winner_score")
         projection["selected_winner"] = selected_winner
     autonomous = projection.get("autonomous")
     autonomous = dict(autonomous) if isinstance(autonomous, Mapping) else {}
@@ -561,11 +712,191 @@ def _canary_status_projection(status: Mapping[str, Any] | None) -> dict[str, Any
         }
     )
     autonomous["winner_id"] = projection["winner_id"]
+    for name, fallback in (
+        ("rank", "winner_rank"),
+        ("score", "winner_score"),
+        ("next_decision", "next_decision"),
+        ("blocker", "blocker"),
+    ):
+        if _display_value_missing(autonomous.get(name)):
+            candidate = projection.get(fallback)
+            if _display_value_missing(candidate) and name in source:
+                candidate = source.get(name)
+            autonomous[name] = candidate
     if not (selection_valid and selection_status == "CURRENT"):
         autonomous["rank"] = None
         autonomous["score"] = None
     projection["autonomous"] = autonomous
     return projection
+
+def _canary_status_report(service: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Read one bounded report plus its cheap legacy readiness projection."""
+    preserve_keys = (
+        *_CANARY_STATUS_FIELDS,
+        *_CANARY_READINESS_FIELDS,
+        "latest_signal",
+        "rank",
+        "score",
+        "next_decision",
+        "blocker",
+        "winner_rank",
+        "winner_score",
+        "autonomous",
+    )
+
+    def bounded_mapping(value: Any) -> dict[str, Any]:
+        projected = _bounded_value(value)
+        result = dict(projected) if isinstance(projected, Mapping) else {}
+        if isinstance(value, Mapping):
+            for key in preserve_keys:
+                if key in value:
+                    result[str(key)] = _bounded_value(value[key])
+        return result
+
+    legacy: Mapping[str, Any] = {}
+    readiness_method = getattr(service, "readiness_snapshot", None)
+    if callable(readiness_method):
+        try:
+            candidate = readiness_method()
+            if isinstance(candidate, Mapping):
+                legacy = bounded_mapping(candidate)
+        except Exception:
+            legacy = {}
+    report_method = getattr(service, "status_report", None)
+    if callable(report_method):
+        try:
+            report = report_method()
+        except Exception:
+            report = {}
+        if isinstance(report, Mapping):
+            projected_report = bounded_mapping(report)
+            bounded = dict(projected_report)
+            for section_name in (
+                "latest_signal",
+                "control",
+                "authoritative_control",
+                "readiness",
+                "authoritative_readiness",
+                "worker",
+                "execution",
+            ):
+                if section_name in report:
+                    bounded[section_name] = bounded_mapping(report[section_name])
+            raw_readiness = bounded.get("readiness") or bounded.get(
+                "authoritative_readiness", {}
+            )
+            readiness = _merge_persisted_values(
+                legacy,
+                raw_readiness if isinstance(raw_readiness, Mapping) else None,
+            )
+            bounded["readiness"] = readiness
+            authoritative_control = bounded.get("control") or bounded.get(
+                "authoritative_control", {}
+            )
+            if isinstance(authoritative_control, Mapping):
+                control_state = str(
+                    authoritative_control.get("state") or "UNKNOWN"
+                ).strip().upper()
+                if control_state in {"ARMED", "AUTONOMOUS_MICRO_LIVE"}:
+                    display_state = "ENABLED"
+                elif control_state == "KILLED":
+                    display_state = "KILLED"
+                elif control_state in {"DISABLED", "DISARMED"}:
+                    display_state = "DISABLED"
+                else:
+                    display_state = "UNKNOWN"
+                # Control state is authoritative even when the qualification
+                # projection is stale and still carries an older control view.
+                merged_control = {
+                    "micro_live_canary": control_state,
+                    "control_state": control_state,
+                    "display_state": display_state,
+                    "candidate": authoritative_control.get("candidate"),
+                    "venue": authoritative_control.get("venue"),
+                    "expiry": authoritative_control.get("expires_at"),
+                    "control_generation": authoritative_control.get("generation"),
+                }
+                readiness.update(merged_control)
+                merged = dict(readiness)
+            sections = [
+                section
+                for section in (
+                    bounded.get("control") or bounded.get("authoritative_control") or {},
+                    readiness,
+                    bounded.get("worker") or {},
+                    bounded.get("execution") or {},
+                )
+                if isinstance(section, Mapping)
+            ]
+            autonomous_sections = [
+                section.get("autonomous")
+                for section in sections
+                if isinstance(section.get("autonomous"), Mapping)
+            ]
+            sources = [readiness, bounded]
+            sources.extend(sections)
+            sources.extend(autonomous_sections)
+            merged = dict(readiness)
+
+            def set_alias(name: str, *aliases: str) -> None:
+                if name in merged and not _display_value_missing(merged[name]):
+                    return
+                for source in sources:
+                    for alias in aliases:
+                        value = source.get(alias)
+                        if not _display_value_missing(value):
+                            merged[name] = value
+                            return
+
+            # Preserve legacy flat fields even when a status report moves them
+            # into bounded control/worker/execution sections.
+            set_alias("connectivity", "connectivity")
+            merged["blocker"] = _canonical_blocker(*sources)
+            signal = None
+            for source in (bounded, *sections, *autonomous_sections):
+                for alias in ("latest_signal", "signal"):
+                    candidate = _signal_projection(source.get(alias))
+                    if candidate is not None:
+                        signal = candidate
+                        break
+                if signal is not None:
+                    break
+            merged["latest_signal"] = signal
+            set_alias("risk_envelope", "risk_envelope", "risk", "limits")
+            set_alias("risk_limits", "risk_limits", "risk_envelope", "limits")
+            set_alias("trades", "trades")
+            set_alias(
+                "execution_event_count",
+                "execution_event_count",
+                "event_count",
+                "real_execution_events",
+            )
+            set_alias(
+                "real_execution_events",
+                "real_execution_events",
+                "execution_event_count",
+                "event_count",
+            )
+            selected_winner = next(
+                (
+                    source.get("selected_winner")
+                    for source in sources
+                    if isinstance(source.get("selected_winner"), Mapping)
+                ),
+                None,
+            )
+            if isinstance(selected_winner, Mapping):
+                sources.append(selected_winner)
+                if "selected_winner" not in merged:
+                    merged["selected_winner"] = dict(selected_winner)
+            set_alias("selected_candidate", "selected_candidate")
+            set_alias("last_selected_candidate", "last_selected_candidate")
+            set_alias("winner_id", "winner_id", "candidate_id")
+            set_alias("winner_rank", "winner_rank", "rank")
+            set_alias("winner_score", "winner_score", "score", "total_score")
+            set_alias("selection_reason", "selection_reason")
+            return merged, bounded
+    return (dict(legacy) if isinstance(legacy, Mapping) else {}, {})
 
 
 class DashboardData:
@@ -1810,7 +2141,12 @@ class DashboardData:
         self,
         persisted_worker_health: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Select configured or persisted health before using the bounded store fallback."""
+        """Project only already-persisted/configured health evidence.
+
+        A normal overview read must not reconstruct collector health from the
+        full snapshot/error tables.  Missing evidence is represented as stale
+        and unknown by ``overview_summary``.
+        """
         configured = self._configured("dataset-health")
         if isinstance(configured, Mapping):
             return self._bounded_operator_health(configured)
@@ -1818,10 +2154,7 @@ class DashboardData:
             projected = self._bounded_operator_health(persisted_worker_health)
             if projected:
                 return projected
-        try:
-            return self._bounded_operator_health(self.dataset_health())
-        except (AttributeError, TypeError, ValueError, sqlite3.Error):
-            return {}
+        return {}
 
 
     @staticmethod
@@ -2157,8 +2490,15 @@ class DashboardData:
         return normalized
 
     def _compact_candidate_display_row(self, item: Mapping[str, Any]) -> dict[str, Any]:
-        """Project only the columns rendered by the overview latest-candidates table."""
-        row = self._candidate_row(item)
+        """Project only overview columns, reusing an already projected row."""
+        # ``paginate_candidate_lifecycle`` normally returns the public
+        # candidate projection.  Re-projecting it here used to repeat
+        # provenance loading and eligibility reads for every overview row.
+        row = (
+            item
+            if "historical_gates" in item and "canary_status" in item
+            else self._candidate_row(item)
+        )
         return {
             key: self._compact_candidate_value(row.get(key))
             for key in (
@@ -2691,13 +3031,16 @@ class DashboardData:
         health_payload = health_payload if isinstance(health_payload, Mapping) else {}
         health = self._health_for_operator(health_payload)
         if not health:
+            # No persisted health monitor row is evidence of unknown/stale
+            # readiness, not permission to rebuild health synchronously.
             health = {
-                "grade": None,
+                "status": "STALE",
+                "grade": "UNKNOWN",
                 "grade_scope": "collector_health",
-                "reason_code": None,
+                "reason_code": "HEALTH_UNAVAILABLE",
                 "reasons": [],
                 "source_type": "FORWARD_COLLECTED",
-                "historical_maturity_grade": None,
+                "historical_maturity_grade": "UNKNOWN",
                 "historical_error_count": 0,
             }
         (
@@ -2800,10 +3143,62 @@ class DashboardData:
         )
         if canary_snapshot is None:
             canary_service = CanaryService(self.store, initialize=False)
-            canary_status = _canary_status_projection(canary_service.status())
+            raw_canary_status, canary_report = _canary_status_report(canary_service)
+            canary_status = _canary_status_projection(raw_canary_status)
+            if canary_report:
+                canary_status["status_report"] = canary_report
         else:
+            canary_report = {}
             canary_status = _canary_status_projection(canary_snapshot)
-        latest_signal = canary_status.get("latest_signal")
+        worker_section = (
+            canary_report.get("worker", {})
+            if isinstance(canary_report, Mapping)
+            else {}
+        )
+        autonomous = dict(canary_status.get("autonomous") or {})
+        if canary_report:
+            worker_section = canary_report.get("worker", {})
+            autonomous = dict(canary_status.get("autonomous") or {})
+            if isinstance(worker_section, Mapping):
+                worker_auto = worker_section.get("autonomous")
+                autonomous = _patch_non_missing_values(autonomous, worker_auto)
+                worker_fields = {
+                    key: worker_section.get(key)
+                    for key in (
+                        "last_tick_at",
+                        "last_tick_started_at",
+                        "last_tick_completed_at",
+                        "last_successful_tick",
+                        "last_error_code",
+                        "consecutive_failures",
+                        "next_retry_at",
+                        "candidates_evaluated",
+                        "signals_generated",
+                        "orders_attempted",
+                        "next_decision",
+                        "blocker",
+                        "last_signal_id",
+                        "worker_status",
+                    )
+                    if key in worker_section
+                }
+                autonomous = _patch_non_missing_values(autonomous, worker_fields)
+        blocker = _normalized_canary_blocker(
+            _canonical_blocker(
+                worker_section if isinstance(worker_section, Mapping) else None,
+                autonomous,
+                canary_status,
+            ),
+            canary_report.get("control") if isinstance(canary_report, Mapping) else None,
+            canary_report.get("authoritative_control") if isinstance(canary_report, Mapping) else None,
+            canary_report.get("readiness") if isinstance(canary_report, Mapping) else None,
+            canary_status,
+        )
+        canary_status["blocker"] = blocker
+        autonomous["blocker"] = blocker
+        canary_status["autonomous"] = autonomous
+        latest_signal = _signal_projection(canary_status.get("latest_signal"))
+        canary_status["latest_signal"] = latest_signal
         def worker_state(name: str, default: str = "NOT INITIALIZED") -> str:
             item = worker_map.get(name, {})
             status = str(item.get("status") or "").upper()
@@ -2830,7 +3225,11 @@ class DashboardData:
         historical = catalog.get("historical", {}) if isinstance(catalog, Mapping) else {}
         forward = catalog.get("forward_collected", {}) if isinstance(catalog, Mapping) else {}
         bootstrap_progress = self._operator_bootstrap_progress()
-        candidate_canary_count = int(canary_status.get("eligible_count", 0) or 0)
+        candidate_canary_count = (
+            canary_status.get("eligible_count")
+            if isinstance(canary_status, Mapping)
+            else None
+        )
         latest_candidates: list[dict[str, Any]] = []
         try:
             candidate_page = self.paginate_candidate_lifecycle(
@@ -2855,16 +3254,13 @@ class DashboardData:
             f"{research_worker_payload.get('passes', 0)} pass(es); "
             f"{research_worker_payload.get('queue_items_processed', 0)} research item(s) processed"
         )
-        forward_catalog_count = (
-            int(forward.get("datasets", 0) or 0)
-            if isinstance(forward, Mapping)
-            else 0
-        )
         if health_grade in {"A", "OK", "HEALTHY"} or (
             not health_grade and forward_catalog_count
         ):
             collector_default_state = "READY"
-        elif health_grade and (health_grade != "F" or forward_catalog_count):
+        elif health_grade == "UNKNOWN" and not forward_catalog_count:
+            collector_default_state = "NOT INITIALIZED"
+        elif health_grade and health_grade != "F" or forward_catalog_count:
             collector_default_state = "DEGRADED"
         else:
             collector_default_state = "NOT INITIALIZED"
@@ -2907,6 +3303,8 @@ class DashboardData:
             "paper_risk_engine": {"status": "Active", "enabled": True},
             "dataset_health": health,
             "health_grade": health_grade,
+            "health_status": str(health.get("status") or ("STALE" if health_grade == "UNKNOWN" else "CURRENT")).upper(),
+            "readiness_status": str(canary_status.get("readiness_snapshot_status") or "STALE").upper(),
             "grade_scope": health_grade_scope,
             "reason_code": health_reason_code,
             "reasons": health_reasons,
@@ -2960,7 +3358,7 @@ class DashboardData:
             "canary_signal": latest_signal,
             "candidate_status": {
                 "canary_eligible": candidate_canary_count,
-                "rankable": canary_status.get("rankable_count", 0) if isinstance(canary_status, Mapping) else 0,
+                "rankable": canary_status.get("rankable_count") if isinstance(canary_status, Mapping) else None,
                 "paper_forward": stages.get("PAPER_FORWARD", 0) + stages.get("PAPER_PROMOTABLE", 0),
                 "paper_promotable": stages.get("PAPER_PROMOTABLE", 0),
             },
@@ -2980,25 +3378,26 @@ class DashboardData:
 
     def canary_data(self) -> dict[str, Any]:
         credentials = canary_module.CredentialStore().safe_projection(allow_environment=False)
+        canary_report: dict[str, Any] = {}
         if self.store is None:
             canary: Mapping[str, Any] = {
-                "production_live_trading": "DISABLED",
-                "micro_live_canary": "DISABLED",
-                "display_state": "DISABLED",
-                "control_state": "DISABLED",
+                "production_live_trading": "UNKNOWN",
+                "micro_live_canary": "UNKNOWN",
+                "display_state": "UNKNOWN",
+                "control_state": "UNKNOWN",
                 "candidate": None,
                 "winner_id": None,
                 "winner_rank": None,
                 "winner_score": None,
                 "selection_reason": None,
-                "eligibility_raw_count": 0,
-                "eligible_count": 0,
-                "rankable_raw_count": 0,
-                "rankable_count": 0,
+                "eligibility_raw_count": None,
+                "eligible_count": None,
+                "rankable_raw_count": None,
+                "rankable_count": None,
                 "ranking_run_id": None,
                 "ranking_timestamp": None,
-                "selection_status": "NONE",
-                "selection_valid": False,
+                "selection_status": "UNKNOWN",
+                "selection_valid": None,
                 "selection_invalidation_reason": None,
                 "selected_candidate": None,
                 "last_selected_candidate": None,
@@ -3008,15 +3407,15 @@ class DashboardData:
                 "readiness_snapshot_updated_at": None,
                 "historical_data_integrity": "UNKNOWN",
                 "historical_execution_fidelity": "UNKNOWN",
-                "current_execution_evidence": "CURRENT_ORDER_BOOK_REQUIRED",
+                "current_execution_evidence": "UNKNOWN",
                 "risk_envelope": {},
                 "risk_limits": {},
-                "real_execution_events": 0,
-                "execution_event_count": 0,
+                "real_execution_events": None,
+                "execution_event_count": None,
                 "autonomous": {
                     "enabled": False,
-                    "next_decision": "ENABLE AUTO CANARY",
-                    "blocker": "AUTONOMOUS_CANARY_DISABLED",
+                    "next_decision": "UNKNOWN",
+                    "blocker": "AUTONOMOUS_CONTROL_UNKNOWN",
                 },
                 "trades": [],
                 "latest_signal": None,
@@ -3024,13 +3423,131 @@ class DashboardData:
             }
         else:
             service = CanaryService(self.store, initialize=False)
-            canary = service.status()
+            raw_canary, canary_report = _canary_status_report(service)
+            canary = raw_canary
         canary = _canary_status_projection(canary)
-        signal = canary.get("latest_signal")
-        autonomous = canary["autonomous"]
+        if canary_report:
+            canary["status_report"] = canary_report
+            for name in ("control", "readiness", "worker", "execution"):
+                value = canary_report.get(name)
+                if isinstance(value, Mapping):
+                    canary[name] = dict(value)
+        else:
+            canary_report = {}
+        if canary_report:
+            readiness = canary_report.get("readiness", {})
+            execution = canary_report.get("execution", {})
+            control = canary_report.get("control", canary_report.get("authoritative_control", {}))
+            readiness = readiness if isinstance(readiness, Mapping) else {}
+            execution = execution if isinstance(execution, Mapping) else {}
+            persisted_risk = (
+                readiness.get("risk_envelope")
+                or control.get("risk_envelope")
+                or dict(getattr(canary_module, "AUTONOMOUS_CANARY_LIMITS", {}))
+            )
+            canary.setdefault("risk_envelope", persisted_risk)
+            canary.setdefault(
+                "risk_limits",
+                readiness.get("risk_limits")
+                or control.get("risk_limits")
+                or canary.get("risk_envelope", {}),
+            )
+            canary.setdefault("trades", execution.get("trades", []))
+            canary.setdefault(
+                "execution_event_count",
+                execution.get("event_count", execution.get("real_execution_events", 0)),
+            )
+            canary.setdefault(
+                "real_execution_events",
+                execution.get("real_execution_events", execution.get("event_count", 0)),
+            )
+        signal = _signal_projection(canary.get("latest_signal"))
+        autonomous = dict(canary.get("autonomous") or {})
+        worker_section = (
+            canary_report.get("worker", {}) if isinstance(canary_report, Mapping) else {}
+        )
+        if isinstance(worker_section, Mapping):
+            autonomous = _patch_non_missing_values(
+                autonomous,
+                worker_section.get("autonomous"),
+            )
+            worker_fields = {
+                key: worker_section.get(key)
+                for key in (
+                    "last_tick_at",
+                    "last_tick_started_at",
+                    "last_tick_completed_at",
+                    "last_successful_tick",
+                    "last_error_code",
+                    "consecutive_failures",
+                    "next_retry_at",
+                    "candidates_evaluated",
+                    "signals_generated",
+                    "orders_attempted",
+                    "next_decision",
+                    "blocker",
+                    "last_signal_id",
+                    "worker_status",
+                )
+                if key in worker_section
+            }
+            autonomous = _patch_non_missing_values(autonomous, worker_fields)
+        autonomous.setdefault("rank", canary.get("winner_rank"))
+        autonomous.setdefault("score", canary.get("winner_score"))
+        autonomous.setdefault("selection_reason", canary.get("selection_reason"))
+        autonomous.setdefault("next_decision", canary.get("next_decision"))
+        canary["autonomous"] = autonomous
+        control_state = _canary_control_state(
+            canary_report.get("control") if isinstance(canary_report, Mapping) else None,
+            canary_report.get("authoritative_control") if isinstance(canary_report, Mapping) else None,
+            canary_report.get("readiness") if isinstance(canary_report, Mapping) else None,
+            canary,
+        )
+        blocker = _normalized_canary_blocker(
+            _canonical_blocker(
+                worker_section if isinstance(worker_section, Mapping) else None,
+                autonomous,
+                canary,
+            ),
+            canary_report.get("control") if isinstance(canary_report, Mapping) else None,
+            canary_report.get("authoritative_control") if isinstance(canary_report, Mapping) else None,
+            canary_report.get("readiness") if isinstance(canary_report, Mapping) else None,
+            canary,
+        )
+        canary["blocker"] = blocker
+        autonomous["blocker"] = blocker
+        canary["latest_signal"] = signal
+        canary["control_state"] = control_state
+        canary.setdefault("display_state", canary.get("control_state"))
+        canary.setdefault(
+            "production_live_trading",
+            "ENABLED" if str(canary.get("control_state")).upper() in {"ARMED", "LIVE"} else "DISABLED",
+        )
+        if "selected_winner" not in canary:
+            selected = canary.get("selected_candidate")
+            historical = canary.get("last_selected_candidate")
+            if selected is not None or historical is not None:
+                canary["selected_winner"] = {
+                    "candidate_id": selected or historical,
+                    "selected_candidate": selected,
+                    "last_selected_candidate": historical,
+                    "selection_status": canary.get("selection_status", "NONE"),
+                    "selection_valid": canary.get("selection_valid", False),
+                    "selection_invalidation_reason": canary.get("selection_invalidation_reason"),
+                }
+        if str(canary.get("display_state") or "").upper() == "DISARMED":
+            canary["display_state"] = "DISABLED"
         eligible_count = canary["eligible_count"]
         rankable_count = canary["rankable_count"]
-        execution_events = int(canary.get("real_execution_events", 0) or 0)
+        raw_execution_events = canary.get("real_execution_events")
+        try:
+            execution_events = (
+                None
+                if raw_execution_events is None
+                else int(raw_execution_events)
+            )
+        except (TypeError, ValueError):
+            execution_events = None
         candidate_status = {
             "eligibility_raw_count": canary["eligibility_raw_count"],
             "canary_eligible": eligible_count,
@@ -3051,6 +3568,27 @@ class DashboardData:
         connectivity = _stored_connectivity_projection(persisted_connectivity)
         projection = {
             "canary": canary,
+            "status_report": canary_report,
+            "control": (
+                canary_report.get("control", canary_report.get("authoritative_control", {}))
+                if isinstance(canary_report, Mapping)
+                else {}
+            ),
+            "readiness": (
+                canary_report.get("readiness", {})
+                if isinstance(canary_report, Mapping)
+                else {}
+            ),
+            "worker": (
+                canary_report.get("worker", {})
+                if isinstance(canary_report, Mapping)
+                else {}
+            ),
+            "execution": (
+                canary_report.get("execution", {})
+                if isinstance(canary_report, Mapping)
+                else {}
+            ),
             "autonomous_canary": autonomous,
             "canary_signal": signal,
             "connectivity": connectivity,
@@ -3131,6 +3669,7 @@ class DashboardData:
             return result
         if self.store is not None:
             return self._operator_control_data()
+        operator_controls: Mapping[str, Any] = {}
         catalogs = self._operator_catalog_summary()
         overview_coverage = catalogs
         summary = self.research_summary_data()
@@ -3300,14 +3839,34 @@ class DashboardData:
         canary_service = (
             CanaryService(self.store, initialize=False) if self.store is not None else None
         )
-        canary_status = _canary_status_projection(
-            canary_service.status()
-            if canary_service is not None
-            else self.canary_data()["canary"]
-        )
+        if canary_service is not None:
+            raw_canary, canary_report = _canary_status_report(canary_service)
+            canary_status = _canary_status_projection(raw_canary)
+            worker_section = canary_report.get("worker", {})
+            autonomous = dict(canary_status.get("autonomous") or {})
+            if isinstance(worker_section, Mapping):
+                autonomous = _patch_non_missing_values(
+                    autonomous,
+                    worker_section.get("autonomous"),
+                )
+                autonomous = _patch_non_missing_values(
+                    autonomous,
+                    {
+                        key: worker_section.get(key)
+                        for key in (
+                            "next_decision",
+                            "blocker",
+                            "last_signal_id",
+                            "worker_status",
+                        )
+                        if key in worker_section
+                    },
+                )
+            canary_status["autonomous"] = autonomous
+        else:
+            canary_report = {}
+            canary_status = _canary_status_projection(self.canary_data()["canary"])
         latest_canary_signal = canary_status.get("latest_signal")
-        operator_controls = self.control.status() if self.control is not None else {}
-        candidate_status["rankable"] = int(canary_status.get("rankable_count", 0) or 0)
         autonomous_canary = (
             canary_status.get("autonomous", {})
             if isinstance(canary_status, Mapping)
@@ -3510,7 +4069,7 @@ def _dashboard_html(control_token: str | None = None) -> str:
   </main>
   <script>
     const $ = (id) => document.getElementById(id), safe = (v) => String(v ?? "—").replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c])), json = (v) => JSON.stringify(v ?? {}, null, 2);
-    const count = (v) => Number.isFinite(Number(v)) ? String(v) : "0", phtDateFormatter = new Intl.DateTimeFormat("en-PH-u-hc-h23", { timeZone:"Asia/Manila", year:"numeric", month:"2-digit", day:"2-digit", hour:"2-digit", minute:"2-digit", second:"2-digit", hourCycle:"h23" }), dateText = (v) => { if(!v || typeof v !== "string" || !/(?:Z|[+-][0-9]{2}:[0-9]{2})$/.test(v)) return "—"; const date = new Date(v); if(Number.isNaN(date.getTime())) return "—"; const parts = Object.fromEntries(phtDateFormatter.formatToParts(date).filter(i => i.type !== "literal").map(i => [i.type, i.value])); return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}:${parts.second} PHT`; }, usd = (v) => { const number=Number(v); return Number.isFinite(number)?`$${number.toFixed(2)}`:"—"; }, arr = (v) => Array.isArray(v) ? v : [];
+    const count = (v) => v == null ? "UNKNOWN" : Number.isFinite(Number(v)) ? String(v) : "UNKNOWN", phtDateFormatter = new Intl.DateTimeFormat("en-PH-u-hc-h23", { timeZone:"Asia/Manila", year:"numeric", month:"2-digit", day:"2-digit", hour:"2-digit", minute:"2-digit", second:"2-digit", hourCycle:"h23" }), dateText = (v) => { if(!v || typeof v !== "string" || !/(?:Z|[+-][0-9]{2}:[0-9]{2})$/.test(v)) return "—"; const date = new Date(v); if(Number.isNaN(date.getTime())) return "—"; const parts = Object.fromEntries(phtDateFormatter.formatToParts(date).filter(i => i.type !== "literal").map(i => [i.type, i.value])); return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}:${parts.second} PHT`; }, usd = (v) => { const number=Number(v); return Number.isFinite(number)?`$${number.toFixed(2)}`:"—"; }, arr = (v) => Array.isArray(v) ? v : [];
     const empty = (title,body) => `<div class="empty"><strong>${safe(title)}</strong>${safe(body)}</div>`, statusClass = (v) => { const s=String(v||"").toUpperCase(); return ["READY","RUNNING","ACTIVE","COMPLETE","COMPLETED","HEALTHY","ELIGIBLE","PASSED","PROMOTABLE","A","B"].includes(s)?"good":["DEGRADED","STOPPED","UPDATING","SUBMITTING","UNKNOWN","C"].includes(s)?"warn":["ERROR","STALE","REJECTED","KILLED","BLOCKED","FAIL","INSUFFICIENT","UNAVAILABLE","D","F"].includes(s)?"bad":""; };
     function readinessSnapshotMarkup(data) { const snapshot=data?.canary&&typeof data.canary==="object"?data.canary:(data||{}),status=String(snapshot.readiness_snapshot_status||"STALE").toUpperCase(),stale=snapshot.readiness_snapshot_stale===true||status==="STALE",label=stale?"READINESS SNAPSHOT STALE":"READINESS SNAPSHOT CURRENT",updated=snapshot.readiness_snapshot_updated_at||data?.readiness_snapshot_updated_at; return `<p class="page-note readiness-snapshot"><span class="badge ${statusClass(stale?"STALE":"CURRENT")}">${label}</span> · Updated ${safe(dateText(updated))}</p>`; }
     let params = new URLSearchParams(location.search); const state = { tab: params.get("tab") || "overview", page: Math.max(1,Number(params.get("page")||1)), page_size: [10,25,50,100].includes(Number(params.get("page_size"))) ? Number(params.get("page_size")) : 25, filter: params.get("filter") || "", sort: params.get("sort") || "", direction: params.get("direction") === "asc" ? "asc" : "desc", selected: params.get("selected") || "", expanded: params.get("expanded") === "1" };
@@ -3602,10 +4161,22 @@ def _dashboard_html(control_token: str | None = None) -> str:
       const c=data.canary||{}, auto=data.autonomous_canary||c.autonomous||{}, risk=c.risk_envelope||c.risk_limits||{}, signal=data.canary_signal||null, connectivity=data.connectivity??c.connectivity??null;
       renderCanaryConnectivity(connectivity);
       $("canary-readiness-snapshot").innerHTML=readinessSnapshotMarkup(data);
-      const backendState=String(c.micro_live_canary||"DISABLED"), stateValue=backendState==="KILLED"?"KILLED":Boolean(auto.enabled)?"ENABLED":"DISABLED";
-      const enabled=Boolean(auto.enabled), selectionStatus=String(c.selection_status||"NONE").toUpperCase(), selectionValid=c.selection_valid===true, currentCandidate=selectionValid&&selectionStatus==="CURRENT"?c.selected_candidate||"": "", currentWinnerId=c.winner_id||"", historicalCandidate=c.last_selected_candidate||"", selectionLabel=selectionStatus==="STALE"?"STALE · REEVALUATION REQUIRED":selectionStatus==="CURRENT"?"CURRENT":"NONE", rawEligible=Number(c.eligibility_raw_count)||0, eligible=Number(c.eligible_count)||0, rawRankable=Number(c.rankable_raw_count)||0, rankable=Number(c.rankable_count)||0, events=data.real_execution_events??c.real_execution_events??c.execution_event_count??0, manualCandidate=backendState==="ARMED"&&c.candidate?`<div class="panel"><div class="metric">${safe(c.candidate)}</div><div class="metric-label">Manual armed candidate</div></div>`:"";
+      const backendState=String(c.micro_live_canary||"UNKNOWN"), stateValue=backendState==="KILLED"?"KILLED":backendState==="UNKNOWN"?"UNKNOWN":Boolean(auto.enabled)?"ENABLED":"DISABLED";
+      const enabled=Boolean(auto.enabled);
+      const selectionStatus=String(c.selection_status||"UNKNOWN").toUpperCase();
+      const selectionValid=c.selection_valid===true&&selectionStatus==="CURRENT";
+      const currentCandidate=selectionValid?c.selected_candidate||"": "";
+      const currentWinnerId=selectionValid?c.winner_id||"": "";
+      const historicalCandidate=c.last_selected_candidate||"";
+      const selectionLabel=selectionStatus==="STALE"?"STALE · REEVALUATION REQUIRED":selectionStatus==="CURRENT"?"CURRENT":"UNKNOWN";
+      const rawEligible=c.eligibility_raw_count==null?null:Number(c.eligibility_raw_count);
+      const eligible=c.eligible_count==null?null:Number(c.eligible_count);
+      const rawRankable=c.rankable_raw_count==null?null:Number(c.rankable_raw_count);
+      const rankable=c.rankable_count==null?null:Number(c.rankable_count);
+      const events=data.real_execution_events??c.real_execution_events??c.execution_event_count??null;
+      const manualCandidate=backendState==="ARMED"&&c.candidate?`<div class="panel"><div class="metric">${safe(c.candidate)}</div><div class="metric-label">Manual armed candidate</div></div>`:"";
       const connectivityReady=connectivity?.ready===true, connectivityBlocker=connectivityReady?"":arr(connectivity?.failure_codes)[0]||"CONNECTIVITY_BLOCKED";
-      const selectionReason=c.selection_invalidation_reason||"", selectionBlocker=selectionValid&&currentCandidate?"":(selectionReason||(selectionStatus==="STALE"?"REEVALUATION_REQUIRED":selectionStatus==="NONE"?"NO_CURRENT_SELECTION":"SELECTION_INVALID"));
+      const selectionReason=c.selection_invalidation_reason||"", selectionBlocker=selectionValid&&currentCandidate?"":(selectionReason||(selectionStatus==="STALE"?"REEVALUATION_REQUIRED":selectionStatus==="UNKNOWN"?"READINESS_UNKNOWN":selectionStatus==="NONE"?"NO_CURRENT_SELECTION":"SELECTION_INVALID"));
       const autonomousBlocker=!connectivity?"CONNECTIVITY_CHECK_REQUIRED":!connectivityReady?connectivityBlocker:backendState==="KILLED"?"CANARY_KILLED":selectionBlocker||String(auto.blocker||"AUTONOMOUS_CANARY_DISABLED");
       const autoReady=connectivityReady&&backendState!=="KILLED"&&!enabled&&selectionValid&&Boolean(currentCandidate);
       const enable=stateValue==="KILLED"?"":enabled?controlButton("canary.disarm","DISARM","","DISARM"):controlButton("canary.enable_auto","ENABLE AUTO CANARY","","ENABLE AUTO CANARY");

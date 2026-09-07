@@ -338,6 +338,74 @@ class AutonomousWorkflowTests(unittest.TestCase):
                 tuple(row[column] for column in persisted),
             )
 
+    def test_node_initializing_publication_is_cheap_and_not_last_good(self):
+        node = ResearchNode(
+            NodeConfig(":memory:", crypto_enabled=False),
+            provider=object(),
+            store=self.store,
+            clock=lambda: T0,
+            sleep=lambda _: None,
+        )
+        with patch.object(
+            CanaryService,
+            "authoritative_status",
+            side_effect=AssertionError("startup must not evaluate authoritative status"),
+        ), patch.object(
+            CandidateCanaryRanker,
+            "evaluate_and_select",
+            side_effect=AssertionError("startup must not rank candidates"),
+        ), patch(
+            "axiom.canary.evaluate_prediction_data_quality",
+            side_effect=AssertionError("startup must not evaluate data quality"),
+        ):
+            node._publish_autonomous_initializing(T0)
+
+        row = self.store.connection.execute(
+            "SELECT projection_version,readiness_snapshot_status,"
+            "readiness_snapshot_stale,readiness_snapshot_reason "
+            "FROM canary_readiness_snapshot WHERE singleton=1"
+        ).fetchone()
+        self.assertEqual(row["projection_version"], 0)
+        self.assertEqual(row["readiness_snapshot_status"], "STALE")
+        self.assertEqual(row["readiness_snapshot_stale"], 1)
+        self.assertEqual(row["readiness_snapshot_reason"], "READINESS_SNAPSHOT_INITIALIZING")
+        status = self.service.status()
+        self.assertEqual(status["selection_status"], "UNKNOWN")
+        self.assertIsNone(status["selection_valid"])
+        self.assertIsNone(status["selected_candidate"])
+        self.assertIsNone(status["winner_id"])
+        for field in (
+            "eligibility_raw_count",
+            "eligible_count",
+            "rankable_raw_count",
+            "rankable_count",
+        ):
+            self.assertIsNone(status[field])
+        self.assertEqual(status["autonomous"]["worker_status"], "INITIALIZING")
+        self.assertIsNone(status["autonomous"]["last_successful_tick"])
+
+    def test_first_successful_ranker_tick_publishes_current_projection(self):
+        self.seed_candidate("startup-ranker", score=0.40)
+        node = ResearchNode(
+            NodeConfig(":memory:", crypto_enabled=False),
+            provider=object(),
+            store=self.store,
+            clock=lambda: T0,
+            sleep=lambda _: None,
+        )
+        node._publish_autonomous_initializing(T0)
+
+        result = node._auto_canary_worker.tick(now=T0)
+        self.assertEqual(result["status"], "DISABLED")
+        row = self.store.connection.execute(
+            "SELECT projection_version,readiness_snapshot_status,"
+            "readiness_snapshot_stale FROM canary_readiness_snapshot "
+            "WHERE singleton=1"
+        ).fetchone()
+        self.assertGreater(row["projection_version"], 0)
+        self.assertEqual(row["readiness_snapshot_status"], "CURRENT")
+        self.assertEqual(row["readiness_snapshot_stale"], 0)
+
     def test_ranker_automatically_binds_eligible_prediction_candidates(self):
         self.seed_candidate("winner", cluster="cluster-a", score=0.40)
         self.seed_candidate("sibling", cluster="cluster-a", score=0.30)
@@ -776,15 +844,31 @@ class AutonomousWorkflowTests(unittest.TestCase):
         enabled = self.service.enable_autonomous_micro_live()
         self.assertEqual(enabled["micro_live_canary"], AUTONOMOUS_MICRO_LIVE)
 
-        # Enabling durable control does not require a dashboard projection.  A
-        # missing projection therefore reports the safe display default even
-        # while autonomous control is live.
+        # The durable control row remains authoritative when the bounded
+        # readiness projection is absent.  The projection reports live
+        # control truthfully while leaving readiness and quality claims
+        # unknown until a fresh publication completes.
         with self.store.connection:
             self.store.connection.execute(
                 "DELETE FROM canary_readiness_snapshot WHERE singleton=1"
             )
         dashboard_projection = self.service.status()
-        self.assertEqual(dashboard_projection["micro_live_canary"], "DISABLED")
+        self.assertEqual(
+            dashboard_projection["micro_live_canary"],
+            AUTONOMOUS_MICRO_LIVE,
+        )
+        self.assertEqual(dashboard_projection["readiness_snapshot_status"], "STALE")
+        self.assertTrue(dashboard_projection["readiness_snapshot_stale"])
+        self.assertEqual(
+            dashboard_projection["readiness_snapshot_reason"],
+            "READINESS_SNAPSHOT_MISSING",
+        )
+        self.assertEqual(dashboard_projection["historical_data_integrity"], "UNKNOWN")
+        self.assertEqual(
+            dashboard_projection["historical_execution_fidelity"],
+            "UNKNOWN",
+        )
+        self.assertEqual(dashboard_projection["selection_status"], "UNKNOWN")
         dashboard_projection.update(
             {
                 "candidate": "dashboard-only",
@@ -808,7 +892,6 @@ class AutonomousWorkflowTests(unittest.TestCase):
         authoritative = self.service.authoritative_status()
         self.assertEqual(authoritative["micro_live_canary"], AUTONOMOUS_MICRO_LIVE)
         self.assertEqual(authoritative["candidate"], "durable-winner")
-
 
     def test_ranker_re_evaluates_legacy_full_payload_into_qualification_binding(self):
         payload = self.seed_candidate("legacy")
@@ -886,6 +969,33 @@ class AutonomousWorkflowTests(unittest.TestCase):
         self.assertIsNone(self.service.generate_signal("rejected"))
         self.assertIsNone(self.service.status()["winner_id"])
 
+    def test_older_ranker_failure_cannot_clobber_newer_current_projection(self):
+        self.service.publish_readiness_snapshot(reason="RANKING_BASELINE")
+        ranker = CandidateCanaryRanker(self.store, clock=lambda: T0)
+
+        def stale_evaluation(now=None):
+            self.service.publish_readiness_snapshot(reason="NEWER_CURRENT")
+            raise RuntimeError("older ranking failed")
+
+        ranker._evaluate_and_select = stale_evaluation
+        with self.assertRaisesRegex(RuntimeError, "older ranking failed"):
+            ranker.evaluate_and_select(T0)
+
+        row = self.store.connection.execute(
+            "SELECT payload_json,projection_version,readiness_snapshot_status,"
+            "readiness_snapshot_stale,readiness_snapshot_reason "
+            "FROM canary_readiness_snapshot WHERE singleton=1"
+        ).fetchone()
+        self.assertEqual(row["readiness_snapshot_status"], "CURRENT")
+        self.assertEqual(row["readiness_snapshot_stale"], 0)
+        self.assertEqual(row["readiness_snapshot_reason"], "NEWER_CURRENT")
+        payload = json.loads(row["payload_json"])
+        self.assertEqual(payload["readiness_snapshot_reason"], "NEWER_CURRENT")
+        self.assertNotEqual(
+            payload.get("readiness_evaluation_error_code"),
+            "RUNTIMEERROR",
+        )
+
     def test_concurrent_paper_lifecycle_update_never_publishes_mixed_current_selection(self):
         payload = self.seed_candidate("paper-race", score=0.40)
         paper_payload = {**payload, "forward_expectancy": 0.40}
@@ -938,33 +1048,286 @@ class AutonomousWorkflowTests(unittest.TestCase):
             release.set()
             ranking_thread.join(timeout=5)
         self.assertFalse(ranking_thread.is_alive())
-        self.assertNotIn("error", result_holder)
-        raced = result_holder["result"]
-        raced_selection = ranker.current_selection()
-        raced_rows = {
-            row["candidate_id"]: row
-            for row in ranker.rankings()
-        }
+        self.assertIn("error", result_holder)
+        self.assertEqual(
+            getattr(result_holder["error"], "error_code", None),
+            "LIFECYCLE_SNAPSHOT_CHANGED",
+        )
+        self.assertIsNone(ranker.current_selection())
+        self.assertEqual(ranker.rankings(), [])
+        snapshot = self.store.connection.execute(
+            "SELECT payload_json,readiness_snapshot_status,"
+            "readiness_snapshot_stale,readiness_snapshot_reason "
+            "FROM canary_readiness_snapshot WHERE singleton=1"
+        ).fetchone()
+        self.assertEqual(snapshot["readiness_snapshot_status"], "STALE")
+        self.assertEqual(snapshot["readiness_snapshot_stale"], 1)
+        self.assertEqual(snapshot["readiness_snapshot_reason"], "EVALUATION_FAILED")
+        failure = json.loads(snapshot["payload_json"])
+        self.assertEqual(failure["readiness_snapshot_reason"], "EVALUATION_FAILED")
+        self.assertEqual(failure["readiness_evaluation_error_code"], "LIFECYCLE_SNAPSHOT_CHANGED")
 
-        # A bounded retry may publish a fresh current selection; if it does,
-        # it must be identical to a clean post-update ranking, never a mixed
-        # pre-update ranking paired with post-update lifecycle evidence.
-        clean = CandidateCanaryRanker(self.store, clock=lambda: T0).evaluate_and_select(T0)
-        clean_rows = {
-            row["candidate_id"]: row
-            for row in CandidateCanaryRanker(self.store, clock=lambda: T0).rankings()
-        }
-        if raced["selection_status"] == "CURRENT":
-            self.assertEqual(raced["selected_candidate"], clean["selected_candidate"])
-            self.assertIsNotNone(raced_selection)
-            self.assertEqual(
-                raced_rows["paper-race"]["ranking_snapshot_hash"],
-                clean_rows["paper-race"]["ranking_snapshot_hash"],
+    def test_new_candidate_between_prevalidation_and_commit_fails_closed(self):
+        candidate_id = "inventory-race"
+        self.seed_candidate(candidate_id, score=0.40)
+        ranker = CandidateCanaryRanker(self.store, clock=lambda: T0)
+        initial = ranker.evaluate_and_select(T0)
+        self.assertEqual(initial["selection_status"], "CURRENT")
+        baseline_ranking = dict(
+            self.store.connection.execute(
+                "SELECT * FROM canary_rankings WHERE candidate_id=?",
+                (candidate_id,),
+            ).fetchone()
+        )
+        baseline_selection = dict(
+            self.store.connection.execute(
+                "SELECT * FROM canary_selection WHERE singleton=1"
+            ).fetchone()
+        )
+        entered = threading.Event()
+        release = threading.Event()
+        result_holder = {}
+        original_rank_evidence = ranker._rank_evidence
+
+        def blocked_rank_evidence(payload, frozen_hash, quality=None):
+            entered.set()
+            if not release.wait(timeout=5):
+                raise AssertionError("ranking barrier was not released")
+            return original_rank_evidence(payload, frozen_hash, quality=quality)
+
+        ranker._rank_evidence = blocked_rank_evidence
+
+        def run_ranker():
+            try:
+                ranker.evaluate_and_select(T0)
+            except BaseException as exc:
+                result_holder["error"] = exc
+
+        ranking_thread = threading.Thread(target=run_ranker)
+        ranking_thread.start()
+        try:
+            self.assertTrue(entered.wait(timeout=5))
+            self.seed_candidate("inventory-new", score=0.90)
+        finally:
+            release.set()
+            ranking_thread.join(timeout=5)
+
+        self.assertFalse(ranking_thread.is_alive())
+        self.assertEqual(
+            getattr(result_holder.get("error"), "error_code", None),
+            "LIFECYCLE_SNAPSHOT_CHANGED",
+        )
+        after_ranking = dict(
+            self.store.connection.execute(
+                "SELECT * FROM canary_rankings WHERE candidate_id=?",
+                (candidate_id,),
+            ).fetchone()
+        )
+        after_selection = dict(
+            self.store.connection.execute(
+                "SELECT * FROM canary_selection WHERE singleton=1"
+            ).fetchone()
+        )
+        self.assertEqual(after_ranking, baseline_ranking)
+        self.assertEqual(after_selection, baseline_selection)
+        self.assertIsNone(
+            self.store.connection.execute(
+                "SELECT 1 FROM canary_rankings WHERE candidate_id='inventory-new'"
+            ).fetchone()
+        )
+        snapshot = self.store.connection.execute(
+            "SELECT payload_json,readiness_snapshot_status,"
+            "readiness_snapshot_stale,readiness_snapshot_reason "
+            "FROM canary_readiness_snapshot WHERE singleton=1"
+        ).fetchone()
+        self.assertEqual(snapshot["readiness_snapshot_status"], "STALE")
+        self.assertEqual(snapshot["readiness_snapshot_stale"], 1)
+        self.assertEqual(snapshot["readiness_snapshot_reason"], "EVALUATION_FAILED")
+        failure = json.loads(snapshot["payload_json"])
+        self.assertEqual(failure["readiness_snapshot_reason"], "EVALUATION_FAILED")
+        self.assertEqual(failure["last_selected_candidate"], candidate_id)
+        self.assertEqual(
+            failure["readiness_evaluation_error_code"],
+            "LIFECYCLE_SNAPSHOT_CHANGED",
+        )
+
+    def test_attestation_policy_change_between_prevalidation_and_commit_fails_closed(self):
+        candidate_id = "attestation-policy-race"
+        self.seed_candidate(candidate_id, score=0.40)
+        ranker = CandidateCanaryRanker(self.store, clock=lambda: T0)
+        initial = ranker.evaluate_and_select(T0)
+        self.assertEqual(initial["selection_status"], "CURRENT")
+        baseline_ranking = dict(
+            self.store.connection.execute(
+                "SELECT * FROM canary_rankings WHERE candidate_id=?",
+                (candidate_id,),
+            ).fetchone()
+        )
+        baseline_selection = dict(
+            self.store.connection.execute(
+                "SELECT * FROM canary_selection WHERE singleton=1"
+            ).fetchone()
+        )
+        entered = threading.Event()
+        release = threading.Event()
+        result_holder = {}
+        original_rank_evidence = ranker._rank_evidence
+
+        def blocked_rank_evidence(payload, frozen_hash, quality=None):
+            entered.set()
+            if not release.wait(timeout=5):
+                raise AssertionError("ranking barrier was not released")
+            return original_rank_evidence(payload, frozen_hash, quality=quality)
+
+        ranker._rank_evidence = blocked_rank_evidence
+
+        def run_ranker():
+            try:
+                ranker.evaluate_and_select(T0)
+            except BaseException as exc:
+                result_holder["error"] = exc
+
+        ranking_thread = threading.Thread(target=run_ranker)
+        ranking_thread.start()
+        try:
+            self.assertTrue(entered.wait(timeout=5))
+            attestation = self.store.load_dataset_integrity_attestation(
+                "prediction-history",
+                "v1",
             )
-        else:
-            self.assertFalse(raced["selection_valid"])
-            self.assertNotEqual(raced["selection_status"], "CURRENT")
-            self.assertIsNone(raced["selected_candidate"])
+            self.assertIsNotNone(attestation)
+            changed = dict(attestation)
+            changed["policy_version"] = "prediction-integrity-v2"
+            changed.pop("attestation_hash", None)
+            self.store.save_dataset_integrity_attestation(
+                "prediction-history",
+                "v1",
+                changed,
+            )
+        finally:
+            release.set()
+            ranking_thread.join(timeout=5)
+
+        self.assertFalse(ranking_thread.is_alive())
+        self.assertEqual(
+            getattr(result_holder.get("error"), "error_code", None),
+            "DATASET_EVIDENCE_CHANGED",
+        )
+        after_ranking = dict(
+            self.store.connection.execute(
+                "SELECT * FROM canary_rankings WHERE candidate_id=?",
+                (candidate_id,),
+            ).fetchone()
+        )
+        after_selection = dict(
+            self.store.connection.execute(
+                "SELECT * FROM canary_selection WHERE singleton=1"
+            ).fetchone()
+        )
+        self.assertEqual(after_ranking, baseline_ranking)
+        self.assertEqual(after_selection, baseline_selection)
+        snapshot = self.store.connection.execute(
+            "SELECT payload_json,readiness_snapshot_status,"
+            "readiness_snapshot_stale,readiness_snapshot_reason "
+            "FROM canary_readiness_snapshot WHERE singleton=1"
+        ).fetchone()
+        self.assertEqual(snapshot["readiness_snapshot_status"], "STALE")
+        self.assertEqual(snapshot["readiness_snapshot_stale"], 1)
+        self.assertEqual(snapshot["readiness_snapshot_reason"], "EVALUATION_FAILED")
+        failure = json.loads(snapshot["payload_json"])
+        self.assertEqual(failure["readiness_snapshot_reason"], "EVALUATION_FAILED")
+        self.assertEqual(failure["last_selected_candidate"], candidate_id)
+        self.assertEqual(
+            failure["readiness_evaluation_error_code"],
+            "DATASET_EVIDENCE_CHANGED",
+        )
+
+    def test_critical_error_lifecycle_change_between_prevalidation_and_commit_fails_closed(self):
+        candidate_id = "critical-error-race"
+        payload = self.seed_candidate(candidate_id, score=0.40)
+        ranker = CandidateCanaryRanker(self.store, clock=lambda: T0)
+        initial = ranker.evaluate_and_select(T0)
+        self.assertEqual(initial["selection_status"], "CURRENT")
+        baseline_ranking = dict(
+            self.store.connection.execute(
+                "SELECT * FROM canary_rankings WHERE candidate_id=?",
+                (candidate_id,),
+            ).fetchone()
+        )
+        baseline_selection = dict(
+            self.store.connection.execute(
+                "SELECT * FROM canary_selection WHERE singleton=1"
+            ).fetchone()
+        )
+        entered = threading.Event()
+        release = threading.Event()
+        result_holder = {}
+        original_rank_evidence = ranker._rank_evidence
+
+        def blocked_rank_evidence(payload, frozen_hash, quality=None):
+            entered.set()
+            if not release.wait(timeout=5):
+                raise AssertionError("ranking barrier was not released")
+            return original_rank_evidence(payload, frozen_hash, quality=quality)
+
+        ranker._rank_evidence = blocked_rank_evidence
+
+        def run_ranker():
+            try:
+                ranker.evaluate_and_select(T0)
+            except BaseException as exc:
+                result_holder["error"] = exc
+
+        ranking_thread = threading.Thread(target=run_ranker)
+        ranking_thread.start()
+        try:
+            self.assertTrue(entered.wait(timeout=5))
+            changed = dict(payload)
+            changed["critical_error"] = "concurrent critical evidence update"
+            self.store.save_candidate_lifecycle(
+                candidate_id,
+                "FROZEN",
+                changed,
+                from_stage="FROZEN",
+                timestamp=T0.replace(second=13),
+            )
+        finally:
+            release.set()
+            ranking_thread.join(timeout=5)
+
+        self.assertFalse(ranking_thread.is_alive())
+        self.assertEqual(
+            getattr(result_holder.get("error"), "error_code", None),
+            "LIFECYCLE_SNAPSHOT_CHANGED",
+        )
+        after_ranking = dict(
+            self.store.connection.execute(
+                "SELECT * FROM canary_rankings WHERE candidate_id=?",
+                (candidate_id,),
+            ).fetchone()
+        )
+        after_selection = dict(
+            self.store.connection.execute(
+                "SELECT * FROM canary_selection WHERE singleton=1"
+            ).fetchone()
+        )
+        self.assertEqual(after_ranking, baseline_ranking)
+        self.assertEqual(after_selection, baseline_selection)
+        snapshot = self.store.connection.execute(
+            "SELECT payload_json,readiness_snapshot_status,"
+            "readiness_snapshot_stale,readiness_snapshot_reason "
+            "FROM canary_readiness_snapshot WHERE singleton=1"
+        ).fetchone()
+        self.assertEqual(snapshot["readiness_snapshot_status"], "STALE")
+        self.assertEqual(snapshot["readiness_snapshot_stale"], 1)
+        self.assertEqual(snapshot["readiness_snapshot_reason"], "EVALUATION_FAILED")
+        failure = json.loads(snapshot["payload_json"])
+        self.assertEqual(failure["readiness_snapshot_reason"], "EVALUATION_FAILED")
+        self.assertEqual(failure["last_selected_candidate"], candidate_id)
+        self.assertEqual(
+            failure["readiness_evaluation_error_code"],
+            "LIFECYCLE_SNAPSHOT_CHANGED",
+        )
 
     def test_ranking_relevant_forward_change_stales_selection_until_reevaluation(self):
         self.seed_candidate("forward-change", score=0.40)
@@ -1358,6 +1721,68 @@ class AutonomousWorkflowTests(unittest.TestCase):
         self.assertEqual(after["limits"], before["limits"])
 
 
+    def test_worker_recovers_after_one_exception_and_persists_error_metadata(self):
+        worker = AutonomousCanaryWorker(self.store, clock=lambda: T0)
+        ranking_without_winner = {
+            "selected_candidate": None,
+            "rankings": [],
+            "eligible_count": 0,
+        }
+        with patch.object(
+            CandidateCanaryRanker,
+            "evaluate_and_select",
+            side_effect=[RuntimeError("injected ranking failure"), ranking_without_winner],
+        ) as evaluate:
+            failed = worker.tick(now=T0)
+            report = self.service.status_report()
+            recovered = worker.tick(now=T0)
+
+        self.assertEqual(failed["status"], "ERROR")
+        self.assertEqual(failed["decision"], "AUTONOMOUS_WORKER_EXCEPTION")
+        self.assertEqual(report["worker"]["worker_status"], "DEGRADED")
+        self.assertEqual(
+            report["worker"]["last_error_code"],
+            "AUTONOMOUS_WORKER_EXCEPTION",
+        )
+        self.assertEqual(report["worker"]["consecutive_failures"], 1)
+        self.assertIsNotNone(report["worker"]["next_retry_at"])
+        self.assertEqual(recovered["status"], "DISABLED")
+        self.assertEqual(evaluate.call_count, 2)
+
+    def test_node_restarts_dead_autonomous_thread_with_durable_restart_state(self):
+        node = ResearchNode(
+            NodeConfig(":memory:", auto_canary_interval_seconds=1.0, crypto_enabled=False),
+            provider=object(),
+            store=self.store,
+            clock=lambda: T0,
+            sleep=lambda _: None,
+        )
+
+        class DeadThread:
+            def is_alive(self):
+                return False
+
+        node._auto_canary_thread = DeadThread()
+        replacement = Mock()
+        with patch("axiom.node.threading.Thread", return_value=replacement) as factory:
+            with patch.object(node.stop_event, "wait", return_value=False):
+                self.assertTrue(node._supervise_autonomous_thread())
+
+        factory.assert_called_once_with(
+            target=node._auto_canary_worker_loop,
+            name=f"{node.config.worker_name}-autonomous-canary",
+            daemon=True,
+        )
+        replacement.start.assert_called_once_with()
+        state = next(
+            row
+            for row in self.store.list_worker_states(limit=64)
+            if row["worker_name"] == "autonomous-canary"
+        )
+        self.assertEqual(state["status"], "degraded")
+        self.assertEqual(state["payload"]["decision"], "AUTONOMOUS_THREAD_RESTARTING")
+        self.assertEqual(state["payload"]["blocker"], "AUTONOMOUS_THREAD_EXITED")
+
     def test_unknown_signal_is_terminal_for_worker_without_external_retry(self):
         self.seed_candidate("winner", score=0.4)
         self.service.enable_autonomous_micro_live()
@@ -1371,11 +1796,10 @@ class AutonomousWorkflowTests(unittest.TestCase):
             self.assertEqual(result["blocker"], "UNKNOWN_NO_RETRY")
             self.assertEqual(worker.tick(now=T0)["blocker"], "UNKNOWN_NO_RETRY")
             submit.assert_not_called()
-        state = self.store.connection.execute(
-            "SELECT next_decision,blocker,last_signal_id FROM canary_autonomous_state WHERE singleton=1"
-        ).fetchone()
-        self.assertEqual(state["next_decision"], "WAIT_FOR_FRESH_ACTIONABLE_SIGNAL")
-        self.assertEqual(state["last_signal_id"], "unknown-signal")
+        worker_state = self.service.status_report()["worker"]
+        self.assertEqual(worker_state["next_decision"], "WAIT_FOR_FRESH_ACTIONABLE_SIGNAL")
+        self.assertEqual(worker_state["blocker"], "UNKNOWN_NO_RETRY")
+        self.assertEqual(worker_state["last_signal_id"], "unknown-signal")
 
     def test_node_worker_isolated_from_collector(self):
         node = ResearchNode(

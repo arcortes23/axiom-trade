@@ -8,6 +8,7 @@ import unittest
 from unittest.mock import patch
 
 from axiom.autonomous import AutonomousResearchConfig, AutonomousResearchProcessor
+from axiom.canary import CanaryService
 from axiom.dashboard import DashboardData, _dashboard_html
 from axiom.director import research_summary, validate_hermes_proposal
 from axiom.experiment_plan import ExperimentPlan, ExperimentPlanError
@@ -216,13 +217,24 @@ class Phase4AutonomousLoopTests(unittest.TestCase):
 
     def test_lifecycle_snapshot_stale_publication_waits_for_outer_commit(self) -> None:
         with AxiomStore(":memory:") as store:
+            service = CanaryService(store, clock=lambda: T0)
             manager = CandidateLifecycleManager(store)
+            published = service.publish_readiness_snapshot(reason="BEFORE_LIFECYCLE")
+            self.assertEqual(published["readiness_snapshot_status"], "CURRENT")
+
             with patch.object(manager, "_mark_readiness_snapshot_stale", wraps=manager._mark_readiness_snapshot_stale) as mark:
                 with store.transaction():
                     manager.register_idea("candidate-commit")
                     mark.assert_not_called()
                 mark.assert_called_once_with("LIFECYCLE_REGISTERED")
             self.assertIsNotNone(manager.get("candidate-commit"))
+            stale = service.status()
+            self.assertEqual(stale["readiness_snapshot_status"], "STALE")
+            self.assertTrue(stale["readiness_snapshot_stale"])
+
+            republished = service.publish_readiness_snapshot(reason="AFTER_LIFECYCLE")
+            self.assertEqual(republished["readiness_snapshot_status"], "CURRENT")
+            self.assertFalse(republished["readiness_snapshot_stale"])
 
             with patch.object(manager, "_mark_readiness_snapshot_stale") as mark:
                 with self.assertRaisesRegex(RuntimeError, "rollback"):
@@ -232,6 +244,7 @@ class Phase4AutonomousLoopTests(unittest.TestCase):
                         raise RuntimeError("rollback")
                 mark.assert_not_called()
             self.assertIsNone(manager.get("candidate-rollback"))
+            self.assertEqual(service.status()["readiness_snapshot_status"], "CURRENT")
 
             with patch.object(manager, "_mark_readiness_snapshot_stale", side_effect=RuntimeError("projection failure")):
                 with store.transaction():

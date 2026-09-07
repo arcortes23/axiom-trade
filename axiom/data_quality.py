@@ -59,8 +59,11 @@ def _catalog_provenance_complete(catalog: Mapping[str, Any]) -> bool:
     metadata = catalog.get("metadata")
     if not isinstance(metadata, Mapping):
         return False
-    return _nonempty(metadata.get("provider", catalog.get("provider"))) and _nonempty(
-        metadata.get("source_type", catalog.get("source_type"))
+    metadata_source = metadata.get("source_type", catalog.get("source_type"))
+    return (
+        _upper(metadata_source) == "HISTORICAL"
+        and _nonempty(metadata.get("provider", catalog.get("provider")))
+        and _nonempty(metadata_source)
     )
 
 
@@ -115,7 +118,120 @@ def _fidelity(catalog: Mapping[str, Any], payload: Mapping[str, Any]) -> str:
     return declared or "UNKNOWN"
 
 
-def evaluate_prediction_data_quality(store: Any, payload: Mapping[str, Any]) -> dict[str, Any]:
+def _map_attestation_reason(value: Any) -> str | None:
+    """Map verifier metadata to the stable quality reason vocabulary."""
+    reason = _upper(value)
+    if not reason:
+        return None
+    if reason.startswith("HISTORICAL_"):
+        return reason
+    return {
+        "FORWARD_CONTAMINATION": "HISTORICAL_FORWARD_CONTAMINATION",
+        "DATASET_PROVENANCE_INVALID": "HISTORICAL_PROVENANCE_INCOMPLETE",
+        "CONSTITUENT_BINDING_INVALID": "HISTORICAL_PROVENANCE_INCOMPLETE",
+        "CONSTITUENT_CATALOG_NOT_FOUND": "HISTORICAL_PROVENANCE_INCOMPLETE",
+        "CONSTITUENT_CATALOG_MISMATCH": "HISTORICAL_PROVENANCE_INCOMPLETE",
+        "DATASET_CATALOG_IDENTITY_CHANGED": "HISTORICAL_DATASET_IDENTITY_MISMATCH",
+        "DATASET_CATALOG_NOT_FOUND": "HISTORICAL_DATASET_VERSION_NOT_FOUND",
+        "CONSTITUENT_LIMIT_EXCEEDED": "HISTORICAL_PROVENANCE_INCOMPLETE",
+        "CONSTITUENT_ROW_COUNT_INVALID": "HISTORICAL_ROWS_EMPTY_OR_MISMATCHED",
+        "CONSTITUENT_ROWS_INVALID": "HISTORICAL_ROWS_EMPTY_OR_MISMATCHED",
+        "DATASET_ROWS_INVALID": "HISTORICAL_ROWS_EMPTY_OR_MISMATCHED",
+        "ROW_COUNT_MISMATCH": "HISTORICAL_ROWS_EMPTY_OR_MISMATCHED",
+        "INCOMPLETE_DATASET": "HISTORICAL_ROWS_EMPTY_OR_MISMATCHED",
+        "BOUNDS_MISMATCH": "HISTORICAL_ROWS_EMPTY_OR_MISMATCHED",
+    }.get(reason)
+
+
+def _attestation_specific_reasons(
+    attestation: Mapping[str, Any],
+    catalog: Mapping[str, Any],
+    payload: Mapping[str, Any],
+) -> list[str]:
+    """Recover exact cheap failures without treating stale facts as valid evidence."""
+    reasons: list[str] = []
+
+    def add(value: Any) -> None:
+        mapped = _map_attestation_reason(value)
+        if mapped and mapped not in reasons:
+            reasons.append(mapped)
+
+    # The verifier's persisted reason is authoritative for a failed snapshot.
+    persisted_reasons = attestation.get("reasons")
+    if isinstance(persisted_reasons, (list, tuple)):
+        for value in persisted_reasons:
+            add(value)
+    add(attestation.get("reason"))
+
+    # A failed contamination result is useful even when older attestations did
+    # not persist the verifier's reason column.
+    contamination_result = _upper(attestation.get("contamination_result"))
+    if not reasons and contamination_result and contamination_result != "PASS":
+        add("FORWARD_CONTAMINATION")
+
+    # Current catalog/provenance metadata can explain a stale attestation
+    # without materializing historical records.
+    metadata = catalog.get("metadata")
+    if isinstance(metadata, Mapping):
+        metadata_contamination = metadata.get(
+            "contamination_result",
+            metadata.get("forward_contamination"),
+        )
+        if (
+            isinstance(metadata_contamination, bool) and metadata_contamination
+        ) or _upper(metadata_contamination) in {
+            "FAIL",
+            "CONTAMINATED",
+            "FORWARD_CONTAMINATION",
+            "FORWARD_COLLECTED",
+            "TRUE",
+            "YES",
+        }:
+            add("FORWARD_CONTAMINATION")
+        if _nonempty(metadata.get("source_type")) and _upper(metadata.get("source_type")) != "HISTORICAL":
+            add("DATASET_PROVENANCE_INVALID")
+
+    catalog_source = _upper(catalog.get("source_type"))
+    if _nonempty(catalog_source) and catalog_source != "HISTORICAL":
+        add("DATASET_PROVENANCE_INVALID")
+    for source in (payload.get("source_type"),):
+        if _nonempty(source) and _upper(source) != "HISTORICAL":
+            add("DATASET_PROVENANCE_INVALID")
+    provenance = payload.get("dataset_provenance")
+    if isinstance(provenance, Mapping):
+        source = provenance.get("source_type")
+        if _nonempty(source) and _upper(source) != "HISTORICAL":
+            add("DATASET_PROVENANCE_INVALID")
+
+    attestation_source = _upper(attestation.get("source_type"))
+    attestation_market = _upper(attestation.get("market_type"))
+    if attestation_source and attestation_source != "HISTORICAL":
+        add("DATASET_PROVENANCE_INVALID")
+    if attestation_market and attestation_market != "PREDICTION":
+        add("DATASET_PROVENANCE_INVALID")
+
+    expected_count = catalog.get("row_count")
+    attestation_count = attestation.get("row_count")
+    if (
+        isinstance(expected_count, int)
+        and not isinstance(expected_count, bool)
+        and isinstance(attestation_count, int)
+        and not isinstance(attestation_count, bool)
+        and attestation_count != expected_count
+    ):
+        add("ROW_COUNT_MISMATCH")
+    completeness = attestation.get("completeness")
+    if isinstance(completeness, (int, float)) and float(completeness) < 1.0:
+        add("INCOMPLETE_DATASET")
+    return reasons
+
+
+def evaluate_prediction_data_quality(
+    store: Any,
+    payload: Mapping[str, Any],
+    *,
+    verify_attestation: bool = True,
+) -> dict[str, Any]:
     """Evaluate immutable historical evidence without conflating fidelity.
 
     The result is the single policy projection consumed by lifecycle gates,
@@ -142,6 +258,8 @@ def evaluate_prediction_data_quality(store: Any, payload: Mapping[str, Any]) -> 
         "dataset_id": dataset_id or None,
         "dataset_version": dataset_version or None,
         "historical_dataset_row_count": 0,
+        "dataset_integrity_attestation_status": None,
+        "dataset_integrity_attestation_hash": None,
         "reasons": [],
     }
     if not applicable:
@@ -180,6 +298,92 @@ def evaluate_prediction_data_quality(store: Any, payload: Mapping[str, Any]) -> 
         base["historical_provenance_complete"] = provenance_complete
         if not provenance_complete:
             reasons.append("HISTORICAL_PROVENANCE_INCOMPLETE")
+        # Recurring consumers only trust a durable CURRENT attestation.  The
+        # ranker owns one-time verification outside publication transactions.
+        attestation_loader = getattr(store, "load_dataset_integrity_attestation", None)
+        attestation_verifier = getattr(store, "verify_dataset_integrity_attestation", None)
+        if callable(attestation_loader):
+            try:
+                attestation = attestation_loader(dataset_id, dataset_version)
+                if (
+                    attestation is None
+                    and verify_attestation
+                    and callable(attestation_verifier)
+                ):
+                    attestation = attestation_verifier(dataset_id, dataset_version)
+            except Exception:
+                attestation = None
+            attestation_status = (
+                _upper(attestation.get("status")) if isinstance(attestation, Mapping) else ""
+            )
+            if isinstance(attestation, Mapping):
+                base["dataset_integrity_attestation_status"] = attestation_status or None
+                base["dataset_integrity_attestation_hash"] = attestation.get("attestation_hash")
+            if not isinstance(attestation, Mapping):
+                reasons.append("HISTORICAL_DATASET_ATTESTATION_MISSING")
+            elif attestation_status != "CURRENT":
+                # Stale attestations fail closed.  Their cheap, explicit
+                # failure metadata is still useful and must not be hidden
+                # behind the generic stale marker.
+                specific_reasons = _attestation_specific_reasons(attestation, catalog, body)
+                if specific_reasons:
+                    reasons.extend(specific_reasons)
+                elif not reasons:
+                    reasons.append("HISTORICAL_DATASET_ATTESTATION_STALE")
+            else:
+                reasons.extend(_attestation_specific_reasons(attestation, catalog, body))
+                attestation_fidelity = _upper(
+                    attestation.get("execution_fidelity", attestation.get("historical_execution_fidelity"))
+                )
+                base["historical_execution_fidelity"] = attestation_fidelity or _fidelity(catalog, body)
+                base["historical_execution_fidelity_score"] = EXECUTION_FIDELITY_SCORES.get(
+                    base["historical_execution_fidelity"]
+                )
+                base["historical_provenance_complete"] = (
+                    _catalog_provenance_complete(catalog)
+                    and _payload_provenance_matches(body, catalog)
+                    and _upper(attestation.get("source_type")) == "HISTORICAL"
+                    and _upper(attestation.get("market_type")) == "PREDICTION"
+                )
+                attestation_count = attestation.get("row_count")
+                expected_count = catalog.get("row_count")
+                completeness = attestation.get("completeness")
+                base["historical_dataset_row_count"] = (
+                    int(attestation_count)
+                    if isinstance(attestation_count, int) and not isinstance(attestation_count, bool)
+                    else 0
+                )
+                base["historical_rows_nonempty"] = bool(
+                    base["historical_dataset_row_count"] > 0
+                    and attestation_count == expected_count
+                    and isinstance(completeness, (int, float))
+                    and float(completeness) >= 1.0
+                )
+                base["historical_no_forward_contamination"] = (
+                    _upper(attestation.get("contamination_result")) == "PASS"
+                )
+                if not base["historical_provenance_complete"]:
+                    reasons.append("HISTORICAL_PROVENANCE_INCOMPLETE")
+                if not base["historical_rows_nonempty"]:
+                    reasons.append("HISTORICAL_ROWS_EMPTY_OR_MISMATCHED")
+                if not base["historical_no_forward_contamination"]:
+                    reasons.append("HISTORICAL_FORWARD_CONTAMINATION")
+                if base["historical_execution_fidelity"] not in EXECUTION_FIDELITY_SCORES:
+                    reasons.append("HISTORICAL_EXECUTION_FIDELITY_UNKNOWN")
+            integrity = not reasons and attestation_status == "CURRENT"
+            base["historical_data_integrity_passed"] = integrity
+            base["historical_data_integrity"] = "PASS" if integrity else "FAIL"
+            acceptable = integrity and base["historical_execution_fidelity"] in {
+                PRICE_PROXY,
+                TIMESTAMPED_DEPTH,
+            }
+            base["canary_data_quality_acceptable"] = acceptable
+            if acceptable and base["historical_execution_fidelity"] == PRICE_PROXY:
+                base["canary_data_quality_status"] = "CANARY_DATA_QUALITY_ACCEPTABLE_LIMITED"
+            elif acceptable:
+                base["canary_data_quality_status"] = "CANARY_DATA_QUALITY_ACCEPTABLE"
+            base["reasons"] = list(dict.fromkeys(reasons))
+            return base
         fidelity = _fidelity(catalog, body)
         base["historical_execution_fidelity"] = fidelity
         base["historical_execution_fidelity_score"] = EXECUTION_FIDELITY_SCORES.get(fidelity)
@@ -272,6 +476,8 @@ def persisted_quality_fields(result: Mapping[str, Any]) -> dict[str, Any]:
         "canary_data_quality_status",
         "production_evidence_status",
         "historical_dataset_row_count",
+        "dataset_integrity_attestation_status",
+        "dataset_integrity_attestation_hash",
     )
     return {
         "data_quality_passed": bool(result.get("canary_data_quality_acceptable")),

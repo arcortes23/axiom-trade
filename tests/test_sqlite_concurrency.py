@@ -55,8 +55,37 @@ class _BarsProvider:
         self.calls.append((start, end, interval))
         return [bar for bar in self.bars if start <= bar.timestamp <= end]
 
+def _seed_attestation_dataset(store: AxiomStore) -> None:
+    store.save_dataset(
+        "prediction:race",
+        "v1",
+        [{"timestamp": T0.isoformat(), "price": 0.5, "source_type": "HISTORICAL"}],
+        quality="PRICE_PROXY",
+    )
+    store.save_dataset_catalog(
+        "prediction:race",
+        "v1",
+        provider="fixture",
+        instrument="race-market",
+        market_type="prediction",
+        timeframe="1h",
+        start_timestamp=T0,
+        end_timestamp=T0,
+        row_count=1,
+        completeness=1.0,
+        quality="PRICE_PROXY",
+        source_type="HISTORICAL",
+        snapshot_id="prediction:race:v1",
+        metadata={
+            "provider": "fixture",
+            "source_type": "HISTORICAL",
+            "policy_version": "prediction-integrity-v1",
+        },
+    )
+
 
 class SQLiteConcurrencyTests(unittest.TestCase):
+
     def test_file_store_uses_verified_wal_and_memory_store_does_not_assume_wal(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = str(Path(directory) / "operational.sqlite3")
@@ -281,6 +310,112 @@ class SQLiteConcurrencyTests(unittest.TestCase):
             "another AXIOM writer held the operational database too long",
             output.getvalue(),
         )
+
+    def test_attestation_first_writer_insert_returns_one_winner(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "attestation-insert.sqlite3")
+            seed = AxiomStore(path)
+            _seed_attestation_dataset(seed)
+            seed.close()
+            left = AxiomStore(path)
+            right = AxiomStore(path)
+            barrier = threading.Barrier(2)
+            results: list[dict[str, object]] = []
+            errors: list[BaseException] = []
+            def delayed(original):
+                def verify(connection, dataset_id, dataset_version):
+                    value = original(connection, dataset_id, dataset_version)
+                    barrier.wait(5)
+                    return value
+
+                return verify
+
+            left._verify_dataset_integrity_snapshot = delayed(left._verify_dataset_integrity_snapshot)  # type: ignore[method-assign]
+            right._verify_dataset_integrity_snapshot = delayed(right._verify_dataset_integrity_snapshot)  # type: ignore[method-assign]
+
+            def worker(store: AxiomStore) -> None:
+                try:
+                    results.append(store.verify_dataset_integrity_attestation("prediction:race", "v1", force=True))
+                except BaseException as exc:
+                    errors.append(exc)
+
+            threads = [threading.Thread(target=worker, args=(store,)) for store in (left, right)]
+            try:
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(10)
+                    self.assertFalse(thread.is_alive(), "attestation insert worker did not finish")
+                self.assertEqual(errors, [])
+                self.assertEqual(len(results), 2)
+                self.assertEqual([item["status"] for item in results], ["CURRENT", "CURRENT"])
+                durable = left.load_dataset_integrity_attestation("prediction:race", "v1")
+                self.assertIsNotNone(durable)
+                assert durable is not None
+                self.assertEqual(durable["status"], "CURRENT")
+                self.assertTrue(all(item["attestation_hash"] == durable["attestation_hash"] for item in results))
+            finally:
+                right.close()
+                left.close()
+
+    def test_delayed_attestation_cannot_overwrite_newer_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "attestation-update.sqlite3")
+            seed = AxiomStore(path)
+            _seed_attestation_dataset(seed)
+            seed.verify_dataset_integrity_attestation("prediction:race", "v1", force=True)
+            seed.close()
+            delayed = AxiomStore(path)
+            newer = AxiomStore(path)
+            entered = threading.Event()
+            release = threading.Event()
+            original = delayed._verify_dataset_integrity_snapshot
+
+            def verify(connection, dataset_id, dataset_version):
+                value = original(connection, dataset_id, dataset_version)
+                entered.set()
+                if not release.wait(5):
+                    raise RuntimeError("attestation verifier release timed out")
+                return value
+
+            delayed._verify_dataset_integrity_snapshot = verify  # type: ignore[method-assign]
+            result: dict[str, dict[str, object]] = {}
+            errors: list[BaseException] = []
+
+            def worker() -> None:
+                try:
+                    result["delayed"] = delayed.verify_dataset_integrity_attestation(
+                        "prediction:race", "v1", force=True
+                    )
+                except BaseException as exc:
+                    errors.append(exc)
+
+            thread = threading.Thread(target=worker)
+            try:
+                thread.start()
+                self.assertTrue(entered.wait(5), "delayed attestation did not reach snapshot fence")
+                winner = newer.load_dataset_integrity_attestation("prediction:race", "v1")
+                self.assertIsNotNone(winner)
+                assert winner is not None
+                winner["policy_version"] = "prediction-integrity-v2"
+                winner.pop("attestation_hash", None)
+                self.assertTrue(newer.save_dataset_integrity_attestation("prediction:race", "v1", winner))
+                release.set()
+                thread.join(10)
+                self.assertFalse(thread.is_alive(), "delayed attestation worker did not finish")
+                self.assertEqual(errors, [])
+                self.assertEqual(result["delayed"]["status"], "STALE")
+                self.assertEqual(result["delayed"]["reason"], "ATTESTATION_CAS_LOST")
+                durable = newer.load_dataset_integrity_attestation("prediction:race", "v1")
+                self.assertIsNotNone(durable)
+                assert durable is not None
+                self.assertEqual(durable["status"], "CURRENT")
+                self.assertEqual(durable["policy_version"], "prediction-integrity-v2")
+                self.assertEqual(result["delayed"]["attestation_hash"], durable["attestation_hash"])
+            finally:
+                release.set()
+                delayed.close()
+                newer.close()
 
     def test_projection_publication_busy_is_stale_and_recoverable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

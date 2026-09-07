@@ -190,6 +190,25 @@ class CanaryTests(unittest.TestCase):
         for stage in ("SCHEMA_VALIDATED","BACKTESTED","VALIDATED","ROBUSTNESS_CHECKED","FROZEN","PAPER_FORWARD","PAPER_PROMOTABLE"):
             self.store.save_candidate_lifecycle("C123",stage,payload,timestamp=T0)
         self.service.mark_eligible("C123")
+    def test_initial_readiness_keeps_qualification_and_selection_unknown(self):
+        store = AxiomStore(":memory:")
+        self.addCleanup(store.close)
+        service = CanaryService(store, clock=lambda: T0)
+        status = service.status()
+        self.assertEqual(status["readiness_snapshot_status"], "STALE")
+        self.assertEqual(
+            status["readiness_snapshot_reason"],
+            "READINESS_SNAPSHOT_INITIALIZING",
+        )
+        for field in ("eligibility_raw_count", "eligible_count", "rankable_raw_count", "rankable_count"):
+            self.assertIsNone(status[field])
+        self.assertEqual(status["selection_status"], "UNKNOWN")
+        self.assertIsNone(status["selection_valid"])
+        self.assertIsNone(status["selected_candidate"])
+        self.assertIsNone(status["winner_id"])
+        self.assertIsNone(status["selection_reason"])
+        self.assertIsNone(status["selection_invalidation_reason"])
+
     def arm(self, **kwargs): return self.service.arm("C123",venue=kwargs.pop("venue",self.venue),credentials_configured=True,**kwargs)
     def submit(self, signal="s1", **kwargs):
         candidate_id = kwargs.pop("candidate_id", "C123")
@@ -562,8 +581,56 @@ class CanaryTests(unittest.TestCase):
                 "SELECT control_generation FROM canary_control WHERE singleton=1"
             ).fetchone()
             self.assertEqual(row["control_generation"], 1)
+            ledger_columns = {
+                str(row["name"])
+                for row in legacy_store.connection.execute(
+                    "PRAGMA table_info(canary_ledger)"
+                )
+            }
+            self.assertIn("control_generation", ledger_columns)
         finally:
             legacy_store.close()
+    def test_status_report_retains_latest_signal_and_legacy_projection_aliases(self):
+        self.store.connection.execute(
+            "INSERT INTO canary_signals("
+            "signal_id,candidate_id,frozen_hash,strategy_hash,model_hash,config_hash,"
+            "market_id,token_id,outcome,side,paper_expected_price,source_snapshot_id,"
+            "source_timestamp,generated_at,expires_at,status,reason,evidence_json,updated_at"
+            ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "status-report-signal",
+                "C123",
+                "frozen",
+                "strategy",
+                "model",
+                "config",
+                "market-1",
+                "yes",
+                "yes",
+                "BUY",
+                "0.50",
+                "snapshot-1",
+                T0.isoformat(),
+                T0.isoformat(),
+                (T0 + timedelta(minutes=1)).isoformat(),
+                "READY",
+                None,
+                json.dumps({"depth": [{"price": "0.50"}] * 200}),
+                T0.isoformat(),
+            ),
+        )
+        self.store.connection.commit()
+        report = self.service.status_report()
+        self.assertEqual(report["latest_signal"]["signal_id"], "status-report-signal")
+        self.assertEqual(report["readiness"]["latest_signal"]["signal_id"], "status-report-signal")
+        self.assertIn("micro_live_canary", report)
+        self.assertIn("control_generation", report)
+        self.assertIn("selection_status", report)
+        self.assertIn("execution", report)
+        self.assertLessEqual(
+            len(report["latest_signal"]["evidence"]["depth"]),
+            1,
+        )
 
     def test_schema_initialization_migration_holds_store_lock(self):
         legacy_store = HealthyStore(":memory:")
@@ -736,6 +803,62 @@ class CanaryTests(unittest.TestCase):
         self.assertEqual(self.service.status()["readiness_snapshot_status"], "STALE")
         self.service.publish_readiness_snapshot(reason="RETRY_AFTER_BUSY")
         self.assertEqual(self.service.status()["readiness_snapshot_status"], "CURRENT")
+
+    def test_matched_evaluation_failure_marks_projection_stale(self):
+        baseline = self.service.publish_readiness_snapshot(reason="BASELINE")
+        version = self.store.connection.execute(
+            "SELECT projection_version FROM canary_readiness_snapshot "
+            "WHERE singleton=1"
+        ).fetchone()["projection_version"]
+
+        result = self.service._persist_evaluation_failure(
+            error_code="MATCHED_FAILURE",
+            expected_projection_version=version,
+        )
+
+        row = self.store.connection.execute(
+            "SELECT payload_json,projection_version,readiness_snapshot_status,"
+            "readiness_snapshot_stale,readiness_snapshot_reason "
+            "FROM canary_readiness_snapshot WHERE singleton=1"
+        ).fetchone()
+        self.assertEqual(row["projection_version"], version)
+        self.assertEqual(row["readiness_snapshot_status"], "STALE")
+        self.assertEqual(row["readiness_snapshot_stale"], 1)
+        self.assertEqual(row["readiness_snapshot_reason"], "EVALUATION_FAILED")
+        payload = json.loads(row["payload_json"])
+        self.assertEqual(payload["readiness_evaluation_error_code"], "MATCHED_FAILURE")
+        self.assertEqual(payload["micro_live_canary"], baseline["micro_live_canary"])
+        self.assertEqual(result["readiness_snapshot_reason"], "EVALUATION_FAILED")
+
+    def test_older_evaluation_failure_cannot_clobber_newer_current_projection(self):
+        self.service.publish_readiness_snapshot(reason="OLDER_EVALUATION")
+        expected_version = self.store.connection.execute(
+            "SELECT projection_version FROM canary_readiness_snapshot "
+            "WHERE singleton=1"
+        ).fetchone()["projection_version"]
+        newer = self.service.publish_readiness_snapshot(reason="NEWER_CURRENT")
+        before = self.store.connection.execute(
+            "SELECT payload_json,projection_version,readiness_snapshot_status,"
+            "readiness_snapshot_stale,readiness_snapshot_reason "
+            "FROM canary_readiness_snapshot WHERE singleton=1"
+        ).fetchone()
+
+        result = self.service._persist_evaluation_failure(
+            error_code="OLDER_FAILURE",
+            expected_projection_version=expected_version,
+        )
+
+        after = self.store.connection.execute(
+            "SELECT payload_json,projection_version,readiness_snapshot_status,"
+            "readiness_snapshot_stale,readiness_snapshot_reason "
+            "FROM canary_readiness_snapshot WHERE singleton=1"
+        ).fetchone()
+        self.assertEqual(after["payload_json"], before["payload_json"])
+        self.assertEqual(after["projection_version"], before["projection_version"])
+        self.assertEqual(after["readiness_snapshot_status"], "CURRENT")
+        self.assertEqual(after["readiness_snapshot_stale"], 0)
+        self.assertEqual(after["readiness_snapshot_reason"], "NEWER_CURRENT")
+        self.assertEqual(result, newer)
 
     def test_snapshot_publications_serialize_authoritative_read_and_write(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -932,6 +1055,31 @@ class CanaryTests(unittest.TestCase):
         self.assertEqual(dashboard["canary"]["eligible_count"], 1)
         self.assertEqual(dashboard["research_cards"]["canary_eligible"], 1)
         self.assertEqual(dashboard["candidate_status"]["canary_eligible"], 1)
+        with self.store.connection:
+            self.store.connection.execute(
+                "UPDATE canary_readiness_snapshot SET "
+                "readiness_snapshot_status='CURRENT',"
+                "readiness_snapshot_stale=0,"
+                "readiness_snapshot_updated_at=? "
+                "WHERE singleton=1",
+                ((T0 - timedelta(hours=1)).isoformat(),),
+            )
+        stale = self.service.status()
+        self.assertEqual(stale["readiness_snapshot_status"], "STALE")
+        self.assertEqual(stale["readiness_snapshot_reason"], "READINESS_SNAPSHOT_TOO_OLD")
+        self.assertEqual(stale["eligible_count"], 1)
+        with patch.object(
+            CredentialStore,
+            "safe_projection",
+            return_value={
+                "configured": False,
+                "status": "NOT CONFIGURED",
+                "secret_values_exposed": False,
+            },
+        ):
+            stale_dashboard = DashboardData(store=self.store).canary_data()
+        self.assertEqual(stale_dashboard["canary"]["eligible_count"], 1)
+        self.assertEqual(stale_dashboard["candidate_status"]["canary_eligible"], 1)
 
 
     def test_expired_arm_cannot_trade(self):

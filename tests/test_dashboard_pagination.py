@@ -656,6 +656,9 @@ class DashboardPaginationEndpointTests(DashboardPaginationFixture):
             self.assertIsNone(projection["selected_candidate"])
             self.assertIsNone(projection["winner_id"])
             self.assertEqual(projection["last_selected_candidate"], "dashboard-stale")
+            self.assertEqual(projection["eligible_count"], 1)
+            self.assertEqual(projection["rankable_count"], 1)
+            self.assertEqual(projection["selection_reason"], "SELECTED_WINNER")
             self.assertEqual(
                 projection["selection_invalidation_reason"],
                 "REEVALUATION_REQUIRED",
@@ -1459,7 +1462,7 @@ class DashboardPaginationEndpointTests(DashboardPaginationFixture):
             self.assertIsInstance(canary, dict)
             assert isinstance(canary, dict)
             canary_status = canary["canary"]
-            self.assertEqual(canary_status["micro_live_canary"], "DISABLED")
+            self.assertEqual(canary_status["micro_live_canary"], "UNKNOWN")
             self.assertEqual(canary_status["eligible_count"], 1)
             self.assertEqual(canary_status["rankable_count"], 0)
             self.assertEqual(canary_status["execution_event_count"], 0)
@@ -1967,8 +1970,9 @@ class DashboardPaginationSurfaceTests(DashboardPaginationFixture):
         self.assertFalse(payload["connectivity"]["ready"])
         self.assertEqual(
             payload["autonomous_canary"]["blocker"],
-            "AUTONOMOUS_CANARY_DISABLED",
+            "AUTONOMOUS_CONTROL_UNKNOWN",
         )
+        self.assertEqual(payload["canary"]["control_state"], "UNKNOWN")
 
         ready = _connectivity_projection(ready=True, status="READY")
         self.store.set_operator_config(CANARY_CONNECTIVITY_CONFIG_KEY, ready)
@@ -1979,8 +1983,9 @@ class DashboardPaginationSurfaceTests(DashboardPaginationFixture):
         self.assertTrue(payload["connectivity"]["ready"])
         self.assertEqual(
             payload["autonomous_canary"]["blocker"],
-            "AUTONOMOUS_CANARY_DISABLED",
+            "AUTONOMOUS_CONTROL_UNKNOWN",
         )
+        self.assertEqual(payload["canary"]["control_state"], "UNKNOWN")
 
 
     def test_dashboard_formats_utc_as_pht_without_mutating_api_timestamps(self) -> None:
