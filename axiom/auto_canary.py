@@ -50,7 +50,7 @@ class AutonomousCanaryWorker:
                 service=service,
                 clock=self.clock,
             ).evaluate_and_select(timestamp)
-            control = service.status()
+            control = service.authoritative_status()
             if control.get("micro_live_canary") == "KILLED":
                 result = {
                     "status": "BLOCKED",

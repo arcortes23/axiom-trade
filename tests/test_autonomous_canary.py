@@ -492,18 +492,44 @@ class AutonomousWorkflowTests(unittest.TestCase):
         payload = self.seed_candidate("gated")
         dashboard = DashboardData(store=self.store)
         record = self.store.load_candidate_lifecycle("gated")
-        fields = dashboard._candidate_status_fields(record)
-        self.assertTrue(fields["canary_eligible"])
-        self.assertEqual(fields["historical_gates"], "PASSED")
-        self.assertEqual(fields["historical_data_integrity"], "PASS")
-        self.assertEqual(fields["historical_execution_fidelity"], "PRICE_PROXY · LIMITED")
-        self.assertEqual(fields["canary_data_quality_gate"], "PASS FOR $1 MICRO-LIVE")
+        with patch.object(
+            CanaryService,
+            "validate_eligibility",
+            side_effect=AssertionError("dashboard projection must not qualify"),
+        ):
+            fields = dashboard._candidate_status_fields(record)
+        self.assertFalse(fields["canary_eligible"])
+        self.assertEqual(fields["historical_gates"], "NOT_PASSED")
+        self.assertEqual(fields["historical_data_integrity"], "UNKNOWN")
+        self.assertEqual(fields["historical_execution_fidelity"], "UNKNOWN")
+        self.assertEqual(fields["canary_data_quality_gate"], "NOT PASSED")
         self.assertEqual(fields["production_evidence"], "INSUFFICIENT")
+
+        self.service.mark_eligible("gated")
+        with patch.object(
+            CanaryService,
+            "validate_eligibility",
+            side_effect=AssertionError("dashboard projection must not qualify"),
+        ):
+            eligible = dashboard._candidate_status_fields(
+                self.store.load_candidate_lifecycle("gated")
+            )
+        self.assertTrue(eligible["canary_eligible"])
+
         changed = dict(payload)
         changed["validation_passed"] = False
         self.store.save_candidate_lifecycle("gated", "FROZEN", changed, from_stage="FROZEN", timestamp=T0)
-        invalid = dashboard._candidate_status_fields(self.store.load_candidate_lifecycle("gated"))
-        self.assertFalse(invalid["canary_eligible"])
+        authoritative = self.service.validate_eligibility("gated")
+        self.assertFalse(authoritative["eligible"])
+        with patch.object(
+            CanaryService,
+            "validate_eligibility",
+            side_effect=AssertionError("dashboard projection must not qualify"),
+        ):
+            invalid = dashboard._candidate_status_fields(
+                self.store.load_candidate_lifecycle("gated")
+            )
+        self.assertTrue(invalid["canary_eligible"])
         self.assertEqual(invalid["historical_gates"], "NOT_PASSED")
     def test_price_proxy_is_limited_historical_fidelity(self):
         self.seed_candidate("proxy")
@@ -744,6 +770,46 @@ class AutonomousWorkflowTests(unittest.TestCase):
         blocked = worker.tick(now=T0)
         self.assertEqual(blocked["blocker"], "NO_ELIGIBLE_RANKABLE_CANDIDATE")
         self.assertEqual(calls, [])
+
+    def test_worker_uses_authoritative_control_when_dashboard_snapshot_is_missing(self):
+        self.seed_candidate("durable-winner", score=0.90)
+        enabled = self.service.enable_autonomous_micro_live()
+        self.assertEqual(enabled["micro_live_canary"], AUTONOMOUS_MICRO_LIVE)
+
+        # Enabling durable control does not require a dashboard projection.  A
+        # missing projection therefore reports the safe display default even
+        # while autonomous control is live.
+        with self.store.connection:
+            self.store.connection.execute(
+                "DELETE FROM canary_readiness_snapshot WHERE singleton=1"
+            )
+        dashboard_projection = self.service.status()
+        self.assertEqual(dashboard_projection["micro_live_canary"], "DISABLED")
+        dashboard_projection.update(
+            {
+                "candidate": "dashboard-only",
+                "selected_candidate": "dashboard-only",
+            }
+        )
+
+        worker = AutonomousCanaryWorker(self.store, clock=lambda: T0)
+        with patch.object(
+            CanaryService,
+            "publish_readiness_snapshot",
+            autospec=True,
+            side_effect=lambda service, reason="AUTHORITATIVE_UPDATE": (
+                service.authoritative_status()
+            ),
+        ), patch.object(CanaryService, "status", return_value=dashboard_projection):
+            result = worker.tick(now=T0)
+
+        self.assertEqual(result["status"], "NO_SIGNAL")
+        self.assertEqual(result["candidate_id"], "durable-winner")
+        authoritative = self.service.authoritative_status()
+        self.assertEqual(authoritative["micro_live_canary"], AUTONOMOUS_MICRO_LIVE)
+        self.assertEqual(authoritative["candidate"], "durable-winner")
+
+
     def test_ranker_re_evaluates_legacy_full_payload_into_qualification_binding(self):
         payload = self.seed_candidate("legacy")
         legacy_evidence = {
@@ -932,10 +998,19 @@ class AutonomousWorkflowTests(unittest.TestCase):
         stale = self.service.status()
         self.assertEqual(stale["selection_status"], "STALE")
         self.assertFalse(stale["selection_valid"])
-        self.assertEqual(stale["selection_invalidation_reason"], "RANKING_EVIDENCE_CHANGED")
+        self.assertEqual(stale["selection_invalidation_reason"], "LIFECYCLE_EVIDENCE_UPDATED")
         self.assertIsNone(stale["selected_candidate"])
         self.assertIsNone(stale["winner_id"])
-        last_selected = stale["last_selected_candidate"]
+        authoritative = self.service.authoritative_status()
+        self.assertEqual(authoritative["selection_status"], "STALE")
+        self.assertFalse(authoritative["selection_valid"])
+        self.assertEqual(
+            authoritative["selection_invalidation_reason"],
+            "RANKING_EVIDENCE_CHANGED",
+        )
+        self.assertIsNone(authoritative["selected_candidate"])
+        self.assertIsNone(authoritative["winner_id"])
+        last_selected = authoritative["last_selected_candidate"]
         self.assertEqual(
             last_selected.get("candidate_id") if isinstance(last_selected, dict) else last_selected,
             "forward-change",
@@ -981,10 +1056,18 @@ class AutonomousWorkflowTests(unittest.TestCase):
         stale = self.service.status()
         self.assertEqual(stale["selection_status"], "STALE")
         self.assertFalse(stale["selection_valid"])
-        self.assertEqual(stale["selection_invalidation_reason"], "RANKING_EVIDENCE_CHANGED")
+        self.assertEqual(stale["selection_invalidation_reason"], "LIFECYCLE_EVIDENCE_UPDATED")
         self.assertIsNone(stale["selected_candidate"])
         self.assertIsNone(stale["winner_id"])
-
+        authoritative = self.service.authoritative_status()
+        self.assertEqual(authoritative["selection_status"], "STALE")
+        self.assertFalse(authoritative["selection_valid"])
+        self.assertEqual(
+            authoritative["selection_invalidation_reason"],
+            "RANKING_EVIDENCE_CHANGED",
+        )
+        self.assertIsNone(authoritative["selected_candidate"])
+        self.assertIsNone(authoritative["winner_id"])
         refreshed = CandidateCanaryRanker(self.store, clock=lambda: T0).evaluate_and_select(T0)
         new_row = self.store.connection.execute(
             "SELECT qualification_hash,ranking_snapshot_hash,total_score "

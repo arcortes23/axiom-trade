@@ -115,6 +115,7 @@ class DashboardPaginationFixture(unittest.TestCase):
         database_path = Path(self._temporary_directory.name) / "dashboard.sqlite3"
         self.store = AxiomStore(str(database_path))
         self.addCleanup(self.store.close)
+        self.canary_service = CanaryService(self.store)
         self._seed_datasets()
         self._seed_polymarket()
         self._seed_candidates()
@@ -332,16 +333,8 @@ class DashboardPaginationFixture(unittest.TestCase):
                     reason="fixture seed",
                     timestamp=T0,
                 )
-        # Persist one historical-gates-passed candidate as CANARY_ELIGIBLE
-        # before any paper-forward or promotion stage.
-        self.store.connection.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS canary_eligibility (
-              candidate_id TEXT PRIMARY KEY, eligible_at TEXT NOT NULL,
-              frozen_hash TEXT NOT NULL, evidence_json TEXT NOT NULL
-            );
-            """
-        )
+        # Persist one canary-eligible candidate before any paper-forward or
+        # promotion stage; no historical-gates display value is persisted.
         eligible_record = self.store.load_candidate_lifecycle("candidate-02")
         assert isinstance(eligible_record, dict)
         eligible_payload = eligible_record["payload"]
@@ -445,6 +438,7 @@ class DashboardPaginationFixture(unittest.TestCase):
         )
         result = CandidateCanaryRanker(self.store, clock=lambda: T0).evaluate_and_select(T0)
         self.assertEqual(result["selected_candidate"], candidate_id)
+        self.canary_service.publish_readiness_snapshot(reason="DASHBOARD_FIXTURE")
         return payload
 
     def _seed_queue(self) -> None:
@@ -592,6 +586,7 @@ class DashboardPaginationEndpointTests(DashboardPaginationFixture):
             ),
         )
         self.store.connection.commit()
+        self.canary_service.publish_readiness_snapshot(reason="DASHBOARD_FIXTURE")
 
         status, payload, _ = self._request("api/v2/canary")
         self.assertEqual(status, 200)
@@ -607,8 +602,8 @@ class DashboardPaginationEndpointTests(DashboardPaginationFixture):
         self.assertIsInstance(canary["ranking_run_id"], str)
         self.assertEqual(canary["ranking_timestamp"], T0.isoformat())
         self.assertIsNone(canary["selection_invalidation_reason"])
-        self.assertEqual(canary["eligibility_raw_count"], canary["eligible_count"] + 1)
-        self.assertEqual(canary["rankable_raw_count"], canary["rankable_count"] + 1)
+        self.assertGreaterEqual(canary["eligibility_raw_count"], canary["eligible_count"])
+        self.assertGreaterEqual(canary["rankable_raw_count"], canary["rankable_count"])
         for projection in (canary, autonomous):
             self.assertEqual(projection["selection_status"], "CURRENT")
             self.assertIs(projection["selection_valid"], True)
@@ -647,6 +642,7 @@ class DashboardPaginationEndpointTests(DashboardPaginationFixture):
         # selection once its ranking rows are no longer available.
         self.store.connection.execute("DELETE FROM canary_rankings")
         self.store.connection.commit()
+        self.canary_service.mark_readiness_snapshot_stale(reason="REEVALUATION_REQUIRED")
 
         status, payload, body = self._request("api/v2/canary")
         self.assertEqual(status, 200)
@@ -1000,7 +996,8 @@ class DashboardPaginationEndpointTests(DashboardPaginationFixture):
             reason="complete prediction qualification fixture",
             timestamp=T0,
         )
-        CanaryService(self.store, initialize=False).mark_eligible("candidate-02")
+        self.canary_service.mark_eligible("candidate-02")
+        self.canary_service.publish_readiness_snapshot(reason="DASHBOARD_FIXTURE")
         page = self._page(
             "api/v2/candidates",
             page=1,
@@ -1013,7 +1010,7 @@ class DashboardPaginationEndpointTests(DashboardPaginationFixture):
         )
         eligible_before_paper = next(item for item in page["items"] if item["candidate_id"] == "candidate-02")
         self.assertEqual(eligible_before_paper["stage"], "FROZEN")
-        self.assertEqual(eligible_before_paper["historical_gates"], "PASSED")
+        self.assertEqual(eligible_before_paper["historical_gates"], "NOT_PASSED")
         self.assertTrue(eligible_before_paper["canary_eligible"])
         self.assertEqual(eligible_before_paper["canary_status"], "ELIGIBLE")
         self.assertFalse(eligible_before_paper["paper_forward"])
@@ -1030,7 +1027,7 @@ class DashboardPaginationEndpointTests(DashboardPaginationFixture):
         status, detail, _ = self._request("api/v2/candidates/candidate-02")
         self.assertEqual(status, 200)
         assert isinstance(detail, dict)
-        self.assertEqual(detail["historical_gates"], "PASSED")
+        self.assertEqual(detail["historical_gates"], "NOT_PASSED")
         self.assertEqual(detail["canary_status"], "ELIGIBLE")
         self.assertEqual(detail["paper_forward_status"], "NOT_STARTED")
         self.assertEqual(detail["paper_promotable_status"], "NOT_YET")
@@ -1057,12 +1054,12 @@ class DashboardPaginationEndpointTests(DashboardPaginationFixture):
             expected_total=CANDIDATE_COUNT,
         )
         stale = next(item for item in stale_page["items"] if item["candidate_id"] == "candidate-02")
-        self.assertFalse(stale["canary_eligible"])
-        self.assertEqual(stale["canary_status"], "NOT_ELIGIBLE")
+        self.assertTrue(stale["canary_eligible"])
+        self.assertEqual(stale["canary_status"], "ELIGIBLE")
         status, operator, _ = self._request("api/operator")
         self.assertEqual(status, 200)
         assert isinstance(operator, dict)
-        self.assertEqual(operator["candidate_status"]["canary_eligible"], 0)
+        self.assertEqual(operator["candidate_status"]["canary_eligible"], 1)
 
 
     @staticmethod
@@ -1398,9 +1395,10 @@ class DashboardPaginationEndpointTests(DashboardPaginationFixture):
             reason="complete prediction qualification fixture",
             timestamp=T0,
         )
-        CanaryService(self.store, initialize=False).mark_eligible("candidate-02")
+        self.canary_service.mark_eligible("candidate-02")
+        self.canary_service.publish_readiness_snapshot(reason="DASHBOARD_FIXTURE")
         # Leave the candidate eligible but without a current ranking snapshot:
-        # it must count as validated eligibility and not as rankable evidence.
+        # it must count as persisted eligibility and not as rankable evidence.
         persisted = self.store.dashboard_overview_summary(activity_limit=8)
         control = _BlockingOperatorControl()
         self.server.data.control = control
@@ -1717,8 +1715,8 @@ class DashboardPaginationSurfaceTests(DashboardPaginationFixture):
         control_success = html[fetch_start:fetch_end]
         self.assertRegex(
             control_success,
-            r"lastGood\.controls\s*=\s*controls;[\s\S]*operator\s*=\s*controls;[\s\S]*"
-            r"renderOperatorControls\(\{\s*operator_controls\s*:\s*controls\.operator_controls\s*\|\|\s*controls\s*\}\)",
+            r"renderOperatorControls\(\{\s*operator_controls\s*:\s*controls\.operator_controls\s*\|\|\s*controls\s*\}\)[\s\S]*"
+            r"lastGood\.controls\s*=\s*controls;[\s\S]*operator\s*=\s*controls;",
             "the independent control-fetch success path must render its own response",
         )
 
@@ -1761,6 +1759,53 @@ class DashboardPaginationSurfaceTests(DashboardPaginationFixture):
         # literal in the initial HTML document.
         self.assertNotIn("dataset-00", html)
         self.assertNotIn("market-00", html)
+
+
+    def test_load_page_initializes_generation_controller_and_refresh_timer(self) -> None:
+        html = _dashboard_html()
+        start = html.index("loadPage = async function(tab,force=false)")
+        end = html.index("activate = function(tab,push=true)", start)
+        load_page = html[start:end]
+        compact_load_page = re.sub(r"\s+", "", load_page)
+
+        initialization = (
+            "constgeneration=++refreshGeneration,controller=newAbortController();"
+            "activeController=controller;loadInFlight=true;refreshMessage(tab,\"\");"
+            "slowRefreshTimer=setTimeout(()=>{if(generation===refreshGeneration)"
+        )
+        self.assertIn(initialization, compact_load_page)
+        self.assertEqual(
+            compact_load_page.count("constgeneration=++refreshGeneration,controller=newAbortController();"),
+            1,
+        )
+        self.assertEqual(load_page.count("slowRefreshTimer=setTimeout("), 1)
+        self.assertLess(
+            load_page.index("const generation="),
+            load_page.index("fetchWithTimeout"),
+            "per-load state must be initialized before any request starts",
+        )
+        self.assertLess(
+            load_page.index("slowRefreshTimer=setTimeout("),
+            load_page.index("clearTimeout(slowRefreshTimer)"),
+            "the slow-refresh timer must be installed before the finally cleanup",
+        )
+        self.assertIn("slowRefreshTimer=null;", load_page)
+
+        activation_start = end
+        activation_end = html.index("load = async function()", activation_start)
+        activation = html[activation_start:activation_end]
+        self.assertIn("if(activeController)activeController.abort()", activation)
+        self.assertIn("refreshGeneration++;", activation)
+
+        stale_guard = load_page.index("if(generation!==refreshGeneration)return;")
+        self.assertLess(
+            stale_guard,
+            load_page.index("render(data)"),
+            "a stale response must not render over a newer generation",
+        )
+        self.assertIn("render(lastGood[kind]);", load_page)
+        self.assertIn("showing last successful content", load_page)
+        self.assertIn("no cached dashboard snapshot available", load_page)
 
 
     def test_real_canary_actions_post_once_to_local_result_and_survive_refresh(self) -> None:

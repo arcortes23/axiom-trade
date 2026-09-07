@@ -9,6 +9,7 @@ import multiprocessing
 import sqlite3
 import tempfile
 import threading
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -16,7 +17,7 @@ from unittest.mock import patch
 from axiom.canary import CanaryBlocked, CanaryLimits, CanaryService, CredentialStore, PolymarketClobV2Venue, PRODUCTION_LIVE_EXECUTION
 from axiom.cli import main
 from axiom.dashboard import DashboardData, _dashboard_html
-from axiom.storage import AxiomStore
+from axiom.storage import AxiomStore, SQLiteBusyTimeout
 
 T0=datetime(2026,1,2,12,tzinfo=timezone.utc)
 
@@ -649,7 +650,7 @@ class CanaryTests(unittest.TestCase):
         finally:
             legacy_store.close()
 
-    def test_status_projection_read_is_serialized_against_concurrent_writer(self):
+    def test_authoritative_status_read_is_serialized_against_concurrent_writer(self):
         self.store.connection.execute(
             "INSERT INTO canary_selection("
             "singleton,ranking_run_id,candidate_id,rank,total_score,"
@@ -677,12 +678,12 @@ class CanaryTests(unittest.TestCase):
         def gated_limits_record(limits):
             read_started.set()
             if not release_read.wait(2):
-                raise AssertionError("status projection was not released")
+                raise AssertionError("authoritative status projection was not released")
             return original_limits_record(limits)
 
         def read_status():
             try:
-                result["status"] = self.service.status()
+                result["status"] = self.service.authoritative_status()
             except BaseException as exc:
                 result["error"] = exc
 
@@ -718,6 +719,83 @@ class CanaryTests(unittest.TestCase):
         self.assertNotIn("error", result)
         self.assertIn("status", result)
         self.assertFalse(writer_acquired.is_set())
+    def test_projection_busy_after_authoritative_commit_returns_stale_result(self):
+        with patch(
+            "axiom.canary.sqlite_retry",
+            side_effect=SQLiteBusyTimeout("publish canary readiness snapshot"),
+        ):
+            result = self.arm()
+        self.assertEqual(result["readiness_snapshot_status"], "STALE")
+        self.assertTrue(result["readiness_snapshot_stale"])
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT state FROM canary_control WHERE singleton=1"
+            ).fetchone()["state"],
+            "ARMED",
+        )
+        self.assertEqual(self.service.status()["readiness_snapshot_status"], "STALE")
+        self.service.publish_readiness_snapshot(reason="RETRY_AFTER_BUSY")
+        self.assertEqual(self.service.status()["readiness_snapshot_status"], "CURRENT")
+
+    def test_snapshot_publications_serialize_authoritative_read_and_write(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = f"{directory}\\projection-order.sqlite3"
+            first_store = AxiomStore(path, sqlite_timeout_seconds=0.05)
+            second_store = AxiomStore(path, sqlite_timeout_seconds=0.05)
+            first = CanaryService(first_store, clock=lambda: T0)
+            second = CanaryService(second_store, clock=lambda: T0)
+            first_read = threading.Event()
+            release_first = threading.Event()
+            results = {}
+
+            def first_status():
+                return {"micro_live_canary": "ARMED", "selection_status": "S1"}
+
+            def second_status():
+                return {"micro_live_canary": "DISARMED", "selection_status": "S2"}
+
+            def first_signal():
+                first_read.set()
+                if not release_first.wait(3):
+                    raise AssertionError("first publication was not released")
+                return None
+
+            first.authoritative_status = first_status
+            second.authoritative_status = second_status
+            first.latest_signal = first_signal
+            second.latest_signal = lambda: None
+
+            def publish(service, key):
+                try:
+                    results[key] = service.publish_readiness_snapshot(reason=key)
+                except BaseException as exc:
+                    results[key] = exc
+
+            first_thread = threading.Thread(target=publish, args=(first, "S1"))
+            second_thread = threading.Thread(target=publish, args=(second, "S2"))
+            try:
+                first_thread.start()
+                self.assertTrue(first_read.wait(2))
+                second_thread.start()
+                time.sleep(0.2)
+                release_first.set()
+                first_thread.join(5)
+                second_thread.join(5)
+                self.assertFalse(first_thread.is_alive())
+                self.assertFalse(second_thread.is_alive())
+                self.assertNotIsInstance(results.get("S1"), BaseException)
+                self.assertNotIsInstance(results.get("S2"), BaseException)
+                self.assertEqual(
+                    second.readiness_snapshot()["selection_status"],
+                    "S2",
+                )
+            finally:
+                release_first.set()
+                first_thread.join(5)
+                second_thread.join(5)
+                second_store.close()
+                first_store.close()
+
 
     def test_paper_forward_telemetry_update_preserves_eligibility_binding(self):
         payload = dict(self.store.load_candidate_lifecycle("C123")["payload"])
@@ -837,6 +915,7 @@ class CanaryTests(unittest.TestCase):
                 "UPDATE canary_eligibility SET frozen_hash=? WHERE candidate_id=?",
                 ("tampered-binding", "STALE"),
             )
+        self.service.publish_readiness_snapshot(reason="ELIGIBILITY_TAMPERED")
 
         status = self.service.status()
         self.assertEqual(status["eligible_count"], 1)

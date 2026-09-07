@@ -253,6 +253,20 @@ class CandidateLifecycleManager:
         self.store = store
         self.criteria = criteria or PromotionCriteria()
 
+    def _mark_readiness_snapshot_stale(self, reason: str) -> None:
+        """Best-effort stale projection update after an authoritative commit."""
+        try:
+            from .canary import CanaryService
+
+            CanaryService(self.store, initialize=False).mark_readiness_snapshot_stale(reason)
+        except Exception:
+            # Projection maintenance must never change the lifecycle outcome.
+            return
+
+    def _schedule_readiness_snapshot_stale(self, reason: str) -> None:
+        """Invalidate the display projection only after the enclosing commit."""
+        self.store.after_commit(lambda: self._mark_readiness_snapshot_stale(reason))
+
     def register_idea(self, candidate_id: str, payload: Mapping[str, Any] | None = None) -> CandidateLifecycle:
         identifier = str(candidate_id).strip()
         if not identifier:
@@ -263,7 +277,10 @@ class CandidateLifecycleManager:
         body = dict(payload or {})
         body.setdefault("candidate_id", identifier)
         body.setdefault("stage", CandidateStage.IDEA.value)
-        self.store.save_candidate_lifecycle(identifier, CandidateStage.IDEA.value, body, reason="candidate registered")
+        committed = self.store.save_candidate_lifecycle(identifier, CandidateStage.IDEA.value, body, reason="candidate registered")
+        if committed:
+            self._schedule_readiness_snapshot_stale("LIFECYCLE_REGISTERED")
+
         result = self.get(identifier)
         if result is None:
             raise RuntimeError("candidate lifecycle registration did not persist")
@@ -318,13 +335,16 @@ class CandidateLifecycleManager:
                     expected_stage=current.stage,
                     expected_payload=current.payload,
                 )
-        self.store.save_candidate_lifecycle(
+        committed = self.store.save_candidate_lifecycle(
             str(candidate_id),
             target_stage.value,
             body,
             from_stage=current.stage.value,
             reason=reason or f"advanced to {target_stage.value}",
         )
+        if committed:
+            self._schedule_readiness_snapshot_stale("LIFECYCLE_ADVANCED")
+
         result = self.get(str(candidate_id))
         if result is None:
             raise RuntimeError("candidate lifecycle transition did not persist")
@@ -359,13 +379,16 @@ class CandidateLifecycleManager:
         body.update(dict(evidence or {}))
         body["rejection_reason"] = reason
         body["rejected_from"] = current.stage.value
-        self.store.save_candidate_lifecycle(
+        committed = self.store.save_candidate_lifecycle(
             str(candidate_id),
             CandidateStage.REJECTED.value,
             body,
             from_stage=current.stage.value,
             reason=reason,
         )
+        if committed:
+            self._schedule_readiness_snapshot_stale("LIFECYCLE_REJECTED")
+
         result = self.get(str(candidate_id))
         if result is None:
             raise RuntimeError("candidate rejection did not persist")
@@ -393,13 +416,15 @@ class CandidateLifecycleManager:
         body.update(dict(evidence))
         body.setdefault("candidate_id", str(candidate_id))
         body.setdefault("holdout_used", False)
-        self.store.save_candidate_lifecycle(
+        committed = self.store.save_candidate_lifecycle(
             str(candidate_id),
             current.stage.value,
             body,
             from_stage=current.stage.value,
             reason=reason,
         )
+        if committed:
+            self._schedule_readiness_snapshot_stale("LIFECYCLE_EVIDENCE_UPDATED")
         result = self.get(str(candidate_id))
         if result is None:
             raise RuntimeError("candidate evidence update did not persist")

@@ -225,6 +225,7 @@ class SchedulerScaleTests(unittest.TestCase):
                 original_lock = store._lock
                 lock_probe = LockProbe()
                 store._lock = lock_probe  # type: ignore[assignment]
+                canary_selection_reads: list[bool] = []
 
                 def authorize_canary_selection(
                     _action: int,
@@ -233,11 +234,8 @@ class SchedulerScaleTests(unittest.TestCase):
                     _database: str | None,
                     _source: str | None,
                 ) -> int:
-                    if (
-                        _action == sqlite3.SQLITE_READ
-                        and table == "canary_selection"
-                        and not lock_probe.held_by_current_thread()
-                    ):
+                    if _action == sqlite3.SQLITE_READ and table == "canary_selection":
+                        canary_selection_reads.append(lock_probe.held_by_current_thread())
                         return sqlite3.SQLITE_DENY
                     return sqlite3.SQLITE_OK
 
@@ -247,12 +245,18 @@ class SchedulerScaleTests(unittest.TestCase):
                     locked_canary = locked_overview["canary"]
                     self.assertIsNone(locked_canary["winner_id"])
                     self.assertIsNone(locked_canary["selected_candidate"])
-                    self.assertEqual(locked_canary["last_selected_candidate"], "persisted-candidate")
-                    self.assertEqual(locked_canary["selection_status"], "STALE")
-                    self.assertEqual(
-                        locked_canary["selection_invalidation_reason"], "LIFECYCLE_REJECTED"
-                    )
+                    self.assertIsNone(locked_canary["last_selected_candidate"])
+                    self.assertEqual(locked_canary["selection_status"], "NONE")
                     self.assertFalse(locked_canary["selection_valid"])
+                    self.assertEqual(locked_canary["readiness_snapshot_status"], "STALE")
+                    self.assertTrue(locked_canary["readiness_snapshot_stale"])
+                    self.assertEqual(
+                        locked_canary["readiness_snapshot_reason"],
+                        "READINESS_SNAPSHOT_MISSING",
+                    )
+                    self.assertIsNone(locked_canary["selection_reason"])
+                    self.assertIsNone(locked_canary["selection_invalidation_reason"])
+                    self.assertEqual(canary_selection_reads, [])
                 finally:
                     store.connection.set_authorizer(None)
                     store._lock = original_lock
@@ -294,18 +298,26 @@ class SchedulerScaleTests(unittest.TestCase):
                 self.assertLess(collection_span, paper_span)
                 self.assertEqual(store.get_collector_state("polymarket")["markets_seen"], 100)
 
-                overview = DashboardData(store=store).overview_summary()
+                store.connection.set_authorizer(authorize_canary_selection)
+                try:
+                    overview = DashboardData(store=store).overview_summary()
+                finally:
+                    store.connection.set_authorizer(None)
+                self.assertEqual(canary_selection_reads, [])
                 canary = overview["canary"]
                 self.assertIsNone(canary["winner_id"])
                 self.assertIsNone(canary["selected_candidate"])
-                self.assertEqual(canary["last_selected_candidate"], "persisted-candidate")
+                self.assertIsNone(canary["last_selected_candidate"])
                 self.assertIsNone(canary["winner_score"])
-                self.assertEqual(canary["selection_reason"], "LIFECYCLE_REJECTED")
-                self.assertEqual(
-                    canary["selection_invalidation_reason"], "LIFECYCLE_REJECTED"
-                )
-                self.assertEqual(canary["selection_status"], "STALE")
+                self.assertIsNone(canary["selection_reason"])
+                self.assertIsNone(canary["selection_invalidation_reason"])
+                self.assertEqual(canary["selection_status"], "NONE")
                 self.assertFalse(canary["selection_valid"])
+                self.assertEqual(canary["readiness_snapshot_status"], "STALE")
+                self.assertTrue(canary["readiness_snapshot_stale"])
+                self.assertEqual(
+                    canary["readiness_snapshot_reason"], "READINESS_SNAPSHOT_MISSING"
+                )
                 self.assertEqual(canary["eligible_count"], 0)
                 self.assertEqual(canary["rankable_count"], 0)
                 self.assertEqual(canary["execution_event_count"], 0)
@@ -352,6 +364,7 @@ class SchedulerScaleTests(unittest.TestCase):
                 collector_worker = next(row for row in store.list_worker_states(limit=64) if row["worker_name"] == "polymarket-collector")
                 self.assertEqual(collector_worker["payload"]["configured_interval_seconds"], 0.01)
                 self.assertIn("next_scheduled_collection_at", collector_worker["payload"])
+
 
 
 if __name__ == "__main__":

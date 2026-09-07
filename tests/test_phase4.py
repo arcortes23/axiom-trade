@@ -5,13 +5,14 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from axiom.autonomous import AutonomousResearchConfig, AutonomousResearchProcessor
 from axiom.dashboard import DashboardData, _dashboard_html
 from axiom.director import research_summary, validate_hermes_proposal
 from axiom.experiment_plan import ExperimentPlan, ExperimentPlanError
 from axiom.forward import ForwardTestRegistry
-from axiom.lifecycle import CandidateStage, PromotionCriteria
+from axiom.lifecycle import CandidateLifecycleManager, CandidateStage, PromotionCriteria
 from axiom.paper import LiveExecutionDisabled, PaperTradingConfig
 from axiom.paper_engine import run_forward_paper
 from axiom.research import ResearchReport, write_report
@@ -212,6 +213,56 @@ def processor(
 
 
 class Phase4AutonomousLoopTests(unittest.TestCase):
+
+    def test_lifecycle_snapshot_stale_publication_waits_for_outer_commit(self) -> None:
+        with AxiomStore(":memory:") as store:
+            manager = CandidateLifecycleManager(store)
+            with patch.object(manager, "_mark_readiness_snapshot_stale", wraps=manager._mark_readiness_snapshot_stale) as mark:
+                with store.transaction():
+                    manager.register_idea("candidate-commit")
+                    mark.assert_not_called()
+                mark.assert_called_once_with("LIFECYCLE_REGISTERED")
+            self.assertIsNotNone(manager.get("candidate-commit"))
+
+            with patch.object(manager, "_mark_readiness_snapshot_stale") as mark:
+                with self.assertRaisesRegex(RuntimeError, "rollback"):
+                    with store.transaction():
+                        manager.register_idea("candidate-rollback")
+                        mark.assert_not_called()
+                        raise RuntimeError("rollback")
+                mark.assert_not_called()
+            self.assertIsNone(manager.get("candidate-rollback"))
+
+            with patch.object(manager, "_mark_readiness_snapshot_stale", side_effect=RuntimeError("projection failure")):
+                with store.transaction():
+                    manager.register_idea("candidate-callback-error")
+            self.assertIsNotNone(manager.get("candidate-callback-error"))
+
+    def test_after_commit_callbacks_follow_nested_savepoint_boundaries(self) -> None:
+        with AxiomStore(":memory:") as store:
+            events: list[str] = []
+            store.after_commit(lambda: events.append("direct"))
+            self.assertEqual(events, ["direct"])
+            events.clear()
+
+            with store.transaction():
+                store.after_commit(lambda: events.append("outer"))
+                with store.transaction():
+                    store.after_commit(lambda: events.append("inner"))
+                    self.assertEqual(events, [])
+                self.assertEqual(events, [])
+            self.assertEqual(events, ["outer", "inner"])
+
+            events.clear()
+            with store.transaction():
+                with self.assertRaisesRegex(RuntimeError, "inner rollback"):
+                    with store.transaction():
+                        store.after_commit(lambda: events.append("discarded"))
+                        raise RuntimeError("inner rollback")
+                self.assertEqual(events, [])
+            self.assertEqual(events, [])
+
+
     def test_plan_numeric_ranges_are_bounded_and_deterministic(self) -> None:
         ranged = ExperimentPlan.from_mapping(
             {

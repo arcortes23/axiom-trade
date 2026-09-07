@@ -13,6 +13,7 @@ import getpass
 import hashlib
 import importlib.metadata
 import json
+import logging
 import math
 import sqlite3
 import queue
@@ -22,13 +23,15 @@ from urllib.request import Request, urlopen
 from typing import Any, Mapping, Protocol
 
 from .domain import ensure_utc, parse_timestamp, utc_now
-from .storage import AxiomStore
+from .storage import AxiomStore, SQLiteBusyTimeout, sqlite_retry
 from .data_quality import (
     CURRENT_ORDER_BOOK,
     CURRENT_ORDER_BOOK_REQUIRED,
     evaluate_prediction_data_quality,
     persisted_quality_fields,
 )
+
+_LOGGER = logging.getLogger(__name__)
 
 SUPPORTED_POLYMARKET_SDK = "0.9"
 _OFFICIAL_GEOBLOCK_URL = "https://polymarket.com/api/geoblock"
@@ -53,6 +56,7 @@ AUTONOMOUS_CANARY_LIMITS = {
 CANARY_SUBMISSION_TIMEOUT_SECONDS = 15.0
 CANARY_SIGNAL_TTL_SECONDS = 60.0
 CANARY_SIGNAL_MAX_AGE_SECONDS = 60.0
+CANARY_READINESS_SNAPSHOT_MAX_AGE_SECONDS = 60.0
 _CANARY_ELIGIBLE_STAGES = frozenset({"FROZEN", "PAPER_FORWARD", "PAPER_PROMOTABLE"})
 _MANDATORY_SECRET_NAMES = ("private_key", "wallet_address")
 _OPTIONAL_SECRET_NAMES = ("relayer_api_key", "relayer_api_key_address")
@@ -1287,6 +1291,16 @@ class CanaryService:
               blocker TEXT, last_signal_id TEXT, worker_status TEXT NOT NULL,
               updated_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS canary_readiness_snapshot (
+              singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+              payload_json TEXT NOT NULL,
+              readiness_snapshot_status TEXT NOT NULL,
+              readiness_snapshot_stale INTEGER NOT NULL DEFAULT 1,
+              readiness_snapshot_reason TEXT NOT NULL,
+              readiness_snapshot_updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_canary_readiness_snapshot_status
+              ON canary_readiness_snapshot(readiness_snapshot_status, readiness_snapshot_updated_at);
             """)
             columns = {
                 str(row["name"])
@@ -1342,6 +1356,742 @@ class CanaryService:
                         self.store.connection.execute(
                             f"ALTER TABLE {table} ADD COLUMN {column} {declaration}"
                         )
+
+            self.store.connection.executescript("""
+            CREATE TRIGGER IF NOT EXISTS canary_readiness_stale_lifecycle_insert
+            AFTER INSERT ON candidate_lifecycle BEGIN
+              UPDATE canary_readiness_snapshot SET
+                readiness_snapshot_status='STALE',
+                readiness_snapshot_stale=1,
+                readiness_snapshot_reason='LIFECYCLE_CHANGED'
+              WHERE singleton=1;
+            END;
+            CREATE TRIGGER IF NOT EXISTS canary_readiness_stale_lifecycle_update
+            AFTER UPDATE ON candidate_lifecycle BEGIN
+              UPDATE canary_readiness_snapshot SET
+                readiness_snapshot_status='STALE',
+                readiness_snapshot_stale=1,
+                readiness_snapshot_reason='LIFECYCLE_CHANGED'
+              WHERE singleton=1;
+            END;
+            CREATE TRIGGER IF NOT EXISTS canary_readiness_stale_eligibility
+            AFTER INSERT ON canary_eligibility BEGIN
+              UPDATE canary_readiness_snapshot SET
+                readiness_snapshot_status='STALE',
+                readiness_snapshot_stale=1,
+                readiness_snapshot_reason='ELIGIBILITY_CHANGED'
+              WHERE singleton=1;
+            END;
+            CREATE TRIGGER IF NOT EXISTS canary_readiness_stale_eligibility_update
+            AFTER UPDATE ON canary_eligibility BEGIN
+              UPDATE canary_readiness_snapshot SET
+                readiness_snapshot_status='STALE',
+                readiness_snapshot_stale=1,
+                readiness_snapshot_reason='ELIGIBILITY_CHANGED'
+              WHERE singleton=1;
+            END;
+            CREATE TRIGGER IF NOT EXISTS canary_readiness_stale_rankings
+            AFTER INSERT ON canary_rankings BEGIN
+              UPDATE canary_readiness_snapshot SET
+                readiness_snapshot_status='STALE',
+                readiness_snapshot_stale=1,
+                readiness_snapshot_reason='RANKINGS_CHANGED'
+              WHERE singleton=1;
+            END;
+            CREATE TRIGGER IF NOT EXISTS canary_readiness_stale_rankings_update
+            AFTER UPDATE ON canary_rankings BEGIN
+              UPDATE canary_readiness_snapshot SET
+                readiness_snapshot_status='STALE',
+                readiness_snapshot_stale=1,
+                readiness_snapshot_reason='RANKINGS_CHANGED'
+              WHERE singleton=1;
+            END;
+            CREATE TRIGGER IF NOT EXISTS canary_readiness_stale_selection
+            AFTER INSERT ON canary_selection BEGIN
+              UPDATE canary_readiness_snapshot SET
+                readiness_snapshot_status='STALE',
+                readiness_snapshot_stale=1,
+                readiness_snapshot_reason='SELECTION_CHANGED'
+              WHERE singleton=1;
+            END;
+            CREATE TRIGGER IF NOT EXISTS canary_readiness_stale_selection_update
+            AFTER UPDATE ON canary_selection BEGIN
+              UPDATE canary_readiness_snapshot SET
+                readiness_snapshot_status='STALE',
+                readiness_snapshot_stale=1,
+                readiness_snapshot_reason='SELECTION_CHANGED'
+              WHERE singleton=1;
+            END;
+            CREATE TRIGGER IF NOT EXISTS canary_readiness_stale_control
+            AFTER INSERT ON canary_control BEGIN
+              UPDATE canary_readiness_snapshot SET
+                readiness_snapshot_status='STALE',
+                readiness_snapshot_stale=1,
+                readiness_snapshot_reason='CONTROL_CHANGED'
+              WHERE singleton=1;
+            END;
+            CREATE TRIGGER IF NOT EXISTS canary_readiness_stale_control_update
+            AFTER UPDATE ON canary_control BEGIN
+              UPDATE canary_readiness_snapshot SET
+                readiness_snapshot_status='STALE',
+                readiness_snapshot_stale=1,
+                readiness_snapshot_reason='CONTROL_CHANGED'
+              WHERE singleton=1;
+            END;
+            CREATE TRIGGER IF NOT EXISTS canary_readiness_stale_autonomous
+            AFTER INSERT ON canary_autonomous_state BEGIN
+              UPDATE canary_readiness_snapshot SET
+                readiness_snapshot_status='STALE',
+                readiness_snapshot_stale=1,
+                readiness_snapshot_reason='AUTONOMOUS_DECISION'
+              WHERE singleton=1;
+            END;
+            CREATE TRIGGER IF NOT EXISTS canary_readiness_stale_autonomous_update
+            AFTER UPDATE ON canary_autonomous_state BEGIN
+              UPDATE canary_readiness_snapshot SET
+                readiness_snapshot_status='STALE',
+                readiness_snapshot_stale=1,
+                readiness_snapshot_reason='AUTONOMOUS_DECISION'
+              WHERE singleton=1;
+            END;
+            CREATE TRIGGER IF NOT EXISTS canary_readiness_stale_signal
+            AFTER INSERT ON canary_signals BEGIN
+              UPDATE canary_readiness_snapshot SET
+                readiness_snapshot_status='STALE',
+                readiness_snapshot_stale=1,
+                readiness_snapshot_reason='SIGNAL_STATUS_CHANGED'
+              WHERE singleton=1;
+            END;
+            CREATE TRIGGER IF NOT EXISTS canary_readiness_stale_signal_update
+            AFTER UPDATE ON canary_signals BEGIN
+              UPDATE canary_readiness_snapshot SET
+                readiness_snapshot_status='STALE',
+                readiness_snapshot_stale=1,
+                readiness_snapshot_reason='SIGNAL_STATUS_CHANGED'
+              WHERE singleton=1;
+            END;
+            CREATE TRIGGER IF NOT EXISTS canary_readiness_stale_ledger
+            AFTER INSERT ON canary_ledger BEGIN
+              UPDATE canary_readiness_snapshot SET
+                readiness_snapshot_status='STALE',
+                readiness_snapshot_stale=1,
+                readiness_snapshot_reason='LEDGER_CHANGED'
+              WHERE singleton=1;
+            END;
+            CREATE TRIGGER IF NOT EXISTS canary_readiness_stale_ledger_update
+            AFTER UPDATE ON canary_ledger BEGIN
+              UPDATE canary_readiness_snapshot SET
+                readiness_snapshot_status='STALE',
+                readiness_snapshot_stale=1,
+                readiness_snapshot_reason='LEDGER_CHANGED'
+              WHERE singleton=1;
+            END;
+            CREATE TRIGGER IF NOT EXISTS canary_readiness_stale_execution
+            AFTER INSERT ON canary_execution_events BEGIN
+              UPDATE canary_readiness_snapshot SET
+                readiness_snapshot_status='STALE',
+                readiness_snapshot_stale=1,
+                readiness_snapshot_reason='EXECUTION_EVENT_CHANGED'
+              WHERE singleton=1;
+            END;
+            CREATE TRIGGER IF NOT EXISTS canary_readiness_stale_execution_update
+            AFTER UPDATE ON canary_execution_events BEGIN
+              UPDATE canary_readiness_snapshot SET
+                readiness_snapshot_status='STALE',
+                readiness_snapshot_stale=1,
+                readiness_snapshot_reason='EXECUTION_EVENT_CHANGED'
+              WHERE singleton=1;
+            END;
+            CREATE TRIGGER IF NOT EXISTS canary_readiness_stale_lifecycle_delete
+            AFTER DELETE ON candidate_lifecycle BEGIN
+              UPDATE canary_readiness_snapshot SET
+                readiness_snapshot_status='STALE',
+                readiness_snapshot_stale=1,
+                readiness_snapshot_reason='LIFECYCLE_CHANGED'
+              WHERE singleton=1;
+            END;
+            CREATE TRIGGER IF NOT EXISTS canary_readiness_stale_eligibility_delete
+            AFTER DELETE ON canary_eligibility BEGIN
+              UPDATE canary_readiness_snapshot SET
+                readiness_snapshot_status='STALE',
+                readiness_snapshot_stale=1,
+                readiness_snapshot_reason='ELIGIBILITY_CHANGED'
+              WHERE singleton=1;
+            END;
+            CREATE TRIGGER IF NOT EXISTS canary_readiness_stale_rankings_delete
+            AFTER DELETE ON canary_rankings BEGIN
+              UPDATE canary_readiness_snapshot SET
+                readiness_snapshot_status='STALE',
+                readiness_snapshot_stale=1,
+                readiness_snapshot_reason='RANKINGS_CHANGED'
+              WHERE singleton=1;
+            END;
+            CREATE TRIGGER IF NOT EXISTS canary_readiness_stale_selection_delete
+            AFTER DELETE ON canary_selection BEGIN
+              UPDATE canary_readiness_snapshot SET
+                readiness_snapshot_status='STALE',
+                readiness_snapshot_stale=1,
+                readiness_snapshot_reason='SELECTION_CHANGED'
+              WHERE singleton=1;
+            END;
+            """)
+            initial_payload = self._readiness_snapshot_default()
+            initial_now = ensure_utc(self.clock()).isoformat()
+            self.store.connection.execute(
+                "INSERT OR IGNORE INTO canary_readiness_snapshot("
+                "singleton,payload_json,readiness_snapshot_status,"
+                "readiness_snapshot_stale,readiness_snapshot_reason,"
+                "readiness_snapshot_updated_at) VALUES(1,?,?,?,?,?)",
+                (
+                    json.dumps(
+                        initial_payload,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    ),
+                    "STALE",
+                    1,
+                    "READINESS_SNAPSHOT_INITIALIZING",
+                    initial_now,
+                ),
+            )
+
+    @staticmethod
+    def _readiness_snapshot_default() -> dict[str, Any]:
+        limits = {
+            "target_notional_usd": str(DEFAULT_TARGET_NOTIONAL_USD),
+            "max_exposure_usd": str(DEFAULT_MAX_EXPOSURE_USD),
+            "max_daily_loss_usd": str(DEFAULT_DAILY_LOSS_USD),
+            "max_open_positions": DEFAULT_MAX_OPEN_POSITIONS,
+            "max_orders_per_day": DEFAULT_MAX_ORDERS_PER_DAY,
+            "max_slippage_bps": DEFAULT_MAX_SLIPPAGE_BPS,
+        }
+        risk = dict(AUTONOMOUS_CANARY_LIMITS)
+        autonomous = {
+            "enabled": False,
+            "selected_candidate": None,
+            "last_selected_candidate": None,
+            "ranking_run_id": None,
+            "ranking_timestamp": None,
+            "rank": None,
+            "score": None,
+            "selection_reason": None,
+            "selection_status": "NONE",
+            "selection_valid": False,
+            "selection_invalidation_reason": None,
+            "eligibility_raw_count": 0,
+            "eligible_count": 0,
+            "rankable_raw_count": 0,
+            "rankable_count": 0,
+            "historical_data_integrity": "UNKNOWN",
+            "historical_execution_fidelity": "UNKNOWN",
+            "current_execution_evidence": "CURRENT_ORDER_BOOK_REQUIRED",
+            "next_decision": "ENABLE AUTO CANARY",
+            "blocker": "AUTONOMOUS_CANARY_DISABLED",
+            "last_tick_at": None,
+            "last_signal_id": None,
+            "worker_status": "IDLE",
+        }
+        return {
+            "production_live_trading": "DISABLED",
+            "micro_live_canary": "DISABLED",
+            "display_state": "DISABLED",
+            "control_state": "DISABLED",
+            "candidate": None,
+            "winner_id": None,
+            "winner_rank": None,
+            "winner_score": None,
+            "selection_reason": None,
+            "selection_status": "NONE",
+            "selection_valid": False,
+            "selection_invalidation_reason": None,
+            "selected_candidate": None,
+            "last_selected_candidate": None,
+            "ranking_run_id": None,
+            "ranking_timestamp": None,
+            "venue": None,
+            "expiry": None,
+            "control_generation": 0,
+            "last_request_status": None,
+            "today_orders": 0,
+            "today_realized_pnl": 0.0,
+            "total_exposure": 0.0,
+            "open_positions": 0,
+            "limits": limits,
+            "risk_envelope": risk,
+            "risk_limits": dict(risk),
+            "eligibility_raw_count": 0,
+            "eligible_count": 0,
+            "rankable_raw_count": 0,
+            "rankable_count": 0,
+            "real_execution_events": 0,
+            "execution_event_count": 0,
+            "historical_data_integrity": "UNKNOWN",
+            "historical_execution_fidelity": "UNKNOWN",
+            "current_execution_evidence": "CURRENT_ORDER_BOOK_REQUIRED",
+            "daily_loss_budget_remaining": float(DEFAULT_DAILY_LOSS_USD),
+            "autonomous": autonomous,
+            "selected_winner": None,
+            "latest_signal": None,
+            "trades": [],
+            "live_execution": False,
+            "kill_semantics": "KILL_PREVENTS_NEW_SUBMISSIONS; IN_FLIGHT_REQUESTS_ARE_NOT_RETRACTED",
+        }
+
+    @staticmethod
+    def _readiness_snapshot_sanitize(
+        value: Any,
+        *,
+        key: str = "",
+        depth: int = 0,
+        limit: int = 100,
+    ) -> Any:
+        """Copy bounded JSON display data while dropping secret-shaped keys."""
+        lowered = str(key).lower()
+        if any(secret in lowered for secret in ("secret", "credential", "private_key", "wallet", "api_key")):
+            return None
+        if depth > 8:
+            return None
+        if value is None or isinstance(value, (str, bool, int)):
+            if isinstance(value, str):
+                return value[:512]
+            return value
+        if isinstance(value, float):
+            return value if math.isfinite(value) else None
+        if isinstance(value, Mapping):
+            result: dict[str, Any] = {}
+            for name in sorted(value, key=lambda item: str(item))[:64]:
+                name_text = str(name)
+                child = CanaryService._readiness_snapshot_sanitize(
+                    value[name_text] if name_text in value else value[name],
+                    key=name_text,
+                    depth=depth + 1,
+                    limit=limit,
+                )
+                if child is not None:
+                    result[name_text[:128]] = child
+            return result
+        if isinstance(value, (list, tuple)):
+            result = []
+            for item in value[:limit]:
+                child = CanaryService._readiness_snapshot_sanitize(
+                    item,
+                    depth=depth + 1,
+                    limit=limit,
+                )
+                if child is not None:
+                    result.append(child)
+            return result
+        return None
+
+    @classmethod
+    def _readiness_snapshot_payload(
+        cls,
+        source: Mapping[str, Any] | None,
+        *,
+        latest_signal: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        defaults = cls._readiness_snapshot_default()
+        source = source if isinstance(source, Mapping) else {}
+        fields = tuple(defaults)
+        payload: dict[str, Any] = {}
+        for name in fields:
+            value = source.get(name, defaults[name])
+            sanitized = cls._readiness_snapshot_sanitize(
+                value,
+                key=name,
+                limit=100 if name == "trades" else 64,
+            )
+            payload[name] = defaults[name] if sanitized is None and value is not None else sanitized
+        if latest_signal is None:
+            latest_signal = source.get("latest_signal")
+        payload["latest_signal"] = cls._readiness_snapshot_sanitize(
+            latest_signal,
+            key="latest_signal",
+            limit=1,
+        )
+        trades = payload.get("trades")
+        payload["trades"] = list(trades[:100]) if isinstance(trades, list) else []
+        return payload
+
+    @staticmethod
+    def _readiness_snapshot_stale_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+        result = dict(payload)
+        current = (
+            result.get("selection_valid") is True
+            or result.get("selected_candidate") is not None
+            or result.get("winner_id") is not None
+        )
+        if current:
+            result["selection_status"] = "STALE"
+            result["selection_valid"] = False
+            result["selection_invalidation_reason"] = (
+                result.get("selection_invalidation_reason") or "READINESS_SNAPSHOT_STALE"
+            )
+            result["selected_candidate"] = None
+            result["winner_id"] = None
+            result["winner_rank"] = None
+            result["winner_score"] = None
+        selected_winner = result.get("selected_winner")
+        if isinstance(selected_winner, Mapping):
+            winner = dict(selected_winner)
+            winner["selection_status"] = "STALE"
+            winner["selection_valid"] = False
+            winner["selected_candidate"] = None
+            winner["winner_id"] = None
+            winner["selection_invalidation_reason"] = (
+                result.get("selection_invalidation_reason") or "READINESS_SNAPSHOT_STALE"
+            )
+            result["selected_winner"] = winner
+        autonomous = result.get("autonomous")
+        if isinstance(autonomous, Mapping):
+            auto = dict(autonomous)
+            auto["selection_status"] = result.get("selection_status", "STALE")
+            auto["selection_valid"] = False
+            auto["selected_candidate"] = None
+            auto["winner_id"] = None
+            auto["selection_invalidation_reason"] = result.get(
+                "selection_invalidation_reason"
+            )
+            result["autonomous"] = auto
+        return result
+    def _readiness_snapshot_failure_safe_payload(
+        self,
+        payload: Mapping[str, Any] | None,
+        *,
+        reason: str,
+        updated_at: str | None = None,
+    ) -> dict[str, Any]:
+        """Return a fail-closed projection when publication cannot complete."""
+        try:
+            bounded = self._readiness_snapshot_payload(payload)
+        except Exception:
+            bounded = self._readiness_snapshot_default()
+        result = self._readiness_snapshot_stale_payload(bounded)
+        result["readiness_snapshot_status"] = "STALE"
+        result["readiness_snapshot_stale"] = True
+        result["readiness_snapshot_reason"] = str(reason or "READINESS_SNAPSHOT_STALE")[:256]
+        result["readiness_snapshot_updated_at"] = (
+            str(updated_at) if updated_at else ensure_utc(self.clock()).isoformat()
+        )
+        autonomous = result.get("autonomous")
+        if isinstance(autonomous, Mapping):
+            autonomous = dict(autonomous)
+            autonomous.update(
+                {
+                    "readiness_snapshot_status": "STALE",
+                    "readiness_snapshot_stale": True,
+                    "readiness_snapshot_reason": result["readiness_snapshot_reason"],
+                    "readiness_snapshot_updated_at": result["readiness_snapshot_updated_at"],
+                }
+            )
+            result["autonomous"] = autonomous
+        return result
+
+    def publish_readiness_snapshot(
+        self,
+        reason: str = "AUTHORITATIVE_UPDATE",
+    ) -> dict[str, Any]:
+        """Persist one bounded, credential-free authoritative display snapshot.
+
+        The authoritative read and projection write share one immediate
+        transaction.  This prevents an older read from overwriting a newer
+        snapshot when concurrent writers publish out of order.
+        """
+        snapshot_reason = str(reason or "AUTHORITATIVE_UPDATE").strip()[:256]
+        if not snapshot_reason:
+            snapshot_reason = "AUTHORITATIVE_UPDATE"
+        payload: dict[str, Any] | None = None
+        try:
+            def operation() -> dict[str, Any]:
+                nonlocal payload
+                with self.store.transaction(immediate=True):
+                    authoritative = self.authoritative_status()
+                    latest_signal = self.latest_signal()
+                    projected = self._readiness_snapshot_payload(
+                        authoritative,
+                        latest_signal=latest_signal,
+                    )
+                    now = ensure_utc(self.clock()).isoformat()
+                    projected["readiness_snapshot_status"] = "CURRENT"
+                    projected["readiness_snapshot_stale"] = False
+                    projected["readiness_snapshot_reason"] = snapshot_reason
+                    projected["readiness_snapshot_updated_at"] = now
+                    autonomous = projected.get("autonomous")
+                    if isinstance(autonomous, Mapping):
+                        autonomous = dict(autonomous)
+                        autonomous.update(
+                            {
+                                "readiness_snapshot_status": "CURRENT",
+                                "readiness_snapshot_stale": False,
+                                "readiness_snapshot_reason": snapshot_reason,
+                                "readiness_snapshot_updated_at": now,
+                            }
+                        )
+                        projected["autonomous"] = autonomous
+                    encoded = json.dumps(
+                        projected,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    )
+                    self.store.connection.execute(
+                        "INSERT INTO canary_readiness_snapshot("
+                        "singleton,payload_json,readiness_snapshot_status,"
+                        "readiness_snapshot_stale,readiness_snapshot_reason,"
+                        "readiness_snapshot_updated_at) VALUES(1,?,?,?,?,?) "
+                        "ON CONFLICT(singleton) DO UPDATE SET "
+                        "payload_json=excluded.payload_json,"
+                        "readiness_snapshot_status=excluded.readiness_snapshot_status,"
+                        "readiness_snapshot_stale=excluded.readiness_snapshot_stale,"
+                        "readiness_snapshot_reason=excluded.readiness_snapshot_reason,"
+                        "readiness_snapshot_updated_at=excluded.readiness_snapshot_updated_at",
+                        (encoded, "CURRENT", 0, snapshot_reason, now),
+                    )
+                    payload = dict(projected)
+                    return dict(projected)
+
+            return dict(
+                sqlite_retry(
+                    operation,
+                    operation_name="publish canary readiness snapshot",
+                )
+            )
+        except Exception as exc:
+            if isinstance(exc, SQLiteBusyTimeout):
+                _LOGGER.warning(
+                    "canary readiness snapshot publication exhausted retries reason=%s",
+                    snapshot_reason,
+                )
+            else:
+                _LOGGER.exception(
+                    "canary readiness snapshot publication failed reason=%s",
+                    snapshot_reason,
+                )
+            return self._readiness_snapshot_failure_safe_payload(
+                payload,
+                reason="READINESS_SNAPSHOT_PUBLICATION_FAILED",
+            )
+
+
+    def readiness_snapshot(self) -> dict[str, Any]:
+        """Read the singleton display projection without running validation."""
+        now = ensure_utc(self.clock())
+        lock = getattr(self.store, "_lock", None)
+        try:
+            if lock is None:
+                row = self.store.connection.execute(
+                    "SELECT payload_json,readiness_snapshot_status,"
+                    "readiness_snapshot_stale,readiness_snapshot_reason,"
+                    "readiness_snapshot_updated_at "
+                    "FROM canary_readiness_snapshot WHERE singleton=1"
+                ).fetchone()
+            else:
+                with lock:
+                    row = self.store.connection.execute(
+                        "SELECT payload_json,readiness_snapshot_status,"
+                        "readiness_snapshot_stale,readiness_snapshot_reason,"
+                        "readiness_snapshot_updated_at "
+                        "FROM canary_readiness_snapshot WHERE singleton=1"
+                    ).fetchone()
+        except sqlite3.OperationalError:
+            row = None
+        reason = "READINESS_SNAPSHOT_MISSING"
+        updated_at = now.isoformat()
+        payload: dict[str, Any]
+        current = False
+        if row is not None:
+            raw_payload = row["payload_json"]
+            try:
+                parsed = json.loads(str(raw_payload))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                parsed = None
+            if (
+                isinstance(parsed, Mapping)
+                and "micro_live_canary" in parsed
+                and "selection_status" in parsed
+            ):
+                payload = self._readiness_snapshot_payload(parsed)
+                row_updated = row["readiness_snapshot_updated_at"]
+                if isinstance(row_updated, str) and row_updated:
+                    updated_at = row_updated
+                reason = str(
+                    row["readiness_snapshot_reason"] or "READINESS_SNAPSHOT_STALE"
+                )[:256]
+                try:
+                    age = (now - ensure_utc(datetime.fromisoformat(updated_at))).total_seconds()
+                    current = (
+                        str(row["readiness_snapshot_status"] or "").upper() == "CURRENT"
+                        and int(row["readiness_snapshot_stale"] or 0) == 0
+                        and age >= 0
+                        and age <= CANARY_READINESS_SNAPSHOT_MAX_AGE_SECONDS
+                    )
+                    if age < 0:
+                        reason = "READINESS_SNAPSHOT_INVALID"
+                    elif age > CANARY_READINESS_SNAPSHOT_MAX_AGE_SECONDS:
+                        reason = "READINESS_SNAPSHOT_TOO_OLD"
+                except (TypeError, ValueError, OverflowError):
+                    current = False
+                    reason = "READINESS_SNAPSHOT_INVALID"
+            else:
+                payload = self._readiness_snapshot_default()
+                row_updated = row["readiness_snapshot_updated_at"]
+                if isinstance(row_updated, str) and row_updated:
+                    updated_at = row_updated
+                reason = "READINESS_SNAPSHOT_INVALID"
+        else:
+            payload = self._readiness_snapshot_default()
+        if not current:
+            payload = self._readiness_snapshot_stale_payload(payload)
+        payload["readiness_snapshot_status"] = "CURRENT" if current else "STALE"
+        payload["readiness_snapshot_stale"] = not current
+        payload["readiness_snapshot_reason"] = (
+            "AUTHORITATIVE_UPDATE" if current and not reason else reason
+        )
+        payload["readiness_snapshot_updated_at"] = updated_at
+        autonomous = payload.get("autonomous")
+        if isinstance(autonomous, Mapping):
+            autonomous = dict(autonomous)
+            autonomous.update(
+                {
+                    "readiness_snapshot_status": payload["readiness_snapshot_status"],
+                    "readiness_snapshot_stale": payload["readiness_snapshot_stale"],
+                    "readiness_snapshot_reason": payload["readiness_snapshot_reason"],
+                    "readiness_snapshot_updated_at": updated_at,
+                }
+            )
+            payload["autonomous"] = autonomous
+        return payload
+
+    def mark_readiness_snapshot_stale(self, reason: str) -> dict[str, Any]:
+        """Best-effort stale projection update after a durable source transition."""
+        snapshot_reason = str(reason or "AUTHORITATIVE_UPDATE").strip()[:256]
+        if not snapshot_reason:
+            snapshot_reason = "AUTHORITATIVE_UPDATE"
+        now = ensure_utc(self.clock()).isoformat()
+        try:
+            def operation() -> None:
+                with self.store.transaction(immediate=True):
+                    row = self.store.connection.execute(
+                        "SELECT payload_json FROM canary_readiness_snapshot "
+                        "WHERE singleton=1"
+                    ).fetchone()
+                    if row is None:
+                        payload = self._readiness_snapshot_default()
+                        payload["selection_invalidation_reason"] = snapshot_reason
+                        autonomous = payload.get("autonomous")
+                        if isinstance(autonomous, Mapping):
+                            autonomous = dict(autonomous)
+                            autonomous["selection_invalidation_reason"] = snapshot_reason
+                            payload["autonomous"] = autonomous
+                        self.store.connection.execute(
+                            "INSERT INTO canary_readiness_snapshot("
+                            "singleton,payload_json,readiness_snapshot_status,"
+                            "readiness_snapshot_stale,readiness_snapshot_reason,"
+                            "readiness_snapshot_updated_at) VALUES(1,?,?,?,?,?)",
+                            (
+                                json.dumps(
+                                    payload,
+                                    sort_keys=True,
+                                    separators=(",", ":"),
+                                    allow_nan=False,
+                                ),
+                                "STALE",
+                                1,
+                                snapshot_reason,
+                                now,
+                            ),
+                        )
+                        return
+                    try:
+                        parsed = json.loads(str(row["payload_json"] or ""))
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        parsed = None
+                    payload = (
+                        dict(parsed)
+                        if isinstance(parsed, Mapping)
+                        else self._readiness_snapshot_default()
+                    )
+                    payload["selection_invalidation_reason"] = snapshot_reason
+                    selected_winner = payload.get("selected_winner")
+                    if isinstance(selected_winner, Mapping):
+                        winner = dict(selected_winner)
+                        winner["selection_invalidation_reason"] = snapshot_reason
+                        payload["selected_winner"] = winner
+                    autonomous = payload.get("autonomous")
+                    if isinstance(autonomous, Mapping):
+                        auto = dict(autonomous)
+                        auto["selection_invalidation_reason"] = snapshot_reason
+                        payload["autonomous"] = auto
+                    self.store.connection.execute(
+                        "UPDATE canary_readiness_snapshot SET "
+                        "payload_json=?,"
+                        "readiness_snapshot_status='STALE',"
+                        "readiness_snapshot_stale=1,"
+                        "readiness_snapshot_reason=? WHERE singleton=1",
+                        (
+                            json.dumps(
+                                payload,
+                                sort_keys=True,
+                                separators=(",", ":"),
+                                allow_nan=False,
+                            ),
+                            snapshot_reason,
+                        ),
+                    )
+
+            sqlite_retry(
+                operation,
+                operation_name="mark canary readiness snapshot stale",
+            )
+        except sqlite3.OperationalError as exc:
+            if "no such table" in str(exc).lower():
+                return self._readiness_snapshot_failure_safe_payload(
+                    None,
+                    reason="READINESS_SNAPSHOT_MISSING",
+                    updated_at=now,
+                )
+            _LOGGER.exception(
+                "canary readiness snapshot stale mark failed reason=%s",
+                snapshot_reason,
+            )
+            return self._readiness_snapshot_failure_safe_payload(
+                None,
+                reason="READINESS_SNAPSHOT_STALE_UPDATE_FAILED",
+                updated_at=now,
+            )
+        except Exception as exc:
+            if isinstance(exc, SQLiteBusyTimeout):
+                _LOGGER.warning(
+                    "canary readiness snapshot stale mark exhausted retries reason=%s",
+                    snapshot_reason,
+                )
+            else:
+                _LOGGER.exception(
+                    "canary readiness snapshot stale mark failed reason=%s",
+                    snapshot_reason,
+                )
+            return self._readiness_snapshot_failure_safe_payload(
+                None,
+                reason="READINESS_SNAPSHOT_STALE_UPDATE_FAILED",
+                updated_at=now,
+            )
+        try:
+            return self.readiness_snapshot()
+        except Exception:
+            _LOGGER.exception(
+                "canary readiness snapshot stale readback failed reason=%s",
+                snapshot_reason,
+            )
+            return self._readiness_snapshot_failure_safe_payload(
+                None,
+                reason="READINESS_SNAPSHOT_STALE_UPDATE_FAILED",
+                updated_at=now,
+            )
+    def status(self) -> dict[str, Any]:
+        """Return the cheap persisted dashboard projection."""
+        return self.readiness_snapshot()
+
 
     @staticmethod
     def _integrity(candidate: str, venue: str, expires: str, limits: Mapping[str, Any]) -> str:
@@ -1443,7 +2193,9 @@ class CanaryService:
                     "DELETE FROM canary_eligibility WHERE candidate_id=?",
                     (str(candidate_id),),
                 )
-
+        self.publish_readiness_snapshot(
+            reason=reason or "ELIGIBILITY_INVALIDATED"
+        )
     def _selection_record(self) -> dict[str, Any] | None:
         connection = self.store.connection
         lock = getattr(self.store, "_lock", None)
@@ -1504,7 +2256,7 @@ class CanaryService:
                         when,
                     ),
                 )
-
+        self.publish_readiness_snapshot(reason="AUTONOMOUS_DECISION")
     def enable_autonomous_micro_live(self) -> Mapping[str, Any]:
         """Enable the single autonomous $1 canary envelope.
 
@@ -1533,49 +2285,49 @@ class CanaryService:
                         raise CanaryBlocked("CANARY_CONTROL_CORRUPT") from None
                     if persisted != values or current["integrity_hash"] != digest:
                         raise CanaryBlocked("CANARY_CONTROL_CORRUPT")
-                    return self.status()
-                try:
-                    generation = int(current["control_generation"] or 0) if current else 0
-                except (TypeError, ValueError):
-                    raise CanaryBlocked("CANARY_CONTROL_CORRUPT") from None
-                selection = connection.execute(
-                    "SELECT * FROM canary_selection WHERE singleton=1"
-                ).fetchone()
-                candidate_id = None
-                if selection is not None:
-                    selection_state = self._selection_validation(dict(selection))
-                    if selection_state.get("selection_valid"):
-                        candidate_id = selection_state.get("selected_candidate")
-                connection.execute(
-                    "INSERT INTO canary_control("
-                    "singleton,state,candidate_id,venue,armed_at,expires_at,"
-                    "limits_json,integrity_hash,updated_at,control_generation) "
-                    "VALUES(1,?,?,?,?,?,?,?,?,?) ON CONFLICT(singleton) DO UPDATE SET "
-                    "state=excluded.state,candidate_id=excluded.candidate_id,"
-                    "venue=excluded.venue,armed_at=excluded.armed_at,expires_at=excluded.expires_at,"
-                    "limits_json=excluded.limits_json,integrity_hash=excluded.integrity_hash,"
-                    "updated_at=excluded.updated_at,control_generation=excluded.control_generation",
-                    (
-                        AUTONOMOUS_MICRO_LIVE,
-                        candidate_id,
-                        AUTONOMOUS_CANARY_VENUE,
-                        now.isoformat(),
-                        None,
-                        json.dumps(values, sort_keys=True),
-                        digest,
-                        now.isoformat(),
-                        generation + 1,
-                    ),
-                )
-                connection.execute(
-                    "INSERT INTO canary_autonomous_state("
-                    "singleton,last_tick_at,next_decision,blocker,last_signal_id,worker_status,updated_at) "
-                    "VALUES(1,NULL,'WAITING_FOR_NEXT_DECISION',NULL,NULL,'IDLE',?) "
-                    "ON CONFLICT(singleton) DO UPDATE SET "
-                    "next_decision=excluded.next_decision,blocker=NULL,worker_status='IDLE',updated_at=excluded.updated_at",
-                    (now.isoformat(),),
-                )
-        return self.status()
+                else:
+                    try:
+                        generation = int(current["control_generation"] or 0) if current else 0
+                    except (TypeError, ValueError):
+                        raise CanaryBlocked("CANARY_CONTROL_CORRUPT") from None
+                    selection = connection.execute(
+                        "SELECT * FROM canary_selection WHERE singleton=1"
+                    ).fetchone()
+                    candidate_id = None
+                    if selection is not None:
+                        selection_state = self._selection_validation(dict(selection))
+                        if selection_state.get("selection_valid"):
+                            candidate_id = selection_state.get("selected_candidate")
+                    connection.execute(
+                        "INSERT INTO canary_control("
+                        "singleton,state,candidate_id,venue,armed_at,expires_at,"
+                        "limits_json,integrity_hash,updated_at,control_generation) "
+                        "VALUES(1,?,?,?,?,?,?,?,?,?) ON CONFLICT(singleton) DO UPDATE SET "
+                        "state=excluded.state,candidate_id=excluded.candidate_id,"
+                        "venue=excluded.venue,armed_at=excluded.armed_at,expires_at=excluded.expires_at,"
+                        "limits_json=excluded.limits_json,integrity_hash=excluded.integrity_hash,"
+                        "updated_at=excluded.updated_at,control_generation=excluded.control_generation",
+                        (
+                            AUTONOMOUS_MICRO_LIVE,
+                            candidate_id,
+                            AUTONOMOUS_CANARY_VENUE,
+                            now.isoformat(),
+                            None,
+                            json.dumps(values, sort_keys=True),
+                            digest,
+                            now.isoformat(),
+                            generation + 1,
+                        ),
+                    )
+                    connection.execute(
+                        "INSERT INTO canary_autonomous_state("
+                        "singleton,last_tick_at,next_decision,blocker,last_signal_id,worker_status,updated_at) "
+                        "VALUES(1,NULL,'WAITING_FOR_NEXT_DECISION',NULL,NULL,'IDLE',?) "
+                        "ON CONFLICT(singleton) DO UPDATE SET "
+                        "next_decision=excluded.next_decision,blocker=NULL,worker_status='IDLE',updated_at=excluded.updated_at",
+                        (now.isoformat(),),
+                    )
+        return self.publish_readiness_snapshot(reason="AUTONOMOUS_ENABLED")
     def bind_autonomous_selection(self, candidate_id: str | None) -> None:
         """Fence the selected winner into autonomous control metadata."""
         identifier = str(candidate_id).strip() if candidate_id else None
@@ -1600,6 +2352,7 @@ class CanaryService:
                     "control_generation=? WHERE singleton=1 AND state=?",
                     (identifier, now, generation + 1, AUTONOMOUS_MICRO_LIVE),
                 )
+        self.publish_readiness_snapshot(reason="AUTONOMOUS_SELECTION_CHANGED")
 
     def _candidate_signal_binding(self, candidate_id: str) -> dict[str, Any]:
         """Load the candidate's immutable executable documents and binding."""
@@ -2023,6 +2776,7 @@ class CanaryService:
                     ),
                 )
                 self.store.connection.commit()
+            self.publish_readiness_snapshot(reason="SIGNAL_GENERATED")
             return self.get_signal(signal_id)
         return None
 
@@ -2084,7 +2838,7 @@ class CanaryService:
                 (str(status).upper(), reason, now, str(signal_id)),
             )
             self.store.connection.commit()
-
+        self.publish_readiness_snapshot(reason="SIGNAL_STATUS_CHANGED")
     def _invalidate_signal(self, signal_id: str, reason: str) -> None:
         self._set_signal_status(signal_id, "NO_LONGER_VALID", reason=reason)
 
@@ -2126,7 +2880,7 @@ class CanaryService:
         ):
             self._invalidate_signal(signal_id, "CANDIDATE_FROZEN_BINDING_CHANGED")
             raise CanaryBlocked("CANARY_SIGNAL_NO_LONGER_VALID")
-        control_snapshot = self.status()
+        control_snapshot = self.authoritative_status()
         if control_snapshot.get("micro_live_canary") == AUTONOMOUS_MICRO_LIVE:
             if str(control_snapshot.get("candidate") or "") != str(signal.get("candidate_id") or ""):
                 self._invalidate_signal(signal_id, "AUTO_CANARY_CANDIDATE_NOT_SELECTED")
@@ -2474,7 +3228,7 @@ class CanaryService:
                 if connection.in_transaction:
                     connection.rollback()
                 raise
-
+        self.publish_readiness_snapshot(reason="ELIGIBILITY_CHANGED")
     def arm(
         self,
         candidate_id: str,
@@ -2618,7 +3372,7 @@ class CanaryService:
                 if connection.in_transaction:
                     connection.rollback()
                 raise
-        return self.status()
+        return self.publish_readiness_snapshot(reason="CANARY_ARMED")
     def disarm(self) -> None: self._set_state("DISARMED")
     def kill(self) -> None: self._set_state("KILLED")
     def _set_state(self, state: str) -> None:
@@ -2668,6 +3422,9 @@ class CanaryService:
                         now,
                     ),
                 )
+        self.publish_readiness_snapshot(
+            reason="CANARY_KILLED" if state == "KILLED" else "CANARY_DISARMED"
+        )
     def _selection_validation(
         self, selection: Mapping[str, Any] | None
     ) -> dict[str, Any]:
@@ -2886,14 +3643,14 @@ class CanaryService:
         }
 
 
-    def status(self) -> dict[str, Any]:
+    def authoritative_status(self) -> dict[str, Any]:
         lock = getattr(self.store, "_lock", None)
         if lock is None:
-            return self._status_locked()
+            return self._authoritative_status_locked()
         with lock:
-            return self._status_locked()
+            return self._authoritative_status_locked()
 
-    def _status_locked(self) -> dict[str, Any]:
+    def _authoritative_status_locked(self) -> dict[str, Any]:
         connection = self.store.connection
         lock = getattr(self.store, "_lock", None)
 
@@ -3433,7 +4190,7 @@ class CanaryService:
             if allow_environment is None
             else bool(allow_environment)
         )
-        status = self.status()
+        status = self.authoritative_status()
         if not _connectivity_only:
             if status["micro_live_canary"] not in {"ARMED", AUTONOMOUS_MICRO_LIVE}:
                 failures.append("CANARY_NOT_ARMED")
@@ -4020,7 +4777,7 @@ class CanaryService:
 
         # All venue/network reads complete before the short writer
         # transactions below.  SQLite only fences persisted canary state.
-        preflight_snapshot = self.status()
+        preflight_snapshot = self.authoritative_status()
         if preflight_snapshot.get("micro_live_canary") == AUTONOMOUS_MICRO_LIVE:
             stored_signal = self.get_signal(signal_id)
             stored_evidence = (
@@ -4068,7 +4825,7 @@ class CanaryService:
                 raise CanaryBlocked("CANARY_TRANSACTION_ACTIVE")
             connection.execute("BEGIN IMMEDIATE")
             try:
-                locked_snapshot = self.status()
+                locked_snapshot = self.authoritative_status()
                 if locked_snapshot["micro_live_canary"] == "KILLED":
                     block("CANARY_KILLED")
                 if locked_snapshot["micro_live_canary"] not in {"ARMED", AUTONOMOUS_MICRO_LIVE}:
@@ -4158,6 +4915,7 @@ class CanaryService:
                 if connection.in_transaction:
                     connection.rollback()
                 raise
+        self.publish_readiness_snapshot(reason="CANARY_RESERVATION")
 
         # Transition RESERVED -> SUBMITTING under a second short fence.
         with self.store._lock:
@@ -4227,7 +4985,7 @@ class CanaryService:
                     ).get("grade", "F")
                 ).upper() not in {"A", "B"}:
                     block("COLLECTOR_DEGRADED")
-                fenced_snapshot = self.status()
+                fenced_snapshot = self.authoritative_status()
                 if fenced_snapshot["micro_live_canary"] == "KILLED":
                     block("CANARY_KILLED")
                 if fenced_snapshot["micro_live_canary"] not in {"ARMED", AUTONOMOUS_MICRO_LIVE}:
@@ -4257,6 +5015,7 @@ class CanaryService:
                 if connection.in_transaction:
                     connection.rollback()
                 raise
+        self.publish_readiness_snapshot(reason="CANARY_SUBMITTING")
 
         submitted_at = ensure_utc(self.clock())
 
@@ -4406,11 +5165,12 @@ class CanaryService:
                         (outcome, error, received_at.isoformat(), signal_id),
                     )
                     connection.commit()
-                    return current_control_state
                 except BaseException:
                     if connection.in_transaction:
                         connection.rollback()
                     raise
+            self.publish_readiness_snapshot(reason="CANARY_EXECUTION_OUTCOME")
+            return current_control_state
 
         response: Mapping[str, Any] | None = None
         try:
@@ -4473,4 +5233,4 @@ class CanaryService:
             "production_live_execution": False,
         }
 
-__all__=["AUTONOMOUS_MICRO_LIVE","AUTONOMOUS_CANARY_VENUE","AUTONOMOUS_CANARY_LIMITS","CanaryBlocked","CanaryLimits","CanaryService","CanaryVenue","CredentialStore","PolymarketClobV2Venue","PRODUCTION_LIVE_EXECUTION"]
+__all__=["AUTONOMOUS_MICRO_LIVE","AUTONOMOUS_CANARY_VENUE","AUTONOMOUS_CANARY_LIMITS","CANARY_READINESS_SNAPSHOT_MAX_AGE_SECONDS","CanaryBlocked","CanaryLimits","CanaryService","CanaryVenue","CredentialStore","PolymarketClobV2Venue","PRODUCTION_LIVE_EXECUTION"]

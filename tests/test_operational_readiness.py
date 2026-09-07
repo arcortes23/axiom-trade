@@ -509,7 +509,7 @@ class CanaryReadinessTests(unittest.TestCase):
                 ),
             )
             store.connection.commit()
-            with patch.object(service, "status", return_value=snapshot), patch.object(
+            with patch.object(service, "authoritative_status", return_value=snapshot), patch.object(
                 store,
                 "polymarket_health",
                 return_value={"grade": "A"},
@@ -689,7 +689,7 @@ class CanaryReadinessTests(unittest.TestCase):
                     ),
                 )
                 store.connection.commit()
-                with patch.object(service, "status", return_value=snapshot), patch.object(
+                with patch.object(service, "authoritative_status", return_value=snapshot), patch.object(
                     store,
                     "polymarket_health",
                     return_value={"grade": "A"},

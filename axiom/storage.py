@@ -21,7 +21,7 @@ from dataclasses import asdict, is_dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Mapping, Sequence
+from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 _MAX_LATEST_SCAN_ROWS = 10_000
 _MAX_EVIDENCE_SCAN_ROWS = 100_000
 _QUEUE_RELEASE_BATCH = 256
@@ -167,6 +167,7 @@ class AxiomStore:
         self._conn.row_factory = sqlite3.Row
         self._lock = threading.RLock()
         self._transaction_depth = 0
+        self._after_commit_callbacks: list[list[Callable[[], Any]]] = []
         self._sqlite_timeout_seconds = timeout
         self._sqlite_busy_timeout_ms = max(1, int(round(timeout * 1000.0)))
         try:
@@ -227,6 +228,7 @@ class AxiomStore:
     @contextmanager
     def transaction(self, *, immediate: bool = False) -> Iterator["AxiomStore"]:
         """Group several append-only writes into one rollback boundary."""
+        callbacks_to_run: list[Callable[[], Any]] = []
         with self._lock:
             if immediate and not self._transaction_depth:
                 sqlite_retry(
@@ -234,10 +236,15 @@ class AxiomStore:
                     operation_name="begin immediate SQLite transaction",
                 )
                 self._transaction_depth += 1
+                self._after_commit_callbacks.append([])
                 try:
                     yield self
                 except BaseException:
-                    self._conn.rollback()
+                    try:
+                        self._conn.rollback()
+                    finally:
+                        self._after_commit_callbacks.pop()
+                        self._transaction_depth -= 1
                     raise
                 else:
                     try:
@@ -246,24 +253,65 @@ class AxiomStore:
                             operation_name="commit SQLite transaction",
                         )
                     except BaseException:
-                        self._conn.rollback()
+                        try:
+                            self._conn.rollback()
+                        finally:
+                            self._after_commit_callbacks.pop()
+                            self._transaction_depth -= 1
                         raise
-                finally:
+                    callbacks_to_run = self._after_commit_callbacks.pop()
                     self._transaction_depth -= 1
-                return
-            self._transaction_depth += 1
-            savepoint = f"axiom_tx_{id(self):x}_{self._transaction_depth}"
-            self._conn.execute(f"SAVEPOINT {savepoint}")
-            try:
-                yield self
-            except BaseException:
-                self._conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
-                self._conn.execute(f"RELEASE SAVEPOINT {savepoint}")
-                raise
             else:
-                self._conn.execute(f"RELEASE SAVEPOINT {savepoint}")
-            finally:
-                self._transaction_depth -= 1
+                self._transaction_depth += 1
+                self._after_commit_callbacks.append([])
+                savepoint = f"axiom_tx_{id(self):x}_{self._transaction_depth}"
+                try:
+                    self._conn.execute(f"SAVEPOINT {savepoint}")
+                except BaseException:
+                    self._after_commit_callbacks.pop()
+                    self._transaction_depth -= 1
+                    raise
+                try:
+                    yield self
+                except BaseException:
+                    try:
+                        self._conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                        self._conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                    finally:
+                        self._after_commit_callbacks.pop()
+                        self._transaction_depth -= 1
+                    raise
+                else:
+                    try:
+                        self._conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                    except BaseException:
+                        self._after_commit_callbacks.pop()
+                        self._transaction_depth -= 1
+                        raise
+                    callbacks_to_run = self._after_commit_callbacks.pop()
+                    self._transaction_depth -= 1
+                    if self._after_commit_callbacks:
+                        self._after_commit_callbacks[-1].extend(callbacks_to_run)
+                        callbacks_to_run = []
+        self._run_after_commit_callbacks(callbacks_to_run)
+
+    def _run_after_commit_callbacks(self, callbacks: Sequence[Callable[[], Any]]) -> None:
+        """Run committed callbacks without allowing projection failures to undo writes."""
+        for callback in callbacks:
+            try:
+                callback()
+            except Exception:
+                _LOGGER.exception("after-commit callback failed")
+
+    def after_commit(self, callback: Callable[[], Any]) -> None:
+        """Run a callback after the outermost transaction durably commits."""
+        if not callable(callback):
+            raise TypeError("after_commit callback must be callable")
+        with self._lock:
+            if self._transaction_depth:
+                self._after_commit_callbacks[-1].append(callback)
+                return
+            self._run_after_commit_callbacks((callback,))
 
     @contextmanager
     def _write_context(self) -> Iterator[None]:

@@ -1340,7 +1340,7 @@ class OperatorControlTests(unittest.TestCase):
         activity = self.store.paginate_research_activity(kind="operator", page_size=25)
         self.assertGreaterEqual(activity["total"], 2)
     def test_manual_arm_target_is_distinct_from_persisted_autonomous_winner(self) -> None:
-        timestamp = datetime(2026, 1, 2, 12, tzinfo=timezone.utc)
+        timestamp = datetime.now(timezone.utc)
         self._seed_candidate("A", timestamp=timestamp)
         candidate_a = dict(self.store.load_candidate_lifecycle("A")["payload"])
 

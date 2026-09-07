@@ -11,6 +11,7 @@ import time
 import unittest
 from unittest.mock import patch
 
+from axiom.canary import CanaryService
 from axiom.cli import main
 from axiom.bootstrap import BTC_DATASET_IDS, HistoricalBootstrapper
 from axiom.dashboard import DashboardData
@@ -280,6 +281,36 @@ class SQLiteConcurrencyTests(unittest.TestCase):
             "another AXIOM writer held the operational database too long",
             output.getvalue(),
         )
+
+    def test_projection_publication_busy_is_stale_and_recoverable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "projection.sqlite3")
+            holder = AxiomStore(path)
+            blocked = AxiomStore(path, sqlite_timeout_seconds=0.05)
+            try:
+                CanaryService(holder)
+                blocked_service = CanaryService(blocked)
+                holder.connection.execute("BEGIN IMMEDIATE")
+                failed = blocked_service.publish_readiness_snapshot(
+                    reason="HELD_WRITER"
+                )
+                self.assertEqual(failed["readiness_snapshot_status"], "STALE")
+                self.assertTrue(failed["readiness_snapshot_stale"])
+                self.assertEqual(
+                    blocked_service.status()["readiness_snapshot_status"],
+                    "STALE",
+                )
+                holder.connection.rollback()
+                recovered = blocked_service.publish_readiness_snapshot(
+                    reason="WRITER_RELEASED"
+                )
+                self.assertEqual(recovered["readiness_snapshot_status"], "CURRENT")
+                self.assertFalse(recovered["readiness_snapshot_stale"])
+            finally:
+                if holder.connection.in_transaction:
+                    holder.connection.rollback()
+                blocked.close()
+                holder.close()
 
 
 if __name__ == "__main__":

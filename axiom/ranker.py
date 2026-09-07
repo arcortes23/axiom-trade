@@ -62,7 +62,7 @@ class CandidateCanaryRanker:
         clock=utc_now,
     ) -> None:
         self.store = store
-        self.service = service or CanaryService(store)
+        self.service = service or CanaryService(store, clock=clock)
         self.clock = clock
 
     @staticmethod
@@ -706,8 +706,20 @@ class CandidateCanaryRanker:
                 raise
         with self.store._lock:
             self.service.bind_autonomous_selection(selected_id)
-            public_status = self.service.status()
-            selected_snapshot = self.current_selection()
+            public_status = self.service.publish_readiness_snapshot(
+                reason="RANKING_EVALUATED"
+            )
+            # The committed ranking already validated selection hashes; avoid
+            # re-running the expensive selection validation for this result.
+            selection_record = self.service._selection_record()
+            selected_snapshot = (
+                selection_record
+                if selected_id
+                and isinstance(selection_record, Mapping)
+                and str(selection_record.get("candidate_id") or "").strip()
+                == selected_id
+                else None
+            )
             rankings_snapshot = self.rankings()
         return {
             "ranking_run_id": run_id,
@@ -771,7 +783,7 @@ class CandidateCanaryRanker:
         return self.current_selection()
 
     def eligible_count(self) -> int:
-        return int(self.service.status().get("eligible_count") or 0)
+        return int(self.service.authoritative_status().get("eligible_count") or 0)
 
 
 __all__ = ["CandidateCanaryRanker"]
