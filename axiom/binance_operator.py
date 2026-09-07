@@ -77,6 +77,9 @@ _SECRET_WORDS = re.compile(
     r"(?:secret|password|passwd|token|api[_-]?key|apikey|private[_-]?key|private|mnemonic|passphrase|authorization|bearer|credential)",
     re.I,
 )
+_CREDENTIAL_HASH_RE = re.compile(r"\A[0-9a-fA-F]{64}\Z")
+_ABSENT_CREDENTIAL_HASH = hashlib.sha256(b'{"configured":false}').hexdigest()
+_REDACTED_MARKER = "<redacted>"
 _FORBIDDEN_TRANSPORT_WORDS = re.compile(r"(?:polymarket|hermes)", re.I)
 _HOST_KEYS = frozenset({"host", "hostname", "base_url", "baseurl", "url", "endpoint", "origin", "path"})
 
@@ -132,19 +135,42 @@ def _decimal_text(value: Any, default: Decimal = Decimal("0")) -> str:
 
 
 def _jsonable(value: Any, *, key: str | None = None, redact: bool = True) -> Any:
-    """Convert arbitrary fake-service values to bounded, secret-free JSON.
+    """Convert arbitrary service values to bounded, secret-free JSON.
 
-    Secret-shaped scalar values are replaced, but container values are walked
-    recursively.  In particular, a safe credential projection must remain a
-    mapping so callers can still inspect ``configured`` and ``reference_hash``.
+    A secret-shaped key owns the entire value below it.  Redacting only
+    scalar leaves is unsafe because nested mappings/lists can still contain
+    credentials.  The one intentional exception is the credential projection,
+    which is constructed explicitly by :meth:`_credential_projection` rather
+    than passed through this generic serializer.
     """
-    secret_key = bool(
-        key
-        and _SECRET_WORDS.search(str(key))
-        and str(key).lower() not in {"credential_hash", "credential_ref_hash", "reference_hash"}
-    )
-    if secret_key and redact and not isinstance(value, Mapping) and not isinstance(value, (list, tuple, set, frozenset)):
+    key_text = str(key) if key is not None else ""
+    lowered = key_text.lower()
+    secret_key = bool(key_text and _SECRET_WORDS.search(key_text))
+    if secret_key:
         return "<redacted>"
+
+    # Persisted JSON columns are still untrusted data.  Decode them before
+    # projection so nested secret-shaped keys cannot survive as an opaque
+    # string.  Keep the column's string shape for callers that expect SQL
+    # records, while replacing unsafe leaves in the encoded value.
+    if lowered.endswith("_json") and isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            decoded = None
+        if decoded is not None:
+            projected = _jsonable(decoded, key=key_text[:-5] or None, redact=redact)
+            try:
+                return json.dumps(
+                    projected,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                )
+            except (TypeError, ValueError):
+                return "<redacted>"
+
     if isinstance(value, Decimal):
         return format(value, "f")
     if isinstance(value, datetime):
@@ -152,7 +178,7 @@ def _jsonable(value: Any, *, key: str | None = None, redact: bool = True) -> Any
     if isinstance(value, Mapping):
         return {str(k): _jsonable(v, key=str(k), redact=redact) for k, v in value.items()}
     if isinstance(value, (list, tuple, set, frozenset)):
-        return [_jsonable(item, key=key if secret_key else None, redact=redact) for item in value]
+        return [_jsonable(item, redact=redact) for item in value]
     if hasattr(value, "to_dict") and callable(value.to_dict):
         try:
             return _jsonable(value.to_dict(), key=key, redact=redact)
@@ -218,6 +244,31 @@ def _summary_record(record: Mapping[str, Any]) -> dict[str, Any]:
 def _as_mapping(value: Any) -> dict[str, Any]:
     projected = _jsonable(value)
     return dict(projected) if isinstance(projected, Mapping) else {}
+
+
+def _validated_credential_hash(value: Any) -> str | None:
+    """Accept only an opaque SHA-256 credential fingerprint."""
+    if not isinstance(value, str) or value == _REDACTED_MARKER:
+        return None
+    if _CREDENTIAL_HASH_RE.fullmatch(value) is None:
+        return None
+    return value.casefold()
+
+
+def _explicit_credentials_configured(value: Any) -> bool:
+    """Read configuration only from explicit scalar credential fields."""
+    if isinstance(value, Mapping):
+        api_key = value.get("api_key")
+        api_secret = value.get("api_secret")
+    elif value is not None:
+        api_key = getattr(value, "api_key", None)
+        api_secret = getattr(value, "api_secret", None)
+    else:
+        return False
+    return all(
+        isinstance(item, str) and bool(item) and item != _REDACTED_MARKER
+        for item in (api_key, api_secret)
+    )
 
 
 def _call(method: Any, payload: Mapping[str, Any] | None = None) -> Any:
@@ -384,24 +435,42 @@ class BinanceCanaryControlPlane:
         try:
             value = getattr(self.execution, "_credential_value", None)
             credentials = value() if callable(value) else getattr(self.execution, "credentials", None)
-            if isinstance(credentials, Mapping):
-                configured = bool(credentials.get("api_key") and credentials.get("api_secret"))
-            elif credentials is not None:
-                configured = bool(getattr(credentials, "api_key", None) and getattr(credentials, "api_secret", None))
+            configured = _explicit_credentials_configured(credentials)
         except Exception:
             configured = False
-        raw_hash = control.get("credential_hash")
-        if raw_hash:
-            # The execution service stores the hash of this exact marker when
-            # credentials are absent.  It is safe to compare, never expose keys.
-            absent_hash = hashlib.sha256(b'{"configured":false}').hexdigest()
-            configured = configured or str(raw_hash) != absent_hash
+        if not configured:
+            # ``_execution_control`` intentionally redacts this secret-shaped
+            # field.  Only inspect a raw value as an opaque, exact SHA-256
+            # fingerprint; never carry it into a projection.
+            raw_hash = _validated_credential_hash(control.get("credential_hash"))
+            if raw_hash is None:
+                method = getattr(self.execution, "control", None) or getattr(self.execution, "status", None)
+                try:
+                    raw_control = method() if callable(method) else {}
+                    raw_hash = _validated_credential_hash(
+                        raw_control.get("credential_hash")
+                        if isinstance(raw_control, Mapping)
+                        else None
+                    )
+                except Exception:
+                    raw_hash = None
+            if raw_hash is not None:
+                configured = raw_hash != _ABSENT_CREDENTIAL_HASH
         ref = getattr(self.execution, "credential_ref", None)
         if ref is not None:
             try:
-                reference_hash = str(ref.stable_id()) if hasattr(ref, "stable_id") else hashlib.sha256(str(getattr(ref, "identity", ref)).encode()).hexdigest()
+                stable_id = getattr(ref, "stable_id", None)
+                raw_reference = stable_id() if callable(stable_id) else None
+                reference_hash = _validated_credential_hash(raw_reference)
             except Exception:
                 reference_hash = None
+            # A valid reference fingerprint can establish configured state,
+            # while malformed references must not override independent,
+            # explicitly configured credentials or control state.
+            if reference_hash is not None:
+                configured = True
+        # This is the sole credential allowlist boundary.  Never merge or
+        # serialize arbitrary credential mappings into a projection.
         return {
             "configured": bool(configured),
             "reference_hash": reference_hash,
@@ -411,7 +480,7 @@ class BinanceCanaryControlPlane:
         method = getattr(self.execution, "control", None) or getattr(self.execution, "status", None)
         try:
             raw = method() if callable(method) else {}
-            projected = _jsonable(raw, redact=False)
+            projected = _jsonable(raw)
             return dict(projected) if isinstance(projected, Mapping) else {}
         except Exception:
             return {"state": DISABLED, "authorized": False, "error": "CONTROL_UNAVAILABLE"}
@@ -564,10 +633,30 @@ class BinanceCanaryControlPlane:
     def _budget_projection(self, positions: Sequence[Mapping[str, Any]], orders: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         control = self._execution_control()
         envelope = getattr(self.execution, "risk_envelope", None) or DEFAULT_BINANCE_RISK_ENVELOPE
+
         def get(name: str, fallback: Any) -> Any:
             return getattr(envelope, name, fallback) if envelope is not None else fallback
         exposure = sum((_decimal(row.get("cost_basis", row.get("notional", 0))) for row in positions), Decimal("0"))
-        reservations = sum((_decimal(row.get("notional", 0)) + _decimal(row.get("fee_reserve", 0)) for row in orders if str(row.get("state", "")).upper() not in {"REJECTED", "FILLED", "CANCELED", "CANCELLED", "EXPIRED"}), Decimal("0"))
+
+        quote_reservations = Decimal("0")
+        base_reservations: dict[str, Decimal] = {}
+        for row in orders:
+            reservation = row.get("risk_reservation")
+            if (
+                not isinstance(reservation, Mapping)
+                or str(reservation.get("status", "")).upper() != "HELD"
+            ):
+                continue
+            side = str(row.get("side") or "BUY").upper()
+            if side == "SELL":
+                symbol = str(row.get("symbol") or "").strip().upper()[:32]
+                quantity = _decimal(reservation.get("reserved_quantity"))
+                if symbol and quantity > 0:
+                    base_reservations[symbol] = base_reservations.get(symbol, Decimal("0")) + quantity
+                # A SELL reserves base inventory, not quote buying power.
+                continue
+            quote_reservations += _decimal(row.get("notional", row.get("amount", 0))) + _decimal(row.get("fee_reserve", 0))
+
         realized = sum((_decimal(row.get("realized_pnl")) for row in positions), Decimal("0"))
         unrealized = sum((_decimal(row.get("unrealized_pnl")) for row in positions), Decimal("0"))
         fees = sum((_decimal(row.get("fees_quote", row.get("commission", 0))) for row in positions), Decimal("0"))
@@ -583,9 +672,9 @@ class BinanceCanaryControlPlane:
             "max_submissions_per_day": int(get("max_submissions_per_day", 20)),
         }
         remaining = {
-            "entry_notional": _decimal_text(max(Decimal("0"), _decimal(limits["entry_notional"]) - reservations)),
+            "entry_notional": _decimal_text(max(Decimal("0"), _decimal(limits["entry_notional"]) - quote_reservations)),
             "max_aggregate_exposure": _decimal_text(max(Decimal("0"), _decimal(limits["max_aggregate_exposure"]) - exposure)),
-            "max_reserved_exposure": _decimal_text(max(Decimal("0"), _decimal(limits["max_reserved_exposure"]) - reservations)),
+            "max_reserved_exposure": _decimal_text(max(Decimal("0"), _decimal(limits["max_reserved_exposure"]) - quote_reservations)),
             "realized_loss_entry_stop": _decimal_text(max(Decimal("0"), _decimal(limits["realized_loss_entry_stop"]) + min(Decimal("0"), realized))),
             "equity_loss_entry_stop": _decimal_text(max(Decimal("0"), _decimal(limits["equity_loss_entry_stop"]) + min(Decimal("0"), realized + unrealized))),
             "max_positions": max(0, int(limits["max_positions"]) - active_positions),
@@ -599,7 +688,12 @@ class BinanceCanaryControlPlane:
             "unrealized_pnl": _decimal_text(unrealized),
             "fees": _decimal_text(fees),
             "exposure": _decimal_text(exposure),
-            "reservations": _decimal_text(reservations),
+            "reservations": _decimal_text(quote_reservations),
+            "quote_reservations": _decimal_text(quote_reservations),
+            "base_reservations": {
+                symbol: _decimal_text(quantity)
+                for symbol, quantity in sorted(base_reservations.items())[:100]
+            },
             "control_state": control.get("state", DISABLED),
         }
 
@@ -639,7 +733,7 @@ class BinanceCanaryControlPlane:
             recent_actions = self.list_actions(limit=5)
             risk = self._budget_projection(positions, orders)
             now_projection = _timestamp_projection(self._now())
-            return _as_mapping(
+            projection = _as_mapping(
                 {
                     "timestamp": now_projection,
                     "profile": self._profile_projection(),
@@ -682,6 +776,8 @@ class BinanceCanaryControlPlane:
                     "live_execution": False if self._is_live() else self._environment() != PAPER,
                 }
             )
+            projection["credentials"] = self._credential_projection(control)
+            return projection
 
     def snapshot(self, page_size: int = DEFAULT_PAGE_SIZE, page: int = 1, **kwargs: Any) -> dict[str, Any]:
         """Return status plus bounded pages and complete IDs in detail records."""

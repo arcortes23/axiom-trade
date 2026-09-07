@@ -41,6 +41,8 @@ from .binance_spot import (
     BinanceSpotResult,
     BinanceSpotRESTClient,
     canonical_sha256,
+    credential_fingerprint,
+    validate_spot_venue_identity,
 )
 from .storage import AxiomStore
 
@@ -62,13 +64,13 @@ FILLED = "FILLED"
 CANCELED = "CANCELED"
 EXPIRED = "EXPIRED"
 TERMINAL = frozenset({REJECTED, FILLED, CANCELED, EXPIRED})
-ACTIVE = frozenset({INTENT, RESERVED, SUBMITTING, ACKNOWLEDGED, UNKNOWN, PARTIALLY_FILLED})
 _RISK_RESERVATION_COLUMNS = (
     "reservation_id",
     "intent_id",
     "symbol",
     "side",
     "amount",
+    "reserved_quantity",
     "fee_reserve",
     "status",
     "created_at",
@@ -173,7 +175,6 @@ def _symbol(value: Any) -> str:
         raise ValueError("symbol is required")
     return text
 
-
 def _status(result: Any) -> str:
     if isinstance(result, BinanceSpotResult):
         return str(result.status).upper()
@@ -183,12 +184,23 @@ def _status(result: Any) -> str:
             text = str(value).upper()
             if text in {"OK", "ACCEPTED", "SUCCESS"}:
                 return "OK"
-            if text in {"REJECTED", "ERROR", "FAILED", "FAILURE"}:
+            if text in {"REJECTED", "ERROR", "FAILED", "FAILURE", "AUTH", "AUTH_ERROR", "INVALID_TIMESTAMP"}:
                 return REJECTED
             if text in {"UNKNOWN", "TIMEOUT", "DISCONNECTED"}:
                 return UNKNOWN
-            if text in {"NEW", "ACKNOWLEDGED", "PARTIALLY_FILLED", "FILLED", "CANCELED", "CANCELLED", "EXPIRED"}:
+            if text in {"RATE_LIMIT", "RATELIMIT", "TOO_MANY_REQUESTS"}:
+                return "RATE_LIMIT"
+            if text in {
+                "NEW",
+                "ACKNOWLEDGED",
+                "PARTIALLY_FILLED",
+                "FILLED",
+                "CANCELED",
+                "CANCELLED",
+                "EXPIRED",
+            }:
                 return "OK"
+            return "MALFORMED"
         if "code" in result and result.get("code") not in (None, 0, "0"):
             try:
                 code = int(result.get("code"))
@@ -199,6 +211,22 @@ def _status(result: Any) -> str:
     value = getattr(result, "status", None)
     if value is not None:
         return str(getattr(value, "value", value)).upper()
+    return "UNKNOWN"
+
+
+_EXCHANGE_ORDER_STATES = frozenset(
+    {"NEW", "ACKNOWLEDGED", "PARTIALLY_FILLED", "FILLED", "CANCELED", "CANCELLED", "EXPIRED"}
+)
+
+
+def _authoritative_order_state(payload: Any) -> str | None:
+    if not isinstance(payload, Mapping):
+        return None
+    value = payload.get("status")
+    if value is None:
+        return None
+    state = str(value).upper()
+    return state if state in _EXCHANGE_ORDER_STATES else None
     return "UNKNOWN"
 
 
@@ -229,6 +257,14 @@ def _exchange_trade_id(fill: Mapping[str, Any]) -> str | None:
             return str(value)
     return None
 
+
+def _scoped_trade_id(symbol: Any, trade_id: Any) -> str:
+    """Keep exchange trade identities unique within their Binance symbol."""
+
+    normalized_symbol = _symbol(symbol)
+    raw = str(trade_id)
+    prefix = normalized_symbol + ":"
+    return raw if raw.startswith(prefix) else prefix + raw
 
 def _explicit_fill_rows(payload: Any) -> list[Mapping[str, Any]]:
     """Extract actual trade rows, never an aggregate order response.
@@ -369,6 +405,32 @@ class BinanceExecutionService:
             store = db_path
         if profile is None:
             profile = runtime_profile
+        if profile is not None and not isinstance(profile, BinanceRuntimeProfile):
+            raise TypeError("profile must be BinanceRuntimeProfile")
+        selected_venue = venue if venue is not None else adapter
+        selected_environment = _env(
+            environment if environment is not None else (profile.environment if profile else PAPER)
+        )
+        if profile is not None and selected_environment != profile.environment.value:
+            raise ValueError("profile/environment mismatch")
+        if selected_environment == BINANCE_SPOT_LIVE:
+            raise ValueError("development execution refuses Binance LIVE")
+        authorization_credentials = credentials
+        if authorization_credentials is None and credential_store is not None:
+            try:
+                authorization_credentials = credential_store.load(credential_ref)
+            except Exception:
+                authorization_credentials = None
+        validate_spot_venue_identity(
+            selected_venue,
+            selected_environment,
+            credential_hash=(
+                credential_fingerprint(authorization_credentials)
+                if selected_environment == BINANCE_SPOT_TESTNET
+                else None
+            ),
+        )
+
         self._owns_store = False
         if isinstance(store, AxiomStore):
             self.store = store
@@ -383,16 +445,9 @@ class BinanceExecutionService:
             self._conn = self.store.connection
         self._conn.row_factory = sqlite3.Row
         self._lock = threading.RLock()
-        self.venue = venue if venue is not None else adapter
+        self.venue = selected_venue
         self.profile = profile
-        self.environment = _env(environment if environment is not None else (profile.environment if profile else PAPER))
-        if profile is not None:
-            if not isinstance(profile, BinanceRuntimeProfile):
-                raise TypeError("profile must be BinanceRuntimeProfile")
-            if self.environment != profile.environment.value:
-                raise ValueError("profile/environment mismatch")
-            if self.environment == BINANCE_SPOT_LIVE:
-                raise ValueError("development profile cannot use Binance LIVE authenticated transport")
+        self.environment = selected_environment
         self.binding = binding
         self.risk_envelope = envelope or risk_envelope
         if not isinstance(self.risk_envelope, BinanceRiskEnvelope):
@@ -473,8 +528,8 @@ class BinanceExecutionService:
                 CREATE TABLE IF NOT EXISTS binance_execution_risk_reservations (
                     reservation_id TEXT PRIMARY KEY, intent_id TEXT NOT NULL UNIQUE,
                     symbol TEXT NOT NULL, side TEXT NOT NULL, amount TEXT NOT NULL,
-                    fee_reserve TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL,
-                    released_at TEXT
+                    reserved_quantity TEXT NOT NULL DEFAULT '0', fee_reserve TEXT NOT NULL,
+                    status TEXT NOT NULL, created_at TEXT NOT NULL, released_at TEXT
                 );
                 CREATE TABLE IF NOT EXISTS binance_execution_positions (
                     symbol TEXT PRIMARY KEY, quantity TEXT NOT NULL, cost_basis TEXT NOT NULL,
@@ -495,6 +550,21 @@ class BinanceExecutionService:
                 CREATE INDEX IF NOT EXISTS idx_binance_exec_fills_order ON binance_execution_fills(client_order_id, trade_time);
                 """
             )
+            columns = {
+                str(row[1])
+                for row in self._conn.execute(
+                    "PRAGMA table_info(binance_execution_risk_reservations)"
+                ).fetchall()
+            }
+            added_reserved_quantity = "reserved_quantity" not in columns
+            if added_reserved_quantity:
+                self._conn.execute(
+                    "ALTER TABLE binance_execution_risk_reservations "
+                    "ADD COLUMN reserved_quantity TEXT NOT NULL DEFAULT '0'"
+                )
+            self._migrate_fill_ids()
+            if added_reserved_quantity:
+                self._migrate_reserved_quantities()
             now = _iso(self.clock())
             self._conn.execute(
                 "INSERT OR IGNORE INTO binance_execution_schema_lock(singleton,namespace,schema_version,created_at) VALUES(1,?,?,?)",
@@ -509,6 +579,91 @@ class BinanceExecutionService:
                 (now,),
             )
             self._conn.commit()
+    def _migrate_fill_ids(self) -> None:
+        """Scope legacy raw exchange trade IDs by symbol exactly once."""
+
+        rows = self._conn.execute(
+            "SELECT rowid,trade_id,symbol FROM binance_execution_fills ORDER BY rowid"
+        ).fetchall()
+        pending: list[tuple[str, str]] = []
+        for row in rows:
+            old_id = str(row["trade_id"])
+            target = _scoped_trade_id(row["symbol"], old_id)
+            if target == old_id:
+                continue
+            temporary = "__binance_fill_migration__" + uuid.uuid4().hex
+            self._conn.execute(
+                "UPDATE binance_execution_fills SET trade_id=? WHERE rowid=?",
+                (temporary, row["rowid"]),
+            )
+            pending.append((temporary, target))
+        claimed: set[str] = set()
+        for temporary, target in pending:
+            duplicate = (
+                target in claimed
+                or self._conn.execute(
+                    "SELECT 1 FROM binance_execution_fills WHERE trade_id=?",
+                    (target,),
+                ).fetchone()
+                is not None
+            )
+            if duplicate:
+                self._conn.execute(
+                    "DELETE FROM binance_execution_fills WHERE trade_id=?", (temporary,)
+                )
+                continue
+            self._conn.execute(
+                "UPDATE binance_execution_fills SET trade_id=? WHERE trade_id=?",
+                (target, temporary),
+            )
+            claimed.add(target)
+    def _migrate_reserved_quantities(self) -> None:
+        """Backfill legacy held SELL reservations from durable fills once."""
+
+        reservations = self._conn.execute(
+            """
+            SELECT r.reservation_id, r.intent_id, r.symbol,
+                   i.quantity, i.client_order_id, i.exchange_order_id
+            FROM binance_execution_risk_reservations AS r
+            JOIN binance_execution_order_intents AS i ON i.intent_id=r.intent_id
+            WHERE UPPER(r.side)='SELL' AND r.status='HELD'
+            ORDER BY r.reservation_id
+            """
+        ).fetchall()
+        fills = self._conn.execute(
+            """
+            SELECT intent_id, client_order_id, exchange_order_id, symbol, quantity
+            FROM binance_execution_fills
+            ORDER BY rowid
+            """
+        ).fetchall()
+        for reservation in reservations:
+            symbol = _symbol(reservation["symbol"])
+            intent_id = str(reservation["intent_id"])
+            client_order_id = reservation["client_order_id"]
+            exchange_order_id = reservation["exchange_order_id"]
+            filled = ZERO
+            for fill in fills:
+                if _symbol(fill["symbol"]) != symbol:
+                    continue
+                associated = str(fill["intent_id"]) == intent_id if fill["intent_id"] is not None else False
+                if not associated and client_order_id not in (None, ""):
+                    associated = fill["client_order_id"] == client_order_id
+                if not associated and exchange_order_id not in (None, ""):
+                    associated = fill["exchange_order_id"] == exchange_order_id
+                if associated:
+                    filled += max(ZERO, _dec(fill["quantity"]))
+            remainder = max(ZERO, _dec(reservation["quantity"]) - filled)
+            self._conn.execute(
+                """
+                UPDATE binance_execution_risk_reservations
+                SET reserved_quantity=?
+                WHERE reservation_id=? AND UPPER(side)='SELL'
+                  AND status='HELD' AND reserved_quantity='0'
+                """,
+                (_dstr(remainder), reservation["reservation_id"]),
+            )
+
 
     def _binding_hash(self) -> str:
         value = self.binding
@@ -648,7 +803,11 @@ class BinanceExecutionService:
             epoch = body.get("epoch", body.get("accountEpoch", body.get("account_epoch")))
         now = _iso(observed_at or self.clock())
         with self._lock:
-            self._conn.execute("INSERT INTO binance_execution_account(singleton,account_json,epoch,observed_at) VALUES(1,?,?,?) ON CONFLICT(singleton) DO UPDATE SET account_json=excluded.account_json,epoch=excluded.epoch,observed_at=excluded.observed_at", (_json(body), None if epoch is None else str(epoch), now))
+            self._conn.execute(
+                "INSERT INTO binance_execution_account(singleton,account_json,epoch,observed_at) VALUES(1,?,?,?) "
+                "ON CONFLICT(singleton) DO UPDATE SET account_json=excluded.account_json,epoch=excluded.epoch,observed_at=excluded.observed_at",
+                (_json(body), None if epoch is None else str(epoch), now),
+            )
             self._conn.commit()
         self.account_state = body
         return body
@@ -657,23 +816,24 @@ class BinanceExecutionService:
 
     def _snapshot(self, now: Any = None) -> RiskSnapshot:
         account = dict(self.account_state)
-        row = self._conn.execute("SELECT account_json FROM binance_execution_account WHERE singleton=1").fetchone()
+        row = self._conn.execute(
+            "SELECT account_json FROM binance_execution_account WHERE singleton=1"
+        ).fetchone()
         if row is not None:
             account.update(_load(row[0], {}) or {})
 
         # The durable ledger is authoritative for inventory and reservations.
-        # Do not derive a risk point from the in-memory account cache alone:
-        # another service instance may have committed a fill since this
-        # instance last refreshed its account payload.
         position_rows = self._conn.execute(
             "SELECT symbol,quantity,valuation_status FROM binance_execution_positions ORDER BY symbol"
         ).fetchall()
         positions = [dict(position) for position in position_rows]
         reservation_rows = self._conn.execute(
             """
-            SELECT i.symbol AS symbol, r.side AS side, i.quantity AS quantity,
-                   i.price AS price, r.fee_reserve AS fee_reserve,
-                   i.exchange_order_id AS exchange_order_id, r.amount AS amount
+            SELECT i.intent_id AS intent_id, i.symbol AS symbol, r.side AS side,
+                   i.quantity AS quantity, i.price AS price, r.fee_reserve AS fee_reserve,
+                   i.exchange_order_id AS exchange_order_id, r.amount AS amount,
+                   r.reserved_quantity AS reserved_quantity, r.status AS reservation_status,
+                   i.state AS intent_state
             FROM binance_execution_risk_reservations AS r
             JOIN binance_execution_order_intents AS i ON i.intent_id = r.intent_id
             WHERE r.status='HELD'
@@ -682,24 +842,36 @@ class BinanceExecutionService:
         ).fetchall()
         pending = []
         pending_buy_exposure = ZERO
+        inventory = dict(account.get("owned_inventory", account.get("inventory", {})) or {})
+        for position in positions:
+            if _dec(position["quantity"]) > ZERO:
+                inventory[str(position["symbol"])] = str(position["quantity"])
         for reservation in reservation_rows:
             pending_row = dict(reservation)
-            # A HELD reservation remains unresolved even if its intent was
-            # interrupted around a state transition; preserve that durable
-            # safety invariant in RiskSnapshot.
+            filled_rows = self._conn.execute(
+                "SELECT quantity FROM binance_execution_fills WHERE intent_id=?",
+                (reservation["intent_id"],),
+            ).fetchall()
+            filled_quantity = sum((_dec(item[0]) for item in filled_rows), ZERO)
+            pending_row["filled_quantity"] = _dstr(filled_quantity)
             pending_row["state"] = "OPEN"
+            side = str(reservation["side"]).upper()
+            if side == "SELL":
+                original = _dec(reservation["quantity"])
+                remainder = max(ZERO, original - filled_quantity)
+                pending_row["reserved_quantity"] = _dstr(remainder)
+                symbol = str(reservation["symbol"])
+                available = _dec(inventory.get(symbol, ZERO))
+                inventory[symbol] = _dstr(max(ZERO, available - remainder))
+            else:
+                pending_row["reserved_quantity"] = "0"
+                pending_buy_exposure += _dec(reservation["amount"], ZERO)
             pending.append(pending_row)
-            if str(pending_row["side"]).upper() == "BUY":
-                pending_buy_exposure += _dec(pending_row["amount"], ZERO)
 
         account["aggregate_exposure"] = _dstr(
             _dec(account.get("aggregate_exposure", account.get("exposure", ZERO)))
             + pending_buy_exposure
         )
-        inventory = dict(account.get("owned_inventory", account.get("inventory", {})) or {})
-        for position in positions:
-            if _dec(position["quantity"]) > ZERO:
-                inventory[str(position["symbol"])] = str(position["quantity"])
         account.setdefault("reserved_exposure", "0")
         if positions:
             account["positions"] = len(
@@ -739,12 +911,6 @@ class BinanceExecutionService:
             int(account.get("exchange_order_count", account.get("open_orders", 0)) or 0),
             pending_count,
         )
-
-        # Reopened services must not lose the fee-valuation safety stop that
-        # was persisted with a position row.  _recompute_position performs the
-        # durable PAUSED transition; this flag also makes an already-open
-        # transaction-time recheck reject a new entry without nesting a
-        # BEGIN IMMEDIATE.
         if any(str(position["valuation_status"]).upper() == "UNKNOWN" for position in positions):
             account["account_paused"] = True
         return RiskSnapshot.from_account(account, now=_utc(now or self.clock()))
@@ -790,7 +956,8 @@ class BinanceExecutionService:
                 result[key[:-5] if key.endswith("_json") else key] = _load(result[key], None)
         if risk_reservation is _MISSING_RESERVATION:
             risk_reservation = self._conn.execute(
-                "SELECT reservation_id,intent_id,symbol,side,amount,fee_reserve,status,created_at,released_at "
+                "SELECT reservation_id,intent_id,symbol,side,amount,reserved_quantity,"
+                "fee_reserve,status,created_at,released_at "
                 "FROM binance_execution_risk_reservations WHERE intent_id=?",
                 (result["intent_id"],),
             ).fetchone()
@@ -897,7 +1064,22 @@ class BinanceExecutionService:
                         self._conn.execute("INSERT INTO binance_execution_signals(signal_id,opportunity_id,candidate_id,binding_hash,symbol,environment,decision_interval,decision_at,intent,side,reason,exit_policy_json,signal_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (data["signal_id"], data.get("opportunity_id"), data["candidate_id"], data["binding_hash"], data["symbol"], data["environment"], data["decision_interval"], data["decision_at"], data["intent"], data["side"], data.get("reason"), _json(data.get("exit_policy")), _json(data), now_iso))
                         self._conn.execute("INSERT INTO binance_execution_order_intents(intent_id,signal_id,opportunity_id,candidate_id,binding_hash,symbol,environment,intent,side,price,quantity,notional,fee_reserve,client_order_id,state,generation,owner_id,lease_expires_at,exit_policy_json,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (intent_id, data["signal_id"], data.get("opportunity_id"), data["candidate_id"], data["binding_hash"], data["symbol"], data["environment"], data["intent"], data["side"], _dstr(price), _dstr(quantity), _dstr(notional), _dstr(fee), client_id, INTENT, generation, self.owner_id, _iso(_utc(self.clock()) + timedelta(seconds=self.lease_seconds)), _json(data.get("exit_policy")), now_iso))
                         self._transition(intent_id, None, INTENT, generation, "created", {})
-                        self._conn.execute("INSERT INTO binance_execution_risk_reservations(reservation_id,intent_id,symbol,side,amount,fee_reserve,status,created_at) VALUES(?,?,?,?,?,?,?,?)", (uuid.uuid4().hex, intent_id, data["symbol"], data["side"], _dstr(notional), _dstr(fee), "HELD", now_iso))
+                        self._conn.execute(
+                            "INSERT INTO binance_execution_risk_reservations("
+                            "reservation_id,intent_id,symbol,side,amount,reserved_quantity,"
+                            "fee_reserve,status,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                            (
+                                uuid.uuid4().hex,
+                                intent_id,
+                                data["symbol"],
+                                data["side"],
+                                _dstr(notional),
+                                _dstr(quantity) if data["side"] == "SELL" else "0",
+                                _dstr(fee),
+                                "HELD",
+                                now_iso,
+                            ),
+                        )
                         self._transition(intent_id, INTENT, RESERVED, generation, "risk reserved", {"amount": _dstr(notional), "fee_reserve": _dstr(fee)})
                         self._conn.execute("UPDATE binance_execution_order_intents SET state=?,updated_at=? WHERE intent_id=?", (RESERVED, now_iso, intent_id))
                         self._conn.commit()
@@ -928,7 +1110,11 @@ class BinanceExecutionService:
             self._conn.commit()
         # Fence in a separate, immediately-preceding read transaction; venue is outside SQLite.
         if not self._fence(generation, entries=data["intent"] == "ENTRY"):
-            return self._set_unknown(intent_id, "fence rejected before venue call")
+            return self._set_unknown(
+                intent_id,
+                "fence rejected before venue call",
+                generation=generation,
+            )
         self._fault("before_venue_call")
         try:
             if self.venue is None:
@@ -943,10 +1129,19 @@ class BinanceExecutionService:
                 kwargs.update({"new_client_order_id": self._client_order_id(data), "newClientOrderId": self._client_order_id(data), "client_order_id": self._client_order_id(data), "orig_client_order_id": self._client_order_id(data)})
             result = _call(method, kwargs)
         except BaseException as exc:
-            return self._set_unknown(intent_id, f"venue exception: {type(exc).__name__}")
+            return self._set_unknown(
+                intent_id,
+                f"venue exception: {type(exc).__name__}",
+                generation=generation,
+            )
         control = self.control()
         if int(control.get("generation", -1)) != int(generation) or control.get("state") == KILLED or control.get("kill_requested"):
-            return self._set_unknown(intent_id, "control generation changed during venue call", result=result)
+            return self._set_unknown(
+                intent_id,
+                "control generation changed during venue call",
+                generation=generation,
+                result=result,
+            )
         return self._apply_order_result(intent_id, result, generation)
 
     def _claim(self, row: sqlite3.Row, generation: int) -> bool:
@@ -955,60 +1150,374 @@ class BinanceExecutionService:
         result = self._conn.execute("UPDATE binance_execution_order_intents SET owner_id=?,lease_expires_at=?,generation=? WHERE intent_id=? AND (owner_id IS NULL OR owner_id=? OR lease_expires_at IS NULL OR lease_expires_at<?)", (self.owner_id, lease, generation, row["intent_id"], self.owner_id, _iso(now)))
         return result.rowcount == 1
 
-    def _set_unknown(self, intent_id: str, reason: str, *, result: Any = None) -> dict[str, Any]:
-        with self._lock:
-            row = self._conn.execute("SELECT state,generation FROM binance_execution_order_intents WHERE intent_id=?", (intent_id,)).fetchone()
-            if row is None:
-                return {}
-            if row[0] in TERMINAL:
-                return self._intent_response(self._conn.execute("SELECT * FROM binance_execution_order_intents WHERE intent_id=?", (intent_id,)).fetchone()) or {}
-            self._conn.execute("BEGIN IMMEDIATE")
-            self._conn.execute("UPDATE binance_execution_order_intents SET state=?,reason=?,raw_json=?,updated_at=? WHERE intent_id=?", (UNKNOWN, reason, _json({"reason": reason, "result": _payload(result)}), _iso(self.clock()), intent_id))
-            self._transition(intent_id, str(row[0]), UNKNOWN, int(row[1]), reason, {"result": _payload(result)})
-            self._conn.commit()
-        return self._intent_response(self._conn.execute("SELECT * FROM binance_execution_order_intents WHERE intent_id=?", (intent_id,)).fetchone()) or {}
+    @staticmethod
+    def _merge_order_state(
+        current: str,
+        observed: str,
+        *,
+        original_quantity: Decimal,
+        observed_filled: Decimal,
+    ) -> str:
+        """Merge an observation without allowing a newer state to regress."""
+        current = str(current).upper()
+        observed = str(observed).upper()
+        if current in TERMINAL:
+            # Once an authoritative terminal state is durable, a delayed
+            # submission/query response must not resurrect or rewrite it.
+            return current
+        if current == PARTIALLY_FILLED:
+            if original_quantity > ZERO and observed_filled >= original_quantity:
+                return FILLED
+            if observed in {CANCELED, EXPIRED}:
+                return observed
+            return PARTIALLY_FILLED
+        if observed in {CANCELED, EXPIRED}:
+            return (
+                FILLED
+                if original_quantity > ZERO and observed_filled >= original_quantity
+                else observed
+            )
+        if observed == FILLED and original_quantity > ZERO and observed_filled >= original_quantity:
+            return FILLED
+        if observed == PARTIALLY_FILLED or observed_filled > ZERO:
+            return PARTIALLY_FILLED
+        rank = {
+            INTENT: 0,
+            RESERVED: 1,
+            SUBMITTING: 2,
+            UNKNOWN: 3,
+            ACKNOWLEDGED: 4,
+            PARTIALLY_FILLED: 5,
+            FILLED: 6,
+            CANCELED: 6,
+            EXPIRED: 6,
+            REJECTED: 6,
+        }
+        return observed if rank.get(observed, 0) >= rank.get(current, 0) else current
 
-    def _apply_order_result(self, intent_id: str, result: Any, generation: int) -> dict[str, Any]:
+    def _filled_quantity_locked(self, intent_id: str) -> Decimal:
+        rows = self._conn.execute(
+            "SELECT quantity FROM binance_execution_fills WHERE intent_id=?",
+            (intent_id,),
+        ).fetchall()
+        return sum((_dec(row[0]) for row in rows), ZERO)
+    def _persist_sell_reservation_remainder_locked(
+        self,
+        intent: Mapping[str, Any],
+        filled_quantity: Decimal,
+    ) -> bool:
+        if str(intent["side"]).upper() != "SELL":
+            return False
+        remainder = max(ZERO, _dec(intent["quantity"]) - filled_quantity)
+        current = self._conn.execute(
+            "SELECT reserved_quantity "
+            "FROM binance_execution_risk_reservations "
+            "WHERE intent_id=? AND UPPER(side)='SELL' AND status='HELD'",
+            (intent["intent_id"],),
+        ).fetchone()
+        if current is None or _dec(current["reserved_quantity"]) == remainder:
+            return False
+        self._conn.execute(
+            "UPDATE binance_execution_risk_reservations "
+            "SET reserved_quantity=? "
+            "WHERE intent_id=? AND UPPER(side)='SELL' AND status='HELD'",
+            (_dstr(remainder), intent["intent_id"]),
+        )
+        return True
+
+
+    def _insert_fills_locked(
+        self,
+        intent: sqlite3.Row,
+        fills: Iterable[Mapping[str, Any]],
+        *,
+        exchange_order_id: str | None = None,
+    ) -> int:
+        count = 0
+        for fill in fills:
+            qty = _dec(fill.get("qty", fill.get("quantity", fill.get("executedQty", 0))))
+            if qty <= ZERO:
+                continue
+            trade_id = _exchange_trade_id(fill)
+            if trade_id is None:
+                trade_id = canonical_sha256({"intent_id": intent["intent_id"], "fill": dict(fill)})[:32]
+            trade_id = _scoped_trade_id(intent["symbol"], trade_id)
+            if self._conn.execute(
+                "SELECT 1 FROM binance_execution_fills WHERE trade_id=?",
+                (trade_id,),
+            ).fetchone() is not None:
+                continue
+            price = _dec(fill.get("price", intent["price"]))
+            quote = _dec(fill.get("quoteQty", fill.get("quote_quantity", qty * price)))
+            commission = _dec(fill.get("commission", fill.get("fee", 0)))
+            asset = fill.get("commissionAsset", fill.get("commission_asset", fill.get("fee_asset")))
+            timestamp = fill.get("time", fill.get("trade_time", fill.get("timestamp", self.clock())))
+            self._conn.execute(
+                "INSERT INTO binance_execution_fills("
+                "trade_id,intent_id,client_order_id,exchange_order_id,symbol,side,"
+                "quantity,price,quote_quantity,commission,commission_asset,trade_time,payload_json"
+                ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    trade_id,
+                    intent["intent_id"],
+                    intent["client_order_id"],
+                    exchange_order_id or intent["exchange_order_id"],
+                    intent["symbol"],
+                    intent["side"],
+                    _dstr(qty),
+                    _dstr(price),
+                    _dstr(quote),
+                    _dstr(commission),
+                    None if asset is None else str(asset).upper(),
+                    _iso(timestamp),
+                    _json(fill),
+                ),
+            )
+            count += 1
+        return count
+
+    def _set_unknown(
+        self,
+        intent_id: str,
+        reason: str,
+        *,
+        generation: int | None = None,
+        result: Any = None,
+    ) -> dict[str, Any]:
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute(
+                    "SELECT * FROM binance_execution_order_intents WHERE intent_id=?",
+                    (intent_id,),
+                ).fetchone()
+                if row is None:
+                    self._conn.rollback()
+                    return {}
+                if (
+                    row["state"] in TERMINAL
+                    or (
+                        generation is not None
+                        and int(row["generation"]) != int(generation)
+                    )
+                ):
+                    current = self._intent_response(row) or {}
+                    self._conn.rollback()
+                    return current
+                now = _iso(self.clock())
+                self._conn.execute(
+                    "UPDATE binance_execution_order_intents "
+                    "SET state=?,reason=?,raw_json=?,updated_at=? WHERE intent_id=?",
+                    (
+                        UNKNOWN,
+                        reason,
+                        _json({"reason": reason, "result": _payload(result)}),
+                        now,
+                        intent_id,
+                    ),
+                )
+                self._transition(
+                    intent_id,
+                    str(row["state"]),
+                    UNKNOWN,
+                    int(row["generation"]),
+                    reason,
+                    {"result": _payload(result)},
+                )
+                self._conn.commit()
+            except BaseException:
+                self._conn.rollback()
+                raise
+        return self._intent_response(
+            self._conn.execute(
+                "SELECT * FROM binance_execution_order_intents WHERE intent_id=?",
+                (intent_id,),
+            ).fetchone()
+        ) or {}
+
+    def _apply_order_result(
+        self,
+        intent_id: str,
+        result: Any,
+        generation: int,
+        *,
+        require_authoritative: bool = False,
+    ) -> dict[str, Any]:
         status = _status(result)
         payload = _payload(result)
-        if status == UNKNOWN:
-            return self._set_unknown(intent_id, "ambiguous venue result", result=result)
-        if status in {REJECTED, "RATE_LIMIT"}:
-            target = REJECTED
-            reason = "venue rejected" if status == REJECTED else "venue rate limited"
+        raw_status = _authoritative_order_state(payload)
+        if require_authoritative:
+            if status != "OK":
+                return self._set_unknown(
+                    intent_id,
+                    "unresolved authoritative order response",
+                    generation=generation,
+                    result=result,
+                )
+            if raw_status is None:
+                return self._set_unknown(
+                    intent_id,
+                    "malformed authoritative order response",
+                    generation=generation,
+                    result=result,
+                )
+        elif status == UNKNOWN:
+            return self._set_unknown(
+                intent_id,
+                "ambiguous venue result",
+                generation=generation,
+                result=result,
+            )
+        elif status == "RATE_LIMIT":
+            # A rate limit says nothing about whether the venue accepted the
+            # request.  Keep the reservation held and reconcile by client ID.
+            return self._set_unknown(
+                intent_id,
+                "venue rate limited",
+                generation=generation,
+                result=result,
+            )
+        elif status not in {"OK", REJECTED}:
+            return self._set_unknown(
+                intent_id,
+                "unresolved venue result",
+                generation=generation,
+                result=result,
+            )
+
+        if status == REJECTED:
+            observed = REJECTED
+            reason = "venue rejected"
+        elif raw_status is None:
+            # A successful transport response is not an order acknowledgement
+            # unless its payload carries a recognized exchange order state.
+            return self._set_unknown(
+                intent_id,
+                "malformed venue order response",
+                generation=generation,
+                result=result,
+            )
         else:
-            raw_status = str(payload.get("status", "NEW")).upper() if isinstance(payload, Mapping) else "NEW"
-            target = {
+            state = raw_status
+            observed = {
                 "CANCELLED": CANCELED,
                 "CANCELED": CANCELED,
                 "EXPIRED": EXPIRED,
                 "FILLED": FILLED,
                 "PARTIALLY_FILLED": PARTIALLY_FILLED,
-            }.get(raw_status, ACKNOWLEDGED)
-            cumulative = _cumulative_quantity(payload)
-            if cumulative > ZERO:
-                quantity_row = self._conn.execute(
-                    "SELECT quantity FROM binance_execution_order_intents WHERE intent_id=?",
-                    (intent_id,),
-                ).fetchone()
-                original = _dec(quantity_row[0]) if quantity_row is not None else ZERO
-                target = FILLED if original > ZERO and cumulative >= original else PARTIALLY_FILLED
+                "ACKNOWLEDGED": ACKNOWLEDGED,
+                "NEW": ACKNOWLEDGED,
+            }[state]
             reason = "venue acknowledged"
+
+        explicit_fills = _explicit_fill_rows(payload)
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
-            row = self._conn.execute("SELECT state,symbol,client_order_id FROM binance_execution_order_intents WHERE intent_id=?", (intent_id,)).fetchone()
-            if row is None:
+            try:
+                row = self._conn.execute(
+                    "SELECT * FROM binance_execution_order_intents WHERE intent_id=?",
+                    (intent_id,),
+                ).fetchone()
+                if row is None:
+                    self._conn.rollback()
+                    return {}
+                if int(row["generation"]) != int(generation):
+                    current = self._intent_response(row) or {}
+                    self._conn.rollback()
+                    return current
+                exchange_order_id = (
+                    str(payload.get("orderId"))
+                    if isinstance(payload, Mapping) and payload.get("orderId") is not None
+                    else None
+                )
+                inserted = self._insert_fills_locked(
+                    row,
+                    explicit_fills,
+                    exchange_order_id=exchange_order_id,
+                )
+                original = _dec(row["quantity"])
+                cumulative = _cumulative_quantity(payload)
+                durable_filled = self._filled_quantity_locked(intent_id)
+                reservation_changed = self._persist_sell_reservation_remainder_locked(
+                    row,
+                    durable_filled,
+                )
+                observed_filled = max(cumulative, durable_filled)
+                target = self._merge_order_state(
+                    str(row["state"]),
+                    observed,
+                    original_quantity=original,
+                    observed_filled=observed_filled,
+                )
+                changed = target != str(row["state"])
+                if not changed and inserted == 0 and exchange_order_id is None and not reservation_changed:
+                    current = self._intent_response(row) or {}
+                    self._conn.rollback()
+                    return current
+
+                now = _iso(self.clock())
+                self._conn.execute(
+                    "UPDATE binance_execution_order_intents "
+                    "SET state=?,exchange_order_id=COALESCE(?,exchange_order_id),"
+                    "acknowledged_at=?,reason=?,raw_json=?,updated_at=? WHERE intent_id=?",
+                    (
+                        target,
+                        exchange_order_id,
+                        now,
+                        reason,
+                        _json(payload),
+                        now,
+                        intent_id,
+                    ),
+                )
+                if changed:
+                    self._transition(
+                        intent_id,
+                        str(row["state"]),
+                        target,
+                        generation,
+                        reason,
+                        payload,
+                    )
+                self._fault("before_order_result_commit")
+                self._conn.commit()
+            except BaseException:
                 self._conn.rollback()
-                return {}
-            self._conn.execute("UPDATE binance_execution_order_intents SET state=?,exchange_order_id=?,acknowledged_at=?,reason=?,raw_json=?,updated_at=? WHERE intent_id=?", (target, str(payload.get("orderId")) if isinstance(payload, Mapping) and payload.get("orderId") is not None else None, _iso(self.clock()), reason, _json(payload), _iso(self.clock()), intent_id))
-            self._transition(intent_id, str(row["state"]), target, generation, reason, payload)
-            self._fault("before_order_result_commit")
-            self._conn.commit()
-        self._ingest_fills(intent_id, _explicit_fill_rows(payload))
+                raise
+        # The transaction above is the durable fill/state commit.  Keep a
+        # deterministic crash boundary here so a restart exercises the same
+        # release recovery path as a process dying after commit.
+        self._fault("after_order_result_commit")
+        if inserted:
+            self._recompute_position(str(row["symbol"]))
         self._release_if_done(intent_id)
-        return self._intent_response(self._conn.execute("SELECT * FROM binance_execution_order_intents WHERE intent_id=?", (intent_id,)).fetchone()) or {}
+        return (
+            self._intent_response(
+                self._conn.execute(
+                    "SELECT * FROM binance_execution_order_intents WHERE intent_id=?",
+                    (intent_id,),
+                ).fetchone()
+            )
+            or {}
+        )
 
     # ---- reconciliation and fills -------------------------------------------------
+    def _filled_evidence_sufficient(self, row: Mapping[str, Any]) -> bool:
+        """Return whether durable trade rows cover an authoritative FILLED."""
+
+        if str(row["state"]) != FILLED:
+            return False
+        payload = _load(row["raw_json"], {}) or {}
+        expected = _cumulative_quantity(payload)
+        if expected <= ZERO:
+            expected = _dec(row["quantity"])
+        current = self._conn.execute(
+            "SELECT quantity FROM binance_execution_fills WHERE intent_id=?",
+            (row["intent_id"],),
+        ).fetchall()
+        filled = sum((_dec(item[0]) for item in current), ZERO)
+        return expected > ZERO and filled >= expected
+
     def reconcile(self, *, symbol: str | None = None, account: Mapping[str, Any] | None = None) -> dict[str, Any]:
         key = _symbol(symbol) if symbol else "ALL"
         attempted = _iso(self.clock())
@@ -1026,43 +1535,136 @@ class BinanceExecutionService:
             except BaseException as exc:
                 reason = type(exc).__name__
                 self.pause("RECONCILIATION_FAILURE")
-                self._set_reconciliation(key, "FAILURE", attempted_at=attempted, completed_at=_iso(self.clock()), heartbeat_at=_iso(self.clock()), error=reason, details={"phase": "account"})
+                self._set_reconciliation(
+                    key,
+                    "FAILURE",
+                    attempted_at=attempted,
+                    completed_at=_iso(self.clock()),
+                    heartbeat_at=_iso(self.clock()),
+                    error=reason,
+                    details={"phase": "account"},
+                )
                 return {"status": "FAILURE", "error": reason}
-        intents = self._conn.execute("SELECT * FROM binance_execution_order_intents WHERE state IN ('RESERVED','SUBMITTING','UNKNOWN','ACKNOWLEDGED','PARTIALLY_FILLED') AND (?='ALL' OR symbol=?) ORDER BY updated_at,intent_id", (key, key)).fetchall()
+        intents = self._conn.execute(
+            "SELECT * FROM binance_execution_order_intents "
+            "WHERE state IN ('RESERVED','SUBMITTING','UNKNOWN','ACKNOWLEDGED',"
+            "'PARTIALLY_FILLED','FILLED') AND (?='ALL' OR symbol=?) "
+            "ORDER BY updated_at,intent_id",
+            (key, key),
+        ).fetchall()
         if self.venue is None:
             self.pause("RECONCILIATION_FAILURE")
-            self._set_reconciliation(key, "FAILURE", attempted_at=attempted, completed_at=_iso(self.clock()), heartbeat_at=_iso(self.clock()), error="no venue")
+            self._set_reconciliation(
+                key,
+                "FAILURE",
+                attempted_at=attempted,
+                completed_at=_iso(self.clock()),
+                heartbeat_at=_iso(self.clock()),
+                error="no venue",
+            )
             return {"status": "FAILURE", "count": 0}
         seen = 0
         failure: str | None = None
         reset_detected = False
         for row in intents:
+            if str(row["state"]) == FILLED and self._filled_evidence_sufficient(row):
+                # Fill/state commit and reservation release are deliberately
+                # separate durable steps.  A restart can land here after a
+                # crash between them, so always run the normal release path
+                # before skipping venue reconciliation.
+                self._release_if_done(str(row["intent_id"]))
+                continue
             try:
                 query = getattr(self.venue, "query_order", None)
                 if query is None:
                     raise RuntimeError("venue has no query_order")
-                response = _call(query, {"symbol": row["symbol"], "orig_client_order_id": row["client_order_id"], "client_order_id": row["client_order_id"], "order_id": row["exchange_order_id"]})
+                identifier = (
+                    {"order_id": row["exchange_order_id"]}
+                    if row["exchange_order_id"] not in (None, "")
+                    else {"orig_client_order_id": row["client_order_id"]}
+                )
+                response = _call(query, {"symbol": row["symbol"], **identifier})
                 status = _status(response)
-                if status == UNKNOWN:
-                    if str(row["state"]) in {RESERVED, SUBMITTING}:
-                        self._set_unknown(row["intent_id"], "ambiguous reconciliation result", result=response)
-                    continue
                 payload = _payload(response)
                 code = payload.get("code") if isinstance(payload, Mapping) else None
-                authoritative_missing = status == REJECTED and (str(code) == "-2013" or (isinstance(payload, Mapping) and payload.get("authoritative_missing")))
+                authoritative_missing = status == REJECTED and (
+                    str(code) == "-2013"
+                    or (
+                        isinstance(payload, Mapping)
+                        and payload.get("authoritative_missing")
+                    )
+                )
                 if authoritative_missing:
                     reset_detected = True
-                    self._set_reconciliation("TESTNET_RESET", "RESET", details={"symbol": row["symbol"], "client_order_id": row["client_order_id"], "authoritative_missing": True})
+                    self._set_reconciliation(
+                        "TESTNET_RESET",
+                        "RESET",
+                        details={
+                            "symbol": row["symbol"],
+                            "client_order_id": row["client_order_id"],
+                            "authoritative_missing": True,
+                        },
+                    )
                     continue
-                self._apply_order_result(row["intent_id"], response, int(row["generation"]))
-                order_id = payload.get("orderId") if isinstance(payload, Mapping) else row["exchange_order_id"]
+                if status == UNKNOWN:
+                    if str(row["state"]) in {RESERVED, SUBMITTING}:
+                        self._set_unknown(
+                            row["intent_id"],
+                            "ambiguous reconciliation result",
+                            generation=int(row["generation"]),
+                            result=response,
+                        )
+                    # UNKNOWN is intentionally not retried blindly; preserve
+                    # the unresolved row while keeping reconciliation callable.
+                    continue
+                if status != "OK":
+                    self._set_unknown(
+                        row["intent_id"],
+                        "unresolved reconciliation response",
+                        generation=int(row["generation"]),
+                        result=response,
+                    )
+                    if failure is None:
+                        failure = "OrderResponse" + status.title()
+                    continue
+                if _authoritative_order_state(payload) is None:
+                    self._set_unknown(
+                        row["intent_id"],
+                        "malformed authoritative reconciliation response",
+                        generation=int(row["generation"]),
+                        result=response,
+                    )
+                    if failure is None:
+                        failure = "MalformedOrderResponse"
+                    continue
+                applied = self._apply_order_result(
+                    row["intent_id"],
+                    response,
+                    int(row["generation"]),
+                    require_authoritative=True,
+                )
+                if applied.get("state") == UNKNOWN:
+                    if failure is None:
+                        failure = "MalformedOrderResponse"
+                    continue
+                order_id = (
+                    payload.get("orderId")
+                    if isinstance(payload, Mapping) and payload.get("orderId") is not None
+                    else row["exchange_order_id"]
+                )
                 trades_method = getattr(self.venue, "my_trades", None)
                 if trades_method is not None:
-                    trades = _call(trades_method, {"symbol": row["symbol"], "order_id": order_id})
+                    trades = _call(
+                        trades_method,
+                        {"symbol": row["symbol"], "order_id": order_id},
+                    )
                     trade_status = _status(trades)
-                    if trade_status not in {"OK", "ACKNOWLEDGED"}:
+                    if trade_status != "OK":
                         raise RuntimeError("myTrades response " + trade_status)
-                    self._ingest_fills(row["intent_id"], _explicit_fill_rows(_payload(trades)))
+                    self._ingest_fills(
+                        row["intent_id"],
+                        _explicit_fill_rows(_payload(trades)),
+                    )
                 seen += 1
             except BaseException as exc:
                 if failure is None:
@@ -1074,14 +1676,40 @@ class BinanceExecutionService:
         completed = _iso(self.clock())
         if failure is not None:
             self.pause("RECONCILIATION_FAILURE")
-            self._set_reconciliation(key, "FAILURE", attempted_at=attempted, completed_at=completed, heartbeat_at=completed, error=failure, details={"phase": "order"})
-            return {"status": "FAILURE", "count": seen, "heartbeat_at": completed, "error": failure}
+            self._set_reconciliation(
+                key,
+                "FAILURE",
+                attempted_at=attempted,
+                completed_at=completed,
+                heartbeat_at=completed,
+                error=failure,
+                details={"phase": "order"},
+            )
+            return {
+                "status": "FAILURE",
+                "count": seen,
+                "heartbeat_at": completed,
+                "error": failure,
+            }
         if reset_detected:
             if self.control().get("pause_reason") != "TESTNET_RESET":
                 self.pause("TESTNET_RESET")
-            self._set_reconciliation(key, "RESET", attempted_at=attempted, completed_at=completed, heartbeat_at=completed, details={"reason": "authoritative order missing"})
+            self._set_reconciliation(
+                key,
+                "RESET",
+                attempted_at=attempted,
+                completed_at=completed,
+                heartbeat_at=completed,
+                details={"reason": "authoritative order missing"},
+            )
             return {"status": "RESET", "count": seen, "heartbeat_at": completed}
-        self._set_reconciliation(key, "SUCCESS", attempted_at=attempted, completed_at=completed, heartbeat_at=completed)
+        self._set_reconciliation(
+            key,
+            "SUCCESS",
+            attempted_at=attempted,
+            completed_at=completed,
+            heartbeat_at=completed,
+        )
         return {"status": "SUCCESS", "count": seen, "heartbeat_at": completed}
 
     poll = reconcile
@@ -1105,64 +1733,127 @@ class BinanceExecutionService:
         return False
 
     def _ingest_fills(self, intent_id: str, fills: Iterable[Mapping[str, Any]]) -> int:
-        intent = self._conn.execute("SELECT * FROM binance_execution_order_intents WHERE intent_id=?", (intent_id,)).fetchone()
-        if intent is None:
+        fill_rows = tuple(fills)
+        if not fill_rows:
             return 0
+        symbol: str | None = None
         count = 0
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
-            for fill in fills:
-                qty = _dec(fill.get("qty", fill.get("quantity", fill.get("executedQty", 0))))
-                if qty <= ZERO:
-                    continue
-                trade_id = _exchange_trade_id(fill)
-                if trade_id is None:
-                    trade_id = canonical_sha256({"intent_id": intent_id, "fill": dict(fill)})[:32]
-                if self._conn.execute("SELECT 1 FROM binance_execution_fills WHERE trade_id=?", (trade_id,)).fetchone() is not None:
-                    continue
-                price = _dec(fill.get("price", intent["price"]))
-                quote = _dec(fill.get("quoteQty", fill.get("quote_quantity", qty * price)))
-                commission = _dec(fill.get("commission", fill.get("fee", 0)))
-                asset = fill.get("commissionAsset", fill.get("commission_asset", fill.get("fee_asset")))
-                timestamp = fill.get("time", fill.get("trade_time", fill.get("timestamp", self.clock())))
-                self._conn.execute("INSERT INTO binance_execution_fills(trade_id,intent_id,client_order_id,exchange_order_id,symbol,side,quantity,price,quote_quantity,commission,commission_asset,trade_time,payload_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", (trade_id, intent_id, intent["client_order_id"], intent["exchange_order_id"], intent["symbol"], intent["side"], _dstr(qty), _dstr(price), _dstr(quote), _dstr(commission), None if asset is None else str(asset).upper(), _iso(timestamp), _json(fill)))
-                count += 1
-            self._conn.commit()
-        if count:
-            self._recompute_position(str(intent["symbol"]))
-            self._update_fill_state(intent_id)
+            try:
+                intent = self._conn.execute(
+                    "SELECT * FROM binance_execution_order_intents WHERE intent_id=?",
+                    (intent_id,),
+                ).fetchone()
+                if intent is None:
+                    self._conn.rollback()
+                    return 0
+                symbol = str(intent["symbol"])
+                count = self._insert_fills_locked(intent, fill_rows)
+                current = self._conn.execute(
+                    "SELECT * FROM binance_execution_order_intents WHERE intent_id=?",
+                    (intent_id,),
+                ).fetchone()
+                if current is not None:
+                    original = _dec(current["quantity"])
+                    filled = self._filled_quantity_locked(intent_id)
+                    self._persist_sell_reservation_remainder_locked(
+                        current,
+                        filled,
+                    )
+                    if count:
+                        observed = FILLED if original > ZERO and filled >= original else PARTIALLY_FILLED
+                        target = self._merge_order_state(
+                            str(current["state"]),
+                            observed,
+                            original_quantity=original,
+                            observed_filled=filled,
+                        )
+                        if target != str(current["state"]):
+                            now = _iso(self.clock())
+                            self._conn.execute(
+                                "UPDATE binance_execution_order_intents SET state=?,updated_at=? WHERE intent_id=?",
+                                (target, now, intent_id),
+                            )
+                            self._transition(
+                                intent_id,
+                                str(current["state"]),
+                                target,
+                                int(current["generation"]),
+                                "fill reconciliation",
+                                {"filled_quantity": _dstr(filled)},
+                            )
+                self._conn.commit()
+            except BaseException:
+                self._conn.rollback()
+                raise
+        if count and symbol is not None:
+            self._recompute_position(symbol)
             self._release_if_done(intent_id)
         return count
 
     record_fills = _ingest_fills
     ingest_fills = _ingest_fills
+
     def _update_fill_state(self, intent_id: str) -> None:
-        row = self._conn.execute("SELECT state,side,quantity FROM binance_execution_order_intents WHERE intent_id=?", (intent_id,)).fetchone()
-        if row is None:
-            return
-        filled_rows = self._conn.execute("SELECT quantity FROM binance_execution_fills WHERE intent_id=?", (intent_id,)).fetchall()
-        qty = sum((_dec(item[0]) for item in filled_rows), ZERO)
-        original = _dec(row["quantity"])
-        target = FILLED if qty >= original and original > ZERO else PARTIALLY_FILLED
-        if str(row["state"]) != REJECTED:
-            with self._lock:
-                self._conn.execute("BEGIN IMMEDIATE")
-                current = self._conn.execute("SELECT state,generation FROM binance_execution_order_intents WHERE intent_id=?", (intent_id,)).fetchone()
-                if current is not None:
-                    current_state = str(current[0])
-                    if current_state != FILLED or target == FILLED:
-                        if current_state != target:
-                            self._conn.execute("UPDATE binance_execution_order_intents SET state=?,updated_at=? WHERE intent_id=?", (target, _iso(self.clock()), intent_id))
-                            self._transition(intent_id, current_state, target, int(current[1]), "fill reconciliation", {"filled_quantity": _dstr(qty)})
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute(
+                    "SELECT * FROM binance_execution_order_intents WHERE intent_id=?",
+                    (intent_id,),
+                ).fetchone()
+                if row is None:
+                    self._conn.rollback()
+                    return
+                original = _dec(row["quantity"])
+                filled = self._filled_quantity_locked(intent_id)
+                observed = FILLED if original > ZERO and filled >= original else PARTIALLY_FILLED
+                target = self._merge_order_state(
+                    str(row["state"]),
+                    observed,
+                    original_quantity=original,
+                    observed_filled=filled,
+                )
+                if target != str(row["state"]):
+                    now = _iso(self.clock())
+                    self._conn.execute(
+                        "UPDATE binance_execution_order_intents SET state=?,updated_at=? WHERE intent_id=?",
+                        (target, now, intent_id),
+                    )
+                    self._transition(
+                        intent_id,
+                        str(row["state"]),
+                        target,
+                        int(row["generation"]),
+                        "fill reconciliation",
+                        {"filled_quantity": _dstr(filled)},
+                    )
                 self._conn.commit()
+            except BaseException:
+                self._conn.rollback()
+                raise
 
     def _release_if_done(self, intent_id: str) -> None:
-        row = self._conn.execute("SELECT state FROM binance_execution_order_intents WHERE intent_id=?", (intent_id,)).fetchone()
+        row = self._conn.execute(
+            "SELECT state,quantity,raw_json,intent_id FROM binance_execution_order_intents "
+            "WHERE intent_id=?",
+            (intent_id,),
+        ).fetchone()
         if row is None:
             return
-        state = str(row[0])
+        state = str(row["state"])
+        if state == FILLED and not self._filled_evidence_sufficient(row):
+            # Exchange FILLED is not durable fill evidence; retain exposure and
+            # keep this order in reconciliation until myTrades supplies rows.
+            return
         if state in {REJECTED, FILLED, CANCELED, EXPIRED}:
-            self._conn.execute("UPDATE binance_execution_risk_reservations SET status='RELEASED',released_at=? WHERE intent_id=? AND status='HELD'", (_iso(self.clock()), intent_id))
+            self._conn.execute(
+                "UPDATE binance_execution_risk_reservations "
+                "SET status='RELEASED',released_at=? "
+                "WHERE intent_id=? AND status='HELD'",
+                (_iso(self.clock()), intent_id),
+            )
             self._conn.commit()
         elif state == PARTIALLY_FILLED:
             # Keep the reservation for the unresolved remainder/worst case.
@@ -1295,6 +1986,8 @@ class BinanceExecutionService:
         if client_order_id:
             conditions.append("client_order_id=?")
             args.append(client_order_id)
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
         query += " ORDER BY trade_time,trade_id"
         return [dict(row) for row in self._conn.execute(query, args).fetchall()]
 
@@ -1337,35 +2030,78 @@ class BinanceExecutionService:
             orders.append(result)
         return orders
 
-    def cancel(self, client_order_id: str | None = None, *, symbol: str, reason: str = "operator cancel", orig_client_order_id: str | None = None) -> dict[str, Any]:
+    def cancel(
+        self,
+        client_order_id: str | None = None,
+        *,
+        symbol: str,
+        reason: str = "operator cancel",
+        orig_client_order_id: str | None = None,
+    ) -> dict[str, Any]:
         client_order_id = client_order_id or orig_client_order_id
         if not client_order_id:
             raise ValueError("client_order_id is required")
-        row = self._conn.execute("SELECT * FROM binance_execution_order_intents WHERE client_order_id=? AND symbol=?", (client_order_id, _symbol(symbol))).fetchone()
+        row = self._conn.execute(
+            "SELECT * FROM binance_execution_order_intents "
+            "WHERE client_order_id=? AND symbol=?",
+            (client_order_id, _symbol(symbol)),
+        ).fetchone()
         if row is None:
             raise ValueError("order is not AXIOM-owned")
         if row["state"] in TERMINAL:
             return self._intent_response(row) or {}
         if self.venue is None:
-            return self._set_unknown(row["intent_id"], "no venue for cancellation")
+            self.pause("CANCEL_FAILURE")
+            return self._set_unknown(
+                row["intent_id"],
+                "no venue for cancellation",
+                generation=int(row["generation"]),
+            )
         try:
-            method = getattr(self.venue, "cancel_owned_order", None) or getattr(self.venue, "cancel_order", None)
+            method = getattr(self.venue, "cancel_owned_order", None) or getattr(
+                self.venue, "cancel_order", None
+            )
             if method is None:
                 raise RuntimeError("venue has no owned cancellation method")
-            response = _call(method, {"symbol": row["symbol"], "orig_client_order_id": client_order_id, "client_order_id": client_order_id, "order_id": row["exchange_order_id"]})
+            identifier = (
+                {"order_id": row["exchange_order_id"]}
+                if row["exchange_order_id"] not in (None, "")
+                else {"orig_client_order_id": client_order_id}
+            )
+            response = _call(method, {"symbol": row["symbol"], **identifier})
         except BaseException as exc:
-            return self._set_unknown(row["intent_id"], f"cancel exception: {type(exc).__name__}")
-        if _status(response) == UNKNOWN:
-            return self._set_unknown(row["intent_id"], "ambiguous cancellation result", result=response)
-        with self._lock:
-            self._conn.execute("BEGIN IMMEDIATE")
-            current = self._conn.execute("SELECT state,generation FROM binance_execution_order_intents WHERE intent_id=?", (row["intent_id"],)).fetchone()
-            if current is not None:
-                self._conn.execute("UPDATE binance_execution_order_intents SET state=?,reason=?,updated_at=? WHERE intent_id=?", (CANCELED, reason, _iso(self.clock()), row["intent_id"]))
-                self._transition(row["intent_id"], str(current[0]), CANCELED, int(current[1]), reason, _payload(response))
-            self._conn.commit()
+            self.pause("CANCEL_FAILURE")
+            return self._set_unknown(
+                row["intent_id"],
+                f"cancel exception: {type(exc).__name__}",
+                generation=int(row["generation"]),
+            )
+        status = _status(response)
+        payload = _payload(response)
+        if status != "OK" or _authoritative_order_state(payload) is None:
+            self.pause("CANCEL_FAILURE")
+            return self._set_unknown(
+                row["intent_id"],
+                "unresolved cancellation response",
+                generation=int(row["generation"]),
+                result=response,
+            )
+        self._apply_order_result(
+            row["intent_id"],
+            response,
+            int(row["generation"]),
+            require_authoritative=True,
+        )
         self._release_if_done(row["intent_id"])
-        return self._intent_response(self._conn.execute("SELECT * FROM binance_execution_order_intents WHERE intent_id=?", (row["intent_id"],)).fetchone()) or {}
+        return (
+            self._intent_response(
+                self._conn.execute(
+                    "SELECT * FROM binance_execution_order_intents WHERE intent_id=?",
+                    (row["intent_id"],),
+                ).fetchone()
+            )
+            or {}
+        )
 
     cancel_order = cancel
     cancel_owned_order = cancel

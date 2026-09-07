@@ -151,6 +151,46 @@ class BinanceSpotTests(unittest.TestCase):
         self.assertTrue(
             request.full_url.startswith("https://testnet.binance.vision/api/v3/account?")
         )
+    def test_query_and_cancel_never_sign_python_client_order_id_alias(self):
+        seen = []
+
+        def opener(request, timeout):
+            seen.append(request)
+            return Response({"status": "CANCELED"})
+
+        client = BinanceSpotRESTClient(
+            BINANCE_SPOT_TESTNET,
+            {"api_key": "k", "api_secret": "s"},
+            opener=opener,
+            clock=lambda: 1,
+        )
+        client.query_order(
+            symbol="BTCUSDT",
+            order_id="42",
+            client_order_id="python-only",
+        )
+        client.my_trades(
+            symbol="BTCUSDT",
+            order_id="42",
+            client_order_id="python-only",
+        )
+        client.cancel_owned_order(
+            symbol="BTCUSDT",
+            order_id="42",
+            client_order_id="python-only",
+        )
+        for request in seen:
+            body = request.full_url
+            if request.data:
+                body += "?" + request.data.decode()
+            self.assertNotIn("client_order_id", body)
+            self.assertNotIn("new_client_order_id", body)
+            self.assertNotIn("newClientOrderId", body)
+        self.assertEqual(len(seen), 3)
+        my_trades_query = urlsplit(seen[1].full_url).query
+        self.assertEqual(parse_qs(my_trades_query)["orderId"], ["42"])
+        self.assertNotIn("order_id", my_trades_query)
+
 
     def test_endpoint_allowlist_orders_and_validation_only_label(self):
         calls = []

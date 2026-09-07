@@ -489,7 +489,7 @@ class BinanceAutonomousWorker:
             return reason
         return None
 
-    def _load_universe(self, now: datetime) -> UniverseSnapshot:
+    def _load_universe(self, now: datetime) -> UniverseSnapshot | None:
         source = self._universe_source
         if self._universe_loader is not None:
             value = _call(self._universe_loader, now=now)
@@ -507,6 +507,8 @@ class BinanceAutonomousWorker:
                 value = source
         else:
             value = load_crypto_universe(self.store)
+        if value is None:
+            return None
         if isinstance(value, UniverseSnapshot):
             return value
         if isinstance(value, Mapping):
@@ -532,7 +534,12 @@ class BinanceAutonomousWorker:
             raise RuntimeError("collector has no collect method")
         result = _call(
             collect, snapshot, interval=self.interval, limit=self.limit, exit_symbols=tuple(exit_symbols),
-            reconciliation=True, now=now,
+            # The collector marks symbols listed in ``exit_symbols`` as
+            # reconciliation/exit-only itself.  The worker must not put the
+            # entire selected universe into that mode: successful
+            # reconciliation is a prerequisite for normal entries, not a
+            # reason to disable them.
+            reconciliation=False, now=now,
         )
         if isinstance(result, Mapping):
             status = str(result.get("status", "SUCCESS")).upper()
@@ -623,6 +630,33 @@ class BinanceAutonomousWorker:
             if _axiom_owned(row) and _quantity(row) > ZERO:
                 output[symbol] = row
         return output
+
+    def _unresolved_exit_symbols(self) -> set[str]:
+        """Return symbols with an owned SELL whose reservation is still held."""
+        if self.execution is None:
+            return set()
+        method = getattr(self.execution, "orders", None)
+        if not callable(method):
+            return set()
+        try:
+            rows = _call(method)
+        except Exception:
+            return set()
+        result: set[str] = set()
+        for row in rows or ():
+            if not isinstance(row, Mapping):
+                continue
+            if str(row.get("intent", "")).upper() != "EXIT":
+                continue
+            if str(row.get("side", "")).upper() != "SELL":
+                continue
+            reservation = row.get("risk_reservation")
+            if not isinstance(reservation, Mapping) or str(reservation.get("status", "")).upper() != "HELD":
+                continue
+            symbol = _symbol(row.get("symbol"))
+            if symbol:
+                result.add(symbol)
+        return result
 
     def _origin_binding(self, position: Any) -> dict[str, Any]:
         for name in ("originating_binding", "entry_binding", "binding"):
@@ -916,12 +950,27 @@ class BinanceAutonomousWorker:
             if reconcile_reason:
                 result["pause_reason"] = reconcile_reason
             result["control_state"] = self._control().get("state")
+            snapshot = self._load_universe(started)
+            if snapshot is None:
+                # A missing persisted snapshot is an ordinary no-trade input
+                # only after reconciliation succeeds.  A real reconciliation
+                # failure remains paused and must not be hidden by this gate.
+                if reconcile_reason:
+                    result["status"] = "PAUSED"
+                    return result
+                # Reconciliation/control have already run, but no market,
+                # provider, or qualification service may be touched.
+                result["status"] = "NO_TRADE"
+                result["no_trade_reason"] = "NO_UNIVERSE"
+                result["pause_reason"] = None
+                result["error"] = None
+                return result
             connectivity_reason = self._connectivity()
             if connectivity_reason and not result.get("pause_reason"):
                 result["pause_reason"] = connectivity_reason
             positions = self._positions()
-            exit_symbols = tuple(sorted(positions))
-            snapshot = self._load_universe(started)
+            unresolved_exits = self._unresolved_exit_symbols()
+            exit_symbols = tuple(sorted(set(positions) - unresolved_exits))
             result["provenance"] = {
                 "universe_id": snapshot.universe_id, "universe_version": snapshot.version,
                 "snapshot_hash": snapshot.snapshot_hash, "dataset_version": snapshot.version,

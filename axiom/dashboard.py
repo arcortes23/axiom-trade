@@ -14,6 +14,7 @@ import json
 import logging
 import math
 import os
+from decimal import Decimal
 from pathlib import Path
 import re
 import secrets
@@ -305,36 +306,69 @@ def _bounded_value(value: Any, *, depth: int = 0) -> Any:
         return value if len(value) <= 1024 else value[:1021] + "..."
     if isinstance(value, float) and not math.isfinite(value):
         return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, Decimal):
+        return format(value, "f")
+    if isinstance(value, float):
+        return value
     return _jsonable(value)
 _BINANCE_SECRET_KEY = re.compile(
-    r"(?:secret|password|passwd|token|api[_-]?key|apikey|private[_-]?key|passphrase|authorization|bearer|credential)",
+    r"(?:secret|password|passwd|token|api[_-]?key|apikey|private[_-]?key|private|mnemonic|passphrase|authorization|bearer|credential)",
     re.IGNORECASE,
 )
+_BINANCE_CREDENTIAL_HASH_RE = re.compile(r"\A[0-9a-fA-F]{64}\Z")
 
 
 def _binance_safe_value(value: Any, *, depth: int = 0, key: str | None = None) -> Any:
-    """Bound and redact a duck-typed Binance projection before JSON output."""
+    """Bound and redact an untrusted Binance projection before JSON output.
+
+    Secret-shaped keys own their entire subtree.  Credential status is the
+    only allowlisted exception and is deliberately reconstructed at this
+    projection boundary.
+    """
     if depth >= 6:
         return "<truncated>"
-    if key and str(key).lower().endswith("_json") and isinstance(value, str):
+    key_text = str(key) if key is not None else ""
+    lowered = key_text.lower()
+
+    if lowered == "credentials":
+        if isinstance(value, Mapping) and ("configured" in value or "reference_hash" in value):
+            reference = value.get("reference_hash")
+            reference_text = (
+                reference.casefold()
+                if type(reference) is str and _BINANCE_CREDENTIAL_HASH_RE.fullmatch(reference)
+                else None
+            )
+            return {
+                "configured": value.get("configured") is True,
+                "reference_hash": reference_text,
+            }
+        return "<redacted>"
+    if key_text and _BINANCE_SECRET_KEY.search(key_text):
+        return "<redacted>"
+
+    # Decode JSON columns before walking them.  A raw JSON string can hide an
+    # entire nested secret subtree even when the column name itself is safe.
+    if lowered.endswith("_json") and isinstance(value, str):
         try:
             decoded = json.loads(value)
         except (TypeError, ValueError, json.JSONDecodeError):
             decoded = None
         if decoded is not None:
-            return _binance_safe_value(decoded, depth=depth, key=key[:-5])
-    if key and _BINANCE_SECRET_KEY.search(str(key)):
-        lowered = str(key).lower()
-        if lowered not in {"credential_hash", "credential_ref_hash", "reference_hash"}:
-            if not isinstance(value, Mapping) and not isinstance(value, (list, tuple, set, frozenset)):
-                return "<redacted>"
+            return _binance_safe_value(decoded, depth=depth, key=key_text[:-5] or None)
+
     if isinstance(value, Mapping):
         return {
             str(name): _binance_safe_value(child, depth=depth + 1, key=str(name))
             for name, child in list(value.items())[:64]
         }
     if isinstance(value, (list, tuple, set, frozenset)):
-        return [_binance_safe_value(child, depth=depth + 1, key=key) for child in list(value)[:100]]
+        return [_binance_safe_value(child, depth=depth + 1) for child in list(value)[:100]]
+    if isinstance(value, Decimal):
+        return format(value, "f")
     if isinstance(value, (datetime, date)):
         return _jsonable(value)
     if isinstance(value, str):

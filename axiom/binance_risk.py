@@ -700,15 +700,17 @@ def _market_checks(market: Mapping[str, Any] | None, *, now: datetime, requested
     status = str(_market_value(market, "status") or "TRADING").upper()
     if status != "TRADING":
         reasons.append("NOT_TRADING")
-    if "isSpotTradingAllowed" in market and not bool(market["isSpotTradingAllowed"]):
+    if "isSpotTradingAllowed" in market and not _flag(market["isSpotTradingAllowed"], default=True):
         reasons.append("SPOT_NOT_ALLOWED")
-    if bool(_market_value(market, "account_paused", "paused")):
+    if _flag(_market_value(market, "account_paused", "paused"), default=False):
         reasons.append("ACCOUNT_PAUSED")
-    if bool(_market_value(market, "rate_limited", "rate_limit", "rate_limited_pause")):
+    if _flag(_market_value(market, "rate_limited", "rate_limit", "rate_limited_pause"), default=False):
         reasons.append("RATE_LIMIT")
-    if bool(_market_value(market, "crash", "crash_pause", "crashed")):
+    if _flag(_market_value(market, "crash", "crash_pause", "crashed"), default=False):
         reasons.append("CRASH")
-    if _market_value(market, "depth_ok") is False or _market_value(market, "thin_book") is True:
+    depth_ok = _market_value(market, "depth_ok")
+    thin_book = _market_value(market, "thin_book")
+    if (depth_ok is not None and not _flag(depth_ok, default=True)) or _flag(thin_book, default=False):
         reasons.append("THIN_BOOK")
     depth = _market_value(market, "depth_available", "available_depth", "conservative_depth")
     min_depth = _market_value(market, "min_depth", "required_depth")
@@ -718,7 +720,9 @@ def _market_checks(market: Mapping[str, Any] | None, *, now: datetime, requested
     max_spread = _market_value(market, "max_spread_bps", "maximum_spread_bps")
     if spread is not None and max_spread is not None and _decimal(spread) > _decimal(max_spread):
         reasons.append("WIDE_SPREAD")
-    if _market_value(market, "fresh") is False or _market_value(market, "stale") is True:
+    fresh = _market_value(market, "fresh")
+    stale = _market_value(market, "stale")
+    if (fresh is not None and not _flag(fresh, default=True)) or _flag(stale, default=False):
         reasons.append("STALE_MARKET")
     seen = _market_value(market, "observed_at", "updated_at", "timestamp")
     max_age = _market_value(market, "max_age_seconds", "freshness_seconds")

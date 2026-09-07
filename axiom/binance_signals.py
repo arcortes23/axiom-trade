@@ -467,7 +467,7 @@ class BinanceSignalEngine:
         # collector's stale metadata.
         if interval != self.decision_interval:
             interval = self.decision_interval
-        rows: list[tuple[datetime, Any]] = []
+        rows: list[tuple[datetime, datetime, Any]] = []
         for bar in _snapshot_bars(snapshot):
             if not _is_explicitly_closed(bar):
                 continue
@@ -475,16 +475,16 @@ class BinanceSignalEngine:
             closing = _bar_close(bar, interval)
             if opening is None or closing is None or closing > now:
                 continue
-            rows.append((opening, bar))
-        rows.sort(key=lambda item: (item[0], _canonical(_bar_payload(item[1]))))
-        deduped: list[tuple[datetime, Any]] = []
+            rows.append((opening, closing, bar))
+        rows.sort(key=lambda item: (item[0], _canonical(_bar_payload(item[2]))))
+        deduped: list[tuple[datetime, datetime, Any]] = []
         seen: set[datetime] = set()
-        for opening, bar in rows:
+        for opening, closing, bar in rows:
             if opening in seen:
                 continue
             seen.add(opening)
-            deduped.append((opening, bar))
-        return tuple(bar for _, bar in deduped), (deduped[-1][0] if deduped else None)
+            deduped.append((opening, closing, bar))
+        return tuple(bar for _, _, bar in deduped), (deduped[-1][1] if deduped else None)
 
     def _entry_allowed(self, snapshot: Any) -> bool:
         qualified, actionable = _qualified_binding(self.binding)
@@ -796,6 +796,7 @@ class CryptoPaperForwardEngine:
         self.holdout = holdout if holdout is not None else locked_holdout
         self.clock = clock or utc_now
         self.run_id = str(run_id).strip() if run_id else ""
+        self._requested_run_id = self.run_id
         self.risk_envelope = kwargs.pop("risk_envelope", None)
         self.symbol_rules = kwargs.pop("symbol_rules", kwargs.pop("rules", None))
         self.risk_snapshot = kwargs.pop("risk_snapshot", None)
@@ -937,7 +938,7 @@ class CryptoPaperForwardEngine:
             pass
         return output
 
-    def _bar_rows(self, symbol: str, snapshot: Any, interval: str) -> tuple[tuple[datetime, Any], ...]:
+    def _bar_rows(self, symbol: str, snapshot: Any, interval: str, cutoff: datetime | None = None) -> tuple[tuple[datetime, Any], ...]:
         rows: list[tuple[datetime, Any]] = []
         holdout_stamps = self._holdout_bars(symbol, interval)
         partition = _value(snapshot, "partition", "dataset_partition", default=None)
@@ -948,7 +949,11 @@ class CryptoPaperForwardEngine:
                 continue
             opening = _bar_open(bar)
             closing = _bar_close(bar, interval)
-            if opening is None or closing is None or opening.isoformat() in holdout_stamps:
+            if opening is None or closing is None:
+                continue
+            if cutoff is not None and closing > cutoff:
+                continue
+            if opening.isoformat() in holdout_stamps or closing.isoformat() in holdout_stamps:
                 continue
             if str(_value(bar, "partition", "dataset_partition", default="")).strip().lower() in {"holdout", "locked_holdout", "test"}:
                 continue
@@ -962,10 +967,17 @@ class CryptoPaperForwardEngine:
                 unique.append((opening, bar))
         return tuple(unique)
 
-    def _immutable_input(self, normalized: Mapping[str, Any], interval: str) -> dict[str, Any]:
+    def _immutable_input(
+        self,
+        normalized: Mapping[str, Any],
+        interval: str,
+        cutoff: datetime | None = None,
+        *,
+        identity_cutoff: datetime | None = None,
+    ) -> dict[str, Any]:
         bindings = {symbol: _binding_projection(value) for symbol, value in sorted(self.bindings.items())}
         bars = {
-            symbol: [_bar_payload(bar) for _, bar in self._bar_rows(symbol, snapshot, interval)]
+            symbol: [_bar_payload(bar) for _, bar in self._bar_rows(symbol, snapshot, interval, cutoff)]
             for symbol, snapshot in sorted(normalized.items())
         }
         dataset_material = {
@@ -997,12 +1009,17 @@ class CryptoPaperForwardEngine:
             "bindings": bindings,
             "bars": bars,
             "interval": interval,
+            # An omitted horizon replays all supplied closed rows and remains
+            # outside deterministic identity.  Explicit horizons are included
+            # so separate windows cannot reuse one persisted result.
+            "cutoff": identity_cutoff,
             "universe": universe_material,
             "dataset": dataset_material,
             "strategies": strategy_material,
             "simulation_config": simulation_config,
             "binding_hashes": {symbol: _binding_hash(value, bindings[symbol]) for symbol, value in sorted(self.bindings.items())},
         }
+
 
     def _existing_result(self, run_id: str, immutable_hash: str) -> CryptoPaperForwardResult | None:
         with (self._lock or _NullLock()):
@@ -1037,55 +1054,117 @@ class CryptoPaperForwardEngine:
             no_trade_reasons=dict(value.get("no_trade_reasons", {})) if isinstance(value.get("no_trade_reasons"), Mapping) else {},
         )
 
-    def _depth_quantity(self, bar: Any, symbol: str, requested: Decimal, side: str) -> Decimal:
-        values = [
-            _value(bar, "available_quantity", "available_qty", "fill_quantity", "depth_quantity", default=None),
-        ]
-        depth = _value(bar, "depth", "order_book_depth", default=None)
-        if isinstance(depth, Mapping):
-            side_key = "asks" if side == "BUY" else "bids"
-            values.extend(
-                (
-                    depth.get(side),
-                    depth.get(side.lower()),
-                    depth.get(side_key),
-                    depth.get("quantity"),
-                    depth.get("available_quantity"),
-                )
-            )
-        elif depth is not None:
-            values.append(depth)
-        if self.depth is not None:
-            values.append(self.depth)
-        for value in values:
-            if value is not None:
-                try:
-                    return min(requested, _decimal(value, name="depth quantity", nonnegative=True))
-                except ValueError:
-                    continue
-        # If an OHLCV bar has volume but no explicit execution depth, volume is
-        # not silently asserted as order-book liquidity; the order is complete.
-        return requested
-
-    def _execution_price(self, bar: Any, side: str, base_price: Decimal) -> tuple[Decimal, Decimal]:
-        levels = _value(bar, "asks" if side == "BUY" else "bids", default=None)
+    @staticmethod
+    def _side_levels(bar: Any, side: str) -> Any:
+        """Return the exact side levels consumed by paper VWAP execution."""
+        side_key = "asks" if side == "BUY" else "bids"
+        levels = _value(bar, side_key, default=None)
         if levels is None:
             book = _value(bar, "book", "order_book", default=None)
-            levels = _value(book, "asks" if side == "BUY" else "bids", default=None) if book is not None else None
+            levels = _value(book, side_key, default=None) if book is not None else None
+        return levels
+
+    @classmethod
+    def _valid_side_levels(cls, bar: Any, side: str) -> tuple[tuple[Decimal, Decimal], ...] | None:
+        """Parse explicit book levels once for both depth caps and VWAP.
+
+        ``None`` means no explicit side book was supplied.  An empty tuple
+        means a side book was supplied but no positive, finite level survived
+        validation, which must provide zero liquidity rather than silently
+        falling back to the requested quantity.
+        """
+        levels = cls._side_levels(bar, side)
+        if levels is None:
+            return None
+        if isinstance(levels, (str, bytes, Mapping)) or not isinstance(levels, Sequence):
+            return ()
+        valid: list[tuple[Decimal, Decimal]] = []
+        for level in levels:
+            raw_price = _value(
+                level,
+                "price",
+                default=level[0] if isinstance(level, (list, tuple)) and level else None,
+            )
+            raw_qty = _value(
+                level,
+                "size",
+                "quantity",
+                "qty",
+                default=level[1] if isinstance(level, (list, tuple)) and len(level) > 1 else None,
+            )
+            try:
+                level_price = _decimal(raw_price, name="depth price", nonnegative=True)
+                level_qty = _decimal(raw_qty, name="depth quantity", nonnegative=True)
+            except ValueError:
+                continue
+            if level_price <= _ZERO or level_qty <= _ZERO:
+                continue
+            valid.append((level_price, level_qty))
+        return tuple(valid)
+
+    def _depth_quantity(self, bar: Any, symbol: str, requested: Decimal, side: str) -> Decimal:
+        del symbol
+        caps: list[Decimal] = []
+        scalar_values: list[Any] = []
+        for name in ("available_quantity", "available_qty", "fill_quantity", "depth_quantity"):
+            value = _value(bar, name, default=None)
+            if value is not None:
+                scalar_values.append(value)
+        for name in ("depth", "order_book_depth"):
+            depth = _value(bar, name, default=None)
+            if depth is None:
+                continue
+            if isinstance(depth, Mapping):
+                scalar_values.extend(
+                    (
+                        depth.get(side),
+                        depth.get(side.lower()),
+                        depth.get("asks" if side == "BUY" else "bids"),
+                        depth.get("quantity"),
+                        depth.get("available_quantity"),
+                    )
+                )
+            else:
+                scalar_values.append(depth)
+        if self.depth is not None:
+            scalar_values.append(self.depth)
+        for value in scalar_values:
+            if value is None:
+                continue
+            try:
+                caps.append(_decimal(value, name="depth quantity", nonnegative=True))
+            except ValueError:
+                continue
+        levels = self._valid_side_levels(bar, side)
+        if levels is not None:
+            caps.append(sum((quantity for _, quantity in levels), _ZERO))
+        return min((requested, *caps)) if caps else requested
+
+    def _execution_price(
+        self,
+        bar: Any,
+        side: str,
+        base_price: Decimal,
+        requested: Decimal | None = None,
+    ) -> tuple[Decimal, Decimal]:
         price = base_price
-        if isinstance(levels, Sequence) and not isinstance(levels, (str, bytes, Mapping)):
+        levels = self._valid_side_levels(bar, side)
+        if levels is not None:
             notional = _ZERO
             quantity = _ZERO
-            for level in levels:
-                raw_price = _value(level, "price", default=level[0] if isinstance(level, (list, tuple)) and level else None)
-                raw_qty = _value(level, "size", "quantity", "qty", default=level[1] if isinstance(level, (list, tuple)) and len(level) > 1 else None)
-                try:
-                    level_price, level_qty = _decimal(raw_price, name="depth price", nonnegative=True), _decimal(raw_qty, name="depth quantity", nonnegative=True)
-                except ValueError:
+            remaining = requested
+            if remaining is not None and remaining <= _ZERO:
+                remaining = _ZERO
+            for level_price, level_qty in levels:
+                take = min(level_qty, remaining) if remaining is not None else level_qty
+                if take <= _ZERO:
                     continue
-                take = level_qty
                 quantity += take
                 notional += take * level_price
+                if remaining is not None:
+                    remaining -= take
+                    if remaining <= _ZERO:
+                        break
             if quantity > _ZERO:
                 price = notional / quantity
         slippage = self.slippage_bps / Decimal("10000")
@@ -1107,8 +1186,8 @@ class CryptoPaperForwardEngine:
         return values.get(symbol, values.get("*", _value(binding, "strategy", "strategy_document", default=None)))
 
     def _run_id_for(self, immutable: Mapping[str, Any]) -> str:
-        if self.run_id:
-            return self.run_id
+        if self._requested_run_id:
+            return self._requested_run_id
         return "binance-paper-" + _hash(immutable)[:32]
 
     def _persist(self, result: CryptoPaperForwardResult, immutable: Mapping[str, Any], hashes: Mapping[str, str]) -> None:
@@ -1124,7 +1203,7 @@ class CryptoPaperForwardEngine:
             with self.connection:
                 self.connection.execute(
                     f"INSERT INTO {self.TABLE_PREFIX}_runs(run_id,immutable_hash,binding_hash,bars_hash,universe_hash,dataset_hash,payload_json,result_json,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
-                    (run_id, hashes["immutable_hash"], hashes["binding_hash"], hashes["bars_hash"], hashes["universe_hash"], hashes["dataset_hash"], _canonical({"binding": bindings, "interval": immutable.get("interval")}), _canonical(payload), created),
+                    (run_id, hashes["immutable_hash"], hashes["binding_hash"], hashes["bars_hash"], hashes["universe_hash"], hashes["dataset_hash"], _canonical({"binding": bindings, "interval": immutable.get("interval"), "cutoff": immutable.get("cutoff")}), _canonical(payload), created),
                 )
                 for observation in rows_observations:
                     oid = str(observation["observation_id"])
@@ -1150,6 +1229,7 @@ class CryptoPaperForwardEngine:
     def _fill_record(
         self,
         *,
+        run_id: str,
         signal: BinanceExecutableSignal,
         timestamp: datetime,
         quantity: Decimal,
@@ -1161,9 +1241,16 @@ class CryptoPaperForwardEngine:
     ) -> dict[str, Any]:
         execution_timestamp = ensure_utc(timestamp)
         decision_bar_close = ensure_utc(signal.bar_close) if signal.bar_close is not None else None
-        fill_id = _hash({"signal_id": signal.signal_id, "timestamp": execution_timestamp, "quantity": quantity, "price": price})
+        fill_id = _hash({
+            "run_id": run_id,
+            "signal_id": signal.signal_id,
+            "timestamp": execution_timestamp,
+            "quantity": quantity,
+            "price": price,
+        })
         return {
             "fill_id": fill_id,
+            "run_id": run_id,
             "signal_id": signal.signal_id,
             "candidate_id": signal.candidate_id,
             "binding_hash": signal.binding_hash,
@@ -1230,7 +1317,16 @@ class CryptoPaperForwardEngine:
             raise ValueError("at least one Binance Spot market snapshot is required")
         interval = self.decision_interval or next((str(_value(snapshot, "interval", "timeframe", default="1d")) for snapshot in snapshot_map.values()), "1d")
         _interval_delta(interval)
-        immutable = self._immutable_input(snapshot_map, interval)
+        if now is not None:
+            cutoff = ensure_utc(now)
+            identity_cutoff: datetime | None = cutoff
+        else:
+            # No explicit horizon means replay every supplied closed row.
+            # Leaving this out of identity preserves deterministic all-input
+            # reruns and avoids hashing ambient wall-clock time.
+            cutoff = None
+            identity_cutoff = None
+        immutable = self._immutable_input(snapshot_map, interval, cutoff, identity_cutoff=identity_cutoff)
         run_id = self._run_id_for(immutable)
         self.run_id = run_id
         binding_hashes = {
@@ -1250,10 +1346,10 @@ class CryptoPaperForwardEngine:
             return existing
         strategies = self._normalize_strategies()
         timelines = {
-            symbol: self._bar_rows(symbol, snapshot, interval)
+            symbol: self._bar_rows(symbol, snapshot, interval, cutoff)
             for symbol, snapshot in sorted(snapshot_map.items())
         }
-        timeline_events = sorted({closing for rows in timelines.values() for closing, _ in rows})
+        timeline_events = sorted({opening for rows in timelines.values() for opening, _ in rows})
         cash = self.initial_cash
         positions: dict[str, _PaperPosition] = {}
         fills: list[Mapping[str, Any]] = []
@@ -1282,20 +1378,21 @@ class CryptoPaperForwardEngine:
                 positions={},
                 deduplicate=True,
             )
-        for closing in timeline_events:
+        for opening in timeline_events:
             for symbol in sorted(timelines):
                 rows = timelines[symbol]
-                index = next((idx for idx, item in enumerate(rows) if item[0] == closing), None)
+                index = next((idx for idx, item in enumerate(rows) if item[0] == opening), None)
                 if index is None:
                     continue
                 bar = rows[index][1]
-                observation_id = _hash({"run_id": run_id, "symbol": symbol, "bar_close": closing})
+                bar_close = _bar_close(bar, interval) or opening
+                observation_id = _hash({"run_id": run_id, "symbol": symbol, "bar_close": bar_close})
                 observation = {
                     "observation_id": observation_id,
                     "run_id": run_id,
                     "symbol": symbol,
-                    "bar_close": closing.isoformat(),
-                    "timestamp": _bar_open(bar).isoformat() if _bar_open(bar) else closing.isoformat(),
+                    "bar_close": bar_close.isoformat(),
+                    "timestamp": _bar_open(bar).isoformat() if _bar_open(bar) else bar_close.isoformat(),
                     "closed": True,
                     "interval": interval,
                     "payload": _bar_payload(bar),
@@ -1321,7 +1418,7 @@ class CryptoPaperForwardEngine:
                 decision_cutoff = _bar_close(bar, interval)
                 signal = engine.evaluate(
                     {"symbol": symbol, "bars": tuple(item[1] for item in rows[: index + 1]), "interval": interval},
-                    now=decision_cutoff or closing,
+                    now=decision_cutoff or bar_close,
                     positions=position_mapping,
                 )
                 if signal is None:
@@ -1333,11 +1430,11 @@ class CryptoPaperForwardEngine:
                     continue
                 _, next_bar = next_item
                 execution_timestamp = _bar_open(next_bar)
-                if execution_timestamp is None or execution_timestamp <= closing:
+                if execution_timestamp is None or execution_timestamp < bar_close:
                     no_trade["INVALID_NEXT_OPEN"] = no_trade.get("INVALID_NEXT_OPEN", 0) + 1
                     continue
-                opening = _bar_price(next_bar, "open")
-                if opening is None or opening <= _ZERO:
+                base_price = _bar_price(next_bar, "open")
+                if base_price is None or base_price <= _ZERO:
                     no_trade["INVALID_NEXT_OPEN"] = no_trade.get("INVALID_NEXT_OPEN", 0) + 1
                     continue
                 side = signal.side
@@ -1351,27 +1448,35 @@ class CryptoPaperForwardEngine:
                         unknown_fee_count += 1
                     else:
                         fee_rate = self.fee_rate
-                    price, slip = self._execution_price(next_bar, side, opening)
-                    requested = Decimal("10") / price
-                    available_cash_qty = cash / (price * (_ONE + fee_rate)) if price else _ZERO
+                    # Size from the base next-open reference first.  Depth
+                    # pricing must never increase the requested quantity.
+                    requested = Decimal("10") / base_price
+                    available_cash_qty = cash / (base_price * (_ONE + fee_rate)) if base_price else _ZERO
                     requested = min(requested, available_cash_qty)
+                    price, slip = self._execution_price(next_bar, side, base_price, requested)
                     depth_qty = self._depth_quantity(next_bar, symbol, requested, side)
                     quantity = min(requested, depth_qty)
                     if quantity <= _ZERO:
                         no_trade["NO_FILL"] = no_trade.get("NO_FILL", 0) + 1
                         continue
+                    # A depth or cash cap can make the final quantity smaller
+                    # than the initial request; recompute VWAP for that exact
+                    # quantity so unconsumed levels cannot affect price.
+                    price, slip = self._execution_price(next_bar, side, base_price, quantity)
                     fee = quantity * price * fee_rate if self.fee_rate is not None else None
                     notional = quantity * price
                     if fee is not None and notional + fee > cash:
-                        quantity = cash / (price * (_ONE + fee_rate))
-                        fee = quantity * price * fee_rate
-                        notional = quantity * price
+                        quantity = min(quantity, cash / (price * (_ONE + fee_rate)))
+                        if quantity > _ZERO:
+                            price, slip = self._execution_price(next_bar, side, base_price, quantity)
+                            fee = quantity * price * fee_rate
+                            notional = quantity * price
                     if quantity <= _ZERO:
                         no_trade["NO_FILL"] = no_trade.get("NO_FILL", 0) + 1
                         continue
                     cash -= notional + (fee or _ZERO)
                     partial = depth_qty < requested
-                    fill = self._fill_record(signal=signal, timestamp=execution_timestamp, quantity=quantity, price=price, fee=fee, slippage=slip, partial=partial)
+                    fill = self._fill_record(run_id=run_id, signal=signal, timestamp=execution_timestamp, quantity=quantity, price=price, fee=fee, slippage=slip, partial=partial)
                     fills.append(fill)
                     policy = dict(signal.exit_policy or {})
                     positions[symbol] = _PaperPosition(
@@ -1408,9 +1513,12 @@ class CryptoPaperForwardEngine:
                     if raw_position is None or raw_position.quantity <= _ZERO:
                         no_trade["FOREIGN_OR_EMPTY_POSITION"] = no_trade.get("FOREIGN_OR_EMPTY_POSITION", 0) + 1
                         continue
-                    price, slip = self._execution_price(next_bar, side, opening)
-                    depth_qty = self._depth_quantity(next_bar, symbol, raw_position.quantity, side)
-                    quantity = min(raw_position.quantity, depth_qty)
+                    requested = raw_position.quantity
+                    price, slip = self._execution_price(next_bar, side, base_price, requested)
+                    depth_qty = self._depth_quantity(next_bar, symbol, requested, side)
+                    quantity = min(requested, depth_qty)
+                    if quantity > _ZERO:
+                        price, slip = self._execution_price(next_bar, side, base_price, quantity)
                     minimum = _optional_decimal(_value(next_bar, "min_notional", default=None))
                     if minimum is not None and quantity * price < minimum:
                         dust_count += 1
@@ -1463,7 +1571,7 @@ class CryptoPaperForwardEngine:
                     allocated_cost = entry_unit_cost * quantity
                     pnl = quantity * price - (fee or _ZERO) - allocated_cost
                     cash += quantity * price - (fee or _ZERO)
-                    fill = self._fill_record(signal=signal, timestamp=execution_timestamp, quantity=quantity, price=price, fee=fee, slippage=slip, partial=quantity < raw_position.quantity, pnl=pnl)
+                    fill = self._fill_record(run_id=run_id, signal=signal, timestamp=execution_timestamp, quantity=quantity, price=price, fee=fee, slippage=slip, partial=quantity < raw_position.quantity, pnl=pnl)
                     fills.append(fill)
                     raw_position.quantity -= quantity
                     raw_position.cost_basis = max(_ZERO, raw_position.cost_basis - allocated_cost)
@@ -1495,13 +1603,17 @@ class CryptoPaperForwardEngine:
                         del positions[symbol]
             marks = cash
             for symbol, position in positions.items():
-                row = next((item for item in timelines[symbol] if item[0] == closing), None)
+                row = next((item for item in timelines[symbol] if item[0] == opening), None)
                 mark = _bar_price(row[1], "close") if row else position.average_price
                 marks += position.quantity * (mark or position.average_price)
             drawdown_peak = max(drawdown_peak, marks)
             if drawdown_peak > _ZERO:
                 max_drawdown = max(max_drawdown, (drawdown_peak - marks) / drawdown_peak)
-            equity_curve.append({"bar_close": closing.isoformat(), "equity": marks})
+            equity_close = max(
+                (_bar_close(item[1], interval) or opening for rows in timelines.values() for item in rows if item[0] == opening),
+                default=opening,
+            )
+            equity_curve.append({"bar_close": equity_close.isoformat(), "equity": marks})
         # Persist the complete position event ledger.  This includes OPEN,
         # UPDATE, CLOSE, and DUST records, followed by a FINAL snapshot for
         # positions that remain open at the end of the forward window.
@@ -1560,6 +1672,7 @@ class CryptoPaperForwardEngine:
             "dataset_hash": hashes["dataset_hash"],
             "bars_hash": hashes["bars_hash"],
             "immutable_hash": hashes["immutable_hash"],
+            "cutoff": cutoff.isoformat() if cutoff is not None else None,
             "interval": interval,
             "symbols": sorted(timelines),
             "observations": sample_count,

@@ -529,6 +529,42 @@ class ExitAssessmentTests(unittest.TestCase):
         result = assess_order(make_rules(), "BUY", "10", "1", market=market, snapshot=make_snapshot(quote_available=D("100")), envelope=envelope, now=T0)
         for reason in ("NOT_TRADING", "SPOT_NOT_ALLOWED", "ACCOUNT_PAUSED", "RATE_LIMIT", "CRASH", "THIN_BOOK", "WIDE_SPREAD", "STALE_MARKET", "EXECUTION_DEVIATION"):
             self.assertIn(reason, result.reasons)
+    def test_market_boolean_strings_use_semantic_flag_parsing(self):
+        market = {
+            "status": "TRADING",
+            "isSpotTradingAllowed": "true",
+            "account_paused": "false",
+            "rate_limited": "false",
+            "crash": "false",
+            "depth_ok": "true",
+            "thin_book": "false",
+            "fresh": "true",
+            "stale": "false",
+        }
+        allowed = assess_order(
+            make_rules(),
+            "BUY",
+            "10",
+            "1",
+            market=market,
+            snapshot=make_snapshot(),
+            now=T0,
+        )
+        self.assertTrue(allowed.allowed)
+
+        blocked_market = dict(market, isSpotTradingAllowed="false")
+        blocked = assess_order(
+            make_rules(),
+            "BUY",
+            "10",
+            "1",
+            market=blocked_market,
+            snapshot=make_snapshot(),
+            now=T0,
+        )
+        self.assertFalse(blocked.allowed)
+        self.assertIn("SPOT_NOT_ALLOWED", blocked.reasons)
+
 
 
     def test_default_envelope_has_canonical_canary_boundaries(self):

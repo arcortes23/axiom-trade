@@ -33,6 +33,7 @@ from .research_bus import DurableResearchBus, ResearchBusPermissionError, _valid
 from .strategy import evaluate_signal_record, load_strategy
 from .tracking import ExperimentTracker
 from .storage import AxiomStore, SQLiteBusyTimeout
+from .binance_dev import BinanceDevelopmentRuntime
 from .bootstrap import (
     BTC_HISTORY_START,
     BTC_INTERVAL_SECONDS,
@@ -163,6 +164,8 @@ def build_parser() -> argparse.ArgumentParser:
     dashboard.add_argument("--port", type=int, default=8080)
     dashboard.add_argument("--db", default=DEFAULT_DB_PATH, help="SQLite operational database path")
     dashboard.add_argument("--once", action="store_true", help="bind and stop after readiness smoke check")
+    binance_dev = commands.add_parser("binance-dev", help="serve the isolated Binance Spot development runtime")
+    binance_dev.add_argument("--once", action="store_true", help="run one bounded worker cycle and stop")
     operator = commands.add_parser("operator", help="supervise one paper node and its localhost operator dashboard")
     operator.add_argument("--db", default=DEFAULT_DB_PATH, help="canonical SQLite operational database path")
     operator.add_argument("--port", type=int, default=8080)
@@ -729,6 +732,23 @@ def _load_cli_execution_inputs(args: argparse.Namespace, spec: Any) -> tuple[Any
 
 def _main_impl(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.command == "binance-dev":
+        runtime = BinanceDevelopmentRuntime()
+        try:
+            runtime.start(once=bool(args.once))
+            payload = runtime.status()
+            if args.once:
+                runtime.stop()
+                payload["stopped"] = True
+                print(json.dumps(payload, sort_keys=True, indent=2, default=str))
+                return 0
+            print(json.dumps(payload, sort_keys=True, indent=2, default=str))
+            runtime.serve_forever()
+            return 0
+        except KeyboardInterrupt:
+            return 0
+        finally:
+            runtime.stop()
     if args.command == "credentials":
         credentials = CredentialStore()
         if args.credentials_command == "configure":

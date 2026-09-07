@@ -8,18 +8,19 @@ ambient environment variables are consulted.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from enum import Enum
 import hashlib
 import hmac
 import json
 import math
 import os
-from pathlib import Path
 import socket
 import time
-from typing import Any, Callable, Mapping, MutableMapping, Sequence
+from collections.abc import Mapping, MutableMapping, Sequence
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from enum import Enum
+from pathlib import Path
+from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -95,7 +96,6 @@ def canonical_path(value: str | os.PathLike[str]) -> str:
 
     return _canonical_path(value)
 
-
 def canonical_json(value: Any) -> str:
     """Stable JSON representation used for identifiers and hashes."""
 
@@ -104,6 +104,24 @@ def canonical_json(value: Any) -> str:
 
 def canonical_sha256(value: Any) -> str:
     return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def credential_fingerprint(value: Any) -> str:
+    """Return the authorization fingerprint without exposing credential values."""
+
+    if isinstance(value, BinanceSpotCredentials):
+        api_key, api_secret = value.api_key, value.api_secret
+    elif isinstance(value, Mapping):
+        api_key = value.get("api_key")
+        api_secret = value.get("api_secret")
+    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)) and len(value) == 2:
+        api_key, api_secret = value
+    else:
+        api_key = getattr(value, "api_key", None) if value is not None else None
+        api_secret = getattr(value, "api_secret", None) if value is not None else None
+    if not api_key or not api_secret:
+        return canonical_sha256({"configured": False})
+    return canonical_sha256({"api_key": str(api_key), "api_secret": str(api_secret)})
 
 
 def _environment(value: BinanceSpotEnvironment | str) -> BinanceSpotEnvironment:
@@ -119,6 +137,52 @@ def _environment(value: BinanceSpotEnvironment | str) -> BinanceSpotEnvironment:
             return BinanceSpotEnvironment[text]
         except (KeyError, TypeError):
             raise BinanceSpotConfigurationError(f"unsupported Binance Spot environment: {value!r}") from exc
+
+def validate_spot_venue_identity(
+    venue: Any,
+    environment: BinanceSpotEnvironment | str,
+    *,
+    credential_hash: str | None = None,
+) -> None:
+    """Enforce the concrete venue and credential execution boundary."""
+
+    expected_environment = _environment(environment)
+    if expected_environment is BinanceSpotEnvironment.BINANCE_SPOT_LIVE:
+        raise BinanceSpotConfigurationError(
+            "development execution refuses Binance LIVE authenticated transport"
+        )
+    if venue is None:
+        raise BinanceSpotEnvironmentMismatch(
+            "an exact concrete Binance Spot venue is required"
+        )
+    if expected_environment is BinanceSpotEnvironment.PAPER:
+        # The import is intentionally local: binance_dev depends on this
+        # module, while this check must still identify the one trusted class.
+        from .binance_dev import PaperBinanceSpotVenue
+
+        if type(venue) is not PaperBinanceSpotVenue:
+            raise BinanceSpotEnvironmentMismatch(
+                "PAPER requires the built-in offline PaperBinanceSpotVenue"
+            )
+        return
+    if type(venue) is not BinanceSpotRESTClient:
+        raise BinanceSpotEnvironmentMismatch(
+            "TESTNET requires the exact BinanceSpotRESTClient"
+        )
+    if venue.environment is not expected_environment:
+        raise BinanceSpotEnvironmentMismatch(
+            "venue environment does not match execution profile"
+        )
+    expected_origin = SPOT_REST_ORIGINS[expected_environment]
+    if venue.origin != expected_origin:
+        raise BinanceSpotEnvironmentMismatch(
+            "venue origin does not match execution profile"
+        )
+    if credential_hash is not None:
+        if not hmac.compare_digest(credential_fingerprint(venue.credentials), credential_hash):
+            raise BinanceSpotEnvironmentMismatch(
+                "venue credentials do not match the authorization fingerprint"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -699,10 +763,27 @@ class BinanceSpotRESTClient:
     place_test_order = test_order
     validation_test_order = test_order
 
-    def query_order(self, *, symbol: str, order_id: str | int | None = None, orig_client_order_id: str | None = None, **params: Any) -> BinanceSpotResult:
+    def query_order(
+        self,
+        *,
+        symbol: str,
+        order_id: str | int | None = None,
+        orig_client_order_id: str | None = None,
+        **params: Any,
+    ) -> BinanceSpotResult:
         if order_id is None and not orig_client_order_id:
             raise ValueError("order_id or orig_client_order_id is required")
-        values = {"symbol": self._symbol(symbol), **params}
+        values = {
+            key: value
+            for key, value in params.items()
+            if key not in {
+                "order_id",
+                "client_order_id",
+                "new_client_order_id",
+                "newClientOrderId",
+            }
+        }
+        values["symbol"] = self._symbol(symbol)
         if order_id is not None:
             values["orderId"] = order_id
         if orig_client_order_id is not None:
@@ -727,20 +808,39 @@ class BinanceSpotRESTClient:
     all = all_orders
     get_all_orders = all_orders
 
-    def my_trades(self, *, symbol: str, **params: Any) -> BinanceSpotResult:
-        return self._request("GET", "/api/v3/myTrades", {"symbol": self._symbol(symbol), **params})
+    def my_trades(
+        self,
+        *,
+        symbol: str,
+        order_id: str | int | None = None,
+        **params: Any,
+    ) -> BinanceSpotResult:
+        values = {
+            key: value
+            for key, value in params.items()
+            if key not in {
+                "order_id",
+                "client_order_id",
+                "new_client_order_id",
+                "newClientOrderId",
+                "orig_client_order_id",
+            }
+        }
+        values["symbol"] = self._symbol(symbol)
+        if order_id is not None:
+            values["orderId"] = order_id
+        return self._request("GET", "/api/v3/myTrades", values)
+
     trades = my_trades
-
-    def order_rate_limits(self, **params: Any) -> BinanceSpotResult:
-        return self._request("GET", "/api/v3/rateLimit/order", params)
-
-    get_order_rate_limits = order_rate_limits
-
-    order_rate_limit = order_rate_limits
     def cancel_owned_order(self, *, symbol: str, order_id: str | int | None = None, orig_client_order_id: str | None = None, **params: Any) -> BinanceSpotResult:
         if order_id is None and not orig_client_order_id:
             raise ValueError("order_id or orig_client_order_id is required")
-        values = {"symbol": self._symbol(symbol), **params}
+        values = {
+            key: value
+            for key, value in params.items()
+            if key not in {"client_order_id", "new_client_order_id", "newClientOrderId"}
+        }
+        values["symbol"] = self._symbol(symbol)
         if order_id is not None:
             values["orderId"] = order_id
         if orig_client_order_id is not None:
@@ -778,7 +878,9 @@ __all__ = [
     "BinanceSpotResult",
     "BinanceSpotRESTClient",
     "canonical_path",
+    "validate_spot_venue_identity",
     "canonical_json",
+    "credential_fingerprint",
     "canonical_sha256",
     "permission_projection",
 ]

@@ -68,6 +68,10 @@ PowerShell lifecycle commands use the same default:
 .\ops\stop_axiom_node.ps1
 ```
 
+## Binance Spot canary
+
+See [docs/binance_spot_canary.md](binance_spot_canary.md) for the isolated PAPER-only Binance Spot runtime, operator controls, evidence status, and later reviewed migration procedure. It is separate from the Polymarket canary.
+
 ## Historical bootstrap examples
 
 ```powershell
