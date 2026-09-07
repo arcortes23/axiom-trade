@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
+import stat
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
@@ -52,6 +53,18 @@ SPOT_REST_ORIGINS: Mapping[BinanceSpotEnvironment, str | None] = {
     BinanceSpotEnvironment.BINANCE_SPOT_TESTNET: "https://testnet.binance.vision",
     BinanceSpotEnvironment.BINANCE_SPOT_LIVE: "https://api.binance.com",
 }
+_PROFILE_SPECS: Mapping[BinanceSpotEnvironment, Mapping[str, Any]] = {
+    BinanceSpotEnvironment.PAPER: {
+        "db_name": "binance-dev.sqlite",
+        "port": 8081,
+        "identity": "binance-dev",
+    },
+    BinanceSpotEnvironment.BINANCE_SPOT_TESTNET: {
+        "db_name": "binance-testnet.sqlite",
+        "port": 8082,
+        "identity": "binance-testnet",
+    },
+}
 BINANCE_API_BASELINE_COMMIT = "041bba2d8a0bb8d26f77b88a0e2761743233fcf7"
 BINANCE_API_BASELINE_DATE = "2026-09-02"
 BINANCE_TESTNET_API_BASELINE_DATE = "2026-09-04"
@@ -80,6 +93,71 @@ class BinanceSpotStatus(str, Enum):
     REJECTED = "REJECTED"
     UNKNOWN = "UNKNOWN"
     RATE_LIMIT = "RATE_LIMIT"
+
+
+def _path_text(value: str | os.PathLike[str]) -> str:
+    raw = os.fspath(value)
+    return os.fsdecode(raw) if isinstance(raw, bytes) else raw
+
+
+def _lexical_path(value: str | os.PathLike[str]) -> str:
+    """Return an absolute path without following filesystem aliases."""
+
+    return os.path.normcase(os.path.abspath(os.path.normpath(_path_text(value))))
+
+
+def _has_dot_component(value: str | os.PathLike[str]) -> bool:
+    """Return whether a path contains an explicit ``.`` or ``..`` segment."""
+
+    text = _path_text(value)
+    separators = os.sep
+    if os.path.altsep:
+        separators += os.path.altsep
+    components = [text]
+    for separator in separators:
+        components = [part for component in components for part in component.split(separator)]
+    return any(component in {".", ".."} for component in components)
+
+
+def _path_components(value: str | os.PathLike[str]) -> tuple[str, ...]:
+    """Return absolute path components, retaining the filesystem root."""
+
+    path = _lexical_path(value)
+    drive, tail = os.path.splitdrive(path)
+    if tail.startswith((os.sep, os.path.altsep or os.sep)):
+        current = drive + os.sep
+    else:
+        current = drive
+    components: list[str] = []
+    for component in tail.replace(os.path.altsep or "\0", os.sep).split(os.sep):
+        if not component:
+            continue
+        current = os.path.join(current, component)
+        components.append(current)
+    if not components and current:
+        components.append(current)
+    return tuple(components)
+
+
+def _is_reparse_or_symlink(path: str) -> bool:
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise BinanceSpotConfigurationError(
+            "cannot inspect a Binance profile database path component"
+        ) from exc
+    reparse_point = bool(getattr(info, "st_file_attributes", 0) & 0x0400)
+    return stat.S_ISLNK(info.st_mode) or reparse_point
+
+
+def _reject_database_aliases(path: str) -> None:
+    for component in _path_components(path):
+        if _is_reparse_or_symlink(component):
+            raise BinanceSpotConfigurationError(
+                "Binance profile database paths cannot contain symlinks, junctions, or reparse points"
+            )
 
 
 def _canonical_path(value: str | os.PathLike[str]) -> str:
@@ -138,6 +216,7 @@ def _environment(value: BinanceSpotEnvironment | str) -> BinanceSpotEnvironment:
         except (KeyError, TypeError):
             raise BinanceSpotConfigurationError(f"unsupported Binance Spot environment: {value!r}") from exc
 
+
 def validate_spot_venue_identity(
     venue: Any,
     environment: BinanceSpotEnvironment | str,
@@ -184,76 +263,182 @@ def validate_spot_venue_identity(
                 "venue credentials do not match the authorization fingerprint"
             )
 
-
 @dataclass(frozen=True, slots=True)
 class BinanceRuntimeProfile:
-    """Immutable development runtime boundary for the Spot canary."""
+    """Immutable PAPER or TESTNET runtime boundary for Binance Spot."""
 
     worktree_root: str
     db_path: str
     host: str = "127.0.0.1"
-    port: int = 8081
-    environment: BinanceSpotEnvironment = BinanceSpotEnvironment.BINANCE_SPOT_TESTNET
-    feature_instance: str = field(default="binance-dev", init=False)
-    runtime_identity: str = field(default="binance-dev", init=False)
-    log_identity: str = field(default="binance-dev.log", init=False)
-    lock_identity: str = field(default="binance-dev.lock", init=False)
-    stop_identity: str = field(default="binance-dev.stop", init=False)
-    pid_identity: str = field(default="binance-dev.pid", init=False)
-    background_identity: str = field(default="binance-dev", init=False)
-    transport: str = field(default="binance_spot", init=False)
+    port: int | None = None
+    environment: BinanceSpotEnvironment = BinanceSpotEnvironment.PAPER
+    feature_instance: str = field(init=False)
+    runtime_identity: str = field(init=False)
+    log_identity: str = field(init=False)
+    lock_identity: str = field(init=False)
+    stop_identity: str = field(init=False)
+    pid_identity: str = field(init=False)
+    background_identity: str = field(init=False)
+    transport: str = field(init=False)
 
     def __post_init__(self) -> None:
-        root = _canonical_path(self.worktree_root)
-        db = _canonical_path(self.db_path)
-        expected = _canonical_path(os.path.join(root, "runtime-data", "binance-dev.sqlite"))
-        if db != expected:
-            raise BinanceSpotConfigurationError(
-                "development profile requires worktree runtime-data/binance-dev.sqlite"
-            )
-        if str(self.host) != "127.0.0.1":
-            raise BinanceSpotConfigurationError("development profile must bind loopback 127.0.0.1")
-        try:
-            port = int(self.port)
-        except (TypeError, ValueError) as exc:
-            raise BinanceSpotConfigurationError("development profile port must be 8081") from exc
-        if port != 8081:
-            raise BinanceSpotConfigurationError("development profile must use port 8081")
+        root = _lexical_path(self.worktree_root)
         env = _environment(self.environment)
         if env is BinanceSpotEnvironment.BINANCE_SPOT_LIVE:
-            raise BinanceSpotConfigurationError("development profile cannot use Binance LIVE authenticated transport")
+            raise BinanceSpotConfigurationError("Binance LIVE is not a development profile")
+        spec = _PROFILE_SPECS[env]
+        raw_db = _path_text(self.db_path)
+        if _has_dot_component(raw_db):
+            raise BinanceSpotConfigurationError(
+                f"{env.value} profile database path cannot contain '.' or '..' components"
+            )
+        db = _lexical_path(raw_db)
+        expected = _lexical_path(os.path.join(root, "runtime-data", spec["db_name"]))
+        if db != expected:
+            raise BinanceSpotConfigurationError(
+                f"{env.value} profile requires runtime-data/{spec['db_name']}"
+            )
+        _reject_database_aliases(expected)
+        if _canonical_path(db) != _canonical_path(expected):
+            raise BinanceSpotConfigurationError(
+                f"{env.value} profile database path resolves outside its dedicated database"
+            )
+        if str(self.host) != "127.0.0.1":
+            raise BinanceSpotConfigurationError(
+                f"{env.value} profile must bind loopback 127.0.0.1"
+            )
+        if self.port is None:
+            port = int(spec["port"])
+        else:
+            try:
+                port = int(self.port)
+            except (TypeError, ValueError) as exc:
+                raise BinanceSpotConfigurationError(
+                    f"{env.value} profile port must be {spec['port']}"
+                ) from exc
+        if port != spec["port"]:
+            raise BinanceSpotConfigurationError(
+                f"{env.value} profile must use port {spec['port']}"
+            )
+        identity = str(spec["identity"])
         object.__setattr__(self, "worktree_root", root)
         object.__setattr__(self, "db_path", db)
         object.__setattr__(self, "port", port)
         object.__setattr__(self, "environment", env)
+        object.__setattr__(self, "feature_instance", identity)
+        object.__setattr__(self, "runtime_identity", identity)
+        object.__setattr__(self, "log_identity", f"{identity}.log")
+        object.__setattr__(self, "lock_identity", f"{identity}.lock")
+        object.__setattr__(self, "stop_identity", f"{identity}.stop")
+        object.__setattr__(self, "pid_identity", f"{identity}.pid")
+        object.__setattr__(self, "background_identity", identity)
+        object.__setattr__(self, "transport", "binance_spot")
+
     @classmethod
     def development(
         cls,
         worktree_root: str | os.PathLike[str],
-        db_path: str | os.PathLike[str],
-        host: str = "127.0.0.1",
-        port: int = 8081,
+        db_path: str | os.PathLike[str] | None = None,
+        host: str | None = None,
+        port: int | None = None,
         *,
-        environment: BinanceSpotEnvironment | str = BinanceSpotEnvironment.BINANCE_SPOT_TESTNET,
+        environment: BinanceSpotEnvironment | str | None = None,
         transport: str = "binance_spot",
     ) -> "BinanceRuntimeProfile":
-        """Build the only permitted development profile.
+        """Compatibility constructor selecting one exact profile.
 
-        The supplied DB is compared after ``resolve``/``realpath``/``normcase``
-        so a live main DB cannot pass through a junction or symlink alias.
+        Existing PAPER callers pass ``binance-dev.sqlite`` and TESTNET callers
+        may pass ``binance-testnet.sqlite``.  The explicit ``paper`` and
+        ``testnet`` constructors are preferred for new code.
         """
 
         normalized_transport = str(transport).strip().lower().replace("-", "_")
         if normalized_transport not in {"binance_spot", "binance"}:
             raise BinanceSpotConfigurationError(
-                "development profile rejects Hermes, Polymarket, and other transports"
+                "Binance Spot profiles reject non-Binance transports"
             )
+        if environment is None:
+            if db_path is not None and os.path.basename(os.fspath(db_path)).lower() == "binance-testnet.sqlite":
+                env = BinanceSpotEnvironment.BINANCE_SPOT_TESTNET
+            else:
+                env = BinanceSpotEnvironment.PAPER
+        else:
+            env = _environment(environment)
+        spec = _PROFILE_SPECS.get(env)
+        if spec is None:
+            raise BinanceSpotConfigurationError("Binance LIVE is not a development profile")
+        root = _lexical_path(worktree_root)
+        selected_db = (
+            os.fspath(db_path)
+            if db_path is not None
+            else os.path.join(root, "runtime-data", spec["db_name"])
+        )
+        selected_host = "127.0.0.1" if host is None else host
+        selected_port = spec["port"] if port is None else port
         return cls(
-            worktree_root=_canonical_path(worktree_root),
-            db_path=os.fspath(db_path),
-            host=host,
-            port=port,
-            environment=_environment(environment),
+            worktree_root=root,
+            db_path=selected_db,
+            host=selected_host,
+            port=selected_port,
+            environment=env,
+        )
+
+    @classmethod
+    def paper(
+        cls,
+        worktree_root: str | os.PathLike[str],
+        db_path: str | os.PathLike[str] | None = None,
+        host: str = "127.0.0.1",
+        port: int = 8081,
+        *,
+        transport: str = "binance_spot",
+    ) -> "BinanceRuntimeProfile":
+        return cls.development(
+            worktree_root,
+            db_path,
+            host,
+            port,
+            environment=BinanceSpotEnvironment.PAPER,
+            transport=transport,
+        )
+
+    @classmethod
+    def testnet(
+        cls,
+        worktree_root: str | os.PathLike[str],
+        db_path: str | os.PathLike[str] | None = None,
+        host: str = "127.0.0.1",
+        port: int = 8082,
+        *,
+        transport: str = "binance_spot",
+    ) -> "BinanceRuntimeProfile":
+        return cls.development(
+            worktree_root,
+            db_path,
+            host,
+            port,
+            environment=BinanceSpotEnvironment.BINANCE_SPOT_TESTNET,
+            transport=transport,
+        )
+
+    @classmethod
+    def for_environment(
+        cls,
+        worktree_root: str | os.PathLike[str],
+        environment: BinanceSpotEnvironment | str,
+        db_path: str | os.PathLike[str] | None = None,
+        host: str | None = None,
+        port: int | None = None,
+        *,
+        transport: str = "binance_spot",
+    ) -> "BinanceRuntimeProfile":
+        return cls.development(
+            worktree_root,
+            db_path,
+            host,
+            port,
+            environment=environment,
+            transport=transport,
         )
 
     @property
@@ -330,17 +515,42 @@ class BinanceCredentialRef:
 
     instance: str
     environment: BinanceSpotEnvironment | str
-    namespace: str = "AXIOM-BINANCE-SPOT"
+    namespace: str | None = None
 
     def __post_init__(self) -> None:
         instance = str(self.instance).strip()
-        if not instance or any(ch not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.:-" for ch in instance):
-            raise BinanceSpotConfigurationError("credential instance must be a safe non-empty identifier")
+        if not instance or any(
+            ch not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.:-"
+            for ch in instance
+        ):
+            raise BinanceSpotConfigurationError(
+                "credential instance must be a safe non-empty identifier"
+            )
         env = _environment(self.environment)
-        if self.namespace != "AXIOM-BINANCE-SPOT":
-            raise BinanceSpotConfigurationError("Binance Spot credentials require AXIOM-BINANCE-SPOT namespace")
+        expected = {
+            BinanceSpotEnvironment.PAPER: ("binance-dev", "AXIOM-BINANCE-SPOT"),
+            BinanceSpotEnvironment.BINANCE_SPOT_TESTNET: (
+                "binance-testnet",
+                "AXIOM-BINANCE-SPOT-TESTNET",
+            ),
+        }.get(env)
+        if expected is None:
+            raise BinanceSpotConfigurationError(
+                "Binance LIVE credentials are prohibited"
+            )
+        expected_instance, expected_namespace = expected
+        if instance != expected_instance:
+            raise BinanceSpotEnvironmentMismatch(
+                f"{env.value} credentials require instance {expected_instance!r}"
+            )
+        namespace = expected_namespace if self.namespace is None else str(self.namespace)
+        if namespace != expected_namespace:
+            raise BinanceSpotEnvironmentMismatch(
+                f"{env.value} credentials require namespace {expected_namespace!r}"
+            )
         object.__setattr__(self, "instance", instance)
         object.__setattr__(self, "environment", env)
+        object.__setattr__(self, "namespace", namespace)
 
     @property
     def identity(self) -> str:
@@ -348,75 +558,83 @@ class BinanceCredentialRef:
 
     @property
     def service(self) -> str:
-        return self.namespace
+        return str(self.namespace)
 
     def projection(self) -> dict[str, str]:
         return {
-            "namespace": self.namespace,
+            "namespace": str(self.namespace),
             "service": self.service,
             "instance": self.instance,
             "environment": self.environment.value,
             "identity": self.identity,
         }
 
-    def stable_id(self) -> str:
-        return canonical_sha256(self.projection())
-
-
-@dataclass(frozen=True, slots=True, repr=False)
-class BinanceSpotCredentials:
-    """Explicit credentials held in memory only for signing requests."""
-
-    api_key: str
-    api_secret: str
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.api_key, str) or not self.api_key:
-            raise BinanceSpotConfigurationError("api_key must be non-empty")
-        if not isinstance(self.api_secret, str) or not self.api_secret:
-            raise BinanceSpotConfigurationError("api_secret must be non-empty")
-
-    def __repr__(self) -> str:  # pragma: no cover - defensive secret hygiene
-        return "BinanceSpotCredentials(api_key=<redacted>, api_secret=<redacted>)"
-
-    def projection(self) -> dict[str, bool]:
-        return {"configured": True, "api_key_configured": True, "api_secret_configured": True, "secret_values_exposed": False}
-
-
 class BinanceCredentialStore:
     """Isolated keyring store with no environment-variable fallback."""
-
-    service = "AXIOM-BINANCE-SPOT"
 
     def __init__(
         self,
         ref: BinanceCredentialRef | None = None,
         *,
-        instance: str = "binance-dev",
-        environment: BinanceSpotEnvironment | str = BinanceSpotEnvironment.BINANCE_SPOT_TESTNET,
+        instance: str | None = None,
+        environment: BinanceSpotEnvironment | str | None = None,
+        namespace: str | None = None,
         keyring_backend: Any | None = None,
         keyring: Any | None = None,
         allow_environment: bool = False,
     ) -> None:
         if allow_environment:
-            raise BinanceSpotConfigurationError("environment credential fallback is prohibited")
+            raise BinanceSpotConfigurationError(
+                "environment credential fallback is prohibited"
+            )
         if ref is not None:
             if not isinstance(ref, BinanceCredentialRef):
                 raise TypeError("ref must be BinanceCredentialRef")
+            if instance is not None and str(instance) != ref.instance:
+                raise BinanceSpotEnvironmentMismatch(
+                    "credential reference instance mismatch"
+                )
+            if environment is not None and _environment(environment) is not ref.environment:
+                raise BinanceSpotEnvironmentMismatch(
+                    "credential reference environment mismatch"
+                )
+            if namespace is not None and str(namespace) != ref.namespace:
+                raise BinanceSpotEnvironmentMismatch(
+                    "credential reference namespace mismatch"
+                )
             candidate = ref
-            if instance != "binance-dev" or _environment(environment) is not candidate.environment:
-                # Explicit ref is authoritative; silently crossing environments
-                # would defeat the namespace boundary.
-                if instance != "binance-dev" or _environment(environment) is not candidate.environment:
-                    instance, environment = candidate.instance, candidate.environment
         else:
-            candidate = BinanceCredentialRef(instance=instance, environment=environment)
+            env = (
+                BinanceSpotEnvironment.PAPER
+                if environment is None
+                else _environment(environment)
+            )
+            if instance is None:
+                instance = {
+                    BinanceSpotEnvironment.PAPER: "binance-dev",
+                    BinanceSpotEnvironment.BINANCE_SPOT_TESTNET: "binance-testnet",
+                }.get(env)
+            if instance is None:
+                raise BinanceSpotConfigurationError(
+                    "Binance LIVE credentials are prohibited"
+                )
+            candidate = BinanceCredentialRef(
+                instance=instance,
+                environment=env,
+                namespace=namespace,
+            )
         self.ref = candidate
         self._keyring = keyring_backend if keyring_backend is not None else keyring
 
     @property
     def namespace(self) -> str:
-        return self.service
+        return self.ref.namespace
+
+    @property
+    def service(self) -> str:
+        """The backend service is always derived from the validated ref."""
+
+        return self.ref.service
 
     def _backend(self) -> Any:
         if self._keyring is not None:
@@ -442,7 +660,9 @@ class BinanceCredentialStore:
 
     def load(self, ref: BinanceCredentialRef | None = None) -> BinanceSpotCredentials | None:
         if ref is not None and ref != self.ref:
-            raise BinanceSpotEnvironmentMismatch("credential reference environment/instance mismatch")
+            raise BinanceSpotEnvironmentMismatch(
+                "credential reference environment/instance/namespace mismatch"
+            )
         backend = self._backend()
         key = backend.get_password(self.service, self._username("api_key"))
         secret = backend.get_password(self.service, self._username("api_secret"))
@@ -462,6 +682,28 @@ class BinanceCredentialStore:
         return projection
 
     projection = safe_projection
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class BinanceSpotCredentials:
+    """Explicit credentials held in memory only for signing requests."""
+
+    api_key: str
+    api_secret: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.api_key, str) or not self.api_key:
+            raise BinanceSpotConfigurationError("api_key must be non-empty")
+        if not isinstance(self.api_secret, str) or not self.api_secret:
+            raise BinanceSpotConfigurationError("api_secret must be non-empty")
+
+    def __repr__(self) -> str:  # pragma: no cover - defensive secret hygiene
+        return "BinanceSpotCredentials(api_key=<redacted>, api_secret=<redacted>)"
+
+    def projection(self) -> dict[str, bool]:
+        return {"configured": True, "api_key_configured": True, "api_secret_configured": True, "secret_values_exposed": False}
+
+
 
 
 class BinanceSpotResult(Mapping[str, Any]):
@@ -531,6 +773,18 @@ class BinanceSpotRESTClient:
             ("DELETE", "/api/v3/order"),
         }
     )
+    # Public requests are deliberately separate from the signed allowlist.
+    _PUBLIC_ALLOWED = frozenset(
+        {
+            ("GET", "/api/v3/time"),
+            ("GET", "/api/v3/exchangeInfo"),
+            ("GET", "/api/v3/ticker/24hr"),
+            ("GET", "/api/v3/ticker/price"),
+            ("GET", "/api/v3/ticker/bookTicker"),
+            ("GET", "/api/v3/depth"),
+            ("GET", "/api/v3/klines"),
+        }
+    )
     AMBIGUOUS_CODES = frozenset({-1000, -1006, -1007})
 
     def __init__(
@@ -556,29 +810,33 @@ class BinanceSpotRESTClient:
                 raise TypeError("profile must be BinanceRuntimeProfile")
             if env is not profile.environment:
                 raise BinanceSpotEnvironmentMismatch("profile and client environment differ")
-            if env is BinanceSpotEnvironment.BINANCE_SPOT_LIVE:
-                raise BinanceSpotConfigurationError("development profile cannot use Binance LIVE authenticated transport")
-        if env is BinanceSpotEnvironment.PAPER:
-            # PAPER is valid as a profile state but has no authenticated origin.
-            self.environment = env
+        if env is BinanceSpotEnvironment.BINANCE_SPOT_LIVE:
+            raise BinanceSpotConfigurationError(
+                "Binance LIVE/mainnet transport is prohibited"
+            )
         if isinstance(credentials, BinanceSpotCredentials):
             explicit = credentials
         elif isinstance(credentials, Mapping):
-            explicit = BinanceSpotCredentials(str(credentials.get("api_key", "")), str(credentials.get("api_secret", "")))
-        elif isinstance(credentials, Sequence) and not isinstance(credentials, (str, bytes, bytearray)) and len(credentials) == 2:
+            explicit = BinanceSpotCredentials(
+                str(credentials.get("api_key", "")),
+                str(credentials.get("api_secret", "")),
+            )
+        elif (
+            isinstance(credentials, Sequence)
+            and not isinstance(credentials, (str, bytes, bytearray))
+            and len(credentials) == 2
+        ):
             explicit = BinanceSpotCredentials(str(credentials[0]), str(credentials[1]))
         elif credentials is None:
             explicit = None
         else:
-            raise TypeError("credentials must be explicit BinanceSpotCredentials or api_key/api_secret mapping")
+            raise TypeError(
+                "credentials must be explicit BinanceSpotCredentials or api_key/api_secret mapping"
+            )
         self.environment = env
         self.profile = profile
         self.credentials = explicit
         self.base_url = SPOT_REST_ORIGINS[env]
-        if self.base_url is None and explicit is not None:
-            # Delay PAPER rejection until an authenticated method so creating a
-            # paper-bound service remains useful for capability inspection.
-            pass
         timeout_value = float(timeout)
         if not math.isfinite(timeout_value) or timeout_value <= 0:
             raise ValueError("timeout must be finite and positive")
@@ -599,10 +857,14 @@ class BinanceSpotRESTClient:
         return cls(environment, credentials, **kwargs)
 
     def _require_auth(self) -> BinanceSpotCredentials:
-        if self.environment is BinanceSpotEnvironment.PAPER:
-            raise BinanceSpotConfigurationError("PAPER rejects authenticated Binance Spot calls")
-        if self.base_url not in {SPOT_REST_ORIGINS[BinanceSpotEnvironment.BINANCE_SPOT_TESTNET], SPOT_REST_ORIGINS[BinanceSpotEnvironment.BINANCE_SPOT_LIVE]}:
-            raise BinanceSpotConfigurationError("Binance Spot authenticated origin is not fixed")
+        if self.environment is not BinanceSpotEnvironment.BINANCE_SPOT_TESTNET:
+            raise BinanceSpotConfigurationError(
+                "authenticated Binance Spot calls are TESTNET-only"
+            )
+        if self.base_url != SPOT_REST_ORIGINS[BinanceSpotEnvironment.BINANCE_SPOT_TESTNET]:
+            raise BinanceSpotConfigurationError(
+                "Binance Spot authenticated origin is not fixed to TESTNET"
+            )
         if self.credentials is None:
             raise BinanceSpotConfigurationError("explicit Binance Spot credentials are required")
         return self.credentials
@@ -687,6 +949,78 @@ class BinanceSpotRESTClient:
         """
 
         return self._request(method, endpoint, dict(params or {}), validation_only=validation_only)
+    def public_request(
+        self,
+        method: str,
+        endpoint: str,
+        params: Mapping[str, Any] | None = None,
+    ) -> BinanceSpotResult:
+        """Issue one fixed-origin, unsigned TESTNET public request."""
+
+        if self.environment is not BinanceSpotEnvironment.BINANCE_SPOT_TESTNET:
+            raise BinanceSpotConfigurationError("public Spot requests are TESTNET-only")
+        if self.base_url != SPOT_REST_ORIGINS[BinanceSpotEnvironment.BINANCE_SPOT_TESTNET]:
+            raise BinanceSpotConfigurationError(
+                "Binance Spot public origin is not fixed to TESTNET"
+            )
+        method = str(method).upper()
+        if (method, endpoint) not in self._PUBLIC_ALLOWED:
+            raise BinanceSpotConfigurationError(
+                f"Spot public endpoint is not allowlisted: {method} {endpoint}"
+            )
+        encoded = self._encode(dict(params or {})).decode("ascii")
+        url = f"{self.base_url}{endpoint}"
+        if encoded:
+            url = f"{url}?{encoded}"
+        request = Request(
+            url,
+            headers={"Accept": "application/json"},
+            method="GET",
+        )
+        try:
+            raw = self._opener(request, timeout=self.timeout)
+            status = int(getattr(raw, "status", getattr(raw, "code", 200)))
+            headers = getattr(raw, "headers", {}) or {}
+            body = raw.read() if hasattr(raw, "read") else raw
+            payload = self._decode(body)
+        except HTTPError as exc:
+            status = int(getattr(exc, "code", 0) or 0)
+            headers = getattr(exc, "headers", {}) or {}
+            body = exc.read() if hasattr(exc, "read") else b""
+            payload = self._decode(body)
+        except (TimeoutError, socket.timeout, URLError, OSError):
+            return BinanceSpotResult(BinanceSpotStatus.UNKNOWN, endpoint=endpoint)
+        if status in {418, 429}:
+            return BinanceSpotResult(
+                BinanceSpotStatus.RATE_LIMIT,
+                payload,
+                http_status=status,
+                retry_after=self._header(headers, "Retry-After"),
+                endpoint=endpoint,
+            )
+        code = self._error_code(payload)
+        if status >= 500 or code in self.AMBIGUOUS_CODES:
+            return BinanceSpotResult(
+                BinanceSpotStatus.UNKNOWN,
+                payload,
+                http_status=status,
+                error_code=code,
+                endpoint=endpoint,
+            )
+        if status >= 400 or code is not None:
+            return BinanceSpotResult(
+                BinanceSpotStatus.REJECTED,
+                payload,
+                http_status=status,
+                error_code=code,
+                endpoint=endpoint,
+            )
+        return BinanceSpotResult(
+            BinanceSpotStatus.OK,
+            payload,
+            http_status=status,
+            endpoint=endpoint,
+        )
 
     @staticmethod
     def _decode(body: Any) -> Any:
@@ -726,6 +1060,107 @@ class BinanceSpotRESTClient:
         if not normalized:
             raise ValueError("symbol must not be empty")
         return normalized
+    def time(self) -> BinanceSpotResult:
+        return self.public_request("GET", "/api/v3/time")
+
+    get_time = time
+    server_time = time
+    get_server_time = time
+    public_time = time
+
+    def exchange_info(
+        self,
+        *,
+        symbol: str | None = None,
+        symbols: Sequence[str] | None = None,
+        **params: Any,
+    ) -> BinanceSpotResult:
+        values = dict(params)
+        if symbol is not None:
+            values["symbol"] = self._symbol(symbol)
+        if symbols is not None:
+            values["symbols"] = [self._symbol(value) for value in symbols]
+        return self.public_request("GET", "/api/v3/exchangeInfo", values)
+
+    get_exchange_info = exchange_info
+
+    def ticker(
+        self,
+        *,
+        symbol: str | None = None,
+        **params: Any,
+    ) -> BinanceSpotResult:
+        values = dict(params)
+        if symbol is not None:
+            values["symbol"] = self._symbol(symbol)
+        return self.public_request("GET", "/api/v3/ticker/24hr", values)
+
+    ticker_24hr = ticker
+    ticker_stats = ticker
+
+    def ticker_price(
+        self,
+        *,
+        symbol: str | None = None,
+        **params: Any,
+    ) -> BinanceSpotResult:
+        values = dict(params)
+        if symbol is not None:
+            values["symbol"] = self._symbol(symbol)
+        return self.public_request("GET", "/api/v3/ticker/price", values)
+
+    price_ticker = ticker_price
+
+    def ticker_book(
+        self,
+        *,
+        symbol: str | None = None,
+        **params: Any,
+    ) -> BinanceSpotResult:
+        values = dict(params)
+        if symbol is not None:
+            values["symbol"] = self._symbol(symbol)
+        return self.public_request("GET", "/api/v3/ticker/bookTicker", values)
+
+    book_ticker = ticker_book
+
+    def depth(
+        self,
+        *,
+        symbol: str,
+        limit: int | None = None,
+        **params: Any,
+    ) -> BinanceSpotResult:
+        values = dict(params)
+        values["symbol"] = self._symbol(symbol)
+        if limit is not None:
+            values["limit"] = limit
+        return self.public_request("GET", "/api/v3/depth", values)
+
+    order_book = depth
+
+    def klines(
+        self,
+        *,
+        symbol: str,
+        interval: str,
+        start_time: int | None = None,
+        end_time: int | None = None,
+        limit: int | None = None,
+        **params: Any,
+    ) -> BinanceSpotResult:
+        values = dict(params)
+        values.update({"symbol": self._symbol(symbol), "interval": str(interval)})
+        if start_time is not None:
+            values["startTime"] = start_time
+        if end_time is not None:
+            values["endTime"] = end_time
+        if limit is not None:
+            values["limit"] = limit
+        return self.public_request("GET", "/api/v3/klines", values)
+
+    candles = klines
+
 
     def account(self, **params: Any) -> BinanceSpotResult:
         return self._request("GET", "/api/v3/account", params)

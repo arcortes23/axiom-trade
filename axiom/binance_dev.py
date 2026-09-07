@@ -475,7 +475,7 @@ class BinanceDevelopmentRuntime:
         worktree_root: str | os.PathLike[str] | None = None,
         *,
         profile: BinanceRuntimeProfile | None = None,
-        environment: BinanceSpotEnvironment | str = PAPER,
+        environment: BinanceSpotEnvironment | str | None = None,
         credentials: Any | None = None,
         venue: Any | None = None,
         provider: Any | None = None,
@@ -487,18 +487,25 @@ class BinanceDevelopmentRuntime:
         dashboard_server_factory: Callable[..., Any] | None = None,
     ) -> None:
         root = canonical_checkout_root(worktree_root)
-        env = _environment(environment)
+        if profile is None:
+            env = _environment(PAPER if environment is None else environment)
+            if env is BinanceSpotEnvironment.BINANCE_SPOT_LIVE:
+                raise ValueError("Binance development runtime cannot use LIVE")
+            profile = (
+                BinanceRuntimeProfile.paper(root)
+                if env is BinanceSpotEnvironment.PAPER
+                else BinanceRuntimeProfile.testnet(root)
+            )
+        else:
+            if not isinstance(profile, BinanceRuntimeProfile):
+                raise TypeError("profile must be BinanceRuntimeProfile")
+            env = _environment(profile.environment if environment is None else environment)
         if env is BinanceSpotEnvironment.BINANCE_SPOT_LIVE:
             raise ValueError("Binance development runtime cannot use LIVE")
         if env is BinanceSpotEnvironment.BINANCE_SPOT_TESTNET and credentials is None:
             raise ValueError("TESTNET requires explicit credentials")
         if env is BinanceSpotEnvironment.PAPER and credentials is not None:
             raise ValueError("PAPER runtime does not accept credentials")
-        expected_db = os.path.join(root, "runtime-data", "binance-dev.sqlite")
-        if profile is None:
-            profile = BinanceRuntimeProfile.development(root, expected_db, DEFAULT_HOST, DEFAULT_PORT, environment=env)
-        elif not isinstance(profile, BinanceRuntimeProfile):
-            raise TypeError("profile must be BinanceRuntimeProfile")
         if os.path.normcase(os.path.realpath(profile.worktree_root)) != root:
             raise ValueError("profile root does not match the development checkout")
         if profile.environment is not env:
@@ -511,6 +518,7 @@ class BinanceDevelopmentRuntime:
         _validate_runtime_venue(env, resolved_venue, credentials)
 
         self.profile = profile
+        self.runtime_identity = self.profile.runtime_identity
         self.environment = env.value
         self.owner = _RuntimeOwner(os.getpid(), uuid.uuid4().hex)
         self.stop_event = threading.Event()
@@ -535,7 +543,7 @@ class BinanceDevelopmentRuntime:
             profile=self.profile,
             environment=self.environment,
             credentials=credentials,
-            owner_id=RUNTIME_IDENTITY,
+            owner_id=self.runtime_identity,
         )
         self.worker = worker
         if self.worker is None:
@@ -549,7 +557,7 @@ class BinanceDevelopmentRuntime:
                 qualification=self.qualification,
                 interval_seconds=DEFAULT_INTERVAL_SECONDS,
                 stop_event=self.stop_event,
-                worker_id=RUNTIME_IDENTITY,
+                worker_id=self.runtime_identity,
                 profile=self.profile,
             )
         self.binance_canary = BinanceCanaryControlPlane(
@@ -563,7 +571,8 @@ class BinanceDevelopmentRuntime:
         self.server = dashboard_server
         if self.server is None:
             factory = dashboard_server_factory or DashboardServer
-            self.server = factory(DEFAULT_HOST, DEFAULT_PORT, data=self.dashboard_data)
+            self.server = factory(self.profile.host, self.profile.port, data=self.dashboard_data)
+
 
     @property
     def root(self) -> str:
@@ -590,7 +599,7 @@ class BinanceDevelopmentRuntime:
         return self.profile.pid_path
 
     def _owner_document(self) -> str:
-        return json.dumps({"pid": self.owner.pid, "runtime_identity": RUNTIME_IDENTITY, "owner_token": self.owner.token}, sort_keys=True, separators=(",", ":"))
+        return json.dumps({"pid": self.owner.pid, "runtime_identity": self.runtime_identity, "owner_token": self.owner.token}, sort_keys=True, separators=(",", ":"))
 
     def _write_owned_file(self, path: str, content: str, *, exclusive: bool = False) -> None:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -622,7 +631,7 @@ class BinanceDevelopmentRuntime:
             pid = int(document.get("pid", -1))
         except (TypeError, ValueError):
             return False
-        return document.get("runtime_identity") == RUNTIME_IDENTITY and document.get("owner_token") == self.owner.token and pid == self.owner.pid
+        return document.get("runtime_identity") == self.runtime_identity and document.get("owner_token") == self.owner.token and pid == self.owner.pid
 
     def _release_lock(self) -> None:
         fd = self._lock_fd
@@ -648,7 +657,7 @@ class BinanceDevelopmentRuntime:
             document = json.loads(Path(self.stop_path).read_text(encoding="utf-8"))
         except (FileNotFoundError, OSError, ValueError, json.JSONDecodeError):
             return
-        if document.get("runtime_identity") == RUNTIME_IDENTITY:
+        if document.get("runtime_identity") == self.runtime_identity:
             try:
                 Path(self.stop_path).unlink()
             except FileNotFoundError:
@@ -684,7 +693,7 @@ class BinanceDevelopmentRuntime:
             if once:
                 self._run_worker(True)
             else:
-                self._worker_thread = threading.Thread(target=self._run_worker, args=(False,), name=RUNTIME_IDENTITY, daemon=True)
+                self._worker_thread = threading.Thread(target=self._run_worker, args=(False,), name=self.runtime_identity, daemon=True)
                 self._worker_thread.start()
             return self
         except BaseException:
@@ -696,7 +705,7 @@ class BinanceDevelopmentRuntime:
             document = json.loads(Path(self.stop_path).read_text(encoding="utf-8"))
         except (FileNotFoundError, OSError, ValueError, json.JSONDecodeError):
             return False
-        return document.get("runtime_identity") == RUNTIME_IDENTITY
+        return document.get("runtime_identity") == self.runtime_identity
 
     def _write_stop_marker(self) -> bool:
         """Publish this runtime's stop marker without replacing another one."""
@@ -785,13 +794,15 @@ class BinanceDevelopmentRuntime:
         url = getattr(self.server, "url", None)
         if callable(url):
             url = url()
+        profile_projection = self.profile.projection()
         return {
             "status": "RUNNING" if self._started else ("STOPPED" if self._closed else "READY"),
+            "runtime_identity": profile_projection["runtime_identity"],
             "url": url,
-            "profile": self.profile.projection(),
+            "profile": profile_projection,
             "paths": {"db": self.db_path, "log": self.log_path, "lock": self.lock_path, "stop": self.stop_path, "pid": self.pid_path},
             "worker": worker_status,
-            "paper_only": self.environment == PAPER,
+            "paper_only": profile_projection["environment"] == BinanceSpotEnvironment.PAPER.value,
             "live_execution": False,
             "polymarket_transport": "DISABLED",
             "hermes": "DISABLED",

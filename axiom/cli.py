@@ -1,6 +1,7 @@
 """Command-line entry point for deterministic offline Axiom workflows."""
 from __future__ import annotations
 
+import getpass
 import argparse
 from datetime import datetime, timedelta, timezone
 import hashlib
@@ -34,6 +35,11 @@ from .strategy import evaluate_signal_record, load_strategy
 from .tracking import ExperimentTracker
 from .storage import AxiomStore, SQLiteBusyTimeout
 from .binance_dev import BinanceDevelopmentRuntime
+from .binance_spot import (
+    BINANCE_SPOT_TESTNET,
+    BinanceCredentialRef,
+    BinanceCredentialStore,
+)
 from .bootstrap import (
     BTC_HISTORY_START,
     BTC_INTERVAL_SECONDS,
@@ -51,6 +57,27 @@ from .crypto_universe import (
 
 _SYNTHETIC_START = datetime(2024, 1, 1, tzinfo=timezone.utc)
 DEFAULT_DB_PATH = "runtime-data/axiom.sqlite"
+_BINANCE_TESTNET_CREDENTIAL_INSTANCE = "binance-testnet"
+_BINANCE_TESTNET_CREDENTIAL_NAMESPACE = "AXIOM-BINANCE-SPOT-TESTNET"
+
+
+def _binance_testnet_credential_ref() -> BinanceCredentialRef:
+    return BinanceCredentialRef(
+        instance=_BINANCE_TESTNET_CREDENTIAL_INSTANCE,
+        environment=BINANCE_SPOT_TESTNET,
+        namespace=_BINANCE_TESTNET_CREDENTIAL_NAMESPACE,
+    )
+
+
+def _binance_testnet_credential_status(*, configured: bool) -> dict[str, Any]:
+    """Return the only credential metadata the CLI is allowed to expose."""
+
+    return {
+        "environment": BINANCE_SPOT_TESTNET,
+        "namespace": _BINANCE_TESTNET_CREDENTIAL_NAMESPACE,
+        "configured": bool(configured),
+        "secret_values_exposed": False,
+    }
 
 
 def synthetic_bars(count: int = 30, *, start: datetime = _SYNTHETIC_START, symbol: str = "SYNTH") -> tuple[OHLCVBar, ...]:
@@ -346,6 +373,34 @@ def build_parser() -> argparse.ArgumentParser:
     credential_status = credential_commands.add_parser("status")
     credential_status.add_argument("venue", nargs="?", choices=("polymarket",), default="polymarket")
     credential_status.add_argument("--allow-environment", action="store_true")
+    binance_credentials = commands.add_parser(
+        "binance-credentials",
+        help="configure or inspect isolated Binance Spot TESTNET credentials",
+    )
+    binance_credential_commands = binance_credentials.add_subparsers(
+        dest="binance_credentials_command",
+        required=True,
+    )
+    binance_credential_configure = binance_credential_commands.add_parser(
+        "configure",
+        help="configure Binance Spot TESTNET credentials using hidden prompts",
+    )
+    binance_credential_configure.add_argument(
+        "--environment",
+        choices=("testnet",),
+        required=True,
+        help="credential environment (only testnet is permitted)",
+    )
+    binance_credential_status = binance_credential_commands.add_parser(
+        "status",
+        help="show safe Binance Spot TESTNET credential status",
+    )
+    binance_credential_status.add_argument(
+        "--environment",
+        choices=("testnet",),
+        required=True,
+        help="credential environment (only testnet is permitted)",
+    )
     for name, help_text in (
         ("canary-status", "show micro-live canary state"),
         ("canary-disarm", "return immediately to paper-only"),
@@ -702,6 +757,8 @@ def _load_cli_documents(strategy_value: str, model_value: str) -> tuple[Any, Map
     if not isinstance(raw_model, Mapping):
         raise ValueError("model document must be an object or a probability number")
     model = dict(raw_model)
+
+
     if "probability" in model or "yes_probability" in model:
         value = model.get("probability", model.get("yes_probability"))
         try:
@@ -729,6 +786,28 @@ def _load_cli_execution_inputs(args: argparse.Namespace, spec: Any) -> tuple[Any
         raise ValueError("model document does not match the frozen forward-test hash")
     return _CliStrategy(strategy_definition), _CliProbabilityModel(model_document)
 
+def _run_binance_credentials(args: argparse.Namespace) -> int:
+    """Run the TESTNET-only credential operator flow without exposing secrets."""
+
+    if args.environment != "testnet":
+        raise ValueError("Binance credentials support only --environment testnet")
+    store = BinanceCredentialStore(ref=_binance_testnet_credential_ref())
+    if args.binance_credentials_command == "configure":
+        api_key = getpass.getpass("Binance Spot TESTNET API key: ")
+        api_secret = getpass.getpass("Binance Spot TESTNET API secret: ")
+        if not api_key or not api_secret:
+            raise ValueError("Binance Spot TESTNET credential configuration is incomplete")
+        try:
+            store.configure(api_key, api_secret)
+        finally:
+            del api_key, api_secret
+        configured = True
+    elif args.binance_credentials_command == "status":
+        configured = store.configured()
+    else:  # pragma: no cover - argparse restricts this value.
+        raise ValueError("unsupported Binance credentials command")
+    print(json.dumps(_binance_testnet_credential_status(configured=configured), sort_keys=True, indent=2))
+    return 0
 
 def _main_impl(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
@@ -749,6 +828,8 @@ def _main_impl(argv: Sequence[str] | None = None) -> int:
             return 0
         finally:
             runtime.stop()
+    if args.command == "binance-credentials":
+        return _run_binance_credentials(args)
     if args.command == "credentials":
         credentials = CredentialStore()
         if args.credentials_command == "configure":

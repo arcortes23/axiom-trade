@@ -9,10 +9,10 @@ import tempfile
 import unittest
 from urllib.parse import parse_qs, urlsplit
 
-
 from axiom.binance_spot import (
     BINANCE_SPOT_LIVE,
     BINANCE_SPOT_TESTNET,
+    PAPER,
     BinanceCredentialRef,
     BinanceCredentialStore,
     BinanceRuntimeProfile,
@@ -57,16 +57,16 @@ class BinanceSpotTests(unittest.TestCase):
         self.addCleanup(self._tmpdir.cleanup)
         self.tmp_path = Path(self._tmpdir.name)
 
-    def test_development_profile_is_immutable_and_canonical(self):
+    def test_development_profile_is_immutable_and_preserves_lexical_db_path(self):
         p = profile(self.tmp_path)
         self.assertEqual(p.host, "127.0.0.1")
         self.assertEqual(p.port, 8081)
+        expected_db = self.tmp_path / "runtime-data" / "binance-dev.sqlite"
         self.assertEqual(
             p.db_path,
-            os.path.normcase(
-                os.path.realpath(str(self.tmp_path / "runtime-data" / "binance-dev.sqlite"))
-            ),
+            os.path.normcase(os.path.abspath(os.path.normpath(str(expected_db)))),
         )
+        self.assertFalse(expected_db.exists())
         projection = p.projection()
         self.assertEqual(projection["feature_instance"], "binance-dev")
         self.assertEqual(projection["log_identity"], "binance-dev.log")
@@ -77,6 +77,99 @@ class BinanceSpotTests(unittest.TestCase):
         with self.assertRaises((AttributeError, TypeError)):
             p.port = 8080
 
+
+    def test_explicit_testnet_profile_has_distinct_resources(self):
+        p = BinanceRuntimeProfile.testnet(self.tmp_path)
+        self.assertEqual(p.environment, BinanceSpotEnvironment.BINANCE_SPOT_TESTNET)
+        self.assertEqual(p.port, 8082)
+        self.assertEqual(
+            p.db_path,
+            os.path.normcase(
+                os.path.abspath(
+                    os.path.normpath(
+                        str(self.tmp_path / "runtime-data" / "binance-testnet.sqlite")
+                    )
+                )
+            ),
+        )
+        self.assertEqual(p.feature_instance, "binance-testnet")
+        self.assertEqual(p.runtime_identity, "binance-testnet")
+        self.assertEqual(p.background_identity, "binance-testnet")
+        self.assertEqual(p.log_identity, "binance-testnet.log")
+        self.assertEqual(p.lock_identity, "binance-testnet.lock")
+        self.assertEqual(p.stop_identity, "binance-testnet.stop")
+        self.assertEqual(p.pid_identity, "binance-testnet.pid")
+
+    def test_profile_rejects_shared_axiom_db_wrong_names_and_roots(self):
+        runtime = self.tmp_path / "runtime-data"
+        runtime.mkdir()
+        axiom_db = runtime / "axiom.sqlite"
+        wrong_root = self.tmp_path / "other-runtime-data"
+        wrong_root.mkdir()
+
+        invalid_profiles = (
+            lambda: BinanceRuntimeProfile.paper(self.tmp_path, axiom_db),
+            lambda: BinanceRuntimeProfile.testnet(self.tmp_path, axiom_db),
+            lambda: BinanceRuntimeProfile.paper(self.tmp_path, runtime / "binance-testnet.sqlite"),
+            lambda: BinanceRuntimeProfile.testnet(self.tmp_path, runtime / "binance-dev.sqlite"),
+            lambda: BinanceRuntimeProfile.paper(self.tmp_path, wrong_root / "binance-dev.sqlite"),
+            lambda: BinanceRuntimeProfile.testnet(self.tmp_path, wrong_root / "binance-testnet.sqlite"),
+        )
+        for build_profile in invalid_profiles:
+            with self.assertRaises(BinanceSpotConfigurationError):
+                build_profile()
+
+    def test_profile_rejects_dedicated_db_symlink_to_axiom_db(self):
+        runtime = self.tmp_path / "runtime-data"
+        runtime.mkdir()
+        axiom_db = runtime / "axiom.sqlite"
+        axiom_db.touch()
+        for db_name, build_profile in (
+            (
+                "binance-dev.sqlite",
+                lambda path: BinanceRuntimeProfile.paper(self.tmp_path, path),
+            ),
+            (
+                "binance-testnet.sqlite",
+                lambda path: BinanceRuntimeProfile.testnet(self.tmp_path, path),
+            ),
+        ):
+            dedicated_db = runtime / db_name
+            try:
+                dedicated_db.symlink_to(axiom_db)
+            except (NotImplementedError, OSError) as exc:
+                self.skipTest(f"filesystem symlinks unavailable: {exc}")
+            try:
+                with self.assertRaises(BinanceSpotConfigurationError):
+                    build_profile(dedicated_db)
+            finally:
+                dedicated_db.unlink(missing_ok=True)
+
+
+    def test_profile_rejects_runtime_data_directory_symlink(self):
+        real_runtime = self.tmp_path / "real-runtime-data"
+        real_runtime.mkdir()
+        (real_runtime / "binance-dev.sqlite").touch()
+        runtime = self.tmp_path / "runtime-data"
+        try:
+            runtime.symlink_to(real_runtime, target_is_directory=True)
+        except (NotImplementedError, OSError) as exc:
+            self.skipTest(f"filesystem symlinks unavailable: {exc}")
+        try:
+            with self.assertRaises(BinanceSpotConfigurationError):
+                BinanceRuntimeProfile.paper(self.tmp_path, runtime / "binance-dev.sqlite")
+        finally:
+            runtime.unlink(missing_ok=True)
+
+    def test_profile_rejects_dot_and_dotdot_db_components(self):
+        runtime = self.tmp_path / "runtime-data"
+        runtime.mkdir()
+        for db_path in (
+            str(runtime) + os.sep + "." + os.sep + "binance-dev.sqlite",
+            str(runtime) + os.sep + ".." + os.sep + "binance-dev.sqlite",
+        ):
+            with self.assertRaises(BinanceSpotConfigurationError):
+                BinanceRuntimeProfile.paper(self.tmp_path, db_path)
     def test_profile_rejects_wrong_db_alias_port_host_and_transport(self):
         p = profile(self.tmp_path)
         with self.assertRaises(BinanceSpotConfigurationError):
@@ -101,29 +194,72 @@ class BinanceSpotTests(unittest.TestCase):
 
     def test_credential_store_namespace_environment_isolation_and_safe_projection(self):
         keyring = FakeKeyring()
-        testnet = BinanceCredentialRef("binance-dev", BINANCE_SPOT_TESTNET)
+        testnet = BinanceCredentialRef("binance-testnet", BINANCE_SPOT_TESTNET)
         store = BinanceCredentialStore(ref=testnet, keyring_backend=keyring)
         store.configure("public-key", "private-secret")
         self.assertEqual(
             store.load(),
             BinanceSpotCredentials("public-key", "private-secret"),
         )
-        self.assertEqual(store.namespace, "AXIOM-BINANCE-SPOT")
+        self.assertEqual(store.namespace, "AXIOM-BINANCE-SPOT-TESTNET")
+        self.assertIn(
+            ("AXIOM-BINANCE-SPOT-TESTNET", "binance-testnet:BINANCE_SPOT_TESTNET:api_key"),
+            keyring.values,
+        )
         self.assertTrue(
             all("private-secret" not in str(value) for value in store.safe_projection().values())
         )
         self.assertTrue(
             all("public-key" not in str(value) for value in store.safe_projection().values())
         )
-        live = BinanceCredentialRef("binance-dev", BINANCE_SPOT_LIVE)
-        self.assertIsNone(BinanceCredentialStore(ref=live, keyring_backend=keyring).load())
         with self.assertRaises(BinanceSpotEnvironmentMismatch):
-            store.load(live)
+            BinanceCredentialRef("binance-dev", BINANCE_SPOT_TESTNET)
+        with self.assertRaises(BinanceSpotEnvironmentMismatch):
+            BinanceCredentialRef(
+                "binance-testnet",
+                BINANCE_SPOT_TESTNET,
+                namespace="AXIOM-BINANCE-SPOT",
+            )
+        with self.assertRaises(BinanceSpotConfigurationError):
+            BinanceCredentialRef("binance-testnet", BINANCE_SPOT_LIVE)
+        with self.assertRaises(BinanceSpotEnvironmentMismatch):
+            store.load(BinanceCredentialRef("binance-dev", PAPER))
         with self.assertRaises(BinanceSpotConfigurationError):
             BinanceCredentialStore(
                 ref=testnet,
                 keyring_backend=keyring,
                 allow_environment=True,
+            )
+
+    def test_public_testnet_methods_are_unsigned_and_fixed_origin(self):
+        seen = []
+
+        def opener(request, timeout):
+            seen.append(request)
+            return Response({"ok": True})
+
+        client = BinanceSpotRESTClient(BINANCE_SPOT_TESTNET, opener=opener)
+        client.time()
+        client.exchange_info(symbol="BTCUSDT")
+        client.ticker_price(symbol="BTCUSDT")
+        client.depth(symbol="BTCUSDT", limit=5)
+        client.klines(symbol="BTCUSDT", interval="1m", limit=2)
+        self.assertEqual(len(seen), 5)
+        for request in seen:
+            self.assertTrue(
+                request.full_url.startswith("https://testnet.binance.vision/api/v3/")
+            )
+            self.assertNotIn("signature=", request.full_url)
+            self.assertNotIn("X-mbx-apikey", request.headers)
+            self.assertIsNone(request.data)
+        client.base_url = "https://api.binance.com"
+        with self.assertRaises(BinanceSpotConfigurationError):
+            client.time()
+        with self.assertRaises(BinanceSpotConfigurationError):
+            BinanceSpotRESTClient(
+                BINANCE_SPOT_LIVE,
+                {"api_key": "k", "api_secret": "s"},
+                opener=opener,
             )
 
     def test_exact_signed_query_and_header(self):

@@ -1,18 +1,21 @@
 from __future__ import annotations
 
+import io
 import json
+import os
 import sqlite3
+from contextlib import redirect_stdout
 from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
 from axiom.cli import _main_impl, build_parser
-
 from axiom.binance_dev import BinanceDevelopmentRuntime, PaperBinanceSpotVenue
 from axiom.binance_spot import (
     BINANCE_SPOT_LIVE,
     BINANCE_SPOT_TESTNET,
     PAPER,
+    BinanceCredentialStore,
     BinanceRuntimeProfile,
     BinanceSpotRESTClient,
 )
@@ -49,6 +52,17 @@ class _Server:
 
     def stop(self):
         self.stopped = True
+
+class _FakeKeyring:
+    def __init__(self) -> None:
+        self.values: dict[tuple[str, str], str] = {}
+
+    def set_password(self, service: str, username: str, password: str) -> None:
+        self.values[(service, username)] = password
+
+    def get_password(self, service: str, username: str) -> str | None:
+        return self.values.get((service, username))
+
 
 
 
@@ -196,16 +210,63 @@ class BinanceDevelopmentTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 BinanceDevelopmentRuntime(root, environment="BINANCE_SPOT_TESTNET")
 
+    def test_default_testnet_profile_uses_distinct_runtime_resources(self):
+        temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary_directory.cleanup)
+        root = Path(temporary_directory.name)
+        worker_ids: list[str] = []
+
+        def worker_factory(*args, **kwargs):
+            worker_ids.append(kwargs["worker_id"])
+            return _Worker()
+
+        runtime = BinanceDevelopmentRuntime(
+            root,
+            environment=BINANCE_SPOT_TESTNET,
+            credentials={"api_key": "test-key", "api_secret": "test-secret"},
+            worker_factory=worker_factory,
+            dashboard_server_factory=_Server,
+        )
+        self.addCleanup(runtime.stop)
+
+        self.assertEqual(worker_ids, ["binance-testnet"])
+
+        expected_db = root / "runtime-data" / "binance-testnet.sqlite"
+        self.assertEqual(
+            runtime.db_path,
+            os.path.normcase(os.path.abspath(os.path.normpath(str(expected_db)))),
+        )
+        self.assertEqual(runtime.profile.host, "127.0.0.1")
+        self.assertEqual(runtime.profile.port, 8082)
+        self.assertEqual(runtime.server.host, "127.0.0.1")
+        self.assertEqual(runtime.profile.runtime_identity, "binance-testnet")
+        self.assertEqual(runtime.execution.owner_id, "binance-testnet")
+        status = runtime.status()
+        self.assertEqual(status["runtime_identity"], "binance-testnet")
+        self.assertFalse(status["paper_only"])
+        self.assertNotIn("binance-dev", json.dumps(status))
+        self.assertNotIn("8081", json.dumps(status))
+        self.assertNotIn("8080", json.dumps(status))
+
+        runtime.start()
+        self.assertIsNotNone(runtime._worker_thread)
+        self.assertEqual(runtime._worker_thread.name, "binance-testnet")
+        for path in (runtime.lock_path, runtime.pid_path, runtime.log_path):
+            document = json.loads(Path(path).read_text(encoding="utf-8").splitlines()[0])
+            self.assertEqual(document["runtime_identity"], "binance-testnet")
+        runtime.stop()
+        stop_document = json.loads(Path(runtime.stop_path).read_text(encoding="utf-8"))
+        self.assertEqual(stop_document["runtime_identity"], "binance-testnet")
+
     def test_explicit_testnet_requires_matching_identity_and_origin(self):
         temporary_directory = tempfile.TemporaryDirectory()
         self.addCleanup(temporary_directory.cleanup)
         root = Path(temporary_directory.name)
         runtime_data = root / "runtime-data"
         runtime_data.mkdir(parents=True)
-        profile = BinanceRuntimeProfile.development(
+        profile = BinanceRuntimeProfile.testnet(
             root,
-            runtime_data / "binance-dev.sqlite",
-            environment=BINANCE_SPOT_TESTNET,
+            runtime_data / "binance-testnet.sqlite",
         )
         venue = BinanceSpotRESTClient(
             BINANCE_SPOT_TESTNET,
@@ -214,13 +275,11 @@ class BinanceDevelopmentTests(unittest.TestCase):
         runtime = BinanceDevelopmentRuntime(
             root,
             profile=profile,
-            environment=BINANCE_SPOT_TESTNET,
             credentials={"api_key": "test-key", "api_secret": "test-secret"},
             venue=venue,
             worker=_Worker(),
             dashboard_server_factory=_Server,
         )
-
         def assert_runtime_released():
             self.assertTrue(runtime._closed)
             self.assertFalse(Path(runtime.lock_path).exists())
@@ -234,6 +293,10 @@ class BinanceDevelopmentTests(unittest.TestCase):
         self.addCleanup(runtime.stop)
 
         self.assertEqual(runtime.environment, BINANCE_SPOT_TESTNET)
+        self.assertEqual(runtime.profile.port, 8082)
+        self.assertEqual(runtime.server.port, 8082)
+        self.assertEqual(runtime.profile.runtime_identity, "binance-testnet")
+        self.assertEqual(runtime.execution.owner_id, "binance-testnet")
         self.assertIs(runtime.venue, venue)
         self.assertEqual(runtime.venue.environment, BINANCE_SPOT_TESTNET)
         self.assertEqual(runtime.venue.origin, "https://testnet.binance.vision")
@@ -312,6 +375,91 @@ class BinanceDevelopmentTests(unittest.TestCase):
                     credentials={"api_key": "test-key", "api_secret": "test-secret"},
                     venue=_IdentityVenue(),
                 )
+
+    def test_cli_binance_credentials_accepts_only_testnet(self):
+        parsed = build_parser().parse_args(
+            ["binance-credentials", "configure", "--environment", "testnet"]
+        )
+        self.assertEqual(parsed.command, "binance-credentials")
+        self.assertEqual(parsed.binance_credentials_command, "configure")
+        self.assertEqual(parsed.environment, "testnet")
+        parsed_status = build_parser().parse_args(
+            ["binance-credentials", "status", "--environment", "testnet"]
+        )
+        self.assertEqual(parsed_status.binance_credentials_command, "status")
+        with self.assertRaises(SystemExit):
+            build_parser().parse_args(["binance-credentials", "configure"])
+        with self.assertRaises(SystemExit):
+            build_parser().parse_args(
+                ["binance-credentials", "status", "--environment", "mainnet"]
+            )
+        with self.assertRaises(SystemExit):
+            build_parser().parse_args(
+                ["binance-credentials", "configure", "--environment", "live"]
+            )
+
+    def test_cli_binance_credentials_writes_only_testnet_namespace_and_exposes_no_secrets(self):
+        keyring = _FakeKeyring()
+        api_key = "testnet-public-key"
+        api_secret = "testnet-private-secret"
+
+        def store_factory(*, ref):
+            return BinanceCredentialStore(ref=ref, keyring_backend=keyring)
+
+        configured_output = io.StringIO()
+        with (
+            patch("axiom.cli.BinanceCredentialStore", side_effect=store_factory),
+            patch("axiom.cli.getpass.getpass", side_effect=[api_key, api_secret]),
+            redirect_stdout(configured_output),
+        ):
+            self.assertEqual(
+                _main_impl(
+                    ["binance-credentials", "configure", "--environment", "testnet"]
+                ),
+                0,
+            )
+        configured_payload = json.loads(configured_output.getvalue())
+        self.assertEqual(
+            set(configured_payload),
+            {"environment", "namespace", "configured", "secret_values_exposed"},
+        )
+        self.assertEqual(configured_payload["environment"], BINANCE_SPOT_TESTNET)
+        self.assertEqual(
+            configured_payload["namespace"], "AXIOM-BINANCE-SPOT-TESTNET"
+        )
+        self.assertTrue(configured_payload["configured"])
+        self.assertFalse(configured_payload["secret_values_exposed"])
+        self.assertNotIn(api_key, configured_output.getvalue())
+        self.assertNotIn(api_secret, configured_output.getvalue())
+        self.assertTrue(keyring.values)
+        self.assertTrue(
+            all(service == "AXIOM-BINANCE-SPOT-TESTNET" for service, _ in keyring.values)
+        )
+        self.assertTrue(
+            all(
+                "binance-testnet" in username
+                and BINANCE_SPOT_TESTNET in username
+                for _, username in keyring.values
+            )
+        )
+        self.assertEqual(set(keyring.values.values()), {api_key, api_secret})
+
+        status_output = io.StringIO()
+        with (
+            patch("axiom.cli.BinanceCredentialStore", side_effect=store_factory),
+            redirect_stdout(status_output),
+        ):
+            self.assertEqual(
+                _main_impl(
+                    ["binance-credentials", "status", "--environment", "testnet"]
+                ),
+                0,
+            )
+        status_payload = json.loads(status_output.getvalue())
+        self.assertTrue(status_payload["configured"])
+        self.assertFalse(status_payload["secret_values_exposed"])
+        self.assertNotIn(api_key, status_output.getvalue())
+        self.assertNotIn(api_secret, status_output.getvalue())
 
     def test_cli_binance_dev_surface_is_fixed_and_once_uses_runtime_only(self):
         args = build_parser().parse_args(["binance-dev", "--once"])
