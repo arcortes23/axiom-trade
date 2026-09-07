@@ -144,6 +144,32 @@ class BinanceSpotTests(unittest.TestCase):
                     build_profile(dedicated_db)
             finally:
                 dedicated_db.unlink(missing_ok=True)
+    def test_profile_rejects_dedicated_db_hardlink_to_axiom_db(self):
+        runtime = self.tmp_path / "runtime-data"
+        runtime.mkdir()
+        axiom_db = runtime / "axiom.sqlite"
+        axiom_db.touch()
+        for db_name, build_profile in (
+            (
+                "binance-dev.sqlite",
+                lambda path: BinanceRuntimeProfile.paper(self.tmp_path, path),
+            ),
+            (
+                "binance-testnet.sqlite",
+                lambda path: BinanceRuntimeProfile.testnet(self.tmp_path, path),
+            ),
+        ):
+            dedicated_db = runtime / db_name
+            try:
+                os.link(axiom_db, dedicated_db)
+            except (NotImplementedError, OSError) as exc:
+                self.skipTest(f"filesystem hardlinks unavailable: {exc}")
+            try:
+                with self.assertRaises(BinanceSpotConfigurationError):
+                    build_profile(dedicated_db)
+            finally:
+                dedicated_db.unlink(missing_ok=True)
+
 
 
     def test_profile_rejects_runtime_data_directory_symlink(self):
@@ -230,6 +256,27 @@ class BinanceSpotTests(unittest.TestCase):
                 keyring_backend=keyring,
                 allow_environment=True,
             )
+    def test_credential_ref_stable_id_is_deterministic_separated_and_opaque(self):
+        testnet = BinanceCredentialRef("binance-testnet", BINANCE_SPOT_TESTNET)
+        stable_id = testnet.stable_id()
+        self.assertEqual(
+            stable_id,
+            BinanceCredentialRef("binance-testnet", BINANCE_SPOT_TESTNET).stable_id(),
+        )
+        self.assertEqual(len(stable_id), 64)
+        self.assertTrue(all(character in "0123456789abcdef" for character in stable_id))
+        self.assertNotEqual(
+            stable_id,
+            BinanceCredentialRef("binance-dev", PAPER).stable_id(),
+        )
+
+        store = BinanceCredentialStore(ref=testnet, keyring_backend=FakeKeyring())
+        store.configure("public-key", "private-secret")
+        self.assertEqual(testnet.stable_id(), stable_id)
+        projection = json.dumps(store.safe_projection(), sort_keys=True)
+        self.assertNotIn("public-key", projection)
+        self.assertNotIn("private-secret", projection)
+
 
     def test_public_testnet_methods_are_unsigned_and_fixed_origin(self):
         seen = []

@@ -52,6 +52,7 @@ ONE = Decimal("1")
 QUOTE_ASSET = "USDT"
 SCHEMA_VERSION = "binance-execution-v1"
 ENABLE_CONFIRMATION = "ENABLE BINANCE AUTO CANARY"
+ENABLE_TESTNET_CONFIRMATION = "ENABLE BINANCE TESTNET AUTO CANARY"
 
 INTENT = "INTENT"
 RESERVED = "RESERVED"
@@ -726,9 +727,16 @@ class BinanceExecutionService:
 
     status = control
 
+    def _required_confirmation(self) -> str:
+        """Return the environment-specific autonomous activation phrase."""
+        if self.environment == BINANCE_SPOT_TESTNET:
+            return ENABLE_TESTNET_CONFIRMATION
+        return ENABLE_CONFIRMATION
+
     def enable_auto_canary(self, confirmation: str = "", *, actor: str = "operator") -> dict[str, Any]:
-        if confirmation != ENABLE_CONFIRMATION:
-            raise PermissionError("exact confirmation required: ENABLE BINANCE AUTO CANARY")
+        required = self._required_confirmation()
+        if confirmation != required:
+            raise PermissionError(f"exact confirmation required: {required}")
         if self.environment == BINANCE_SPOT_LIVE or (self.profile is not None and self.profile.environment.value == BINANCE_SPOT_LIVE):
             raise PermissionError("development profile refuses Binance LIVE")
         now = _iso(self.clock())
@@ -757,9 +765,13 @@ class BinanceExecutionService:
         return self._set_control(KILLED, reason, actor, "KILL", kill=True)
 
     def reset(self, confirmation: str = "", *, actor: str = "operator") -> dict[str, Any]:
-        if confirmation not in {ENABLE_CONFIRMATION, "RESET BINANCE AUTO CANARY"}:
-            raise PermissionError("exact confirmation required")
-        return self.enable_auto_canary(ENABLE_CONFIRMATION, actor=actor)
+        required = self._required_confirmation()
+        accepted = {required}
+        if self.environment == PAPER:
+            accepted.add("RESET BINANCE AUTO CANARY")
+        if confirmation not in accepted:
+            raise PermissionError(f"exact confirmation required: {required}")
+        return self.enable_auto_canary(required, actor=actor)
     def _set_control(self, state: str, reason: str, actor: str, action: str, *, kill: bool = False) -> dict[str, Any]:
         now = _iso(self.clock())
         with self._lock:
@@ -2158,7 +2170,7 @@ OrderExecutionService = BinanceExecutionService
 
 __all__ = [
     "BinanceExecutionService", "BinanceExecution", "BinanceSpotExecutionService", "OrderExecutionService",
-    "BinancePosition", "ENABLE_CONFIRMATION", "INTENT", "RESERVED", "SUBMITTING", "ACKNOWLEDGED",
-    "REJECTED", "UNKNOWN", "PARTIALLY_FILLED", "FILLED", "CANCELED", "EXPIRED", "DISABLED", "ARMED",
-    "PAUSED", "DISARMED", "KILLED",
+    "BinancePosition", "ENABLE_CONFIRMATION", "ENABLE_TESTNET_CONFIRMATION", "INTENT", "RESERVED",
+    "SUBMITTING", "ACKNOWLEDGED", "REJECTED", "UNKNOWN", "PARTIALLY_FILLED", "FILLED", "CANCELED",
+    "EXPIRED", "DISABLED", "ARMED", "PAUSED", "DISARMED", "KILLED",
 ]

@@ -158,6 +158,18 @@ def _reject_database_aliases(path: str) -> None:
             raise BinanceSpotConfigurationError(
                 "Binance profile database paths cannot contain symlinks, junctions, or reparse points"
             )
+    try:
+        info = os.stat(path)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise BinanceSpotConfigurationError(
+            "cannot inspect a Binance profile database path"
+        ) from exc
+    if int(getattr(info, "st_nlink", 1)) > 1:
+        raise BinanceSpotConfigurationError(
+            "Binance profile database paths cannot be hard-linked or multiply-linked"
+        )
 
 
 def _canonical_path(value: str | os.PathLike[str]) -> str:
@@ -559,6 +571,18 @@ class BinanceCredentialRef:
     @property
     def service(self) -> str:
         return str(self.namespace)
+    def stable_id(self) -> str:
+        """Return an opaque, deterministic identity hash without credentials."""
+
+        return canonical_sha256(
+            {
+                "environment": self.environment.value,
+                "instance": self.instance,
+                "namespace": self.namespace,
+                "service": self.service,
+            }
+        )
+
 
     def projection(self) -> dict[str, str]:
         return {

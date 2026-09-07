@@ -11,6 +11,7 @@ from axiom.binance_execution import (
     ACKNOWLEDGED,
     CANCELED,
     ENABLE_CONFIRMATION,
+    ENABLE_TESTNET_CONFIRMATION,
     EXPIRED,
     FILLED,
     INTENT,
@@ -23,6 +24,7 @@ from axiom.binance_execution import (
 )
 from axiom.binance_risk import BinanceRiskEnvelope
 from axiom.binance_dev import PaperBinanceSpotVenue
+from axiom.binance_spot import BINANCE_SPOT_TESTNET, BinanceSpotRESTClient
 from axiom.storage import AxiomStore
 
 
@@ -54,6 +56,15 @@ def FakeVenue(**_: object) -> PaperBinanceSpotVenue:
     venue._order_number = 0
     venue._trade_number = 0
     return venue
+
+
+def TestnetVenue() -> BinanceSpotRESTClient:
+    """Exact TESTNET REST venue with a transport that is never called."""
+    return BinanceSpotRESTClient(
+        BINANCE_SPOT_TESTNET,
+        {"api_key": "test-key", "api_secret": "test-secret"},
+        opener=lambda *_args, **_kwargs: None,
+    )
 
 
 class _UntrustedVenue:
@@ -141,6 +152,60 @@ class BinanceExecutionContractTests(unittest.TestCase):
         self.service.enable_auto_canary(ENABLE_CONFIRMATION)
         self.assertEqual(self.service.control()["state"], "ARMED")
         self.assertTrue(self.service.control()["authorized"])
+    def test_testnet_requires_distinct_phrase_and_frozen_risk_envelope(self):
+        store = AxiomStore(":memory:")
+        service = BinanceExecutionService(
+            store,
+            venue=TestnetVenue(),
+            environment=BINANCE_SPOT_TESTNET,
+            credentials={"api_key": "test-key", "api_secret": "test-secret"},
+        )
+        try:
+            self.assertEqual(service.control()["state"], "DISABLED")
+            with self.assertRaises(PermissionError):
+                service.enable_auto_canary(ENABLE_CONFIRMATION)
+            self.assertEqual(service.control()["state"], "DISABLED")
+            self.assertEqual(service.risk_envelope.entry_notional, Decimal("10"))
+            self.assertEqual(service.risk_envelope.max_aggregate_exposure, Decimal("30"))
+            self.assertEqual(service.risk_envelope.realized_loss_entry_stop, Decimal("5"))
+            self.assertEqual(service.risk_envelope.equity_loss_entry_stop, Decimal("5"))
+            self.assertEqual(service.risk_envelope.max_positions, 5)
+            self.assertEqual(service.risk_envelope.max_submissions_per_day, 20)
+            self.assertEqual(service.risk_envelope.max_execution_deviation_bps, Decimal("100"))
+            service.enable_auto_canary(ENABLE_TESTNET_CONFIRMATION)
+            self.assertEqual(service.control()["state"], "ARMED")
+            service.disarm()
+            with self.assertRaises(PermissionError):
+                service.reset(ENABLE_CONFIRMATION)
+            service.reset(ENABLE_TESTNET_CONFIRMATION)
+            self.assertEqual(service.control()["state"], "ARMED")
+        finally:
+            service.close()
+            store.close()
+
+    def test_persisted_paper_authorization_is_disabled_for_testnet(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = directory + "/execution.sqlite"
+            paper = BinanceExecutionService(path, venue=FakeVenue(), environment="PAPER")
+            paper.enable_auto_canary(ENABLE_CONFIRMATION)
+            paper.close()
+
+            testnet = BinanceExecutionService(
+                path,
+                venue=TestnetVenue(),
+                environment=BINANCE_SPOT_TESTNET,
+                credentials={"api_key": "test-key", "api_secret": "test-secret"},
+            )
+            try:
+                self.assertEqual(testnet.control()["state"], "DISABLED")
+                self.assertFalse(testnet.control()["authorized"])
+                with self.assertRaises(PermissionError):
+                    testnet.enable_auto_canary(ENABLE_CONFIRMATION)
+                testnet.enable_auto_canary(ENABLE_TESTNET_CONFIRMATION)
+                self.assertEqual(testnet.control()["state"], "ARMED")
+            finally:
+                testnet.close()
+
 
     def test_entry_reserves_before_send_and_repeated_signal_does_not_resubmit(self):
         self.service.enable_auto_canary(ENABLE_CONFIRMATION)
