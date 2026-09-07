@@ -5,7 +5,7 @@ from decimal import Decimal
 import hashlib
 import json
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from axiom.auto_canary import AutonomousCanaryWorker
 from axiom.canary import (
@@ -17,13 +17,52 @@ from axiom.canary import (
 )
 from axiom.dashboard import DashboardData
 from axiom.node import NodeConfig, ResearchNode
-from axiom.operator import HermesOperatorAdapter, OperatorControlPlane
+from axiom.operator import (
+    CANARY_CONNECTIVITY_CONFIG_KEY,
+    HermesOperatorAdapter,
+    OperatorControlPlane,
+)
 from axiom.ranker import CandidateCanaryRanker
 from axiom.storage import AxiomStore
 from axiom.data_quality import PRICE_PROXY, TIMESTAMPED_DEPTH, evaluate_prediction_data_quality
 
 
 T0 = datetime(2026, 1, 2, 12, tzinfo=timezone.utc)
+
+
+def connectivity_projection(*, ready: bool, failure_codes: list[str] | None = None) -> dict[str, object]:
+    codes = list(failure_codes or ([] if ready else ["CANARY_ALLOWANCE_INSUFFICIENT"]))
+    return {
+        "ready": ready,
+        "status": "READY" if ready else "BLOCKED",
+        "checked_at": T0.isoformat(),
+        "sdk": {
+            "installed": True,
+            "name": "polymarket-client",
+            "version": "0.9.0",
+            "status": "INSTALLED",
+        },
+        "credentials": {"status": "CONFIGURED"},
+        "authentication": {"status": "PASS"},
+        "account": {"status": "PASS", "wallet_type": "EOA"},
+        "geoblock": {"status": "PASS", "country": "ZZ", "region": "T"},
+        "balance": {"status": "PASS", "available_usd": "10"},
+        "allowance": {"status": "SUFFICIENT" if ready else "INSUFFICIENT"},
+        "market": {"status": "SKIPPED"},
+        "order_book": {"status": "SKIPPED"},
+        "failure_codes": codes,
+        "failure_reasons": (
+            []
+            if ready
+            else [
+                {
+                    "code": codes[0],
+                    "reason": "Current allowance is below the amount required for a $1 canary.",
+                }
+            ]
+        ),
+        "live_execution": False,
+    }
 
 
 class HealthyStore(AxiomStore):
@@ -383,11 +422,40 @@ class AutonomousWorkflowTests(unittest.TestCase):
         self.assertIsNone(self.service.generate_signal("book-required"))
 
 
-    def test_enable_requires_exact_confirmation_and_freezes_risk_envelope(self):
+    def test_enable_requires_exact_confirmation_and_connectivity_gate(self):
         control = OperatorControlPlane(self.store)
         denied = control.execute("canary.enable_auto", confirm="ENABLE AUTO CANARY ")
         self.assertFalse(denied["ok"])
         self.assertEqual(denied["reason"], "EXACT_CONFIRMATION_REQUIRED")
+
+        absent_service = Mock()
+        with patch("axiom.operator.CanaryService", return_value=absent_service) as service_factory:
+            absent = control.execute("canary.enable_auto", confirm="ENABLE AUTO CANARY")
+        service_factory.assert_not_called()
+        self.assertFalse(absent["ok"])
+        self.assertEqual(absent["reason"], "CONNECTIVITY_CHECK_REQUIRED")
+        absent_service.enable_autonomous_micro_live.assert_not_called()
+
+        blocked = connectivity_projection(
+            ready=False,
+            failure_codes=["CANARY_ALLOWANCE_INSUFFICIENT"],
+        )
+        self.store.set_operator_config(CANARY_CONNECTIVITY_CONFIG_KEY, blocked)
+        blocked_service = Mock()
+        with patch("axiom.operator.CanaryService", return_value=blocked_service) as service_factory:
+            blocked_result = control.execute(
+                "canary.enable_auto",
+                confirm="ENABLE AUTO CANARY",
+            )
+        service_factory.assert_not_called()
+        self.assertFalse(blocked_result["ok"])
+        self.assertEqual(blocked_result["reason"], "CANARY_ALLOWANCE_INSUFFICIENT")
+        blocked_service.enable_autonomous_micro_live.assert_not_called()
+
+        self.store.set_operator_config(
+            CANARY_CONNECTIVITY_CONFIG_KEY,
+            connectivity_projection(ready=True),
+        )
         enabled = control.execute("canary.enable_auto", confirm="ENABLE AUTO CANARY")
         self.assertTrue(enabled["ok"])
         status = self.service.status()
@@ -395,6 +463,57 @@ class AutonomousWorkflowTests(unittest.TestCase):
         self.assertEqual(status["risk_envelope"], AUTONOMOUS_CANARY_LIMITS)
         self.assertEqual(status["limits"], AUTONOMOUS_CANARY_LIMITS)
         self.assertFalse(status["live_execution"])
+
+    def test_enable_rejects_partial_and_contradictory_stored_ready_projection(self):
+        valid = connectivity_projection(ready=True)
+        partial = dict(valid)
+        partial.pop("balance")
+        extra = {**valid, "unexpected": "tampered"}
+        contradictory_status = {**valid, "status": "BLOCKED"}
+        contradictory_failure = {
+            **valid,
+            "failure_codes": ["CANARY_ALLOWANCE_INSUFFICIENT"],
+            "failure_reasons": [
+                {
+                    "code": "CANARY_ALLOWANCE_INSUFFICIENT",
+                    "reason": "Current allowance is below the amount required for a $1 canary.",
+                }
+            ],
+        }
+        cases = (
+            ("partial", partial),
+            ("extra", extra),
+            ("contradictory status", contradictory_status),
+            ("contradictory failure", contradictory_failure),
+        )
+        sdk_null = {**valid, "sdk": {**valid["sdk"], "version": None}}
+        sdk_unsupported = {**valid, "sdk": {**valid["sdk"], "version": "1.0.0"}}
+        balance_below_target = {
+            **valid,
+            "balance": {**valid["balance"], "available_usd": "0"},
+        }
+        cases += (
+            ("sdk version null", sdk_null),
+            ("unsupported sdk version", sdk_unsupported),
+            ("balance below canary target", balance_below_target),
+        )
+
+        control = OperatorControlPlane(self.store)
+        for label, stored in cases:
+            with self.subTest(label=label):
+                self.store.set_operator_config(CANARY_CONNECTIVITY_CONFIG_KEY, stored)
+                service = Mock()
+                with patch("axiom.operator.CanaryService", return_value=service) as service_factory:
+                    result = control.execute(
+                        "canary.enable_auto",
+                        confirm="ENABLE AUTO CANARY",
+                    )
+                self.assertFalse(result["ok"])
+                self.assertEqual(result["reason"], "CONNECTIVITY_CHECK_REQUIRED")
+                service_factory.assert_not_called()
+                service.enable_autonomous_micro_live.assert_not_called()
+
+
 
     def test_kill_latch_precedes_disarm_and_reenable(self):
         self.service.enable_autonomous_micro_live()

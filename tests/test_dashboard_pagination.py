@@ -14,6 +14,7 @@ from urllib.request import urlopen
 
 from axiom.dashboard import DashboardData, DashboardServer, _dashboard_html, _jsonable
 from axiom.domain import MarketType
+from axiom.operator import CANARY_CONNECTIVITY_CONFIG_KEY
 from axiom.storage import AxiomStore
 
 
@@ -27,6 +28,59 @@ QUEUE_COUNT = 23
 PAPER_COUNT = 23
 ACTIVITY_COUNT = DATASET_COUNT + 1 + 45 + 25
 
+CANARY_ALLOWANCE_INSUFFICIENT_REASON = (
+    "Current allowance is below the amount required for a $1 canary."
+)
+PERSISTED_CONNECTIVITY_SECRET_VALUES = (
+    "API_KEY_SENTINEL",
+    "MNEMONIC_SENTINEL",
+    "SECRET_SENTINEL",
+    "ADDRESS_SENTINEL",
+    "RAW_SENTINEL",
+    "SPENDER_SENTINEL",
+)
+WALLET_LIKE_CONNECTIVITY_VALUE = "0123456789abcdef0123456789abcdef01234567"
+
+
+FORBIDDEN_CONNECTIVITY_VALUES = (
+    "PRIVATE_KEY_SENTINEL",
+    "API_SECRET_SENTINEL",
+    "PASSPHRASE_SENTINEL",
+    "KEYRING_VALUE_SENTINEL",
+    "RAW_DIAGNOSTIC_SENTINEL",
+)
+
+
+def _connectivity_projection(
+    *,
+    ready: bool,
+    status: str,
+    checked_at: str = "2024-01-02T03:04:05+00:00",
+    allowance_status: str = "SUFFICIENT",
+) -> dict[str, object]:
+    """Return the bounded, public connectivity fixture shared by API tests."""
+    return {
+        "ready": ready,
+        "status": status,
+        "checked_at": checked_at,
+        "sdk": {
+            "installed": True,
+            "name": "polymarket-client",
+            "version": "0.9.0",
+            "status": "INSTALLED",
+        },
+        "credentials": {"status": "CONFIGURED"},
+        "authentication": {"status": "PASS"},
+        "account": {"status": "PASS", "wallet_type": "EOA"},
+        "geoblock": {"status": "PASS", "country": "PH", "region": "NCR"},
+        "balance": {"status": "PASS", "available_usd": "12.34"},
+        "allowance": {"status": allowance_status},
+        "market": {"status": "PASS"},
+        "order_book": {"status": "PASS"},
+        "failure_codes": [],
+        "failure_reasons": [],
+        "live_execution": False,
+    }
 
 class _BlockingOperatorControl:
     """Control stub that makes the legacy status path observably unavailable."""
@@ -1029,6 +1083,143 @@ class DashboardPaginationEndpointTests(DashboardPaginationFixture):
         self.assertFalse(operator_errors)
         self.assertEqual(len(operator_result), 1)
         self.assertEqual(control.status_calls, 1)
+    def test_canary_endpoint_serves_bounded_connectivity_and_exact_block_reason(self) -> None:
+        ready = _connectivity_projection(ready=True, status="READY")
+        self.store.set_operator_config(CANARY_CONNECTIVITY_CONFIG_KEY, ready)
+        status, payload, body = self._request("api/v2/canary")
+        self.assertEqual(status, 200)
+        self.assertIsInstance(payload, dict)
+        assert isinstance(payload, dict)
+        self.assertEqual(payload["connectivity"], ready)
+        self.assertEqual(
+            set(payload["connectivity"]),
+            {
+                "ready",
+                "status",
+                "checked_at",
+                "sdk",
+                "credentials",
+                "authentication",
+                "account",
+                "geoblock",
+                "balance",
+                "allowance",
+                "market",
+                "order_book",
+                "failure_codes",
+                "failure_reasons",
+                "live_execution",
+            },
+        )
+        for value in ("0.9.0", "CONFIGURED", "PASS", "EOA", "PH", "NCR", "12.34"):
+            self.assertIn(value, body)
+
+        blocked = _connectivity_projection(
+            ready=False,
+            status="BLOCKED",
+            allowance_status="INSUFFICIENT",
+        )
+        blocked["failure_codes"] = ["CANARY_ALLOWANCE_INSUFFICIENT"]
+        blocked["failure_reasons"] = [
+            {
+                "code": "CANARY_ALLOWANCE_INSUFFICIENT",
+                "reason": CANARY_ALLOWANCE_INSUFFICIENT_REASON,
+            }
+        ]
+        self.store.set_operator_config(CANARY_CONNECTIVITY_CONFIG_KEY, blocked)
+        status, payload, body = self._request("api/v2/canary")
+        self.assertEqual(status, 200)
+        self.assertIsInstance(payload, dict)
+        assert isinstance(payload, dict)
+        self.assertEqual(payload["connectivity"], blocked)
+        self.assertEqual(payload["connectivity"]["allowance"]["status"], "INSUFFICIENT")
+        self.assertEqual(
+            payload["connectivity"]["failure_codes"],
+            ["CANARY_ALLOWANCE_INSUFFICIENT"],
+        )
+        self.assertEqual(
+            payload["connectivity"]["failure_reasons"],
+            [
+                {
+                    "code": "CANARY_ALLOWANCE_INSUFFICIENT",
+                    "reason": CANARY_ALLOWANCE_INSUFFICIENT_REASON,
+                }
+            ],
+        )
+        self.assertIn("CANARY_ALLOWANCE_INSUFFICIENT", body)
+        self.assertIn(CANARY_ALLOWANCE_INSUFFICIENT_REASON, body)
+
+        tampered_with_extra = {**ready, "unexpected": "EXTRA_SENTINEL"}
+        malformed_ready = {**ready, "ready": False}
+        tampered_balance = {
+            **ready,
+            "balance": {
+                **ready["balance"],
+                "available_usd": "1e999999999",
+            },
+        }
+        secret_bearing = {
+            **ready,
+            "sdk": {
+                **ready["sdk"],
+                "version": PERSISTED_CONNECTIVITY_SECRET_VALUES[0],
+            },
+            "private_key": FORBIDDEN_CONNECTIVITY_VALUES[0],
+        }
+        opaque_failure = {
+            **blocked,
+            "failure_codes": ["OPAQUE_FAILURE_CODE"],
+            "failure_reasons": [
+                {
+                    "code": "OPAQUE_FAILURE_CODE",
+                    "reason": "OPAQUE_FAILURE_REASON",
+                }
+            ],
+        }
+        for label, persisted in (
+            ("extra", tampered_with_extra),
+            ("malformed", malformed_ready),
+            ("extreme exponent balance", tampered_balance),
+            ("secret-bearing", secret_bearing),
+            ("opaque failure code", opaque_failure),
+        ):
+            self.store.set_operator_config(CANARY_CONNECTIVITY_CONFIG_KEY, persisted)
+            status, payload, body = self._request("api/v2/canary")
+            self.assertEqual(status, 200, label)
+            self.assertIsInstance(payload, dict, label)
+            assert isinstance(payload, dict)
+            self.assertIsNone(payload["connectivity"], label)
+            serialized = json.dumps(payload, sort_keys=True)
+            for forbidden in (
+                *FORBIDDEN_CONNECTIVITY_VALUES,
+                *PERSISTED_CONNECTIVITY_SECRET_VALUES,
+                WALLET_LIKE_CONNECTIVITY_VALUE,
+                "EXTRA_SENTINEL",
+                "OPAQUE_FAILURE_CODE",
+                "OPAQUE_FAILURE_REASON",
+                "1e999999999",
+            ):
+                self.assertNotIn(forbidden, serialized, label)
+                self.assertNotIn(forbidden, body, label)
+
+    def test_v2_canary_restores_connectivity_after_file_backed_store_reopen(self) -> None:
+        expected = _connectivity_projection(
+            ready=True,
+            status="READY",
+            checked_at="2024-01-03T12:34:56+00:00",
+        )
+        self.store.set_operator_config(CANARY_CONNECTIVITY_CONFIG_KEY, expected)
+        reopened = AxiomStore(self.store.path)
+        self.addCleanup(reopened.close)
+        self.server.data.store = reopened
+
+        status, payload, _ = self._request("api/v2/canary")
+        self.assertEqual(status, 200)
+        self.assertIsInstance(payload, dict)
+        assert isinstance(payload, dict)
+        self.assertEqual(payload["connectivity"], expected)
+        self.assertIs(payload["connectivity"]["live_execution"], False)
+
 
 class DashboardPaginationSurfaceTests(DashboardPaginationFixture):
     def test_overview_and_list_responses_do_not_embed_unbounded_records(self) -> None:
@@ -1218,6 +1409,256 @@ class DashboardPaginationSurfaceTests(DashboardPaginationFixture):
             r"\$\{manualcandidate\}",
             "the manual armed candidate card must be rendered when present",
         )
+    def test_real_canary_connectivity_panel_consumes_persisted_schema_and_pht(self) -> None:
+        html = _dashboard_html()
+        start = html.index("function renderCanaryConnectivity")
+        end = html.index("function renderBtc", start)
+        real_canary = html[start:end]
+        self.assertRegex(html, r'id=["\']canary-action-result["\']')
+        self.assertIn("data.connectivity", real_canary)
+        for field in (
+            "ready",
+            "status",
+            "checked_at",
+            "sdk",
+            "credentials",
+            "authentication",
+            "account",
+            "geoblock",
+            "balance",
+            "allowance",
+            "market",
+            "order_book",
+            "failure_codes",
+            "failure_reasons",
+        ):
+            self.assertIn(field, real_canary)
+        self.assertRegex(
+            real_canary,
+            r"checked_at[\s\S]{0,120}dateText\(",
+            "REAL CANARY must format the persisted UTC check timestamp through the PHT formatter",
+        )
+        self.assertRegex(
+            real_canary,
+            r"failure_codes[\s\S]{0,240}(?:failure_reasons|reason)",
+            "the panel must render bounded failure codes and their human-readable reasons",
+        )
+
+    def test_real_canary_actions_post_once_to_local_result_and_survive_refresh(self) -> None:
+        html = _dashboard_html()
+        start = html.index("function renderCanary(data)")
+        end = html.index("function renderBtc", start)
+        real_canary = html[start:end]
+        canary_actions = (
+            "canary.connectivity_check",
+            "canary.enable_auto",
+            "canary.disarm",
+            "canary.kill",
+        )
+        for action in canary_actions:
+            self.assertIn(
+                f'controlButton("{action}"',
+                real_canary,
+                f"{action} must be rendered on REAL CANARY",
+            )
+        self.assertRegex(
+            html,
+            r"function isCanaryAction\(action\)[\s\S]{0,160}startsWith\([\"']canary\.[\"']\)",
+        )
+        self.assertRegex(
+            html,
+            r"function actionResultNode\(action\)[\s\S]{0,220}"
+            r"[\"']canary-action-result[\"'][\s\S]{0,80}[\"']control-result[\"']",
+            "all canary actions must route to the REAL CANARY result, while ordinary actions retain Overview routing",
+        )
+        self.assertNotIn("control-result", real_canary)
+
+        control_post_start = html.index("async function controlPost")
+        control_post_end = html.index("function renderOperatorControls", control_post_start)
+        control_post = html[control_post_start:control_post_end]
+        for forbidden in FORBIDDEN_CONNECTIVITY_VALUES:
+            self.assertNotIn(forbidden, real_canary)
+            self.assertNotIn(forbidden, control_post)
+        self.assertEqual(control_post.count('fetch("/api/control"'), 1)
+        self.assertIn("actionResultMessage(action", control_post)
+        self.assertRegex(
+            control_post,
+            r"result\?\.result\?\.connectivity",
+            "canary control responses must consume the fresh nested connectivity projection",
+        )
+        canary_update_start = control_post.index("if(isCanaryAction(action)&&connectivity)")
+        canary_update_end = control_post.index("actionResultMessage", canary_update_start)
+        canary_update = control_post[canary_update_start:canary_update_end]
+        merge = re.search(
+            r"if\s*\(\s*lastGood\.canary\s*&&\s*typeof\s+lastGood\.canary\s*===\s*['\"]object['\"]"
+            r"\s*&&\s*!Array\.isArray\(\s*lastGood\.canary\s*\)\s*\)\s*"
+            r"(?:\{\s*)?lastGood\.canary\s*=\s*\{\s*\.\.\.\s*lastGood\.canary\s*,\s*connectivity\s*\}",
+            canary_update,
+        )
+        self.assertIsNotNone(
+            merge,
+            "fresh canary connectivity must immutably replace the persisted projection only when one exists",
+        )
+        assert merge is not None
+        render = canary_update.index("renderCanaryConnectivity(connectivity)")
+        load = control_post.index("await loadPage(state.tab,true)", canary_update_start)
+        self.assertLess(
+            merge.start(),
+            render,
+            "lastGood.canary must be updated before the immediate connectivity render",
+        )
+        self.assertLess(
+            canary_update_start + render,
+            load,
+            "fresh canary connectivity must be retained before the follow-up load/fallback can run",
+        )
+        self.assertNotRegex(
+            canary_update,
+            r"lastGood\.canary\s*=\s*\{\s*connectivity\s*\}",
+            "a missing lastGood.canary must not be seeded with a partial projection",
+        )
+        self.assertRegex(
+            canary_update,
+            r"lastGood\.canary\s*&&\s*typeof\s+lastGood\.canary\s*===\s*['\"]object['\"]",
+            "the POST merge must be guarded against an absent last-good canary",
+        )
+        message = control_post.index("actionResultMessage(action")
+        render_position = canary_update_start + render
+        self.assertLess(
+            render_position,
+            message,
+            "fresh canary connectivity must render before action feedback is written",
+        )
+        forced_load = control_post.index("await loadPage(state.tab,true)", message)
+        self.assertLess(
+            message,
+            forced_load,
+            "the action result must remain visible before the forced refresh starts",
+        )
+        post_feedback = control_post[message:forced_load]
+        abort = re.search(
+            r"if\s*\(\s*activeController\s*\)\s*activeController\.abort\(\)",
+            post_feedback,
+        )
+        self.assertIsNotNone(
+            abort,
+            "an action must abort any pre-action refresh before forcing a new load",
+        )
+        generation = re.search(
+            r"refreshGeneration\s*(?:\+\+|\+=\s*1)",
+            post_feedback,
+        )
+        self.assertIsNotNone(
+            generation,
+            "an action must invalidate the pre-action refresh generation",
+        )
+        for bookkeeping in (
+            r"activeController\s*=\s*null",
+            r"loadInFlight\s*=\s*false",
+            r"clearTimeout\(\s*slowRefreshTimer\s*\)",
+            r"slowRefreshTimer\s*=\s*null",
+            r"nextRefreshAt\s*=\s*0",
+        ):
+            self.assertRegex(
+                post_feedback,
+                bookkeeping,
+                "action refresh bookkeeping must reset before the forced active-tab load",
+            )
+
+        click_start = html.index('document.addEventListener("click",async event=>')
+        click_end = html.index("ensureActivityKind()", click_start)
+        click_handler = html[click_start:click_end]
+        self.assertEqual(click_handler.count("controlPost("), 1)
+        self.assertEqual(click_handler.count('fetch("/api/control"'), 0)
+
+        result_markup = re.search(r'<(?:div|p)[^>]*id=["\']canary-action-result["\']', html)
+        self.assertIsNotNone(result_markup)
+        assert result_markup is not None
+        self.assertLess(result_markup.start(), start)
+        self.assertNotRegex(
+            real_canary,
+            r'id=["\']canary-action-result["\']',
+            "renderCanary must not recreate the result node during ordinary refresh",
+        )
+        self.assertNotRegex(
+            real_canary,
+            r'\$\(\s*["\']canary-action-result["\']\s*\)\.(?:innerHTML|textContent)\s*=',
+            "renderCanary must not clear an action result",
+        )
+
+    def test_real_canary_ready_to_enable_requires_connectivity_and_existing_readiness_gates(self) -> None:
+        blocked = _connectivity_projection(ready=False, status="BLOCKED")
+        blocked["failure_codes"] = ["CONNECTIVITY_CHECK_FAILED"]
+        blocked["failure_reasons"] = [
+            {
+                "code": "CONNECTIVITY_CHECK_FAILED",
+                "reason": "Connectivity check failed.",
+            }
+        ]
+        self.store.set_operator_config(CANARY_CONNECTIVITY_CONFIG_KEY, blocked)
+        status, payload, _ = self._request("api/v2/canary")
+        self.assertEqual(status, 200)
+        self.assertIsInstance(payload, dict)
+        assert isinstance(payload, dict)
+        self.assertFalse(payload["connectivity"]["ready"])
+        self.assertEqual(
+            payload["autonomous_canary"]["blocker"],
+            "AUTONOMOUS_CANARY_DISABLED",
+        )
+
+        ready = _connectivity_projection(ready=True, status="READY")
+        self.store.set_operator_config(CANARY_CONNECTIVITY_CONFIG_KEY, ready)
+        status, payload, _ = self._request("api/v2/canary")
+        self.assertEqual(status, 200)
+        self.assertIsInstance(payload, dict)
+        assert isinstance(payload, dict)
+        self.assertTrue(payload["connectivity"]["ready"])
+        self.assertEqual(
+            payload["autonomous_canary"]["blocker"],
+            "AUTONOMOUS_CANARY_DISABLED",
+        )
+
+        html = _dashboard_html()
+        start = html.index("function renderCanary(data)")
+        end = html.index("function renderBtc", start)
+        real_canary = html[start:end]
+        self.assertIn("AUTO CANARY READY TO ENABLE", real_canary)
+        readiness_window_start = real_canary.index("AUTO CANARY READY TO ENABLE")
+        readiness_window = real_canary[max(0, readiness_window_start - 1600):readiness_window_start]
+        for marker in (
+            "connectivity",
+            "ready",
+            "KILLED",
+            "enabled",
+            "winner",
+            "eligible",
+            "rankable",
+        ):
+            self.assertIn(marker, readiness_window)
+        self.assertRegex(
+            real_canary,
+            r"autoReady\s*=\s*connectivityReady\s*&&\s*backendState\s*!==\s*[\"']KILLED[\"']"
+            r"\s*&&\s*!enabled\s*&&\s*Boolean\(\s*winnerRaw\s*\)\s*&&\s*eligible\s*>\s*0"
+            r"\s*&&\s*rankable\s*>\s*0",
+            "READY TO ENABLE must retain the existing autonomous readiness gates",
+        )
+        self.assertRegex(
+            real_canary,
+            r"autonomousBlocker\s*=\s*!connectivity\s*\?\s*[\"']CONNECTIVITY_CHECK_REQUIRED[\"']"
+            r"\s*:\s*!connectivityReady\s*\?\s*connectivityBlocker"
+            r"\s*:\s*backendState\s*===\s*[\"']KILLED[\"']\s*\?\s*[\"']CANARY_KILLED[\"']"
+            r"[\s\S]{0,260}NO_ELIGIBLE_RANKABLE_CANDIDATE",
+            "persisted connectivity and existing canary blockers must have deterministic precedence",
+        )
+        for blocker in (
+            "CONNECTIVITY_CHECK_REQUIRED",
+            "CONNECTIVITY_BLOCKED",
+            "CANARY_KILLED",
+            "NO_ELIGIBLE_RANKABLE_CANDIDATE",
+            "AUTONOMOUS_CANARY_DISABLED",
+        ):
+            self.assertIn(blocker, real_canary)
+
 
     def test_refresh_lifecycle_is_bounded_independent_and_preserves_last_good_data(self) -> None:
         html = _dashboard_html()

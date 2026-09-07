@@ -7,6 +7,7 @@ persists every requested action as a bounded audit record.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from decimal import Decimal
 import ipaddress
 import os
 from pathlib import Path
@@ -57,6 +58,584 @@ _CONFIRMATIONS = {
     "canary.disarm": "DISARM",
     "canary.kill": "KILL",
 }
+CANARY_CONNECTIVITY_CONFIG_KEY = "canary_connectivity_status"
+
+_CONNECTIVITY_FAILURE_REASONS = {
+    "CONNECTIVITY_CHECK_FAILED": "Connectivity check failed.",
+    "CREDENTIALS_NOT_CONFIGURED": "Polymarket credentials are not configured.",
+    "VENUE_REQUIRED": "A Polymarket venue is required for the connectivity check.",
+    "OFFICIAL_POLYMARKET_SDK_NOT_INSTALLED": "The Polymarket SDK is not installed.",
+    "UNSUPPORTED_POLYMARKET_SDK": "The installed Polymarket SDK version is unsupported.",
+    "OFFICIAL_POLYMARKET_SDK_NOT_READONLY_COMPATIBLE": "The installed Polymarket SDK does not support safe read-only connectivity.",
+    "GEOGRAPHICALLY_BLOCKED": "The current region is blocked from Polymarket access.",
+    "GEOBLOCK_CHECK_FAILED": "The geographic access check failed.",
+    "AUTHENTICATED_CONNECTIVITY_FAILED": "Authenticated connectivity failed.",
+    "ACCOUNT_CHECK_FAILED": "The account check failed.",
+    "BALANCE_CHECK_FAILED": "The balance check failed.",
+    "BALANCE_RESPONSE_INVALID": "The balance response was invalid.",
+    "INSUFFICIENT_BALANCE": "Available balance is below the $1 canary requirement.",
+    "CANARY_ALLOWANCE_UNAVAILABLE": "Allowance information is unavailable.",
+    "CANARY_ALLOWANCE_INSUFFICIENT": "Current allowance is below the amount required for a $1 canary.",
+    "CANARY_SPENDER_UNAVAILABLE": "The canary allowance spender is unavailable.",
+    "MARKET_CONNECTIVITY_FAILED": "Market connectivity failed.",
+    "MARKET_NOT_ACCEPTING_ORDERS": "The market is not accepting orders.",
+    "MARKET_OUTCOMES_UNAVAILABLE": "Market outcomes are unavailable.",
+    "MARKET_OUTCOME_NOT_ALLOWED": "The requested market outcome is not allowed.",
+    "MARKET_OUTCOME_ID_UNAVAILABLE": "The market outcome identifier is unavailable.",
+    "VENUE_MINIMUM_EXCEEDS_CANARY_TARGET": "The venue minimum exceeds the $1 canary target.",
+}
+_CONNECTIVITY_FAILURE_CODES = frozenset(_CONNECTIVITY_FAILURE_REASONS)
+_CONNECTIVITY_TEXT_LIMIT = 128
+_CONNECTIVITY_MAX_FAILURES = 16
+_CONNECTIVITY_SUPPORTED_SDK = "0.9"
+_CONNECTIVITY_CODE = re.compile(r"^[A-Z0-9][A-Z0-9_.:-]{0,63}$")
+_CONNECTIVITY_LABEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _./:-]{0,63}$")
+_CONNECTIVITY_DECIMAL = re.compile(r"^(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$")
+_CONNECTIVITY_VERSION = re.compile(r"^[vV]?[0-9]{1,8}(?:\.[0-9]{1,8}){0,7}(?:[-+][0-9A-Za-z.-]{1,32})?$")
+_CONNECTIVITY_ADDRESS = re.compile(r"0x[0-9a-fA-F]{16,}", re.I)
+_CONNECTIVITY_HEX_ADDRESS = re.compile(r"(?<![A-Za-z0-9])[0-9a-fA-F]{32,}(?![A-Za-z0-9])")
+_CONNECTIVITY_SENSITIVE_TEXT = re.compile(
+    r"(?<![A-Za-z0-9])(?:address|api|credential|key|mnemonic|passphrase|private|raw|secret|spender|token)(?![A-Za-z0-9])",
+    re.I,
+)
+
+
+def _connectivity_text(value: Any, *, pattern: re.Pattern[str] = _CONNECTIVITY_LABEL) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if (
+        not text
+        or len(text) > _CONNECTIVITY_TEXT_LIMIT
+        or _CONNECTIVITY_ADDRESS.search(text)
+        or _CONNECTIVITY_HEX_ADDRESS.search(text)
+        or _CONNECTIVITY_SENSITIVE_TEXT.search(text)
+        or pattern.fullmatch(text) is None
+    ):
+        return None
+    return text
+
+
+def _connectivity_version(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    version = value.strip()
+    if (
+        not version
+        or len(version) > _CONNECTIVITY_TEXT_LIMIT
+        or _CONNECTIVITY_SENSITIVE_TEXT.search(version)
+        or _CONNECTIVITY_VERSION.fullmatch(version) is None
+    ):
+        return None
+    return version
+
+
+def _connectivity_decimal(value: Any) -> str | None:
+    """Return only bounded, canonical, nonnegative fixed-point decimals."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        if value < 0 or value.bit_length() > 430:
+            return None
+        text = str(value)
+    elif isinstance(value, (str, Decimal, float)):
+        try:
+            text = str(value).strip()
+        except Exception:
+            return None
+    else:
+        return None
+    if (
+        not text
+        or len(text) > _CONNECTIVITY_TEXT_LIMIT
+        or _CONNECTIVITY_DECIMAL.fullmatch(text) is None
+    ):
+        return None
+    try:
+        decimal_value = Decimal(text)
+    except (ArithmeticError, TypeError, ValueError):
+        return None
+    if not decimal_value.is_finite():
+        return None
+    formatted = format(decimal_value, "f")
+    return formatted if len(formatted) <= _CONNECTIVITY_TEXT_LIMIT else None
+
+
+def _connectivity_checked_at(value: Any) -> str | None:
+    if isinstance(value, datetime):
+        stamp = value
+    elif isinstance(value, str):
+        stamp = value.strip()
+        if not stamp:
+            return None
+        try:
+            stamp = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    else:
+        return None
+    if stamp.tzinfo is None:
+        return None
+    return stamp.astimezone(timezone.utc).isoformat()
+
+
+def _connectivity_failure_codes(raw: Mapping[str, Any], *, ready: bool) -> list[str]:
+    """Return a bounded, deterministic set of canonical failure codes."""
+    result: list[str] = []
+    unknown = False
+    generic_seen = False
+    scan_limit = _CONNECTIVITY_MAX_FAILURES * 4
+    for field in ("failure_codes", "failures"):
+        if field not in raw:
+            continue
+        values = raw[field]
+        if isinstance(values, str):
+            values = (values,)
+        elif not isinstance(values, (list, tuple, set, frozenset)):
+            unknown = True
+            continue
+        try:
+            value_count = len(values)
+        except Exception:
+            value_count = scan_limit + 1
+        if value_count > scan_limit:
+            unknown = True
+        # Sets have no input order.  Keep their canonical output in the fixed
+        # failure-code order below, while list/tuple inputs retain their order.
+        unordered = isinstance(values, (set, frozenset))
+        set_codes: set[str] = set()
+        try:
+            iterator = iter(values)
+            for index, value in enumerate(iterator):
+                if index >= scan_limit:
+                    break
+                if not isinstance(value, str):
+                    unknown = True
+                    continue
+                if len(value) > _CONNECTIVITY_TEXT_LIMIT:
+                    unknown = True
+                    continue
+                code = value.strip().upper()
+                if code == "CONNECTIVITY_CHECK_FAILED":
+                    generic_seen = True
+                elif code in _CONNECTIVITY_FAILURE_CODES:
+                    if unordered:
+                        set_codes.add(code)
+                    elif code not in result:
+                        result.append(code)
+                else:
+                    unknown = True
+        except Exception:
+            unknown = True
+        if unordered:
+            for code in _CONNECTIVITY_FAILURE_REASONS:
+                if code in set_codes and code not in result:
+                    result.append(code)
+    fallback_needed = generic_seen or unknown or (not ready and not result)
+    if fallback_needed:
+        result = result[: _CONNECTIVITY_MAX_FAILURES - 1]
+        result.append("CONNECTIVITY_CHECK_FAILED")
+    return result[:_CONNECTIVITY_MAX_FAILURES]
+
+
+def _connectivity_sdk_supported(value: Any) -> bool:
+    version = _connectivity_version(value)
+    if version is None:
+        return False
+    parts = version.lstrip("vV").split(".")
+    supported = _CONNECTIVITY_SUPPORTED_SDK.split(".")
+    return len(parts) >= len(supported) and parts[: len(supported)] == supported
+
+
+def _connectivity_status(value: Any, *, pass_values: frozenset[str], fail_values: frozenset[str]) -> str | None:
+    if not isinstance(value, str):
+        return None
+    status = value.strip().upper()
+    if status in pass_values:
+        return "PASS"
+    if status in fail_values:
+        return "FAIL"
+    if status == "SKIPPED":
+        return "SKIPPED"
+    return None
+
+
+def _project_connectivity(value: Any, *, checked_at: Any = None) -> dict[str, Any]:
+    """Project service diagnostics into the deliberately small operator schema."""
+    raw = value if isinstance(value, Mapping) else {}
+    diagnostics = raw.get("diagnostics") if isinstance(raw.get("diagnostics"), Mapping) else {}
+    requested_ready = raw.get("ready") if isinstance(raw.get("ready"), bool) else False
+    # Delay the not-ready fallback until projected diagnostics have supplied a
+    # more useful canonical reason.
+    failure_codes = _connectivity_failure_codes(raw, ready=True)
+
+    def add_failure(code: str) -> None:
+        if code not in _CONNECTIVITY_FAILURE_CODES or code in failure_codes:
+            return
+        if len(failure_codes) < _CONNECTIVITY_MAX_FAILURES:
+            failure_codes.append(code)
+    sdk_raw = raw.get("sdk") if isinstance(raw.get("sdk"), Mapping) else diagnostics
+    sdk_version = _connectivity_version(
+        sdk_raw.get("version") if "version" in sdk_raw else sdk_raw.get("sdk_version")
+    )
+    if isinstance(raw.get("sdk"), Mapping) and "installed" in sdk_raw:
+        sdk_installed = sdk_raw.get("installed") is True
+    else:
+        sdk_installed = sdk_version is not None
+    if isinstance(sdk_raw.get("status"), str):
+        sdk_status = sdk_raw["status"].strip().upper()
+        if sdk_status in {"NOT INSTALLED", "MISSING"}:
+            sdk_installed = False
+
+    credentials_raw = raw.get("credentials") if isinstance(raw.get("credentials"), Mapping) else {}
+    credentials_configured = raw.get("credentials_configured")
+    if not isinstance(credentials_configured, bool):
+        credentials_configured = diagnostics.get("credentials_configured")
+    if not isinstance(credentials_configured, bool):
+        credentials_configured = credentials_raw.get("status") == "CONFIGURED"
+    credentials_status = str(credentials_raw.get("status") or "").strip().upper()
+    if credentials_status == "NOT CONFIGURED":
+        credentials_configured = False
+    elif credentials_status == "CONFIGURED" and not isinstance(raw.get("credentials_configured"), bool):
+        credentials_configured = True
+
+    def source(name: str, diagnostic_name: str | None = None) -> Mapping[str, Any]:
+        candidate = raw.get(name)
+        if isinstance(candidate, Mapping):
+            return candidate
+        candidate = diagnostics.get(diagnostic_name or name)
+        return candidate if isinstance(candidate, Mapping) else {}
+
+    def explicit_status(
+        candidate: Mapping[str, Any],
+        *,
+        pass_values: frozenset[str],
+        fail_values: frozenset[str],
+    ) -> str | None:
+        status = _connectivity_status(
+            candidate.get("status"),
+            pass_values=pass_values,
+            fail_values=fail_values,
+        )
+        raw_status = str(candidate.get("status") or "").strip().upper()
+        if status is None and raw_status and raw_status != "SKIPPED":
+            status = "FAIL"
+        return status
+
+    authentication_raw = source("authentication")
+    authentication_status = explicit_status(
+        authentication_raw,
+        pass_values=frozenset({"OK", "PASS", "PASSED", "SUCCESS"}),
+        fail_values=frozenset({"FAILED", "FAIL", "ERROR"}),
+    )
+    if authentication_status is None and "AUTHENTICATED_CONNECTIVITY_FAILED" in failure_codes:
+        authentication_status = "FAIL"
+    if not authentication_status and not credentials_configured:
+        authentication_status = "SKIPPED"
+    authentication = {"status": authentication_status or "SKIPPED"}
+
+    account_raw = source("account")
+    account_status = explicit_status(
+        account_raw,
+        pass_values=frozenset({"OK", "PASS", "PASSED", "SUCCESS"}),
+        fail_values=frozenset({"FAILED", "FAIL", "ERROR"}),
+    )
+    if isinstance(account_raw.get("authenticated"), bool):
+        account_status = "PASS" if account_raw["authenticated"] else "FAIL"
+    if account_status is None and "ACCOUNT_CHECK_FAILED" in failure_codes:
+        account_status = "FAIL"
+    account = {
+        "status": account_status or "SKIPPED",
+        "wallet_type": _connectivity_text(account_raw.get("wallet_type")),
+    }
+
+    geoblock_raw = source("geoblock")
+    geoblock_status = explicit_status(
+        geoblock_raw,
+        pass_values=frozenset({"OK", "PASS", "PASSED", "SUCCESS"}),
+        fail_values=frozenset({"FAILED", "FAIL", "ERROR"}),
+    )
+    if str(geoblock_raw.get("status") or "").strip().upper() == "BLOCKED":
+        geoblock_status = "BLOCKED"
+    if geoblock_raw.get("blocked") or geoblock_raw.get("close_only"):
+        geoblock_status = "BLOCKED"
+    elif geoblock_status is None and isinstance(geoblock_raw.get("blocked"), bool):
+        geoblock_status = "PASS"
+    if "GEOGRAPHICALLY_BLOCKED" in failure_codes:
+        geoblock_status = "BLOCKED"
+    elif "GEOBLOCK_CHECK_FAILED" in failure_codes and geoblock_status != "BLOCKED":
+        geoblock_status = "FAIL"
+    geoblock = {
+        "status": geoblock_status or "SKIPPED",
+        "country": _connectivity_text(geoblock_raw.get("country")),
+        "region": _connectivity_text(geoblock_raw.get("region")),
+    }
+
+    balance_raw = source("balance")
+    balance_status = explicit_status(
+        balance_raw,
+        pass_values=frozenset({"OK", "PASS", "PASSED", "SUCCESS"}),
+        fail_values=frozenset({"FAILED", "FAIL", "ERROR"}),
+    )
+    available_usd = _connectivity_decimal(balance_raw.get("available_usd"))
+    balance_available_status = str(balance_raw.get("status") or "").strip().upper()
+    if "available_usd" in balance_raw and available_usd is None and balance_available_status != "SKIPPED":
+        balance_status = "FAIL"
+        add_failure("BALANCE_RESPONSE_INVALID")
+    if balance_status == "PASS" and available_usd is None:
+        balance_status = "FAIL"
+        add_failure("BALANCE_RESPONSE_INVALID")
+    if "BALANCE_CHECK_FAILED" in failure_codes or "BALANCE_RESPONSE_INVALID" in failure_codes:
+        balance_status = "FAIL"
+    balance = {"status": balance_status or "SKIPPED", "available_usd": available_usd}
+
+    allowance_raw = source("allowance")
+    allowance_value = str(allowance_raw.get("status") or "").strip().upper()
+    if "CANARY_ALLOWANCE_INSUFFICIENT" in failure_codes or allowance_value == "INSUFFICIENT":
+        allowance_status = "INSUFFICIENT"
+    elif "CANARY_ALLOWANCE_UNAVAILABLE" in failure_codes or allowance_value in {"FAILED", "FAIL", "ERROR", "UNAVAILABLE"}:
+        allowance_status = "UNAVAILABLE"
+    elif allowance_value in {"SUFFICIENT"}:
+        allowance_status = "SUFFICIENT"
+    elif allowance_value in {"OK", "PASS", "PASSED", "SUCCESS", "AVAILABLE"}:
+        allowance_status = "AVAILABLE"
+    elif allowance_value and allowance_value != "SKIPPED":
+        allowance_status = "UNAVAILABLE"
+    else:
+        allowance_status = "SKIPPED"
+    allowance = {"status": allowance_status}
+
+    market_raw = source("market")
+    market_status = explicit_status(
+        market_raw,
+        pass_values=frozenset({"OK", "PASS", "PASSED", "SUCCESS"}),
+        fail_values=frozenset({"FAILED", "FAIL", "ERROR"}),
+    )
+    if market_status is None and market_raw:
+        market_status = (
+            "FAIL"
+            if any(code in failure_codes for code in {
+                "MARKET_CONNECTIVITY_FAILED",
+                "MARKET_NOT_ACCEPTING_ORDERS",
+                "MARKET_OUTCOMES_UNAVAILABLE",
+                "MARKET_OUTCOME_NOT_ALLOWED",
+                "MARKET_OUTCOME_ID_UNAVAILABLE",
+                "VENUE_MINIMUM_EXCEEDS_CANARY_TARGET",
+            })
+            else "PASS"
+        )
+    market = {"status": market_status or "SKIPPED"}
+
+    order_book_raw = source("order_book", "book")
+    order_book_status = explicit_status(
+        order_book_raw,
+        pass_values=frozenset({"OK", "PASS", "PASSED", "SUCCESS"}),
+        fail_values=frozenset({"FAILED", "FAIL", "ERROR"}),
+    )
+    if order_book_status is None and order_book_raw:
+        order_book_status = "FAIL" if "MARKET_CONNECTIVITY_FAILED" in failure_codes else "PASS"
+    order_book = {"status": order_book_status or "SKIPPED"}
+
+    enforce_diagnostics = requested_ready or not failure_codes
+    if enforce_diagnostics:
+        if not credentials_configured:
+            add_failure("CREDENTIALS_NOT_CONFIGURED")
+        else:
+            if not sdk_installed:
+                add_failure("OFFICIAL_POLYMARKET_SDK_NOT_INSTALLED")
+            elif not _connectivity_sdk_supported(sdk_version):
+                add_failure("UNSUPPORTED_POLYMARKET_SDK")
+            if authentication["status"] != "PASS":
+                add_failure("AUTHENTICATED_CONNECTIVITY_FAILED")
+            if account["status"] != "PASS":
+                add_failure("ACCOUNT_CHECK_FAILED")
+            if geoblock["status"] == "BLOCKED":
+                add_failure("GEOGRAPHICALLY_BLOCKED")
+            elif geoblock["status"] != "PASS":
+                add_failure("GEOBLOCK_CHECK_FAILED")
+            if balance["status"] != "PASS":
+                add_failure(
+                    "BALANCE_RESPONSE_INVALID"
+                    if balance["available_usd"] is None
+                    else "BALANCE_CHECK_FAILED"
+                )
+            elif Decimal(balance["available_usd"]) < Decimal("1"):
+                add_failure("INSUFFICIENT_BALANCE")
+            if allowance["status"] == "INSUFFICIENT":
+                add_failure("CANARY_ALLOWANCE_INSUFFICIENT")
+            elif allowance["status"] not in {"AVAILABLE", "SUFFICIENT"}:
+                add_failure("CANARY_ALLOWANCE_UNAVAILABLE")
+    elif credentials_configured:
+        if authentication["status"] == "FAIL":
+            add_failure("AUTHENTICATED_CONNECTIVITY_FAILED")
+        if account["status"] == "FAIL":
+            add_failure("ACCOUNT_CHECK_FAILED")
+        if geoblock["status"] == "BLOCKED":
+            add_failure("GEOGRAPHICALLY_BLOCKED")
+        elif geoblock["status"] == "FAIL":
+            add_failure("GEOBLOCK_CHECK_FAILED")
+        if balance["status"] == "FAIL":
+            add_failure(
+                "BALANCE_RESPONSE_INVALID"
+                if balance["available_usd"] is None
+                else "BALANCE_CHECK_FAILED"
+            )
+        elif balance["status"] == "PASS" and balance["available_usd"] is not None and Decimal(balance["available_usd"]) < Decimal("1"):
+            add_failure("INSUFFICIENT_BALANCE")
+        if allowance["status"] == "INSUFFICIENT":
+            add_failure("CANARY_ALLOWANCE_INSUFFICIENT")
+        elif allowance["status"] == "UNAVAILABLE":
+            add_failure("CANARY_ALLOWANCE_UNAVAILABLE")
+    if market["status"] == "FAIL" or order_book["status"] == "FAIL":
+        add_failure("MARKET_CONNECTIVITY_FAILED")
+    if not requested_ready and not failure_codes:
+        add_failure("CONNECTIVITY_CHECK_FAILED")
+
+    ready = bool(
+        requested_ready
+        and not failure_codes
+        and credentials_configured
+        and sdk_installed
+        and _connectivity_sdk_supported(sdk_version)
+        and authentication["status"] == "PASS"
+        and account["status"] == "PASS"
+        and geoblock["status"] == "PASS"
+        and balance["status"] == "PASS"
+        and balance["available_usd"] is not None
+        and Decimal(balance["available_usd"]) >= Decimal("1")
+        and allowance["status"] in {"AVAILABLE", "SUFFICIENT"}
+        and market["status"] in {"PASS", "SKIPPED"}
+        and order_book["status"] in {"PASS", "SKIPPED"}
+    )
+    stamp = _connectivity_checked_at(checked_at)
+    if stamp is None:
+        stamp = _connectivity_checked_at(raw.get("checked_at"))
+    if stamp is None:
+        stamp = _connectivity_checked_at(utc_now())
+    failure_reasons = [
+        {
+            "code": code,
+            "reason": _CONNECTIVITY_FAILURE_REASONS[code][:_CONNECTIVITY_TEXT_LIMIT],
+        }
+        for code in failure_codes
+    ]
+    return {
+        "ready": ready,
+        "status": "READY" if ready else "BLOCKED",
+        "checked_at": stamp,
+        "sdk": {
+            "installed": bool(sdk_installed),
+            "name": "polymarket-client",
+            "version": sdk_version,
+            "status": "INSTALLED" if sdk_installed else "NOT INSTALLED",
+        },
+        "credentials": {"status": "CONFIGURED" if credentials_configured else "NOT CONFIGURED"},
+        "authentication": authentication,
+        "account": account,
+        "geoblock": geoblock,
+        "balance": balance,
+        "allowance": allowance,
+        "market": market,
+        "order_book": order_book,
+        "failure_codes": failure_codes[:_CONNECTIVITY_MAX_FAILURES],
+        "failure_reasons": failure_reasons[:_CONNECTIVITY_MAX_FAILURES],
+        "live_execution": False,
+    }
+
+
+_CONNECTIVITY_PROJECTION_KEYS = frozenset(
+    {
+        "ready",
+        "status",
+        "checked_at",
+        "sdk",
+        "credentials",
+        "authentication",
+        "account",
+        "geoblock",
+        "balance",
+        "allowance",
+        "market",
+        "order_book",
+        "failure_codes",
+        "failure_reasons",
+        "live_execution",
+    }
+)
+_CONNECTIVITY_PROJECTION_NESTED_KEYS = {
+    "sdk": frozenset({"installed", "name", "version", "status"}),
+    "credentials": frozenset({"status"}),
+    "authentication": frozenset({"status"}),
+    "account": frozenset({"status", "wallet_type"}),
+    "geoblock": frozenset({"status", "country", "region"}),
+    "balance": frozenset({"status", "available_usd"}),
+    "allowance": frozenset({"status"}),
+    "market": frozenset({"status"}),
+    "order_book": frozenset({"status"}),
+}
+
+
+def _stored_connectivity_projection(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, Mapping) or set(value) != _CONNECTIVITY_PROJECTION_KEYS:
+        return None
+    checked_at = _connectivity_checked_at(value.get("checked_at"))
+    if checked_at is None or value.get("checked_at") != checked_at:
+        return None
+    for name, keys in _CONNECTIVITY_PROJECTION_NESTED_KEYS.items():
+        child = value.get(name)
+        if not isinstance(child, Mapping) or set(child) != keys:
+            return None
+    if not isinstance(value.get("ready"), bool) or value.get("status") not in {"READY", "BLOCKED"}:
+        return None
+    projected = _project_connectivity(value, checked_at=checked_at)
+    if projected != dict(value):
+        return None
+    if value["live_execution"] is not False:
+        return None
+    failure_codes = value["failure_codes"]
+    if (
+        not isinstance(failure_codes, list)
+        or len(failure_codes) > _CONNECTIVITY_MAX_FAILURES
+        or any(
+            not isinstance(code, str) or code not in _CONNECTIVITY_FAILURE_CODES
+            for code in failure_codes
+        )
+    ):
+        return None
+    if value["ready"]:
+        sdk_version = value["sdk"].get("version")
+        available_usd = _connectivity_decimal(value["balance"].get("available_usd"))
+        if (
+            value["status"] != "READY"
+            or failure_codes
+            or value["sdk"]["installed"] is not True
+            or _connectivity_version(sdk_version) != sdk_version
+            or not _connectivity_sdk_supported(sdk_version)
+            or value["credentials"]["status"] != "CONFIGURED"
+            or value["authentication"]["status"] != "PASS"
+            or value["account"]["status"] != "PASS"
+            or value["geoblock"]["status"] != "PASS"
+            or value["balance"]["status"] != "PASS"
+            or available_usd is None
+            or Decimal(available_usd) < Decimal("1")
+            or value["balance"]["available_usd"] != available_usd
+            or value["allowance"]["status"] not in {"AVAILABLE", "SUFFICIENT"}
+            or value["market"]["status"] not in {"PASS", "SKIPPED"}
+            or value["order_book"]["status"] not in {"PASS", "SKIPPED"}
+        ):
+            return None
+    elif value["status"] != "BLOCKED" or not failure_codes:
+        return None
+    return dict(value)
+
+
+def _blocked_connectivity_projection(code: Any = None) -> dict[str, Any]:
+    candidate = code.strip().upper() if isinstance(code, str) else ""
+    safe_code = candidate if candidate in _CONNECTIVITY_FAILURE_CODES else "CONNECTIVITY_CHECK_FAILED"
+    return _project_connectivity(
+        {"ready": False, "failures": [safe_code], "live_execution": False},
+        checked_at=utc_now(),
+    )
 
 
 class OperatorControlError(RuntimeError):
@@ -211,6 +790,7 @@ class OperatorControlPlane:
         self.db_path = os.path.abspath(os.path.expanduser(str(raw_db))) if str(raw_db) not in {"", ":memory:"} else str(raw_db)
         self._node_launcher = node_launcher or self._spawn_node
         self._lock = threading.RLock()
+        self._connectivity_lock = threading.RLock()
         self._bootstrap_threads: dict[str, threading.Thread] = {}
         configured = self.store.get_operator_config("hermes_research_job_id", None)
         selected = hermes_job_id or configured or DEFAULT_HERMES_JOB_ID
@@ -486,7 +1066,11 @@ class OperatorControlPlane:
             canary_status, latest_signal = {"micro_live_canary": "DISABLED"}, None
         worker_status = worker("autonomous-canary")
         autonomous_state = canary_status.get("autonomous") if isinstance(canary_status, Mapping) else {}
+        latest_connectivity = _stored_connectivity_projection(
+            self.store.get_operator_config(CANARY_CONNECTIVITY_CONFIG_KEY, None)
+        )
         return {
+            "connectivity": latest_connectivity,
             "node": self._node_status(),
             "bootstrap": self._bootstrap_status(),
             "hermes": hermes.state(),
@@ -499,6 +1083,7 @@ class OperatorControlPlane:
                 "status": canary_status,
                 "latest_signal": latest_signal,
                 "autonomous": autonomous_state,
+                "connectivity": latest_connectivity,
                 "submit": "AUTONOMOUS_WORKER" if autonomous_state.get("enabled") else "DISABLED_UNTIL_OPERATOR_ENABLE",
             },
             "live_execution": False,
@@ -543,17 +1128,23 @@ class OperatorControlPlane:
             elif action_value == "hermes.run_now":
                 result = {"hermes": self._hermes().run_now()}
             elif action_value == "canary.connectivity_check":
-                credentials = CredentialStore()
-                configured = credentials.configured(allow_environment=False)
-                venue = PolymarketClobV2Venue(allow_environment=False) if configured else None
-                service = CanaryService(self.store, credentials=credentials, initialize=False)
-                result = {
-                    "connectivity": service.connectivity_check(
-                        venue=venue,
-                        credentials_configured=configured,
-                        allow_environment=False,
-                    )
-                }
+                with self._connectivity_lock:
+                    try:
+                        credentials = CredentialStore()
+                        configured = credentials.configured(allow_environment=False)
+                        venue = PolymarketClobV2Venue(allow_environment=False) if configured else None
+                        service = CanaryService(self.store, credentials=credentials, initialize=False)
+                        raw_connectivity = service.connectivity_check(
+                            venue=venue,
+                            allow_environment=False,
+                        )
+                        connectivity = _project_connectivity(raw_connectivity, checked_at=utc_now())
+                    except CanaryBlocked as exc:
+                        connectivity = _blocked_connectivity_projection(str(exc))
+                    except Exception:
+                        connectivity = _blocked_connectivity_projection()
+                    self.store.set_operator_config(CANARY_CONNECTIVITY_CONFIG_KEY, connectivity)
+                    result = {"connectivity": connectivity}
             elif action_value == "canary.eligibility.verify":
                 service = CanaryService(self.store, initialize=False)
                 result = {"eligibility": service.validate_eligibility(target_value)}
@@ -580,11 +1171,25 @@ class OperatorControlPlane:
                     )
                 }
             elif action_value == "canary.enable_auto":
-                service = CanaryService(self.store, initialize=True)
-                result = {
-                    "canary": service.enable_autonomous_micro_live(),
-                    "confirmation": "ENABLE AUTO CANARY",
-                }
+                with self._connectivity_lock:
+                    connectivity = _stored_connectivity_projection(
+                        self.store.get_operator_config(CANARY_CONNECTIVITY_CONFIG_KEY, None)
+                    )
+                    if connectivity is None:
+                        raise OperatorControlError("CONNECTIVITY_CHECK_REQUIRED")
+                    if not connectivity["ready"] or connectivity["status"] != "READY":
+                        failure_codes = connectivity.get("failure_codes")
+                        blocked_reason = (
+                            failure_codes[0]
+                            if isinstance(failure_codes, list) and failure_codes and isinstance(failure_codes[0], str)
+                            else "CONNECTIVITY_BLOCKED"
+                        )
+                        raise OperatorControlError(blocked_reason)
+                    service = CanaryService(self.store, initialize=True)
+                    result = {
+                        "canary": service.enable_autonomous_micro_live(),
+                        "confirmation": "ENABLE AUTO CANARY",
+                    }
             elif action_value == "canary.disarm":
                 service = CanaryService(self.store, initialize=True)
                 service.disarm()
@@ -595,7 +1200,10 @@ class OperatorControlPlane:
                 result = {"canary": service.status()}
             else:
                 raise OperatorControlError("ACTION_NOT_ALLOWED")
-            public = _safe_value(result)
+            if action_value == "canary.connectivity_check":
+                public = {"connectivity": connectivity}
+            else:
+                public = _safe_value(result)
             self._audit(action_value, target_value, success=True, result=public)
             return {"ok": True, "action": action_value, "target": target_value, "result": public, "paper_only": True, "live_execution": False}
         except OperatorControlError as exc:
@@ -611,8 +1219,9 @@ class OperatorControlPlane:
 
 
 __all__ = [
-    "BOOTSTRAP_JOB_NAME",
     "DEFAULT_HERMES_JOB_ID",
+    "BOOTSTRAP_JOB_NAME",
+    "CANARY_CONNECTIVITY_CONFIG_KEY",
     "HermesOperatorAdapter",
     "OperatorControlError",
     "OperatorControlPlane",
