@@ -45,6 +45,19 @@ def _optional_decimal(value: Any, *, name: str = "value") -> Decimal | None:
     if value is None or value == "":
         return None
     return _decimal(value, name=name)
+def _flag(value: Any, *, default: bool = False) -> bool:
+    """Parse exchange boolean fields without treating ``"false"`` as true."""
+    if value is None:
+        return default
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"", "0", "false", "no", "off"}:
+            return False
+        if text in {"1", "true", "yes", "on"}:
+            return True
+    return bool(value)
+
+
 
 
 def _utc(value: datetime | None) -> datetime:
@@ -266,7 +279,7 @@ class SymbolRules:
             "base_asset": str(value.get("baseAsset", "")),
             "quote_asset": str(value.get("quoteAsset", QUOTE_ASSET)).upper(),
             "status": str(value.get("status", "")).upper(),
-            "spot_trading_allowed": bool(value.get("isSpotTradingAllowed", True)),
+            "spot_trading_allowed": _flag(value.get("isSpotTradingAllowed"), default=True),
             "order_types": tuple(str(x).upper() for x in value.get("orderTypes", ()) or ()),
             "time_in_force": tuple(str(x).upper() for x in value.get("timeInForce", ()) or ()),
         }
@@ -285,19 +298,31 @@ class SymbolRules:
             elif ftype == "MARKET_LOT_SIZE":
                 parsed.update(market_min_qty=_optional_decimal(row.get("minQty"), name="marketMinQty"), market_max_qty=_optional_decimal(row.get("maxQty"), name="marketMaxQty"), market_step_size=_optional_decimal(row.get("stepSize"), name="marketStepSize"))
             elif ftype == "MIN_NOTIONAL":
-                parsed["min_notional"] = _optional_decimal(row.get("minNotional"), name="minNotional")
-                parsed["min_notional_apply_to_market"] = bool(row.get("applyToMarket", False))
+                nmin = _optional_decimal(row.get("minNotional"), name="minNotional")
+                oldmin = parsed.get("min_notional")
+                # A zero/absent filter value disables that bound.  Ignore it
+                # rather than replacing a stricter active bound from the other
+                # notional filter.
+                if nmin is not None and nmin > ZERO and (oldmin is None or oldmin <= ZERO or nmin >= oldmin):
+                    parsed["min_notional"] = nmin
+                    parsed["min_notional_apply_to_market"] = _flag(row.get("applyToMarket"), default=False)
             elif ftype == "NOTIONAL":
                 # NOTIONAL is the newer complete min/max form.  Keep the
-                # strictest values when both filters are supplied.
+                # strictest positive values when both filters are supplied.
                 nmin = _optional_decimal(row.get("minNotional"), name="minNotional")
                 nmax = _optional_decimal(row.get("maxNotional"), name="maxNotional")
                 oldmin = parsed.get("min_notional")
-                parsed["min_notional"] = nmin if oldmin is None else max(oldmin, nmin or ZERO)
-                parsed["max_notional"] = nmax
-                parsed["max_notional_apply_to_market"] = bool(row.get("applyMaxToMarket", False))
-                if "applyMinToMarket" in row:
-                    parsed["min_notional_apply_to_market"] = bool(row.get("applyMinToMarket"))
+                if nmin is not None and nmin > ZERO and (oldmin is None or oldmin <= ZERO or nmin >= oldmin):
+                    parsed["min_notional"] = nmin
+                    parsed["min_notional_apply_to_market"] = _flag(row.get("applyMinToMarket"), default=False)
+                oldmax = parsed.get("max_notional")
+                if nmax is not None and nmax > ZERO and (
+                    oldmax is None
+                    or oldmax <= ZERO
+                    or nmax < oldmax
+                ):
+                    parsed["max_notional"] = nmax
+                    parsed["max_notional_apply_to_market"] = _flag(row.get("applyMaxToMarket"), default=False)
             elif ftype == "PERCENT_PRICE":
                 avg_price_mins = _optional_integer(row.get("avgPriceMins"), name="avgPriceMins")
                 parsed.update(
@@ -340,7 +365,12 @@ class SymbolRules:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "symbol", self.symbol.upper())
+        object.__setattr__(self, "base_asset", self.base_asset.upper())
         object.__setattr__(self, "quote_asset", self.quote_asset.upper())
+        object.__setattr__(self, "status", self.status.upper())
+        object.__setattr__(self, "spot_trading_allowed", _flag(self.spot_trading_allowed, default=True))
+        object.__setattr__(self, "order_types", tuple(_key(value) for value in self.order_types))
+        object.__setattr__(self, "time_in_force", tuple(_key(value) for value in self.time_in_force))
         for name in (
             "min_price", "max_price", "tick_size", "min_qty", "max_qty", "step_size",
             "market_min_qty", "market_max_qty", "market_step_size", "min_notional",
@@ -639,6 +669,30 @@ def _market_value(market: Mapping[str, Any] | None, *names: str) -> Any:
     return None
 
 
+def _market_reference_price(market: Mapping[str, Any] | None, mins: int) -> Decimal | None:
+    """Return a market reference, honoring optional per-window snapshots."""
+    if not market:
+        return None
+    values = _market_value(market, "average_prices", "weighted_average_prices", "reference_prices")
+    if isinstance(values, Mapping):
+        value = values.get(mins, values.get(str(mins)))
+        if value is not None:
+            return _optional_decimal(value, name="average price")
+    if mins:
+        value = _market_value(
+            market,
+            f"average_price_{mins}m",
+            f"weighted_average_price_{mins}m",
+            f"reference_price_{mins}m",
+        )
+        if value is not None:
+            return _optional_decimal(value, name="average price")
+    return _optional_decimal(
+        _market_value(market, "average_price", "weighted_average_price", "reference_price", "last_price"),
+        name="average price",
+    )
+
+
 def _market_checks(market: Mapping[str, Any] | None, *, now: datetime, requested_price: Decimal, fill_price: Decimal, envelope: BinanceRiskEnvelope) -> list[str]:
     if not market:
         return []
@@ -690,8 +744,20 @@ def _market_checks(market: Mapping[str, Any] | None, *, now: datetime, requested
     return list(dict.fromkeys(reasons))
 
 
-def _filter_reason(rules: SymbolRules, *, side: str, price: Decimal, quantity: Decimal, notional: Decimal, order_type: str, average_price: Decimal | None, max_position_after: Decimal | None) -> list[str]:
+def _filter_reason(
+    rules: SymbolRules,
+    *,
+    side: str,
+    price: Decimal,
+    quantity: Decimal,
+    notional: Decimal,
+    order_type: str,
+    average_price: Decimal | None,
+    max_position_after: Decimal | None,
+    side_average_price: Decimal | None = None,
+) -> list[str]:
     side = _key(side)
+    order_type = _key(order_type)
     reasons: list[str] = []
     if rules.min_price is not None and rules.min_price > ZERO and price < rules.min_price:
         reasons.append("PRICE_BELOW_MINIMUM")
@@ -708,20 +774,26 @@ def _filter_reason(rules: SymbolRules, *, side: str, price: Decimal, quantity: D
         reasons.append("QUANTITY_ABOVE_MAXIMUM")
     if step not in (None, ZERO) and (quantity / step) != (quantity / step).to_integral_value():
         reasons.append("QUANTITY_STEP")
-    if rules.min_notional is not None and rules.min_notional > ZERO and notional < rules.min_notional:
+    apply_market_min = order_type != "MARKET" or rules.min_notional_apply_to_market
+    apply_market_max = order_type != "MARKET" or rules.max_notional_apply_to_market
+    if apply_market_min and rules.min_notional is not None and rules.min_notional > ZERO and notional < rules.min_notional:
         reasons.append("MIN_NOTIONAL")
-    if rules.max_notional is not None and rules.max_notional > ZERO and notional > rules.max_notional:
+    if apply_market_max and rules.max_notional is not None and rules.max_notional > ZERO and notional > rules.max_notional:
         reasons.append("MAX_NOTIONAL")
-    if average_price is not None:
-        if rules.percent_multiplier_up is not None and rules.percent_multiplier_up > ZERO and price > average_price * rules.percent_multiplier_up:
+
+    percent_reference = average_price if average_price is not None and average_price > ZERO else None
+    side_reference = side_average_price if side_average_price is not None and side_average_price > ZERO else percent_reference
+    if percent_reference is not None:
+        if rules.percent_multiplier_up is not None and rules.percent_multiplier_up > ZERO and price > percent_reference * rules.percent_multiplier_up:
             reasons.append("PERCENT_PRICE_ABOVE_MAX")
-        if rules.percent_multiplier_down is not None and rules.percent_multiplier_down > ZERO and price < average_price * rules.percent_multiplier_down:
+        if rules.percent_multiplier_down is not None and rules.percent_multiplier_down > ZERO and price < percent_reference * rules.percent_multiplier_down:
             reasons.append("PERCENT_PRICE_BELOW_MIN")
+    if side_reference is not None:
         up = rules.bid_multiplier_up if side == "BUY" else rules.ask_multiplier_up
         down = rules.bid_multiplier_down if side == "BUY" else rules.ask_multiplier_down
-        if up is not None and up > ZERO and price > average_price * up:
+        if up is not None and up > ZERO and price > side_reference * up:
             reasons.append("PERCENT_PRICE_BY_SIDE_ABOVE_MAX")
-        if down is not None and down > ZERO and price < average_price * down:
+        if down is not None and down > ZERO and price < side_reference * down:
             reasons.append("PERCENT_PRICE_BY_SIDE_BELOW_MIN")
     elif any(x is not None and x > ZERO for x in (rules.percent_multiplier_up, rules.percent_multiplier_down, rules.bid_multiplier_up, rules.bid_multiplier_down, rules.ask_multiplier_up, rules.ask_multiplier_down)):
         reasons.append("FILTER_REFERENCE_UNAVAILABLE")
@@ -772,7 +844,7 @@ def assess_order(
     requested_price = _decimal(price, name="price", nonnegative=True)
     requested_quantity = _decimal(quantity, name="quantity", nonnegative=True)
     owned = state.owned_inventory.get(rules.symbol, ZERO)
-    if side == "SELL" and rules.symbol not in state.owned_inventory and available_inventory is None:
+    if side == "SELL" and owned <= ZERO and available_inventory is None:
         reasons.append("FOREIGN_INVENTORY")
     if side == "SELL":
         available = owned if available_inventory is None else min(owned, _decimal(available_inventory, name="available inventory", nonnegative=True))
@@ -783,21 +855,49 @@ def assess_order(
     except ValueError as exc:
         rounded_price = requested_price
         reasons.append(str(exc))
-    rounded_quantity = rules.round_quantity(requested_quantity, side, market=order_type == "MARKET", available=available)
+    market_order = order_type == "MARKET"
+    inventory_quantity = rules.round_quantity(requested_quantity, side, market=market_order)
+    rounded_quantity = rules.round_quantity(requested_quantity, side, market=market_order, available=available)
+    if side == "SELL" and inventory_quantity > available:
+        reasons.append("INSUFFICIENT_OWNED_INVENTORY")
     # Entry cap is all-in (quote notional plus the reserved fee), then qty is
     # floored again.  This is what makes a ceiling-rounded BUY safe.
     if side == "BUY" and rounded_price > ZERO:
         cap_qty = envelope.entry_notional / (rounded_price * (ONE + fee))
-        rounded_quantity = rules.round_quantity(min(rounded_quantity, cap_qty), side, market=order_type == "MARKET")
+        rounded_quantity = rules.round_quantity(min(rounded_quantity, cap_qty), side, market=market_order)
     notional = rounded_price * rounded_quantity
     fee_reserve = notional * fee
-    if side == "SELL" and rounded_quantity > available:
-        reasons.append("INSUFFICIENT_OWNED_INVENTORY")
     if side == "SELL" and rounded_quantity <= ZERO:
         reasons.extend(("DUST", "EXIT_BELOW_MINIMUM"))
-    if side == "SELL" and rules.min_notional is not None and rules.min_notional > ZERO and notional < rules.min_notional:
+    if (
+        side == "SELL"
+        and (not market_order or rules.min_notional_apply_to_market)
+        and rules.min_notional is not None
+        and rules.min_notional > ZERO
+        and notional < rules.min_notional
+    ):
         reasons.append("EXIT_BELOW_MINIMUM")
-    reasons.extend(_filter_reason(rules, side=side, price=rounded_price, quantity=rounded_quantity, notional=notional, order_type=order_type, average_price=_optional_decimal(_market_value(market, "average_price", "weighted_average_price", "reference_price", "last_price")), max_position_after=(owned + rounded_quantity if side == "BUY" else owned - rounded_quantity)))
+    percent_reference = _market_reference_price(market, rules.percent_avg_price_mins)
+    side_percent_reference = _market_reference_price(market, rules.side_percent_avg_price_mins)
+    reasons.extend(
+        _filter_reason(
+            rules,
+            side=side,
+            price=rounded_price,
+            quantity=rounded_quantity,
+            notional=notional,
+            order_type=order_type,
+            average_price=percent_reference,
+            side_average_price=side_percent_reference,
+            max_position_after=(
+                owned + rounded_quantity
+                if side == "BUY"
+                else owned - rounded_quantity
+                if side == "SELL"
+                else None
+            ),
+        )
+    )
     fill_price = _optional_decimal(_market_value(market, "conservative_fill_price", "fill_price")) or rounded_price
     reasons.extend(_market_checks(market, now=instant, requested_price=requested_price, fill_price=fill_price, envelope=envelope))
     if side == "BUY":
@@ -809,7 +909,7 @@ def assess_order(
             reasons.append("AGGREGATE_EXPOSURE")
         if state.unresolved_exposure + notional + fee_reserve > envelope.max_reserved_exposure:
             reasons.append("RESERVED_EXPOSURE")
-        if state.owned_positions >= envelope.max_positions:
+        if state.owned_positions >= envelope.max_positions and owned <= ZERO:
             reasons.append("MAX_POSITIONS")
         if state.realized_loss_today >= envelope.realized_loss_entry_stop:
             reasons.append("DAILY_REALIZED_LOSS")
@@ -820,25 +920,35 @@ def assess_order(
             reasons.append("DAILY_EQUITY_LOSS")
         if state.entry_submissions_today + 1 > envelope.max_submissions_per_day:
             reasons.append("SUBMISSIONS_PER_DAY")
-    else:
+    elif side == "SELL":
         if state.exit_submissions_today + 1 > envelope.max_submissions_per_day:
             reasons.append("SUBMISSIONS_PER_DAY")
     # Exchange/account order limits are evaluated with the exit reserve kept
     # available for each owned position.
     current_orders = max(state.open_orders, state.account_order_count)
-    if rules.max_num_orders is not None and rules.max_num_orders > 0 and current_orders + 1 > rules.max_num_orders:
+    exchange_orders = max(state.exchange_order_count, current_orders)
+    if rules.max_num_orders is not None and rules.max_num_orders > ZERO and current_orders + 1 > rules.max_num_orders:
         reasons.append("MAX_NUM_ORDERS")
-    if rules.exchange_max_num_orders is not None and rules.exchange_max_num_orders > 0 and max(state.exchange_order_count, current_orders) + 1 > rules.exchange_max_num_orders:
+    if rules.exchange_max_num_orders is not None and rules.exchange_max_num_orders > ZERO and exchange_orders + 1 > rules.exchange_max_num_orders:
         reasons.append("EXCHANGE_MAX_NUM_ORDERS")
-    reserve_needed = max(0, state.owned_positions * envelope.exit_order_reserve_per_position - (state.exit_submissions_today))
-    if side == "BUY" and rules.max_num_orders is not None and rules.max_num_orders > 0 and current_orders + 1 + reserve_needed > rules.max_num_orders:
-        reasons.append("EXIT_ORDER_RESERVE")
+    reserve_needed = state.owned_positions * envelope.exit_order_reserve_per_position
+    if side == "BUY":
+        if rules.max_num_orders is not None and rules.max_num_orders > ZERO and current_orders + 1 + reserve_needed > rules.max_num_orders:
+            reasons.append("EXIT_ORDER_RESERVE")
+        if rules.exchange_max_num_orders is not None and rules.exchange_max_num_orders > ZERO and exchange_orders + 1 + reserve_needed > rules.exchange_max_num_orders:
+            reasons.append("EXIT_ORDER_RESERVE")
     if state.account_paused:
         reasons.append("ACCOUNT_PAUSED")
     if state.rate_limited:
         reasons.append("RATE_LIMIT")
     # Stable first-occurrence reasons are useful in persisted skip records.
     reasons = list(dict.fromkeys(reasons))
+    projected_exposure = state.aggregate_exposure + (
+        notional if side == "BUY" else -notional if side == "SELL" else ZERO
+    )
+    projected_reserved = state.unresolved_exposure + (
+        notional + fee_reserve if side == "BUY" else ZERO
+    )
     return RiskAssessment(
         allowed=not reasons,
         reasons=tuple(reasons),
@@ -848,9 +958,27 @@ def assess_order(
         quantity=rounded_quantity,
         notional=notional,
         fee_reserve=fee_reserve,
-        projected_exposure=state.aggregate_exposure + (notional if side == "BUY" else -notional),
-        projected_reserved=state.unresolved_exposure + (notional + fee_reserve if side == "BUY" else ZERO),
-        checks={reason: reason not in reasons for reason in ("NOT_TRADING", "SPOT_NOT_ALLOWED", "MIN_NOTIONAL", "MAX_NOTIONAL", "MAX_POSITION", "AGGREGATE_EXPOSURE", "RESERVED_EXPOSURE", "MAX_POSITIONS", "DAILY_REALIZED_LOSS", "DAILY_EQUITY_LOSS", "SUBMISSIONS_PER_DAY")},
+        projected_exposure=projected_exposure,
+        projected_reserved=projected_reserved,
+        checks={
+            reason: reason not in reasons
+            for reason in (
+                "NOT_TRADING",
+                "SPOT_NOT_ALLOWED",
+                "MIN_NOTIONAL",
+                "MAX_NOTIONAL",
+                "MAX_POSITION",
+                "AGGREGATE_EXPOSURE",
+                "RESERVED_EXPOSURE",
+                "MAX_POSITIONS",
+                "DAILY_REALIZED_LOSS",
+                "DAILY_EQUITY_LOSS",
+                "SUBMISSIONS_PER_DAY",
+                "MAX_NUM_ORDERS",
+                "EXCHANGE_MAX_NUM_ORDERS",
+                "EXIT_ORDER_RESERVE",
+            )
+        },
     )
 
 
@@ -923,14 +1051,21 @@ def size_limit_order(
     side = _key(side)
     fee = _decimal(fee_rate if fee_bps is None else _decimal(fee_bps, name="fee bps") / Decimal("10000"), name="fee rate", nonnegative=True)
     requested_price = _decimal(price, name="price", nonnegative=True)
-    available = None if side == "BUY" else (_decimal(available_inventory, name="available inventory", nonnegative=True) if available_inventory is not None else ZERO)
+    available = (
+        None
+        if side == "BUY" or available_inventory is None
+        else _decimal(available_inventory, name="available inventory", nonnegative=True)
+    )
     reasons: list[str] = []
     try:
         rounded_price = rules.round_price(requested_price, side)
     except ValueError as exc:
         rounded_price = requested_price
         reasons.append(str(exc))
+    inventory_qty = rules.round_quantity(quantity, side)
     rounded_qty = rules.round_quantity(quantity, side, available=available)
+    if side == "SELL" and available is not None and inventory_qty > available:
+        reasons.append("INSUFFICIENT_OWNED_INVENTORY")
     if side == "BUY" and rounded_price > ZERO:
         rounded_qty = rules.round_quantity(
             min(rounded_qty, envelope.entry_notional / (rounded_price * (ONE + fee))),
@@ -940,8 +1075,6 @@ def size_limit_order(
     fee_reserve = notional * fee
     if side == "SELL" and rounded_qty <= ZERO:
         reasons.extend(("DUST", "EXIT_BELOW_MINIMUM"))
-    if side == "SELL" and available is not None and rounded_qty > available:
-        reasons.append("INSUFFICIENT_OWNED_INVENTORY")
     reasons.extend(
         _filter_reason(
             rules,

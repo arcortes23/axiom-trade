@@ -201,6 +201,8 @@ class SymbolRulesTests(unittest.TestCase):
         })
         self.assertEqual(disabled.round_price("1.234", "BUY"), D("1.234"))
         self.assertEqual(disabled.round_quantity("2.345", "BUY"), D("2.345"))
+        self.assertIsNone(disabled.min_notional)
+        self.assertIsNone(disabled.max_notional)
         result = assess_order(disabled, "BUY", "1.234", "2.345", snapshot=make_snapshot(quote_available=D("100")), envelope=BinanceRiskEnvelope(entry_notional=D("100"), max_aggregate_exposure=D("100"), max_reserved_exposure=D("100")))
         self.assertTrue(result.allowed, result.reasons)
         self.assertEqual(result.price, D("1.234"))
@@ -527,6 +529,374 @@ class ExitAssessmentTests(unittest.TestCase):
         result = assess_order(make_rules(), "BUY", "10", "1", market=market, snapshot=make_snapshot(quote_available=D("100")), envelope=envelope, now=T0)
         for reason in ("NOT_TRADING", "SPOT_NOT_ALLOWED", "ACCOUNT_PAUSED", "RATE_LIMIT", "CRASH", "THIN_BOOK", "WIDE_SPREAD", "STALE_MARKET", "EXECUTION_DEVIATION"):
             self.assertIn(reason, result.reasons)
+
+
+    def test_default_envelope_has_canonical_canary_boundaries(self):
+        envelope = DEFAULT_BINANCE_RISK_ENVELOPE
+        self.assertEqual(
+            (
+                envelope.entry_notional,
+                envelope.max_aggregate_exposure,
+                envelope.realized_loss_entry_stop,
+                envelope.equity_loss_entry_stop,
+                envelope.max_positions,
+                envelope.max_submissions_per_day,
+                envelope.max_execution_deviation_bps,
+            ),
+            (D("10"), D("30"), D("5"), D("5"), 5, 20, D("100")),
+        )
+
+
+class BinanceRiskBoundaryTests(unittest.TestCase):
+    def test_price_filter_boundaries_and_zero_disabled_bounds(self):
+        cases = (
+            ("BUY", "10.01", "10.01", ()),
+            ("SELL", "10.019", "10.01", ()),
+            ("BUY", "9.99", "9.99", ("PRICE_BELOW_MINIMUM",)),
+            ("SELL", "100.01", "100.01", ("PRICE_ABOVE_MAXIMUM",)),
+        )
+        for side, requested, expected, reasons in cases:
+            with self.subTest(side=side, requested=requested):
+                result = assess_order(
+                    make_rules(min_price=D("10"), max_price=D("100"), tick_size=D("0.01")),
+                    side,
+                    requested,
+                    "1",
+                    snapshot=make_snapshot(quote_available=D("1000"), owned_inventory={"BTCUSDT": D("2")}),
+                    envelope=BinanceRiskEnvelope(
+                        entry_notional=D("1000"),
+                        max_aggregate_exposure=D("1000"),
+                        max_reserved_exposure=D("1000"),
+                    ),
+                )
+                self.assertEqual(result.price, D(expected))
+                self.assertNotIn("PRICE_TICK", result.reasons)
+                for reason in reasons:
+                    self.assertIn(reason, result.reasons)
+        disabled = make_rules(min_price=D("0"), max_price=D("0"), tick_size=D("0"), min_notional=D("0"), max_notional=D("0"))
+        result = assess_order(
+            disabled,
+            "BUY",
+            "0.12345",
+            "1",
+            snapshot=make_snapshot(quote_available=D("100")),
+            envelope=BinanceRiskEnvelope(
+                entry_notional=D("100"),
+                max_aggregate_exposure=D("100"),
+                max_reserved_exposure=D("100"),
+            ),
+        )
+        self.assertTrue(result.allowed, result.reasons)
+        self.assertEqual(result.price, D("0.12345"))
+
+    def test_sell_sizing_rounds_to_tick_and_validates_the_rounded_order(self):
+        sized = size_limit_order(
+            make_rules(min_price=D("10"), max_price=D("100"), tick_size=D("0.01")),
+            "SELL",
+            "10.019",
+            "1",
+            available_inventory="2",
+        )
+        self.assertTrue(sized.valid, sized.reasons)
+        self.assertEqual(sized.price, D("10.01"))
+        self.assertNotIn("PRICE_TICK", sized.reasons)
+
+    def test_lot_and_market_lot_boundaries_use_decimal_floor_and_market_rules(self):
+        rules = make_rules(
+            min_qty=D("0.5"),
+            max_qty=D("5"),
+            step_size=D("0.5"),
+            market_min_qty=D("2"),
+            market_max_qty=D("3"),
+            market_step_size=D("0.25"),
+        )
+        limit = assess_order(
+            rules,
+            "BUY",
+            "10",
+            "5.49",
+            snapshot=make_snapshot(quote_available=D("1000")),
+            envelope=BinanceRiskEnvelope(
+                entry_notional=D("1000"),
+                max_aggregate_exposure=D("1000"),
+                max_reserved_exposure=D("1000"),
+            ),
+        )
+        self.assertEqual(limit.quantity, D("5"))
+        self.assertNotIn("QUANTITY_STEP", limit.reasons)
+        market = assess_order(
+            rules,
+            "BUY",
+            "10",
+            "3.99",
+            order_type="MARKET",
+            snapshot=make_snapshot(quote_available=D("1000")),
+            envelope=BinanceRiskEnvelope(
+                entry_notional=D("1000"),
+                max_aggregate_exposure=D("1000"),
+                max_reserved_exposure=D("1000"),
+            ),
+        )
+        self.assertEqual(market.quantity, D("3"))
+        self.assertNotIn("QUANTITY_BELOW_MINIMUM", market.reasons)
+        below_market = assess_order(
+            rules,
+            "BUY",
+            "10",
+            "1.99",
+            order_type="MARKET",
+            snapshot=make_snapshot(quote_available=D("1000")),
+            envelope=BinanceRiskEnvelope(
+                entry_notional=D("1000"),
+                max_aggregate_exposure=D("1000"),
+                max_reserved_exposure=D("1000"),
+            ),
+        )
+        self.assertEqual(below_market.quantity, D("1.75"))
+        self.assertIn("QUANTITY_BELOW_MINIMUM", below_market.reasons)
+
+    def test_notional_market_apply_flags_and_disabled_zero_bounds(self):
+        envelope = BinanceRiskEnvelope(
+            entry_notional=D("1000"),
+            max_aggregate_exposure=D("1000"),
+            max_reserved_exposure=D("1000"),
+        )
+        rules = make_rules(
+            min_notional=D("5"),
+            max_notional=D("20"),
+            min_notional_apply_to_market=False,
+            max_notional_apply_to_market=False,
+        )
+        limit_low = assess_order(rules, "BUY", "10", "0.1", snapshot=make_snapshot(quote_available=D("1000")), envelope=envelope)
+        self.assertIn("MIN_NOTIONAL", limit_low.reasons)
+        limit_high = assess_order(rules, "BUY", "10", "3", snapshot=make_snapshot(quote_available=D("1000")), envelope=envelope)
+        self.assertIn("MAX_NOTIONAL", limit_high.reasons)
+        market_low = assess_order(rules, "BUY", "10", "0.1", order_type="MARKET", snapshot=make_snapshot(quote_available=D("1000")), envelope=envelope)
+        self.assertNotIn("MIN_NOTIONAL", market_low.reasons)
+        market_high = assess_order(rules, "BUY", "10", "3", order_type="MARKET", snapshot=make_snapshot(quote_available=D("1000")), envelope=envelope)
+        self.assertNotIn("MAX_NOTIONAL", market_high.reasons)
+        applied = make_rules(
+            min_notional=D("5"),
+            max_notional=D("20"),
+            min_notional_apply_to_market=True,
+            max_notional_apply_to_market=True,
+        )
+        self.assertIn(
+            "MIN_NOTIONAL",
+            assess_order(applied, "BUY", "10", "0.1", order_type="MARKET", snapshot=make_snapshot(quote_available=D("1000")), envelope=envelope).reasons,
+        )
+        self.assertIn(
+            "MAX_NOTIONAL",
+            assess_order(applied, "BUY", "10", "3", order_type="MARKET", snapshot=make_snapshot(quote_available=D("1000")), envelope=envelope).reasons,
+        )
+        disabled = make_rules(min_notional=D("0"), max_notional=D("0"))
+        result = assess_order(disabled, "BUY", "10", "0.1", order_type="MARKET", snapshot=make_snapshot(quote_available=D("1000")), envelope=envelope)
+        self.assertNotIn("MIN_NOTIONAL", result.reasons)
+        self.assertNotIn("MAX_NOTIONAL", result.reasons)
+
+    def test_notional_parser_keeps_stricter_bound_and_its_market_flag(self):
+        rules = SymbolRules.from_exchange_info(
+            {
+                "symbol": "BTCUSDT",
+                "filters": [
+                    {"filterType": "MIN_NOTIONAL", "minNotional": "5", "applyToMarket": True},
+                    {"filterType": "NOTIONAL", "minNotional": "2", "maxNotional": "50", "applyMinToMarket": False, "applyMaxToMarket": True},
+                ],
+            }
+        )
+        self.assertEqual(rules.min_notional, D("5"))
+        self.assertTrue(rules.min_notional_apply_to_market)
+        self.assertEqual(rules.max_notional, D("50"))
+        self.assertTrue(rules.max_notional_apply_to_market)
+    def test_zero_notional_filter_does_not_clear_active_minimum(self):
+        rules = SymbolRules.from_exchange_info(
+            {
+                "symbol": "BTCUSDT",
+                "filters": [
+                    {"filterType": "MIN_NOTIONAL", "minNotional": "5", "applyToMarket": True},
+                    {"filterType": "NOTIONAL", "minNotional": "0", "maxNotional": "0", "applyMinToMarket": False, "applyMaxToMarket": False},
+                ],
+            }
+        )
+        self.assertEqual(rules.min_notional, D("5"))
+        self.assertTrue(rules.min_notional_apply_to_market)
+        result = assess_order(
+            rules,
+            "BUY",
+            "10",
+            "0.1",
+            snapshot=make_snapshot(quote_available=D("1000")),
+            envelope=BinanceRiskEnvelope(
+                entry_notional=D("1000"),
+                max_aggregate_exposure=D("1000"),
+                max_reserved_exposure=D("1000"),
+            ),
+        )
+        self.assertIn("MIN_NOTIONAL", result.reasons)
+
+
+    def test_percent_price_by_side_uses_bid_and_ask_boundaries(self):
+        envelope = BinanceRiskEnvelope(
+            entry_notional=D("1000"),
+            max_aggregate_exposure=D("1000"),
+            max_reserved_exposure=D("1000"),
+        )
+        rules = make_rules(
+            percent_multiplier_up=D("2"),
+            percent_multiplier_down=D("0.5"),
+            bid_multiplier_up=D("1.1"),
+            bid_multiplier_down=D("0.9"),
+            ask_multiplier_up=D("1.3"),
+            ask_multiplier_down=D("0.7"),
+            percent_avg_price_mins=5,
+            side_percent_avg_price_mins=3,
+        )
+        bid_high = assess_order(rules, "BUY", "11.01", "1", market={"average_prices": {"5": "10", "3": "10"}}, snapshot=make_snapshot(quote_available=D("1000")), envelope=envelope)
+        self.assertIn("PERCENT_PRICE_BY_SIDE_ABOVE_MAX", bid_high.reasons)
+        bid_low = assess_order(rules, "BUY", "8.99", "1", market={"average_prices": {"5": "10", "3": "10"}}, snapshot=make_snapshot(quote_available=D("1000")), envelope=envelope)
+        self.assertIn("PERCENT_PRICE_BY_SIDE_BELOW_MIN", bid_low.reasons)
+        ask_high = assess_order(rules, "SELL", "13.01", "1", market={"average_prices": {"5": "10", "3": "10"}}, snapshot=make_snapshot(owned_inventory={"BTCUSDT": D("2")}), envelope=envelope)
+        self.assertIn("PERCENT_PRICE_BY_SIDE_ABOVE_MAX", ask_high.reasons)
+        ask_low = assess_order(rules, "SELL", "6.99", "1", market={"average_prices": {"5": "10", "3": "10"}}, snapshot=make_snapshot(owned_inventory={"BTCUSDT": D("2")}), envelope=envelope)
+        self.assertIn("PERCENT_PRICE_BY_SIDE_BELOW_MIN", ask_low.reasons)
+        self.assertEqual(rules.percent_avg_price_mins, 5)
+        self.assertEqual(rules.side_percent_avg_price_mins, 3)
+    def test_direct_rules_normalize_symbol_policy_and_exchange_boolean_flags(self):
+        rules = SymbolRules(
+            symbol="btcusdt",
+            base_asset="btc",
+            quote_asset="usdt",
+            status="trading",
+            spot_trading_allowed="false",
+            order_types=("limit", "market"),
+            time_in_force=("ioc", "fok"),
+        )
+        self.assertEqual(rules.symbol, "BTCUSDT")
+        self.assertEqual(rules.base_asset, "BTC")
+        self.assertEqual(rules.status, "TRADING")
+        self.assertFalse(rules.spot_trading_allowed)
+        self.assertEqual(rules.order_types, ("LIMIT", "MARKET"))
+        self.assertEqual(rules.time_in_force, ("IOC", "FOK"))
+        parsed = SymbolRules.from_exchange_info(
+            {
+                "symbol": "BTCUSDT",
+                "isSpotTradingAllowed": "false",
+                "filters": [
+                    {"filterType": "MIN_NOTIONAL", "minNotional": "1", "applyToMarket": "false"},
+                    {"filterType": "NOTIONAL", "minNotional": "1", "maxNotional": "5", "applyMinToMarket": "true", "applyMaxToMarket": "false"},
+                ],
+            }
+        )
+        self.assertFalse(parsed.spot_trading_allowed)
+        self.assertTrue(parsed.min_notional_apply_to_market)
+        self.assertFalse(parsed.max_notional_apply_to_market)
+
+
+
+    def test_existing_position_can_grow_at_position_count_boundary(self):
+        envelope = BinanceRiskEnvelope(
+            entry_notional=D("100"),
+            max_aggregate_exposure=D("100"),
+            max_reserved_exposure=D("100"),
+            max_positions=1,
+        )
+        existing = assess_order(
+            make_rules(),
+            "BUY",
+            "10",
+            "1",
+            snapshot=make_snapshot(quote_available=D("100"), positions=1, owned_inventory={"BTCUSDT": D("1")}),
+            envelope=envelope,
+        )
+        self.assertNotIn("MAX_POSITIONS", existing.reasons)
+        new_symbol = assess_order(
+            make_rules(symbol="ETHUSDT"),
+            "BUY",
+            "10",
+            "1",
+            snapshot=make_snapshot(quote_available=D("100"), positions=1, owned_inventory={"BTCUSDT": D("1")}),
+            envelope=envelope,
+        )
+        self.assertIn("MAX_POSITIONS", new_symbol.reasons)
+
+    def test_exchange_reserve_applies_without_spending_exit_submission_counter(self):
+        envelope = BinanceRiskEnvelope(
+            entry_notional=D("100"),
+            max_aggregate_exposure=D("100"),
+            max_reserved_exposure=D("100"),
+            max_positions=5,
+            max_submissions_per_day=200,
+            exit_order_reserve_per_position=1,
+        )
+        rules = make_rules(max_num_orders=3, exchange_max_num_orders=4)
+        at_symbol_boundary = assess_order(
+            rules,
+            "BUY",
+            "10",
+            "1",
+            snapshot=make_snapshot(
+                quote_available=D("100"),
+                positions=1,
+                owned_inventory={"BTCUSDT": D("1")},
+                open_orders=1,
+                account_order_count=1,
+                exchange_order_count=1,
+                exit_submissions_today=100,
+            ),
+            envelope=envelope,
+        )
+        self.assertNotIn("EXIT_ORDER_RESERVE", at_symbol_boundary.reasons)
+        blocked = assess_order(
+            rules,
+            "BUY",
+            "10",
+            "1",
+            snapshot=make_snapshot(
+                quote_available=D("100"),
+                positions=1,
+                owned_inventory={"BTCUSDT": D("1")},
+                open_orders=2,
+                account_order_count=2,
+                exchange_order_count=2,
+            ),
+            envelope=envelope,
+        )
+        self.assertIn("EXIT_ORDER_RESERVE", blocked.reasons)
+
+    def test_size_sell_without_inventory_hint_still_rounds_and_validates_dust(self):
+        result = size_limit_order(make_rules(step_size=D("0.1"), min_qty=D("0.1")), "SELL", "10", "0.29")
+        self.assertEqual(result.quantity, D("0.2"))
+        self.assertTrue(result.valid, result.reasons)
+        oversell = size_limit_order(
+            make_rules(step_size=D("0.1"), min_qty=D("0.1")),
+            "SELL",
+            "10",
+            "0.29",
+            available_inventory=D("0.15"),
+        )
+        self.assertEqual(oversell.quantity, D("0.1"))
+        self.assertFalse(oversell.valid)
+        self.assertIn("INSUFFICIENT_OWNED_INVENTORY", oversell.reasons)
+
+    def test_fee_cap_and_post_round_validation_never_approve_infeasible_buy(self):
+        envelope = BinanceRiskEnvelope(
+            entry_notional=D("10"),
+            max_aggregate_exposure=D("100"),
+            max_reserved_exposure=D("100"),
+        )
+        capped = size_limit_order(make_rules(tick_size=D("0.01"), step_size=D("0.001")), "BUY", "3.333", "10", envelope=envelope, fee_rate=D("1"))
+        self.assertLessEqual(capped.notional + capped.fee_reserve, envelope.entry_notional)
+        infeasible = size_limit_order(
+            make_rules(min_qty=D("3"), step_size=D("1")),
+            "BUY",
+            "4",
+            "10",
+            envelope=envelope,
+        )
+        self.assertFalse(infeasible.valid)
+        self.assertIn("QUANTITY_BELOW_MINIMUM", infeasible.reasons)
+        self.assertLessEqual(infeasible.notional + infeasible.fee_reserve, envelope.entry_notional)
+
 
 
 if __name__ == "__main__":

@@ -167,7 +167,7 @@ _ENDPOINTS = (
     "evidence-maturity",
     "strategy",
 )
-_V2_ENDPOINTS = ("overview-summary", "canary", "datasets", "activity", "candidates", "polymarket", "hermes", "crypto-research", "crypto", "paper")
+_V2_ENDPOINTS = ("overview-summary", "canary", "binance-canary", "datasets", "activity", "candidates", "polymarket", "hermes", "crypto-research", "crypto", "paper")
 
 _DEFAULT_PAGE_SIZE = 25
 _PAGE_SIZE_OPTIONS = (10, 25, 50, 100)
@@ -306,6 +306,45 @@ def _bounded_value(value: Any, *, depth: int = 0) -> Any:
     if isinstance(value, float) and not math.isfinite(value):
         return None
     return _jsonable(value)
+_BINANCE_SECRET_KEY = re.compile(
+    r"(?:secret|password|passwd|token|api[_-]?key|apikey|private[_-]?key|passphrase|authorization|bearer|credential)",
+    re.IGNORECASE,
+)
+
+
+def _binance_safe_value(value: Any, *, depth: int = 0, key: str | None = None) -> Any:
+    """Bound and redact a duck-typed Binance projection before JSON output."""
+    if depth >= 6:
+        return "<truncated>"
+    if key and str(key).lower().endswith("_json") and isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            decoded = None
+        if decoded is not None:
+            return _binance_safe_value(decoded, depth=depth, key=key[:-5])
+    if key and _BINANCE_SECRET_KEY.search(str(key)):
+        lowered = str(key).lower()
+        if lowered not in {"credential_hash", "credential_ref_hash", "reference_hash"}:
+            if not isinstance(value, Mapping) and not isinstance(value, (list, tuple, set, frozenset)):
+                return "<redacted>"
+    if isinstance(value, Mapping):
+        return {
+            str(name): _binance_safe_value(child, depth=depth + 1, key=str(name))
+            for name, child in list(value.items())[:64]
+        }
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [_binance_safe_value(child, depth=depth + 1, key=key) for child in list(value)[:100]]
+    if isinstance(value, (datetime, date)):
+        return _jsonable(value)
+    if isinstance(value, str):
+        return value if len(value) <= 4096 else value[:4093] + "..."
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    projected = _jsonable(value)
+    if projected is value and not isinstance(value, (str, int, float, bool, type(None))):
+        return str(value)[:1024]
+    return projected
 
 
 def _nested_value(*sources: Mapping[str, Any], keys: tuple[str, ...]) -> Any:
@@ -549,6 +588,7 @@ class DashboardData:
         risk: Any | None = None,
         store: Any | None = None,
         control: OperatorControlPlane | None = None,
+        binance_canary: Any | None = None,
     ) -> None:
         self._data = dict(data or {})
         self.tracker = tracker
@@ -558,6 +598,7 @@ class DashboardData:
         self.risk = risk
         self.store = store
         self.control = control
+        self.binance_canary = binance_canary
     def _configured(self, name: str) -> Any:
         if name in self._data:
             return self._data[name]
@@ -1411,6 +1452,76 @@ class DashboardData:
                 pass
         return result
 
+    def binance_canary_data(self, params: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        """Return a bounded, secret-free projection from an optional Binance facade.
+
+        The dashboard deliberately does not import or construct the Binance
+        control plane.  Callers inject an already configured facade and this
+        method only uses its public duck-typed methods.
+        """
+        values = _pagination_params(params)
+        page = int(values["page"])
+        page_size = min(int(values["page_size"]), 100)
+        facade = self.binance_canary
+        if facade is None:
+            return {
+                "available": False,
+                "configured": False,
+                "page": page,
+                "page_size": page_size,
+                "positions": _page_result([], page=page, page_size=page_size),
+                "orders": _page_result([], page=page, page_size=page_size),
+                "fills": _page_result([], page=page, page_size=page_size),
+                "unknown": _page_result([], page=page, page_size=page_size),
+                "actions": [],
+                "status": {"state": "NOT_CONFIGURED", "transport": {"polymarket": "DISABLED"}},
+            }
+
+        snapshot_method = getattr(facade, "snapshot", None)
+        raw: Any = None
+        if callable(snapshot_method):
+            try:
+                raw = snapshot_method(page=page, page_size=page_size)
+            except TypeError:
+                try:
+                    raw = snapshot_method(page, page_size)
+                except TypeError:
+                    try:
+                        raw = snapshot_method(page_size, page)
+                    except TypeError:
+                        raw = snapshot_method()
+        status_method = getattr(facade, "status", None)
+        status_raw: Any = None
+        if isinstance(raw, Mapping) and isinstance(raw.get("status"), Mapping):
+            status_raw = raw.get("status")
+        elif isinstance(raw, Mapping):
+            status_raw = raw
+        if status_raw is None and callable(status_method):
+            status_raw = status_method()
+
+        result = dict(raw) if isinstance(raw, Mapping) else {}
+        if isinstance(status_raw, Mapping):
+            # Keep status fields available at the top level for simple fakes,
+            # while preserving the explicit nested status contract.
+            for key, value in status_raw.items():
+                result.setdefault(str(key), value)
+            result["status"] = status_raw
+        result.setdefault("available", True)
+        result["configured"] = True
+        result["page"] = page
+        result["page_size"] = page_size
+
+        history_method = getattr(facade, "action_history", None)
+        if not callable(history_method):
+            history_method = getattr(facade, "list_actions", None)
+        if callable(history_method) and "actions" not in result:
+            try:
+                history = history_method(limit=page_size)
+            except TypeError:
+                history = history_method()
+            result["actions"] = history
+        return _binance_safe_value(result)
+
     def v2_snapshot(self, endpoint: str, params: Mapping[str, Any] | None = None) -> dict[str, Any]:
         name = endpoint.strip("/")
         if name.lower().startswith("datasets/"):
@@ -1449,6 +1560,7 @@ class DashboardData:
         handlers = {
             "overview-summary": lambda _params: self.overview_summary(),
             "canary": lambda _params: self.canary_data(),
+            "binance-canary": self.binance_canary_data,
             "datasets": self.paginate_dataset_catalog,
             "activity": self.paginate_research_activity,
             "candidates": self.paginate_candidate_lifecycle,
@@ -3139,10 +3251,11 @@ class DashboardData:
             "paper_only": True,
             "live_execution": False,
         }
-
     def snapshot(self, endpoint: str, params: Mapping[str, Any] | None = None) -> Any:
         raw_endpoint = endpoint.strip("/")
         endpoint = raw_endpoint.lower()
+        if endpoint == "binance-canary":
+            return self.binance_canary_data(params)
         if endpoint.startswith("strategy/"):
             return self.strategy_detail(raw_endpoint.split("/", 1)[1])
         if endpoint == "overview":
@@ -3228,12 +3341,13 @@ def _dashboard_html(control_token: str | None = None) -> str:
     .key-value { display:grid; grid-template-columns:145px minmax(0,1fr); gap:7px; font-size:.76rem; } .key { color:var(--muted); } .key-value + .key-value { margin-top:7px; } details { margin-top:12px; } summary { color:var(--muted); cursor:pointer; font-size:.72rem; } pre { margin:9px 0 0; max-height:350px; overflow:auto; white-space:pre-wrap; word-break:break-word; color:#b7c7dc; font-size:.68rem; line-height:1.4; } .page-note { font-size:.74rem; line-height:1.5; margin-top:9px; } .notice { border-left:3px solid var(--amber); padding:8px 11px; color:#e7d4a8; background:#211b10; font-size:.73rem; line-height:1.4; } .right { text-align:right; } .pager { margin-top:11px; color:var(--muted); font-size:.72rem; } .pager button { border:1px solid var(--line); border-radius:4px; color:var(--text); background:#0a1220; padding:5px 8px; cursor:pointer; } .pager button:disabled { opacity:.4; cursor:default; }
     @media (max-width:1050px) { .status-grid { grid-template-columns:repeat(3,1fr); } .card-grid { grid-template-columns:repeat(3,1fr); } .two-col,.three-col { grid-template-columns:1fr; } } @media (max-width:620px) { .topbar,main,nav { width:min(100% - 24px,1400px); } .status-grid,.card-grid { grid-template-columns:repeat(2,1fr); } .timeline-item { grid-template-columns:72px 60px minmax(0,1fr); } }
     .identity { display:flex; flex-direction:column; gap:2px; min-width:160px; } .identity-main { color:var(--text); font-weight:650; } .identity-sub { color:var(--muted); font-size:.65rem; } .copy { border:1px solid var(--line); border-radius:4px; background:transparent; color:var(--blue); cursor:pointer; font-size:.62rem; padding:2px 5px; margin-left:5px; } .copy:hover { background:#122039; } .refresh-note { min-height:1.1em; color:var(--muted); font-size:.68rem; } .refresh-note.slow { color:var(--amber); } .quality-context { display:block; color:var(--muted); font-size:.62rem; white-space:normal; max-width:260px; } .activity-compact { border-bottom:1px solid #1c2a3f; padding:8px 0; } .activity-compact + .activity-compact { margin-top:2px; } .detail-grid { display:grid; gap:10px; } .detail-section { border-top:1px solid #1c2a3f; padding-top:9px; } .detail-section h3 { margin-bottom:6px; } .progress { height:7px; background:#172238; border-radius:5px; overflow:hidden; } .progress > i { display:block; height:100%; background:linear-gradient(90deg,var(--blue),var(--cyan)); }
+    .binance-view .identity,.binance-view td,.binance-view strong { overflow-wrap:anywhere; word-break:break-word; white-space:normal; } .binance-view table { table-layout:fixed; } .binance-view details pre { max-height:420px; } .binance-action { border:1px solid var(--line); border-radius:5px; background:#0a1220; color:var(--text); cursor:pointer; padding:7px 9px; font-size:.7rem; } .binance-action.danger { color:#ffb4bd; border-color:#713844; }
   </style>
 </head>
 <body>
   <header><div class="topbar"><div><div class="eyebrow">Paper-first research operations</div><h1>AXIOM / operator console</h1><p class="subtitle">Historical evidence, forward observation, and paper lifecycle in one view.</p></div><div class="live-lock">Live trading <strong>Disabled</strong><br>Paper risk engine <strong>Active</strong></div></div>
     <nav aria-label="Research sections">
-      <button class="tab active" data-view="overview">Overview</button><button class="tab" data-view="datasets">DATASETS</button><button class="tab" data-view="activity">ACTIVITY</button><button class="tab" data-view="crypto">CRYPTO RESEARCH</button><button class="tab" data-view="polymarket">Polymarket</button><button class="tab" data-view="candidates">Candidates</button><button class="tab" data-view="hermes">Hermes</button><button class="tab" data-view="portfolio">Paper Portfolio</button><button class="tab" data-view="canary">REAL CANARY</button>
+      <button class="tab active" data-view="overview">Overview</button><button class="tab" data-view="datasets">DATASETS</button><button class="tab" data-view="activity">ACTIVITY</button><button class="tab" data-view="crypto">CRYPTO RESEARCH</button><button class="tab" data-view="polymarket">Polymarket</button><button class="tab" data-view="candidates">Candidates</button><button class="tab" data-view="hermes">Hermes</button><button class="tab" data-view="portfolio">Paper Portfolio</button><button class="tab" data-view="canary">Polymarket Canary</button><button class="tab" data-view="binance-canary">Binance Spot Canary</button>
     </nav>
   </header>
   <main>
@@ -3244,7 +3358,7 @@ def _dashboard_html(control_token: str | None = None) -> str:
         <article class="panel"><div class="section-title"><h2>Latest candidates</h2><a class="link" href="#candidates" data-link="candidates">View all</a></div><div id="overview-candidates" class="scroll"></div></article></div>
         <div><article class="panel"><div class="section-title"><h2>Latest activity</h2><a class="link" href="#activity" data-link="activity">View all</a></div><div id="overview-activity" class="timeline"></div></article>
         <article class="panel"><div class="section-title"><h2>Selected detail</h2><span class="muted">preserved on refresh</span></div><div id="detail" class="empty"><strong>Select an item</strong>Dataset and candidate evidence appears here.</div></article></div></div>
-      <details><summary>Technical details · raw APIs and retained debug surfaces</summary><p class="page-note">Existing JSON APIs remain available for automation. Research maturity, Paper forward, and Research queue and node status are retained below as raw endpoint links.</p><div id="api-links"><a href="/api/v2/datasets">datasets</a> · <a href="/api/v2/activity">activity</a> · <a href="/api/v2/candidates">candidates</a> · <a href="/api/v2/polymarket">polymarket</a> · <a href="/api/v2/hermes">hermes</a> · <a href="/api/v2/paper">paper</a> · <a href="/api/autonomous-research">autonomous-research</a></div><pre id="raw-overview"></pre></details>
+      <details><summary>Technical details · raw APIs and retained debug surfaces</summary><p class="page-note">Existing JSON APIs remain available for automation. Research maturity, Paper forward, and Research queue and node status are retained below as raw endpoint links.</p><div id="api-links"><a href="/api/v2/datasets">datasets</a> · <a href="/api/v2/activity">activity</a> · <a href="/api/v2/candidates">candidates</a> · <a href="/api/v2/polymarket">polymarket</a> · <a href="/api/v2/binance-canary">binance-canary</a> · <a href="/api/v2/hermes">hermes</a> · <a href="/api/v2/paper">paper</a> · <a href="/api/autonomous-research">autonomous-research</a></div><pre id="raw-overview"></pre></details>
     </section>
     <section id="view-datasets" class="view"><article class="panel"><div class="section-title"><h2>DATASETS</h2><span id="dataset-total" class="muted"></span></div><div class="filters"><input id="datasets-filter" placeholder="Filter dataset, instrument, source" aria-label="Filter datasets"><select id="datasets-source"><option value="">All sources</option><option>HISTORICAL</option><option>FORWARD_COLLECTED</option></select><select id="datasets-size"><option>25</option><option>50</option><option>100</option></select></div><div id="datasets-table" class="scroll"></div><div id="datasets-pager" class="pager"></div></article><article id="dataset-detail" class="panel"></article></section>
     <section id="view-activity" class="view"><article class="panel"><div class="section-title"><h2>ACTIVITY</h2><span id="activity-total" class="muted"></span></div><div class="filters"><input id="activity-filter" placeholder="Filter activity" aria-label="Filter activity"><select id="activity-status"><option value="">All statuses</option><option>PENDING</option><option>RUNNING</option><option>COMPLETE</option><option>COMPLETED</option><option>ACCEPTED</option><option>FAILED</option><option>ERROR</option><option>REJECTED</option></select><select id="activity-size"><option>25</option><option>50</option><option>100</option></select></div><div id="activity-table" class="scroll"></div><div id="activity-pager" class="pager"></div></article></section>
@@ -3254,6 +3368,7 @@ def _dashboard_html(control_token: str | None = None) -> str:
     <article id="candidate-detail" class="panel"><div class="section-title"><h2>Candidate detail</h2><span class="muted">historical → forward → lifecycle</span></div><div class="empty">Select a candidate to inspect evidence.</div></article>
     <section id="view-hermes" class="view"><article class="panel"><div class="section-title"><h2>Hermes / research loop</h2><span class="badge">research only · no canary control</span></div><div id="hermes-summary"></div><div class="filters"><input id="hermes-filter" placeholder="Filter queue" aria-label="Filter Hermes queue"><select id="hermes-status"><option value="">All statuses</option><option>PENDING</option><option>TESTING</option><option>COMPLETED</option><option>ACCEPTED</option><option>REJECTED</option><option>FAILED</option><option>ERROR</option></select><select id="hermes-size"><option>25</option><option>50</option><option>100</option></select></div><div id="hermes-table" class="scroll"></div><div id="hermes-pager" class="pager"></div><div id="hermes-detail"></div></article></section>
     <section id="view-canary" class="view"><article class="panel" style="border-color:var(--red)"><div class="section-title"><h2>REAL CANARY MONEY</h2><span class="badge bad">PRODUCTION LIVE TRADING: DISABLED</span></div><div id="canary-action-result" class="page-note"></div><div id="canary-controls"></div><div id="canary-connectivity"></div><div id="canary-summary"></div><div id="canary-trades" class="scroll"></div><p class="notice">Autonomous canary is independent from paper research. No secrets are stored or displayed. It remains prediction-only, bounded at $1 per order, and killable from this console.</p></article></section>
+    <section id="view-binance-canary" class="view binance-view"><article class="panel" style="border-color:var(--amber)"><div class="section-title"><h2>BINANCE SPOT CANARY</h2><span class="badge warn">DEVELOPMENT / PAPER|TESTNET</span></div><p class="page-note">Separate from the Polymarket canary. <strong>POLYMARKET TRANSPORT: DISABLED</strong> · Binance Spot only · no implicit control-plane construction.</p><div id="binance-action-result" class="page-note"></div><div id="binance-identity"></div><div id="binance-connectivity"></div><div id="binance-qualification"></div><div id="binance-risk"></div><div id="binance-controls"></div><div id="binance-records" class="scroll"></div><details><summary>Full Binance projection and identifiers</summary><pre id="binance-raw"></pre></details><p class="notice">Credentials are never displayed. Connectivity checks are read-only; order validation is an explicit test action. No browser action can place an order.</p></article></section>
   </main>
   <script>
     const $ = (id) => document.getElementById(id), safe = (v) => String(v ?? "—").replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c])), json = (v) => JSON.stringify(v ?? {}, null, 2);
@@ -3344,6 +3459,42 @@ def _dashboard_html(control_token: str | None = None) -> str:
       const bookMarkup=String(book.status||"SKIPPED").toUpperCase()!=="SKIPPED"?`<div class="key-value"><span class="key">Order book</span><strong>${safe(book.status)}</strong></div>`:"";
       $("canary-connectivity").innerHTML=`<article class="panel"><div class="section-title"><h2>CONNECTIVITY</h2><span class="badge ${statusClass(c.status)}">${safe(c.status||"BLOCKED")}</span></div><div class="three-col"><div class="key-value"><span class="key">SDK</span><strong>${safe(sdk.status)} · ${safe(sdk.name)} · ${safe(sdk.version)}</strong></div><div class="key-value"><span class="key">Credentials</span><strong>${safe(credentials.status)}</strong></div><div class="key-value"><span class="key">Authentication</span><strong>${safe(authentication.status)}</strong></div><div class="key-value"><span class="key">Account</span><strong>${safe(account.status)}${account.wallet_type?` · ${safe(account.wallet_type)}`:""}</strong></div><div class="key-value"><span class="key">Geoblock</span><strong>${safe(geo.status)}${geo.country?` · ${safe(geo.country)}`:""}${geo.region?` / ${safe(geo.region)}`:""}</strong></div><div class="key-value"><span class="key">Balance</span><strong>${safe(balance.status)}${balance.available_usd!=null?` · ${usd(balance.available_usd)}`:""}</strong></div><div class="key-value"><span class="key">Allowance</span><strong>${safe(allowance.status)}</strong></div>${marketMarkup}${bookMarkup}<div class="key-value"><span class="key">Checked</span><strong>${safe(dateText(c.checked_at))}</strong></div></div>${failureMarkup?`<p class="page-note">${failureMarkup}</p>`:""}</article>`;
     }
+    async function binanceControlPost(action,payload={}) {
+      const node=$("binance-action-result");
+      try {
+        const response=await fetch("/api/binance/control",{method:"POST",headers:{"Content-Type":"application/json","X-Axiom-Control-Token":controlToken},body:JSON.stringify({action,payload}),cache:"no-store"});
+        const result=await response.json();
+        if(node)node.textContent=result.ok?`${action} completed · ${result.action_id||"persisted"}`:`${action} blocked: ${result.reason||"CONTROL_FAILED"}`;
+        if(activeController)activeController.abort();
+        refreshGeneration++; activeController=null; loadInFlight=false; clearTimeout(slowRefreshTimer); slowRefreshTimer=null; nextRefreshAt=0;
+        if(state.tab==="binance-canary")await loadPage("binance-canary",true);
+        return result;
+      } catch(error) {
+        if(node)node.textContent=`${action} unavailable: ${error?.message||"network failure"}`;
+        return {ok:false,reason:"BINANCE_CONTROL_UNAVAILABLE"};
+      }
+    }
+    function binanceRecordTable(title,rows) {
+      const values=arr(rows), keys=[...new Set(values.flatMap(item=>Object.keys(item||{})).filter(key=>!/(?:secret|token|password|credential|authorization)/i.test(key)))].slice(0,8);
+      if(!values.length)return empty(`No ${title.toLowerCase()}`,"No bounded records are available.");
+      const visible=values.slice(0,100);
+      return `<article class="panel"><div class="section-title"><h3>${safe(title)}</h3><span class="badge">${visible.length} shown</span></div><table><thead><tr>${keys.map(key=>`<th>${safe(key.replaceAll("_"," "))}</th>`).join("")}</tr></thead><tbody>${visible.map(item=>`<tr>${keys.map(key=>`<td>${safe(typeof item[key]==="object"?JSON.stringify(item[key]):item[key])}</td>`).join("")}</tr>`).join("")}</tbody></table><details><summary>Full IDs and bounded detail records</summary><pre>${safe(json(visible))}</pre></details></article>`;
+    }
+    function renderBinanceCanary(data) {
+      const status=data?.status&&typeof data.status==="object"?data.status:data||{}, profile=data.profile||data.development_profile||status.profile||status.development_profile||{}, connectivity=data.connectivity||status.connectivity||{}, readiness=data.readiness||status.readiness||{}, qualification=data.qualification||status.qualification||{}, risk=data.risk||data.budgets||status.risk||status.budgets||{}, heartbeat=data.heartbeat||status.heartbeat||{}, signal=data.latest_signal||status.latest_signal||null, actions=arr(data.actions||status.actions);
+      const identityRows=[["Environment",profile.environment||"PAPER / TESTNET"],["Instance",profile.feature_instance||profile.runtime_identity||profile.runtime||"binance-dev"],["DB path",profile.db_path||"—"],["Schema revision",profile.schema_revision||profile.revision||"unknown"],["Transport","BINANCE SPOT ENABLED · POLYMARKET DISABLED"],["Credentials",data.credentials?.configured?"CONFIGURED (safe status only)":"NOT CONFIGURED"]];
+      $("binance-identity").innerHTML=`<article class="panel"><div class="section-title"><h2>DEVELOPMENT / PAPER|TESTNET IDENTITY</h2><span class="badge warn">${safe(profile.environment||"PAPER|TESTNET")}</span></div><div class="three-col">${identityRows.map(([key,value])=>`<div class="key-value"><span class="key">${safe(key)}</span><strong>${safe(value)}</strong></div>`).join("")}</div><p class="page-note">Status ${safe(dateText(data.timestamp||status.timestamp))} · UTC→PHT display enabled</p></article>`;
+      $("binance-connectivity").innerHTML=`<article class="panel"><div class="section-title"><h2>READ-ONLY CONNECTIVITY / READINESS</h2><span class="badge ${statusClass(readiness.status||connectivity.readiness||connectivity.status)}">${safe(readiness.status||connectivity.readiness||connectivity.status||"UNKNOWN")}</span></div><div class="three-col"><div class="key-value"><span class="key">Connectivity</span><strong>${safe(connectivity.status||"UNKNOWN")} · ${connectivity.stale?"STALE":"CURRENT"}</strong></div><div class="key-value"><span class="key">Checked UTC / PHT</span><strong>${safe(connectivity.checked_at||"—")} · ${safe(dateText(connectivity.checked_at))}</strong></div><div class="key-value"><span class="key">Heartbeat</span><strong>${safe(heartbeat.status||"UNKNOWN")} · ${safe(dateText(heartbeat.timestamp||heartbeat.heartbeat_at))}</strong></div></div><p class="page-note"><button class="binance-action" data-binance-action="CONNECTIVITY_CHECK">Connectivity check (read-only)</button> · no order placement</p></article>`;
+      const selected=qualification.selection||status.selection||null, selectedId=selected?.candidate_id||selected?.strategy_id||selected?.id||"—";
+      $("binance-qualification").innerHTML=`<article class="panel"><div class="section-title"><h2>QUALIFICATION / RANKING</h2><span class="badge ${statusClass(qualification.current_vs_stale||qualification.selection_status)}">${safe(qualification.current_vs_stale||qualification.selection_status||"NONE")}</span></div><div class="three-col"><div class="key-value"><span class="key">Eligibility</span><strong>${safe(qualification.eligible_count??qualification.eligibility??"—")}</strong></div><div class="key-value"><span class="key">Rankable</span><strong>${safe(qualification.rankable_count??arr(qualification.rankable).length)}</strong></div><div class="key-value"><span class="key">Selection / family</span><strong>${safe(selectedId)} · ${safe(qualification.family||selected?.family||"—")}</strong></div><div class="key-value"><span class="key">Reason</span><strong>${safe(qualification.reason||status.reason||"—")}</strong></div></div><details><summary>Ranking selection and reasons</summary><pre>${safe(json({qualification,selection:selected}))}</pre></details></article>`;
+      const limits=risk.limits||risk.envelope||{}, remaining=risk.remaining||{}, riskKeys=[...new Set([...Object.keys(limits),...Object.keys(remaining)])].slice(0,32);
+      $("binance-risk").innerHTML=`<article class="panel"><div class="section-title"><h2>RISK ENVELOPE / BUDGETS</h2><span class="badge">bounded</span></div><div class="three-col">${riskKeys.map(key=>`<div class="key-value"><span class="key">${safe(key.replaceAll("_"," "))}</span><strong>${safe(limits[key]??"—")} / remaining ${safe(remaining[key]??"—")}</strong></div>`).join("")}<div class="key-value"><span class="key">Net PnL / fees</span><strong>${safe(risk.net_pnl||"—")} / ${safe(risk.fees||"—")}</strong></div><div class="key-value"><span class="key">Exposure / reservations</span><strong>${safe(risk.exposure||"—")} / ${safe(risk.reservations||"—")}</strong></div></div></article>`;
+      const currentState=String(status.control?.state||status.state||"UNKNOWN"), confirm=String(status.enable_phrase||"ENABLE BINANCE AUTO CANARY");
+      $("binance-controls").innerHTML=`<article class="panel"><div class="section-title"><h2>BINANCE CONTROL</h2><span class="badge ${statusClass(currentState)}">${safe(currentState)}</span></div><div class="filters"><input id="binance-confirm" aria-label="Exact enable phrase" placeholder="${safe(confirm)}"><input id="binance-order-symbol" aria-label="Order validation symbol" placeholder="BTCUSDT"><input id="binance-order-price" aria-label="Order validation price" placeholder="price"><input id="binance-order-quantity" aria-label="Order validation quantity" placeholder="quantity"></div><p class="page-note"><button class="binance-action" data-binance-action="ORDER_VALIDATION_TEST">Order validation test</button> <button class="binance-action" data-binance-action="ENABLE">ENABLE</button> <button class="binance-action" data-binance-action="PAUSE">PAUSE</button> <button class="binance-action" data-binance-action="RESUME">RESUME</button> <button class="binance-action" data-binance-action="DISARM">DISARM</button> <button class="binance-action danger" data-binance-action="KILL">KILL</button></p><p class="page-note">Enable/resume require the exact phrase: <code>${safe(confirm)}</code>. Actions are persisted per action.</p></article>`;
+      const records=[binanceRecordTable("Positions",data.positions?.items||status.positions?.items||data.positions),binanceRecordTable("Orders",data.orders?.items||status.orders?.items||data.orders),binanceRecordTable("Fills",data.fills?.items||status.fills?.items||data.fills),binanceRecordTable("UNKNOWN orders",data.unknown?.items||status.unknown?.items||data.unknown)].join("");
+      $("binance-records").innerHTML=`<div class="three-col">${records}</div><article class="panel"><div class="section-title"><h3>LATEST SIGNAL / NO-TRADE</h3><span class="badge ${statusClass(signal?.status||"UNKNOWN")}">${safe(signal?.status||"UNKNOWN")}</span></div><div class="key-value"><span class="key">Signal</span><strong>${safe(signal?.signal_id||signal?.id||"—")}</strong></div><div class="key-value"><span class="key">No-trade reason</span><strong>${safe(data.no_trade_reason||status.no_trade_reason||signal?.no_trade_reason||"—")}</strong></div><div class="key-value"><span class="key">Pause / disarm / kill</span><strong>${status.pause?"PAUSED":"RUNNING"} / ${status.disarmed?"DISARMED":"ARMED"} / ${status.killed?"KILLED":"NOT KILLED"}</strong></div></article>`;
+      $("binance-raw").textContent=json({status,actions});
+    }
     function renderCanary(data) {
       const c=data.canary||{}, auto=data.autonomous_canary||c.autonomous||{}, risk=c.risk_envelope||c.risk_limits||{}, signal=data.canary_signal||null, connectivity=data.connectivity??c.connectivity??null;
       renderCanaryConnectivity(connectivity);
@@ -3367,12 +3518,12 @@ def _dashboard_html(control_token: str | None = None) -> str:
     function renderCrypto(data) { const rows=arr(data.items),symbols=arr(data.symbols),summary={universe_version:data.universe_version,symbols:data.symbol_count??symbols.length,assets:data.asset_count??arr(data.assets).length,catalogs:data.total,reports:arr(data.reports).length}; $("crypto-summary").innerHTML=`<div class="three-col">${[["Universe version",summary.universe_version],["Symbols",summary.symbols],["Assets",summary.assets],["Catalogs",summary.catalogs],["Reports",summary.reports],["Families",arr(data.families).length]].map(([label,value])=>`<div class="key-value"><span class="key">${safe(label)}</span><strong>${safe(value)}</strong></div>`).join("")}</div>`; $("crypto-table").innerHTML=rows.length?`<table><thead><tr><th>Symbol</th><th>Dataset</th><th>Version</th><th>Source</th><th>Coverage</th><th>Strategies</th><th>Experiments</th><th>Validation</th><th>Families</th></tr></thead><tbody>${rows.map(i=>`<tr><td><button class="link crypto-symbol-row" data-symbol="${encodeURIComponent(i.symbol||"")}">${safe(i.symbol)}</button></td><td>${safe(i.dataset_id)}</td><td>${safe(i.dataset_version)}</td><td>${safe(i.source_type)}</td><td>${safe(json(i.coverage))}</td><td>${safe(json(i.strategies))}</td><td>${safe(json(i.experiments))}</td><td>${safe(json(i.validation))}</td><td>${safe(json(i.families))}</td></tr>`).join("")}</tbody></table>`:empty("No crypto catalogs","No crypto catalog or report has been persisted."); pager("crypto",data); document.querySelectorAll(".crypto-symbol-row").forEach(b=>b.addEventListener("click",()=>loadCrypto(decodeURIComponent(b.dataset.symbol)))); }
     function renderOutcomeCards(data) { const cards=data.research_cards||{}, latest=data.hermes_latest_outcome||cards.newest_hermes_outcome||{}, latestLabel=latest.outcome_label||latest.status||"—"; $("research-cards").innerHTML=[["experiments_run","Experiments run"],["active_hypotheses","Active hypotheses"],["candidates_alive","Candidates alive"],["candidate_rejected","Candidate Rejected"],["research_rejected","Research Rejected"],["canary_eligible","Canary eligible"],["paper_forward","Paper forward"],["paper_promotable","Paper promotable"]].map(([k,l])=>`<article class="panel"><div class="metric">${count(cards[k])}</div><div class="metric-label">${l}</div></article>`).join("")+`<article class="panel"><div class="metric">${safe(latestLabel)}</div><div class="metric-label">Newest Hermes outcome · ${safe(latest.item_id||"none")}</div><div class="page-note">Dataset: ${safe(latest.dataset_id||"—")} / ${safe(latest.dataset_version||"—")}</div>${latest.human_reason?`<p class="page-note">${safe(latest.human_reason)}</p>`:""}</article>`; }
     const _renderOverview=renderOverview; renderOverview=(data)=>{_renderOverview(data);renderOutcomeCards(data);};
-    const VIEW_ENDPOINT = {overview:"overview-summary",canary:"canary",datasets:"datasets",activity:"activity",candidates:"candidates",polymarket:"polymarket",hermes:"hermes",crypto:"crypto-research",portfolio:"paper"};
-    const VIEW_TARGET = {datasets:"datasets-table",activity:"activity-table",candidates:"candidates-table",polymarket:"pm-markets",hermes:"hermes-table",crypto:"crypto-table",portfolio:"portfolio-states"};
-    const VIEW_CADENCE = {overview:10000,canary:15000,datasets:30000,activity:15000,candidates:30000,polymarket:30000,hermes:30000,crypto:30000,portfolio:30000};
+    const VIEW_ENDPOINT = {overview:"overview-summary",canary:"canary","binance-canary":"binance-canary",datasets:"datasets",activity:"activity",candidates:"candidates",polymarket:"polymarket",hermes:"hermes",crypto:"crypto-research",portfolio:"paper"};
+    const VIEW_TARGET = {datasets:"datasets-table",activity:"activity-table",candidates:"candidates-table",polymarket:"pm-markets",hermes:"hermes-table",crypto:"crypto-table",portfolio:"portfolio-states", "binance-canary":"binance-records"};
+    const VIEW_CADENCE = {overview:10000,canary:15000,"binance-canary":15000,datasets:30000,activity:15000,candidates:30000,polymarket:30000,hermes:30000,crypto:30000,portfolio:30000};
     let activeController = null, detailController = null, refreshGeneration = 0, nextRefreshAt = 0, slowRefreshTimer = null, startupPending = true;
     const REFRESH_TIMEOUT_MS = 8000;
-    const lastGood = {overview:null,canary:null,controls:null};
+    const lastGood = {overview:null,canary:null,"binance-canary":null,controls:null};
     let lastSuccessful = 0;
     function refreshError(error) {
       if(error?.name==="AbortError") return "request cancelled";
@@ -3517,12 +3668,12 @@ def _dashboard_html(control_token: str | None = None) -> str:
           const data=await fetchV2Bounded(VIEW_ENDPOINT[tab],controller.signal);
           if(generation!==refreshGeneration)return;
           lastGood[tab]=data; lastSuccessful=Date.now(); current=data;
-          ({datasets:renderDatasets,activity:renderActivity,candidates:renderCandidates,polymarket:renderPolymarket,hermes:renderHermes,crypto:renderCrypto,portfolio:renderPaper}[tab])(data);
+          ({datasets:renderDatasets,activity:renderActivity,candidates:renderCandidates,polymarket:renderPolymarket,hermes:renderHermes,crypto:renderCrypto,portfolio:renderPaper,"binance-canary":renderBinanceCanary}[tab])(data);
           refreshMessage(tab,`Updated · ${new Date().toLocaleTimeString()}`);
         }
       } catch(error) {
         if(generation===refreshGeneration&&error?.name!=="AbortError") {
-          if(lastGood[tab])({overview:renderOverview,canary:renderCanary,datasets:renderDatasets,activity:renderActivity,candidates:renderCandidates,polymarket:renderPolymarket,hermes:renderHermes,crypto:renderCrypto,portfolio:renderPaper}[tab])(lastGood[tab]);
+          if(lastGood[tab])({overview:renderOverview,canary:renderCanary,datasets:renderDatasets,activity:renderActivity,candidates:renderCandidates,polymarket:renderPolymarket,hermes:renderHermes,crypto:renderCrypto,portfolio:renderPaper,"binance-canary":renderBinanceCanary}[tab])(lastGood[tab]);
           refreshMessage(tab,`Refresh failed (${refreshError(error)}) · showing last successful content`,true);
         }
       } finally {
@@ -3557,6 +3708,7 @@ def _dashboard_html(control_token: str | None = None) -> str:
       if(document.hidden||loadInFlight)return;
       return loadPage(state.tab,false);
     };
+    document.addEventListener("click",async event=>{const button=event.target.closest?.(".binance-action");if(!button)return;const action=button.dataset.binanceAction||"",payload={};if(action==="ENABLE"||action==="RESUME")payload.confirmation=$("binance-confirm")?.value||"";if(action==="ORDER_VALIDATION_TEST"){payload.symbol=$("binance-order-symbol")?.value||"";payload.price=$("binance-order-price")?.value||"";payload.quantity=$("binance-order-quantity")?.value||"";}await binanceControlPost(action,payload);});
     document.addEventListener("click",async event=>{const button=event.target.closest?.(".control-action");if(!button)return;const action=button.dataset.controlAction||"",target=button.dataset.controlTarget||"",expected=button.dataset.controlConfirm||"";if(expected){const typed=window.prompt(`Type ${expected} to continue`);if(typed!==expected){actionResultMessage(action,`${action} cancelled: exact confirmation required`);return;}}const result=await controlPost(action,target,expected);const local=$("candidate-control-result");if(local&&target===state.selected&&!isCanaryAction(action))local.textContent=result.ok?`${action} completed`:`${action} blocked: ${result.reason||"CONTROL_FAILED"}`;});
     ensureActivityKind(); if($("crypto-symbol")){const oldSymbol=$("crypto-symbol"),newSymbol=oldSymbol.cloneNode(true);oldSymbol.replaceWith(newSymbol);newSymbol.addEventListener("input",()=>{state.page=1;saveState(true);loadPage("crypto",true);});} document.addEventListener("click",event=>{const button=event.target.closest?.(".copy");if(!button)return;navigator.clipboard?.writeText(button.dataset.copy||"").then(()=>{button.textContent="copied";setTimeout(()=>button.textContent="copy",1200);}).catch(()=>{});}); document.addEventListener("visibilitychange",()=>{if(document.hidden){if(activeController)activeController.abort();}else{nextRefreshAt=0;load();}});
     ensureFacets(); document.querySelectorAll(".tab").forEach(b=>b.addEventListener("click",()=>activate(b.dataset.view))); document.querySelectorAll("[data-link]").forEach(b=>b.addEventListener("click",e=>{e.preventDefault();activate(b.dataset.link)})); document.querySelectorAll(".filters input,.filters select").forEach(el=>el.addEventListener(el.tagName==="INPUT"?"input":"change",()=>{if(el.id.endsWith("-size")){const n=Number(el.value);if([10,25,50,100].includes(n)){state.page_size=n;document.querySelectorAll('select[id$="-size"]').forEach(s=>s.value=String(n));}} else if(el.id.includes("-filter"))state.filter=el.value;state.page=1;saveState(true);loadPage(state.tab)})); window.addEventListener("popstate",()=>{const q=new URLSearchParams(location.search),nextTab=q.get("tab")||"overview",changed=nextTab!==state.tab;params=q;state.tab=nextTab;state.page=Math.max(1,Number(q.get("page")||1));state.page_size=[10,25,50,100].includes(Number(q.get("page_size")))?Number(q.get("page_size")):25;state.filter=changed?"":q.get("filter")||"";state.sort=changed?"":q.get("sort")||"";state.direction=changed?"desc":q.get("direction")==="asc"?"asc":"desc";state.selected=changed?"":q.get("selected")||"";state.expanded=changed?false:q.get("expanded")==="1";restoreFacets();activate(state.tab,false)}); load(); activate(state.tab,false); const refreshHandle=setInterval(load,10000); window.addEventListener("beforeunload",()=>clearInterval(refreshHandle));
@@ -3606,14 +3758,19 @@ class _DashboardHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802 - stdlib handler API
         parsed = urlparse(self.path)
-        if parsed.path.rstrip("/") != "/api/control":
-            self._send(405 if parsed.path.startswith("/api/control") else 404, {"error": "control endpoint required"})
+        route = parsed.path.rstrip("/")
+        is_binance = route == "/api/binance/control"
+        if route != "/api/control" and not is_binance:
+            self._send(405 if parsed.path.startswith("/api/control") or parsed.path.startswith("/api/binance/control") else 404, {"error": "control endpoint required"})
             return
-        if self.server.dashboard_data.control is None:
+        if not is_binance and self.server.dashboard_data.control is None:
             self._send(503, {"error": "operator controls unavailable"})
             return
         if not self._control_request_allowed():
             self._send(403, {"error": "localhost control token required"})
+            return
+        if is_binance and self.server.dashboard_data.binance_canary is None:
+            self._send(503, {"error": "Binance canary controls unavailable"})
             return
         content_length = self.headers.get("Content-Length")
         try:
@@ -3634,6 +3791,30 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             return
         if not isinstance(body, Mapping):
             self._send(400, {"error": "control request must be an object"})
+            return
+        if is_binance:
+            if set(body) - {"action", "payload"}:
+                self._send(400, {"error": "unsupported Binance control fields"})
+                return
+            action = body.get("action")
+            payload = body.get("payload", {})
+            if not isinstance(action, str) or not action.strip():
+                self._send(400, {"error": "Binance action must be a non-empty string"})
+                return
+            if not isinstance(payload, Mapping):
+                self._send(400, {"error": "Binance payload must be an object"})
+                return
+            try:
+                result = self.server.dashboard_data.binance_canary.action(action, payload)
+            except Exception as exc:
+                self._send(503, {"ok": False, "action": action.strip().upper(), "reason": "BINANCE_ACTION_FAILED", "error": type(exc).__name__})
+                return
+            result = _binance_safe_value(result)
+            if not isinstance(result, Mapping):
+                result = {"ok": True, "action": action.strip().upper(), "result": result}
+            reason = str(result.get("reason", "")) if isinstance(result, Mapping) else ""
+            status = 200 if result.get("ok") is not False else (503 if reason.endswith(("UNAVAILABLE", "TIMEOUT", "FAILED")) else 400)
+            self._send(status, result)
             return
         allowed_fields = {"action", "target", "confirm"}
         if set(body) - allowed_fields:
@@ -3658,7 +3839,7 @@ class _DashboardHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802 - stdlib handler API
         parsed = urlparse(self.path)
         path = parsed.path.strip("/")
-        if path == "api/control":
+        if path in {"api/control", "api/binance/control"}:
             self._send(405, {"error": "POST required"})
             return
         if path in {"", "index.html"}:
@@ -3681,9 +3862,9 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 except _CLIENT_DISCONNECT_ERRORS:
                     return
                 except ValueError as exc:
-                    self._send(400, {"error": "invalid request", "detail": str(exc)})
+                    self._send(400, {"error": "invalid request", "detail": type(exc).__name__ if endpoint.lower() == "binance-canary" else str(exc)})
                 except Exception as exc:
-                    self._send(503, {"error": "data unavailable", "detail": str(exc)})
+                    self._send(503, {"error": "data unavailable", "detail": type(exc).__name__ if endpoint.lower() == "binance-canary" else str(exc)})
                 return
         endpoint = path[4:] if path.startswith("api/") else path
         dynamic_strategy = endpoint.lower().startswith("strategy/") and len(endpoint.split("/", 1)[1]) > 0
