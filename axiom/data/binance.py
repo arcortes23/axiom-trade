@@ -46,6 +46,9 @@ class BinanceAdapter(CryptoMarketDataProvider):
         base_url: str = "https://api.binance.com",
         timeout: float = 10.0,
         opener: Callable[..., Any] | None = None,
+        clock: Callable[[], datetime] | None = None,
+        close_grace: float | Any = 0.0,
+        grace: float | Any | None = None,
     ) -> None:
         timeout_value = float(timeout)
         if not math.isfinite(timeout_value) or timeout_value <= 0:
@@ -55,6 +58,15 @@ class BinanceAdapter(CryptoMarketDataProvider):
         self.timeout = timeout_value
         self._opener = opener
         self._transport_errors: list[HTTPFetchError] = []
+        self._clock = clock or utc_now
+        selected_grace = close_grace if grace is None else grace
+        if hasattr(selected_grace, "total_seconds"):
+            grace_seconds = float(selected_grace.total_seconds())
+        else:
+            grace_seconds = float(selected_grace)
+        if not math.isfinite(grace_seconds) or grace_seconds < 0:
+            raise ValueError("close_grace must be finite and non-negative")
+        self.close_grace = grace_seconds
 
     @staticmethod
     def _normalize_symbol(symbol: str) -> str:
@@ -63,18 +75,6 @@ class BinanceAdapter(CryptoMarketDataProvider):
             raise ValueError("symbol must not be empty")
         return normalized
 
-    def consume_transport_errors(self) -> tuple[HTTPFetchError, ...]:
-        errors = tuple(self._transport_errors)
-        self._transport_errors.clear()
-        return errors
-
-    def _get(self, path: str, **params: Any) -> Any | None:
-        try:
-            return fetch_json_strict(query_url(self.base_url, path, params), self.timeout, self._opener)
-        except HTTPFetchError as exc:
-            self._transport_errors.append(exc)
-            return None
-
     def historical_ohlcv(
         self,
         symbol: str,
@@ -82,47 +82,95 @@ class BinanceAdapter(CryptoMarketDataProvider):
         end: datetime | None = None,
         interval: str = "1d",
     ) -> Sequence[OHLCVBar]:
+        """Return Binance klines, retaining the legacy open-candle behavior.
+
+        This method intentionally does not discard the currently forming kline.
+        Canary collection must call :meth:`closed_historical_ohlcv` instead.
+        """
         symbol = self._normalize_symbol(symbol)
+        rows = self._fetch_kline_rows(symbol, start=start, end=end, interval=interval)
+        bars: list[OHLCVBar] = []
+        for row in rows:
+            bar = self._bar_from_kline(row)
+            if bar is not None:
+                bars.append(bar)
+        bars.sort(key=lambda bar: bar.timestamp)
+        return bars
+
+    def closed_historical_ohlcv(
+        self,
+        symbol: str,
+        start: datetime | None = None,
+        end: datetime | None = None,
+        interval: str = "1d",
+        *,
+        now: datetime | None = None,
+        grace: float | Any | None = None,
+        limit: int | None = None,
+    ) -> Sequence[OHLCVBar]:
+        """Return only klines whose exchange-provided ``closeTime`` has passed.
+
+        Binance's kline open timestamp alone cannot establish that a bar is
+        immutable.  The canary path therefore requires the response's
+        ``closeTime`` and compares it with an injected UTC clock.  ``grace`` is
+        subtracted from the clock to avoid accepting a bar while the exchange
+        is still finalizing it.  The legacy :meth:`historical_ohlcv` method is
+        unchanged and may return the open/current bar.
+        """
+        symbol = self._normalize_symbol(symbol)
+        rows = self._fetch_kline_rows(symbol, start=start, end=end, interval=interval, limit=limit)
+        if now is None:
+            now = self._clock()
+        cutoff = ensure_utc(now)
+        selected_grace = self.close_grace if grace is None else _duration_seconds(grace, "grace")
+        if selected_grace < 0 or not math.isfinite(selected_grace):
+            raise ValueError("grace must be finite and non-negative")
+        cutoff = cutoff.timestamp() - selected_grace
+        bars: list[OHLCVBar] = []
+        for row in rows:
+            if not isinstance(row, (list, tuple)) or len(row) <= 6:
+                continue
+            close_time = parse_timestamp(row[6])
+            if close_time is None or close_time.timestamp() > cutoff:
+                continue
+            bar = self._bar_from_kline(row)
+            if bar is not None:
+                bars.append(bar)
+        bars.sort(key=lambda bar: bar.timestamp)
+        return bars
+
+    # Explicit aliases make the immutable-bar contract discoverable without
+    # changing the established historical_ohlcv interface.
+    closed_ohlcv = closed_historical_ohlcv
+    historical_ohlcv_closed = closed_historical_ohlcv
+
+    def _fetch_kline_rows(
+        self,
+        symbol: str,
+        *,
+        start: datetime | None,
+        end: datetime | None,
+        interval: str,
+        limit: int | None = None,
+    ) -> list[Any]:
+        request_limit = 1000 if limit is None else int(limit)
+        if isinstance(limit, bool) or request_limit <= 0:
+            raise ValueError("limit must be a positive integer")
+        request_limit = min(request_limit, 1000)
         params: dict[str, Any] = {
             "symbol": symbol,
             "interval": interval,
-            "limit": 1000,
+            "limit": request_limit,
             "startTime": _millis(start),
             "endTime": _millis(end),
         }
-        bars: list[OHLCVBar] = []
+        rows: list[Any] = []
         for _page in range(100):
             payload = self._get("/api/v3/klines", **params)
             if not isinstance(payload, list):
                 break
-            for row in payload:
-                if not isinstance(row, (list, tuple)) or len(row) < 6:
-                    continue
-                timestamp = parse_timestamp(row[0])
-                values = [as_float(item) for item in row[1:6]]
-                if (
-                    timestamp is None
-                    or any(value is None for value in values)
-                    or min(values[:4]) <= 0
-                    or values[1] < max(values[0], values[3], values[2])
-                    or values[2] > min(values[0], values[3], values[1])
-                    or values[4] < 0
-                ):
-                    continue
-                bars.append(
-                    OHLCVBar(
-                        timestamp=timestamp,
-                        open=values[0],
-                        high=values[1],
-                        low=values[2],
-                        close=values[3],
-                        volume=values[4],
-                        trades=as_int(row[8]) if len(row) > 8 else None,
-                    )
-                )
-            # Without an explicit start, preserve the endpoint's usual
-            # "latest 1000" behavior rather than downloading all history.
-            if start is None or len(payload) < 1000:
+            rows.extend(payload)
+            if start is None or len(payload) < request_limit:
                 break
             last_open = as_int(payload[-1][0]) if payload and isinstance(payload[-1], (list, tuple)) else None
             if last_open is None:
@@ -132,8 +180,40 @@ class BinanceAdapter(CryptoMarketDataProvider):
             if next_start <= int(params.get("startTime") or 0) or (end_ms is not None and next_start > end_ms):
                 break
             params["startTime"] = next_start
-        bars.sort(key=lambda bar: bar.timestamp)
-        return bars
+        return rows
+
+    @staticmethod
+    def _bar_from_kline(row: Any) -> OHLCVBar | None:
+        if not isinstance(row, (list, tuple)) or len(row) < 6:
+            return None
+        timestamp = parse_timestamp(row[0])
+        values = [as_float(item) for item in row[1:6]]
+        if (
+            timestamp is None
+            or any(value is None for value in values)
+            or min(values[:4]) <= 0
+            or values[1] < max(values[0], values[3], values[2])
+            or values[2] > min(values[0], values[3], values[1])
+            or values[4] < 0
+        ):
+            return None
+        return OHLCVBar(
+            timestamp=timestamp,
+            open=values[0],
+            high=values[1],
+            low=values[2],
+            close=values[3],
+            volume=values[4],
+            trades=as_int(row[8]) if len(row) > 8 else None,
+        )
+
+    def _get(self, path: str, **params: Any) -> Any | None:
+        try:
+            return fetch_json_strict(query_url(self.base_url, path, params), self.timeout, self._opener)
+        except HTTPFetchError as exc:
+            self._transport_errors.append(exc)
+            return None
+
 
     def ticker(self, symbol: str) -> CryptoTicker | None:
         symbol = self._normalize_symbol(symbol)
@@ -336,11 +416,10 @@ class BinanceAdapter(CryptoMarketDataProvider):
                     tick_size = as_float(item.get("tickSize"))
                 elif kind == "LOT_SIZE":
                     lot_size = as_float(item.get("stepSize"))
-        extra = {
-            key: record[key]
-            for key in ("status", "permissions", "quoteOrderQtyMarketAllowed", "isSpotTradingAllowed")
-            if key in record
-        }
+        # Keep the complete public exchangeInfo symbol record.  Downstream
+        # canary/risk checks need status, permissions, orderTypes,
+        # permissionSets, and every filter (not only tick/lot size).
+        extra = dict(record)
         return InstrumentMetadata(
             symbol=str(record.get("symbol", symbol)),
             market_type=MarketType.CRYPTO_SPOT,
@@ -352,6 +431,15 @@ class BinanceAdapter(CryptoMarketDataProvider):
             currency=str(record.get("quoteAsset") or "USD"),
             extra=extra,
         )
+
+def _duration_seconds(value: Any, name: str) -> float:
+    if hasattr(value, "total_seconds"):
+        seconds = float(value.total_seconds())
+    else:
+        seconds = float(value)
+    if not math.isfinite(seconds):
+        raise ValueError(f"{name} must be finite")
+    return seconds
 
 
 def _millis(value: datetime | None) -> int | None:
