@@ -6,6 +6,7 @@ import tempfile
 import sqlite3
 import threading
 import unittest
+from pathlib import Path
 
 from axiom.binance_execution import (
     ACKNOWLEDGED,
@@ -22,10 +23,11 @@ from axiom.binance_execution import (
     UNKNOWN,
     BinanceExecutionService,
 )
-from axiom.binance_risk import BinanceRiskEnvelope
 from axiom.binance_dev import PaperBinanceSpotVenue
-from axiom.binance_spot import BINANCE_SPOT_TESTNET, BinanceSpotRESTClient
+from axiom.binance_spot import BINANCE_SPOT_TESTNET, BinanceCredentialRef, BinanceRuntimeProfile, BinanceSpotRESTClient, canonical_sha256
+from axiom.binance_testnet import BinanceTestnetGateService
 from axiom.storage import AxiomStore
+from axiom.binance_risk import BinanceRiskEnvelope
 
 
 UTC = timezone.utc
@@ -65,6 +67,24 @@ def TestnetVenue() -> BinanceSpotRESTClient:
         {"api_key": "test-key", "api_secret": "test-secret"},
         opener=lambda *_args, **_kwargs: None,
     )
+def StrictTestnetExecutionOptions() -> dict[str, object]:
+    """Fixed runtime-owned seams required by strict TESTNET construction."""
+    qualification = object()
+
+    def authorize(_: object) -> tuple[bool, str]:
+        return True, "AUTHORIZED"
+
+    authorize._axiom_testnet_runtime_authorizer = True
+    authorize._axiom_testnet_qualification = qualification
+    return {
+        "credential_ref": BinanceCredentialRef(
+            instance="binance-testnet",
+            environment=BINANCE_SPOT_TESTNET,
+        ),
+        "qualification": qualification,
+        "entry_binding_authorizer": authorize,
+        "entry_policy_hash": "BINANCE_TESTNET_CURRENT_QUALIFICATION_V1",
+    }
 
 
 class _UntrustedVenue:
@@ -142,6 +162,52 @@ class BinanceExecutionContractTests(unittest.TestCase):
         self.service = BinanceExecutionService(self.store, venue=self.venue, environment="PAPER")
         self.service.update_account({"quote_available": "100", "owned_inventory": {}})
 
+    def _create_probe_peer_tables(self):
+        self.store.connection.executescript(
+            """
+            CREATE TABLE binance_testnet_probe_intents (
+                intent_id TEXT PRIMARY KEY, probe_kind TEXT, symbol TEXT, side TEXT,
+                quantity TEXT, notional TEXT, fee_reserve TEXT, state TEXT,
+                reason TEXT, created_at_utc TEXT
+            );
+            CREATE TABLE binance_testnet_probe_reservations (
+                intent_id TEXT, probe_kind TEXT, symbol TEXT, side TEXT,
+                amount TEXT, fee_reserve TEXT, reserved_quantity TEXT, status TEXT
+            );
+            CREATE TABLE binance_testnet_probe_fills (
+                intent_id TEXT, symbol TEXT, side TEXT, quantity TEXT, price TEXT,
+                quote_quantity TEXT, commission TEXT, commission_asset TEXT,
+                trade_time_utc TEXT, trade_id TEXT
+            );
+            CREATE TABLE binance_testnet_probe_events (
+                intent_id TEXT, to_state TEXT, observed_at_utc TEXT
+            );
+            """
+        )
+
+    def test_probe_peer_invalid_intent_side_fails_closed(self):
+        self._create_probe_peer_tables()
+        self.store.connection.execute(
+            "INSERT INTO binance_testnet_probe_intents VALUES(?,?,?,?,?,?,?,?,?,?)",
+            ("bad", "TESTNET EXECUTION PROBE", "BTCUSDT", "HOLD", "1", "10", "0.01", "FILLED", "", T0.isoformat()),
+        )
+        self.store.connection.commit()
+        peer = self.service._probe_peer_snapshot(T0)
+        self.assertEqual(peer["block_auto"], "PROBE_STATE_MALFORMED")
+
+    def test_probe_peer_reservation_symbol_side_mismatch_fails_closed_even_released(self):
+        self._create_probe_peer_tables()
+        self.store.connection.execute(
+            "INSERT INTO binance_testnet_probe_intents VALUES(?,?,?,?,?,?,?,?,?,?)",
+            ("intent", "TESTNET EXECUTION PROBE", "BTCUSDT", "BUY", "1", "10", "0.01", "FILLED", "", T0.isoformat()),
+        )
+        self.store.connection.execute(
+            "INSERT INTO binance_testnet_probe_reservations VALUES(?,?,?,?,?,?,?,?)",
+            ("intent", "TESTNET EXECUTION PROBE", "ETHUSDT", "SELL", "10", "0.01", "0", "RELEASED"),
+        )
+        self.store.connection.commit()
+        peer = self.service._probe_peer_snapshot(T0)
+        self.assertEqual(peer["block_auto"], "PROBE_STATE_MALFORMED")
     def tearDown(self):
         self.store.close()
 
@@ -152,6 +218,28 @@ class BinanceExecutionContractTests(unittest.TestCase):
         self.service.enable_auto_canary(ENABLE_CONFIRMATION)
         self.assertEqual(self.service.control()["state"], "ARMED")
         self.assertTrue(self.service.control()["authorized"])
+    def test_testnet_deadline_is_rechecked_before_durable_arm(self):
+        store = AxiomStore(":memory:")
+        ticks = iter((0.0, 51.0))
+        service = BinanceExecutionService(
+            store,
+            venue=TestnetVenue(),
+            environment=BINANCE_SPOT_TESTNET,
+            credentials={"api_key": "test-key", "api_secret": "test-secret"},
+            **StrictTestnetExecutionOptions(),
+            monotonic_clock=lambda: next(ticks),
+        )
+        try:
+            with self.assertRaisesRegex(TimeoutError, "AUTO_DEADLINE_EXPIRED"):
+                service.enable_auto_canary(
+                    ENABLE_TESTNET_CONFIRMATION,
+                    deadline_monotonic=50.0,
+                )
+            self.assertEqual(service.control()["state"], "DISABLED")
+            self.assertFalse(service.control()["authorized"])
+        finally:
+            service.close()
+            store.close()
     def test_testnet_requires_distinct_phrase_and_frozen_risk_envelope(self):
         store = AxiomStore(":memory:")
         service = BinanceExecutionService(
@@ -159,6 +247,7 @@ class BinanceExecutionContractTests(unittest.TestCase):
             venue=TestnetVenue(),
             environment=BINANCE_SPOT_TESTNET,
             credentials={"api_key": "test-key", "api_secret": "test-secret"},
+            **StrictTestnetExecutionOptions(),
         )
         try:
             self.assertEqual(service.control()["state"], "DISABLED")
@@ -182,6 +271,204 @@ class BinanceExecutionContractTests(unittest.TestCase):
         finally:
             service.close()
             store.close()
+    def test_testnet_auto_refuses_unresolved_probe_before_arm(self):
+        store = AxiomStore(":memory:")
+        temp = tempfile.TemporaryDirectory()
+        gate = BinanceTestnetGateService(
+            store,
+            profile=BinanceRuntimeProfile.testnet(Path(temp.name)),
+            venue=TestnetVenue(),
+            credentials={"api_key": "test-key", "api_secret": "test-secret"},
+        )
+        intent_id = gate._insert_intent(
+            symbol="BTCUSDT",
+            side="BUY",
+            price=Decimal("10"),
+            quantity=Decimal("1"),
+            notional=Decimal("10"),
+            fee_reserve=Decimal("0.01"),
+            tif="IOC",
+            client_id="probe-unknown",
+        )
+        gate._transition(intent_id, "UNKNOWN", "ambiguous venue response")
+        service = BinanceExecutionService(
+            store,
+            venue=TestnetVenue(),
+            environment=BINANCE_SPOT_TESTNET,
+            credentials={"api_key": "test-key", "api_secret": "test-secret"},
+            **StrictTestnetExecutionOptions(),
+        )
+        try:
+            with self.assertRaisesRegex(PermissionError, "TESTNET_PROBE_PROBE_UNKNOWN"):
+                service.enable_auto_canary(ENABLE_TESTNET_CONFIRMATION)
+            self.assertEqual(service.control()["state"], "DISABLED")
+        finally:
+            service.close()
+            temp.cleanup()
+            store.close()
+    def test_armed_testnet_entry_blocks_every_probe_peer_blocker(self):
+        for index, (probe_state, reservation_status, with_fill) in enumerate(
+            (("RESERVED", "HELD", False), ("DUST", "RELEASED", False), ("FILLED", "RELEASED", True)),
+            start=1,
+        ):
+            with self.subTest(probe_state=probe_state):
+                store = AxiomStore(":memory:")
+                venue = TestnetVenue()
+                transport_calls: list[tuple[object, object]] = []
+                venue._opener = lambda *args, **kwargs: transport_calls.append((args, kwargs))
+                service = BinanceExecutionService(
+                    store,
+                    venue=venue,
+                    environment=BINANCE_SPOT_TESTNET,
+                    credentials={"api_key": "test-key", "api_secret": "test-secret"},
+                    **StrictTestnetExecutionOptions(),
+                )
+                binding = {
+                    "candidate_id": "c1",
+                    "symbol": "BTCUSDT",
+                    "environment": BINANCE_SPOT_TESTNET,
+                }
+                strict_signal = {
+                    **signal(f"peer-block-{index}"),
+                    "environment": BINANCE_SPOT_TESTNET,
+                    "binding": binding,
+                    "binding_hash": canonical_sha256(binding),
+                    "provenance": {"candidate_id": "c1", "symbol": "BTCUSDT"},
+                    "strategy_ref": {"id": "strict-fixture"},
+                }
+                try:
+                    service.update_account({"balances": [{"asset": "USDT", "free": "100"}]})
+                    service.enable_auto_canary(ENABLE_TESTNET_CONFIRMATION)
+                    store.connection.executescript(
+                        """
+                        CREATE TABLE binance_testnet_probe_intents (
+                            intent_id TEXT PRIMARY KEY, probe_kind TEXT, symbol TEXT, side TEXT,
+                            quantity TEXT, notional TEXT, fee_reserve TEXT, state TEXT,
+                            reason TEXT, created_at_utc TEXT
+                        );
+                        CREATE TABLE binance_testnet_probe_reservations (
+                            intent_id TEXT, probe_kind TEXT, symbol TEXT, side TEXT,
+                            amount TEXT, fee_reserve TEXT, reserved_quantity TEXT, status TEXT
+                        );
+                        CREATE TABLE binance_testnet_probe_fills (
+                            intent_id TEXT, symbol TEXT, side TEXT, quantity TEXT, price TEXT,
+                            quote_quantity TEXT, commission TEXT, commission_asset TEXT,
+                            trade_time_utc TEXT, trade_id TEXT
+                        );
+                        CREATE TABLE binance_testnet_probe_events (
+                            intent_id TEXT, to_state TEXT, observed_at_utc TEXT
+                        );
+                        """
+                    )
+                    store.connection.execute(
+                        "INSERT INTO binance_testnet_probe_intents VALUES(?,?,?,?,?,?,?,?,?,?)",
+                        ("peer", "TESTNET EXECUTION PROBE", "BTCUSDT", "BUY", "1", "10", "0.01", probe_state, "", T0.isoformat()),
+                    )
+                    store.connection.execute(
+                        "INSERT INTO binance_testnet_probe_reservations VALUES(?,?,?,?,?,?,?,?)",
+                        ("peer", "TESTNET EXECUTION PROBE", "BTCUSDT", "BUY", "10", "0.01", "0", reservation_status),
+                    )
+                    if with_fill:
+                        store.connection.execute(
+                            "INSERT INTO binance_testnet_probe_fills VALUES(?,?,?,?,?,?,?,?,?,?)",
+                            ("peer", "BTCUSDT", "BUY", "1", "10", "10", "0", "BTC", T0.isoformat(), "peer-trade"),
+                        )
+                    store.connection.commit()
+                    blocked = service.submit_signal(
+                        strict_signal,
+                        price="10",
+                        quantity="1",
+                        market={
+                            "symbol": "BTCUSDT",
+                            "ticker_fresh": True,
+                            "book_fresh": True,
+                            "fill_evidence": {"buy": {"price": "10", "fresh": True}},
+                        },
+                    )
+                    self.assertEqual(blocked["state"], REJECTED)
+                    self.assertIn("TESTNET_PROBE_", blocked["reason"])
+                    self.assertEqual(transport_calls, [])
+                finally:
+                    service.close()
+                    store.close()
+
+    def test_testnet_nested_fill_client_identity_mismatch_is_unknown_and_held(self):
+        store = AxiomStore(":memory:")
+        venue = TestnetVenue()
+        calls: list[dict[str, object]] = []
+
+        def place(**kwargs: object) -> dict[str, object]:
+            calls.append(kwargs)
+            client_order_id = str(kwargs["newClientOrderId"])
+            return {
+                "status": "FILLED",
+                "symbol": "BTCUSDT",
+                "side": "BUY",
+                "orderId": "12345",
+                "clientOrderId": client_order_id,
+                "executedQty": "1",
+                "origQty": "1",
+                "fills": [
+                    {
+                        "tradeId": "wrong-client-fill",
+                        "orderId": "12345",
+                        "symbol": "BTCUSDT",
+                        "clientOrderId": "wrong-client-order",
+                        "qty": "1",
+                        "price": "10",
+                    }
+                ],
+            }
+
+        venue.place_limit_order = place
+        service = BinanceExecutionService(
+            store,
+            venue=venue,
+            environment=BINANCE_SPOT_TESTNET,
+            credentials={"api_key": "test-key", "api_secret": "test-secret"},
+            **StrictTestnetExecutionOptions(),
+        )
+        binding = {
+            "candidate_id": "c1",
+            "symbol": "BTCUSDT",
+            "environment": BINANCE_SPOT_TESTNET,
+        }
+        strict_signal = {
+            **signal("testnet-fill-client-mismatch"),
+            "environment": BINANCE_SPOT_TESTNET,
+            "binding": binding,
+            "binding_hash": canonical_sha256(binding),
+            "provenance": {"candidate_id": "c1", "symbol": "BTCUSDT"},
+            "strategy_ref": {"id": "strict-fixture"},
+        }
+        try:
+            service.update_account(
+                {
+                    "balances": [{"asset": "USDT", "free": "100"}],
+                    "owned_inventory": {},
+                }
+            )
+            service.enable_auto_canary(ENABLE_TESTNET_CONFIRMATION)
+            result = service.submit_signal(
+                strict_signal,
+                price="10",
+                quantity="1",
+                market={
+                    "symbol": "BTCUSDT",
+                    "ticker_fresh": True,
+                    "book_fresh": True,
+                    "fill_evidence": {"buy": {"price": "10", "fresh": True}},
+                },
+            )
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(result["state"], UNKNOWN)
+            self.assertEqual(result["reason"], "TRADE_RESPONSE_IDENTITY_MISMATCH")
+            self.assertEqual(result["risk_reservation"]["status"], "HELD")
+            self.assertEqual(service.fills(), [])
+        finally:
+            service.close()
+            store.close()
+
 
     def test_persisted_paper_authorization_is_disabled_for_testnet(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -195,6 +482,7 @@ class BinanceExecutionContractTests(unittest.TestCase):
                 venue=TestnetVenue(),
                 environment=BINANCE_SPOT_TESTNET,
                 credentials={"api_key": "test-key", "api_secret": "test-secret"},
+                **StrictTestnetExecutionOptions(),
             )
             try:
                 self.assertEqual(testnet.control()["state"], "DISABLED")
@@ -226,6 +514,7 @@ class BinanceExecutionContractTests(unittest.TestCase):
 
         self.venue.trades["1"] = [{
             "tradeId": "partial-1",
+            "orderId": entry["exchange_order_id"],
             "qty": "0.25",
             "price": "10",
             "quoteQty": "2.5",
@@ -263,7 +552,7 @@ class BinanceExecutionContractTests(unittest.TestCase):
         self.service.update_account({"quote_available": "100", "api_secret": "DO_NOT_PERSIST"})
         self.service.enable_auto_canary(ENABLE_CONFIRMATION)
         entry = self.service.submit_signal(signal(), price="10", quantity="1")
-        fill = {"tradeId": "same", "qty": "1", "price": "10", "quoteQty": "10", "commission": "0", "time": T0.isoformat()}
+        fill = {"tradeId": "same", "orderId": entry["exchange_order_id"], "qty": "1", "price": "10", "quoteQty": "10", "commission": "0", "time": T0.isoformat()}
         self.venue.trades["1"] = [dict(fill), dict(fill)]
         self.assertEqual(self.service.reconcile()["status"], "SUCCESS")
         self.assertEqual(len(self.service.fills()), 1)
@@ -1063,7 +1352,13 @@ class BinanceExecutionContractTests(unittest.TestCase):
         self.assertEqual(order["state"], FILLED)
         self.assertEqual(order["risk_reservation"]["status"], "HELD")
         self.venue.trades[entry["exchange_order_id"]] = [
-            {"tradeId": "filled-later", "qty": "1", "price": "10", "quoteQty": "10"}
+            {
+                "tradeId": "filled-later",
+                "orderId": entry["exchange_order_id"],
+                "qty": "1",
+                "price": "10",
+                "quoteQty": "10",
+            }
         ]
         self.assertEqual(self.service.reconcile()["status"], "SUCCESS")
         self.assertEqual(self.service.orders()[0]["risk_reservation"]["status"], "RELEASED")
@@ -1192,6 +1487,151 @@ class BinanceExecutionContractTests(unittest.TestCase):
                     finally:
                         service.close()
 
+    def test_canceled_aggregate_waits_for_delayed_buy_trade_across_restart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = directory + "/execution.sqlite"
+            venue = FakeVenue()
+            first = BinanceExecutionService(path, venue=venue, environment="PAPER")
+            try:
+                first.update_account({"quote_available": "100", "owned_inventory": {}})
+                first.enable_auto_canary(ENABLE_CONFIRMATION)
+                entry = first.submit_signal(
+                    signal("delayed-buy"),
+                    price="10",
+                    quantity="1",
+                )
+                venue.query_result = {
+                    "status": CANCELED,
+                    "orderId": entry["exchange_order_id"],
+                    "executedQty": "0.4",
+                }
+                self.assertEqual(first.reconcile()["status"], "SUCCESS")
+                unresolved = first.orders()[0]
+                self.assertEqual(unresolved["state"], UNKNOWN)
+                self.assertEqual(unresolved["risk_reservation"]["status"], "HELD")
+                self.assertEqual(len(first.fills()), 0)
+            finally:
+                first.close()
+
+            venue.trades[entry["exchange_order_id"]] = [
+                {
+                    "tradeId": "delayed-buy-missing-order-id",
+                    "qty": "0.4",
+                    "price": "10",
+                    "quoteQty": "4",
+                    "commission": "0.01",
+                    "commissionAsset": "USDT",
+                    "time": T0.isoformat(),
+                },
+                {
+                    "tradeId": "delayed-buy-unrelated-order",
+                    "orderId": "unrelated-order",
+                    "qty": "0.4",
+                    "price": "10",
+                    "quoteQty": "4",
+                    "commission": "0.01",
+                    "commissionAsset": "USDT",
+                    "time": T0.isoformat(),
+                },
+            ]
+            second = BinanceExecutionService(path, venue=venue, environment="PAPER")
+            try:
+                self.assertEqual(second.reconcile()["status"], "SUCCESS")
+                unresolved = second.orders()[0]
+                self.assertEqual(unresolved["state"], UNKNOWN)
+                self.assertEqual(unresolved["risk_reservation"]["status"], "HELD")
+                self.assertEqual(len(second.fills()), 0)
+                self.assertIsNone(second.position("BTCUSDT"))
+
+                venue.trades[entry["exchange_order_id"]] = [
+                    {
+                        "tradeId": "delayed-buy-fill",
+                        "orderId": entry["exchange_order_id"],
+                        "qty": "0.4",
+                        "price": "10",
+                        "quoteQty": "4",
+                        "commission": "0.01",
+                        "commissionAsset": "USDT",
+                        "time": T0.isoformat(),
+                    }
+                ]
+                self.assertEqual(second.reconcile()["status"], "SUCCESS")
+                resolved = second.orders()[0]
+                self.assertEqual(resolved["state"], CANCELED)
+                self.assertEqual(resolved["risk_reservation"]["status"], "RELEASED")
+                self.assertEqual(Decimal(second.position("BTCUSDT")["quantity"]), Decimal("0.4"))
+                self.assertEqual(Decimal(second.position("BTCUSDT")["fees_quote"]), Decimal("0.01"))
+                self.assertEqual(len(second.fills()), 1)
+
+                self.assertEqual(second.reconcile()["status"], "SUCCESS")
+                self.assertEqual(len(second.fills()), 1)
+                self.assertEqual(len(venue.submissions), 1)
+            finally:
+                second.close()
+
+    def test_expired_aggregate_waits_for_delayed_sell_trade_and_releases_remainder(self):
+        venue = self.venue
+        self.service.enable_auto_canary(ENABLE_CONFIRMATION)
+        seed = self.service.submit_signal(signal("sell-seed"), price="10", quantity="1")
+        self.service.record_fills(
+            seed["intent_id"],
+            [{"tradeId": "sell-seed-fill", "qty": "1", "price": "10", "quoteQty": "10", "time": T0.isoformat()}],
+        )
+        exit_order = self.service.submit_signal(
+            signal("delayed-sell", intent="EXIT"),
+            price="10",
+            quantity="1",
+        )
+        venue.query_result = {
+            "status": EXPIRED,
+            "orderId": exit_order["exchange_order_id"],
+            "executedQty": "0.4",
+        }
+        self.assertEqual(self.service.reconcile()["status"], "SUCCESS")
+        unresolved = next(
+            row for row in self.service.orders() if row["intent_id"] == exit_order["intent_id"]
+        )
+        self.assertEqual(unresolved["state"], UNKNOWN)
+        self.assertEqual(unresolved["risk_reservation"]["status"], "HELD")
+        self.assertEqual(unresolved["risk_reservation"]["reserved_quantity"], "1")
+        self.assertEqual(
+            Decimal(self.service.position("BTCUSDT")["quantity"]),
+            Decimal("1"),
+        )
+
+        venue.trades[exit_order["exchange_order_id"]] = [
+            {
+                "tradeId": "delayed-sell-fill",
+                "orderId": exit_order["exchange_order_id"],
+                "qty": "0.4",
+                "price": "10",
+                "quoteQty": "4",
+                "commission": "0",
+                "time": T0.isoformat(),
+            }
+        ]
+        self.assertEqual(self.service.reconcile()["status"], "SUCCESS")
+        resolved = next(
+            row for row in self.service.orders() if row["intent_id"] == exit_order["intent_id"]
+        )
+        self.assertEqual(resolved["state"], EXPIRED)
+        self.assertEqual(resolved["risk_reservation"]["status"], "RELEASED")
+        self.assertEqual(resolved["risk_reservation"]["reserved_quantity"], "0.6")
+        self.assertEqual(
+            Decimal(self.service.position("BTCUSDT")["quantity"]),
+            Decimal("0.6"),
+        )
+        blocked = self.service.submit_signal(
+            signal("sell-too-much", intent="EXIT"),
+            price="10",
+            quantity="0.7",
+        )
+        self.assertEqual(blocked["state"], REJECTED)
+        self.assertIn("INSUFFICIENT_OWNED_INVENTORY", blocked["reason"])
+        self.assertEqual(len(venue.submissions), 2)
+        self.assertEqual(self.service.reconcile()["status"], "SUCCESS")
+        self.assertEqual(len(self.service.fills()), 2)
+
     def test_venue_identity_is_required_and_profile_bound(self):
         with self.assertRaises(ValueError):
             BinanceExecutionService(":memory:", venue=object(), environment="PAPER")
@@ -1229,5 +1669,118 @@ class BinanceExecutionContractTests(unittest.TestCase):
         ).fetchone()[0]
         self.assertEqual(persisted, 0)
         self.assertEqual(self.venue.submissions, [])
+    def test_dynamic_authorizer_and_policy_are_an_atomic_constructor_pair(self):
+        with self.assertRaises(ValueError):
+            BinanceExecutionService(self.store, venue=self.venue, environment="PAPER", entry_policy_hash="policy")
+        with self.assertRaises(ValueError):
+            BinanceExecutionService(self.store, venue=self.venue, environment="PAPER", entry_binding_authorizer=lambda payload: (True, ""))
+
+    def test_dynamic_entry_authorizes_successor_without_static_binding_equality(self):
+        store = AxiomStore(":memory:")
+        venue = FakeVenue()
+        binding = {"candidate_id": "dynamic-candidate", "symbol": "BTCUSDT", "environment": "PAPER", "binding_hash": "dynamic-hash"}
+        provenance = {"candidate_id": "dynamic-candidate", "symbol": "BTCUSDT", "source_binding_hash": "source", "qualification_hash": "qualification", "strategy_ref": {"id": "strategy"}}
+        seen = []
+        service = BinanceExecutionService(
+            store,
+            venue=venue,
+            environment="PAPER",
+            entry_binding_authorizer=lambda payload: (seen.append(dict(payload)) is None, ""),
+            entry_policy_hash="policy-v1",
+        )
+        try:
+            service.update_account({"quote_available": "100", "owned_inventory": {}})
+            service.enable_auto_canary(ENABLE_CONFIRMATION)
+            result = service.submit_signal(
+                {
+                    **signal("dynamic"),
+                    "candidate_id": "dynamic-candidate",
+                    "binding_hash": "dynamic-hash",
+                    "binding": binding,
+                    "provenance": provenance,
+                },
+                price="10",
+                quantity="1",
+            )
+            self.assertIn(result["state"], {ACKNOWLEDGED, UNKNOWN})
+            self.assertEqual(len(venue.submissions), 1)
+            self.assertGreaterEqual(len(seen), 2)
+            self.assertEqual(seen[-1]["binding"], binding)
+        finally:
+            service.close()
+            store.close()
+
+    def test_dynamic_selection_change_at_final_fence_is_known_unsent(self):
+        store = AxiomStore(":memory:")
+        venue = FakeVenue()
+        binding = {"candidate_id": "dynamic-candidate", "symbol": "BTCUSDT", "environment": "PAPER", "binding_hash": "dynamic-hash"}
+        provenance = {"candidate_id": "dynamic-candidate", "symbol": "BTCUSDT", "source_binding_hash": "source", "qualification_hash": "qualification", "strategy_ref": {"id": "strategy"}}
+        selected = {"binding_hash": "dynamic-hash"}
+
+        def authorize(payload):
+            return (payload["binding"]["binding_hash"] == selected["binding_hash"], "")
+
+        def fault(point):
+            if point == "before_venue_call":
+                selected["binding_hash"] = "changed"
+
+        service = BinanceExecutionService(
+            store,
+            venue=venue,
+            environment="PAPER",
+            entry_binding_authorizer=authorize,
+            entry_policy_hash="policy-v1",
+            fault_hook=fault,
+        )
+        try:
+            service.update_account({"quote_available": "100", "owned_inventory": {}})
+            service.enable_auto_canary(ENABLE_CONFIRMATION)
+            result = service.submit_signal(
+                {
+                    **signal("dynamic-final"),
+                    "candidate_id": "dynamic-candidate",
+                    "binding_hash": "dynamic-hash",
+                    "binding": binding,
+                    "provenance": provenance,
+                },
+                price="10",
+                quantity="1",
+            )
+            self.assertEqual(result["state"], REJECTED)
+            self.assertEqual(len(venue.submissions), 0)
+            self.assertEqual(result["risk_reservation"]["status"], "RELEASED")
+        finally:
+            service.close()
+            store.close()
+
+    def test_dynamic_exit_rejects_account_inventory_without_durable_origin(self):
+        store = AxiomStore(":memory:")
+        venue = FakeVenue()
+        service = BinanceExecutionService(
+            store,
+            venue=venue,
+            environment="PAPER",
+            entry_binding_authorizer=lambda payload: (True, ""),
+            entry_policy_hash="policy-v1",
+        )
+        try:
+            service.update_account({"quote_available": "100", "owned_inventory": {"BTCUSDT": "1"}})
+            service.enable_auto_canary(ENABLE_CONFIRMATION)
+            result = service.submit_signal(signal("dynamic-unresolved-exit", intent="EXIT"), price="10", quantity="1")
+            self.assertEqual(result["state"], REJECTED)
+            self.assertEqual(result["reason"], "EXIT_ORIGIN_UNRESOLVED")
+            self.assertEqual(venue.submissions, [])
+        finally:
+            service.close()
+            store.close()
+
+    def test_expired_submit_is_known_unsent_and_never_calls_venue(self):
+        venue = self.venue
+        self.service.enable_auto_canary(ENABLE_CONFIRMATION)
+        result = self.service.submit_signal(signal("expired"), price="10", quantity="1", deadline_monotonic=0)
+        self.assertEqual(result["state"], REJECTED)
+        self.assertEqual(result["reason"], "AUTO_DEADLINE_EXPIRED")
+        self.assertEqual(venue.submissions, [])
+
 if __name__ == "__main__":
     unittest.main()

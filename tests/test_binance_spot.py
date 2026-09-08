@@ -5,6 +5,7 @@ import hmac
 import json
 import os
 from pathlib import Path
+import time
 import tempfile
 import unittest
 from urllib.parse import parse_qs, urlsplit
@@ -18,6 +19,7 @@ from axiom.binance_spot import (
     BinanceRuntimeProfile,
     BinanceSpotConfigurationError,
     BinanceSpotCredentials,
+    BinanceSpotTransportError,
     BinanceSpotEnvironment,
     BinanceSpotEnvironmentMismatch,
     BinanceSpotRESTClient,
@@ -334,6 +336,79 @@ class BinanceSpotTests(unittest.TestCase):
         self.assertTrue(
             request.full_url.startswith("https://testnet.binance.vision/api/v3/account?")
         )
+
+    def test_deadline_is_transport_only_and_bounds_opener_timeout(self):
+        seen = []
+        timeouts = []
+
+        def opener(request, timeout):
+            seen.append(request)
+            timeouts.append(timeout)
+            return Response({"status": "NEW"})
+
+        client = BinanceSpotRESTClient(
+            BINANCE_SPOT_TESTNET,
+            {"api_key": "public-key", "api_secret": "private-secret"},
+            opener=opener,
+            clock=lambda: 1_700_000_000,
+        )
+        deadline = time.monotonic() + 0.25
+        client.place_order(
+            symbol="BTCUSDT",
+            side="BUY",
+            quantity="1",
+            price="100",
+            deadline_monotonic=deadline,
+        )
+        request = seen[0]
+        encoded = request.data.decode() if request.data else urlsplit(request.full_url).query
+        self.assertNotIn("deadline_monotonic", encoded)
+        self.assertLessEqual(timeouts[0], 0.25)
+
+    def test_signed_timestamp_uses_bounded_server_offset_and_reserved_fields_fail_closed(self):
+        seen = []
+
+        def opener(request, timeout):
+            seen.append(request)
+            return Response({})
+
+        client = BinanceSpotRESTClient(
+            BINANCE_SPOT_TESTNET,
+            {"api_key": "public-key", "api_secret": "private-secret"},
+            opener=opener,
+            clock=lambda: 1_700_000_000,
+        )
+        client.set_server_time_offset_ms(8_000)
+        client.test_order(
+            symbol="BTCUSDT",
+            side="BUY",
+            quantity="1",
+            price="100",
+        )
+        body = parse_qs(seen[0].data.decode())
+        self.assertEqual(body["timestamp"], ["1700000008000"])
+        self.assertEqual(body["recvWindow"], ["5000"])
+        with self.assertRaises(BinanceSpotConfigurationError):
+            client.account(timestamp=1)
+        with self.assertRaises(BinanceSpotConfigurationError):
+            client.account(recvWindow=50_000)
+
+    def test_signed_redirect_is_rejected_before_any_follow_up(self):
+        calls = []
+
+        def opener(request, timeout):
+            calls.append(request)
+            return Response({}, status=302, headers={"Location": "https://evil.example/account"})
+
+        client = BinanceSpotRESTClient(
+            BINANCE_SPOT_TESTNET,
+            {"api_key": "public-key", "api_secret": "private-secret"},
+            opener=opener,
+        )
+        with self.assertRaises(BinanceSpotTransportError):
+            client.account()
+        self.assertEqual(len(calls), 1)
+
     def test_query_and_cancel_never_sign_python_client_order_id_alias(self):
         seen = []
 

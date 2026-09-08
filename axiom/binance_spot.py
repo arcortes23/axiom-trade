@@ -14,6 +14,7 @@ import json
 import math
 import os
 import socket
+import threading
 import time
 from collections.abc import Mapping, MutableMapping, Sequence
 from dataclasses import dataclass, field
@@ -23,8 +24,8 @@ from pathlib import Path
 import stat
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
-from urllib.request import Request, urlopen
+from urllib.parse import urlencode, urlsplit
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 
 class BinanceSpotEnvironment(str, Enum):
@@ -74,6 +75,15 @@ API_BASELINE_DATE = BINANCE_API_BASELINE_DATE
 TESTNET_API_BASELINE_DATE = BINANCE_TESTNET_API_BASELINE_DATE
 BINANCE_SPOT_REQUIRED_PERMISSIONS = frozenset({"USER_DATA", "TRADE"})
 BINANCE_SPOT_PROHIBITED_PERMISSIONS = frozenset({"WITHDRAWAL", "TRANSFER"})
+_MAX_SERVER_TIME_OFFSET_MS = 120_000
+_DEADLINE_REQUEST_CEILING_SECONDS = 1.0
+
+
+class _RejectRedirectHandler(HTTPRedirectHandler):
+    """Reject redirects before urllib can replay an authenticated request."""
+
+    def redirect_request(self, req: Request, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> Request | None:
+        raise BinanceSpotTransportError("Binance Spot transport rejected redirect")
 
 
 class BinanceSpotConfigurationError(ValueError):
@@ -869,17 +879,60 @@ class BinanceSpotRESTClient:
             raise ValueError("recv_window must be between 1 and 5000")
         self.timeout = timeout_value
         self.recv_window = recv_value
-        self._opener = opener or urlopen
+        self._request_lock = threading.RLock()
+        self._timeout_local = threading.local()
+        self._server_time_offset_ms = 0
+        self._opener = opener or build_opener(_RejectRedirectHandler())
         self._clock = clock or time.time
 
     @property
     def origin(self) -> str | None:
         return self.base_url
 
-    @classmethod
-    def for_environment(cls, environment: BinanceSpotEnvironment | str, credentials: BinanceSpotCredentials, **kwargs: Any) -> "BinanceSpotRESTClient":
-        return cls(environment, credentials, **kwargs)
+    def _effective_timeout(self) -> float:
+        with self._request_lock:
+            return float(getattr(self._timeout_local, "value", self.timeout))
 
+    def set_server_time_offset_ms(self, offset_ms: int | float) -> None:
+        """Set the bounded clock correction used by every signed request."""
+        if isinstance(offset_ms, bool):
+            raise ValueError("server time offset must be finite")
+        try:
+            value = int(offset_ms)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("server time offset must be finite") from exc
+        if abs(value) > _MAX_SERVER_TIME_OFFSET_MS:
+            raise ValueError("server time offset is outside the supported bound")
+        with self._request_lock:
+            self._server_time_offset_ms = value
+
+    @property
+    def server_time_offset_ms(self) -> int:
+        with self._request_lock:
+            return self._server_time_offset_ms
+
+    def _response_origin_check(self, response: Any, request_url: str) -> None:
+        geturl = getattr(response, "geturl", None)
+        response_url = geturl() if callable(geturl) else None
+        if not response_url:
+            return
+        expected = urlsplit(request_url)
+        actual = urlsplit(str(response_url))
+        expected_origin = (expected.scheme.lower(), expected.hostname, expected.port)
+        actual_origin = (actual.scheme.lower(), actual.hostname, actual.port)
+        if actual_origin != expected_origin:
+            raise BinanceSpotTransportError("Binance Spot transport rejected cross-origin response")
+
+    def _request_timeout(self, deadline_monotonic: float | None) -> float:
+        if deadline_monotonic is None:
+            return self.timeout
+        try:
+            remaining = float(deadline_monotonic) - time.monotonic()
+        except (TypeError, ValueError, OverflowError):
+            remaining = -1.0
+        if remaining <= 0:
+            raise TimeoutError("AUTO_DEADLINE_EXPIRED")
+        return min(self.timeout, remaining, _DEADLINE_REQUEST_CEILING_SECONDS)
     def _require_auth(self) -> BinanceSpotCredentials:
         if self.environment is not BinanceSpotEnvironment.BINANCE_SPOT_TESTNET:
             raise BinanceSpotConfigurationError(
@@ -914,14 +967,27 @@ class BinanceSpotRESTClient:
                 pairs.append((str(key), str(value)))
         return urlencode(pairs, doseq=True).encode("utf-8")
 
-    def _request(self, method: str, endpoint: str, params: MutableMapping[str, Any] | None = None, *, validation_only: bool = False) -> BinanceSpotResult:
+    def _request(
+        self,
+        method: str,
+        endpoint: str,
+        params: MutableMapping[str, Any] | None = None,
+        *,
+        validation_only: bool = False,
+        deadline_monotonic: float | None = None,
+    ) -> BinanceSpotResult:
+        request_timeout = self._request_timeout(deadline_monotonic)
         credentials = self._require_auth()
         method = method.upper()
         if (method, endpoint) not in self._ALLOWED:
             raise BinanceSpotConfigurationError(f"Spot endpoint is not allowlisted: {method} {endpoint}")
         values: dict[str, Any] = dict(params or {})
-        values.setdefault("timestamp", self._millis(self._clock))
-        values.setdefault("recvWindow", self.recv_window)
+        if any(key in values for key in ("deadline_monotonic", "timestamp", "recvWindow")):
+            raise BinanceSpotConfigurationError("deadline, timestamp, and recvWindow are client-owned")
+        with self._request_lock:
+            offset_ms = self._server_time_offset_ms
+        values["timestamp"] = self._millis(self._clock) + offset_ms
+        values["recvWindow"] = self.recv_window
         unsigned = self._encode(values)
         signature = hmac.new(credentials.api_secret.encode("utf-8"), unsigned, hashlib.sha256).hexdigest()
         signed = unsigned + b"&signature=" + signature.encode("ascii")
@@ -938,13 +1004,18 @@ class BinanceSpotRESTClient:
             method=method,
         )
         try:
-            raw = self._opener(request, timeout=self.timeout)
+            raw = self._opener(request, timeout=request_timeout)
+            self._response_origin_check(raw, url)
             status = int(getattr(raw, "status", getattr(raw, "code", 200)))
+            if 300 <= status < 400:
+                raise BinanceSpotTransportError("Binance Spot transport rejected redirect")
             headers = getattr(raw, "headers", {}) or {}
             body = raw.read() if hasattr(raw, "read") else raw
             payload = self._decode(body)
         except HTTPError as exc:
             status = int(getattr(exc, "code", 0) or 0)
+            if 300 <= status < 400:
+                raise BinanceSpotTransportError("Binance Spot transport rejected redirect") from exc
             headers = getattr(exc, "headers", {}) or {}
             body = exc.read() if hasattr(exc, "read") else b""
             payload = self._decode(body)
@@ -958,6 +1029,7 @@ class BinanceSpotRESTClient:
         if status >= 400 or code is not None:
             return BinanceSpotResult(BinanceSpotStatus.REJECTED, payload, http_status=status, error_code=code, endpoint=endpoint, validation_only=validation_only)
         return BinanceSpotResult(BinanceSpotStatus.OK, payload, http_status=status, endpoint=endpoint, validation_only=validation_only, label="VALIDATION_ONLY" if validation_only else None)
+
     def request(
         self,
         method: str,
@@ -965,22 +1037,27 @@ class BinanceSpotRESTClient:
         params: Mapping[str, Any] | None = None,
         *,
         validation_only: bool = False,
+        deadline_monotonic: float | None = None,
     ) -> BinanceSpotResult:
-        """Issue one explicitly allowlisted Spot request.
+        """Issue one explicitly allowlisted Spot request."""
+        return self._request(
+            method,
+            endpoint,
+            dict(params or {}),
+            validation_only=validation_only,
+            deadline_monotonic=deadline_monotonic,
+        )
 
-        This public escape hatch still goes through the allowlist; arbitrary
-        URL paths and origins cannot be supplied by callers.
-        """
-
-        return self._request(method, endpoint, dict(params or {}), validation_only=validation_only)
     def public_request(
         self,
         method: str,
         endpoint: str,
         params: Mapping[str, Any] | None = None,
+        *,
+        deadline_monotonic: float | None = None,
     ) -> BinanceSpotResult:
         """Issue one fixed-origin, unsigned TESTNET public request."""
-
+        request_timeout = self._request_timeout(deadline_monotonic)
         if self.environment is not BinanceSpotEnvironment.BINANCE_SPOT_TESTNET:
             raise BinanceSpotConfigurationError("public Spot requests are TESTNET-only")
         if self.base_url != SPOT_REST_ORIGINS[BinanceSpotEnvironment.BINANCE_SPOT_TESTNET]:
@@ -992,7 +1069,10 @@ class BinanceSpotRESTClient:
             raise BinanceSpotConfigurationError(
                 f"Spot public endpoint is not allowlisted: {method} {endpoint}"
             )
-        encoded = self._encode(dict(params or {})).decode("ascii")
+        values = dict(params or {})
+        if "deadline_monotonic" in values:
+            raise BinanceSpotConfigurationError("deadline_monotonic is transport-only")
+        encoded = self._encode(values).decode("ascii")
         url = f"{self.base_url}{endpoint}"
         if encoded:
             url = f"{url}?{encoded}"
@@ -1002,50 +1082,31 @@ class BinanceSpotRESTClient:
             method="GET",
         )
         try:
-            raw = self._opener(request, timeout=self.timeout)
+            raw = self._opener(request, timeout=request_timeout)
+            self._response_origin_check(raw, url)
             status = int(getattr(raw, "status", getattr(raw, "code", 200)))
+            if 300 <= status < 400:
+                raise BinanceSpotTransportError("Binance Spot transport rejected redirect")
             headers = getattr(raw, "headers", {}) or {}
             body = raw.read() if hasattr(raw, "read") else raw
             payload = self._decode(body)
         except HTTPError as exc:
             status = int(getattr(exc, "code", 0) or 0)
+            if 300 <= status < 400:
+                raise BinanceSpotTransportError("Binance Spot transport rejected redirect") from exc
             headers = getattr(exc, "headers", {}) or {}
             body = exc.read() if hasattr(exc, "read") else b""
             payload = self._decode(body)
         except (TimeoutError, socket.timeout, URLError, OSError):
             return BinanceSpotResult(BinanceSpotStatus.UNKNOWN, endpoint=endpoint)
         if status in {418, 429}:
-            return BinanceSpotResult(
-                BinanceSpotStatus.RATE_LIMIT,
-                payload,
-                http_status=status,
-                retry_after=self._header(headers, "Retry-After"),
-                endpoint=endpoint,
-            )
+            return BinanceSpotResult(BinanceSpotStatus.RATE_LIMIT, payload, http_status=status, retry_after=self._header(headers, "Retry-After"), endpoint=endpoint)
         code = self._error_code(payload)
         if status >= 500 or code in self.AMBIGUOUS_CODES:
-            return BinanceSpotResult(
-                BinanceSpotStatus.UNKNOWN,
-                payload,
-                http_status=status,
-                error_code=code,
-                endpoint=endpoint,
-            )
+            return BinanceSpotResult(BinanceSpotStatus.UNKNOWN, payload, http_status=status, error_code=code, endpoint=endpoint)
         if status >= 400 or code is not None:
-            return BinanceSpotResult(
-                BinanceSpotStatus.REJECTED,
-                payload,
-                http_status=status,
-                error_code=code,
-                endpoint=endpoint,
-            )
-        return BinanceSpotResult(
-            BinanceSpotStatus.OK,
-            payload,
-            http_status=status,
-            endpoint=endpoint,
-        )
-
+            return BinanceSpotResult(BinanceSpotStatus.REJECTED, payload, http_status=status, error_code=code, endpoint=endpoint)
+        return BinanceSpotResult(BinanceSpotStatus.OK, payload, http_status=status, endpoint=endpoint)
     @staticmethod
     def _decode(body: Any) -> Any:
         if isinstance(body, bytes):
@@ -1084,8 +1145,8 @@ class BinanceSpotRESTClient:
         if not normalized:
             raise ValueError("symbol must not be empty")
         return normalized
-    def time(self) -> BinanceSpotResult:
-        return self.public_request("GET", "/api/v3/time")
+    def time(self, *, deadline_monotonic: float | None = None) -> BinanceSpotResult:
+        return self.public_request("GET", "/api/v3/time", deadline_monotonic=deadline_monotonic)
 
     get_time = time
     server_time = time
@@ -1097,14 +1158,23 @@ class BinanceSpotRESTClient:
         *,
         symbol: str | None = None,
         symbols: Sequence[str] | None = None,
+        deadline_monotonic: float | None = None,
         **params: Any,
     ) -> BinanceSpotResult:
         values = dict(params)
         if symbol is not None:
             values["symbol"] = self._symbol(symbol)
         if symbols is not None:
-            values["symbols"] = [self._symbol(value) for value in symbols]
-        return self.public_request("GET", "/api/v3/exchangeInfo", values)
+            values["symbols"] = json.dumps(
+                [self._symbol(value) for value in symbols],
+                separators=(",", ":"),
+            )
+        return self.public_request(
+            "GET",
+            "/api/v3/exchangeInfo",
+            values,
+            deadline_monotonic=deadline_monotonic,
+        )
 
     get_exchange_info = exchange_info
 
@@ -1112,12 +1182,18 @@ class BinanceSpotRESTClient:
         self,
         *,
         symbol: str | None = None,
+        deadline_monotonic: float | None = None,
         **params: Any,
     ) -> BinanceSpotResult:
         values = dict(params)
         if symbol is not None:
             values["symbol"] = self._symbol(symbol)
-        return self.public_request("GET", "/api/v3/ticker/24hr", values)
+        return self.public_request(
+            "GET",
+            "/api/v3/ticker/24hr",
+            values,
+            deadline_monotonic=deadline_monotonic,
+        )
 
     ticker_24hr = ticker
     ticker_stats = ticker
@@ -1126,12 +1202,18 @@ class BinanceSpotRESTClient:
         self,
         *,
         symbol: str | None = None,
+        deadline_monotonic: float | None = None,
         **params: Any,
     ) -> BinanceSpotResult:
         values = dict(params)
         if symbol is not None:
             values["symbol"] = self._symbol(symbol)
-        return self.public_request("GET", "/api/v3/ticker/price", values)
+        return self.public_request(
+            "GET",
+            "/api/v3/ticker/price",
+            values,
+            deadline_monotonic=deadline_monotonic,
+        )
 
     price_ticker = ticker_price
 
@@ -1139,12 +1221,18 @@ class BinanceSpotRESTClient:
         self,
         *,
         symbol: str | None = None,
+        deadline_monotonic: float | None = None,
         **params: Any,
     ) -> BinanceSpotResult:
         values = dict(params)
         if symbol is not None:
             values["symbol"] = self._symbol(symbol)
-        return self.public_request("GET", "/api/v3/ticker/bookTicker", values)
+        return self.public_request(
+            "GET",
+            "/api/v3/ticker/bookTicker",
+            values,
+            deadline_monotonic=deadline_monotonic,
+        )
 
     book_ticker = ticker_book
 
@@ -1153,13 +1241,19 @@ class BinanceSpotRESTClient:
         *,
         symbol: str,
         limit: int | None = None,
+        deadline_monotonic: float | None = None,
         **params: Any,
     ) -> BinanceSpotResult:
         values = dict(params)
         values["symbol"] = self._symbol(symbol)
         if limit is not None:
             values["limit"] = limit
-        return self.public_request("GET", "/api/v3/depth", values)
+        return self.public_request(
+            "GET",
+            "/api/v3/depth",
+            values,
+            deadline_monotonic=deadline_monotonic,
+        )
 
     order_book = depth
 
@@ -1171,6 +1265,7 @@ class BinanceSpotRESTClient:
         start_time: int | None = None,
         end_time: int | None = None,
         limit: int | None = None,
+        deadline_monotonic: float | None = None,
         **params: Any,
     ) -> BinanceSpotResult:
         values = dict(params)
@@ -1181,43 +1276,99 @@ class BinanceSpotRESTClient:
             values["endTime"] = end_time
         if limit is not None:
             values["limit"] = limit
-        return self.public_request("GET", "/api/v3/klines", values)
+        return self.public_request(
+            "GET",
+            "/api/v3/klines",
+            values,
+            deadline_monotonic=deadline_monotonic,
+        )
 
     candles = klines
 
-
-    def account(self, **params: Any) -> BinanceSpotResult:
-        return self._request("GET", "/api/v3/account", params)
+    def account(self, *, deadline_monotonic: float | None = None, **params: Any) -> BinanceSpotResult:
+        return self._request(
+            "GET",
+            "/api/v3/account",
+            params,
+            deadline_monotonic=deadline_monotonic,
+        )
 
     get_account = account
 
-    def place_order(self, *, symbol: str, side: str, quantity: str | int | float, price: str | int | float, time_in_force: str = "IOC", **params: Any) -> BinanceSpotResult:
+    def place_order(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        quantity: str | int | float,
+        price: str | int | float,
+        time_in_force: str = "IOC",
+        deadline_monotonic: float | None = None,
+        **params: Any,
+    ) -> BinanceSpotResult:
         tif = str(time_in_force).upper()
         if tif not in {"IOC", "FOK"}:
             raise BinanceSpotConfigurationError("only LIMIT IOC/FOK orders are permitted")
         side_value = str(side).upper()
         if side_value not in {"BUY", "SELL"}:
             raise ValueError("side must be BUY or SELL")
-        values = {"symbol": self._symbol(symbol), "side": side_value, "type": "LIMIT", "timeInForce": tif, "quantity": quantity, "price": price, **params}
+        values = {
+            "symbol": self._symbol(symbol),
+            "side": side_value,
+            "type": "LIMIT",
+            "timeInForce": tif,
+            "quantity": quantity,
+            "price": price,
+            **params,
+        }
         values["type"] = "LIMIT"
         values["timeInForce"] = tif
-        return self._request("POST", "/api/v3/order", values)
+        return self._request(
+            "POST",
+            "/api/v3/order",
+            values,
+            deadline_monotonic=deadline_monotonic,
+        )
 
     place_limit_order = place_order
     place_limit_ioc_order = place_order
     place_limit_fok_order = place_order
 
-    def test_order(self, *, symbol: str, side: str, quantity: str | int | float, price: str | int | float, time_in_force: str = "IOC", **params: Any) -> BinanceSpotResult:
+    def test_order(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        quantity: str | int | float,
+        price: str | int | float,
+        time_in_force: str = "IOC",
+        deadline_monotonic: float | None = None,
+        **params: Any,
+    ) -> BinanceSpotResult:
         tif = str(time_in_force).upper()
         if tif not in {"IOC", "FOK"}:
             raise BinanceSpotConfigurationError("only LIMIT IOC/FOK test orders are permitted")
         side_value = str(side).upper()
         if side_value not in {"BUY", "SELL"}:
             raise ValueError("side must be BUY or SELL")
-        values = {"symbol": self._symbol(symbol), "side": side_value, "type": "LIMIT", "timeInForce": tif, "quantity": quantity, "price": price, **params}
+        values = {
+            "symbol": self._symbol(symbol),
+            "side": side_value,
+            "type": "LIMIT",
+            "timeInForce": tif,
+            "quantity": quantity,
+            "price": price,
+            **params,
+        }
         values["type"] = "LIMIT"
         values["timeInForce"] = tif
-        return self._request("POST", "/api/v3/order/test", values, validation_only=True)
+        return self._request(
+            "POST",
+            "/api/v3/order/test",
+            values,
+            validation_only=True,
+            deadline_monotonic=deadline_monotonic,
+        )
 
     place_test_order = test_order
     validation_test_order = test_order
@@ -1228,6 +1379,7 @@ class BinanceSpotRESTClient:
         symbol: str,
         order_id: str | int | None = None,
         orig_client_order_id: str | None = None,
+        deadline_monotonic: float | None = None,
         **params: Any,
     ) -> BinanceSpotResult:
         if order_id is None and not orig_client_order_id:
@@ -1247,22 +1399,50 @@ class BinanceSpotRESTClient:
             values["orderId"] = order_id
         if orig_client_order_id is not None:
             values["origClientOrderId"] = orig_client_order_id
-        return self._request("GET", "/api/v3/order", values)
+        return self._request(
+            "GET",
+            "/api/v3/order",
+            values,
+            deadline_monotonic=deadline_monotonic,
+        )
 
     get_order = query_order
     query = query_order
 
-    def open_orders(self, *, symbol: str | None = None, **params: Any) -> BinanceSpotResult:
+    def open_orders(
+        self,
+        *,
+        symbol: str | None = None,
+        deadline_monotonic: float | None = None,
+        **params: Any,
+    ) -> BinanceSpotResult:
         values = dict(params)
         if symbol is not None:
             values["symbol"] = self._symbol(symbol)
-        return self._request("GET", "/api/v3/openOrders", values)
+        return self._request(
+            "GET",
+            "/api/v3/openOrders",
+            values,
+            deadline_monotonic=deadline_monotonic,
+        )
 
     get_open_orders = open_orders
     open = open_orders
 
-    def all_orders(self, *, symbol: str, **params: Any) -> BinanceSpotResult:
-        return self._request("GET", "/api/v3/allOrders", {"symbol": self._symbol(symbol), **params})
+    def all_orders(
+        self,
+        *,
+        symbol: str,
+        deadline_monotonic: float | None = None,
+        **params: Any,
+    ) -> BinanceSpotResult:
+        values = {"symbol": self._symbol(symbol), **params}
+        return self._request(
+            "GET",
+            "/api/v3/allOrders",
+            values,
+            deadline_monotonic=deadline_monotonic,
+        )
 
     all = all_orders
     get_all_orders = all_orders
@@ -1272,6 +1452,7 @@ class BinanceSpotRESTClient:
         *,
         symbol: str,
         order_id: str | int | None = None,
+        deadline_monotonic: float | None = None,
         **params: Any,
     ) -> BinanceSpotResult:
         values = {
@@ -1288,10 +1469,24 @@ class BinanceSpotRESTClient:
         values["symbol"] = self._symbol(symbol)
         if order_id is not None:
             values["orderId"] = order_id
-        return self._request("GET", "/api/v3/myTrades", values)
+        return self._request(
+            "GET",
+            "/api/v3/myTrades",
+            values,
+            deadline_monotonic=deadline_monotonic,
+        )
 
     trades = my_trades
-    def cancel_owned_order(self, *, symbol: str, order_id: str | int | None = None, orig_client_order_id: str | None = None, **params: Any) -> BinanceSpotResult:
+
+    def cancel_owned_order(
+        self,
+        *,
+        symbol: str,
+        order_id: str | int | None = None,
+        orig_client_order_id: str | None = None,
+        deadline_monotonic: float | None = None,
+        **params: Any,
+    ) -> BinanceSpotResult:
         if order_id is None and not orig_client_order_id:
             raise ValueError("order_id or orig_client_order_id is required")
         values = {
@@ -1304,10 +1499,29 @@ class BinanceSpotRESTClient:
             values["orderId"] = order_id
         if orig_client_order_id is not None:
             values["origClientOrderId"] = orig_client_order_id
-        return self._request("DELETE", "/api/v3/order", values)
+        return self._request(
+            "DELETE",
+            "/api/v3/order",
+            values,
+            deadline_monotonic=deadline_monotonic,
+        )
 
     cancel_owned = cancel_owned_order
     cancel_order = cancel_owned_order
+
+    def rate_limit_order(
+        self,
+        *,
+        deadline_monotonic: float | None = None,
+    ) -> BinanceSpotResult:
+        return self._request(
+            "GET",
+            "/api/v3/rateLimit/order",
+            deadline_monotonic=deadline_monotonic,
+        )
+
+    order_rate_limit = rate_limit_order
+    rate_limits = rate_limit_order
 
 
 __all__ = [

@@ -4,10 +4,11 @@ The adapter only uses public market-data endpoints.  HTTP failures, rate limits,
 and offline environments return empty/``None`` values rather than inventing
 observations.  Returned timestamps are timezone-aware UTC values.
 """
-from __future__ import annotations
-
 from datetime import datetime
+import time
 import math
+import urllib.parse
+import urllib.request
 from typing import Any, Callable, Mapping, Sequence
 
 from ..domain import (
@@ -24,6 +25,84 @@ from ..domain import (
 )
 from ._http import HTTPFetchError, as_float, as_int, fetch_json_strict, parse_timestamp, query_url
 from .interfaces import CryptoMarketDataProvider
+
+
+def _url_origin(url: Any) -> tuple[str, str, int | None] | None:
+    try:
+        parsed = urllib.parse.urlsplit(str(url))
+        hostname = parsed.hostname
+        if not parsed.scheme or hostname is None:
+            return None
+        return parsed.scheme.lower(), hostname.lower(), parsed.port
+    except (TypeError, ValueError):
+        return None
+
+
+class _RejectRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Reject redirects before urllib can replay a public market request."""
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> urllib.request.Request | None:
+        raise HTTPFetchError(
+            "Binance public transport rejected redirect",
+            url=req.full_url,
+            status=int(code),
+            retryable=False,
+        )
+
+
+class _FixedOriginOpener:
+    """Reject redirects and cross-origin responses before JSON decoding."""
+
+    def __init__(self, opener: Callable[..., Any], expected_origin: tuple[str, str, int | None] | None) -> None:
+        self._opener = opener
+        self._expected_origin = expected_origin
+
+    @staticmethod
+    def _close(response: Any) -> None:
+        close = getattr(response, "close", None)
+        if callable(close):
+            close()
+
+    def __call__(self, request: Any, *, timeout: float) -> Any:
+        response = self._opener(request, timeout=timeout)
+        status = getattr(response, "status", None)
+        if status is None:
+            getcode = getattr(response, "getcode", None)
+            status = getcode() if callable(getcode) else None
+        if status is not None and 300 <= int(status) < 400:
+            self._close(response)
+            raise HTTPFetchError(
+                "Binance public transport rejected redirect",
+                url=getattr(request, "full_url", str(request)),
+                status=int(status),
+                retryable=False,
+            )
+        geturl = getattr(response, "geturl", None)
+        response_url = geturl() if callable(geturl) else getattr(response, "url", None)
+        actual_origin = _url_origin(response_url) if response_url is not None else None
+        if response_url is not None and (actual_origin is None or actual_origin != self._expected_origin):
+            self._close(response)
+            raise HTTPFetchError(
+                "Binance public transport rejected cross-origin response",
+                url=getattr(request, "full_url", str(request)),
+                status=int(status) if status is not None else None,
+                retryable=False,
+            )
+        return response
+
+
+class BinanceDeadlineExpired(TimeoutError):
+    """Raised when a strict market-data deadline has elapsed."""
+
+    deadline_expired = True
 
 
 class BinanceAdapter(CryptoMarketDataProvider):
@@ -56,7 +135,9 @@ class BinanceAdapter(CryptoMarketDataProvider):
         self.symbol = self._normalize_symbol(symbol)
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout_value
-        self._opener = opener
+        self._expected_origin = _url_origin(self.base_url)
+        self._opener = opener if opener is not None else urllib.request.build_opener(_RejectRedirectHandler()).open
+        self._fetch_opener = _FixedOriginOpener(self._opener, self._expected_origin)
         self._transport_errors: list[HTTPFetchError] = []
         self._clock = clock or utc_now
         selected_grace = close_grace if grace is None else grace
@@ -75,12 +156,30 @@ class BinanceAdapter(CryptoMarketDataProvider):
             raise ValueError("symbol must not be empty")
         return normalized
 
+    @staticmethod
+    def _deadline_timeout(deadline_monotonic: float | None) -> float | None:
+        if deadline_monotonic is None:
+            return None
+        try:
+            deadline = float(deadline_monotonic)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("deadline_monotonic must be finite") from exc
+        if not math.isfinite(deadline):
+            raise ValueError("deadline_monotonic must be finite")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise BinanceDeadlineExpired("AUTO_DEADLINE_EXPIRED")
+        return remaining
+
+
     def historical_ohlcv(
         self,
         symbol: str,
         start: datetime | None = None,
         end: datetime | None = None,
         interval: str = "1d",
+        *,
+        deadline_monotonic: float | None = None,
     ) -> Sequence[OHLCVBar]:
         """Return Binance klines, retaining the legacy open-candle behavior.
 
@@ -88,7 +187,13 @@ class BinanceAdapter(CryptoMarketDataProvider):
         Canary collection must call :meth:`closed_historical_ohlcv` instead.
         """
         symbol = self._normalize_symbol(symbol)
-        rows = self._fetch_kline_rows(symbol, start=start, end=end, interval=interval)
+        rows = self._fetch_kline_rows(
+            symbol,
+            start=start,
+            end=end,
+            interval=interval,
+            deadline_monotonic=deadline_monotonic,
+        )
         bars: list[OHLCVBar] = []
         for row in rows:
             bar = self._bar_from_kline(row)
@@ -107,6 +212,7 @@ class BinanceAdapter(CryptoMarketDataProvider):
         now: datetime | None = None,
         grace: float | Any | None = None,
         limit: int | None = None,
+        deadline_monotonic: float | None = None,
     ) -> Sequence[OHLCVBar]:
         """Return only klines whose exchange-provided ``closeTime`` has passed.
 
@@ -118,7 +224,14 @@ class BinanceAdapter(CryptoMarketDataProvider):
         unchanged and may return the open/current bar.
         """
         symbol = self._normalize_symbol(symbol)
-        rows = self._fetch_kline_rows(symbol, start=start, end=end, interval=interval, limit=limit)
+        rows = self._fetch_kline_rows(
+            symbol,
+            start=start,
+            end=end,
+            interval=interval,
+            limit=limit,
+            deadline_monotonic=deadline_monotonic,
+        )
         if now is None:
             now = self._clock()
         cutoff = ensure_utc(now)
@@ -152,6 +265,7 @@ class BinanceAdapter(CryptoMarketDataProvider):
         end: datetime | None,
         interval: str,
         limit: int | None = None,
+        deadline_monotonic: float | None = None,
     ) -> list[Any]:
         request_limit = 1000 if limit is None else int(limit)
         if isinstance(limit, bool) or request_limit <= 0:
@@ -166,7 +280,7 @@ class BinanceAdapter(CryptoMarketDataProvider):
         }
         rows: list[Any] = []
         for _page in range(100):
-            payload = self._get("/api/v3/klines", **params)
+            payload = self._get("/api/v3/klines", deadline_monotonic=deadline_monotonic, **params)
             if not isinstance(payload, list):
                 break
             rows.extend(payload)
@@ -207,17 +321,24 @@ class BinanceAdapter(CryptoMarketDataProvider):
             trades=as_int(row[8]) if len(row) > 8 else None,
         )
 
-    def _get(self, path: str, **params: Any) -> Any | None:
+    def _get(self, path: str, *, deadline_monotonic: float | None = None, **params: Any) -> Any | None:
+        remaining = self._deadline_timeout(deadline_monotonic)
+        request_timeout = self.timeout if remaining is None else min(self.timeout, remaining, 1.0)
         try:
-            return fetch_json_strict(query_url(self.base_url, path, params), self.timeout, self._opener)
+            payload = fetch_json_strict(query_url(self.base_url, path, params), request_timeout, self._fetch_opener)
+            if deadline_monotonic is not None:
+                self._deadline_timeout(deadline_monotonic)
+            return payload
         except HTTPFetchError as exc:
+            if deadline_monotonic is not None:
+                self._deadline_timeout(deadline_monotonic)
             self._transport_errors.append(exc)
             return None
 
 
-    def ticker(self, symbol: str) -> CryptoTicker | None:
+    def ticker(self, symbol: str, *, deadline_monotonic: float | None = None) -> CryptoTicker | None:
         symbol = self._normalize_symbol(symbol)
-        payload = self._get("/api/v3/ticker/24hr", symbol=symbol)
+        payload = self._get("/api/v3/ticker/24hr", deadline_monotonic=deadline_monotonic, symbol=symbol)
         if not isinstance(payload, Mapping):
             return None
         last = as_float(payload.get("lastPrice"))
@@ -249,6 +370,8 @@ class BinanceAdapter(CryptoMarketDataProvider):
         symbol: str,
         start: datetime | None = None,
         end: datetime | None = None,
+        *,
+        deadline_monotonic: float | None = None,
     ) -> Sequence[TradePrint]:
         symbol = self._normalize_symbol(symbol)
         historical = start is not None or end is not None
@@ -261,7 +384,7 @@ class BinanceAdapter(CryptoMarketDataProvider):
         result: list[TradePrint] = []
         seen: set[str] = set()
         for _ in range(1000 if historical else 1):
-            payload = self._get(path, **params)
+            payload = self._get(path, deadline_monotonic=deadline_monotonic, **params)
             if not isinstance(payload, list) or not payload:
                 break
             last_timestamp: datetime | None = None
@@ -309,14 +432,27 @@ class BinanceAdapter(CryptoMarketDataProvider):
                 params["startTime"] = int(last_timestamp.timestamp() * 1000) + 1
             else:
                 break
+        if deadline_monotonic is not None:
+            self._deadline_timeout(deadline_monotonic)
         result.sort(key=lambda trade: trade.timestamp)
         return result
 
-    def order_book(self, symbol: str, depth: int = 20) -> OrderBookSnapshot | None:
+    def order_book(
+        self,
+        symbol: str,
+        depth: int = 20,
+        *,
+        deadline_monotonic: float | None = None,
+    ) -> OrderBookSnapshot | None:
         symbol = self._normalize_symbol(symbol)
         if isinstance(depth, bool) or not isinstance(depth, int) or depth <= 0:
             raise ValueError("depth must be a positive integer")
-        payload = self._get("/api/v3/depth", symbol=symbol, limit=min(depth, 5000))
+        payload = self._get(
+            "/api/v3/depth",
+            deadline_monotonic=deadline_monotonic,
+            symbol=symbol,
+            limit=min(depth, 5000),
+        )
         if not isinstance(payload, Mapping):
             return None
         bids = self._levels(payload.get("bids"), reverse=True, depth=depth)
@@ -345,15 +481,29 @@ class BinanceAdapter(CryptoMarketDataProvider):
         levels.sort(key=lambda level: level.price, reverse=reverse)
         return levels[:depth]
 
-    def exchange_info(self, *, symbol: str | None = None) -> Mapping[str, Any] | None:
+    def exchange_info(
+        self,
+        *,
+        symbol: str | None = None,
+        deadline_monotonic: float | None = None,
+    ) -> Mapping[str, Any] | None:
         """Return public Spot exchange metadata without credentials."""
         normalized = self._normalize_symbol(symbol) if symbol is not None else None
-        payload = self._get("/api/v3/exchangeInfo", symbol=normalized)
+        payload = self._get(
+            "/api/v3/exchangeInfo",
+            deadline_monotonic=deadline_monotonic,
+            symbol=normalized,
+        )
         return payload if isinstance(payload, Mapping) else None
 
-    def exchange_symbols(self, *, quote_asset: str | None = None) -> tuple[Mapping[str, Any], ...] | None:
+    def exchange_symbols(
+        self,
+        *,
+        quote_asset: str | None = None,
+        deadline_monotonic: float | None = None,
+    ) -> tuple[Mapping[str, Any], ...] | None:
         """Return public Binance symbol records, optionally narrowed by quote."""
-        payload = self.exchange_info()
+        payload = self.exchange_info(deadline_monotonic=deadline_monotonic)
         if payload is None:
             return None
         records = payload.get("symbols")
@@ -367,9 +517,17 @@ class BinanceAdapter(CryptoMarketDataProvider):
             and (quote is None or str(record.get("quoteAsset", "")).upper() == quote)
         )
 
-    def discover_spot_symbols(self, *, quote_asset: str = "USDT") -> tuple[str, ...] | None:
+    def discover_spot_symbols(
+        self,
+        *,
+        quote_asset: str = "USDT",
+        deadline_monotonic: float | None = None,
+    ) -> tuple[str, ...] | None:
         """Return currently tradable Spot symbols for a quote asset."""
-        records = self.exchange_symbols(quote_asset=quote_asset)
+        records = self.exchange_symbols(
+            quote_asset=quote_asset,
+            deadline_monotonic=deadline_monotonic,
+        )
         if records is None:
             return None
         symbols: list[str] = []
@@ -386,9 +544,18 @@ class BinanceAdapter(CryptoMarketDataProvider):
                 symbols.append(str(record["symbol"]).upper())
         return tuple(sorted(set(symbols)))
 
-    def metadata(self, symbol: str) -> InstrumentMetadata | None:
+    def metadata(
+        self,
+        symbol: str,
+        *,
+        deadline_monotonic: float | None = None,
+    ) -> InstrumentMetadata | None:
         symbol = self._normalize_symbol(symbol)
-        payload = self._get("/api/v3/exchangeInfo", symbol=symbol)
+        payload = self._get(
+            "/api/v3/exchangeInfo",
+            deadline_monotonic=deadline_monotonic,
+            symbol=symbol,
+        )
         if not isinstance(payload, Mapping):
             return None
         records = payload.get("symbols")
@@ -452,4 +619,4 @@ def _boolish(value: Any) -> bool:
     return bool(value)
 
 
-__all__ = ["BinanceAdapter"]
+__all__ = ["BinanceAdapter", "BinanceDeadlineExpired"]

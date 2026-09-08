@@ -3,10 +3,19 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from decimal import Decimal
 import json
+from pathlib import Path
 import sqlite3
+import tempfile
 import unittest
 
-from axiom.binance_operator import BinanceCanaryControlPlane, EXACT_ENABLE_PHRASE
+from axiom.binance_operator import (
+    BinanceCanaryControlPlane,
+    BinanceOperatorError,
+    BinanceTestnetControlPlane,
+    EXACT_ENABLE_PHRASE,
+    EXACT_PROBE_PHRASE,
+    EXACT_TESTNET_ENABLE_PHRASE,
+)
 from axiom.binance_risk import DEFAULT_BINANCE_RISK_ENVELOPE
 from axiom.binance_spot import PAPER, canonical_sha256
 
@@ -143,6 +152,514 @@ class _Worker:
 
     def stop(self):
         return {"status": "STOPPED"}
+
+class _TestnetGate:
+    def __init__(self, connection, *, configured=False):
+        self.connection = connection
+        self.credentials = (
+            {"api_key": "configured", "api_secret": "configured"}
+            if configured
+            else None
+        )
+        self.calls = []
+        self.venue_calls = []
+        self.profile = {
+            "environment": "BINANCE_SPOT_TESTNET",
+            "host": "127.0.0.1",
+            "port": 8082,
+            "runtime_identity": "binance-testnet",
+            "db_path": "runtime-data/binance-testnet.sqlite",
+        }
+        self.connectivity = {"status": "BLOCKED", "reason": "CREDENTIALS_NOT_CONFIGURED"}
+        self.validation = {"status": "BLOCKED", "reason": "NOT_CHECKED"}
+        self.probe = {"status": "BLOCKED", "reason": "NOT_STARTED"}
+
+    def connectivity_status(self):
+        return dict(self.connectivity)
+
+    def validation_status(self):
+        return dict(self.validation)
+
+    def probe_status(self):
+        return dict(self.probe)
+
+    def dashboard_projection(self):
+        return {
+            "environment": "BINANCE_SPOT_TESTNET",
+            "source": "binance_testnet_gate",
+            "probe_kind": "TESTNET EXECUTION PROBE",
+            "profile": dict(self.profile),
+            "credentials": {"configured": bool(self.credentials)},
+            "risk_envelope": {"entry_notional": "10.00"},
+        }
+
+    def check_connectivity(self):
+        self.calls.append("connectivity")
+        if not self.credentials:
+            return {**self.connectivity}
+        self.venue_calls.append("account")
+        self.connectivity = {"status": "PASS", "reason": ""}
+        return dict(self.connectivity)
+
+    def validate_order(self, symbol=None):
+        self.calls.append(("validation", symbol))
+        self.validation = {"status": "PASS", "symbol": symbol or "BTCUSDT"}
+        return dict(self.validation)
+
+    def execute_probe(self, symbol=None):
+        self.calls.append(("probe", symbol))
+        self.probe = {"status": "PASS", "symbol": symbol or "BTCUSDT"}
+        return dict(self.probe)
+
+    def reconcile_probe(self):
+        self.calls.append("reconcile")
+        return dict(self.probe)
+
+
+class _TestnetStrategy:
+    def __init__(self):
+        self.state = "DISABLED"
+        self.calls = []
+
+    def status(self):
+        return {
+            "state": self.state,
+            "enabled": self.state == "ARMED",
+            "selected_candidate": {"candidate_id": "candidate-1"},
+            "current_signal": {"signal_id": "signal-1"},
+            "no_trade_reason": "WAITING",
+        }
+
+    def submit_signal(self, *_args, **_kwargs):
+        raise AssertionError("operator gate actions must not submit strategy signals")
+
+    def enable_auto_canary(self, confirmation="", **_kwargs):
+        self.calls.append(("enable", confirmation))
+        self.state = "ARMED"
+        return {"state": self.state, "enabled": True}
+
+    def pause(self, **kwargs):
+        self.calls.append(("pause", kwargs))
+        self.state = "PAUSED"
+        return {"state": self.state}
+
+    def resume(self, **kwargs):
+        self.calls.append(("resume", kwargs))
+        self.state = "ARMED"
+        return {"state": self.state}
+
+    def disarm(self, **kwargs):
+        self.calls.append(("disarm", kwargs))
+        self.state = "DISARMED"
+        return {"state": self.state}
+
+    def kill(self, **kwargs):
+        self.calls.append(("kill", kwargs))
+        self.state = "KILLED"
+        return {"state": self.state}
+
+
+class _TestnetWorker:
+    def __init__(self, strategy, *, supports_persisted_strategy=True):
+        self.strategy = strategy
+        self._supports_persisted_strategy = supports_persisted_strategy
+
+    def supports_persisted_strategy(self):
+        return self._supports_persisted_strategy
+
+    def cycle(self):
+        return {"status": "NO_TRADE"}
+
+
+class BinanceTestnetOperatorTests(unittest.TestCase):
+    def setUp(self):
+        self.connection = sqlite3.connect(":memory:")
+        self.connection.row_factory = sqlite3.Row
+        self.gate = _TestnetGate(self.connection)
+
+    def tearDown(self):
+        self.connection.close()
+
+    def test_missing_credentials_blocks_gate_without_venue_calls(self):
+        control = BinanceTestnetControlPlane(self.gate)
+        status = control.status()
+        self.assertEqual(status["connectivity"]["status"], "BLOCKED")
+        self.assertEqual(status["autonomous"]["blocked_reason"], "CREDENTIALS_NOT_CONFIGURED")
+        result = control.action("CONNECTIVITY_CHECK")
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["result"]["status"], "BLOCKED")
+        self.assertEqual(self.gate.venue_calls, [])
+        self.assertEqual(self.gate.calls, ["connectivity"])
+
+    def test_status_and_snapshot_identify_strict_testnet(self):
+        control = BinanceTestnetControlPlane(self.gate)
+        status = control.status()
+        snapshot = control.snapshot(page_size=1)
+
+        self.assertIs(status["strict_testnet"], True)
+        self.assertIs(snapshot["strict_testnet"], True)
+
+    def test_status_blocker_precedence_is_gate_first_and_network_free(self):
+        strategy = _TestnetStrategy()
+        control = BinanceTestnetControlPlane(self.gate, execution=strategy, worker=_TestnetWorker(strategy))
+
+        # Missing credentials are actionable before connectivity or strategy.
+        status = control.status()
+        self.assertEqual(status["autonomous"]["blocked_reason"], "CREDENTIALS_NOT_CONFIGURED")
+        self.assertEqual(
+            status["strategy_evidence"],
+            {
+                "selected_candidate": {"candidate_id": "candidate-1"},
+                "current_signal": {"signal_id": "signal-1"},
+                "no_trade_reason": "WAITING",
+            },
+        )
+
+        self.gate.credentials = {"api_key": "configured", "api_secret": "configured"}
+        self.gate.connectivity = {"status": "BLOCKED", "reason": "NOT_CHECKED"}
+        self.gate.validation = {"status": "PASS"}
+        self.assertEqual(
+            control.status()["autonomous"]["blocked_reason"],
+            "CONNECTIVITY_NOT_PASS",
+        )
+
+        self.gate.connectivity = {"status": "PASS"}
+        self.gate.validation = {"status": "BLOCKED", "reason": "NOT_CHECKED"}
+        self.assertEqual(
+            control.status()["autonomous"]["blocked_reason"],
+            "VALIDATION_NOT_PASS",
+        )
+        self.assertEqual(self.gate.calls, [])
+        self.assertEqual(self.gate.venue_calls, [])
+
+    def test_validation_probe_and_reconcile_dispatch_are_not_strategy_signals(self):
+        strategy = _TestnetStrategy()
+        control = BinanceTestnetControlPlane(self.gate, execution=strategy, worker=_TestnetWorker(strategy))
+        validation = control.action("ORDER_VALIDATION_TEST", {"symbol": "BTCUSDT"})
+        probe = control.action(
+            "EXECUTION_PROBE",
+            {"symbol": "BTCUSDT", "confirmation": EXACT_PROBE_PHRASE},
+        )
+        reconcile = control.action("RECONCILE_PROBE")
+        self.assertTrue(validation["ok"])
+        self.assertTrue(probe["ok"])
+        self.assertTrue(reconcile["ok"])
+        self.assertEqual(
+            self.gate.calls,
+            [
+                ("validation", "BTCUSDT"),
+                ("probe", "BTCUSDT"),
+                "reconcile",
+            ],
+        )
+        self.assertEqual(strategy.calls, [])
+
+    def test_probe_requires_exact_confirmation(self):
+        control = BinanceTestnetControlPlane(self.gate)
+        wrong = control.action(
+            "EXECUTION_PROBE",
+            {"confirmation": EXACT_PROBE_PHRASE + " "},
+        )
+        self.assertFalse(wrong["ok"])
+        self.assertEqual(wrong["reason"], "EXACT_CONFIRMATION_REQUIRED")
+        self.assertEqual(self.gate.calls, [])
+    def test_enable_and_resume_actions_never_arm_and_private_authorization_does(self):
+        strategy = _TestnetStrategy()
+        control = BinanceTestnetControlPlane(
+            self.gate,
+            execution=strategy,
+            worker=_TestnetWorker(strategy),
+        )
+        self.gate.credentials = {"api_key": "configured", "api_secret": "configured"}
+        self.gate.connectivity = {"status": "PASS"}
+        self.gate.validation = {"status": "PASS"}
+
+        for action, payload in (
+            ("ENABLE", {"confirmation": EXACT_TESTNET_ENABLE_PHRASE, "window_seconds": 30}),
+            ("RESUME", {"confirmation": EXACT_TESTNET_ENABLE_PHRASE}),
+        ):
+            blocked = control.action(action, payload)
+            self.assertFalse(blocked["ok"])
+            self.assertEqual(blocked["reason"], "BOUNDED_AUTO_REQUIRES_CLI")
+        self.assertEqual(strategy.calls, [])
+        self.assertEqual(strategy.state, "DISABLED")
+
+        authorized = control.authorize_bounded_auto(
+            EXACT_TESTNET_ENABLE_PHRASE,
+            30,
+        )
+        self.assertEqual(strategy.state, "ARMED")
+        self.assertEqual(strategy.calls[0], ("enable", EXACT_TESTNET_ENABLE_PHRASE))
+        self.assertEqual(authorized["autonomous"], {"seconds": 30, "bounded": True})
+
+    def test_private_authorization_rejects_invalid_bounded_windows_before_authorization(self):
+        invalid_windows = (
+            0,
+            29,
+            901,
+            3601,
+            True,
+            False,
+            None,
+            "30",
+            30.0,
+            {},
+            [],
+        )
+        for window in invalid_windows:
+            with self.subTest(window=window):
+                strategy = _TestnetStrategy()
+                control = BinanceTestnetControlPlane(
+                    self.gate,
+                    execution=strategy,
+                    worker=_TestnetWorker(strategy),
+                )
+                self.gate.connectivity = {"status": "PASS"}
+                self.gate.validation = {"status": "PASS"}
+                with self.assertRaises(BinanceOperatorError) as context:
+                    control.authorize_bounded_auto(
+                        EXACT_TESTNET_ENABLE_PHRASE,
+                        window,
+                    )
+                self.assertEqual(context.exception.reason, "BOUNDED_WINDOW_REQUIRED")
+                self.assertEqual(strategy.calls, [])
+                self.assertEqual(strategy.state, "DISABLED")
+                self.assertIsNone(control._autonomous_window)
+
+    def test_private_authorization_accepts_integer_bounded_window(self):
+        strategy = _TestnetStrategy()
+        control = BinanceTestnetControlPlane(
+            self.gate,
+            execution=strategy,
+            worker=_TestnetWorker(strategy),
+        )
+        self.gate.credentials = {"api_key": "configured", "api_secret": "configured"}
+        self.gate.connectivity = {"status": "PASS"}
+        self.gate.validation = {"status": "PASS"}
+        result = control.authorize_bounded_auto(
+            EXACT_TESTNET_ENABLE_PHRASE,
+            900,
+        )
+        self.assertEqual(strategy.state, "ARMED")
+        self.assertEqual(strategy.calls, [("enable", EXACT_TESTNET_ENABLE_PHRASE)])
+        self.assertEqual(result["autonomous"], {"seconds": 900, "bounded": True})
+
+    def test_private_authorization_rechecks_deadline_before_durable_arm(self):
+        strategy = _TestnetStrategy()
+        self.gate.credentials = {"api_key": "configured", "api_secret": "configured"}
+        self.gate.connectivity = {"status": "PASS"}
+        self.gate.validation = {"status": "PASS"}
+        ticks = iter((0.0, 0.0, 0.0, 0.0, 0.0, 101.0))
+        control = BinanceTestnetControlPlane(
+            self.gate,
+            execution=strategy,
+            worker=_TestnetWorker(strategy),
+            monotonic_clock=lambda: next(ticks),
+        )
+
+        with self.assertRaises(BinanceOperatorError) as context:
+            control.authorize_bounded_auto(
+                EXACT_TESTNET_ENABLE_PHRASE,
+                30,
+                deadline_monotonic=100.0,
+            )
+
+        self.assertEqual(context.exception.reason, "AUTO_DEADLINE_EXPIRED")
+        self.assertEqual(strategy.calls, [])
+        self.assertEqual(strategy.state, "DISABLED")
+        self.assertIsNone(getattr(control, "_autonomous_window", None))
+
+    def test_private_authorization_rejects_stale_pass_without_current_credentials(self):
+        strategy = _TestnetStrategy()
+        control = BinanceTestnetControlPlane(
+            self.gate,
+            execution=strategy,
+            worker=_TestnetWorker(strategy),
+        )
+        # Persisted PASS statuses must not authorize when credentials are absent.
+        self.gate.connectivity = {"status": "PASS"}
+        self.gate.validation = {"status": "PASS"}
+        self.gate.credentials = None
+
+        with self.assertRaises(BinanceOperatorError) as context:
+            control.authorize_bounded_auto(EXACT_TESTNET_ENABLE_PHRASE, 30)
+
+        self.assertEqual(context.exception.reason, "CREDENTIALS_NOT_CONFIGURED")
+        self.assertEqual(strategy.calls, [])
+        self.assertEqual(self.gate.calls, [])
+        self.assertEqual(self.gate.venue_calls, [])
+        self.assertEqual(strategy.state, "DISABLED")
+
+
+    def test_history_is_independent_bounded_and_secret_free(self):
+        control = BinanceTestnetControlPlane(self.gate, store=_Store(self.connection))
+        result = control.action(
+            "CONNECTIVITY_CHECK",
+            {"api_secret": "must-not-persist"},
+        )
+        self.assertFalse(result["ok"])
+        row = self.connection.execute(
+            "SELECT environment,source,probe_kind,payload_json FROM binance_testnet_operator_actions"
+        ).fetchone()
+        self.assertEqual(row["environment"], "BINANCE_SPOT_TESTNET")
+        self.assertEqual(row["source"], "binance_testnet_operator")
+        self.assertEqual(row["probe_kind"], "TESTNET EXECUTION PROBE")
+        self.assertNotIn("must-not-persist", row["payload_json"])
+        legacy_table = self.connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='binance_operator_actions'"
+        ).fetchone()
+        self.assertIsNone(legacy_table)
+
+    def test_absent_strategy_reports_autonomous_blocked_and_separate_evidence(self):
+        self.gate.credentials = {"api_key": "configured", "api_secret": "configured"}
+        self.gate.connectivity = {"status": "PASS"}
+        self.gate.validation = {"status": "PASS"}
+        control = BinanceTestnetControlPlane(self.gate)
+        status = control.status()
+        self.assertEqual(status["title"], "BINANCE SPOT TESTNET")
+        self.assertEqual(status["autonomous"]["state"], "BLOCKED")
+        self.assertEqual(status["autonomous"]["blocked_reason"], "STRATEGY_NOT_CONFIGURED")
+        self.assertIsNone(status["autonomous"]["selected_candidate"])
+        self.assertIsNone(status["autonomous"]["current_signal"])
+        self.assertEqual(status["isolation"]["strategy_ledgers_touched"], False)
+
+
+    def test_execution_only_runtime_is_blocked_without_execution_calls(self):
+        self.gate.credentials = {"api_key": "configured", "api_secret": "configured"}
+        self.gate.connectivity = {"status": "PASS"}
+        self.gate.validation = {"status": "PASS"}
+        execution = _TestnetStrategy()
+        control = BinanceTestnetControlPlane(self.gate, execution=execution)
+
+        status = control.status()
+        self.assertEqual(status["autonomous"]["state"], "BLOCKED")
+        self.assertEqual(status["autonomous"]["blocked_reason"], "STRATEGY_NOT_CONFIGURED")
+        result = control.action(
+            "ENABLE",
+            {
+                "confirmation": EXACT_TESTNET_ENABLE_PHRASE,
+                "window_seconds": 30,
+            },
+        )
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "BOUNDED_AUTO_REQUIRES_CLI")
+        with self.assertRaises(BinanceOperatorError) as context:
+            control.authorize_bounded_auto(EXACT_TESTNET_ENABLE_PHRASE, 30)
+        self.assertEqual(context.exception.reason, "STRATEGY_NOT_CONFIGURED")
+        self.assertEqual(execution.calls, [])
+
+    def test_non_executable_worker_is_blocked_even_with_strategy_and_passed_gates(self):
+        strategy = _TestnetStrategy()
+        worker = _TestnetWorker(strategy, supports_persisted_strategy=False)
+        self.gate.credentials = {"api_key": "configured", "api_secret": "configured"}
+        self.gate.connectivity = {"status": "PASS"}
+        self.gate.validation = {"status": "PASS"}
+        control = BinanceTestnetControlPlane(self.gate, execution=strategy, worker=worker)
+
+        status = control.status()
+        self.assertEqual(status["autonomous"]["state"], "BLOCKED")
+        self.assertEqual(status["autonomous"]["blocked_reason"], "STRATEGY_NOT_CONFIGURED")
+        with self.assertRaises(BinanceOperatorError) as context:
+            control.authorize_bounded_auto(EXACT_TESTNET_ENABLE_PHRASE, 30)
+        self.assertEqual(context.exception.reason, "STRATEGY_NOT_CONFIGURED")
+        self.assertEqual(strategy.calls, [])
+
+    def test_persisted_strategy_worker_can_authorize_without_injected_strategy(self):
+        execution = _TestnetStrategy()
+        worker = _TestnetWorker(None)
+        self.gate.credentials = {"api_key": "configured", "api_secret": "configured"}
+        self.gate.connectivity = {"status": "PASS"}
+        self.gate.validation = {"status": "PASS"}
+        control = BinanceTestnetControlPlane(self.gate, execution=execution, worker=worker)
+
+        authorized = control.authorize_bounded_auto(EXACT_TESTNET_ENABLE_PHRASE, 30)
+
+        self.assertEqual(execution.state, "ARMED")
+        self.assertEqual(authorized["autonomous"], {"seconds": 30, "bounded": True})
+
+    def test_configured_worker_routes_control_to_execution(self):
+        strategy = _TestnetStrategy()
+        control = BinanceTestnetControlPlane(
+            self.gate,
+            execution=strategy,
+            worker=_TestnetWorker(strategy),
+        )
+        self.gate.connectivity = {"status": "PASS"}
+        self.gate.credentials = {"api_key": "configured", "api_secret": "configured"}
+        self.gate.validation = {"status": "PASS"}
+
+        control.authorize_bounded_auto(EXACT_TESTNET_ENABLE_PHRASE, 30)
+        control.action("PAUSE", {"reason": "operator test"})
+        control.action("DISARM", {"reason": "operator test"})
+
+        self.assertEqual(
+            [call[0] for call in strategy.calls],
+            ["enable", "pause", "disarm"],
+        )
+
+    def test_explicit_audit_connection_cannot_commit_gate_transaction(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = str(Path(directory) / "testnet.sqlite")
+            gate_connection = sqlite3.connect(database, timeout=0.1)
+            audit_connection = sqlite3.connect(database, timeout=0.1)
+            try:
+                gate_connection.execute("PRAGMA journal_mode=WAL")
+                gate_connection.commit()
+                gate_connection.execute("CREATE TABLE gate_transaction_probe(value TEXT)")
+                gate_connection.commit()
+                gate = _TestnetGate(gate_connection)
+                control = BinanceTestnetControlPlane(
+                    gate,
+                    store=_Store(audit_connection),
+                )
+                self.assertIs(control._conn, audit_connection)
+                self.assertIsNot(control._conn, gate_connection)
+
+                # Acquire SQLite's write lock and make the gate work
+                # uncommitted before the audit connection attempts its write.
+                gate_connection.execute("BEGIN IMMEDIATE")
+                gate_connection.execute(
+                    "INSERT INTO gate_transaction_probe VALUES ('uncommitted')"
+                )
+                self.assertTrue(gate_connection.in_transaction)
+
+                result = control.action("CONNECTIVITY_CHECK")
+
+                # The separate audit writer cannot commit while the gate
+                # transaction owns SQLite's write lock.  The operator boundary
+                # reports that persistence failed rather than committing the
+                # gate transaction through an aliased connection.
+                self.assertFalse(result["ok"])
+                self.assertEqual(result["reason"], "ACTION_AUDIT_FAILED")
+                self.assertEqual(result["audit_error"], "OperationalError")
+                self.assertEqual(
+                    gate_connection.execute(
+                        "SELECT COUNT(*) FROM gate_transaction_probe"
+                    ).fetchone()[0],
+                    1,
+                )
+
+                gate_connection.rollback()
+                self.assertEqual(
+                    gate_connection.execute(
+                        "SELECT COUNT(*) FROM gate_transaction_probe"
+                    ).fetchone()[0],
+                    0,
+                )
+
+                # Once the gate transaction is rolled back, the same distinct
+                # audit connection can persist a normal operator action.
+                recovered = control.action("CONNECTIVITY_CHECK")
+                self.assertTrue(recovered["ok"])
+                self.assertEqual(
+                    audit_connection.execute(
+                        "SELECT COUNT(*) FROM binance_testnet_operator_actions"
+                    ).fetchone()[0],
+                    1,
+                )
+            finally:
+                audit_connection.close()
+                gate_connection.close()
 
 
 class BinanceOperatorTests(unittest.TestCase):

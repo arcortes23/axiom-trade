@@ -2,14 +2,17 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 import json
-from threading import Event
+import time
+from threading import Event, Lock
 from urllib.parse import parse_qs, urlsplit
 import unittest
+from unittest.mock import patch
 
-from axiom.binance_market import BoundedBinanceMarketCollector
+from axiom.binance_market import AUTO_DEADLINE_EXPIRED, BoundedBinanceMarketCollector
 from axiom.crypto_universe import UniverseSnapshot
-from axiom.data.binance import BinanceAdapter
+from axiom.data.binance import BinanceAdapter, BinanceDeadlineExpired
 from axiom.domain import CryptoTicker, OHLCVBar, OrderBookLevel, OrderBookSnapshot
+
 
 
 UTC = timezone.utc
@@ -87,6 +90,24 @@ class JsonResponse:
 
     def close(self) -> None:
         return None
+
+
+class RoutedResponse(JsonResponse):
+    def __init__(
+        self,
+        payload: object,
+        *,
+        status: int = 200,
+        response_url: str | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        super().__init__(payload)
+        self.status = status
+        self.headers = headers or {}
+        self.response_url = response_url
+
+    def geturl(self) -> str | None:
+        return self.response_url
 
 
 class FakeOpener:
@@ -280,6 +301,75 @@ class BinanceAdapterPublicTests(unittest.TestCase):
         for name in ("account", "orders", "place_order", "cancel_order", "create_order"):
             self.assertFalse(callable(getattr(adapter, name, None)), name)
 
+    def test_public_redirect_and_alternate_final_origin_are_rejected_before_decode(self):
+        calls: list[str] = []
+        responses = iter(
+            (
+                RoutedResponse(
+                    {},
+                    status=302,
+                    headers={"Location": "https://evil.example/api/v3/ticker/24hr"},
+                ),
+                RoutedResponse(
+                    {
+                        "symbol": "BTCUSDT",
+                        "lastPrice": "100.5",
+                        "bidPrice": "100",
+                        "askPrice": "101",
+                    },
+                    response_url="https://evil.example/api/v3/ticker/24hr",
+                ),
+            )
+        )
+
+        def opener(request: object, *, timeout: float) -> RoutedResponse:
+            del timeout
+            calls.append(str(getattr(request, "full_url", request)))
+            return next(responses)
+
+        origin = "https://testnet.binance.vision"
+        adapter = BinanceAdapter(base_url=origin, opener=opener, clock=lambda: NOW)
+
+        self.assertIsNone(adapter.ticker("BTCUSDT"))
+        self.assertIsNone(adapter.ticker("BTCUSDT"))
+        self.assertEqual(calls, [f"{origin}/api/v3/ticker/24hr?symbol=BTCUSDT"] * 2)
+
+    def test_trades_propagate_absolute_deadline_across_pages(self):
+        adapter = BinanceAdapter()
+        first_page = [
+            {"a": index, "T": int((NOW + timedelta(seconds=index)).timestamp() * 1000), "p": "100", "q": "1"}
+            for index in range(1000)
+        ]
+        second_page = [{"a": 1000, "T": int((NOW + timedelta(seconds=1000)).timestamp() * 1000), "p": "100", "q": "1"}]
+        calls: list[float | None] = []
+        pages = [first_page, second_page]
+
+        def fake_get(path: str, *, deadline_monotonic: float | None = None, **params: object) -> object:
+            calls.append(deadline_monotonic)
+            return pages.pop(0)
+
+        adapter._get = fake_get  # type: ignore[method-assign]
+        deadline = time.monotonic() + 30.0
+        trades = adapter.trades("BTCUSDT", start=NOW, deadline_monotonic=deadline)
+
+        self.assertEqual(len(trades), 1001)
+        self.assertEqual(calls, [deadline, deadline])
+
+    def test_transport_error_crossing_deadline_is_not_swallowed(self):
+        calls: list[float] = []
+
+        class SlowFailure:
+            def __call__(self, request: object, *, timeout: float) -> object:
+                calls.append(timeout)
+                raise TimeoutError("fixture transport timeout")
+
+        adapter = BinanceAdapter(opener=SlowFailure(), timeout=1.0)
+        with patch("axiom.data.binance.time.monotonic", side_effect=(100.0, 100.002)):
+            with self.assertRaises(BinanceDeadlineExpired):
+                adapter.ticker("BTCUSDT", deadline_monotonic=100.001)
+        self.assertEqual(len(calls), 1)
+
+
 
 class BinanceMarketCollectorTests(unittest.TestCase):
     def test_exact_universe_provenance_rank_order_recheck_and_market_evidence(self):
@@ -386,6 +476,81 @@ class BinanceMarketCollectorTests(unittest.TestCase):
         finally:
             provider.release.set()
             provider.started.wait(timeout=2.0)
+    def test_deadline_propagates_to_every_provider_call(self):
+        class DeadlineProvider(PublicProvider):
+            def __init__(self) -> None:
+                super().__init__()
+                self.deadlines: list[float | None] = []
+
+            def exchange_info(self, symbol: str, *, deadline_monotonic: float | None = None) -> dict[str, object]:
+                self.deadlines.append(deadline_monotonic)
+                return super().exchange_info(symbol)
+
+            def closed_historical_ohlcv(
+                self, symbol: str, *, deadline_monotonic: float | None = None, **kwargs: object
+            ) -> tuple[OHLCVBar, ...]:
+                self.deadlines.append(deadline_monotonic)
+                return super().closed_historical_ohlcv(symbol, **kwargs)
+
+            def ticker(self, symbol: str, *, deadline_monotonic: float | None = None) -> CryptoTicker:
+                self.deadlines.append(deadline_monotonic)
+                return super().ticker(symbol)
+
+            def order_book(
+                self, symbol: str, depth: int = 20, *, deadline_monotonic: float | None = None
+            ) -> OrderBookSnapshot:
+                self.deadlines.append(deadline_monotonic)
+                return super().order_book(symbol, depth)
+
+        provider = DeadlineProvider()
+        deadline = time.monotonic() + 30.0
+        BoundedBinanceMarketCollector(provider, _universe(), max_workers=1, clock=lambda: NOW).collect(
+            now=NOW, deadline_monotonic=deadline
+        )
+        self.assertTrue(provider.deadlines)
+        self.assertEqual(set(provider.deadlines), {deadline})
+
+    def test_already_expired_deadline_makes_zero_provider_calls(self):
+        provider = PublicProvider()
+        result = BoundedBinanceMarketCollector(provider, _universe(), clock=lambda: NOW).collect(
+            now=NOW, deadline_monotonic=time.monotonic() - 1.0
+        )
+
+        self.assertEqual(provider.calls, [])
+        self.assertTrue(all(record.timed_out for record in result))
+        self.assertTrue(all(record.error == AUTO_DEADLINE_EXPIRED for record in result))
+        self.assertTrue(all(AUTO_DEADLINE_EXPIRED in record.reasons for record in result))
+
+    def test_deadline_cancels_queued_work_and_joins_started_workers(self):
+        class SlowFirstProvider(PublicProvider):
+            def __init__(self) -> None:
+                super().__init__()
+                self.lock = Lock()
+                self.active = 0
+                self.max_active = 0
+                self.exchange_calls: list[str] = []
+
+            def exchange_info(self, symbol: str, *, deadline_monotonic: float | None = None) -> dict[str, object]:
+                with self.lock:
+                    self.active += 1
+                    self.max_active = max(self.max_active, self.active)
+                    self.exchange_calls.append(symbol)
+                try:
+                    if symbol == "BTCUSDT":
+                        time.sleep(0.03)
+                    return super().exchange_info(symbol)
+                finally:
+                    with self.lock:
+                        self.active -= 1
+
+        provider = SlowFirstProvider()
+        result = BoundedBinanceMarketCollector(
+            provider, _universe(), max_workers=1, clock=lambda: NOW
+        ).collect(now=NOW, deadline_monotonic=time.monotonic() + 0.002)
+
+        self.assertEqual(provider.active, 0)
+        self.assertLessEqual(len(provider.exchange_calls), 1)
+        self.assertTrue(all(record.timed_out for record in result))
 
 
 if __name__ == "__main__":

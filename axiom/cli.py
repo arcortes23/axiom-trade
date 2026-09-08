@@ -34,7 +34,7 @@ from .research_bus import DurableResearchBus, ResearchBusPermissionError, _valid
 from .strategy import evaluate_signal_record, load_strategy
 from .tracking import ExperimentTracker
 from .storage import AxiomStore, SQLiteBusyTimeout
-from .binance_dev import BinanceDevelopmentRuntime
+from .binance_dev import BinanceDevelopmentRuntime, BinanceTestnetRuntime
 from .binance_spot import (
     BINANCE_SPOT_TESTNET,
     BinanceCredentialRef,
@@ -194,6 +194,47 @@ def build_parser() -> argparse.ArgumentParser:
     binance_dev = commands.add_parser("binance-dev", help="serve the isolated Binance Spot development runtime")
     binance_dev.add_argument("--once", action="store_true", help="run one bounded worker cycle and stop")
     operator = commands.add_parser("operator", help="supervise one paper node and its localhost operator dashboard")
+    binance_testnet = commands.add_parser(
+        "binance-testnet",
+        help="operate the isolated Binance Spot TESTNET runtime",
+    )
+    binance_testnet_commands = binance_testnet.add_subparsers(
+        dest="binance_testnet_command",
+        required=True,
+    )
+    binance_testnet_commands.add_parser("status", help="show TESTNET status without network calls")
+    binance_testnet_commands.add_parser("connectivity", help="perform the explicit TESTNET connectivity check")
+    validate_testnet = binance_testnet_commands.add_parser(
+        "validate",
+        help="perform the explicit TESTNET order validation gate",
+    )
+    validate_testnet.add_argument("--symbol")
+    probe_testnet = binance_testnet_commands.add_parser(
+        "probe",
+        help="run the explicit TESTNET execution probe",
+    )
+    probe_testnet.add_argument("--symbol")
+    probe_testnet.add_argument("--confirmation", required=True)
+    binance_testnet_commands.add_parser(
+        "reconcile",
+        help="reconcile the persisted TESTNET execution probe",
+    )
+    serve_testnet = binance_testnet_commands.add_parser(
+        "serve",
+        help="serve the TESTNET dashboard on 127.0.0.1:8082",
+    )
+    serve_testnet.add_argument(
+        "--once",
+        action="store_true",
+        help="bind and stop after the dashboard readiness smoke check",
+    )
+    auto_testnet = binance_testnet_commands.add_parser(
+        "auto",
+        help="run the explicitly enabled bounded TESTNET autonomous window",
+    )
+    auto_testnet.add_argument("--confirmation", required=True)
+    auto_testnet.add_argument("--window-seconds", required=True, type=int)
+    auto_testnet.add_argument("--symbol")
     operator.add_argument("--db", default=DEFAULT_DB_PATH, help="canonical SQLite operational database path")
     operator.add_argument("--port", type=int, default=8080)
     operator.add_argument("--open-browser", action="store_true")
@@ -809,8 +850,54 @@ def _run_binance_credentials(args: argparse.Namespace) -> int:
     print(json.dumps(_binance_testnet_credential_status(configured=configured), sort_keys=True, indent=2))
     return 0
 
+def _run_binance_testnet(args: argparse.Namespace) -> int:
+    """Dispatch one explicit TESTNET runtime command."""
+
+    runtime: BinanceTestnetRuntime | None = None
+    try:
+        runtime = BinanceTestnetRuntime()
+        command = args.binance_testnet_command
+        if command == "status":
+            # Status is intentionally read-only and does not take the profile
+            # lock; a serving dashboard remains observable.
+            payload = runtime.status()
+        elif command == "connectivity":
+            payload = runtime.locked_action("CONNECTIVITY_CHECK")
+        elif command == "validate":
+            payload = runtime.locked_action(
+                "ORDER_VALIDATION_TEST",
+                {"symbol": args.symbol} if args.symbol else {},
+            )
+        elif command == "probe":
+            payload = runtime.locked_action(
+                "EXECUTION_PROBE",
+                {
+                    **({"symbol": args.symbol} if args.symbol else {}),
+                    "confirmation": args.confirmation,
+                },
+            )
+        elif command == "reconcile":
+            payload = runtime.locked_action("RECONCILE_PROBE")
+        elif command == "serve":
+            payload = runtime.serve(once=bool(args.once))
+        elif command == "auto":
+            payload = runtime.auto(
+                confirmation=args.confirmation,
+                window_seconds=args.window_seconds,
+                symbol=args.symbol,
+            )
+        else:  # pragma: no cover
+            raise ValueError(f"unsupported Binance TESTNET command: {command}")
+        print(json.dumps(payload, sort_keys=True, indent=2, default=str))
+        return 0
+    finally:
+        if runtime is not None:
+            runtime.stop()
+
 def _main_impl(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.command == "binance-testnet":
+        return _run_binance_testnet(args)
     if args.command == "binance-dev":
         runtime = BinanceDevelopmentRuntime()
         try:

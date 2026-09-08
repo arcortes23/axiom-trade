@@ -3,10 +3,12 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import json
 import tempfile
+import time
 import unittest
 
-from axiom.binance_auto import BinanceAutonomousWorker
+from axiom.binance_auto import BinanceAutonomousWorker, _strategy_digest
 from axiom.binance_execution import ARMED, DISABLED, KILLED
+from axiom.binance_research import project_testnet_execution_binding
 from axiom.crypto_universe import UniverseSnapshot
 from axiom.storage import AxiomStore
 
@@ -179,6 +181,85 @@ class BinanceAutonomousWorkerTests(unittest.TestCase):
             interval_seconds=0,
             **kwargs,
         )
+    def persisted_candidate(self, candidate_id="frozen-entry", symbol="BTCUSDT"):
+        strategy = {
+            "version": 1,
+            "market_type": "crypto_spot",
+            "family": "trend",
+            "parameters": {"lookback": 5},
+            "operations": [],
+            "metadata": {
+                "api_token": "immutable-token",
+                "secret_key": "immutable-secret",
+                "key": "immutable-key",
+            },
+        }
+        strategy_hash = _strategy_digest(strategy)
+        self.store.save_strategy_if_absent("trend", strategy, version="1")
+        source_binding = {
+            "candidate_id": candidate_id,
+            "symbol": symbol,
+            "frozen_hash": "frozen-" + candidate_id,
+            "strategy_hash": strategy_hash,
+            "model_hash": "model-" + candidate_id,
+            "config_hash": "config-" + candidate_id,
+            "plan_hash": "plan-" + candidate_id,
+            "universe_id": "universe-test",
+            "universe_version": "u-v1",
+            "universe_snapshot": "sha256:universe-test",
+            "asset_symbol_mapping": {"BASE": symbol},
+            "dataset_id": "crypto",
+            "dataset_version": "crypto-v1",
+            "timeframe": "1d",
+            "source": "HISTORICAL",
+            "quality": "HIGH",
+            "survivorship": "point_in_time",
+            "environment": "PAPER",
+            "venue": "BINANCE_SPOT",
+            "adapter_version": "fixture",
+            "strategy_ref": {
+                "strategy_id": "trend",
+                "strategy_version": "1",
+                "strategy_hash": strategy_hash,
+            },
+        }
+        successor, source_hash = project_testnet_execution_binding(source_binding)
+        source_binding["binding_hash"] = source_hash
+        payload = {
+            "candidate_id": candidate_id,
+            "symbol": symbol,
+            "binding": source_binding,
+            "strategy_ref": source_binding["strategy_ref"],
+            "strategy_document": strategy,
+            "qualification_hash": "qualification-" + candidate_id,
+            "immutable_hashes": {
+                "frozen_hash": source_binding["frozen_hash"],
+                "secret_key": "immutable-evidence",
+            },
+        }
+        self.store.save_candidate_lifecycle(candidate_id, "IDEA", payload, timestamp=T0)
+        self.store.save_candidate_lifecycle(
+            candidate_id, "FROZEN", payload, from_stage="IDEA", timestamp=T0
+        )
+        row = {
+            "candidate_id": candidate_id,
+            "symbol": symbol,
+            "rank": 1,
+            "qualified": True,
+            "binding": source_binding,
+            "binding_hash": source_hash,
+            "qualification_hash": payload["qualification_hash"],
+            "immutable_hashes": payload["immutable_hashes"],
+            "strategy_ref": source_binding["strategy_ref"],
+        }
+        successor_map = successor.as_dict()
+        successor_map["binding_hash"] = successor.binding_hash
+        return strategy, row, dict(source_binding), successor_map, source_hash
+
+    def persisted_qualification(self, ranking):
+        qualification = FakeQualification(ranking)
+        qualification.store = self.store
+        return qualification
 
     def test_reconciles_before_entries_when_disabled_and_killed(self):
         ranking = {"selection_status": "CURRENT", "rankings": [{"candidate_id": "c1", "symbol": "BTCUSDT", "rank": 1, "qualified": True}]}
@@ -265,8 +346,8 @@ class BinanceAutonomousWorkerTests(unittest.TestCase):
             ],
         }
         execution = FakeExecution(positions=[position])
-        collector = FakeCollector([market("BTCUSDT"), market("ETHUSDT"), market("XRPUSDT")])
-
+        btc_market, eth_market, xrp_market = market("BTCUSDT"), market("ETHUSDT"), market("XRPUSDT")
+        collector = FakeCollector([btc_market, eth_market, xrp_market])
         def factory(**kwargs):
             if kwargs["intent"] == "EXIT":
                 signal = entry_signal("exit-owned", "XRPUSDT", "owned-candidate")
@@ -289,6 +370,11 @@ class BinanceAutonomousWorkerTests(unittest.TestCase):
             item for item in execution.submissions if item["signal"]["intent"] == "ENTRY"
         ]
         self.assertEqual(len(entry_submissions), 1)
+        self.assertIs(
+            next(item for item in execution.submissions if item["signal"]["intent"] == "EXIT")["market"],
+            xrp_market,
+        )
+        self.assertIs(entry_submissions[0]["market"], btc_market)
         self.assertEqual(entry_submissions[0]["signal"]["symbol"], "BTCUSDT")
         self.assertEqual(
             [item["signal"]["intent"] for item in execution.submissions],
@@ -509,5 +595,652 @@ class BinanceAutonomousWorkerTests(unittest.TestCase):
         self.assertNotIn("hermes", json.dumps(result).lower())
 
 
+    def test_generated_frozen_candidate_hydrates_exact_strategy_and_evidence(self):
+        strategy, row, source, successor, source_hash = self.persisted_candidate()
+        ranking = {"selection_status": "CURRENT", "rankings": [row]}
+        execution = FakeExecution()
+        btc_market, eth_market = market("BTCUSDT"), market("ETHUSDT")
+        collector = FakeCollector([btc_market, eth_market])
+        captured = []
+
+        def factory(**kwargs):
+            captured.append(kwargs)
+            binding = kwargs["binding"]
+            signal = entry_signal("frozen-entry-signal", binding["symbol"], binding["candidate_id"])
+            signal["binding_hash"] = binding["binding_hash"]
+            return FakeEngine(binding, kwargs["intent"], signal)
+
+        result = self.worker(
+            execution,
+            collector,
+            self.persisted_qualification(ranking),
+            signal_engine_factory=factory,
+        ).cycle(now=T0)
+        self.assertEqual(result["entries"][0]["status"], "SUBMITTED")
+        self.assertIs(execution.submissions[0]["market"], btc_market)
+        self.assertEqual(captured[0]["strategy"].to_dict(), strategy)
+        submitted = execution.submissions[0]["signal"]
+        self.assertEqual(submitted["binding_hash"], successor["binding_hash"])
+        self.assertEqual(submitted["source_binding_hash"], source_hash)
+        self.assertEqual(submitted["strategy_ref"]["strategy_id"], "trend")
+        self.assertEqual(submitted["provenance"]["source_binding_hash"], source_hash)
+        self.assertEqual(submitted["provenance"]["strategy_ref"]["strategy_hash"], _strategy_digest(strategy))
+        altered = json.loads(json.dumps(strategy))
+        altered["metadata"]["api_token"] = "changed-token"
+        self.assertNotEqual(_strategy_digest(altered), _strategy_digest(strategy))
+
+    def test_explicit_paper_execution_keeps_persisted_row_on_legacy_binding_path(self):
+        strategy, row, *_ = self.persisted_candidate("paper-static", "BTCUSDT")
+        execution = FakeExecution()
+        execution.environment = "PAPER"
+        captured = []
+
+        def factory(**kwargs):
+            captured.append(kwargs)
+            binding = kwargs["binding"]
+            return FakeEngine(
+                binding,
+                kwargs["intent"],
+                entry_signal("paper-static-entry", "BTCUSDT", "paper-static"),
+            )
+
+        result = self.worker(
+            execution,
+            FakeCollector([market("BTCUSDT"), market("ETHUSDT")]),
+            self.persisted_qualification({"selection_status": "CURRENT", "rankings": [row]}),
+            strategy=strategy,
+            signal_engine_factory=factory,
+        ).cycle(now=T0)
+        self.assertEqual(result["entries"][0]["status"], "SUBMITTED")
+        self.assertEqual(captured[0]["binding"]["environment"], "PAPER")
+        self.assertNotIn("source_binding_hash", captured[0]["binding"])
+
+
+    def test_paper_persisted_candidate_hydrates_strategy_without_static_injection(self):
+        strategy, row, *_ = self.persisted_candidate("paper-hydrated", "BTCUSDT")
+        execution = FakeExecution()
+        execution.environment = "PAPER"
+        captured = []
+
+        def factory(**kwargs):
+            captured.append(kwargs)
+            binding = kwargs["binding"]
+            return FakeEngine(
+                binding,
+                kwargs["intent"],
+                entry_signal("paper-hydrated-entry", "BTCUSDT", "paper-hydrated"),
+            )
+
+        result = self.worker(
+            execution,
+            FakeCollector([market("BTCUSDT"), market("ETHUSDT")]),
+            self.persisted_qualification({"selection_status": "CURRENT", "rankings": [row]}),
+            signal_engine_factory=factory,
+        ).cycle(now=T0)
+        self.assertEqual(result["entries"][0]["status"], "SUBMITTED")
+        self.assertEqual(captured[0]["strategy"].to_dict(), strategy)
+
+    def test_explicit_paper_execution_keeps_persisted_origin_on_legacy_exit_path(self):
+        strategy, row, _, _, source_hash = self.persisted_candidate("paper-exit", "BTCUSDT")
+        position = {
+            "symbol": "BTCUSDT",
+            "quantity": "1",
+            "candidate_id": "paper-exit",
+            "binding_hash": source_hash,
+            "originating_binding": {**row["binding"], "binding_hash": source_hash},
+            "originating_provenance": {
+                "source_binding_hash": source_hash,
+                "strategy_ref": row["strategy_ref"],
+            },
+            "exit_policy": {"strategy": strategy},
+        }
+        execution = FakeExecution(positions=[position])
+        execution.environment = "PAPER"
+        captured = []
+
+        def factory(**kwargs):
+            captured.append(kwargs)
+            binding = kwargs["binding"]
+            signal = entry_signal("paper-exit-signal", "BTCUSDT", "paper-exit")
+            signal.update({"intent": "EXIT", "side": "SELL", "binding_hash": binding["binding_hash"]})
+            return FakeEngine(binding, kwargs["intent"], signal)
+
+        result = self.worker(
+            execution,
+            FakeCollector([market("BTCUSDT"), market("ETHUSDT")]),
+            self.persisted_qualification({"selection_status": "NONE", "rankings": []}),
+            strategy=strategy,
+            signal_engine_factory=factory,
+        ).cycle(now=T0)
+        self.assertEqual(result["status"], "ACTIONED")
+        self.assertEqual(result["exits"][0]["status"], "SUBMITTED")
+        self.assertEqual(captured[0]["binding"]["environment"], "PAPER")
+
+    def test_invalid_frozen_hash_never_falls_back_to_static_strategy(self):
+        static_strategy, row, *_ = self.persisted_candidate()
+        row["binding_hash"] = "tampered-wrapper-hash"
+        execution = FakeExecution()
+        engines = []
+
+        def factory(**kwargs):
+            engines.append(kwargs)
+            return FakeEngine(kwargs["binding"], kwargs["intent"], entry_signal("unexpected", "BTCUSDT", "frozen-entry"))
+
+        result = self.worker(
+            execution,
+            FakeCollector([market("BTCUSDT"), market("ETHUSDT")]),
+            self.persisted_qualification({"selection_status": "CURRENT", "rankings": [row]}),
+            strategy=static_strategy,
+            signal_engine_factory=factory,
+        ).cycle(now=T0)
+        self.assertEqual(execution.submissions, [])
+        self.assertEqual(engines, [])
+        self.assertIn("SOURCE_BINDING_HASH_MISMATCH", result["no_trade_reason"])
+
+    def test_persisted_strategy_support_uses_canonical_same_database_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = directory + "/auto.sqlite"
+            worker_store = AxiomStore(path)
+            qualification_store = AxiomStore(path)
+            try:
+                qualification = FakeQualification({"selection_status": "NONE", "rankings": []})
+                qualification.store = qualification_store
+                worker = BinanceAutonomousWorker(
+                    worker_store,
+                    FakeExecution(state=DISABLED, authorized=False),
+                    universe=universe("BTCUSDT"),
+                    collector=FakeCollector([market("BTCUSDT")]),
+                    qualification=qualification,
+                    clock=lambda: T0,
+                    interval_seconds=0,
+                )
+                self.assertTrue(worker.supports_persisted_strategy())
+            finally:
+                qualification_store.close()
+                worker_store.close()
+    def test_different_database_candidate_id_collision_cannot_hydrate_local_lifecycle(self):
+        self.persisted_candidate("collision", "BTCUSDT")
+        foreign_store = AxiomStore(":memory:")
+        try:
+            qualification = FakeQualification({
+                "selection_status": "CURRENT",
+                "rankings": [{
+                    "candidate_id": "collision",
+                    "symbol": "BTCUSDT",
+                    "rank": 1,
+                    "qualified": True,
+                }],
+            })
+            qualification.store = foreign_store
+            execution = FakeExecution()
+            result = self.worker(
+                execution,
+                FakeCollector([market("BTCUSDT"), market("ETHUSDT")]),
+                qualification,
+                strategy={"market_type": "crypto_spot"},
+            ).cycle(now=T0)
+            self.assertEqual(execution.submissions, [])
+            self.assertIn("PERSISTED_EVIDENCE_STORE_MISMATCH", result["no_trade_reason"])
+        finally:
+            foreign_store.close()
+
+    def test_cross_database_nested_provenance_hash_is_not_row_proof(self):
+        _, _, _, _, source_hash = self.persisted_candidate("nested-collision", "BTCUSDT")
+        foreign_store = AxiomStore(":memory:")
+        try:
+            qualification = FakeQualification({
+                "selection_status": "CURRENT",
+                "rankings": [{
+                    "candidate_id": "nested-collision",
+                    "symbol": "BTCUSDT",
+                    "rank": 1,
+                    "qualified": True,
+                    "provenance": {"source_binding_hash": source_hash},
+                }],
+            })
+            qualification.store = foreign_store
+            execution = FakeExecution()
+            engines = []
+
+            def factory(**kwargs):
+                engines.append(kwargs)
+                return FakeEngine(kwargs["binding"], kwargs["intent"], entry_signal("unexpected-nested", "BTCUSDT", "nested-collision"))
+
+            result = self.worker(
+                execution,
+                FakeCollector([market("BTCUSDT"), market("ETHUSDT")]),
+                qualification,
+                strategy={"market_type": "crypto_spot"},
+                signal_engine_factory=factory,
+            ).cycle(now=T0)
+            self.assertEqual(execution.submissions, [])
+            self.assertEqual(engines, [])
+            self.assertIn("PERSISTED_EVIDENCE_STORE_MISMATCH", result["no_trade_reason"])
+        finally:
+            foreign_store.close()
+
+    def test_cross_database_wrong_row_hash_fails_closed(self):
+        _, row, _, _, _ = self.persisted_candidate("wrong-collision", "BTCUSDT")
+        row = {
+            "candidate_id": row["candidate_id"],
+            "symbol": row["symbol"],
+            "rank": 1,
+            "qualified": True,
+            "binding_hash": "wrong-public-proof",
+        }
+        foreign_store = AxiomStore(":memory:")
+        try:
+            qualification = FakeQualification({"selection_status": "CURRENT", "rankings": [row]})
+            qualification.store = foreign_store
+            execution = FakeExecution()
+            engines = []
+
+            def factory(**kwargs):
+                engines.append(kwargs)
+                return FakeEngine(kwargs["binding"], kwargs["intent"], entry_signal("unexpected-wrong", "BTCUSDT", "wrong-collision"))
+
+            result = self.worker(
+                execution,
+                FakeCollector([market("BTCUSDT"), market("ETHUSDT")]),
+                qualification,
+                strategy={"market_type": "crypto_spot"},
+                signal_engine_factory=factory,
+            ).cycle(now=T0)
+            self.assertEqual(execution.submissions, [])
+            self.assertEqual(engines, [])
+            self.assertIn("SOURCE_BINDING_HASH_MISMATCH", result["no_trade_reason"])
+        finally:
+            foreign_store.close()
+
+    def test_cross_database_exact_row_hash_can_bind_local_frozen_candidate(self):
+        _, row, _, _, source_hash = self.persisted_candidate("exact-collision", "BTCUSDT")
+        row = {
+            "candidate_id": row["candidate_id"],
+            "symbol": row["symbol"],
+            "rank": 1,
+            "qualified": True,
+            "binding_hash": source_hash,
+        }
+        foreign_store = AxiomStore(":memory:")
+        try:
+            qualification = FakeQualification({"selection_status": "CURRENT", "rankings": [row]})
+            qualification.store = foreign_store
+            execution = FakeExecution()
+            engines = []
+
+            def factory(**kwargs):
+                engines.append(kwargs)
+                binding = kwargs["binding"]
+                signal = entry_signal("exact-collision-entry", "BTCUSDT", "exact-collision")
+                signal["binding_hash"] = binding["binding_hash"]
+                return FakeEngine(binding, kwargs["intent"], signal)
+
+            result = self.worker(
+                execution,
+                FakeCollector([market("BTCUSDT"), market("ETHUSDT")]),
+                qualification,
+                strategy={"market_type": "crypto_spot"},
+                signal_engine_factory=factory,
+            ).cycle(now=T0)
+            self.assertEqual(len(engines), 1)
+            self.assertEqual(len(execution.submissions), 1)
+            self.assertEqual(result["entries"][0]["status"], "SUBMITTED")
+        finally:
+            foreign_store.close()
+
+    def test_same_database_minimal_row_uses_local_frozen_candidate(self):
+        self.persisted_candidate("same-db-minimal", "BTCUSDT")
+        qualification = self.persisted_qualification({
+            "selection_status": "CURRENT",
+            "rankings": [{
+                "candidate_id": "same-db-minimal",
+                "symbol": "BTCUSDT",
+                "rank": 1,
+                "qualified": True,
+            }],
+        })
+        execution = FakeExecution()
+        engines = []
+
+        def factory(**kwargs):
+            engines.append(kwargs)
+            binding = kwargs["binding"]
+            signal = entry_signal("same-db-minimal-entry", "BTCUSDT", "same-db-minimal")
+            signal["binding_hash"] = binding["binding_hash"]
+            return FakeEngine(binding, kwargs["intent"], signal)
+
+        result = self.worker(
+            execution,
+            FakeCollector([market("BTCUSDT"), market("ETHUSDT")]),
+            qualification,
+            strategy={"market_type": "crypto_spot"},
+            signal_engine_factory=factory,
+        ).cycle(now=T0)
+        self.assertEqual(len(engines), 1)
+        self.assertEqual(len(execution.submissions), 1)
+        self.assertEqual(result["entries"][0]["status"], "SUBMITTED")
+
+
+    def test_requested_entry_symbol_filters_entries_but_keeps_cross_symbol_exit(self):
+        _, row, _, successor, _ = self.persisted_candidate("eth-entry", "ETHUSDT")
+        ranking = {
+            "selection_status": "CURRENT",
+            "rankings": [
+                {"candidate_id": "btc-entry", "symbol": "BTCUSDT", "rank": 1, "qualified": True},
+                row,
+            ],
+        }
+        position = {
+            "symbol": "XRPUSDT",
+            "quantity": "1",
+            "candidate_id": "static-origin",
+            "originating_binding": {
+                "candidate_id": "static-origin",
+                "symbol": "XRPUSDT",
+                "binding_hash": "static-origin-hash",
+            },
+        }
+        execution = FakeExecution(positions=[position])
+
+        def factory(**kwargs):
+            binding = kwargs["binding"]
+            if kwargs["intent"] == "EXIT":
+                signal = entry_signal("cross-exit", "XRPUSDT", "static-origin")
+                signal.update({"intent": "EXIT", "side": "SELL", "binding_hash": binding.get("binding_hash")})
+            else:
+                signal = entry_signal("eth-entry-signal", "ETHUSDT", "eth-entry")
+                signal["binding_hash"] = binding["binding_hash"]
+            return FakeEngine(binding, kwargs["intent"], signal)
+
+        result = self.worker(
+            execution,
+            FakeCollector([market("BTCUSDT"), market("ETHUSDT"), market("XRPUSDT")]),
+            self.persisted_qualification(ranking),
+            signal_engine_factory=factory,
+        ).cycle(now=T0, symbol="ETHUSDT")
+        self.assertEqual([item["symbol"] for item in result["entries"]], ["ETHUSDT"])
+        self.assertEqual([item["symbol"] for item in result["exits"]], ["XRPUSDT"])
+        self.assertEqual([item["signal"]["intent"] for item in execution.submissions], ["EXIT", "ENTRY"])
+
+    def test_persisted_exit_rejects_non_paper_source_binding(self):
+        for environment in ("LIVE", "BINANCE_SPOT_TESTNET"):
+            with self.subTest(environment=environment):
+                candidate_id = "invalid-origin-" + environment.lower()
+                strategy, row, source, successor, source_hash = self.persisted_candidate(candidate_id)
+                lifecycle = self.store.load_candidate_lifecycle(candidate_id)
+                payload = dict(lifecycle["payload"])
+                payload["binding"] = {**payload["binding"], "environment": environment}
+                self.store.connection.execute(
+                    "UPDATE candidate_lifecycle SET payload_json=? WHERE candidate_id=?",
+                    (json.dumps(payload, sort_keys=True), candidate_id),
+                )
+                self.store.connection.commit()
+                position = {
+                    "symbol": "BTCUSDT",
+                    "quantity": "1",
+                    "candidate_id": candidate_id,
+                    "originating_binding": successor,
+                    "originating_provenance": {
+                        "source_binding_hash": source_hash,
+                        "strategy_ref": source["strategy_ref"],
+                    },
+                }
+                execution = FakeExecution(positions=[position])
+                engines = []
+
+                def factory(**kwargs):
+                    engines.append(kwargs)
+                    return FakeEngine(kwargs["binding"], kwargs["intent"], None)
+
+                result = self.worker(
+                    execution,
+                    FakeCollector([market("BTCUSDT"), market("ETHUSDT")]),
+                    self.persisted_qualification({"selection_status": "NONE", "rankings": []}),
+                    signal_engine_factory=factory,
+                    worker_id=candidate_id,
+                ).cycle(now=T0)
+                self.assertEqual(result["exits"][0]["status"], "NO_TRADE")
+                self.assertEqual(result["exits"][0]["reason"], "EXIT_ORIGIN_SOURCE_ENVIRONMENT_INVALID")
+                self.assertEqual(execution.submissions, [])
+                self.assertEqual(engines, [])
+
+    def test_restart_exit_rejects_live_origin_with_matching_paper_lifecycle(self):
+        strategy, row, source, successor, source_hash = self.persisted_candidate("live-origin-restart")
+        live_origin = {**successor, "environment": "LIVE"}
+        position = {
+            "symbol": "BTCUSDT",
+            "quantity": "1",
+            "candidate_id": "live-origin-restart",
+            "originating_binding": live_origin,
+            "originating_provenance": {
+                "source_binding_hash": source_hash,
+                "strategy_ref": source["strategy_ref"],
+            },
+        }
+        execution = FakeExecution(positions=[position])
+        engines = []
+
+        def factory(**kwargs):
+            engines.append(kwargs)
+            return FakeEngine(kwargs["binding"], kwargs["intent"], None)
+
+        result = self.worker(
+            execution,
+            FakeCollector([market("BTCUSDT"), market("ETHUSDT")]),
+            self.persisted_qualification({"selection_status": "NONE", "rankings": []}),
+            signal_engine_factory=factory,
+            worker_id="live-origin-restart-worker",
+        ).cycle(now=T0)
+        self.assertEqual(result["exits"][0]["status"], "NO_TRADE")
+        self.assertEqual(result["exits"][0]["reason"], "EXIT_ORIGIN_ENVIRONMENT_INVALID")
+        self.assertEqual(execution.submissions, [])
+        self.assertEqual(engines, [])
+
+    def test_restart_exit_rejects_conflicting_root_environment_evidence(self):
+        for environment in ("PAPER", "LIVE"):
+            with self.subTest(environment=environment):
+                strategy, row, source, successor, source_hash = self.persisted_candidate("root-" + environment.lower())
+                position = {
+                    "symbol": "BTCUSDT",
+                    "quantity": "1",
+                    "candidate_id": "root-" + environment.lower(),
+                    "environment": environment,
+                    "originating_binding": successor,
+                    "originating_provenance": {
+                        "source_binding_hash": source_hash,
+                        "strategy_ref": source["strategy_ref"],
+                    },
+                }
+                execution = FakeExecution(positions=[position])
+                engines = []
+
+                def factory(**kwargs):
+                    engines.append(kwargs)
+                    return FakeEngine(kwargs["binding"], kwargs["intent"], None)
+
+                result = self.worker(
+                    execution,
+                    FakeCollector([market("BTCUSDT"), market("ETHUSDT")]),
+                    self.persisted_qualification({"selection_status": "NONE", "rankings": []}),
+                    signal_engine_factory=factory,
+                    worker_id="root-" + environment.lower(),
+                ).cycle(now=T0)
+                self.assertEqual(result["exits"][0]["status"], "NO_TRADE")
+                self.assertEqual(result["exits"][0]["reason"], "EXIT_ORIGIN_ENVIRONMENT_INVALID")
+                self.assertEqual(execution.submissions, [])
+                self.assertEqual(engines, [])
+
+    def test_restart_exit_rejects_conflicting_root_hash_evidence(self):
+        for field, expected_reason in (
+            ("binding_hash", "EXIT_ORIGIN_BINDING_HASH_MISMATCH"),
+            ("source_binding_hash", "EXIT_ORIGIN_PROVENANCE_MISMATCH"),
+        ):
+            with self.subTest(field=field):
+                strategy, row, source, successor, source_hash = self.persisted_candidate("root-hash-" + field)
+                position = {
+                    "symbol": "BTCUSDT",
+                    "quantity": "1",
+                    "candidate_id": "root-hash-" + field,
+                    "originating_binding": successor,
+                    "originating_provenance": {
+                        "source_binding_hash": source_hash,
+                        "strategy_ref": source["strategy_ref"],
+                    },
+                    field: "contradictory-root-hash",
+                }
+                execution = FakeExecution(positions=[position])
+                engines = []
+
+                def factory(**kwargs):
+                    engines.append(kwargs)
+                    return FakeEngine(kwargs["binding"], kwargs["intent"], None)
+
+                result = self.worker(
+                    execution,
+                    FakeCollector([market("BTCUSDT"), market("ETHUSDT")]),
+                    self.persisted_qualification({"selection_status": "NONE", "rankings": []}),
+                    signal_engine_factory=factory,
+                    worker_id="root-hash-" + field,
+                ).cycle(now=T0)
+                self.assertEqual(result["exits"][0]["status"], "NO_TRADE")
+                self.assertEqual(result["exits"][0]["reason"], expected_reason)
+                self.assertEqual(execution.submissions, [])
+                self.assertEqual(engines, [])
+
+    def test_restart_exit_rejects_projected_origin_missing_hash_evidence(self):
+        for missing, expected_reason in (
+            ("binding_hash", "EXIT_ORIGIN_BINDING_HASH_MISSING"),
+            ("source_binding_hash", "EXIT_ORIGIN_PROVENANCE_MISMATCH"),
+        ):
+            with self.subTest(missing=missing):
+                strategy, row, source, successor, source_hash = self.persisted_candidate("missing-" + missing)
+                origin = dict(successor)
+                provenance = {
+                    "source_binding_hash": source_hash,
+                    "strategy_ref": source["strategy_ref"],
+                }
+                if missing == "binding_hash":
+                    origin.pop("binding_hash", None)
+                else:
+                    provenance.pop("source_binding_hash")
+                position = {
+                    "symbol": "BTCUSDT",
+                    "quantity": "1",
+                    "candidate_id": "missing-" + missing,
+                    "originating_binding": origin,
+                    "originating_provenance": provenance,
+                }
+                execution = FakeExecution(positions=[position])
+                engines = []
+
+                def factory(**kwargs):
+                    engines.append(kwargs)
+                    return FakeEngine(kwargs["binding"], kwargs["intent"], None)
+
+                result = self.worker(
+                    execution,
+                    FakeCollector([market("BTCUSDT"), market("ETHUSDT")]),
+                    self.persisted_qualification({"selection_status": "NONE", "rankings": []}),
+                    signal_engine_factory=factory,
+                    worker_id="missing-" + missing,
+                ).cycle(now=T0)
+                self.assertEqual(result["exits"][0]["status"], "NO_TRADE")
+                self.assertEqual(result["exits"][0]["reason"], expected_reason)
+                self.assertEqual(execution.submissions, [])
+                self.assertEqual(engines, [])
+
+    def test_restart_exit_rejects_contradictory_nested_payload_hash(self):
+        strategy, row, source, successor, source_hash = self.persisted_candidate("contradictory-origin")
+        lifecycle = self.store.load_candidate_lifecycle("contradictory-origin")
+        payload = dict(lifecycle["payload"])
+        payload["provenance"] = {"binding_hash": "contradictory-successor-hash"}
+        self.store.connection.execute(
+            "UPDATE candidate_lifecycle SET payload_json=? WHERE candidate_id=?",
+            (json.dumps(payload, sort_keys=True), "contradictory-origin"),
+        )
+        self.store.connection.commit()
+        position = {
+            "symbol": "BTCUSDT",
+            "quantity": "1",
+            "candidate_id": "contradictory-origin",
+            "originating_binding": successor,
+            "originating_provenance": {
+                "source_binding_hash": source_hash,
+                "strategy_ref": source["strategy_ref"],
+            },
+        }
+        execution = FakeExecution(positions=[position])
+        engines = []
+
+        def factory(**kwargs):
+            engines.append(kwargs)
+            return FakeEngine(kwargs["binding"], kwargs["intent"], None)
+
+        result = self.worker(
+            execution,
+            FakeCollector([market("BTCUSDT"), market("ETHUSDT")]),
+            self.persisted_qualification({"selection_status": "NONE", "rankings": []}),
+            signal_engine_factory=factory,
+        ).cycle(now=T0)
+        self.assertEqual(result["exits"][0]["status"], "NO_TRADE")
+        self.assertEqual(result["exits"][0]["reason"], "EXIT_ORIGIN_PROVENANCE_MISMATCH")
+        self.assertEqual(execution.submissions, [])
+        self.assertEqual(engines, [])
+
+    def test_restart_exit_rehydrates_exact_origin_and_rejects_missing_origin(self):
+        strategy, row, source, successor, source_hash = self.persisted_candidate("restart-origin", "BTCUSDT")
+        position = {
+            "symbol": "BTCUSDT",
+            "quantity": "1",
+            "candidate_id": "restart-origin",
+            "originating_binding": successor,
+            "originating_provenance": {
+                "source_binding_hash": source_hash,
+                "strategy_ref": source["strategy_ref"],
+            },
+        }
+        execution = FakeExecution(positions=[position])
+        collector = FakeCollector([market("BTCUSDT"), market("ETHUSDT")])
+
+        def factory(**kwargs):
+            binding = kwargs["binding"]
+            signal = entry_signal("restart-exit", "BTCUSDT", "restart-origin")
+            signal.update({"intent": "EXIT", "side": "SELL", "binding_hash": binding["binding_hash"]})
+            return FakeEngine(binding, kwargs["intent"], signal)
+
+        worker = self.worker(
+            execution, collector, FakeQualification({"selection_status": "NONE", "rankings": []}),
+            signal_engine_factory=factory,
+        )
+        first = worker.cycle(now=T0)
+        self.assertEqual(first["exits"][0]["status"], "SUBMITTED")
+        execution.position_rows = [{**position, "candidate_id": "missing-origin", "originating_binding": {**successor, "candidate_id": "missing-origin"}}]
+        restarted = self.worker(
+            execution,
+            FakeCollector([market("BTCUSDT"), market("ETHUSDT")]),
+            FakeQualification({"selection_status": "NONE", "rankings": []}),
+            signal_engine_factory=factory,
+            worker_id=worker.worker_id,
+        )
+        second = restarted.cycle(now=T0)
+        self.assertEqual(second["exits"][0]["status"], "NO_TRADE")
+        self.assertIn("EXIT_ORIGIN_EVIDENCE_MISMATCH", second["exits"][0]["reason"])
+        self.assertEqual(len(execution.submissions), 1)
+
+    def test_deadline_expiry_stops_after_reconcile_without_collection_or_submission(self):
+        class SlowReconcile(FakeExecution):
+            def reconcile(self, **kwargs):
+                time.sleep(0.05)
+                return {"status": "SUCCESS"}
+
+        execution = SlowReconcile()
+        collector = FakeCollector([market("BTCUSDT"), market("ETHUSDT")])
+        deadline = time.monotonic() + 0.005
+        result = self.worker(execution, collector).cycle(
+            now=T0, symbol="BTCUSDT", deadline_monotonic=deadline
+        )
+        self.assertEqual(result["no_trade_reason"], "AUTO_DEADLINE_EXPIRED")
+        self.assertEqual(collector.calls, [])
+        self.assertEqual(execution.submissions, [])
 if __name__ == "__main__":
     unittest.main()

@@ -7,12 +7,13 @@ handles credentials or submits an order.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from decimal import Decimal
 import hashlib
 import json
 import math
+from types import MappingProxyType
 import re
 import sqlite3
 from typing import Any, Iterable, Mapping, Sequence
@@ -286,6 +287,139 @@ class CryptoExecutionBinding:
     def binding_hash(self) -> str:
         return _hash(self.as_dict())
 
+def project_testnet_execution_binding(
+    source: CryptoExecutionBinding | Mapping[str, Any],
+) -> tuple[CryptoExecutionBinding, str]:
+    """Project one selected research binding into the isolated Testnet profile.
+
+    ``source`` may be a binding itself, a qualification/ranking row carrying a
+    ``binding`` mapping, or the binding mapping directly.  The source hash is
+    always recomputed from the parsed immutable binding; a supplied hash is
+    accepted only when it agrees with that value.  This makes the returned
+    provenance useful without trusting a mutable selection wrapper.
+    """
+    source_mapping: Mapping[str, Any] | None = None
+    declared_hash: Any = None
+
+    def require_paper_environment(value: Any) -> None:
+        # A Testnet successor may only be derived from an explicitly PAPER
+        # source.  Do not normalize or silently re-label LIVE/Testnet
+        # provenance during projection.
+        if value != PAPER:
+            raise ValueError("SOURCE_ENVIRONMENT_INVALID")
+
+    def collect_declared_environments(value: Any, seen: set[int] | None = None) -> list[Any]:
+        if not isinstance(value, Mapping):
+            return []
+        visited = seen if seen is not None else set()
+        if id(value) in visited:
+            return []
+        visited.add(id(value))
+        values: list[Any] = []
+        for name in ("environment", "execution_environment"):
+            declared = value.get(name)
+            if declared not in (None, ""):
+                values.append(declared)
+        # Qualification rows may wrap source evidence in selection,
+        # provenance, origin, or lifecycle envelopes.  Walk every supported
+        # source-side chain so a contradictory LIVE/Testnet declaration cannot
+        # be hidden behind a PAPER binding.
+        for name in (
+            "binding", "selection", "provenance", "origin", "originating",
+            "originating_provenance", "originating_binding", "entry_binding",
+            "source_binding", "source", "crypto_provenance", "dataset_provenance",
+            "strategy_ref", "frozen", "forward_config", "config", "lifecycle", "payload",
+        ):
+            values.extend(collect_declared_environments(value.get(name), visited))
+        return values
+
+    def validated_mapping(value: Any) -> Mapping[str, str]:
+        if not isinstance(value, Mapping) or not value:
+            raise ValueError("source binding asset_symbol_mapping must be a non-empty mapping")
+        result: dict[str, str] = {}
+        for key, item in value.items():
+            if not isinstance(key, str) or not isinstance(item, str):
+                raise ValueError("source binding asset_symbol_mapping keys and values must be strings")
+            clean_key, clean_value = key.strip(), item.strip()
+            if not clean_key or not clean_value:
+                raise ValueError("source binding asset_symbol_mapping keys and values must be non-empty")
+            result[clean_key] = clean_value
+        return MappingProxyType(result)
+
+    if isinstance(source, CryptoExecutionBinding):
+        parsed = replace(source, asset_symbol_mapping=validated_mapping(source.asset_symbol_mapping))
+        source_hash = parsed.binding_hash
+    elif isinstance(source, Mapping):
+        selected = source.get("binding")
+        selection = source.get("selection")
+        if not isinstance(selected, Mapping):
+            if isinstance(selection, Mapping) and isinstance(selection.get("binding"), Mapping):
+                selected = selection["binding"]
+        source_mapping = selected if isinstance(selected, Mapping) else source
+        if source_mapping is not source:
+            declared_hash = source.get("source_binding_hash", source.get("binding_hash", source.get("source_hash")))
+            if declared_hash in (None, "") and isinstance(selection, Mapping):
+                declared_hash = selection.get("source_binding_hash", selection.get("binding_hash", selection.get("source_hash")))
+        if declared_hash in (None, ""):
+            declared_hash = source_mapping.get("source_binding_hash", source_mapping.get("binding_hash", source_mapping.get("source_hash")))
+
+        def required(name: str, *aliases: str) -> str:
+            values = (source_mapping.get(name), *(source_mapping.get(alias) for alias in aliases))
+            for value in values:
+                if value is None:
+                    continue
+                if not isinstance(value, str):
+                    raise ValueError(f"source binding field {name!r} must be a string")
+                text = value.strip()
+                if text:
+                    return text
+            raise ValueError(f"source binding field {name!r} is missing")
+
+        mapping = validated_mapping(source_mapping.get("asset_symbol_mapping"))
+        parsed = CryptoExecutionBinding(
+            candidate_id=required("candidate_id"),
+            symbol=required("symbol"),
+            frozen_hash=required("frozen_hash"),
+            strategy_hash=required("strategy_hash"),
+            model_hash=required("model_hash"),
+            config_hash=required("config_hash"),
+            plan_hash=required("plan_hash"),
+            universe_id=required("universe_id"),
+            universe_version=required("universe_version"),
+            universe_snapshot=required("universe_snapshot", "universe_snapshot_hash"),
+            asset_symbol_mapping=mapping,
+            dataset_id=required("dataset_id"),
+            dataset_version=required("dataset_version"),
+            timeframe=required("timeframe", "interval"),
+            source=required("source", "source_type"),
+            quality=required("quality", "data_quality"),
+            survivorship=required("survivorship", "survivorship_bias", "survivorship_label"),
+            environment=required("environment", "execution_environment"),
+            venue=required("venue", "exchange", "execution_venue"),
+            adapter_version=required("adapter_version", "binance_adapter_version"),
+            policy_version=str(source_mapping.get("policy_version") or POLICY_VERSION).strip(),
+            formula_version=str(source_mapping.get("formula_version") or FORMULA_VERSION).strip(),
+            schema_version=str(source_mapping.get("schema_version") or BINDING_SCHEMA_VERSION).strip(),
+        )
+        source_hash = parsed.binding_hash
+    else:
+        raise TypeError("source must be CryptoExecutionBinding or a mapping")
+
+    if isinstance(source, Mapping):
+        for declared_environment in collect_declared_environments(source):
+            require_paper_environment(declared_environment)
+    require_paper_environment(parsed.environment)
+
+    if declared_hash not in (None, "") and str(declared_hash).strip() != source_hash:
+        raise ValueError("source binding hash does not match its immutable binding")
+    successor = replace(
+        parsed,
+        environment=BINANCE_SPOT_TESTNET,
+        venue="BINANCE_SPOT",
+        asset_symbol_mapping=MappingProxyType(dict(parsed.asset_symbol_mapping)),
+    )
+    return successor, source_hash
+
 
 class _QualificationRows(list):
     """List result with small mapping conveniences for downstream callers."""
@@ -409,13 +543,32 @@ class BinanceCryptoQualificationService:
             result.append(pair)
         result.append(payload)
         for key in (
-            "frozen", "strategy", "model", "config", "experiment_plan", "plan",
+            "frozen", "strategy", "strategy_ref", "model", "config", "experiment_plan", "plan",
             "metrics", "validation", "robustness", "execution_metrics", "execution",
             "paper_forward", "forward_evidence", "forward_paper",
         ):
             value = payload.get(key)
             if isinstance(value, Mapping):
                 result.append(value)
+        # Autonomous crypto candidates retain their exact source binding in
+        # nested projections. Include each provenance container and its
+        # structured dataset/universe/strategy children, while keeping
+        # flattened payload fields first so legacy exact evidence remains
+        # authoritative.
+        for key in ("crypto_provenance", "dataset_provenance", "provenance"):
+            value = payload.get(key)
+            if not isinstance(value, Mapping):
+                continue
+            result.append(value)
+            for child_key in ("dataset_provenance", "dataset", "universe", "strategy_ref"):
+                child = value.get(child_key)
+                if not isinstance(child, Mapping):
+                    continue
+                result.append(child)
+                for grandchild_key in ("dataset", "universe"):
+                    grandchild = child.get(grandchild_key)
+                    if isinstance(grandchild, Mapping):
+                        result.append(grandchild)
         return result
 
     @classmethod
@@ -456,25 +609,32 @@ class BinanceCryptoQualificationService:
                     if normalized:
                         result[normalized.removesuffix(USDT)] = normalized
         if not result:
-            for key in ("universe", "universe_snapshot", "universe_records"):
-                rows = payload.get(key)
-                if isinstance(rows, Mapping):
-                    rows = rows.get("records", rows.get("assets", []))
-                if isinstance(rows, (list, tuple)):
+            for source in sources:
+                for key in ("universe", "universe_snapshot", "universe_records", "records", "assets"):
+                    rows = source.get(key)
+                    if isinstance(rows, Mapping):
+                        rows = rows.get("records", rows.get("rows", rows.get("assets", [])))
+                    if not isinstance(rows, (list, tuple)):
+                        continue
                     for item in rows:
                         if not isinstance(item, Mapping):
                             continue
                         if item.get("selected") is False:
                             continue
                         asset = item.get("asset_id", item.get("asset", item.get("base_asset", item.get("id"))))
-                        symbol = item.get("binance_symbol", item.get("symbol"))
+                        symbol = item.get("binance_symbol", item.get("symbol", item.get("instrument")))
                         if symbol:
                             result[str(asset or symbol)] = _symbol(symbol)
+                if result:
+                    break
         if not result:
-            one = _lookup(sources, ("binance_symbol", "symbol", "instrument"))
-            if one:
+            one = _lookup(sources, ("selected_symbol", "binance_symbol", "symbol", "instrument"))
+            if isinstance(one, Mapping):
+                one = one.get("binance_symbol", one.get("symbol", one.get("instrument")))
+            if one and not isinstance(one, Mapping):
                 normalized = _symbol(one)
-                result[normalized.removesuffix(USDT)] = normalized
+                if normalized:
+                    result[normalized.removesuffix(USDT)] = normalized
         return {key: value for key, value in sorted(result.items()) if value}
 
     @staticmethod
@@ -494,34 +654,64 @@ class BinanceCryptoQualificationService:
                     body.update(child)
         return body
 
-    @staticmethod
-    def _dataset_values(payload: Mapping[str, Any], catalog: Mapping[str, Any] | None) -> dict[str, str]:
+    @classmethod
+    def _dataset_values(cls, payload: Mapping[str, Any], catalog: Mapping[str, Any] | None) -> dict[str, str]:
         metadata = catalog.get("metadata", {}) if isinstance(catalog, Mapping) else {}
         metadata = metadata if isinstance(metadata, Mapping) else {}
-        sources = [payload, metadata]
+        sources = [*cls._context(payload), metadata]
+        # A flattened source/source_type is an existing exact contract.  When
+        # it is absent, generated provenance carries source_type beside its
+        # provider/source label; qualification binds the immutable source type
+        # just as the legacy flattened field did.
+        flattened_source = _lookup([payload], ("source", "source_type", "data_source"))
+        source = flattened_source
+        if source in (None, ""):
+            source = _lookup(sources, ("source_type",))
+        if source in (None, ""):
+            source = _lookup(sources, ("source", "data_source"))
         return {
             "dataset_id": str(_lookup(sources, ("dataset_id", "data_id")) or ""),
             "dataset_version": str(_lookup(sources, ("dataset_version", "data_version", "version")) or ""),
             "timeframe": str(_lookup(sources, ("timeframe", "interval")) or (catalog or {}).get("timeframe", "")),
-            "source": str(_lookup(sources, ("source", "source_type", "data_source")) or (catalog or {}).get("source_type", "")),
+            "source": str(source or (catalog or {}).get("source_type", "")),
             "quality": str(_lookup(sources, ("quality", "data_quality")) or (catalog or {}).get("quality", "")),
-            "survivorship": str(_lookup(sources, ("survivorship", "survivorship_policy")) or ""),
+            "survivorship": str(_lookup(sources, ("survivorship", "survivorship_policy", "survivorship_bias", "survivorship_label")) or ""),
         }
-
-    @staticmethod
-    def _universe_values(payload: Mapping[str, Any], catalog: Mapping[str, Any] | None) -> dict[str, str]:
+    @classmethod
+    def _universe_values(cls, payload: Mapping[str, Any], catalog: Mapping[str, Any] | None) -> dict[str, str]:
         metadata = catalog.get("metadata", {}) if isinstance(catalog, Mapping) else {}
         metadata = metadata if isinstance(metadata, Mapping) else {}
-        universe = payload.get("universe")
-        universe = universe if isinstance(universe, Mapping) else {}
-        sources = [payload, universe, metadata]
+        sources = [*cls._context(payload), metadata]
+        container = _lookup(sources, ("universe",))
+        universe = container if isinstance(container, Mapping) else {}
+
+        universe_id_value = _lookup(sources, ("universe_id",))
+        if universe_id_value in (None, ""):
+            universe_id_value = universe.get("universe_id", universe.get("id"))
+        if universe_id_value in (None, "") and container not in (None, "") and not isinstance(container, Mapping):
+            universe_id_value = container
+
+        universe_version_value = _lookup(sources, ("universe_version", "universe_snapshot_version"))
+        if universe_version_value in (None, ""):
+            universe_version_value = universe.get("universe_version", universe.get("version"))
+
         snapshot = _lookup(sources, ("universe_snapshot", "snapshot_hash", "universe_snapshot_hash", "content_hash"))
         if isinstance(snapshot, Mapping):
             snapshot = snapshot.get("snapshot_hash", snapshot.get("content_hash", snapshot.get("snapshot_id")))
+        if snapshot in (None, ""):
+            snapshot = universe.get("snapshot_hash", universe.get("universe_snapshot", universe.get("content_hash")))
+
+        universe_dataset_id = universe.get(
+            "dataset_id",
+            universe.get("universe_dataset_id", universe.get("snapshot_dataset_id", "")),
+        )
+        if universe_dataset_id in (None, ""):
+            universe_dataset_id = metadata.get("universe_dataset_id", "")
         return {
-            "universe_id": str(_lookup(sources, ("universe_id", "universe")) or ""),
-            "universe_version": str(_lookup(sources, ("universe_version", "universe_snapshot_version", "version")) or ""),
-            "universe_snapshot": str(snapshot or (catalog or {}).get("snapshot_id", "") or ""),
+            "universe_id": str(universe_id_value or "").strip(),
+            "universe_version": str(universe_version_value or "").strip(),
+            "universe_snapshot": str(snapshot or (catalog or {}).get("snapshot_id", "") or "").strip(),
+            "universe_dataset_id": str(universe_dataset_id or "").strip(),
         }
 
     def _catalog(self, dataset_id: str, version: str) -> Mapping[str, Any] | None:
@@ -530,6 +720,31 @@ class BinanceCryptoQualificationService:
             return None
         value = loader(dataset_id, version)
         return value if isinstance(value, Mapping) else None
+    @staticmethod
+    def _record_evidence(record: Mapping[str, Any]) -> dict[str, Any]:
+        """Keep immutable dataset identity/content while excluding timestamps."""
+        body = _public(record)
+        if isinstance(body, Mapping):
+            body = dict(body)
+            for key in ("created_at", "updated_at", "last_updated"):
+                body.pop(key, None)
+        return body if isinstance(body, dict) else {}
+    @staticmethod
+    def _record_symbols(record: Mapping[str, Any], *, selected_only: bool = False) -> set[str]:
+        rows = record.get("records")
+        if isinstance(rows, Mapping):
+            rows = rows.get("records", rows.get("rows", rows.get("observations", ())))
+        if not isinstance(rows, (list, tuple)):
+            return set()
+        symbols: set[str] = set()
+        for item in rows:
+            if not isinstance(item, Mapping) or (selected_only and item.get("selected") is False):
+                continue
+            value = item.get("binance_symbol", item.get("symbol", item.get("instrument")))
+            normalized = _symbol(value)
+            if normalized:
+                symbols.add(normalized)
+        return symbols
 
     def _binding_for(
         self,
@@ -537,11 +752,11 @@ class BinanceCryptoQualificationService:
         symbol: str,
         payload: Mapping[str, Any],
         mapping: Mapping[str, str],
-    ) -> tuple[CryptoExecutionBinding | None, list[str], dict[str, str]]:
+    ) -> tuple[CryptoExecutionBinding | None, list[str], dict[str, str], dict[str, str]]:
         reasons: list[str] = []
         context = self._context(payload)
-        dataset_hint = str(_lookup(context, ("dataset_id", "data_id")) or "")
-        version_hint = str(_lookup(context, ("dataset_version", "data_version")) or "")
+        dataset_hint = str(_lookup(context, ("dataset_id", "data_id")) or "").strip()
+        version_hint = str(_lookup(context, ("dataset_version", "data_version")) or "").strip()
         catalog = self._catalog(dataset_hint, version_hint)
         dataset = self._dataset_values(payload, catalog)
         if not dataset["dataset_id"] or not dataset["dataset_version"]:
@@ -549,44 +764,159 @@ class BinanceCryptoQualificationService:
         elif catalog is None:
             reasons.append("DATASET_NOT_FOUND")
         else:
-            expected_market = str(catalog.get("market_type", "")).lower()
+            expected_market = str(catalog.get("market_type", "")).strip().lower()
             if expected_market and expected_market != "crypto_spot":
                 reasons.append("DATASET_NOT_CRYPTO_SPOT")
-            for field, catalog_field in (("dataset_version", "dataset_version"), ("timeframe", "timeframe"), ("source", "source_type")):
-                expected = dataset[field]
-                actual = str(catalog.get(catalog_field, ""))
-                if expected and actual and expected != actual:
+            metadata = catalog.get("metadata", {})
+            metadata = metadata if isinstance(metadata, Mapping) else {}
+            catalog_survivorship = metadata.get(
+                "survivorship",
+                metadata.get("survivorship_bias", metadata.get("survivorship_label", "")),
+            )
+            catalog_instrument = _symbol(catalog.get("instrument"))
+            if catalog_instrument and catalog_instrument != _symbol(symbol):
+                reasons.append("DATASET_EVIDENCE_CHANGED")
+            catalog_values = {
+                "dataset_version": catalog.get("dataset_version", catalog.get("version", "")),
+                "timeframe": catalog.get("timeframe", ""),
+                "source": catalog.get("source_type", ""),
+                "quality": catalog.get("quality", ""),
+                "survivorship": catalog_survivorship,
+            }
+            for field in ("dataset_version", "timeframe", "source", "quality", "survivorship"):
+                expected = str(dataset[field]).strip()
+                actual = str(catalog_values[field] or "").strip()
+                if not expected:
+                    reasons.append("DATASET_METADATA_MISSING")
+                elif not actual:
+                    # Legacy catalog fixtures predate persisted
+                    # survivorship metadata; the immutable lifecycle payload
+                    # remains authoritative when that optional catalog field
+                    # is absent.
+                    if field != "survivorship":
+                        reasons.append("DATASET_METADATA_MISSING")
+                elif expected != actual:
                     reasons.append("DATASET_EVIDENCE_CHANGED")
-            if not dataset["timeframe"] or not dataset["source"] or not dataset["quality"] or not dataset["survivorship"]:
-                reasons.append("DATASET_METADATA_MISSING")
 
-        # Hash the exact persisted catalog and its reconstructed records.  The
+        # Hash the exact persisted catalog and immutable dataset record. The
         # hash is stored beside the successor binding, so a changed immutable
-        # dataset or universe invalidates a previously selected pair even when
-        # its lifecycle payload has not changed.
+        # dataset invalidates a previously selected pair even when its
+        # lifecycle payload has not changed.
         evidence_hash = ""
         if catalog is not None:
             evidence_body: dict[str, Any] = {"catalog": _public(catalog)}
             loader = getattr(self.store, "load_dataset_record", None)
+            loaded_record = None
             if callable(loader):
                 try:
-                    record = loader(dataset["dataset_id"], dataset["dataset_version"])
+                    loaded_record = loader(dataset["dataset_id"], dataset["dataset_version"])
                 except Exception:
-                    record = None
-                if isinstance(record, Mapping):
-                    evidence_body["records"] = _public(record.get("records", []))
-            evidence_hash = _hash(evidence_body)
-
+                    loaded_record = None
+            if isinstance(loaded_record, Mapping):
+                record_symbols = self._record_symbols(loaded_record)
+                if record_symbols and _symbol(symbol) not in record_symbols:
+                    reasons.append("DATASET_EVIDENCE_CHANGED")
+                evidence_body["record"] = self._record_evidence(loaded_record)
+                evidence_hash = _hash(evidence_body)
+            else:
+                reasons.append("DATASET_RECORD_NOT_FOUND")
+                evidence_hash = ""
         universe = self._universe_values(payload, catalog)
-        if not all(universe.values()):
+        if not all(universe[field] for field in ("universe_id", "universe_version", "universe_snapshot")):
             reasons.append("UNIVERSE_REFERENCE_MISSING")
-        elif catalog is not None:
+
+        catalog_universe: dict[str, str] = {}
+        if isinstance(catalog, Mapping):
             metadata = catalog.get("metadata", {})
             metadata = metadata if isinstance(metadata, Mapping) else {}
+            catalog_universe = {
+                "universe_id": str(metadata.get("universe_id", "") or "").strip(),
+                "universe_version": str(metadata.get("universe_version", "") or "").strip(),
+                "universe_snapshot": str(
+                    metadata.get(
+                        "universe_snapshot",
+                        metadata.get("snapshot_hash", metadata.get("universe_snapshot_hash", metadata.get("content_hash", ""))),
+                    )
+                    or ""
+                ).strip(),
+            }
             for field in ("universe_id", "universe_version", "universe_snapshot"):
-                actual = str(metadata.get(field, metadata.get("snapshot_hash" if field == "universe_snapshot" else field, "")) or "")
+                actual = catalog_universe[field]
                 if actual and actual != universe[field]:
                     reasons.append("UNIVERSE_EVIDENCE_CHANGED")
+
+        # Generated crypto provenance names the immutable universe dataset.
+        # Load that exact record (or the established universe:<id> fallback)
+        # and include its content in the evidence hash. Probe/testnet tables
+        # are intentionally never consulted here.
+        universe_catalog: Mapping[str, Any] | None = None
+        universe_record: Mapping[str, Any] | None = None
+        universe_dataset_id = universe["universe_dataset_id"]
+        record_loader = getattr(self.store, "load_dataset_record", None)
+        candidates = (
+            [universe_dataset_id]
+            if universe_dataset_id
+            else [f"universe:{universe['universe_id']}", universe["universe_id"]]
+        )
+        if callable(record_loader) and universe["universe_id"] and universe["universe_version"]:
+            for candidate_dataset_id in dict.fromkeys(item for item in candidates if item):
+                try:
+                    loaded_universe = record_loader(candidate_dataset_id, universe["universe_version"])
+                except Exception:
+                    loaded_universe = None
+                if isinstance(loaded_universe, Mapping):
+                    universe_dataset_id = str(candidate_dataset_id).strip()
+                    universe_record = loaded_universe
+                    universe_catalog = self._catalog(universe_dataset_id, universe["universe_version"])
+                    break
+        if universe_record is not None:
+            selected_symbols = self._record_symbols(universe_record, selected_only=True)
+            if not selected_symbols or _symbol(symbol) not in selected_symbols:
+                reasons.append("CRYPTO_UNIVERSE_MEMBERSHIP_MISMATCH")
+        if universe["universe_dataset_id"] and universe_record is None:
+            reasons.append("UNIVERSE_RECORD_NOT_FOUND")
+        if universe["universe_dataset_id"] and universe_record is not None and universe_catalog is None:
+            reasons.append("UNIVERSE_CATALOG_NOT_FOUND")
+        if universe_catalog is not None:
+            universe_metadata = universe_catalog.get("metadata", {})
+            universe_metadata = universe_metadata if isinstance(universe_metadata, Mapping) else {}
+            if universe_metadata.get("point_in_time") is False:
+                reasons.append("UNIVERSE_EVIDENCE_CHANGED")
+            persisted_id = str(universe_metadata.get("universe_id", "") or "").strip()
+            persisted_version = str(
+                universe_catalog.get("dataset_version", universe_catalog.get("version", "")) or ""
+            ).strip()
+            persisted_snapshot = str(
+                universe_metadata.get(
+                    "snapshot_hash",
+                    universe_metadata.get("universe_snapshot", universe_catalog.get("snapshot_id", "")),
+                )
+                or ""
+            ).strip()
+            if persisted_id and persisted_id != universe["universe_id"]:
+                reasons.append("UNIVERSE_EVIDENCE_CHANGED")
+            if persisted_version and persisted_version != universe["universe_version"]:
+                reasons.append("UNIVERSE_EVIDENCE_CHANGED")
+            if persisted_snapshot and persisted_snapshot != universe["universe_snapshot"]:
+                reasons.append("UNIVERSE_EVIDENCE_CHANGED")
+
+        universe_evidence_body: dict[str, Any] = {
+            "universe": universe,
+            "catalog_universe": catalog_universe,
+        }
+        if universe_catalog is not None:
+            universe_evidence_body["catalog"] = _public(universe_catalog)
+        if universe_record is not None:
+            universe_evidence_body["record"] = self._record_evidence(universe_record)
+        universe_evidence_hash = (
+            _hash(universe_evidence_body)
+            if universe["universe_id"]
+            and (
+                not universe["universe_dataset_id"]
+                or (universe_record is not None and universe_catalog is not None)
+            )
+            else ""
+        )
 
         def hash_value(*names: str) -> str:
             value = _lookup(context, names)
@@ -603,12 +933,45 @@ class BinanceCryptoQualificationService:
             if not value:
                 reasons.append(name)
 
-        strategy_id = str(_lookup(context, ("strategy_id",)) or "")
-        strategy_version = str(_lookup(context, ("strategy_version",)) or "")
-        strategy_evidence_hash = ""
-        if strategy_id and strategy_hash:
-            loaded = getattr(self.store, "load_strategy", lambda *_args, **_kwargs: None)(strategy_id, strategy_version or None)
-            if loaded is None:
+        strategy_ref_source = _lookup(context, ("strategy_ref",))
+        strategy_ref_source = strategy_ref_source if isinstance(strategy_ref_source, Mapping) else {}
+        strategy_id = str(
+            strategy_ref_source.get("strategy_id", strategy_ref_source.get("id"))
+            or _lookup(context, ("strategy_id",))
+            or ""
+        ).strip()
+        strategy_version = str(
+            strategy_ref_source.get("strategy_version", strategy_ref_source.get("version"))
+            or _lookup(context, ("strategy_version",))
+            or "1"
+        ).strip() or "1"
+        strategy_loader = getattr(self.store, "load_strategy", None)
+        loaded = None
+        if strategy_hash and callable(strategy_loader):
+            # Generated candidates persist the exact strategy under the
+            # candidate identity. Prefer an explicit lifecycle strategy_ref,
+            # then hydrate that existing identity; never synthesize a plan
+            # template as an execution fallback.
+            if not strategy_id:
+                try:
+                    candidate_loaded = strategy_loader(candidate_id, strategy_version)
+                except Exception:
+                    candidate_loaded = None
+                if isinstance(candidate_loaded, Mapping):
+                    candidate_hashes = {_hash(candidate_loaded), _hash(_public(candidate_loaded))}
+                    if strategy_hash.removeprefix("sha256:") in {
+                        item.removeprefix("sha256:") for item in candidate_hashes
+                    }:
+                        strategy_id = candidate_id
+                        loaded = candidate_loaded
+            if strategy_id and loaded is None:
+                try:
+                    loaded = strategy_loader(strategy_id, strategy_version)
+                except Exception:
+                    loaded = None
+            if not strategy_id:
+                reasons.append("STRATEGY_REFERENCE_MISSING")
+            elif loaded is None:
                 reasons.append("STRATEGY_NOT_FOUND")
             else:
                 loaded_digest = _hash(loaded)
@@ -622,6 +985,13 @@ class BinanceCryptoQualificationService:
                 }
                 if strategy_hash not in loaded_hashes:
                     reasons.append("STRATEGY_EVIDENCE_CHANGED")
+                strategy_ref = {
+                    "strategy_id": strategy_id,
+                    "strategy_version": strategy_version,
+                    "strategy_hash": strategy_hash,
+                }
+        elif strategy_hash:
+            reasons.append("STRATEGY_REFERENCE_MISSING")
 
         # When executable documents are carried in the frozen payload, verify
         document_checks = (
@@ -642,10 +1012,11 @@ class BinanceCryptoQualificationService:
                 digest = _hash(document)
                 if declared not in {digest, "sha256:" + digest}:
                     reasons.append(reason)
-
-        environment = str(_lookup(context, ("environment", "execution_environment")) or PAPER)
-        venue = str(_lookup(context, ("venue", "exchange", "execution_venue")) or self.default_venue)
-        adapter_version = str(_lookup(context, ("adapter_version", "binance_adapter_version")) or self.default_adapter_version)
+        environment = str(_lookup(context, ("environment", "execution_environment")) or PAPER).strip()
+        venue = str(_lookup(context, ("venue", "exchange", "execution_venue")) or self.default_venue).strip()
+        adapter_version = str(_lookup(context, ("adapter_version", "binance_adapter_version")) or self.default_adapter_version).strip()
+        if environment != PAPER:
+            reasons.append("SOURCE_ENVIRONMENT_INVALID")
         if not mapping or symbol not in mapping.values():
             reasons.append("ASSET_SYMBOL_MAPPING_MISSING")
         binding = None
@@ -661,7 +1032,7 @@ class BinanceCryptoQualificationService:
                 universe_id=universe["universe_id"],
                 universe_version=universe["universe_version"],
                 universe_snapshot=universe["universe_snapshot"],
-                asset_symbol_mapping=mapping,
+                asset_symbol_mapping=MappingProxyType(dict(mapping)),
                 dataset_id=dataset["dataset_id"],
                 dataset_version=dataset["dataset_version"],
                 timeframe=dataset["timeframe"],
@@ -674,40 +1045,26 @@ class BinanceCryptoQualificationService:
                 policy_version=self.policy.policy_version,
                 formula_version=self.policy.formula_version,
             )
-        catalog_universe: dict[str, str] = {}
-        if isinstance(catalog, Mapping):
-            metadata = catalog.get("metadata", {})
-            metadata = metadata if isinstance(metadata, Mapping) else {}
-            catalog_universe = {
-                "universe_id": str(metadata.get("universe_id", "") or ""),
-                "universe_version": str(metadata.get("universe_version", "") or ""),
-                "universe_snapshot": str(
-                    metadata.get(
-                        "universe_snapshot",
-                        metadata.get("snapshot_hash", metadata.get("universe_snapshot_hash", metadata.get("content_hash", ""))),
-                    )
-                    or ""
-                ),
-            }
-        universe_evidence_hash = _hash(
-            {"universe": universe, "catalog_universe": catalog_universe}
-        ) if universe["universe_id"] else ""
         hashes = {
             "frozen_hash": frozen_hash,
             "strategy_hash": strategy_hash,
             "strategy_evidence_hash": strategy_evidence_hash,
+            "strategy_ref": strategy_ref,
             "model_hash": model_hash,
             "config_hash": config_hash,
             "plan_hash": plan_hash,
             "dataset_id": dataset["dataset_id"],
             "dataset_version": dataset["dataset_version"],
+            "dataset_quality": dataset["quality"],
+            "dataset_survivorship": dataset["survivorship"],
             "dataset_evidence_hash": evidence_hash,
             "universe_id": universe["universe_id"],
             "universe_version": universe["universe_version"],
             "universe_snapshot": universe["universe_snapshot"],
+            "universe_dataset_id": universe_dataset_id,
             "universe_evidence_hash": universe_evidence_hash,
         }
-        return binding, list(dict.fromkeys(reasons)), hashes
+        return binding, list(dict.fromkeys(reasons)), hashes, strategy_ref
 
     def _metrics(self, payload: Mapping[str, Any], symbol: str) -> dict[str, Any]:
         pair = self._pair_payload(payload, symbol)
@@ -863,7 +1220,7 @@ class BinanceCryptoQualificationService:
             reasons.append("LIFECYCLE_NOT_FROZEN")
         if self._find_market_type(payload) != "crypto_spot":
             reasons.append("CRYPTO_SPOT_ONLY")
-        binding, binding_reasons, immutable_hashes = self._binding_for(candidate_id, symbol, payload, mapping)
+        binding, binding_reasons, immutable_hashes, strategy_ref = self._binding_for(candidate_id, symbol, payload, mapping)
         immutable_hashes = {
             **immutable_hashes,
             # Lifecycle payloads are immutable research evidence after the
@@ -886,6 +1243,7 @@ class BinanceCryptoQualificationService:
             "candidate_id": candidate_id,
             "symbol": symbol,
             "binding": binding_dict,
+            "strategy_ref": strategy_ref,
             "raw_metrics": _public(metrics),
             "gates": _public(gates),
             "policy_version": self.policy.policy_version,
@@ -893,6 +1251,14 @@ class BinanceCryptoQualificationService:
         }
         qualification_hash = _hash(immutable_projection)
         unique_reasons = list(dict.fromkeys(reasons))
+        lifecycle_stage = str(record.get("stage") or "")
+        lifecycle_ref = {"candidate_id": candidate_id, "stage": lifecycle_stage}
+        provenance = {
+            "candidate_id": candidate_id,
+            "lifecycle_stage": lifecycle_stage,
+            "lifecycle": lifecycle_ref,
+            "strategy_ref": dict(strategy_ref),
+        }
         return {
             "schema_version": QUALIFICATION_SCHEMA_VERSION,
             "candidate_id": candidate_id,
@@ -903,10 +1269,13 @@ class BinanceCryptoQualificationService:
             "raw_metrics": _public(metrics),
             "gates": _public(gates),
             "immutable_hashes": immutable_hashes,
+            "strategy_ref": dict(strategy_ref),
+            "provenance": provenance,
+            "lifecycle_ref": lifecycle_ref,
             "qualified": not unique_reasons,
             "reasons": unique_reasons,
             "reason": unique_reasons[0] if unique_reasons else "QUALIFIED",
-            "lifecycle_stage": str(record.get("stage") or ""),
+            "lifecycle_stage": lifecycle_stage,
             "evaluated_at": evaluated_at,
             "no_credentials": True,
         }
@@ -1021,7 +1390,13 @@ class BinanceCryptoQualificationService:
                             row["candidate_id"], row["symbol"], run_id, timestamp, int(row.get("rank") or 0),
                             row.get("total_score"), _canonical(row.get("raw_metrics", {})), _canonical(row.get("components", {})),
                             _canonical(row.get("weights", {})), _canonical(row.get("tie_breaks", [])), _canonical(row.get("binding", {})),
-                            _canonical({"binding_hash": row.get("binding_hash", ""), "qualification_hash": row.get("qualification_hash", "")}),
+                            _canonical({
+                                "binding_hash": row.get("binding_hash", ""),
+                                "qualification_hash": row.get("qualification_hash", ""),
+                                "strategy_ref": row.get("strategy_ref", {}),
+                                "lifecycle_ref": row.get("lifecycle_ref", {}),
+                                "provenance": row.get("provenance", {}),
+                            }),
                             row.get("cluster_key", ""), int(bool(row.get("cluster_representative"))), int(bool(row.get("selected"))),
                             int(bool(row.get("actionable"))), str(row.get("reason", "")), row.get("binding_hash", ""), row.get("qualification_hash", ""),
                         )
@@ -1083,7 +1458,12 @@ class BinanceCryptoQualificationService:
         timestamp = (now or self.clock()).astimezone(timezone.utc).isoformat()
         seed = [(row["candidate_id"], row["symbol"], row["qualification_hash"], row.get("total_score"), row.get("rank")) for row in reps]
         run_id = "crypto-rank-" + _hash(seed)[:24]
-        fallback_rows = [row for row in reps if not row.get("selected")][:bounded_limit]
+        # ``selected`` is assigned on copied final rows below; filtering the
+        # representative objects by that flag would therefore include winner.
+        fallback_rows = [
+            row for row in reps
+            if (str(row.get("candidate_id")), str(row.get("symbol"))) != winner_key
+        ][:bounded_limit]
         winner = next((row for row in final_rows if row.get("selected")), None)
         self._persist_ranking(final_rows, winner or {}, run_id, timestamp, feasibility_by_symbol)
         status = "CURRENT" if winner else ("STALE" if self._stored_selection_exists() else "NONE")
@@ -1233,15 +1613,29 @@ class BinanceCryptoQualificationService:
     def actionable_rankings(self, limit: int = MAX_FALLBACKS) -> list[dict[str, Any]]:
         bounded = max(1, min(int(limit), max(1, int(self.policy.max_fallbacks) + 1)))
         with self.store._lock:
-            rows = self.store.connection.execute("SELECT * FROM binance_crypto_rankings WHERE actionable=1 ORDER BY rank,total_score DESC,candidate_id,symbol LIMIT ?", (bounded,)).fetchall()
+            rows = self.store.connection.execute(
+                "SELECT * FROM binance_crypto_rankings WHERE actionable=1 "
+                "ORDER BY rank,total_score DESC,candidate_id,symbol LIMIT ?",
+                (bounded,),
+            ).fetchall()
         result: list[dict[str, Any]] = []
         for row in rows:
             item = dict(row)
-            for key in ("raw_metrics_json", "component_scores_json", "weights_json", "tie_breaks_json", "binding_json", "evidence_hashes_json"):
+            for key in (
+                "raw_metrics_json", "component_scores_json", "weights_json",
+                "tie_breaks_json", "binding_json", "evidence_hashes_json",
+            ):
                 try:
-                    item[key.removesuffix("_json")] = json.loads(item.get(key) or ("[]" if key == "tie_breaks_json" else "{}"))
+                    item[key.removesuffix("_json")] = json.loads(
+                        item.get(key) or ("[]" if key == "tie_breaks_json" else "{}")
+                    )
                 except (TypeError, ValueError, json.JSONDecodeError):
                     item[key.removesuffix("_json")] = {} if key != "tie_breaks_json" else []
+            evidence = item.get("evidence_hashes")
+            if isinstance(evidence, Mapping):
+                for key in ("strategy_ref", "lifecycle_ref", "provenance"):
+                    if key in evidence:
+                        item[key] = evidence[key]
             result.append(item)
         return result
 
@@ -1289,4 +1683,5 @@ __all__ = [
     "QUALIFICATION_SCHEMA_VERSION", "BINDING_SCHEMA_VERSION", "FORMULA_VERSION", "POLICY_VERSION",
     "CryptoExecutionBinding", "CryptoQualificationPolicy", "BinanceCryptoQualificationService",
     "CryptoExecutionRanker", "BinanceCryptoResearch", "qualify_all", "rank_and_select",
+    "project_testnet_execution_binding",
 ]

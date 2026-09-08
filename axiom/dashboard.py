@@ -175,6 +175,7 @@ _PAGE_SIZE_OPTIONS = (10, 25, 50, 100)
 _MAX_PAGE_SIZE = 100
 _CANARY_ELIGIBLE_STAGES = frozenset({"FROZEN", "PAPER_FORWARD", "PAPER_PROMOTABLE"})
 _PAPER_FORWARD_STAGES = frozenset({"PAPER_FORWARD", "PAPER_PROMOTABLE"})
+_BINANCE_HTTP_FORBIDDEN_ACTIONS = frozenset({"EXECUTION_PROBE", "RECONCILE_PROBE"})
 
 
 def _pagination_error(query: Mapping[str, Any]) -> str | None:
@@ -335,7 +336,7 @@ def _binance_safe_value(value: Any, *, depth: int = 0, key: str | None = None) -
     lowered = key_text.lower()
 
     if lowered == "credentials":
-        if isinstance(value, Mapping) and ("configured" in value or "reference_hash" in value):
+        if isinstance(value, Mapping) and "configured" in value:
             reference = value.get("reference_hash")
             reference_text = (
                 reference.casefold()
@@ -1486,6 +1487,60 @@ class DashboardData:
                 pass
         return result
 
+    @staticmethod
+    def _binance_testnet_status(status: Mapping[str, Any] | None, result: Mapping[str, Any] | None = None) -> bool:
+        """Recognize strict TESTNET only from its explicit boolean marker."""
+        status = status if isinstance(status, Mapping) else {}
+        result = result if isinstance(result, Mapping) else {}
+        return status.get("strict_testnet") is True or result.get("strict_testnet") is True
+
+    def binance_nav_label(self) -> str:
+        """Return the initial Binance nav label from the facade's strict marker."""
+        return (
+            "BINANCE SPOT TESTNET"
+            if getattr(self.binance_canary, "strict_testnet", False) is True
+            else "BINANCE SPOT CANARY"
+        )
+
+    @classmethod
+    def _binance_testnet_projection(
+        cls,
+        result: dict[str, Any],
+        status: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Expose stable named TESTNET sections while retaining duck typing."""
+        projected_status = dict(status)
+        projected_status["strict_testnet"] = True
+        projected_status["title"] = "BINANCE SPOT TESTNET"
+        projected_status.setdefault("environment", "BINANCE_SPOT_TESTNET")
+        profile = projected_status.get("profile")
+        if not isinstance(profile, Mapping):
+            profile = result.get("profile") if isinstance(result.get("profile"), Mapping) else {}
+        projected_status["profile"] = dict(profile)
+        projected_status["profile"].setdefault("environment", "TESTNET")
+        projected_status.pop("enable_phrase", None)
+        projected_status.pop("probe_confirmation", None)
+        for name in (
+            "credentials",
+            "connectivity",
+            "validation",
+            "probe",
+            "isolation",
+            "autonomous",
+        ):
+            value = result.get(name, projected_status.get(name))
+            if value is not None:
+                projected_status[name] = value
+                result.setdefault(name, value)
+        result.pop("enable_phrase", None)
+        result.pop("probe_confirmation", None)
+        result["strict_testnet"] = True
+        result["title"] = "BINANCE SPOT TESTNET"
+        result["environment"] = projected_status["environment"]
+        result["profile"] = projected_status["profile"]
+        result["status"] = projected_status
+        return result
+
     def binance_canary_data(self, params: Mapping[str, Any] | None = None) -> dict[str, Any]:
         """Return a bounded, secret-free projection from an optional Binance facade.
 
@@ -1554,6 +1609,8 @@ class DashboardData:
             except TypeError:
                 history = history_method()
             result["actions"] = history
+        if isinstance(status_raw, Mapping) and self._binance_testnet_status(status_raw, result):
+            result = self._binance_testnet_projection(result, status_raw)
         return _binance_safe_value(result)
 
     def v2_snapshot(self, endpoint: str, params: Mapping[str, Any] | None = None) -> dict[str, Any]:
@@ -3342,7 +3399,11 @@ class DashboardData:
         raise KeyError(endpoint)
 
 
-def _dashboard_html(control_token: str | None = None) -> str:
+def _dashboard_html(
+    control_token: str | None = None,
+    *,
+    binance_nav_label: str = "BINANCE SPOT CANARY",
+) -> str:
     """Return the bounded operator dashboard surface."""
     return """<!doctype html>
 <html lang="en">
@@ -3381,7 +3442,7 @@ def _dashboard_html(control_token: str | None = None) -> str:
 <body>
   <header><div class="topbar"><div><div class="eyebrow">Paper-first research operations</div><h1>AXIOM / operator console</h1><p class="subtitle">Historical evidence, forward observation, and paper lifecycle in one view.</p></div><div class="live-lock">Live trading <strong>Disabled</strong><br>Paper risk engine <strong>Active</strong></div></div>
     <nav aria-label="Research sections">
-      <button class="tab active" data-view="overview">Overview</button><button class="tab" data-view="datasets">DATASETS</button><button class="tab" data-view="activity">ACTIVITY</button><button class="tab" data-view="crypto">CRYPTO RESEARCH</button><button class="tab" data-view="polymarket">Polymarket</button><button class="tab" data-view="candidates">Candidates</button><button class="tab" data-view="hermes">Hermes</button><button class="tab" data-view="portfolio">Paper Portfolio</button><button class="tab" data-view="canary">Polymarket Canary</button><button class="tab" data-view="binance-canary">Binance Spot Canary</button>
+      <button class="tab active" data-view="overview">Overview</button><button class="tab" data-view="datasets">DATASETS</button><button class="tab" data-view="activity">ACTIVITY</button><button class="tab" data-view="crypto">CRYPTO RESEARCH</button><button class="tab" data-view="polymarket">Polymarket</button><button class="tab" data-view="candidates">Candidates</button><button class="tab" data-view="hermes">Hermes</button><button class="tab" data-view="portfolio">Paper Portfolio</button><button class="tab" data-view="canary">Polymarket Canary</button><button class="tab" data-view="binance-canary">__BINANCE_NAV_LABEL__</button>
     </nav>
   </header>
   <main>
@@ -3403,13 +3464,14 @@ def _dashboard_html(control_token: str | None = None) -> str:
     <section id="view-hermes" class="view"><article class="panel"><div class="section-title"><h2>Hermes / research loop</h2><span class="badge">research only · no canary control</span></div><div id="hermes-summary"></div><div class="filters"><input id="hermes-filter" placeholder="Filter queue" aria-label="Filter Hermes queue"><select id="hermes-status"><option value="">All statuses</option><option>PENDING</option><option>TESTING</option><option>COMPLETED</option><option>ACCEPTED</option><option>REJECTED</option><option>FAILED</option><option>ERROR</option></select><select id="hermes-size"><option>25</option><option>50</option><option>100</option></select></div><div id="hermes-table" class="scroll"></div><div id="hermes-pager" class="pager"></div><div id="hermes-detail"></div></article></section>
     <section id="view-canary" class="view"><article class="panel" style="border-color:var(--red)"><div class="section-title"><h2>REAL CANARY MONEY</h2><span class="badge bad">PRODUCTION LIVE TRADING: DISABLED</span></div><div id="canary-action-result" class="page-note"></div><div id="canary-controls"></div><div id="canary-connectivity"></div><div id="canary-summary"></div><div id="canary-trades" class="scroll"></div><p class="notice">Autonomous canary is independent from paper research. No secrets are stored or displayed. It remains prediction-only, bounded at $1 per order, and killable from this console.</p></article></section>
     <section id="view-binance-canary" class="view binance-view"><article class="panel" style="border-color:var(--amber)"><div class="section-title"><h2>BINANCE SPOT CANARY</h2><span class="badge warn">DEVELOPMENT / PAPER|TESTNET</span></div><p class="page-note">Separate from the Polymarket canary. <strong>POLYMARKET TRANSPORT: DISABLED</strong> · Binance Spot only · no implicit control-plane construction.</p><div id="binance-action-result" class="page-note"></div><div id="binance-identity"></div><div id="binance-connectivity"></div><div id="binance-qualification"></div><div id="binance-risk"></div><div id="binance-controls"></div><div id="binance-records" class="scroll"></div><details><summary>Full Binance projection and identifiers</summary><pre id="binance-raw"></pre></details><p class="notice">Credentials are never displayed. Connectivity checks are read-only; order validation is an explicit test action. No browser action can place an order.</p></article></section>
+    <div id="binance-testnet-static-labels" hidden>BINANCE SPOT TESTNET · TESTNET CONNECTIVITY · ORDER VALIDATION · TESTNET EXECUTION PROBE · AUTONOMOUS TESTNET · localhost</div>
   </main>
   <script>
     const $ = (id) => document.getElementById(id), safe = (v) => String(v ?? "—").replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c])), json = (v) => JSON.stringify(v ?? {}, null, 2);
     const count = (v) => Number.isFinite(Number(v)) ? String(v) : "0", phtDateFormatter = new Intl.DateTimeFormat("en-PH-u-hc-h23", { timeZone:"Asia/Manila", year:"numeric", month:"2-digit", day:"2-digit", hour:"2-digit", minute:"2-digit", second:"2-digit", hourCycle:"h23" }), dateText = (v) => { if(!v || typeof v !== "string" || !/(?:Z|[+-][0-9]{2}:[0-9]{2})$/.test(v)) return "—"; const date = new Date(v); if(Number.isNaN(date.getTime())) return "—"; const parts = Object.fromEntries(phtDateFormatter.formatToParts(date).filter(i => i.type !== "literal").map(i => [i.type, i.value])); return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}:${parts.second} PHT`; }, usd = (v) => { const number=Number(v); return Number.isFinite(number)?`$${number.toFixed(2)}`:"—"; }, arr = (v) => Array.isArray(v) ? v : [];
     const empty = (title,body) => `<div class="empty"><strong>${safe(title)}</strong>${safe(body)}</div>`, statusClass = (v) => { const s=String(v||"").toUpperCase(); return ["READY","RUNNING","ACTIVE","COMPLETE","COMPLETED","HEALTHY","ELIGIBLE","PASSED","PROMOTABLE","A","B"].includes(s)?"good":["DEGRADED","STOPPED","UPDATING","SUBMITTING","UNKNOWN","C"].includes(s)?"warn":["ERROR","STALE","REJECTED","KILLED","BLOCKED","FAIL","INSUFFICIENT","UNAVAILABLE","D","F"].includes(s)?"bad":""; };
     let params = new URLSearchParams(location.search); const state = { tab: params.get("tab") || "overview", page: Math.max(1,Number(params.get("page")||1)), page_size: [10,25,50,100].includes(Number(params.get("page_size"))) ? Number(params.get("page_size")) : 25, filter: params.get("filter") || "", sort: params.get("sort") || "", direction: params.get("direction") === "asc" ? "asc" : "desc", selected: params.get("selected") || "", expanded: params.get("expanded") === "1" };
-    let operator = {}, current = {}, loadInFlight = false, operatorControlsRendered = false;
+    let operator = {}, current = {}, loadInFlight = false, operatorControlsRendered = false, binanceTestnetMode = false;
     const controlToken = document.querySelector('meta[name="axiom-control-token"]')?.content || "";
     function controlButton(action,label,target="",confirmation="") { return `<button class="link control-action" data-control-action="${safe(action)}" data-control-target="${safe(target)}" data-control-confirm="${safe(confirmation)}">${safe(label)}</button>`; }
     function isCanaryAction(action) { return String(action||"").startsWith("canary."); }
@@ -3514,7 +3576,9 @@ def _dashboard_html(control_token: str | None = None) -> str:
       const visible=values.slice(0,100);
       return `<article class="panel"><div class="section-title"><h3>${safe(title)}</h3><span class="badge">${visible.length} shown</span></div><table><thead><tr>${keys.map(key=>`<th>${safe(key.replaceAll("_"," "))}</th>`).join("")}</tr></thead><tbody>${visible.map(item=>`<tr>${keys.map(key=>`<td>${safe(typeof item[key]==="object"?JSON.stringify(item[key]):item[key])}</td>`).join("")}</tr>`).join("")}</tbody></table><details><summary>Full IDs and bounded detail records</summary><pre>${safe(json(visible))}</pre></details></article>`;
     }
+    function setBinanceNavLabel(label) { const tab=document.querySelector('nav button.tab[data-view="binance-canary"]'); if(tab)tab.textContent=label; }
     function renderBinanceCanary(data) {
+      setBinanceNavLabel("BINANCE SPOT CANARY");
       const status=data?.status&&typeof data.status==="object"?data.status:data||{}, profile=data.profile||data.development_profile||status.profile||status.development_profile||{}, connectivity=data.connectivity||status.connectivity||{}, readiness=data.readiness||status.readiness||{}, qualification=data.qualification||status.qualification||{}, risk=data.risk||data.budgets||status.risk||status.budgets||{}, heartbeat=data.heartbeat||status.heartbeat||{}, signal=data.latest_signal||status.latest_signal||null, actions=arr(data.actions||status.actions);
       const identityRows=[["Environment",profile.environment||"PAPER / TESTNET"],["Instance",profile.feature_instance||profile.runtime_identity||profile.runtime||"binance-dev"],["DB path",profile.db_path||"—"],["Schema revision",profile.schema_revision||profile.revision||"unknown"],["Transport","BINANCE SPOT ENABLED · POLYMARKET DISABLED"],["Credentials",data.credentials?.configured?"CONFIGURED (safe status only)":"NOT CONFIGURED"]];
       $("binance-identity").innerHTML=`<article class="panel"><div class="section-title"><h2>DEVELOPMENT / PAPER|TESTNET IDENTITY</h2><span class="badge warn">${safe(profile.environment||"PAPER|TESTNET")}</span></div><div class="three-col">${identityRows.map(([key,value])=>`<div class="key-value"><span class="key">${safe(key)}</span><strong>${safe(value)}</strong></div>`).join("")}</div><p class="page-note">Status ${safe(dateText(data.timestamp||status.timestamp))} · UTC→PHT display enabled</p></article>`;
@@ -3529,6 +3593,44 @@ def _dashboard_html(control_token: str | None = None) -> str:
       $("binance-records").innerHTML=`<div class="three-col">${records}</div><article class="panel"><div class="section-title"><h3>LATEST SIGNAL / NO-TRADE</h3><span class="badge ${statusClass(signal?.status||"UNKNOWN")}">${safe(signal?.status||"UNKNOWN")}</span></div><div class="key-value"><span class="key">Signal</span><strong>${safe(signal?.signal_id||signal?.id||"—")}</strong></div><div class="key-value"><span class="key">No-trade reason</span><strong>${safe(data.no_trade_reason||status.no_trade_reason||signal?.no_trade_reason||"—")}</strong></div><div class="key-value"><span class="key">Pause / disarm / kill</span><strong>${status.pause?"PAUSED":"RUNNING"} / ${status.disarmed?"DISARMED":"ARMED"} / ${status.killed?"KILLED":"NOT KILLED"}</strong></div></article>`;
       $("binance-raw").textContent=json({status,actions});
     }
+    const _renderBinanceCanaryPaper = renderBinanceCanary;
+    function _binanceTestnetData(data) {
+      const status=data?.status&&typeof data.status==="object"?data.status:{};
+      return status.strict_testnet===true||data?.strict_testnet===true;
+    }
+    function _binanceTestnetValue(value) {
+      return value&&typeof value==="object"?safe(json(value)):safe(value);
+    }
+    function _binanceTestnetField(object, keys) {
+      const source=object&&typeof object==="object"?object:{};
+      for(const key of keys) {
+        const value=source[key];
+        if(value!==undefined&&value!==null&&value!=="")return _binanceTestnetValue(value);
+      }
+      return "—";
+    }
+    function renderBinanceTestnet(data) {
+      setBinanceNavLabel("BINANCE SPOT TESTNET");
+      const status=data?.status&&typeof data.status==="object"?data.status:{}, profile=data?.profile||status.profile||{}, credentials=data?.credentials||status.credentials||{}, connectivity=data?.connectivity||status.connectivity||{}, validation=data?.validation||status.validation||{}, probe=data?.probe||status.probe||{}, isolation=data?.isolation||status.isolation||{}, autonomous=data?.autonomous||status.autonomous||{}, account=connectivity.account||status.account||{}, entry=probe.intent||probe.entry||probe.buy||{}, exit=probe.exit||probe.exit_order||probe.sell||{}, orders=probe.orders||probe.order_records||[], fills=probe.fills||probe.trade_fills||probe.fill_records||[], reconciliation=probe.reconciliation||probe.reconcile||status.reconciliation||{}, actions=arr(data?.actions||status.actions);
+      const checked=connectivity.checked_at||connectivity.timestamp||status.checked_at||status.timestamp||{}, checkedPht=typeof checked==="object"?checked.pht:checked, balances=account.balances||connectivity.balances||[], state=autonomous.state||status.control?.state||status.state||"DISARMED";
+      document.querySelector("#view-binance-canary > article > .section-title h2")?.replaceChildren(document.createTextNode("BINANCE SPOT TESTNET"));
+      const badge=document.querySelector("#view-binance-canary > article > .section-title .badge"); if(badge)badge.textContent="TESTNET / LOCALHOST ONLY";
+      $("binance-identity").innerHTML=`<article class="panel"><div class="section-title"><h2>BINANCE SPOT TESTNET</h2><span class="badge warn">${safe(profile.environment||"TESTNET")}</span></div><div class="three-col"><div class="key-value"><span class="key">Environment</span><strong>TESTNET</strong></div><div class="key-value"><span class="key">Profile</span><strong>${_binanceTestnetField(profile,["identity","name","runtime_identity","profile"])}</strong></div><div class="key-value"><span class="key">Database</span><strong>${_binanceTestnetField(profile,["db_path","database","database_path"])}</strong></div><div class="key-value"><span class="key">Configured</span><strong>${credentials.configured===true?"CONFIGURED":"NOT CONFIGURED"}</strong></div><div class="key-value"><span class="key">Isolation</span><strong>${_binanceTestnetField(isolation,["status","reason","boundary"])}</strong></div><div class="key-value"><span class="key">Credentials</span><strong>STATUS ONLY · VALUES NEVER RENDERED</strong></div></div><p class="page-note">Status ${safe(typeof checked==="object"?(checked.utc||"—"):checked)} · localhost control token required.</p></article>`;
+      $("binance-connectivity").innerHTML=`<article class="panel"><div class="section-title"><h2>TESTNET CONNECTIVITY</h2><span class="badge ${statusClass(connectivity.status||"BLOCKED")}">${safe(connectivity.status||"BLOCKED")}</span></div><div class="three-col"><div class="key-value"><span class="key">Configured status</span><strong>${credentials.configured===true?"CONFIGURED":"NOT CONFIGURED"}</strong></div><div class="key-value"><span class="key">Authentication</span><strong>${_binanceTestnetField(connectivity,["authentication","auth_status","reason"])}</strong></div><div class="key-value"><span class="key">Account / Spot</span><strong>${_binanceTestnetField(account,["account_type","type"])} · ${account.can_trade===true?"CAN TRADE":"BLOCKED"}</strong></div><div class="key-value"><span class="key">Server time</span><strong>${_binanceTestnetField(connectivity,["server_time_ms","server_time","serverTime"])}</strong></div><div class="key-value"><span class="key">Bounded balances</span><strong>${Array.isArray(balances)?`${balances.length} shown`:_binanceTestnetValue(balances)}</strong></div><div class="key-value"><span class="key">Check PHT</span><strong>${safe(checkedPht||"—")}</strong></div><div class="key-value"><span class="key">Reason</span><strong>${_binanceTestnetField(connectivity,["reason","error"])}</strong></div></div>${Array.isArray(balances)&&balances.length?`<details><summary>Bounded balances</summary><pre>${safe(json(balances.slice(0,64)))}</pre></details>`:""}</article>`;
+      $("binance-qualification").innerHTML=`<article class="panel"><div class="section-title"><h2>ORDER VALIDATION</h2><span class="badge ${statusClass(validation.status||"BLOCKED")}">${safe(validation.status||"BLOCKED")}</span></div><div class="three-col"><div class="key-value"><span class="key">Symbol</span><strong>${_binanceTestnetField(validation,["symbol"])}</strong></div><div class="key-value"><span class="key">Side</span><strong>${_binanceTestnetField(validation,["side","order_side"])}</strong></div><div class="key-value"><span class="key">Price</span><strong>${_binanceTestnetField(validation,["price"])}</strong></div><div class="key-value"><span class="key">Quantity</span><strong>${_binanceTestnetField(validation,["quantity"])}</strong></div><div class="key-value"><span class="key">Fee reserve</span><strong>${_binanceTestnetField(validation,["fee_reserve","fee","fee_reservation"])}</strong></div><div class="key-value"><span class="key">Reservation</span><strong>${_binanceTestnetField(validation,["reservation","risk_reservation","planned_exit"])}</strong></div><div class="key-value"><span class="key">Status</span><strong>${_binanceTestnetField(validation,["status","reason"])}</strong></div></div></article>`;
+      $("binance-risk").innerHTML=`<article class="panel"><div class="section-title"><h2>TESTNET EXECUTION PROBE</h2><span class="badge ${statusClass(probe.status||"BLOCKED")}">${safe(probe.status||"BLOCKED")}</span></div><div class="three-col"><div class="key-value"><span class="key">Probe label</span><strong>${_binanceTestnetField(probe,["label","probe_kind","name"])}</strong></div><div class="key-value"><span class="key">Entry exchange ID</span><strong>${_binanceTestnetField(entry,["exchange_order_id","exchangeOrderId","order_id"])}</strong></div><div class="key-value"><span class="key">Entry client ID</span><strong>${_binanceTestnetField(entry,["client_order_id","clientOrderId","newClientOrderId"])}</strong></div><div class="key-value"><span class="key">Fills / fees</span><strong>${Array.isArray(fills)?`${fills.length} fills · ${_binanceTestnetField(probe,["fee_paid","fees","commission"])}`:_binanceTestnetField(probe,["fills","fees"])}</strong></div><div class="key-value"><span class="key">Owned quantity</span><strong>${_binanceTestnetField(probe,["owned_quantity","owned_qty","quantity_owned"])}</strong></div><div class="key-value"><span class="key">Exit</span><strong>${_binanceTestnetField(exit,["state","status","reason"])}</strong></div><div class="key-value"><span class="key">Exit exchange / client IDs</span><strong>${_binanceTestnetField(exit,["exchange_order_id","client_order_id","order_id"])}</strong></div><div class="key-value"><span class="key">Realized PnL</span><strong>${_binanceTestnetField(probe,["realized_pnl","realizedPnL"])}</strong></div><div class="key-value"><span class="key">Reconciliation</span><strong>${_binanceTestnetField(reconciliation,["status","reason","state"])}</strong></div><div class="key-value"><span class="key">DUST</span><strong>${String(probe.status||exit.state||exit.status||"").toUpperCase()==="DUST"?"DUST":"—"}</strong></div></div>${orders.length||fills.length?`<details><summary>Probe orders and fills</summary><pre>${safe(json({orders:orders.slice(0,100),fills:fills.slice(0,100)}))}</pre></details>`:""}</article>`;
+      $("binance-controls").innerHTML=`<article class="panel"><div class="section-title"><h2>AUTONOMOUS TESTNET</h2><span class="badge ${statusClass(state)}">${safe(state)}</span></div><p class="page-note">Price and quantity are computed automatically from Binance exchange filters and the frozen bounded Testnet envelope.</p><p class="page-note"><button class="binance-action" data-binance-action="CONNECTIVITY_CHECK">Connectivity check</button> <button class="binance-action" data-binance-action="ORDER_VALIDATION_TEST">Validate order</button> <button class="binance-action" data-binance-action="PAUSE">Pause</button> <button class="binance-action" data-binance-action="DISARM">Disarm</button> <button class="binance-action danger" data-binance-action="KILL">Kill</button></p><p class="notice">Execution probe and reconciliation actions are CLI/runtime-only. Browser controls are limited to read-only connectivity, order validation, and risk-reducing pause, disarm, or kill.</p></article><article class="panel"><div class="section-title"><h2>AUTONOMOUS TESTNET STATUS</h2><span class="badge ${statusClass(autonomous.state||state)}">${safe(autonomous.state||state)}</span></div><div class="three-col"><div class="key-value"><span class="key">Enabled</span><strong>${_binanceTestnetField(autonomous,["enabled"])}</strong></div><div class="key-value"><span class="key">State</span><strong>${_binanceTestnetField(autonomous,["state"])}</strong></div><div class="key-value"><span class="key">Blocked reason</span><strong>${_binanceTestnetField(autonomous,["blocked_reason","blocker","reason"])}</strong></div><div class="key-value"><span class="key">Selected candidate</span><strong>${_binanceTestnetField(autonomous,["selected_candidate","candidate"])}</strong></div><div class="key-value"><span class="key">Current signal</span><strong>${_binanceTestnetField(autonomous,["current_signal","signal"])}</strong></div><div class="key-value"><span class="key">No-trade reason</span><strong>${_binanceTestnetField(autonomous,["no_trade_reason"])}</strong></div><div class="key-value"><span class="key">Frozen envelope</span><strong>${_binanceTestnetField(autonomous,["risk_envelope","frozen_envelope","risk"])}</strong></div><div class="key-value"><span class="key">Bounded window</span><strong>${_binanceTestnetField(autonomous,["bounded_window","window","window_seconds"])}</strong></div></div></article>`;
+      $("binance-controls").firstElementChild?.insertAdjacentHTML("beforeend",'<p class="page-note">Autonomous enable/resume is CLI-only; window-seconds 30..900.</p>');
+      const records=[binanceRecordTable("TESTNET PROBE ORDERS",orders),binanceRecordTable("TESTNET PROBE FILLS",fills)].join("");
+      $("binance-records").innerHTML=`<div class="three-col">${records}</div><article class="panel"><div class="section-title"><h3>TESTNET ISOLATION</h3><span class="badge">${safe(_binanceTestnetField(isolation,["status","reason","boundary"]))}</span></div><p class="page-note">Probe evidence is isolated from strategy signals and execution ledgers. No Polymarket transport is available.</p><pre>${safe(json({isolation,actions:actions.slice(0,100)}))}</pre></article>`;
+      $("binance-raw").textContent=json({status,connectivity,validation,probe,isolation,autonomous,actions});
+    }
+    renderBinanceCanary = function(data) {
+      binanceTestnetMode = _binanceTestnetData(data);
+      if(binanceTestnetMode) { renderBinanceTestnet(data); return; }
+      _renderBinanceCanaryPaper(data);
+    };
+
     function renderCanary(data) {
       const c=data.canary||{}, auto=data.autonomous_canary||c.autonomous||{}, risk=c.risk_envelope||c.risk_limits||{}, signal=data.canary_signal||null, connectivity=data.connectivity??c.connectivity??null;
       renderCanaryConnectivity(connectivity);
@@ -3742,14 +3844,16 @@ def _dashboard_html(control_token: str | None = None) -> str:
       if(document.hidden||loadInFlight)return;
       return loadPage(state.tab,false);
     };
-    document.addEventListener("click",async event=>{const button=event.target.closest?.(".binance-action");if(!button)return;const action=button.dataset.binanceAction||"",payload={};if(action==="ENABLE"||action==="RESUME")payload.confirmation=$("binance-confirm")?.value||"";if(action==="ORDER_VALIDATION_TEST"){payload.symbol=$("binance-order-symbol")?.value||"";payload.price=$("binance-order-price")?.value||"";payload.quantity=$("binance-order-quantity")?.value||"";}await binanceControlPost(action,payload);});
+    document.addEventListener("click",async event=>{const button=event.target.closest?.(".binance-action");if(!button)return;const action=button.dataset.binanceAction||"",payload={};if(!binanceTestnetMode&&(action==="ENABLE"||action==="RESUME"))payload.confirmation=$("binance-confirm")?.value||"";if(action==="ORDER_VALIDATION_TEST"&&!binanceTestnetMode){payload.symbol=$("binance-order-symbol")?.value||"";payload.price=$("binance-order-price")?.value||"";payload.quantity=$("binance-order-quantity")?.value||"";}await binanceControlPost(action,payload);});
     document.addEventListener("click",async event=>{const button=event.target.closest?.(".control-action");if(!button)return;const action=button.dataset.controlAction||"",target=button.dataset.controlTarget||"",expected=button.dataset.controlConfirm||"";if(expected){const typed=window.prompt(`Type ${expected} to continue`);if(typed!==expected){actionResultMessage(action,`${action} cancelled: exact confirmation required`);return;}}const result=await controlPost(action,target,expected);const local=$("candidate-control-result");if(local&&target===state.selected&&!isCanaryAction(action))local.textContent=result.ok?`${action} completed`:`${action} blocked: ${result.reason||"CONTROL_FAILED"}`;});
     ensureActivityKind(); if($("crypto-symbol")){const oldSymbol=$("crypto-symbol"),newSymbol=oldSymbol.cloneNode(true);oldSymbol.replaceWith(newSymbol);newSymbol.addEventListener("input",()=>{state.page=1;saveState(true);loadPage("crypto",true);});} document.addEventListener("click",event=>{const button=event.target.closest?.(".copy");if(!button)return;navigator.clipboard?.writeText(button.dataset.copy||"").then(()=>{button.textContent="copied";setTimeout(()=>button.textContent="copy",1200);}).catch(()=>{});}); document.addEventListener("visibilitychange",()=>{if(document.hidden){if(activeController)activeController.abort();}else{nextRefreshAt=0;load();}});
     ensureFacets(); document.querySelectorAll(".tab").forEach(b=>b.addEventListener("click",()=>activate(b.dataset.view))); document.querySelectorAll("[data-link]").forEach(b=>b.addEventListener("click",e=>{e.preventDefault();activate(b.dataset.link)})); document.querySelectorAll(".filters input,.filters select").forEach(el=>el.addEventListener(el.tagName==="INPUT"?"input":"change",()=>{if(el.id.endsWith("-size")){const n=Number(el.value);if([10,25,50,100].includes(n)){state.page_size=n;document.querySelectorAll('select[id$="-size"]').forEach(s=>s.value=String(n));}} else if(el.id.includes("-filter"))state.filter=el.value;state.page=1;saveState(true);loadPage(state.tab)})); window.addEventListener("popstate",()=>{const q=new URLSearchParams(location.search),nextTab=q.get("tab")||"overview",changed=nextTab!==state.tab;params=q;state.tab=nextTab;state.page=Math.max(1,Number(q.get("page")||1));state.page_size=[10,25,50,100].includes(Number(q.get("page_size")))?Number(q.get("page_size")):25;state.filter=changed?"":q.get("filter")||"";state.sort=changed?"":q.get("sort")||"";state.direction=changed?"desc":q.get("direction")==="asc"?"asc":"desc";state.selected=changed?"":q.get("selected")||"";state.expanded=changed?false:q.get("expanded")==="1";restoreFacets();activate(state.tab,false)}); load(); activate(state.tab,false); const refreshHandle=setInterval(load,10000); window.addEventListener("beforeunload",()=>clearInterval(refreshHandle));
     if($("crypto-symbol"))$("crypto-symbol").addEventListener("input",async()=>{const symbol=$("crypto-symbol").value.trim(),q=new URLSearchParams({page:"1",page_size:String(state.page_size),direction:state.direction});if(symbol)q.set("symbol",symbol);const response=await fetch(`/api/v2/crypto-research?${q}`,{cache:"no-store"});if(response.ok)renderCrypto(await response.json());});
     // setInterval(load, 10000) is the ten-second refresh contract.
   </script>
-</html>""".replace("__AXIOM_CONTROL_TOKEN__", str(control_token or ""))
+</html>""".replace("__AXIOM_CONTROL_TOKEN__", str(control_token or "")).replace(
+        "__BINANCE_NAV_LABEL__", binance_nav_label
+    )
 
 class _DashboardHandler(BaseHTTPRequestHandler):
     server: "_BoundDashboardServer"
@@ -3803,9 +3907,6 @@ class _DashboardHandler(BaseHTTPRequestHandler):
         if not self._control_request_allowed():
             self._send(403, {"error": "localhost control token required"})
             return
-        if is_binance and self.server.dashboard_data.binance_canary is None:
-            self._send(503, {"error": "Binance canary controls unavailable"})
-            return
         content_length = self.headers.get("Content-Length")
         try:
             length = int(content_length or "0")
@@ -3827,16 +3928,30 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             self._send(400, {"error": "control request must be an object"})
             return
         if is_binance:
-            if set(body) - {"action", "payload"}:
-                self._send(400, {"error": "unsupported Binance control fields"})
-                return
             action = body.get("action")
-            payload = body.get("payload", {})
             if not isinstance(action, str) or not action.strip():
                 self._send(400, {"error": "Binance action must be a non-empty string"})
                 return
+            normalized_action = action.strip().upper()
+            if normalized_action in _BINANCE_HTTP_FORBIDDEN_ACTIONS:
+                self._send(
+                    403,
+                    {
+                        "ok": False,
+                        "action": normalized_action,
+                        "reason": "BROWSER_ACTION_FORBIDDEN",
+                    },
+                )
+                return
+            if set(body) - {"action", "payload"}:
+                self._send(400, {"error": "unsupported Binance control fields"})
+                return
+            payload = body.get("payload", {})
             if not isinstance(payload, Mapping):
                 self._send(400, {"error": "Binance payload must be an object"})
+                return
+            if self.server.dashboard_data.binance_canary is None:
+                self._send(503, {"error": "Binance canary controls unavailable"})
                 return
             try:
                 result = self.server.dashboard_data.binance_canary.action(action, payload)
@@ -3878,7 +3993,14 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             return
         if path in {"", "index.html"}:
             try:
-                self._send(200, _dashboard_html(self.server.control_token), "text/html; charset=utf-8")
+                self._send(
+                    200,
+                    _dashboard_html(
+                        self.server.control_token,
+                        binance_nav_label=self.server.dashboard_data.binance_nav_label(),
+                    ),
+                    "text/html; charset=utf-8",
+                )
             except _CLIENT_DISCONNECT_ERRORS:
                 return
             return

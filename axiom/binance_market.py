@@ -26,6 +26,41 @@ PAPER = "PAPER"
 BINANCE_SPOT_TESTNET = "BINANCE_SPOT_TESTNET"
 BINANCE_SPOT_LIVE = "BINANCE_SPOT_LIVE"
 USDT = "USDT"
+AUTO_DEADLINE_EXPIRED = "AUTO_DEADLINE_EXPIRED"
+
+
+class _CollectionDeadlineExpired(TimeoutError):
+    deadline_expired = True
+
+    def __init__(self) -> None:
+        super().__init__(AUTO_DEADLINE_EXPIRED)
+
+
+def _coerce_deadline(value: float | None) -> float | None:
+    if value is None:
+        return None
+    try:
+        deadline = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("deadline_monotonic must be finite") from exc
+    if not math.isfinite(deadline):
+        raise ValueError("deadline_monotonic must be finite")
+    return deadline
+
+
+def _check_deadline(deadline_monotonic: float | None) -> None:
+    if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+        raise _CollectionDeadlineExpired()
+
+def _deadline_expired(deadline_monotonic: float | None) -> bool:
+    return deadline_monotonic is not None and time.monotonic() >= deadline_monotonic
+
+
+def _deadline_exception(exc: BaseException) -> bool:
+    return bool(
+        getattr(exc, "deadline_expired", False)
+        or str(exc) == AUTO_DEADLINE_EXPIRED
+    )
 REST_ORIGINS: Mapping[str, str | None] = {
     PAPER: None,
     BINANCE_SPOT_TESTNET: "https://testnet.binance.vision",
@@ -184,6 +219,8 @@ def _coerce_bar(row: Any) -> OHLCVBar | Any | None:
 
 def _invoke(method: Callable[..., Any], symbol: str, **kwargs: Any) -> Any:
     """Invoke a fake or real provider without requiring one exact signature."""
+    if kwargs.get("deadline_monotonic") is None:
+        kwargs = {name: value for name, value in kwargs.items() if name != "deadline_monotonic"}
     try:
         signature = inspect.signature(method)
     except (TypeError, ValueError):
@@ -482,6 +519,7 @@ class BoundedBinanceMarketCollector:
         quality: str | None = None,
         reconciliation: bool = False,
         now: datetime | None = None,
+        deadline_monotonic: float | None = None,
     ) -> BinanceMarketCollection:
         """Collect selected symbols, plus explicit exit-only symbols.
 
@@ -489,6 +527,7 @@ class BoundedBinanceMarketCollector:
         when supplied it replaces the bound snapshot for this call and is
         still used verbatim (no refresh or membership reconstruction).
         """
+        deadline = _coerce_deadline(deadline_monotonic)
         snapshot = self._coerce_snapshot(universe_snapshot) if universe_snapshot is not None else self.universe_snapshot
         interval = str(interval).strip()
         if not interval:
@@ -534,7 +573,17 @@ class BoundedBinanceMarketCollector:
             "observed_at": observed_at,
         }
 
+        completed: dict[str, BinanceMarketSnapshot] = {}
+        futures: dict[Future[BinanceMarketSnapshot], Mapping[str, Any]] = {}
+        started: dict[str, float] = {}
+        start_lock = threading.Lock()
+        deadline_path = deadline is not None
+
+        def deadline_snapshot(entry: Mapping[str, Any]) -> BinanceMarketSnapshot:
+            return self._error_snapshot(entry, common, AUTO_DEADLINE_EXPIRED, timed_out=True)
+
         def run(entry: Mapping[str, Any]) -> BinanceMarketSnapshot:
+            _check_deadline(deadline)
             return self._collect_symbol(
                 entry,
                 snapshot=snapshot,
@@ -545,47 +594,92 @@ class BoundedBinanceMarketCollector:
                 observed_at=observed_at,
                 reconciliation=reconciliation or entry["symbol"] in exits,
                 common=common,
+                deadline_monotonic=deadline,
             )
 
-        futures: dict[Future[BinanceMarketSnapshot], Mapping[str, Any]] = {}
-        started: dict[str, float] = {}
-        start_lock = threading.Lock()
-
         def wrapped(entry: Mapping[str, Any]) -> BinanceMarketSnapshot:
+            _check_deadline(deadline)
             with start_lock:
+                _check_deadline(deadline)
                 started[str(entry["symbol"])] = time.monotonic()
             return run(entry)
 
-        executor = ThreadPoolExecutor(max_workers=self.max_workers, thread_name_prefix="binance-market")
-        try:
+        if deadline_path and _deadline_expired(deadline):
             for entry in requested_entries:
-                future = executor.submit(wrapped, entry)
-                futures[future] = entry
-            pending = set(futures)
-            completed: dict[str, BinanceMarketSnapshot] = {}
-            while pending:
-                done, _ = wait(pending, timeout=0.02, return_when=FIRST_COMPLETED)
-                for future in done:
-                    pending.discard(future)
-                    entry = futures[future]
-                    try:
-                        completed[str(entry["symbol"])] = future.result()
-                    except BaseException as exc:
-                        completed[str(entry["symbol"])] = self._error_snapshot(entry, common, f"{type(exc).__name__}: {exc}")
-                current = time.monotonic()
-                for future in tuple(pending):
-                    entry = futures[future]
-                    started_at = started.get(str(entry["symbol"]))
-                    if started_at is None or current - started_at < self.timeout:
+                completed[str(entry["symbol"])] = deadline_snapshot(entry)
+        else:
+            executor = ThreadPoolExecutor(max_workers=self.max_workers, thread_name_prefix="binance-market")
+            pending: set[Future[BinanceMarketSnapshot]] = set()
+            try:
+                for entry in requested_entries:
+                    if deadline_path and _deadline_expired(deadline):
+                        completed[str(entry["symbol"])] = deadline_snapshot(entry)
                         continue
-                    pending.discard(future)
-                    future.cancel()
-                    completed[str(entry["symbol"])] = self._error_snapshot(entry, common, f"timeout after {self.timeout:g}s", timed_out=True)
-            records = [completed[str(entry["symbol"])] for entry in requested_entries]
-        finally:
-            # A timed-out urllib call may still be in a worker.  Never wait for
-            # it here: one bad symbol must not starve healthy records.
-            executor.shutdown(wait=False, cancel_futures=True)
+                    future = executor.submit(wrapped, entry)
+                    futures[future] = entry
+                    pending.add(future)
+                while pending:
+                    wait_timeout = 0.02
+                    if deadline_path:
+                        remaining = float(deadline) - time.monotonic()
+                        if remaining <= 0:
+                            break
+                        wait_timeout = min(wait_timeout, remaining)
+                    done, _ = wait(pending, timeout=wait_timeout, return_when=FIRST_COMPLETED)
+                    for future in done:
+                        pending.discard(future)
+                        entry = futures[future]
+                        symbol = str(entry["symbol"])
+                        if future.cancelled():
+                            completed[symbol] = deadline_snapshot(entry) if deadline_path else self._error_snapshot(
+                                entry, common, f"timeout after {self.timeout:g}s", timed_out=True
+                            )
+                            continue
+                        try:
+                            completed[symbol] = future.result()
+                        except BaseException as exc:
+                            if _deadline_exception(exc):
+                                completed[symbol] = deadline_snapshot(entry)
+                            else:
+                                completed[symbol] = self._error_snapshot(entry, common, f"{type(exc).__name__}: {exc}")
+                    current = time.monotonic()
+                    if deadline_path and current >= float(deadline):
+                        break
+                    for future in tuple(pending):
+                        entry = futures[future]
+                        started_at = started.get(str(entry["symbol"]))
+                        if started_at is None or current - started_at < self.timeout:
+                            continue
+                        pending.discard(future)
+                        future.cancel()
+                        completed[str(entry["symbol"])] = self._error_snapshot(
+                            entry, common, f"timeout after {self.timeout:g}s", timed_out=True
+                        )
+
+                if deadline_path and _deadline_expired(deadline):
+                    for future in tuple(pending):
+                        pending.discard(future)
+                        entry = futures[future]
+                        future.cancel()
+                        completed.setdefault(str(entry["symbol"]), deadline_snapshot(entry))
+            finally:
+                if deadline_path:
+                    # A deadline-bound collection must join every started
+                    # worker before returning; queued work is cancelled.
+                    executor.shutdown(wait=True, cancel_futures=True)
+                else:
+                    # Preserve legacy per-symbol timeout behavior for callers
+                    # that did not opt into an absolute deadline.
+                    executor.shutdown(wait=False, cancel_futures=True)
+
+        for entry in requested_entries:
+            completed.setdefault(
+                str(entry["symbol"]),
+                deadline_snapshot(entry) if deadline_path and _deadline_expired(deadline) else self._error_snapshot(
+                    entry, common, "missing collection result"
+                ),
+            )
+        records = [completed[str(entry["symbol"])] for entry in requested_entries]
         return BinanceMarketCollection(records, {
             "universe_id": snapshot.universe_id,
             "universe_version": snapshot.version,
@@ -635,13 +729,18 @@ class BoundedBinanceMarketCollector:
         observed_at: datetime,
         reconciliation: bool,
         common: Mapping[str, Any],
+        deadline_monotonic: float | None = None,
     ) -> BinanceMarketSnapshot:
+        _check_deadline(deadline_monotonic)
         symbol = str(entry["symbol"])
         reasons: list[str] = []
         exchange_info: Mapping[str, Any] | None = None
         try:
-            exchange_info = self._exchange_info(symbol)
+            exchange_info = self._exchange_info(symbol, deadline_monotonic=deadline_monotonic)
         except BaseException as exc:
+            if _deadline_exception(exc):
+                raise
+            _check_deadline(deadline_monotonic)
             reasons.append(f"EXCHANGE_INFO_ERROR: {exc}")
         tradable = self._tradable(exchange_info, symbol)
         if exchange_info is None:
@@ -660,18 +759,31 @@ class BoundedBinanceMarketCollector:
         ticker: CryptoTicker | None = None
         book: OrderBookSnapshot | None = None
         try:
-            bars = self._closed_bars(symbol, interval, limit, start, end, observed_at)
+            bars = self._closed_bars(
+                symbol, interval, limit, start, end, observed_at, deadline_monotonic=deadline_monotonic
+            )
             if not bars:
                 reasons.append("NO_CLOSED_BARS")
         except BaseException as exc:
+            if _deadline_exception(exc):
+                raise
+            _check_deadline(deadline_monotonic)
             reasons.append(f"BARS_ERROR: {exc}")
         try:
-            ticker = self._provider_call("ticker", symbol)
+            ticker = self._provider_call("ticker", symbol, deadline_monotonic=deadline_monotonic)
         except BaseException as exc:
+            if _deadline_exception(exc):
+                raise
+            _check_deadline(deadline_monotonic)
             reasons.append(f"TICKER_ERROR: {exc}")
         try:
-            book = self._provider_call("order_book", symbol, depth=self.depth_limit)
+            book = self._provider_call(
+                "order_book", symbol, depth=self.depth_limit, deadline_monotonic=deadline_monotonic
+            )
         except BaseException as exc:
+            if _deadline_exception(exc):
+                raise
+            _check_deadline(deadline_monotonic)
             reasons.append(f"BOOK_ERROR: {exc}")
         ticker_fresh = ticker is not None and self._fresh(getattr(ticker, "timestamp", None), observed_at)
         book_fresh = book is not None and self._fresh(getattr(book, "timestamp", None), observed_at)
@@ -683,7 +795,10 @@ class BoundedBinanceMarketCollector:
             reasons.append("NO_BOOK")
         elif not book_fresh:
             reasons.append("BOOK_STALE")
-        depth_evidence, spread, spread_evidence, fill_evidence = self._book_evidence(book, ticker, ticker_fresh and book_fresh)
+        depth_evidence, spread, spread_evidence, fill_evidence = self._book_evidence(
+            book, ticker, ticker_fresh and book_fresh
+        )
+        _check_deadline(deadline_monotonic)
         selected = bool(entry.get("selected"))
         stale_universe = snapshot.status != "CURRENT"
         new_entry_allowed = selected and tradable and not stale_universe and not reconciliation
@@ -722,7 +837,12 @@ class BoundedBinanceMarketCollector:
         *,
         timed_out: bool = False,
     ) -> BinanceMarketSnapshot:
-        reason = "TIMEOUT" if timed_out else "ERROR"
+        if error == AUTO_DEADLINE_EXPIRED:
+            reason = AUTO_DEADLINE_EXPIRED
+            reasons = (reason, "TIMEOUT")
+        else:
+            reason = "TIMEOUT" if timed_out else "ERROR"
+            reasons = (reason,)
         return BinanceMarketSnapshot(
             symbol=str(entry["symbol"]),
             asset_symbol=str(entry.get("asset_symbol")) if entry.get("asset_symbol") is not None else None,
@@ -731,26 +851,46 @@ class BoundedBinanceMarketCollector:
             selected=bool(entry.get("selected")),
             error=error,
             timed_out=timed_out,
-            reasons=(reason,),
+            reasons=reasons,
             **common,
         )
 
-    def _provider_call(self, name: str, symbol: str, **kwargs: Any) -> Any:
+    def _provider_call(
+        self,
+        name: str,
+        symbol: str,
+        *,
+        deadline_monotonic: float | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        _check_deadline(deadline_monotonic)
         method = getattr(self.provider, name, None)
         if not callable(method):
             raise AttributeError(f"provider has no public {name} method")
-        return _invoke(method, symbol, **kwargs)
+        result = _invoke(method, symbol, deadline_monotonic=deadline_monotonic, **kwargs)
+        _check_deadline(deadline_monotonic)
+        return result
 
-    def _exchange_info(self, symbol: str) -> Mapping[str, Any] | None:
+    def _exchange_info(
+        self,
+        symbol: str,
+        *,
+        deadline_monotonic: float | None = None,
+    ) -> Mapping[str, Any] | None:
+        _check_deadline(deadline_monotonic)
         method = getattr(self.provider, "exchange_info", None)
         if callable(method):
-            payload = _invoke(method, symbol)
+            _check_deadline(deadline_monotonic)
+            payload = _invoke(method, symbol, deadline_monotonic=deadline_monotonic)
+            _check_deadline(deadline_monotonic)
             record = _records_from_exchange(payload, symbol)
             if record is not None:
                 return record
         method = getattr(self.provider, "exchange_symbols", None)
         if callable(method):
-            payload = _invoke(method, symbol, quote_asset=USDT)
+            _check_deadline(deadline_monotonic)
+            payload = _invoke(method, symbol, quote_asset=USDT, deadline_monotonic=deadline_monotonic)
+            _check_deadline(deadline_monotonic)
             if isinstance(payload, Mapping):
                 record = _records_from_exchange(payload, symbol)
                 if record is not None:
@@ -761,7 +901,9 @@ class BoundedBinanceMarketCollector:
                         return _public_copy(item)
         metadata = getattr(self.provider, "metadata", None)
         if callable(metadata):
-            instrument = _invoke(metadata, symbol)
+            _check_deadline(deadline_monotonic)
+            instrument = _invoke(metadata, symbol, deadline_monotonic=deadline_monotonic)
+            _check_deadline(deadline_monotonic)
             extra = getattr(instrument, "extra", None)
             if isinstance(extra, Mapping):
                 record = dict(_public_copy(extra))
@@ -788,7 +930,10 @@ class BoundedBinanceMarketCollector:
         start: datetime | None,
         end: datetime | None,
         observed_at: datetime,
+        *,
+        deadline_monotonic: float | None = None,
     ) -> tuple[Any, ...]:
+        _check_deadline(deadline_monotonic)
         method = None
         for name in ("closed_historical_ohlcv", "closed_ohlcv", "historical_ohlcv_closed", "closed_candles"):
             candidate = getattr(self.provider, name, None)
@@ -800,7 +945,19 @@ class BoundedBinanceMarketCollector:
             method = getattr(self.provider, "historical_ohlcv", None)
         if not callable(method):
             raise AttributeError("provider has no public OHLCV method")
-        rows = _invoke(method, symbol, start=start, end=end, interval=interval, limit=limit, now=observed_at, grace=self.grace)
+        _check_deadline(deadline_monotonic)
+        rows = _invoke(
+            method,
+            symbol,
+            start=start,
+            end=end,
+            interval=interval,
+            limit=limit,
+            now=observed_at,
+            grace=self.grace,
+            deadline_monotonic=deadline_monotonic,
+        )
+        _check_deadline(deadline_monotonic)
         if not isinstance(rows, Sequence) or isinstance(rows, (str, bytes, bytearray)):
             return ()
         result: list[Any] = []
@@ -888,6 +1045,7 @@ __all__ = [
     "BINANCE_SPOT_TESTNET",
     "BINANCE_SPOT_LIVE",
     "USDT",
+    "AUTO_DEADLINE_EXPIRED",
     "REST_ORIGINS",
     "BinanceMarketSnapshot",
     "BinanceCanarySnapshot",

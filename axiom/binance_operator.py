@@ -7,15 +7,16 @@ the ``binance_operator_*`` namespace; action records are append-only and carry
 both UTC and Asia/Manila display timestamps.
 """
 from __future__ import annotations
-
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 import hashlib
+import inspect
 import json
 import os
 import re
 import sqlite3
 import threading
+import time
 import uuid
 from typing import Any, Callable, Mapping, Sequence
 from zoneinfo import ZoneInfo
@@ -27,6 +28,7 @@ try:  # These imports are deliberately Binance-only.
         DISARMED,
         DISABLED,
         ENABLE_CONFIRMATION,
+        ENABLE_TESTNET_CONFIRMATION,
         KILLED,
         PAPER,
         PAUSED,
@@ -38,6 +40,7 @@ except ImportError:  # pragma: no cover - direct module loading fallback
     DISARMED = "DISARMED"
     DISABLED = "DISABLED"
     ENABLE_CONFIRMATION = "ENABLE BINANCE AUTO CANARY"
+    ENABLE_TESTNET_CONFIRMATION = "ENABLE BINANCE TESTNET AUTO CANARY"
     KILLED = "KILLED"
     PAPER = "PAPER"
     PAUSED = "PAUSED"
@@ -70,9 +73,28 @@ ACTION_NAMES = frozenset(
     }
 )
 EXACT_ENABLE_PHRASE = ENABLE_CONFIRMATION
+TESTNET_PROBE_CONFIRMATION = "RUN BINANCE TESTNET EXECUTION PROBE"
+EXACT_PROBE_PHRASE = TESTNET_PROBE_CONFIRMATION
+EXACT_TESTNET_PROBE_PHRASE = TESTNET_PROBE_CONFIRMATION
+EXACT_EXECUTION_PROBE_PHRASE = TESTNET_PROBE_CONFIRMATION
+TESTNET_EXECUTION_PROBE_CONFIRMATION = TESTNET_PROBE_CONFIRMATION
+EXACT_TESTNET_ENABLE_PHRASE = ENABLE_TESTNET_CONFIRMATION
 MAX_PAGE_SIZE = 100
 DEFAULT_PAGE_SIZE = 25
 DEFAULT_STALE_SECONDS = 300.0
+TESTNET_ACTION_NAMES = frozenset(
+    {
+        "CONNECTIVITY_CHECK",
+        "ORDER_VALIDATION_TEST",
+        "EXECUTION_PROBE",
+        "RECONCILE_PROBE",
+        "ENABLE",
+        "PAUSE",
+        "RESUME",
+        "DISARM",
+        "KILL",
+    }
+)
 _SECRET_WORDS = re.compile(
     r"(?:secret|password|passwd|token|api[_-]?key|apikey|private[_-]?key|private|mnemonic|passphrase|authorization|bearer|credential)",
     re.I,
@@ -1072,10 +1094,667 @@ class BinanceCanaryControlPlane:
             return []
         return [_as_mapping(dict(row)) for row in rows]
 
+class BinanceTestnetControlPlane:
+    """Operator boundary for the isolated Binance Spot TESTNET gate.
+
+    The gate owns all authenticated/network work.  This facade only dispatches
+    explicit gate operations, projects already-persisted gate state, and
+    optionally controls an injected strategy component.  In particular,
+    validation and probes never pass through strategy signal submission.
+    """
+
+    strict_testnet = True
+    action_names = TESTNET_ACTION_NAMES
+    action_table = "binance_testnet_operator_actions"
+    environment = "BINANCE_SPOT_TESTNET"
+    source = "binance_testnet_operator"
+    probe_kind = "TESTNET EXECUTION PROBE"
+    max_history = 256
+
+    def __init__(
+        self,
+        gate: Any,
+        *,
+        execution: Any | None = None,
+        worker: Any | None = None,
+        clock: Callable[[], Any] | None = None,
+        monotonic_clock: Callable[[], float] | None = None,
+        store: Any | None = None,
+        connection: sqlite3.Connection | None = None,
+    ) -> None:
+        if gate is None:
+            raise TypeError("gate is required")
+        if store is not None and connection is not None:
+            raise TypeError("provide either audit store or audit connection, not both")
+        self.gate = gate
+        self.execution = execution
+        self.worker = worker
+        self.clock = clock or getattr(gate, "clock", None) or (lambda: datetime.now(UTC))
+        self.monotonic_clock = monotonic_clock or time.monotonic
+        self._lock = threading.RLock()
+        self.audit_store = store
+        # ``store`` remains an explicit audit-only alias; it is never inferred
+        # from the gate, whose connection is independently owned by runtime.
+        self.store = store
+        self._owns_audit_connection = False
+        self._closed = False
+        self._autonomous_window: dict[str, Any] | None = None
+        self._conn = self._resolve_connection(store=store, connection=connection)
+        self._init_schema()
+
+    def _resolve_connection(
+        self,
+        *,
+        store: Any | None = None,
+        connection: sqlite3.Connection | None = None,
+    ) -> sqlite3.Connection:
+        candidates = (
+            connection,
+            store if isinstance(store, sqlite3.Connection) else None,
+            getattr(store, "connection", None),
+            getattr(store, "_conn", None),
+        )
+        for candidate in candidates:
+            if isinstance(candidate, sqlite3.Connection):
+                candidate.row_factory = sqlite3.Row
+                return candidate
+        if store is not None or connection is not None:
+            raise TypeError("audit store must provide a sqlite3 connection")
+        # Standalone control-plane fakes still get an isolated, owned audit
+        # connection rather than borrowing the gate's transaction boundary.
+        owned = sqlite3.connect(":memory:", check_same_thread=False)
+        owned.row_factory = sqlite3.Row
+        self._owns_audit_connection = True
+        return owned
+
+    def close(self) -> None:
+        """Close only an internally-owned audit connection, idempotently."""
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            if self._owns_audit_connection:
+                try:
+                    self._conn.close()
+                except sqlite3.Error:
+                    pass
+
+
+    def _init_schema(self) -> None:
+        with self._lock:
+            self._conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS binance_testnet_operator_actions (
+                    action_id TEXT PRIMARY KEY,
+                    action TEXT NOT NULL,
+                    environment TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    probe_kind TEXT NOT NULL,
+                    attempted_at TEXT NOT NULL,
+                    completed_at TEXT NOT NULL,
+                    timestamp_utc TEXT NOT NULL,
+                    timestamp_pht TEXT NOT NULL,
+                    success INTEGER NOT NULL,
+                    reason TEXT NOT NULL DEFAULT '',
+                    payload_json TEXT NOT NULL,
+                    result_json TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_binance_testnet_operator_actions_time
+                    ON binance_testnet_operator_actions(timestamp_utc, action_id);
+                """
+            )
+            columns = {
+                str(row[1])
+                for row in self._conn.execute(
+                    "PRAGMA table_info(binance_testnet_operator_actions)"
+                ).fetchall()
+            }
+            for name, definition in (
+                ("environment", "TEXT NOT NULL DEFAULT 'BINANCE_SPOT_TESTNET'"),
+                ("source", "TEXT NOT NULL DEFAULT 'binance_testnet_operator'"),
+                ("probe_kind", "TEXT NOT NULL DEFAULT 'TESTNET EXECUTION PROBE'"),
+            ):
+                if name not in columns:
+                    self._conn.execute(
+                        f"ALTER TABLE binance_testnet_operator_actions ADD COLUMN {name} {definition}"
+                    )
+            self._conn.commit()
+
+    def _now(self) -> datetime:
+        try:
+            return _utc(self.clock())
+        except Exception:
+            return datetime.now(UTC)
+
+    @staticmethod
+    def _status_value(value: Any, default: str = "BLOCKED") -> str:
+        if isinstance(value, Mapping):
+            value = value.get("status", default)
+        text = str(getattr(value, "value", value) or default).upper()
+        return text[:64]
+
+    def _safe_call(self, method: Any, payload: Mapping[str, Any] | None = None) -> Any:
+        if not callable(method):
+            raise BinanceOperatorError("ACTION_UNAVAILABLE")
+        body = dict(payload or {})
+        if not body:
+            return method()
+        try:
+            signature = inspect.signature(method)
+        except (TypeError, ValueError):
+            signature = None
+        if signature is not None and not any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in signature.parameters.values()
+        ):
+            body = {key: value for key, value in body.items() if key in signature.parameters}
+        try:
+            return method(**body)
+        except TypeError as first:
+            try:
+                return method(body)
+            except TypeError:
+                raise first
+
+    def _gate_projection(self, name: str, fallback: Mapping[str, Any]) -> dict[str, Any]:
+        method = getattr(self.gate, name, None)
+        if not callable(method):
+            return dict(fallback)
+        try:
+            return _as_mapping(method())
+        except Exception as exc:
+            return {
+                "status": "BLOCKED",
+                "reason": f"{name.upper()}_UNAVAILABLE",
+                "error": type(exc).__name__,
+            }
+
+    def _profile_projection(self) -> dict[str, Any]:
+        profile = getattr(self.gate, "profile", None)
+        try:
+            method = getattr(profile, "projection", None)
+            value = method() if callable(method) else profile
+        except Exception:
+            value = {}
+        projected = _as_mapping(value)
+        projected["environment"] = self.environment
+        projected.setdefault("host", "127.0.0.1")
+        projected.setdefault("port", 8082)
+        projected.setdefault("runtime_identity", "binance-testnet")
+        projected.setdefault("feature_instance", "binance-testnet")
+        projected.setdefault("identity", "binance-testnet")
+        projected.setdefault("db_path", "runtime-data/binance-testnet.sqlite")
+        projected.setdefault("transport", "binance_spot_testnet")
+        return projected
+
+    def _credential_projection(self) -> dict[str, Any]:
+        method = getattr(self.gate, "_credential_projection", None)
+        raw: Mapping[str, Any] = {}
+        if callable(method):
+            try:
+                candidate = method()
+                raw = candidate if isinstance(candidate, Mapping) else {}
+            except Exception:
+                raw = {}
+        configured = bool(raw.get("configured"))
+        if not configured:
+            credentials = getattr(self.gate, "credentials", None)
+            configured = _explicit_credentials_configured(credentials)
+        return {
+            "configured": configured,
+            "api_key_configured": configured,
+            "api_secret_configured": configured,
+            "secret_values_exposed": False,
+        }
+
+    def _strategy_status(self) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for label, component in (("execution", self.execution), ("worker", self.worker)):
+            # An execution coordinator is not autonomous state unless the
+            # worker explicitly supports persisted strategy hydration and can
+            # execute a cycle; keep execution-only runtimes blocked.
+            if component is None or (label == "execution" and self._strategy_target() is None):
+                continue
+            method = getattr(component, "status", None) or getattr(component, "control", None)
+            if not callable(method):
+                continue
+            try:
+                state = _as_mapping(method())
+            except Exception as exc:
+                state = {"status": "ERROR", "error": type(exc).__name__}
+            result[label] = state
+        if "execution" in result:
+            merged = dict(result["execution"])
+            if "worker" in result:
+                merged["worker"] = result["worker"]
+            return merged
+        if "worker" in result:
+            return dict(result["worker"])
+        return {}
+
+    def _strategy_target(self) -> Any | None:
+        """Return the control target only for an executable persisted-strategy worker.
+
+        A configured ``strategy`` attribute is not an execution capability:
+        production workers hydrate the exact strategy/binding from the frozen
+        qualification row at cycle time.  The worker therefore has to
+        explicitly advertise that persisted-strategy path and expose a cycle
+        entry point.  This also keeps an execution-only or arbitrary injected
+        transport blocked.
+        """
+        worker = self.worker
+        if worker is None:
+            return None
+        capability = getattr(worker, "supports_persisted_strategy", None)
+        cycle = getattr(worker, "cycle", None)
+        if not callable(capability) or not callable(cycle):
+            return None
+        try:
+            if capability() is not True:
+                return None
+        except Exception:
+            return None
+        return self.execution if self.execution is not None else worker
+
+    def _strategy_method(self, name: str) -> Any:
+        for component in (self.execution, self.worker):
+            method = getattr(component, name, None) if component is not None else None
+            if callable(method):
+                return method
+        return None
+
+    def _strategy_evidence(self, strategy: Mapping[str, Any]) -> dict[str, Any]:
+        def first_mapping(*keys: str) -> dict[str, Any] | None:
+            for key in keys:
+                value = strategy.get(key)
+                if isinstance(value, Mapping):
+                    return _summary_record(value)
+            return None
+
+        selected = first_mapping("selected_candidate", "selection", "candidate")
+        signal = first_mapping("current_signal", "latest_signal", "signal")
+        reason = strategy.get("no_trade_reason") or strategy.get("reason")
+        return {
+            "selected_candidate": selected,
+            "current_signal": signal,
+            "no_trade_reason": str(reason)[:256] if reason is not None else None,
+        }
+
+    def _autonomous_projection(
+        self,
+        strategy: Mapping[str, Any],
+        connectivity: Mapping[str, Any],
+        validation: Mapping[str, Any],
+        gate_projection: Mapping[str, Any],
+        credentials: Mapping[str, Any],
+        evidence: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        target_present = self._strategy_target() is not None
+        raw_state = str(strategy.get("state") or strategy.get("control_state") or strategy.get("status") or "").upper()
+        enabled = bool(strategy.get("enabled")) or raw_state in {"ARMED", "ENABLED", "RUNNING"}
+
+        # Autonomous control must report the earliest actionable safety gate.
+        # In particular, a missing credential configuration is actionable even
+        # when no optional strategy component was injected.
+        if not bool(credentials.get("configured")):
+            state, blocked, enabled = "BLOCKED", "CREDENTIALS_NOT_CONFIGURED", False
+        elif self._status_value(connectivity) != "PASS":
+            state, blocked, enabled = "BLOCKED", "CONNECTIVITY_NOT_PASS", False
+        elif self._status_value(validation) != "PASS":
+            state, blocked, enabled = "BLOCKED", "VALIDATION_NOT_PASS", False
+        elif not target_present:
+            state, blocked, enabled = "BLOCKED", "STRATEGY_NOT_CONFIGURED", False
+        else:
+            state = raw_state or ("ENABLED" if enabled else "DISABLED")
+            blocked = None
+            if not enabled:
+                blocked = evidence["no_trade_reason"] or strategy.get("blocked_reason")
+        risk = strategy.get("risk_envelope")
+        if not isinstance(risk, Mapping):
+            risk = gate_projection.get("risk_envelope")
+        if not isinstance(risk, Mapping):
+            risk = {}
+        bounded = strategy.get("bounded_window")
+        if not isinstance(bounded, Mapping):
+            bounded = self._autonomous_window
+        return {
+            "enabled": enabled,
+            "state": state,
+            "blocked_reason": str(blocked)[:256] if blocked else None,
+            **evidence,
+            "risk_envelope": _as_mapping(risk),
+            "bounded_window": _as_mapping(bounded) if isinstance(bounded, Mapping) else bounded,
+        }
+
+    def status(self) -> dict[str, Any]:
+        """Return only persisted/projection state; never initiate gate I/O."""
+        with self._lock:
+            connectivity = self._gate_projection(
+                "connectivity_status",
+                {"status": "BLOCKED", "reason": "NOT_CHECKED"},
+            )
+            validation = self._gate_projection(
+                "validation_status",
+                {"status": "BLOCKED", "reason": "NOT_CHECKED"},
+            )
+            probe = self._gate_projection(
+                "probe_status",
+                {"status": "BLOCKED", "reason": "NOT_STARTED"},
+            )
+            credentials = self._credential_projection()
+            strategy = self._strategy_status()
+            evidence = self._strategy_evidence(strategy)
+            # The status path intentionally reads no gate dashboard helper:
+            # projection helpers are duck-typed and may be implemented by an
+            # embedding runtime.  Only the three persisted, read-only gate
+            # status methods above are allowed here.
+            gate_projection: dict[str, Any] = {}
+            envelope = getattr(self.gate, "risk_envelope", None) or DEFAULT_BINANCE_RISK_ENVELOPE
+            if envelope is not None:
+                try:
+                    gate_projection["risk_envelope"] = (
+                        _as_mapping(envelope.as_dict())
+                        if callable(getattr(envelope, "as_dict", None))
+                        else _as_mapping(envelope)
+                    )
+                except Exception:
+                    pass
+            profile = self._profile_projection()
+            result = {
+                "title": "BINANCE SPOT TESTNET",
+                "strict_testnet": True,
+                "environment": self.environment,
+                "source": self.source,
+                "probe_kind": self.probe_kind,
+                "timestamp": _timestamp_projection(self._now()),
+                "profile": profile,
+                "credentials": credentials,
+                "connectivity": connectivity,
+                "validation": validation,
+                "probe": probe,
+                "isolation": {
+                    "schema_namespace": "binance_testnet_*",
+                    "operator_action_table": self.action_table,
+                    "strategy_ledgers_touched": False,
+                    "probe_separate_from_strategy": True,
+                    "polymarket_transport": "DISABLED",
+                },
+                "strategy_evidence": evidence,
+                "autonomous": self._autonomous_projection(
+                    strategy, connectivity, validation, gate_projection, credentials, evidence
+                ),
+                "actions": self.list_actions(limit=5),
+            }
+            # Preserve safe gate-level fields (notably risk permissions) without
+            # allowing gate probe data to become strategy evidence.
+            for key in ("risk_envelope", "permissions"):
+                if key in gate_projection:
+                    result[key] = _jsonable(gate_projection[key])
+            return _as_mapping(result)
+
+
+    def snapshot(self, **kwargs: Any) -> dict[str, Any]:
+        size = kwargs.get("page_size", DEFAULT_PAGE_SIZE)
+        try:
+            size = max(1, min(int(size), MAX_PAGE_SIZE))
+        except (TypeError, ValueError):
+            size = DEFAULT_PAGE_SIZE
+        result = self.status()
+        result["strict_testnet"] = True
+        result["page_size"] = size
+        result["actions"] = self.list_actions(limit=size)
+        if "action" in kwargs:
+            result["action"] = kwargs["action"]
+        return result
+
+    def _validate_request(self, action: str, payload: Mapping[str, Any]) -> None:
+        if action not in self.action_names:
+            raise BinanceOperatorError("ACTION_NOT_ALLOWED")
+        if _contains_secret_shape(payload):
+            raise BinanceOperatorError("SECRET_PAYLOAD_REJECTED")
+        if _contains_forbidden_transport(payload) or _contains_forbidden_transport(action):
+            raise BinanceOperatorError("TRANSPORT_NOT_ALLOWED")
+        encoded = json.dumps(_jsonable(payload), ensure_ascii=False).lower()
+        if "/sapi" in encoded or "mainnet" in encoded or "api.binance.com" in encoded:
+            raise BinanceOperatorError("TESTNET_TRANSPORT_ONLY")
+
+    def _require_phrase(self, payload: Mapping[str, Any], phrase: str) -> None:
+        confirmation = payload.get("confirmation", payload.get("confirm"))
+        if confirmation != phrase:
+            raise BinanceOperatorError("EXACT_CONFIRMATION_REQUIRED")
+
+    def _deadline_checkpoint(self, deadline_monotonic: float | None) -> None:
+        if deadline_monotonic is None:
+            return
+        try:
+            expired = self.monotonic_clock() >= float(deadline_monotonic)
+        except Exception:
+            expired = True
+        if expired:
+            raise BinanceOperatorError("AUTO_DEADLINE_EXPIRED")
+
+    def authorize_bounded_auto(
+        self,
+        confirmation: str,
+        window_seconds: int,
+        *,
+        deadline_monotonic: float | None = None,
+    ) -> dict[str, Any]:
+        """Authorize one bounded autonomous run for the CLI runtime only."""
+        with self._lock:
+            # All checks happen before the first durable execution mutation.
+            self._deadline_checkpoint(deadline_monotonic)
+            if confirmation != ENABLE_TESTNET_CONFIRMATION:
+                raise BinanceOperatorError("EXACT_CONFIRMATION_REQUIRED")
+            if (
+                not isinstance(window_seconds, int)
+                or isinstance(window_seconds, bool)
+                or not 30 <= window_seconds <= 900
+            ):
+                raise BinanceOperatorError("BOUNDED_WINDOW_REQUIRED")
+            credentials = self._credential_projection()
+            self._deadline_checkpoint(deadline_monotonic)
+            if not bool(credentials.get("configured")):
+                raise BinanceOperatorError("CREDENTIALS_NOT_CONFIGURED")
+            if self._strategy_target() is None:
+                raise BinanceOperatorError("STRATEGY_NOT_CONFIGURED")
+            self._deadline_checkpoint(deadline_monotonic)
+            connectivity = self._gate_projection("connectivity_status", {})
+            self._deadline_checkpoint(deadline_monotonic)
+            validation = self._gate_projection("validation_status", {})
+            self._deadline_checkpoint(deadline_monotonic)
+            if self._status_value(connectivity) != "PASS":
+                raise BinanceOperatorError("CONNECTIVITY_NOT_PASS")
+            if self._status_value(validation) != "PASS":
+                raise BinanceOperatorError("VALIDATION_NOT_PASS")
+            method = (
+                self._strategy_method("enable_auto_canary")
+                or self._strategy_method("enable")
+                or self._strategy_method("start")
+            )
+            if method is None:
+                raise BinanceOperatorError("ENABLE_UNAVAILABLE")
+            # This is the durable mutation boundary.  Do not invoke the
+            # strategy once the absolute deadline has elapsed.
+            self._deadline_checkpoint(deadline_monotonic)
+            result = _as_mapping(
+                self._safe_call(
+                    method,
+                    {
+                        "confirmation": ENABLE_TESTNET_CONFIRMATION,
+                        "deadline_monotonic": deadline_monotonic,
+                    },
+                )
+            )
+            self._autonomous_window = {"seconds": window_seconds, "bounded": True}
+            return {"control": result, "autonomous": self._autonomous_window}
+
+    def _execute(self, action: str, payload: Mapping[str, Any]) -> dict[str, Any]:
+        self._validate_request(action, payload)
+        # ENABLE and RESUME are deliberately not API actions.  Both could arm
+        # a strategy without a bounded execution window; only runtime.auto()
+        # may call authorize_bounded_auto() after taking the profile lock.
+        if action in {"ENABLE", "RESUME"}:
+            raise BinanceOperatorError("BOUNDED_AUTO_REQUIRES_CLI")
+        if action == "CONNECTIVITY_CHECK":
+            return _as_mapping(
+                self._safe_call(getattr(self.gate, "check_connectivity", None))
+            )
+        if action == "ORDER_VALIDATION_TEST":
+            symbol = payload.get("symbol")
+            body = {"symbol": symbol} if symbol else {}
+            return _as_mapping(
+                self._safe_call(getattr(self.gate, "validate_order", None), body)
+            )
+        if action == "EXECUTION_PROBE":
+            self._require_phrase(payload, TESTNET_PROBE_CONFIRMATION)
+            symbol = payload.get("symbol")
+            body = {"symbol": symbol} if symbol else {}
+            return _as_mapping(
+                self._safe_call(getattr(self.gate, "execute_probe", None), body)
+            )
+        if action == "RECONCILE_PROBE":
+            return _as_mapping(
+                self._safe_call(getattr(self.gate, "reconcile_probe", None))
+            )
+        if action in {"PAUSE", "DISARM", "KILL"}:
+            if self._strategy_target() is None:
+                raise BinanceOperatorError("STRATEGY_NOT_CONFIGURED")
+            method = self._strategy_method(action.lower())
+            if method is None:
+                raise BinanceOperatorError(action + "_UNAVAILABLE")
+            result = _as_mapping(
+                self._safe_call(method, {"reason": str(payload.get("reason") or f"operator {action.lower()}")})
+            )
+            return {"control": result}
+        raise BinanceOperatorError("ACTION_NOT_ALLOWED")
+
+    def _persist_action(
+        self,
+        action: str,
+        payload: Mapping[str, Any],
+        *,
+        attempted: datetime,
+        completed: datetime,
+        success: bool,
+        reason: str,
+        result: Mapping[str, Any],
+    ) -> str:
+        action_id = uuid.uuid4().hex
+        attempted_projection = _timestamp_projection(attempted)
+        completed_projection = _timestamp_projection(completed)
+        encoded_payload = json.dumps(
+            _jsonable(payload), sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
+        )
+        encoded_result = json.dumps(
+            _jsonable(result), sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
+        )
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO binance_testnet_operator_actions(action_id,action,environment,source,probe_kind,attempted_at,completed_at,timestamp_utc,timestamp_pht,success,reason,payload_json,result_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    action_id,
+                    action,
+                    self.environment,
+                    self.source,
+                    self.probe_kind,
+                    attempted_projection["utc"],
+                    completed_projection["utc"],
+                    completed_projection["utc"],
+                    completed_projection["pht"],
+                    int(bool(success)),
+                    str(reason or "")[:256],
+                    encoded_payload,
+                    encoded_result,
+                ),
+            )
+            self._conn.execute(
+                "DELETE FROM binance_testnet_operator_actions WHERE rowid NOT IN (SELECT rowid FROM binance_testnet_operator_actions ORDER BY timestamp_utc DESC,action_id DESC LIMIT ?)",
+                (self.max_history,),
+            )
+            self._conn.commit()
+        return action_id
+
+    def action(self, action: str, payload: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        with self._lock:
+            return self._action_unlocked(action, payload)
+
+    def _action_unlocked(self, action: str, payload: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        action_value = str(action or "").strip().upper()
+        body = dict(payload or {}) if isinstance(payload or {}, Mapping) else {}
+        attempted = self._now()
+        success = False
+        reason = ""
+        result: dict[str, Any] = {}
+        try:
+            result = _as_mapping(self._execute(action_value, body))
+            success = True
+        except BinanceOperatorError as exc:
+            reason = exc.reason
+        except PermissionError as exc:
+            reason = str(exc).upper().replace(" ", "_")[:256] or "PERMISSION_DENIED"
+        except Exception as exc:
+            reason = type(exc).__name__.upper()
+        completed = self._now()
+        stamp = _timestamp_projection(completed)
+        response: dict[str, Any] = {
+            "ok": success,
+            "action": action_value,
+            "environment": self.environment,
+            "source": self.source,
+            "probe_kind": self.probe_kind,
+            "attempted_at": _timestamp_projection(attempted),
+            "completed_at": _timestamp_projection(completed),
+            "timestamp": stamp,
+            "timestamp_utc": stamp["utc"],
+            "timestamp_pht": stamp["pht"],
+        }
+        if success:
+            response["result"] = result
+        else:
+            response["reason"] = reason or "ACTION_FAILED"
+        try:
+            response["action_id"] = self._persist_action(
+                action_value or "INVALID",
+                body,
+                attempted=attempted,
+                completed=completed,
+                success=success,
+                reason=reason,
+                result=response,
+            )
+        except Exception as exc:
+            response["ok"] = False
+            response["reason"] = "ACTION_AUDIT_FAILED"
+            response["audit_error"] = type(exc).__name__
+        return _as_mapping(response)
+
+    execute = action
+
+    def list_actions(self, *, limit: int = DEFAULT_PAGE_SIZE) -> list[dict[str, Any]]:
+        try:
+            bounded = max(0, min(int(limit), MAX_PAGE_SIZE))
+        except (TypeError, ValueError):
+            bounded = DEFAULT_PAGE_SIZE
+        try:
+            rows = self._conn.execute(
+                "SELECT * FROM binance_testnet_operator_actions ORDER BY timestamp_utc DESC,action_id DESC LIMIT ?",
+                (bounded,),
+            ).fetchall()
+        except Exception:
+            return []
+        return [_as_mapping(dict(row)) for row in rows]
 
 __all__ = [
     "ACTION_NAMES",
-    "EXACT_ENABLE_PHRASE",
+    "TESTNET_ACTION_NAMES",
+    "TESTNET_PROBE_CONFIRMATION",
+    "EXACT_PROBE_PHRASE",
+    "EXACT_TESTNET_PROBE_PHRASE",
+    "EXACT_EXECUTION_PROBE_PHRASE",
+    "TESTNET_EXECUTION_PROBE_CONFIRMATION",
+    "EXACT_TESTNET_ENABLE_PHRASE",
     "BinanceCanaryControlPlane",
+    "BinanceTestnetControlPlane",
     "BinanceOperatorError",
 ]
