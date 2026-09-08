@@ -14,7 +14,12 @@ from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import urlopen
 
-from axiom.canary import AUTONOMOUS_MICRO_LIVE, CanaryBlocked, CanaryService
+from axiom.canary import (
+    AUTONOMOUS_MICRO_LIVE,
+    CanaryBlocked,
+    CanaryService,
+    CredentialStore,
+)
 from axiom.dashboard import DashboardData, DashboardServer
 from axiom.operator import CANARY_CONNECTIVITY_CONFIG_KEY, OperatorControlPlane
 from axiom.ranker import CandidateCanaryRanker
@@ -45,6 +50,21 @@ class _NeverUsedVenue:
 
     def submit_limit_order(self, **_kwargs):
         raise AssertionError("execution venue must not be used after failed validation")
+
+
+class _ExplodingNetworkProvider:
+    """A provider fake that makes any dashboard network access observable."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def markets(self, **_kwargs: object) -> list[object]:
+        self.calls.append("markets")
+        raise AssertionError("dashboard GET unexpectedly called a provider")
+
+    def ticker(self, *_args: object, **_kwargs: object) -> object:
+        self.calls.append("ticker")
+        raise AssertionError("dashboard GET unexpectedly called a provider")
 
 
 class DashboardReadLatencyFixture(unittest.TestCase):
@@ -703,6 +723,45 @@ class DashboardReadLatencyFixture(unittest.TestCase):
         self.assertIsInstance(payload, dict)
         self.assertLess(elapsed, 1.0)
 
+    def test_dashboard_gets_use_persisted_state_without_provider_or_network(self) -> None:
+        provider = _ExplodingNetworkProvider()
+        reader = AxiomStore(str(self.database_path))
+        self.addCleanup(reader.close)
+        server = DashboardServer(
+            port=0,
+            data=DashboardData(
+                store=reader,
+                prediction_provider=provider,
+                crypto_provider=provider,
+            ),
+        ).start()
+        self.addCleanup(server.stop)
+
+        persisted_summary = reader.dashboard_summary()
+        for endpoint, params in (
+            ("api/crypto", {}),
+            ("api/prediction", {}),
+            ("api/v2/overview-summary", {}),
+            ("api/v2/canary", {}),
+            ("api/v2/polymarket", {"page": 1, "page_size": 10}),
+            ("api/v2/candidates", {"page": 1, "page_size": 10}),
+        ):
+            with self.subTest(endpoint=endpoint):
+                status, payload, _body = self._request(server, endpoint, **params)
+                self.assertEqual(status, 200)
+                self.assertIsInstance(payload, dict)
+                assert isinstance(payload, dict)
+                if endpoint == "api/crypto":
+                    self.assertEqual(payload["provider"], "persisted")
+                    self.assertEqual(payload["bars"], persisted_summary["bars"])
+                    self.assertEqual(payload["datasets"], persisted_summary["datasets"])
+                    self.assertLessEqual(len(payload["symbols"]), 32)
+                elif endpoint == "api/prediction":
+                    self.assertEqual(payload["provider"], "persisted")
+                    self.assertEqual(payload["source_type"], "FORWARD_COLLECTED")
+                    self.assertLessEqual(len(payload["markets"]), 1000)
+        self.assertEqual(provider.calls, [])
+
     def test_dashboard_responses_never_expose_secret_values(self) -> None:
         responses: list[str] = []
         for endpoint in ("api/v2/overview-summary", "api/v2/canary", "api/operator"):
@@ -712,6 +771,40 @@ class DashboardReadLatencyFixture(unittest.TestCase):
         encoded = "\n".join(responses)
         for secret in SECRET_VALUES:
             self.assertNotIn(secret, encoded)
+
+    def test_canary_gets_do_not_probe_empty_credential_cache(self) -> None:
+        class ExplodingKeyring:
+            @staticmethod
+            def get_password(*_args: object, **_kwargs: object) -> str:
+                raise AssertionError("dashboard GET touched keyring")
+
+        class ExplodingCredentialStore(CredentialStore):
+            def configured(self, **_kwargs: object) -> bool:
+                raise AssertionError("dashboard GET checked credentials")
+
+            def load(self, **_kwargs: object) -> dict[str, str]:
+                raise AssertionError("dashboard GET loaded credentials")
+
+        with patch.dict("sys.modules", {"keyring": ExplodingKeyring}):
+            with patch(
+                "axiom.dashboard.canary_module.CredentialStore",
+                ExplodingCredentialStore,
+            ), patch(
+                "axiom.operator.CredentialStore",
+                ExplodingCredentialStore,
+            ):
+                for endpoint in ("api/v2/canary", "api/operator"):
+                    with self.subTest(endpoint=endpoint):
+                        status, payload, _body = self._request(
+                            self.server, endpoint
+                        )
+                        self.assertEqual(status, 200)
+                        self.assertIsInstance(payload, dict)
+                        assert isinstance(payload, dict)
+                        credentials = payload["credentials"]
+                        self.assertIsNone(credentials["configured"])
+                        self.assertEqual(credentials["status"], "NOT CHECKED")
+                        self.assertFalse(credentials["secret_values_exposed"])
 
 if __name__ == "__main__":
     unittest.main()

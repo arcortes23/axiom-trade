@@ -13,6 +13,7 @@ import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
+import axiom.canary as canary_module
 
 from axiom.lifecycle import CandidateLifecycleManager, CandidateStage
 from axiom.auto_canary import AutonomousCanaryWorker
@@ -37,6 +38,12 @@ T0=datetime(2026,1,2,12,tzinfo=timezone.utc)
 class HealthyStore(AxiomStore):
     def polymarket_health(self, **kwargs):
         return {"grade":"A","errors":0}
+class BlockedRequiredHealthStore(HealthyStore):
+    def polymarket_required_health(self, **kwargs):
+        result = super().polymarket_required_health(**kwargs)
+        result.update({"grade": "C", "reason_code": "REQUIRED_MARKETS_STALE"})
+        return result
+
 
 class FakeCredentials(CredentialStore):
     def __init__(self, configured=True): self.value=configured
@@ -1428,7 +1435,7 @@ class CanaryTests(unittest.TestCase):
         self.assertEqual(status["eligible_count"], 1)
         with patch.object(
             CredentialStore,
-            "safe_projection",
+            "cached_projection",
             return_value={
                 "configured": False,
                 "status": "NOT CONFIGURED",
@@ -1454,7 +1461,7 @@ class CanaryTests(unittest.TestCase):
         self.assertEqual(stale["eligible_count"], 1)
         with patch.object(
             CredentialStore,
-            "safe_projection",
+            "cached_projection",
             return_value={
                 "configured": False,
                 "status": "NOT CONFIGURED",
@@ -1950,15 +1957,33 @@ class CanaryTests(unittest.TestCase):
 
         checked: list[str] = []
 
-        def signal(candidate_id):
+        def evaluate_signal(candidate_id, *, cycle_id=None):
             checked.append(candidate_id)
             if candidate_id == "scan-candidate-1001":
-                return {
+                signal = {
                     "status": "READY",
                     "signal_id": "scan-signal-1001",
                     "candidate_id": candidate_id,
                 }
-            return None
+                return {
+                    "candidate_id": candidate_id,
+                    "evaluated_at": T0.isoformat(),
+                    "reason_code": "READY_SIGNAL",
+                    "market_id": "scan-market-1001",
+                    "signal": signal,
+                    "required_health": {"grade": "A"},
+                    "evidence": {"cycle_id": cycle_id},
+                }
+            return {
+                "candidate_id": candidate_id,
+                "evaluated_at": T0.isoformat(),
+                "reason_code": "NO_STRATEGY_SIGNAL",
+                "market_id": None,
+                "signal": None,
+                "required_health": {"grade": "A"},
+                "evidence": {"cycle_id": cycle_id},
+            }
+
 
         worker = AutonomousCanaryWorker(self.store, clock=lambda: T0)
         ranking = {
@@ -1980,8 +2005,8 @@ class CanaryTests(unittest.TestCase):
             return_value=scan_rows,
         ), patch.object(
             CanaryService,
-            "generate_signal",
-            side_effect=signal,
+            "evaluate_signal",
+            side_effect=evaluate_signal,
         ), patch.object(
             CredentialStore,
             "configured",
@@ -2222,10 +2247,21 @@ class CanarySignalTests(unittest.TestCase):
     def tearDown(self):
         self.store.close()
 
-    def _add_candidate(self, candidate_id):
-        strategy = {**self.strategy, "strategy_id": candidate_id}
+    def _add_candidate(
+        self,
+        candidate_id,
+        *,
+        market_ids=("m",),
+        frozen_filters=None,
+        strategy=None,
+        model=None,
+        dataset_market_ids=(),
+        experiment_plan=None,
+    ):
+        strategy = {**(strategy or self.strategy), "strategy_id": candidate_id}
+        model = dict(model or self.model)
         strategy_hash = self.service._document_hash(strategy)
-        model_hash = self.service._document_hash(self.model)
+        model_hash = self.service._document_hash(model)
         config_hash = "config-hash"
         payload = {
             "market_type": "prediction",
@@ -2237,6 +2273,11 @@ class CanarySignalTests(unittest.TestCase):
                 "dataset_version": "v1",
                 "source_type": "HISTORICAL",
                 "time_split": "train-validation-holdout",
+                **(
+                    {"historical_market_ids": list(dataset_market_ids)}
+                    if dataset_market_ids
+                    else {}
+                ),
             },
             "schema_validated": True,
             "historical_backtest_passed": True,
@@ -2265,8 +2306,13 @@ class CanarySignalTests(unittest.TestCase):
                 "|".join((strategy_hash, model_hash, config_hash)).encode()
             ).hexdigest(),
             "strategy_document": strategy,
-            "model_document": self.model,
+            "model_document": model,
+            "market_ids": list(market_ids),
         }
+        if frozen_filters:
+            payload["frozen_filters"] = dict(frozen_filters)
+        if experiment_plan is not None:
+            payload["experiment_plan"] = dict(experiment_plan)
         self.store.save_candidate_lifecycle(
             candidate_id, "IDEA", payload, timestamp=T0
         )
@@ -2279,44 +2325,59 @@ class CanarySignalTests(unittest.TestCase):
         self,
         snapshot_id,
         *,
+        market_id="m",
         active=True,
+        closed=None,
         price="0.50",
         settlement="open",
+        source_timestamp=None,
+        observed_at=None,
+        category=None,
+        feature_probability=None,
     ):
+        source_timestamp = source_timestamp or T0
+        observed_at = observed_at or self.now
+        metadata = {"category": category} if category is not None else {}
+        nested = {
+            "market_id": market_id,
+            "timestamp": source_timestamp.isoformat(),
+            "yes_mid": price,
+            "yes_ask": price,
+            "yes_order_book": {
+                "asks": [{"price": price, "size": "100"}],
+                "bids": [],
+                "timestamp": source_timestamp.isoformat(),
+                "token_id": "yes",
+            },
+            "no_order_book": {
+                "asks": [{"price": price, "size": "100"}],
+                "bids": [],
+                "timestamp": source_timestamp.isoformat(),
+                "token_id": "no",
+            },
+            "no_ask": price,
+            "yes_token_id": "yes",
+            "no_token_id": "no",
+            "settlement": settlement,
+        }
+        if feature_probability is not None:
+            nested["feature_probability"] = feature_probability
         payload = {
             "source_type": "FORWARD_COLLECTED",
-            "snapshot": {
-                "market_id": "m",
-                "timestamp": T0.isoformat(),
-                "yes_mid": price,
-                "yes_ask": price,
-                "yes_order_book": {
-                    "asks": [{"price": price, "size": "100"}],
-                    "bids": [],
-                    "timestamp": T0.isoformat(),
-                    "token_id": "yes",
-                },
-                "no_order_book": {
-                    "asks": [{"price": price, "size": "100"}],
-                    "bids": [],
-                    "timestamp": T0.isoformat(),
-                    "token_id": "no",
-                },
-                "no_ask": price,
-                "yes_token_id": "yes",
-                "no_token_id": "no",
-                "settlement": settlement,
-            },
+            "snapshot": nested,
             "yes_token_id": "yes",
             "no_token_id": "no",
             "settlement": settlement,
             "active": active,
+            "metadata": metadata,
         }
+        if closed is not None:
+            payload["closed"] = closed
         self.store.save_polymarket_snapshot(
             snapshot_id,
-            "m",
-            T0,
-            self.now,
+            market_id,
+            source_timestamp,
+            observed_at,
             payload,
             source_type="FORWARD_COLLECTED",
         )
@@ -2326,6 +2387,832 @@ class CanarySignalTests(unittest.TestCase):
         self.assertIsNotNone(signal)
         assert signal is not None
         return signal
+    def _save_metadata(
+        self,
+        market_id,
+        *,
+        active=True,
+        closed=False,
+        settlement="open",
+        category=None,
+        observed_at=None,
+    ):
+        metadata = {
+            "source_type": "FORWARD_COLLECTED",
+            "active": active,
+            "closed": closed,
+            "metadata": {"category": category} if category is not None else {},
+            "snapshot": {
+                "market_id": market_id,
+                "settlement": settlement,
+                "expiry": (T0 + timedelta(days=1)).isoformat(),
+            },
+        }
+        self.store.save_polymarket_market_metadata(
+            market_id,
+            metadata,
+            observed_at=observed_at or self.now,
+            source_type="FORWARD_COLLECTED",
+        )
+
+    def _assert_evaluation(
+        self,
+        candidate_id,
+        reason_code,
+        *,
+        market_id=None,
+        cycle_id=None,
+        expect_signal=False,
+        assert_market_id=False,
+    ):
+        cycle_id = cycle_id or f"cycle-{candidate_id}"
+        result = self.service.evaluate_signal(candidate_id, cycle_id=cycle_id)
+        for field in (
+            "candidate_id",
+            "evaluated_at",
+            "reason_code",
+            "market_id",
+            "signal",
+            "required_health",
+            "evidence",
+        ):
+            self.assertIn(field, result)
+        self.assertEqual(result["candidate_id"], candidate_id)
+        self.assertEqual(result["reason_code"], reason_code)
+        if assert_market_id:
+            self.assertEqual(result["market_id"], market_id)
+        if expect_signal:
+            self.assertIsInstance(result["signal"], dict)
+        else:
+            self.assertIsNone(result["signal"])
+        self.assertIsInstance(result["required_health"], dict)
+        self.assertIsInstance(result["evidence"], dict)
+        row = self.store.connection.execute(
+            "SELECT reason_code, market_id, signal_json, required_health_json, evidence_json "
+            "FROM canary_signal_evaluations "
+            "WHERE candidate_id=? AND cycle_id=? ORDER BY evaluated_at DESC LIMIT 1",
+            (candidate_id, cycle_id),
+        ).fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row["reason_code"], reason_code)
+        self.assertEqual(row["market_id"], result["market_id"])
+        persisted_signal = (
+            json.loads(row["signal_json"]) if row["signal_json"] is not None else None
+        )
+        self.assertEqual(persisted_signal, result["signal"])
+        self.assertEqual(json.loads(row["required_health_json"]), result["required_health"])
+        self.assertEqual(json.loads(row["evidence_json"]), result["evidence"])
+        listed = self.service.list_signal_evaluations(
+            candidate_id=candidate_id, cycle_id=cycle_id, limit=10
+        )
+        self.assertEqual(len(listed), 1)
+        self.assertEqual(listed[0]["reason_code"], reason_code)
+        return result
+
+    def test_evaluate_signal_ready_persists_exact_fresh_evidence_and_wrapper_is_compatible(self):
+        result = self.service.evaluate_signal("C", cycle_id="ready-cycle")
+        self.assertEqual(result["reason_code"], "READY_SIGNAL")
+        self.assertEqual(result["candidate_id"], "C")
+        self.assertEqual(result["market_id"], "m")
+        self.assertIsInstance(result["signal"], dict)
+        self.assertEqual(result["signal"]["status"], "READY")
+        self.assertEqual(result["required_health"]["grade"], "A")
+        self.assertEqual(
+            result["evidence"]["current_execution_evidence"],
+            "CURRENT_ORDER_BOOK",
+        )
+        self.assertEqual(self.service.generate_signal("C"), result["signal"])
+        rows = self.service.list_signal_evaluations(candidate_id="C", limit=10)
+        self.assertGreaterEqual(len(rows), 2)
+        self.assertEqual(rows[0]["candidate_id"], "C")
+
+    def test_no_strategy_signal_is_a_persisted_non_actionable_outcome(self):
+        self._add_candidate(
+            "no-strategy",
+            market_ids=("no-strategy-market",),
+            model={"probability": 0.50},
+        )
+        self._save_snapshot(
+            "no-strategy-snapshot",
+            market_id="no-strategy-market",
+            price="0.50",
+        )
+        self._assert_evaluation(
+            "no-strategy",
+            "NO_STRATEGY_SIGNAL",
+            market_id="no-strategy-market",
+            assert_market_id=True,
+        )
+
+    def test_missing_forward_snapshot_is_distinct_from_unresolved_authority(self):
+        self._add_candidate(
+            "missing-forward",
+            market_ids=("missing-forward-market",),
+        )
+        self._save_metadata("missing-forward-market")
+        self._assert_evaluation(
+            "missing-forward",
+            "NO_FORWARD_SNAPSHOT",
+            market_id="missing-forward-market",
+        )
+
+    def test_stale_forward_evidence_is_rejected_even_when_market_is_authorized(self):
+        stale = T0 - timedelta(seconds=61)
+        self._add_candidate("stale-forward", market_ids=("stale-market",))
+        self._save_snapshot(
+            "stale-snapshot",
+            market_id="stale-market",
+            source_timestamp=stale,
+            observed_at=stale,
+        )
+        self._assert_evaluation(
+            "stale-forward",
+            "STALE_FORWARD_EVIDENCE",
+            market_id="stale-market",
+        )
+
+    def test_current_signal_market_normalizes_persisted_closed_flags(self):
+        open_market = "string-false-open-market"
+        closed_market = "string-true-closed-market"
+        self._save_snapshot(
+            "string-false-open-snapshot",
+            market_id=open_market,
+            closed="false",
+        )
+        self._save_snapshot(
+            "string-true-closed-snapshot",
+            market_id=closed_market,
+            closed="true",
+        )
+
+        self.assertIsNotNone(
+            self.service._current_signal_market(open_market, now=self.now)
+        )
+        self.assertIsNone(
+            self.service._current_signal_market(closed_market, now=self.now)
+        )
+
+        self._add_candidate("string-false-open-candidate", market_ids=(open_market,))
+        self._add_candidate("string-true-closed-candidate", market_ids=(closed_market,))
+        self._assert_evaluation(
+            "string-false-open-candidate",
+            "READY_SIGNAL",
+            market_id=open_market,
+            cycle_id="string-false-open-evaluation-cycle",
+            expect_signal=True,
+            assert_market_id=True,
+        )
+        self._assert_evaluation(
+            "string-true-closed-candidate",
+            "MARKET_CLOSED",
+            market_id=closed_market,
+            cycle_id="string-true-closed-evaluation-cycle",
+            assert_market_id=True,
+        )
+
+    def test_closed_market_is_not_reclassified_as_missing_or_unresolved(self):
+        self._add_candidate(
+            "closed-forward",
+            market_ids=("unresolved-declared", "closed-market"),
+        )
+        self._save_metadata(
+            "closed-market",
+            active=False,
+            closed=True,
+            settlement="closed",
+        )
+        self._assert_evaluation(
+            "closed-forward",
+            "MARKET_CLOSED",
+            market_id="closed-market",
+        )
+
+    def test_frozen_filter_mismatch_is_an_exact_non_actionable_reason(self):
+        self._add_candidate(
+            "filter-mismatch",
+            market_ids=("sports-market",),
+            frozen_filters={"category": "politics"},
+        )
+        self._save_metadata("sports-market", category="sports")
+        self._assert_evaluation(
+            "filter-mismatch",
+            "MARKET_FILTER_MISMATCH",
+            market_id="sports-market",
+        )
+
+    def test_declared_missing_target_is_persisted_as_exact_market_scoped_reason(self):
+        missing_market = "never-seen"
+        self._add_candidate(
+            "unresolved-forward",
+            market_ids=(missing_market,),
+        )
+        result = self._assert_evaluation(
+            "unresolved-forward",
+            "NO_FORWARD_SNAPSHOT",
+            market_id=missing_market,
+            assert_market_id=True,
+        )
+        self.assertEqual(result["market_id"], missing_market)
+
+
+    def test_declared_missing_target_remains_diagnostic_only(self):
+        candidate_id = "missing-diagnostic"
+        missing_market = "missing-declared"
+        authorized_market = "authorized-no-signal"
+        self._add_candidate(
+            candidate_id,
+            market_ids=(missing_market, authorized_market),
+            model={"probability": 0.50},
+        )
+        self._save_snapshot(
+            "authorized-no-signal-for-missing",
+            market_id=authorized_market,
+        )
+
+        with patch.object(
+            self.service,
+            "_forward_snapshot_rows",
+            wraps=self.service._forward_snapshot_rows,
+        ) as load_rows:
+            result = self._assert_evaluation(
+                candidate_id,
+                "NO_FORWARD_SNAPSHOT",
+                market_id=missing_market,
+                cycle_id="missing-diagnostic-cycle",
+                assert_market_id=True,
+            )
+
+        evaluated_market_ids = [call.args[0] for call in load_rows.call_args_list]
+        self.assertEqual(evaluated_market_ids, [authorized_market])
+        self.assertNotIn(missing_market, evaluated_market_ids)
+        self.assertEqual(
+            result["evidence"]["market_failures"],
+            [
+                {
+                    "market_id": authorized_market,
+                    "reason_code": "NO_STRATEGY_SIGNAL",
+                },
+                {
+                    "market_id": missing_market,
+                    "reason_code": "NO_FORWARD_SNAPSHOT",
+                },
+            ],
+        )
+
+    def test_required_collector_health_blocks_a_ready_candidate(self):
+        health = {
+            "candidate_bound_markets": ["m"],
+            "scheduled": ["m"],
+            "fresh": ["m"],
+            "stale": [],
+            "missing": [],
+            "grade": "C",
+            "grade_scope": "required_forward_markets",
+            "reason_code": "COLLECTOR_DEGRADED",
+            "candidate_references": {"m": ["C"]},
+        }
+        with patch.object(
+            self.store,
+            "polymarket_required_health",
+            return_value=health,
+        ):
+            self._assert_evaluation(
+                "C",
+                "COLLECTOR_CANDIDATE_HEALTH_BLOCKED",
+                market_id="m",
+                cycle_id="health-cycle",
+                assert_market_id=True,
+            )
+
+    def test_historical_validation_market_is_ignored_for_current_executable_authority(self):
+        self._add_candidate(
+            "historical-independent",
+            market_ids=("current-market",),
+            dataset_market_ids=("historical-market",),
+        )
+        self._save_snapshot(
+            "current-snapshot",
+            market_id="current-market",
+        )
+        requirements = self.store.candidate_forward_requirements(
+            candidate_ids=["historical-independent"], now=self.now
+        )
+        candidate = requirements["candidates"][0]
+        self.assertEqual(candidate["historical_market_ids_ignored"], [])
+        self.assertNotIn("historical-market", candidate["market_ids"])
+        self.assertEqual(candidate["market_ids"], ["current-market"])
+        result = self._assert_evaluation(
+            "historical-independent",
+            "READY_SIGNAL",
+            market_id="current-market",
+            expect_signal=True,
+            assert_market_id=True,
+        )
+        self.assertEqual(result["signal"]["market_id"], "current-market")
+
+    def test_frozen_filters_select_only_the_matching_current_market(self):
+        self._add_candidate(
+            "filter-match",
+            market_ids=("politics-market",),
+            frozen_filters={"category": "politics"},
+        )
+        self._save_snapshot(
+            "politics-snapshot",
+            market_id="politics-market",
+            category="politics",
+        )
+        result = self._assert_evaluation(
+            "filter-match",
+            "READY_SIGNAL",
+            market_id="politics-market",
+            expect_signal=True,
+            assert_market_id=True,
+        )
+        self.assertEqual(result["signal"]["market_id"], "politics-market")
+
+    def test_filter_excluded_declared_market_never_enters_signal_evaluation(self):
+        candidate_id = "excluded-target-not-executable"
+        authorized_market = "authorized-no-signal"
+        excluded_market = "instrument-filter-excluded"
+        self._add_candidate(
+            candidate_id,
+            market_ids=(authorized_market, excluded_market),
+            frozen_filters={"category": "politics"},
+            model={"probability": 0.50},
+        )
+        self._save_snapshot(
+            "authorized-no-signal-snapshot",
+            market_id=authorized_market,
+            category="politics",
+        )
+        self._save_snapshot(
+            "excluded-ready-snapshot",
+            market_id=excluded_market,
+            category="sports",
+        )
+
+        with patch.object(
+            self.service,
+            "_forward_snapshot_rows",
+            wraps=self.service._forward_snapshot_rows,
+        ) as load_rows, patch.object(
+            self.service,
+            "_apply_signal_model",
+            wraps=self.service._apply_signal_model,
+        ) as apply_model:
+            result = self._assert_evaluation(
+                candidate_id,
+                "MARKET_FILTER_MISMATCH",
+                market_id=excluded_market,
+                cycle_id="excluded-target-cycle",
+                assert_market_id=True,
+            )
+
+        evaluated_market_ids = [call.args[0] for call in load_rows.call_args_list]
+        self.assertEqual(evaluated_market_ids, [authorized_market])
+        self.assertNotIn(excluded_market, evaluated_market_ids)
+        self.assertEqual(apply_model.call_count, 1)
+        self.assertEqual(result["evidence"]["market_failures"], [
+            {
+                "market_id": authorized_market,
+                "reason_code": "NO_STRATEGY_SIGNAL",
+            },
+            {
+                "market_id": excluded_market,
+                "reason_code": "MARKET_FILTER_MISMATCH",
+            },
+        ])
+
+    def test_nested_plan_closed_target_returns_exact_market_scoped_reason_without_model_evaluation(self):
+        candidate_id = "nested-closed-target"
+        closed_market = "nested-closed-market"
+        self._add_candidate(
+            candidate_id,
+            market_ids=("legacy-top-level-market",),
+            experiment_plan={
+                "hypothesis_id": candidate_id,
+                "market_type": "prediction",
+                "template": "probability_mispricing",
+                "parameters": {"threshold": [0.05]},
+                "target": {"market_ids": [closed_market]},
+                "dataset_selector": {
+                    "dataset_id": "prediction-history",
+                    "dataset_version": "v1",
+                },
+                "experiment_family": "probability_mispricing",
+                "max_variants": 1,
+                "min_samples": 30,
+                "min_trades": 0,
+                "paper_only": True,
+            },
+        )
+        requirements = self.store.candidate_forward_requirements(
+            candidate_ids=[candidate_id],
+            now=self.now,
+        )
+        candidate_entry = requirements["candidates"][0]
+        self.assertEqual(candidate_entry["declared_market_ids"], [closed_market])
+        self.assertEqual(candidate_entry["market_ids"], [])
+        self._save_metadata(
+            closed_market,
+            active=False,
+            closed=True,
+            settlement="closed",
+        )
+
+        with patch.object(
+            self.service,
+            "_forward_snapshot_rows",
+            wraps=self.service._forward_snapshot_rows,
+        ) as load_rows, patch.object(
+            self.service,
+            "_apply_signal_model",
+            wraps=self.service._apply_signal_model,
+        ) as apply_model:
+            result = self._assert_evaluation(
+                candidate_id,
+                "MARKET_CLOSED",
+                market_id=closed_market,
+                cycle_id="nested-closed-target-cycle",
+                assert_market_id=True,
+            )
+
+        self.assertEqual(load_rows.call_count, 0)
+        self.assertEqual(apply_model.call_count, 0)
+        self.assertEqual(
+            result["evidence"]["market_failures"],
+            [
+                {
+                    "market_id": closed_market,
+                    "reason_code": "MARKET_CLOSED",
+                }
+            ],
+        )
+
+    def test_nested_plan_filter_exclusion_is_diagnostic_only_and_never_ready(self):
+        candidate_id = "nested-filter-excluded-target"
+        authorized_market = "nested-authorized-market"
+        excluded_market = "nested-filter-excluded-market"
+        self._add_candidate(
+            candidate_id,
+            market_ids=("legacy-top-level-market",),
+            model={"probability": 0.50},
+            experiment_plan={
+                "hypothesis_id": candidate_id,
+                "market_type": "prediction",
+                "template": "probability_mispricing",
+                "parameters": {"threshold": [0.05]},
+                "filters": {"category": "politics"},
+                "target": {
+                    "market_ids": [authorized_market, excluded_market],
+                },
+                "dataset_selector": {
+                    "dataset_id": "prediction-history",
+                    "dataset_version": "v1",
+                },
+                "experiment_family": "probability_mispricing",
+                "max_variants": 1,
+                "min_samples": 30,
+                "min_trades": 0,
+                "paper_only": True,
+            },
+        )
+        self._save_metadata(authorized_market, category="politics")
+        self._save_metadata(excluded_market, category="sports")
+        self._save_snapshot(
+            "nested-authorized-snapshot",
+            market_id=authorized_market,
+            category="politics",
+        )
+        self._save_snapshot(
+            "nested-excluded-snapshot",
+            market_id=excluded_market,
+            category="sports",
+        )
+        requirements = self.store.candidate_forward_requirements(
+            candidate_ids=[candidate_id],
+            now=self.now,
+        )
+        candidate_entry = requirements["candidates"][0]
+        self.assertEqual(
+            candidate_entry["declared_market_ids"],
+            [authorized_market, excluded_market],
+        )
+        self.assertEqual(candidate_entry["market_ids"], [authorized_market])
+
+        with patch.object(
+            self.service,
+            "_forward_snapshot_rows",
+            wraps=self.service._forward_snapshot_rows,
+        ) as load_rows, patch.object(
+            self.service,
+            "_apply_signal_model",
+            wraps=self.service._apply_signal_model,
+        ) as apply_model:
+            result = self._assert_evaluation(
+                candidate_id,
+                "MARKET_FILTER_MISMATCH",
+                market_id=excluded_market,
+                cycle_id="nested-filter-excluded-target-cycle",
+                assert_market_id=True,
+            )
+
+        evaluated_market_ids = [call.args[0] for call in load_rows.call_args_list]
+        self.assertEqual(evaluated_market_ids, [authorized_market])
+        self.assertNotIn(excluded_market, evaluated_market_ids)
+        self.assertEqual(apply_model.call_count, 1)
+        self.assertEqual(
+            result["evidence"]["market_failures"],
+            [
+                {
+                    "market_id": authorized_market,
+                    "reason_code": "NO_STRATEGY_SIGNAL",
+                },
+                {
+                    "market_id": excluded_market,
+                    "reason_code": "MARKET_FILTER_MISMATCH",
+                },
+            ],
+        )
+
+    def test_declared_closed_and_filter_targets_beyond_catalog_page_remain_exact_diagnostics(self):
+        candidate_id = "paginated-diagnostic-targets"
+        closed_market = "zz-paginated-closed-target"
+        excluded_market = "zz-paginated-filter-target"
+        self._add_candidate(
+            candidate_id,
+            market_ids=("legacy-top-level-market",),
+            experiment_plan={
+                "hypothesis_id": candidate_id,
+                "market_type": "prediction",
+                "template": "probability_mispricing",
+                "parameters": {"threshold": [0.05]},
+                "filters": {"category": "politics"},
+                "target": {
+                    "market_ids": [closed_market, excluded_market],
+                },
+                "dataset_selector": {
+                    "dataset_id": "prediction-history",
+                    "dataset_version": "v1",
+                },
+                "experiment_family": "probability_mispricing",
+                "max_variants": 1,
+                "min_samples": 30,
+                "min_trades": 0,
+                "paper_only": True,
+            },
+        )
+        for index in range(1001):
+            self._save_metadata(f"distractor-{index:04d}", category="politics")
+        self._save_metadata(
+            closed_market,
+            active=False,
+            closed=True,
+            settlement="closed",
+            category="politics",
+        )
+        # String false is a valid persisted flag and must not outrank the
+        # frozen-filter diagnostic as a truthy Python value.
+        self._save_metadata(
+            excluded_market,
+            active=True,
+            closed="false",
+            settlement="open",
+            category="sports",
+        )
+
+        requirements = self.store.candidate_forward_requirements(
+            candidate_ids=[candidate_id],
+            now=self.now,
+        )
+        candidate_entry = requirements["candidates"][0]
+        self.assertEqual(
+            candidate_entry["declared_market_ids"],
+            [closed_market, excluded_market],
+        )
+        self.assertEqual(candidate_entry["market_ids"], [])
+
+        with patch.object(
+            self.service,
+            "_forward_snapshot_rows",
+            wraps=self.service._forward_snapshot_rows,
+        ) as load_rows, patch.object(
+            self.service,
+            "_apply_signal_model",
+            wraps=self.service._apply_signal_model,
+        ) as apply_model:
+            result = self._assert_evaluation(
+                candidate_id,
+                "MARKET_CLOSED",
+                market_id=closed_market,
+                cycle_id="paginated-diagnostic-targets-cycle",
+                assert_market_id=True,
+            )
+
+        self.assertEqual(load_rows.call_count, 0)
+        self.assertEqual(apply_model.call_count, 0)
+        self.assertEqual(
+            result["evidence"]["market_failures"],
+            [
+                {
+                    "market_id": closed_market,
+                    "reason_code": "MARKET_CLOSED",
+                },
+                {
+                    "market_id": excluded_market,
+                    "reason_code": "MARKET_FILTER_MISMATCH",
+                },
+            ],
+        )
+
+    def test_unrelated_discovery_staleness_is_not_required_health(self):
+        self._save_metadata("unrelated-stale")
+        self._save_snapshot(
+            "unrelated-stale-snapshot",
+            market_id="unrelated-stale",
+            source_timestamp=T0 - timedelta(minutes=10),
+            observed_at=T0 - timedelta(minutes=10),
+        )
+        result = self._assert_evaluation(
+            "C",
+            "READY_SIGNAL",
+            market_id="m",
+            expect_signal=True,
+            assert_market_id=True,
+        )
+
+    def test_non_actionable_first_authorized_market_does_not_block_later_ready_market(self):
+        candidate_id = "multi-market-ready"
+        first_market = "multi-market-missing"
+        second_market = "multi-market-ready"
+        self._add_candidate(
+            candidate_id,
+            market_ids=(first_market, second_market),
+        )
+        self._save_metadata(first_market)
+        self._save_metadata(second_market)
+        self._save_snapshot(
+            "multi-market-ready-snapshot",
+            market_id=second_market,
+        )
+
+        result = self.service.evaluate_signal(candidate_id, cycle_id="multi-ready-cycle")
+
+        self.assertEqual(result["reason_code"], "READY_SIGNAL")
+        self.assertEqual(result["market_id"], second_market)
+        self.assertEqual(result["signal"]["market_id"], second_market)
+        rows = self.service.list_signal_evaluations(
+            candidate_id=candidate_id,
+            cycle_id="multi-ready-cycle",
+            limit=10,
+        )
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["reason_code"], "READY_SIGNAL")
+
+    def test_all_market_failures_use_deterministic_severity_and_market_evidence(self):
+        candidate_id = "multi-market-failure"
+        closed_market = "multi-market-closed"
+        stale_market = "multi-market-stale"
+        missing_market = "multi-market-missing"
+        self._add_candidate(
+            candidate_id,
+            market_ids=(closed_market, stale_market, missing_market),
+        )
+        self._save_metadata(closed_market)
+        self._save_snapshot(
+            "multi-market-closed-snapshot",
+            market_id=closed_market,
+            active=False,
+            settlement="closed",
+        )
+        stale = T0 - timedelta(seconds=61)
+        self._save_metadata(stale_market)
+        self._save_snapshot(
+            "multi-market-stale-snapshot",
+            market_id=stale_market,
+            source_timestamp=stale,
+            observed_at=stale,
+        )
+        self._save_metadata(missing_market)
+
+        result = self.service.evaluate_signal(candidate_id, cycle_id="multi-failure-cycle")
+
+        self.assertEqual(result["reason_code"], "MARKET_CLOSED")
+        self.assertEqual(result["market_id"], closed_market)
+        self.assertEqual(result["evidence"]["market_id"], closed_market)
+        self.assertEqual(
+            result["evidence"]["market_failures"],
+            [
+                {"market_id": stale_market, "reason_code": "STALE_FORWARD_EVIDENCE"},
+                {"market_id": missing_market, "reason_code": "NO_FORWARD_SNAPSHOT"},
+                {"market_id": closed_market, "reason_code": "MARKET_CLOSED"},
+            ],
+        )
+        rows = self.service.list_signal_evaluations(
+            candidate_id=candidate_id,
+            cycle_id="multi-failure-cycle",
+            limit=10,
+        )
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["market_id"], closed_market)
+
+    def test_evaluation_authority_is_bounded_to_eight_markets(self):
+        market_ids = tuple(f"bound-market-{index:02d}" for index in range(12))
+        self._add_candidate("bounded-candidate", market_ids=market_ids)
+        for index, market_id in enumerate(market_ids):
+            self._save_snapshot(
+                f"bound-snapshot-{index:02d}",
+                market_id=market_id,
+            )
+        result = self.service.evaluate_signal("bounded-candidate", cycle_id="bounded-cycle")
+        self.assertEqual(result["reason_code"], "READY_SIGNAL")
+        self.assertEqual(result["market_id"], market_ids[0])
+        self.assertLessEqual(
+            len(result["required_health"]["candidate_bound_markets"]),
+            8,
+        )
+
+    def test_model_probability_is_derived_from_persisted_snapshot_feature(self):
+        self._add_candidate(
+            "derived-model",
+            market_ids=("derived-market",),
+            model={"field": "feature_probability"},
+        )
+        self._save_snapshot(
+            "derived-model-snapshot",
+            market_id="derived-market",
+            feature_probability=0.80,
+        )
+        result = self._assert_evaluation(
+            "derived-model",
+            "READY_SIGNAL",
+            market_id="derived-market",
+            expect_signal=True,
+            assert_market_id=True,
+        )
+        self.assertEqual(result["signal"]["evidence"]["model_probability"], 0.80)
+        self.assertNotIn("model_probability", self.store.load_polymarket_snapshots(
+            "derived-market", source_type="FORWARD_COLLECTED"
+        )[0]["payload"]["snapshot"])
+
+    def test_generate_and_evaluate_signal_make_no_network_calls(self):
+        with patch(
+            "urllib.request.urlopen",
+            side_effect=AssertionError("signal evaluation must not access network"),
+        ):
+            evaluation = self.service.evaluate_signal("C", cycle_id="offline-cycle")
+            signal = self.service.generate_signal("C")
+        self.assertEqual(evaluation["reason_code"], "READY_SIGNAL")
+        self.assertEqual(signal, evaluation["signal"])
+
+    def test_ready_signal_does_not_bypass_arm_or_credential_gates(self):
+        result = self.service.evaluate_signal("C", cycle_id="gate-cycle")
+        venue = FakeVenue()
+        with self.assertRaisesRegex(CanaryBlocked, "CANARY_NOT_ARMED"):
+            self.service.submit_signal(
+                result["signal"]["signal_id"],
+                venue=venue,
+                allow_test_venue=True,
+            )
+        self.assertFalse(venue.submissions)
+        no_credentials = CanaryService(
+            self.store,
+            credentials=FakeCredentials(False),
+            clock=lambda: self.now,
+        )
+        self.assertEqual(
+            no_credentials.evaluate_signal("C", cycle_id="credential-cycle")["reason_code"],
+            "READY_SIGNAL",
+        )
+        with self.assertRaisesRegex(CanaryBlocked, "CREDENTIALS_NOT_CONFIGURED"):
+            no_credentials.arm(
+                "C",
+                venue=venue,
+                credentials_configured=True,
+            )
+
+    def test_selected_candidate_stale_market_blocks_submission_before_order(self):
+        signal = self._signal()
+        self._save_snapshot(
+            "newest-but-stale-source",
+            market_id="m",
+            source_timestamp=T0 - timedelta(minutes=2),
+            observed_at=T0 + timedelta(seconds=1),
+        )
+        self.now = T0 + timedelta(seconds=30)
+        self._arm()
+        venue = FakeVenue()
+        with self.assertRaisesRegex(CanaryBlocked, "CANARY_SIGNAL_STALE"):
+            self.service.submit_signal(
+                signal["signal_id"],
+                venue=venue,
+                allow_test_venue=True,
+            )
+        self.assertFalse(venue.submissions)
+        self.assertEqual(
+            self.service.get_signal(signal["signal_id"])["status"],
+            "STALE",
+        )
 
     def _arm(self, candidate_id="C"):
         return self.service.arm(
@@ -2345,6 +3232,152 @@ class CanarySignalTests(unittest.TestCase):
             ).fetchone()[0],
             1,
         )
+    def test_canary_signal_transient_retention_preserves_references_and_current_ready(self):
+        current = self._signal()
+        transient_rows = []
+        for index in range(5):
+            signal_id = f"retention-transient-{index}"
+            generated_at = T0 - timedelta(minutes=5 - index)
+            transient_rows.append(signal_id)
+            self.store.connection.execute(
+                "INSERT INTO canary_signals("
+                "signal_id,candidate_id,frozen_hash,strategy_hash,model_hash,config_hash,"
+                "market_id,token_id,outcome,side,paper_expected_price,source_snapshot_id,"
+                "source_timestamp,generated_at,expires_at,status,reason,evidence_json,updated_at"
+                ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    signal_id,
+                    f"retention-candidate-{index}",
+                    "frozen",
+                    "strategy",
+                    "model",
+                    "config",
+                    "market",
+                    "token",
+                    "yes",
+                    "BUY",
+                    "0.50",
+                    f"snapshot-{index}",
+                    generated_at.isoformat(),
+                    generated_at.isoformat(),
+                    (generated_at - timedelta(seconds=1)).isoformat(),
+                    "EXPIRED",
+                    "SIGNAL_EXPIRED",
+                    "{}",
+                    generated_at.isoformat(),
+                ),
+            )
+        self.store.connection.execute(
+            "INSERT INTO canary_signal_evaluations("
+            "evaluation_id,candidate_id,cycle_id,evaluated_at,reason_code,"
+            "market_id,signal_id,signal_json,required_health_json,evidence_json"
+            ") VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (
+                "retention-note",
+                "retention-note-candidate",
+                "retention-note-cycle",
+                (T0 - timedelta(minutes=4)).isoformat(),
+                "READY_SIGNAL",
+                "market",
+                transient_rows[0],
+                None,
+                "{}",
+                '{"note":"audit"}',
+            ),
+        )
+        self.store.connection.execute(
+            "INSERT INTO canary_ledger("
+            "event_id,signal_id,timestamp,candidate_id,venue,market_id,token_id,side,"
+            "requested_notional,paper_expected_price,max_price,status,evidence_json"
+            ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "retention-reservation",
+                transient_rows[1],
+                (T0 - timedelta(minutes=4)).isoformat(),
+                "retention-order-candidate",
+                "polymarket",
+                "market",
+                "token",
+                "BUY",
+                "1.00",
+                "0.50",
+                "0.50",
+                "RESERVED",
+                "{}",
+            ),
+        )
+        self.store.connection.commit()
+
+        with patch.object(canary_module, "CANARY_SIGNAL_TRANSIENT_RETENTION", 2):
+            self.service.evaluate_signal("C", cycle_id="retention-cleanup")
+
+        retained = {
+            row["signal_id"]
+            for row in self.store.connection.execute(
+                "SELECT signal_id FROM canary_signals WHERE status='EXPIRED'"
+            ).fetchall()
+        }
+        self.assertEqual(
+            retained,
+            {
+                transient_rows[0],
+                transient_rows[1],
+                transient_rows[3],
+                transient_rows[4],
+            },
+        )
+        self.assertNotIn(transient_rows[2], retained)
+        self.assertEqual(self.service.get_signal(current["signal_id"])["status"], "READY")
+    def test_canary_signal_retention_bounds_older_unexpired_ready_duplicates(self):
+        current = self._signal()
+        ready_ids = []
+        for index in range(4):
+            signal_id = f"retention-ready-{index}"
+            generated_at = T0 - timedelta(seconds=4 - index)
+            ready_ids.append(signal_id)
+            self.store.connection.execute(
+                "INSERT INTO canary_signals("
+                "signal_id,candidate_id,frozen_hash,strategy_hash,model_hash,config_hash,"
+                "market_id,token_id,outcome,side,paper_expected_price,source_snapshot_id,"
+                "source_timestamp,generated_at,expires_at,status,reason,evidence_json,updated_at"
+                ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    signal_id,
+                    "retention-ready-candidate",
+                    "frozen",
+                    "strategy",
+                    "model",
+                    "config",
+                    "market",
+                    "token",
+                    "yes",
+                    "BUY",
+                    "0.50",
+                    f"ready-snapshot-{index}",
+                    generated_at.isoformat(),
+                    generated_at.isoformat(),
+                    (T0 + timedelta(minutes=1)).isoformat(),
+                    "READY",
+                    None,
+                    "{}",
+                    generated_at.isoformat(),
+                ),
+            )
+        self.store.connection.commit()
+
+        with patch.object(canary_module, "CANARY_SIGNAL_TRANSIENT_RETENTION", 1):
+            self.service.evaluate_signal("C", cycle_id="ready-retention-cleanup")
+
+        candidate_rows = self.store.connection.execute(
+            "SELECT signal_id FROM canary_signals "
+            "WHERE candidate_id=? ORDER BY generated_at DESC,signal_id DESC",
+            ("retention-ready-candidate",),
+        ).fetchall()
+        self.assertEqual(
+            [row["signal_id"] for row in candidate_rows],
+            [ready_ids[3], ready_ids[2]],
+        )
+        self.assertEqual(self.service.get_signal(current["signal_id"])["status"], "READY")
 
     def test_autonomous_binding_rejects_forged_rank_zero_representative(self):
         ranking = CandidateCanaryRanker(
@@ -2678,4 +3711,114 @@ class CanarySignalTests(unittest.TestCase):
         self.assertFalse(PRODUCTION_LIVE_EXECUTION)
         self.assertNotIn("live_execution\": true", json.dumps(self._signal()))
 
+class CanaryForwardAuthorityContractTests(unittest.TestCase):
+    @staticmethod
+    def _metadata(store: AxiomStore, market_id: str, category: str) -> None:
+        store.save_polymarket_market_metadata(
+            market_id,
+            {
+                "source_type": "FORWARD_COLLECTED",
+                "active": True,
+                "closed": False,
+                "metadata": {"category": category},
+                "snapshot": {
+                    "market_id": market_id,
+                    "settlement": "open",
+                    "expiry": (T0 + timedelta(days=1)).isoformat(),
+                },
+            },
+            observed_at=T0,
+            source_type="FORWARD_COLLECTED",
+        )
+
+    @staticmethod
+    def _freeze_candidate(store: AxiomStore, candidate_id: str, payload: dict[str, object]) -> None:
+        lifecycle = CandidateLifecycleManager(store)
+        lifecycle.register_idea(candidate_id, {"candidate_id": candidate_id, **payload})
+        lifecycle.advance(candidate_id, CandidateStage.SCHEMA_VALIDATED, {"schema_valid": True})
+        lifecycle.advance(candidate_id, CandidateStage.BACKTESTED, {"backtest_complete": True})
+        lifecycle.advance(
+            candidate_id,
+            CandidateStage.VALIDATED,
+            {"validation_complete": True, "holdout_used": False},
+        )
+        lifecycle.advance(
+            candidate_id,
+            CandidateStage.ROBUSTNESS_CHECKED,
+            {"robustness_passed": True},
+        )
+        lifecycle.advance(
+            candidate_id,
+            CandidateStage.FROZEN,
+            {
+                "frozen": True,
+                "strategy_hash": "strategy-hash",
+                "model_hash": "model-hash",
+                "config_hash": "config-hash",
+                "risk_snapshot": {"max_position_fraction": 0.05},
+            },
+        )
+
+    def test_authority_order_and_candidate_references_are_stable_without_network_or_writes(self) -> None:
+        with AxiomStore(":memory:") as store:
+            self._metadata(store, "current-politics", "politics")
+            self._metadata(store, "current-sports", "sports")
+            self._freeze_candidate(
+                store,
+                "candidate-filter",
+                {"frozen_filters": {"category": "POLITICS"}},
+            )
+            self._freeze_candidate(
+                store,
+                "candidate-exact",
+                {"market_ids": ["current-sports"]},
+            )
+            before = store.connection.total_changes
+            with patch(
+                "urllib.request.urlopen",
+                side_effect=AssertionError("forward authority must not access the network"),
+            ):
+                first = store.candidate_forward_requirements(
+                    candidate_ids=["candidate-exact", "candidate-filter"],
+                    now=T0,
+                )
+                second = store.candidate_forward_requirements(
+                    candidate_ids=["candidate-exact", "candidate-filter"],
+                    now=T0,
+                )
+                health = store.polymarket_required_health(
+                    requirements=first,
+                    scheduled_market_ids=["current-sports", "current-politics"],
+                    now=T0,
+                    stale_after_seconds=60,
+                )
+            after = store.connection.total_changes
+
+        self.assertEqual(first, second)
+        self.assertEqual(
+            first["market_ids"],
+            ["current-sports", "current-politics"],
+        )
+        self.assertEqual(
+            first["candidate_references"],
+            {
+                "current-sports": ["candidate-exact"],
+                "current-politics": ["candidate-filter"],
+            },
+        )
+        self.assertEqual(
+            first["candidate_bound_markets"],
+            {
+                "candidate-exact": ["current-sports"],
+                "candidate-filter": ["current-politics"],
+            },
+        )
+        self.assertEqual(
+            health["candidate_references"],
+            {
+                "current-sports": ["candidate-exact"],
+                "current-politics": ["candidate-filter"],
+            },
+        )
+        self.assertEqual(before, after)
 if __name__=="__main__": unittest.main()

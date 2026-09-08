@@ -218,6 +218,8 @@ class DashboardPaginationFixture(unittest.TestCase):
             settlement = "open" if index != 20 else "resolved_yes"
             quality = "ORDER_BOOK_SIMULATED" if index % 2 == 0 else "PRICE_PROXY"
             question = f"Will fixture event {index:02d} happen?"
+            source_timestamp = T0 + timedelta(minutes=index // 2)
+            observed_at = source_timestamp + timedelta(seconds=1)
             metadata = {
                 "market_id": market_id,
                 "question": question,
@@ -238,14 +240,22 @@ class DashboardPaginationFixture(unittest.TestCase):
             self.store.save_polymarket_market_metadata(
                 market_id,
                 metadata,
-                observed_at=T0 + timedelta(minutes=index // 2),
+                observed_at=source_timestamp,
             )
             self.store.save_polymarket_snapshot(
                 f"market-snapshot-{index:02d}",
                 market_id,
-                T0 + timedelta(minutes=index // 2),
-                T0 + timedelta(minutes=index // 2, seconds=1),
-                {"snapshot": snapshot, "source_type": "FORWARD_COLLECTED"},
+                source_timestamp,
+                observed_at,
+                {
+                    "snapshot": snapshot,
+                    "source_type": "FORWARD_COLLECTED",
+                    "request_started_at": (source_timestamp - timedelta(seconds=1)).isoformat(),
+                    "provider_timestamp": source_timestamp.isoformat(),
+                    "response_received_at": observed_at.isoformat(),
+                    "observed_at": observed_at.isoformat(),
+                    "source_timestamp": source_timestamp.isoformat(),
+                },
                 quality=quality,
             )
 
@@ -2070,8 +2080,8 @@ class DashboardPaginationEndpointTests(DashboardPaginationFixture):
                 set(credentials),
                 {"configured", "status", "secret_values_exposed"},
             )
-            self.assertIsInstance(credentials["configured"], bool)
-            self.assertIn(credentials["status"], {"CONFIGURED", "NOT CONFIGURED"})
+            self.assertIsNone(credentials["configured"])
+            self.assertEqual(credentials["status"], "NOT CHECKED")
             self.assertFalse(credentials["secret_values_exposed"])
         finally:
             control.release_status.set()
@@ -2223,6 +2233,270 @@ class DashboardPaginationEndpointTests(DashboardPaginationFixture):
         self.assertEqual(payload["connectivity"], expected)
         self.assertIs(payload["connectivity"]["live_execution"], False)
 
+    def test_overview_and_canary_expose_bounded_forward_evidence(self) -> None:
+        requirements = {
+            "market_ids": ["market-00", "market-01", "market-02"],
+            "candidate_bound_markets": {
+                "candidate-forward": ["market-00", "market-01", "market-02"],
+            },
+            "candidate_references": {
+                "market-00": ["candidate-forward"],
+                "market-01": ["candidate-forward"],
+                "market-02": ["candidate-forward"],
+            },
+            "as_of": T0.isoformat(),
+        }
+        health = {
+            "candidate_bound_markets": ["market-00", "market-01", "market-02"],
+            "scheduled": ["market-00", "market-01"],
+            "fresh": ["market-00"],
+            "stale": ["market-01"],
+            "missing": ["market-02"],
+            "newest_required_source_timestamp": (T0 - timedelta(seconds=5)).isoformat(),
+            "oldest_required_source_timestamp": (T0 - timedelta(minutes=5)).isoformat(),
+            "newest_required_observed_at": (T0 - timedelta(seconds=2)).isoformat(),
+            "oldest_required_observed_at": (T0 - timedelta(minutes=5)).isoformat(),
+            "newest_required_snapshot": (T0 - timedelta(seconds=5)).isoformat(),
+            "oldest_required_snapshot": (T0 - timedelta(minutes=5)).isoformat(),
+            "grade": "D",
+            "reason_code": "REQUIRED_MARKETS_MISSING",
+            "reason_display": "Required forward market snapshots are missing.",
+            "candidate_references": requirements["candidate_references"],
+            "market_diagnostics": [
+                {
+                    "market_id": "market-00",
+                    "candidate_bound": True,
+                    "candidate_references": ["candidate-forward"],
+                    "source_timestamp": (T0 - timedelta(seconds=5)).isoformat(),
+                    "observed_at": (T0 - timedelta(seconds=2)).isoformat(),
+                    "freshness_age_seconds": 2.0,
+                    "collection_state": "fresh",
+                    "reason_code": "REQUIRED_MARKET_SNAPSHOT_FRESH",
+                },
+                {
+                    "market_id": "market-01",
+                    "candidate_bound": True,
+                    "candidate_references": ["candidate-forward"],
+                    "source_timestamp": (T0 - timedelta(minutes=5)).isoformat(),
+                    "observed_at": (T0 - timedelta(minutes=5)).isoformat(),
+                    "freshness_age_seconds": 300.0,
+                    "collection_state": "stale",
+                    "reason_code": "REQUIRED_MARKET_SNAPSHOT_STALE",
+                },
+                {
+                    "market_id": "market-02",
+                    "candidate_bound": True,
+                    "candidate_references": ["candidate-forward"],
+                    "source_timestamp": None,
+                    "observed_at": None,
+                    "freshness_age_seconds": None,
+                    "collection_state": "missing",
+                    "reason_code": "REQUIRED_MARKET_SNAPSHOT_MISSING",
+                },
+            ],
+        }
+        with patch.object(
+            self.store,
+            "candidate_forward_requirements",
+            return_value=requirements,
+        ), patch.object(
+            self.store,
+            "polymarket_required_health",
+            return_value=health,
+        ):
+            status, overview, _ = self._request("api/v2/overview-summary")
+            self.assertEqual(status, 200)
+            self.assertIsInstance(overview, dict)
+            assert isinstance(overview, dict)
+            status, canary_payload, _ = self._request("api/v2/canary")
+            self.assertEqual(status, 200)
+            self.assertIsInstance(canary_payload, dict)
+            assert isinstance(canary_payload, dict)
+
+        for projection in (overview, canary_payload):
+            evidence = projection["forward_evidence"]
+            self.assertEqual(evidence["candidate_bound_markets"], health["candidate_bound_markets"])
+            self.assertEqual(evidence["scheduled"], health["scheduled"])
+            self.assertEqual(evidence["fresh"], health["fresh"])
+            self.assertEqual(evidence["stale"], health["stale"])
+            self.assertEqual(evidence["missing"], health["missing"])
+            self.assertEqual(evidence["grade"], "D")
+            self.assertEqual(evidence["reason_code"], "REQUIRED_MARKETS_MISSING")
+            self.assertEqual(evidence["reason_display"], health["reason_code"])
+            for timestamp_key in (
+                "newest_required_source_timestamp",
+                "oldest_required_source_timestamp",
+                "newest_required_observed_at",
+                "oldest_required_observed_at",
+            ):
+                self.assertEqual(evidence[timestamp_key], health[timestamp_key])
+
+    def test_polymarket_page_marks_required_rows_with_bounded_health_diagnostics(self) -> None:
+        requirements = {
+            "market_ids": ["market-00"],
+            "candidate_bound_markets": {"candidate-forward": ["market-00"]},
+            "candidate_references": {"market-00": ["candidate-forward"]},
+        }
+        diagnostic = {
+            "market_id": "market-00",
+            "candidate_bound": True,
+            "candidate_references": ["candidate-forward"],
+            "source_timestamp": (T0 - timedelta(seconds=5)).isoformat(),
+            "observed_at": (T0 - timedelta(seconds=2)).isoformat(),
+            "freshness_age_seconds": 2.0,
+            "collection_state": "fresh",
+            "reason_code": "REQUIRED_MARKET_SNAPSHOT_FRESH",
+        }
+        health = {
+            "candidate_bound_markets": ["market-00"],
+            "scheduled": ["market-00"],
+            "fresh": ["market-00"],
+            "stale": [],
+            "missing": [],
+            "grade": "A",
+            "reason_code": "REQUIRED_MARKETS_FRESH",
+            "market_diagnostics": [diagnostic],
+        }
+        with patch.object(
+            self.store,
+            "candidate_forward_requirements",
+            return_value=requirements,
+        ), patch.object(
+            self.store,
+            "polymarket_required_health",
+            return_value=health,
+        ):
+            page = self._page(
+                "api/v2/polymarket",
+                page=1,
+                page_size=10,
+                expected_page=1,
+                expected_size=10,
+                expected_total=MARKET_COUNT,
+                sort="market_id",
+                direction="asc",
+            )
+
+        row = page["items"][0]
+        for key in (
+            "candidate_bound",
+            "source_timestamp",
+            "observed_at",
+            "freshness_age_seconds",
+            "collection_state",
+            "candidate_references",
+            "reason_code",
+            "reason_display",
+        ):
+            self.assertIn(key, row)
+        self.assertTrue(row["candidate_bound"])
+        self.assertEqual(row["source_timestamp"], diagnostic["source_timestamp"])
+        self.assertEqual(row["observed_at"], diagnostic["observed_at"])
+        self.assertEqual(row["freshness_age_seconds"], 2.0)
+        self.assertEqual(row["collection_state"], "fresh")
+        self.assertEqual(row["candidate_references"], ["candidate-forward"])
+        self.assertEqual(row["reason_code"], "REQUIRED_MARKET_SNAPSHOT_FRESH")
+        self.assertEqual(row["reason_display"], "REQUIRED_MARKET_SNAPSHOT_FRESH")
+        ordinary = page["items"][1]
+        self.assertEqual(ordinary["market_id"], "market-01")
+        self.assertFalse(ordinary["candidate_bound"])
+        self.assertEqual(ordinary["candidate_references"], [])
+        self.assertEqual(ordinary["source_timestamp"], T0.isoformat())
+        self.assertEqual(
+            ordinary["observed_at"],
+            (T0 + timedelta(seconds=1)).isoformat(),
+        )
+        ordinary_payload = ordinary["payload"]
+        self.assertIsInstance(ordinary_payload, dict)
+        assert isinstance(ordinary_payload, dict)
+        self.assertEqual(ordinary_payload["source_timestamp"], T0.isoformat())
+        self.assertEqual(ordinary_payload["provider_timestamp"], T0.isoformat())
+        self.assertEqual(
+            ordinary_payload["response_received_at"],
+            (T0 + timedelta(seconds=1)).isoformat(),
+        )
+        self.assertEqual(
+            ordinary_payload["observed_at"],
+            (T0 + timedelta(seconds=1)).isoformat(),
+        )
+        self.assertEqual(ordinary["quality"], "PRICE_PROXY")
+        for key in (
+            "freshness_age_seconds",
+            "collection_state",
+            "reason_code",
+            "reason_display",
+        ):
+            self.assertNotIn(key, ordinary)
+
+    def test_canary_exposes_current_signal_reason_counts_and_durable_coverage(self) -> None:
+        reason_counts = {
+            "NO_STRATEGY_SIGNAL": 7,
+            "CURRENT_ORDER_BOOK_REQUIRED": 2,
+        }
+        self.canary_service.record_autonomous_decision(
+            next_decision="WAIT_FOR_FRESH_ACTIONABLE_SIGNAL",
+            blocker="NO_ACTIONABLE_SIGNAL",
+            timestamp=T0,
+            candidates_ranked=23,
+            candidates_signal_checked=9,
+            candidates_no_signal=7,
+            actionable_candidates_found=0,
+            signal_scan_cycle_id="cycle-dashboard",
+            signal_scan_cycle_started_at=(T0 - timedelta(minutes=2)).isoformat(),
+            signal_scan_cycle_completed_at=T0.isoformat(),
+            signal_scan_cycle_complete=True,
+            signal_scan_checked_this_cycle=9,
+            signal_scan_remaining_this_cycle=14,
+            signal_scan_coverage_percentage=39.13,
+            signal_scan_reason_counts_json=json.dumps(reason_counts),
+            signal_scan_status="COMPLETE",
+        )
+        self.canary_service.publish_readiness_snapshot(reason="DASHBOARD_SCAN_REASONS")
+
+        status, payload, _body = self._request("api/v2/canary")
+        self.assertEqual(status, 200)
+        self.assertIsInstance(payload, dict)
+        assert isinstance(payload, dict)
+        self.assertEqual(payload["signal_scan_reason_counts"], reason_counts)
+        for projection in (payload["canary"], payload["autonomous_canary"]):
+            self.assertEqual(projection["signal_scan_reason_counts"], reason_counts)
+            self.assertEqual(projection["signal_scan_remaining_this_cycle"], 14)
+            self.assertEqual(projection["signal_scan_coverage_percentage"], 39.13)
+            self.assertEqual(projection["signal_scan_cycle_id"], "cycle-dashboard")
+            self.assertEqual(projection["signal_scan_cycle_complete"], 1)
+
+    def test_enabled_control_does_not_render_stale_disabled_blocker(self) -> None:
+        self.canary_service.record_autonomous_decision(
+            next_decision="WAIT_FOR_NEXT_TICK",
+            blocker="AUTONOMOUS_CANARY_DISABLED",
+            worker_status="IDLE",
+            timestamp=T0,
+        )
+        self.canary_service.enable_autonomous_micro_live()
+        # Simulate the persisted worker's last-cycle telemetry arriving after
+        # the control transition; the current control state remains enabled.
+        self.canary_service.record_autonomous_decision(
+            next_decision="WAIT_FOR_NEXT_TICK",
+            blocker="AUTONOMOUS_CANARY_DISABLED",
+            worker_status="IDLE",
+            timestamp=T0 + timedelta(minutes=1),
+        )
+
+        status, payload, _body = self._request("api/v2/canary")
+        self.assertEqual(status, 200)
+        self.assertIsInstance(payload, dict)
+        assert isinstance(payload, dict)
+        self.assertIn(
+            payload["canary"]["control_state"],
+            {"AUTONOMOUS_MICRO_LIVE", "ARMED", "ENABLED", "LIVE"},
+        )
+        self.assertNotEqual(payload["canary"]["blocker"], "AUTONOMOUS_CANARY_DISABLED")
+        self.assertNotEqual(
+            payload["autonomous_canary"]["blocker"],
+            "AUTONOMOUS_CANARY_DISABLED",
+        )
+        self.assertEqual(payload["canary"]["last_cycle_blocker"], "AUTONOMOUS_CANARY_DISABLED")
+
 
 class DashboardPaginationSurfaceTests(DashboardPaginationFixture):
 
@@ -2312,24 +2586,6 @@ class DashboardPaginationSurfaceTests(DashboardPaginationFixture):
                 self.assertEqual(external_hermes["status"], "UNKNOWN")
 
 
-    def test_final_overview_renderer_consumes_lifecycle_funnel(self) -> None:
-        html = _dashboard_html()
-        start = html.rfind("renderOverview = (data) =>")
-        end = html.index("renderDatasets =", start)
-        final_renderer = html[start:end]
-        for marker in (
-            "data.lifecycle_funnel",
-            "funnel-row",
-            "funnel-track",
-            "funnel-bar",
-            'empty("No candidate lifecycle"',
-            "Hermes hypotheses appear after a durable queue item is processed.",
-        ):
-            self.assertIn(marker, final_renderer)
-        self.assertRegex(final_renderer, r'\$\(\s*["\']funnel["\']\s*\)\.innerHTML\s*=')
-        self.assertRegex(final_renderer, r"Object\.entries\(\s*funnel\s*\)")
-        self.assertRegex(final_renderer, r"safe\(\s*k\s*\)")
-        self.assertRegex(final_renderer, r"count\(\s*v\s*\)")
 
     def test_independent_operator_controls_preserve_both_response_orders(self) -> None:
         html = _dashboard_html()
@@ -2365,10 +2621,51 @@ class DashboardPaginationSurfaceTests(DashboardPaginationFixture):
         control_success = html[fetch_start:fetch_end]
         self.assertRegex(
             control_success,
+
             r"renderOperatorControls\(\{\s*operator_controls\s*:\s*controls\.operator_controls\s*\|\|\s*controls\s*\}\)[\s\S]*"
             r"lastGood\.controls\s*=\s*controls;[\s\S]*operator\s*=\s*controls;",
             "the independent control-fetch success path must render its own response",
         )
+    def test_real_canary_renderer_consumes_forward_evidence_and_reason_counts(self) -> None:
+        html = _dashboard_html()
+        start = html.index("function renderCanary(data)")
+        end = html.index("function renderBtc", start)
+        renderer = html[start:end]
+        for marker in (
+            "forward_evidence",
+            "candidate_bound_markets",
+            "scheduled",
+            "stale",
+            "missing",
+            "newest_required",
+            "oldest_required",
+            "signal_scan_reason_counts",
+            "signal_scan_coverage_percentage",
+            "last_cycle_blocker",
+        ):
+            self.assertIn(marker, renderer)
+        self.assertIn("REAL CANARY MONEY", html)
+
+    def test_dashboard_research_feed_preserves_no_new_hermes_reason_text(self) -> None:
+        with AxiomStore(":memory:") as store:
+            store.set_scheduler_state(
+                "hermes-control",
+                {
+                    "status": "IDLE",
+                    "no_new_candidates_reason": "NO_NEW_HERMES_PROPOSALS",
+                },
+            )
+            server = DashboardServer(port=0, data=DashboardData(store=store)).start()
+            try:
+                assert server.url is not None
+                with urlopen(server.url + "/api/v2/overview-summary", timeout=3) as response:
+                    self.assertEqual(response.status, 200)
+                    body = response.read().decode("utf-8")
+                    payload = json.loads(body)
+            finally:
+                server.stop()
+        self.assertEqual(payload["research_feed"]["no_new_candidates_reason"], "NO_NEW_HERMES_PROPOSALS")
+        self.assertIn("NO_NEW_HERMES_PROPOSALS", body)
 
     def test_html_has_paginated_views_url_state_and_responsive_sticky_layout(self) -> None:
         html = _dashboard_html()

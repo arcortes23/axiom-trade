@@ -12,13 +12,398 @@ from axiom.cli import _load_cli_universe, _run_cli_crypto_research, build_parser
 from axiom.crypto_universe import TOP_50_MARKET_CAP_BINANCE_USDT, UniverseSnapshot, load_crypto_universe
 from axiom.data import InMemoryCryptoProvider
 from axiom.domain import MarketType, OHLCVBar
-from axiom.experiment_plan import ExperimentPlan, ExperimentPlanError
+from axiom.experiment_plan import ExperimentPlan, ExperimentPlanError, forward_market_matches
 from axiom.research import run_crypto_research, run_multi_symbol_crypto_research
 from axiom.storage import AxiomStore
+from axiom.dashboard import DashboardData
 
 
 UTC = timezone.utc
 T0 = datetime(2026, 1, 2, 12, 0, tzinfo=UTC)
+
+
+class ForwardAuthorityPredicateTests(unittest.TestCase):
+    def test_resolution_window_ages_from_expiry_and_supplied_now(self) -> None:
+        market = {
+            "timestamp": T0.isoformat(),
+            "expiry": (T0 + timedelta(hours=2)).isoformat(),
+            # This persisted value is the original observation-time window.
+            "time_to_expiry_seconds": 2 * 60 * 60,
+        }
+        filters = {"maximum_hours_to_resolution": 1.5}
+
+        self.assertFalse(forward_market_matches(market, filters, now=T0))
+        self.assertTrue(
+            forward_market_matches(
+                market,
+                filters,
+                now=T0 + timedelta(hours=1),
+            )
+        )
+
+    def test_max_spread_uses_collected_quote_spread(self) -> None:
+        market = {
+            "payload": {
+                "quotes": {
+                    "yes_bid": 0.46,
+                    "yes_ask": 0.50,
+                    "yes_spread": 0.04,
+                    "no_spread": 0.08,
+                }
+            }
+        }
+
+        self.assertTrue(forward_market_matches(market, {"max_spread": 0.05}, now=T0))
+        self.assertFalse(forward_market_matches(market, {"max_spread": 0.03}, now=T0))
+    def test_numeric_forward_bounds_reject_text_booleans_and_non_finite_values(self) -> None:
+        market = {
+            "timestamp": T0,
+            "time_to_expiry_seconds": 2 * 60 * 60,
+            "yes_mid": 0.5,
+            "yes_ask": 0.51,
+            "liquidity": 100.0,
+            "spread": 0.01,
+        }
+        invalid_filters = (
+            {"entry_price": "0.5"},
+            {"entry_price": True},
+            {"entry_price": [0.4, float("nan")]},
+            {"minimum_hours_to_resolution": float("inf")},
+            {"maximum_hours_to_resolution": "2"},
+            {"min_liquidity": False},
+            {"max_spread": float("-inf")},
+        )
+        for filters in invalid_filters:
+            with self.subTest(filters=filters):
+                self.assertFalse(forward_market_matches(market, filters, now=T0))
+
+    def test_target_instrument_matches_only_persisted_instrument_identity(self) -> None:
+        self.assertTrue(
+            forward_market_matches(
+                {"market_id": "market-id", "instrument": " Venue "},
+                {},
+                target_instrument="venue",
+            )
+        )
+        self.assertTrue(
+            forward_market_matches(
+                {"market_id": "market-id", "payload": {"metadata": {"symbol": "Venue"}}},
+                {},
+                target_instrument=" venue ",
+            )
+        )
+        self.assertFalse(
+            forward_market_matches(
+                {"market_id": "market-id"},
+                {},
+                target_instrument="market-id",
+            )
+        )
+        self.assertFalse(
+            forward_market_matches(
+                {"market_id": "market-id", "instrument": "Other"},
+                {},
+                target_instrument="venue",
+            )
+        )
+
+
+    def test_candidate_authority_applies_target_instrument_to_persisted_market(self) -> None:
+        plan = {
+            "hypothesis_id": "target-instrument",
+            "market_type": "prediction",
+            "template": "probability_mispricing",
+            "dataset_version": "v1",
+            "target": {"instrument": "Venue", "market_ids": ["target-market"]},
+            "paper_only": True,
+        }
+        with AxiomStore(":memory:") as store:
+            store.save_polymarket_market_metadata(
+                "target-market",
+                {
+                    "source_type": "FORWARD_COLLECTED",
+                    "active": True,
+                    "closed": False,
+                    "instrument": " venue ",
+                    "snapshot": {
+                        "market_id": "target-market",
+                        "settlement": "open",
+                        "expiry": (T0 + timedelta(days=1)).isoformat(),
+                    },
+                },
+                observed_at=T0,
+                source_type="FORWARD_COLLECTED",
+            )
+            store.save_candidate_lifecycle(
+                "candidate-target-instrument",
+                "IDEA",
+                {"experiment_plan": plan},
+                timestamp=T0,
+            )
+            requirements = store.candidate_forward_requirements(
+                candidate_ids=["candidate-target-instrument"],
+                now=T0,
+            )
+
+        candidate = requirements["candidates"][0]
+        self.assertEqual(candidate["resolution"], "RESOLVED")
+        self.assertEqual(candidate["market_ids"], ["target-market"])
+
+    def test_filter_discovery_excludes_historical_validation_constituent(self) -> None:
+        normalized_plan = ExperimentPlan.from_mapping(
+            {
+                "hypothesis_id": "historical-filter-authority",
+                "market_type": "prediction",
+                "template": "probability_mispricing",
+                "dataset_version": "v1",
+                "filters": {"category": "politics"},
+                "target": {
+                    "instrument": "Venue",
+                    "market_ids": ["historical-filter-market"],
+                },
+                "paper_only": True,
+            }
+        ).as_dict()
+        with AxiomStore(":memory:") as store:
+            for market_id in ("historical-filter-market", "current-filter-market"):
+                store.save_polymarket_market_metadata(
+                    market_id,
+                    {
+                        "source_type": "FORWARD_COLLECTED",
+                        "active": True,
+                        "closed": False,
+                        "instrument": "Venue",
+                        "metadata": {"category": "politics"},
+                        "snapshot": {
+                            "market_id": market_id,
+                            "settlement": "open",
+                            "expiry": (T0 + timedelta(days=1)).isoformat(),
+                        },
+                    },
+                    observed_at=T0,
+                    source_type="FORWARD_COLLECTED",
+                )
+            store.save_candidate_lifecycle(
+                "candidate-historical-filter",
+                "IDEA",
+                {
+                    "experiment_plan": normalized_plan,
+                    "dataset_provenance": {
+                        "source_type": "HISTORICAL",
+                        "historical_market_ids": ["historical-filter-market"],
+                    },
+                },
+                timestamp=T0,
+            )
+            requirements = store.candidate_forward_requirements(
+                candidate_ids=["candidate-historical-filter"],
+                now=T0,
+            )
+
+        candidate = requirements["candidates"][0]
+        self.assertEqual(candidate["historical_market_ids_ignored"], ["historical-filter-market"])
+        self.assertEqual(candidate["market_ids"], ["current-filter-market"])
+        self.assertEqual(candidate["permitted_market_ids"], ["current-filter-market"])
+        self.assertEqual(requirements["market_ids"], ["current-filter-market"])
+        self.assertEqual(candidate["resolution"], "RESOLVED")
+
+
+    def test_normal_serialized_plan_declares_open_closed_and_filtered_targets(self) -> None:
+        normalized_plan = ExperimentPlan.from_mapping(
+            {
+                "hypothesis_id": "declared-targets",
+                "market_type": "prediction",
+                "template": "probability_mispricing",
+                "dataset_version": "v1",
+                "filters": {"category": "politics"},
+                "target": {
+                    "market_ids": [
+                        "open-market",
+                        "closed-market",
+                        "filtered-market",
+                        "open-market",
+                    ]
+                },
+                "paper_only": True,
+            }
+        ).as_dict()
+        with AxiomStore(":memory:") as store:
+            store.save_polymarket_market_metadata(
+                "open-market",
+                {
+                    "source_type": "FORWARD_COLLECTED",
+                    "active": True,
+                    "closed": False,
+                    "metadata": {"category": "politics"},
+                    "snapshot": {
+                        "market_id": "open-market",
+                        "settlement": "open",
+                        "expiry": (T0 + timedelta(days=1)).isoformat(),
+                    },
+                },
+                observed_at=T0,
+                source_type="FORWARD_COLLECTED",
+            )
+            store.save_polymarket_market_metadata(
+                "closed-market",
+                {
+                    "source_type": "FORWARD_COLLECTED",
+                    "active": False,
+                    "closed": True,
+                    "metadata": {"category": "politics"},
+                    "snapshot": {
+                        "market_id": "closed-market",
+                        "settlement": "resolved_yes",
+                        "expiry": (T0 - timedelta(days=1)).isoformat(),
+                    },
+                },
+                observed_at=T0,
+                source_type="FORWARD_COLLECTED",
+            )
+            store.save_polymarket_market_metadata(
+                "filtered-market",
+                {
+                    "source_type": "FORWARD_COLLECTED",
+                    "active": True,
+                    "closed": False,
+                    "metadata": {"category": "sports"},
+                    "snapshot": {
+                        "market_id": "filtered-market",
+                        "settlement": "open",
+                        "expiry": (T0 + timedelta(days=1)).isoformat(),
+                    },
+                },
+                observed_at=T0,
+                source_type="FORWARD_COLLECTED",
+            )
+            store.save_candidate_lifecycle(
+                "candidate-declared-targets",
+                "IDEA",
+                {"experiment_plan": normalized_plan},
+                timestamp=T0,
+            )
+            requirements = store.candidate_forward_requirements(
+                candidate_ids=["candidate-declared-targets"],
+                now=T0,
+            )
+
+        candidate = requirements["candidates"][0]
+        self.assertEqual(
+            candidate["declared_market_ids"],
+            ["open-market", "closed-market", "filtered-market"],
+        )
+        self.assertEqual(candidate["market_ids"], ["open-market"])
+        self.assertEqual(candidate["permitted_market_ids"], ["open-market"])
+        self.assertEqual(candidate["resolution"], "RESOLVED")
+        self.assertNotIn("closed-market", candidate["market_ids"])
+        self.assertNotIn("filtered-market", candidate["market_ids"])
+
+    def test_capacity_excluded_candidate_is_unresolved_without_broad_fallback(self) -> None:
+        with AxiomStore(":memory:") as store:
+            for market_id in ("admitted-market", "capacity-market"):
+                store.save_polymarket_market_metadata(
+                    market_id,
+                    {
+                        "source_type": "FORWARD_COLLECTED",
+                        "active": True,
+                        "closed": False,
+                        "snapshot": {
+                            "market_id": market_id,
+                            "settlement": "open",
+                            "expiry": (T0 + timedelta(days=1)).isoformat(),
+                        },
+                    },
+                    observed_at=T0,
+                    source_type="FORWARD_COLLECTED",
+                )
+            store.save_candidate_lifecycle(
+                "candidate-admitted",
+                "IDEA",
+                {"market_ids": ["admitted-market"]},
+                timestamp=T0,
+            )
+            store.save_candidate_lifecycle(
+                "candidate-capacity",
+                "IDEA",
+                {"market_ids": ["capacity-market"]},
+                timestamp=T0,
+            )
+
+            requirements = store.candidate_forward_requirements(
+                candidate_ids=["candidate-admitted", "candidate-capacity"],
+                now=T0,
+                max_total_markets=1,
+            )
+            health = store.polymarket_required_health(requirements=requirements, now=T0)
+
+        by_id = {candidate["candidate_id"]: candidate for candidate in requirements["candidates"]}
+        self.assertEqual(requirements["market_ids"], ["admitted-market"])
+        self.assertEqual(
+            requirements["candidate_references"],
+            {"admitted-market": ["candidate-admitted"]},
+        )
+        self.assertEqual(
+            requirements["capacity_excluded_candidates"],
+            ["candidate-capacity"],
+        )
+        self.assertEqual(requirements["capacity_excluded_candidate_count"], 1)
+        self.assertEqual(by_id["candidate-admitted"]["resolution"], "RESOLVED")
+        self.assertEqual(by_id["candidate-capacity"]["resolution"], "UNRESOLVED")
+        self.assertEqual(by_id["candidate-capacity"]["reason_code"], "COLLECTOR_CAPACITY_INSUFFICIENT")
+        self.assertEqual(by_id["candidate-capacity"]["market_ids"], [])
+        self.assertEqual(by_id["candidate-capacity"]["permitted_market_ids"], [])
+        self.assertEqual(by_id["candidate-capacity"]["capacity_excluded_market_ids"], ["capacity-market"])
+        self.assertEqual(health["reason_code"], "COLLECTOR_CAPACITY_INSUFFICIENT")
+
+
+
+    def test_shared_admitted_market_is_retained_for_each_candidate(self) -> None:
+        with AxiomStore(":memory:") as store:
+            store.save_polymarket_market_metadata(
+                "shared-market",
+                {
+                    "source_type": "FORWARD_COLLECTED",
+                    "active": True,
+                    "closed": False,
+                    "snapshot": {
+                        "market_id": "shared-market",
+                        "settlement": "open",
+                        "expiry": (T0 + timedelta(days=1)).isoformat(),
+                    },
+                },
+                observed_at=T0,
+                source_type="FORWARD_COLLECTED",
+            )
+            for candidate_id in ("candidate-a", "candidate-b"):
+                store.save_candidate_lifecycle(
+                    candidate_id,
+                    "IDEA",
+                    {"market_ids": ["shared-market"]},
+                    timestamp=T0,
+                )
+
+            requirements = store.candidate_forward_requirements(
+                candidate_ids=["candidate-a", "candidate-b"],
+                now=T0,
+                max_total_markets=1,
+            )
+
+        self.assertEqual(requirements["market_ids"], ["shared-market"])
+        self.assertEqual(
+            requirements["candidate_bound_markets"],
+            {
+                "candidate-a": ["shared-market"],
+                "candidate-b": ["shared-market"],
+            },
+        )
+        self.assertEqual(
+            requirements["candidate_references"],
+            {"shared-market": ["candidate-a", "candidate-b"]},
+        )
+        self.assertEqual(
+            [candidate["market_ids"] for candidate in requirements["candidates"]],
+            [["shared-market"], ["shared-market"]],
+        )
 
 
 class _CredentialStore(CredentialStore):
@@ -1047,6 +1432,181 @@ class MultiSymbolProvenanceTests(unittest.TestCase):
         self.assertEqual(report["universe_provenance"]["selected_symbols"], symbols)
 
 
+class RequiredPolymarketHealthTests(unittest.TestCase):
+    @staticmethod
+    def _metadata(store: AxiomStore, market_id: str, observed_at: datetime) -> None:
+        store.save_polymarket_market_metadata(
+            market_id,
+            {
+                "source_type": "FORWARD_COLLECTED",
+                "active": True,
+                "closed": False,
+                "metadata": {"category": "politics"},
+                "snapshot": {
+                    "market_id": market_id,
+                    "settlement": "open",
+                    "expiry": (observed_at + timedelta(days=1)).isoformat(),
+                },
+            },
+            observed_at=observed_at,
+            source_type="FORWARD_COLLECTED",
+        )
+
+    @staticmethod
+    def _snapshot(
+        store: AxiomStore,
+        market_id: str,
+        *,
+        source_timestamp: datetime,
+        observed_at: datetime,
+    ) -> None:
+        store.save_polymarket_snapshot(
+            f"required-{market_id}-{observed_at.timestamp()}",
+            market_id,
+            source_timestamp,
+            observed_at,
+            {
+                "source_type": "FORWARD_COLLECTED",
+                "request_started_at": (observed_at - timedelta(seconds=1)).isoformat(),
+                "provider_timestamp": source_timestamp.isoformat(),
+                "response_received_at": observed_at.isoformat(),
+                "observed_at": observed_at.isoformat(),
+                "snapshot": {
+                    "market_id": market_id,
+                    "settlement": "open",
+                    "yes_mid": 0.5,
+                },
+            },
+            quality="ORDER_BOOK_SIMULATED",
+            source_type="FORWARD_COLLECTED",
+        )
+
+    def test_required_health_counts_fresh_stale_and_missing_and_ignores_unrelated_staleness(self) -> None:
+        stale_source = T0 - timedelta(minutes=5)
+        with AxiomStore(":memory:") as store:
+            for market_id in (
+                "required-fresh",
+                "required-stale",
+                "required-missing",
+                "unrelated-discovery",
+            ):
+                self._metadata(store, market_id, T0)
+            self._snapshot(
+                store,
+                "required-fresh",
+                source_timestamp=T0 - timedelta(seconds=2),
+                observed_at=T0,
+            )
+            self._snapshot(
+                store,
+                "required-stale",
+                source_timestamp=stale_source,
+                observed_at=stale_source,
+            )
+            self._snapshot(
+                store,
+                "unrelated-discovery",
+                source_timestamp=stale_source,
+                observed_at=stale_source,
+            )
+            requirements = {
+                "market_ids": [
+                    "required-fresh",
+                    "required-stale",
+                    "required-missing",
+                ],
+                "candidate_bound_markets": [
+                    "required-fresh",
+                    "required-stale",
+                    "required-missing",
+                ],
+                "candidate_references": {
+                    "required-fresh": ["candidate-health"],
+                    "required-stale": ["candidate-health"],
+                    "required-missing": ["candidate-health"],
+                },
+            }
+            health = store.polymarket_required_health(
+                requirements=requirements,
+                scheduled_market_ids=[
+                    "required-fresh",
+                    "required-stale",
+                    "required-missing",
+                ],
+                now=T0,
+                stale_after_seconds=60,
+            )
+
+        self.assertEqual(
+            health["candidate_bound_markets"],
+            ["required-fresh", "required-stale", "required-missing"],
+        )
+        self.assertEqual(
+            health["scheduled"],
+            ["required-fresh", "required-stale", "required-missing"],
+        )
+        self.assertEqual(health["fresh"], ["required-fresh"])
+        self.assertEqual(health["stale"], ["required-stale"])
+        self.assertEqual(health["missing"], ["required-missing"])
+        self.assertEqual(health["reason_code"], "REQUIRED_MARKETS_MISSING")
+        self.assertEqual(health["grade"], "D")
+        self.assertNotIn("unrelated-discovery", health["stale"])
+        self.assertNotIn("unrelated-discovery", health["missing"])
+
+        diagnostics = {
+            item["market_id"]: item for item in health["market_diagnostics"]
+        }
+        self.assertEqual(
+            diagnostics["required-fresh"]["candidate_references"],
+            ["candidate-health"],
+        )
+        self.assertTrue(diagnostics["required-fresh"]["candidate_bound"])
+        self.assertEqual(
+            diagnostics["required-fresh"]["source_timestamp"],
+            (T0 - timedelta(seconds=2)).isoformat(),
+        )
+        self.assertEqual(diagnostics["required-fresh"]["observed_at"], T0.isoformat())
+        self.assertEqual(diagnostics["required-fresh"]["collection_state"], "fresh")
+        self.assertEqual(diagnostics["required-stale"]["collection_state"], "stale")
+        self.assertEqual(diagnostics["required-missing"]["collection_state"], "missing")
+
+    def test_required_health_fresh_is_grade_a_and_retains_provider_timestamps(self) -> None:
+        source_timestamp = T0 - timedelta(seconds=17)
+        with AxiomStore(":memory:") as store:
+            self._metadata(store, "required-market", T0)
+            self._snapshot(
+                store,
+                "required-market",
+                source_timestamp=source_timestamp,
+                observed_at=T0,
+            )
+            requirements = {
+                "market_ids": ["required-market"],
+                "candidate_bound_markets": ["required-market"],
+                "candidate_references": {"required-market": ["candidate-fresh"]},
+            }
+            health = store.polymarket_required_health(
+                requirements=requirements,
+                scheduled_market_ids=["required-market"],
+                now=T0,
+                stale_after_seconds=60,
+            )
+            stored = store.load_polymarket_snapshots("required-market")
+
+        self.assertEqual(health["grade"], "A")
+        self.assertEqual(health["reason_code"], "REQUIRED_MARKETS_FRESH")
+        self.assertEqual(health["fresh"], ["required-market"])
+        self.assertEqual(health["stale"], [])
+        self.assertEqual(health["missing"], [])
+        self.assertEqual(health["newest_required_snapshot"], source_timestamp.isoformat())
+        self.assertEqual(health["oldest_required_snapshot"], source_timestamp.isoformat())
+        self.assertEqual(stored[0]["source_timestamp"], source_timestamp)
+        self.assertEqual(stored[0]["observed_at"], T0)
+        self.assertEqual(stored[0]["payload"]["provider_timestamp"], source_timestamp.isoformat())
+        self.assertEqual(stored[0]["payload"]["request_started_at"], (T0 - timedelta(seconds=1)).isoformat())
+        self.assertEqual(stored[0]["payload"]["response_received_at"], T0.isoformat())
+        self.assertEqual(stored[0]["payload"]["observed_at"], T0.isoformat())
+
 class DashboardAndCliShapeTests(unittest.TestCase):
     def test_dashboard_exposes_exact_health_reason_provenance_and_bootstrap_progress(self) -> None:
         health = {
@@ -1089,6 +1649,86 @@ class DashboardAndCliShapeTests(unittest.TestCase):
             self.assertEqual(progress[0]["status"], "RUNNING")
             self.assertAlmostEqual(progress[0]["progress"], 0.4)
             self.assertEqual(progress[0]["errors"], ["one retry"])
+
+    def test_dashboard_projection_exposes_required_health_without_provider_access(self) -> None:
+        requirements = {
+            "market_ids": ["required-market"],
+            "candidate_bound_markets": {"candidate-dashboard": ["required-market"]},
+            "candidate_references": {"required-market": ["candidate-dashboard"]},
+        }
+        health = {
+            "candidate_bound_markets": ["required-market"],
+            "scheduled": ["required-market"],
+            "fresh": ["required-market"],
+            "stale": [],
+            "missing": [],
+            "newest_required_source_timestamp": (T0 - timedelta(seconds=5)).isoformat(),
+            "oldest_required_source_timestamp": (T0 - timedelta(seconds=5)).isoformat(),
+            "newest_required_observed_at": T0.isoformat(),
+            "oldest_required_observed_at": T0.isoformat(),
+            "newest_required_snapshot": (T0 - timedelta(seconds=5)).isoformat(),
+            "oldest_required_snapshot": (T0 - timedelta(seconds=5)).isoformat(),
+            "grade": "A",
+            "reason_code": "REQUIRED_MARKETS_FRESH",
+            "reason_display": "All required forward market snapshots are fresh.",
+            "candidate_references": {"required-market": ["candidate-dashboard"]},
+            "market_diagnostics": [
+                {
+                    "market_id": "required-market",
+                    "candidate_bound": True,
+                    "candidate_references": ["candidate-dashboard"],
+                    "source_timestamp": (T0 - timedelta(seconds=5)).isoformat(),
+                    "observed_at": T0.isoformat(),
+                    "freshness_age_seconds": 0.0,
+                    "collection_state": "fresh",
+                    "reason_code": "REQUIRED_MARKET_SNAPSHOT_FRESH",
+                }
+            ],
+        }
+
+        class ExplodingProvider:
+            def markets(self, **_kwargs: object) -> None:
+                raise AssertionError("dashboard projection called provider")
+
+            def ticker(self, *_args: object, **_kwargs: object) -> None:
+                raise AssertionError("dashboard projection called provider")
+
+        with AxiomStore(":memory:") as store:
+            with patch.object(
+                store,
+                "candidate_forward_requirements",
+                return_value=requirements,
+            ), patch.object(
+                store,
+                "polymarket_required_health",
+                return_value=health,
+            ):
+                data = DashboardData(
+                    store=store,
+                    prediction_provider=ExplodingProvider(),
+                    crypto_provider=ExplodingProvider(),
+                )
+                overview = data.overview_summary()
+                canary = data.canary_data()
+
+        for payload in (overview, canary):
+            evidence = payload["forward_evidence"]
+            self.assertEqual(evidence["candidate_bound_markets"], ["required-market"])
+            self.assertEqual(evidence["reason_display"], health["reason_code"])
+            self.assertEqual(evidence["fresh"], ["required-market"])
+            self.assertEqual(evidence["grade"], "A")
+            self.assertEqual(evidence["reason_code"], "REQUIRED_MARKETS_FRESH")
+            for timestamp_key in (
+                "newest_required_source_timestamp",
+                "oldest_required_source_timestamp",
+                "newest_required_observed_at",
+                "oldest_required_observed_at",
+            ):
+                self.assertEqual(evidence[timestamp_key], health[timestamp_key])
+            self.assertEqual(
+                evidence["market_diagnostics"][0]["candidate_references"],
+                ["candidate-dashboard"],
+            )
 
     def test_cli_parser_has_required_readiness_commands_and_argument_shapes(self) -> None:
         parser = build_parser()

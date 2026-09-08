@@ -7,7 +7,7 @@ import json
 import threading
 import unittest
 from unittest.mock import Mock, patch
-
+from typing import Mapping
 from axiom.auto_canary import AutonomousCanaryWorker
 from axiom.canary import (
     AUTONOMOUS_MICRO_LIVE,
@@ -177,6 +177,7 @@ def candidate_payload(
             "strategy_id": candidate_id,
         }
         model = {"probability": 0.80}
+        payload["target_market_ids"] = ["market-1"]
         payload["strategy_document"] = strategy
         payload["model_document"] = model
         payload["strategy_hash"] = "sha256:" + hashlib.sha256(
@@ -265,6 +266,17 @@ class AutonomousWorkflowTests(unittest.TestCase):
             },
         )
     def save_forward_canary_snapshot(self, snapshot_id: str = "selection-binding-snapshot") -> None:
+        self.store.save_polymarket_market_metadata(
+            "market-1",
+            {
+                "market_id": "market-1",
+                "active": True,
+                "closed": False,
+                "settlement": "open",
+            },
+            observed_at=T0,
+            source_type="FORWARD_COLLECTED",
+        )
         self.store.save_polymarket_snapshot(
             snapshot_id,
             "market-1",
@@ -869,15 +881,24 @@ class AutonomousWorkflowTests(unittest.TestCase):
         venue = TestVenue()
         checked: list[str] = []
         generated_follower_signal: dict[str, object] = {}
-        original_generate_signal = CanaryService.generate_signal
+        original_evaluate_signal = CanaryService.evaluate_signal
 
-        def generate_signal(service, candidate_id):
+        def evaluate(service, candidate_id, **kwargs):
             checked.append(candidate_id)
             if candidate_id == "same-cluster-representative":
-                return None
-            signal = original_generate_signal(service, candidate_id)
+                return self._signal_evaluation(candidate_id, "NO_STRATEGY_SIGNAL")
+            evaluation = original_evaluate_signal(
+                service,
+                candidate_id,
+                **kwargs,
+            )
+            signal = (
+                evaluation.get("signal")
+                if isinstance(evaluation, Mapping)
+                else None
+            )
             generated_follower_signal["signal"] = signal
-            return signal
+            return evaluation
 
         worker = AutonomousCanaryWorker(
             self.store,
@@ -887,9 +908,9 @@ class AutonomousWorkflowTests(unittest.TestCase):
         )
         with patch.object(
             CanaryService,
-            "generate_signal",
+            "evaluate_signal",
             autospec=True,
-            side_effect=generate_signal,
+            side_effect=evaluate,
         ), patch.object(CredentialStore, "configured", return_value=True):
             result = worker.tick(now=T0)
 
@@ -2274,8 +2295,13 @@ class AutonomousWorkflowTests(unittest.TestCase):
         worker = AutonomousCanaryWorker(self.store, clock=lambda: T0, venue_factory=TestVenue)
         with patch.object(
             CanaryService,
-            "generate_signal",
-            return_value={"status": "UNKNOWN", "signal_id": "unknown-signal"},
+            "evaluate_signal",
+            autospec=True,
+            return_value=self._signal_evaluation(
+                "winner",
+                "COLLECTOR_CANDIDATE_HEALTH_BLOCKED",
+                signal={"status": "UNKNOWN", "signal_id": "unknown-signal"},
+            ),
         ), patch.object(CanaryService, "submit_signal") as submit:
             result = worker.tick(now=T0)
             self.assertEqual(result["blocker"], "UNKNOWN_NO_RETRY")
@@ -2313,6 +2339,93 @@ class AutonomousWorkflowTests(unittest.TestCase):
             "liquidity_feasible": feasible,
             "slippage_feasible": feasible,
         }
+    _SIGNAL_REASON_CODES = (
+        "READY_SIGNAL",
+        "NO_STRATEGY_SIGNAL",
+        "NO_FORWARD_SNAPSHOT",
+        "STALE_FORWARD_EVIDENCE",
+        "MARKET_CLOSED",
+        "MARKET_FILTER_MISMATCH",
+        "CANDIDATE_FORWARD_MARKET_UNRESOLVED",
+        "COLLECTOR_CANDIDATE_HEALTH_BLOCKED",
+    )
+
+    @classmethod
+    def _signal_evaluation(
+        cls,
+        candidate_id: str,
+        reason_code: str,
+        *,
+        signal: Mapping[str, object] | None = None,
+        market_id: str | None = None,
+        required_health: Mapping[str, object] | None = None,
+        evidence: Mapping[str, object] | None = None,
+    ) -> dict[str, object]:
+        return {
+            "candidate_id": candidate_id,
+            "evaluated_at": T0.isoformat(),
+            "reason_code": reason_code,
+            "market_id": market_id,
+            "signal": signal,
+            "required_health": dict(required_health or {}),
+            "evidence": dict(evidence or {}),
+        }
+
+    @staticmethod
+    def _normalized_reason_counts(value):
+        if isinstance(value, str):
+            value = json.loads(value or "{}")
+        return dict(value) if isinstance(value, Mapping) else {}
+
+    def _assert_reason_counts(
+        self,
+        result: Mapping[str, object],
+        expected: Mapping[str, int],
+        *,
+        checked: int | None = None,
+    ) -> None:
+        expected_map = {
+            reason: int(expected.get(reason, 0))
+            for reason in self._SIGNAL_REASON_CODES
+        }
+        result_map = self._normalized_reason_counts(
+            result["signal_scan_reason_counts_json"]
+        )
+        self.assertEqual(result_map, expected_map)
+        if checked is not None:
+            self.assertEqual(sum(result_map.values()), checked)
+            self.assertLessEqual(sum(result_map.values()), checked)
+        state = self.store.connection.execute(
+            "SELECT signal_scan_reason_counts_json "
+            "FROM canary_autonomous_state WHERE singleton=1"
+        ).fetchone()
+        self.assertIsNotNone(state)
+        assert state is not None
+        self.assertEqual(
+            self._normalized_reason_counts(state["signal_scan_reason_counts_json"]),
+            expected_map,
+        )
+        report = self.service.status_report()
+        self.assertEqual(
+            self._normalized_reason_counts(
+                report["worker"]["signal_scan_reason_counts_json"]
+            ),
+            expected_map,
+        )
+        self.assertEqual(
+            self._normalized_reason_counts(
+                report["autonomous"]["signal_scan_reason_counts_json"]
+            ),
+            expected_map,
+        )
+        status = self.service.status()
+        self.assertEqual(
+            self._normalized_reason_counts(
+                status["autonomous"]["signal_scan_reason_counts_json"]
+            ),
+            expected_map,
+        )
+
 
     def _assert_scan_metrics(self, result, expected):
         state = self.store.connection.execute(
@@ -2406,14 +2519,521 @@ class AutonomousWorkflowTests(unittest.TestCase):
         return candidate_ids
 
     def _durable_scan_patches(self, candidate_ids, run_ids, checked):
-        def signal(candidate_id):
+        def evaluate(service, candidate_id, **kwargs):
             checked.append(candidate_id)
-            return None
+            return self._signal_evaluation(candidate_id, "NO_STRATEGY_SIGNAL")
 
         return (
             self._durable_ranking_patch(candidate_ids, run_ids),
             patch.object(CandidateCanaryRanker, "validate_persisted_ranking", return_value=True),
-            patch.object(CanaryService, "generate_signal", side_effect=signal),
+            patch.object(CanaryService, "evaluate_signal", autospec=True, side_effect=evaluate),
+        )
+
+    def test_signal_reason_counts_are_exact_bounded_and_one_per_checked_candidate(self):
+        candidate_ids = self._seed_durable_candidates(8, prefix="reasons")
+        self._enable_worker()
+        reasons = {
+            candidate_ids[0]: "READY_SIGNAL",
+            candidate_ids[1]: "NO_STRATEGY_SIGNAL",
+            candidate_ids[2]: "NO_FORWARD_SNAPSHOT",
+            candidate_ids[3]: "STALE_FORWARD_EVIDENCE",
+            candidate_ids[4]: "MARKET_CLOSED",
+            candidate_ids[5]: "MARKET_FILTER_MISMATCH",
+            candidate_ids[6]: "CANDIDATE_FORWARD_MARKET_UNRESOLVED",
+            candidate_ids[7]: "COLLECTOR_CANDIDATE_HEALTH_BLOCKED",
+        }
+        checked: list[str] = []
+        venue_calls: list[bool] = []
+
+        def evaluate(service, candidate_id, **kwargs):
+            checked.append(candidate_id)
+            reason_code = reasons[candidate_id]
+            signal = (
+                self._ready_signal(candidate_id)
+                if reason_code == "READY_SIGNAL"
+                else None
+            )
+            return self._signal_evaluation(
+                candidate_id,
+                reason_code,
+                signal=signal,
+                market_id="market-1" if signal else None,
+            )
+
+        worker = AutonomousCanaryWorker(
+            self.store,
+            clock=lambda: T0,
+            venue_factory=lambda: venue_calls.append(True),
+        )
+        with patch.object(
+            CanaryService,
+            "evaluate_signal",
+            autospec=True,
+            side_effect=evaluate,
+        ), patch.object(CredentialStore, "configured", return_value=False):
+            result = worker.tick(now=T0)
+
+        expected = {reason: 1 for reason in self._SIGNAL_REASON_CODES}
+        self.assertEqual(checked, candidate_ids)
+        self.assertEqual(result["candidates_signal_checked"], len(candidate_ids))
+        self.assertEqual(result["actionable_candidates_found"], 1)
+        self.assertEqual(result["selected_actionable_candidate"], candidate_ids[0])
+        self.assertEqual(result["selected_actionable_rank"], 1)
+        self.assertEqual(result["status"], "BLOCKED")
+        self.assertEqual(result["blocker"], "CREDENTIALS_NOT_CONFIGURED")
+        self.assertEqual(venue_calls, [])
+        self._assert_reason_counts(result, expected, checked=len(candidate_ids))
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM canary_ledger"
+            ).fetchone()[0],
+            0,
+        )
+
+    def test_reason_counts_persist_across_restart_ranking_and_c_d_telemetry(self):
+        candidate_ids = self._seed_durable_candidates(12, prefix="reason-stable")
+        self._enable_worker()
+        checked: list[str] = []
+
+        def evaluate(service, candidate_id, **kwargs):
+            checked.append(candidate_id)
+            return self._signal_evaluation(candidate_id, "NO_STRATEGY_SIGNAL")
+
+        ranking_patch = self._durable_ranking_patch(
+            candidate_ids,
+            ["reason-run-a", "reason-run-b"],
+        )
+        worker = AutonomousCanaryWorker(self.store, clock=lambda: T0)
+        with ranking_patch, patch.object(
+            CandidateCanaryRanker,
+            "validate_persisted_ranking",
+            return_value=True,
+        ), patch.object(
+            CanaryService,
+            "evaluate_signal",
+            autospec=True,
+            side_effect=evaluate,
+        ):
+            first = worker.tick(now=T0)
+            self.assertEqual(first["signal_scan_checked_this_cycle"], 10)
+            self._assert_reason_counts(
+                first,
+                {"NO_STRATEGY_SIGNAL": 10},
+                checked=10,
+            )
+
+            before = self.service.status()
+            CandidateLifecycleManager(self.store).record_evidence(
+                candidate_ids[0],
+                {
+                    "forward_evidence": {
+                        "forward_liquidity": 0.42,
+                        "forward_max_drawdown": 0.05,
+                        "forward_fills": 17,
+                        "forward_observations": 99,
+                    }
+                },
+                expected_stage=CandidateStage.FROZEN,
+                reason="reason-count telemetry update",
+            )
+            after = self.service.status()
+            for key in (
+                "readiness_snapshot_status",
+                "readiness_snapshot_stale",
+                "readiness_snapshot_reason",
+            ):
+                self.assertEqual(after[key], before[key])
+
+            restarted = AutonomousCanaryWorker(self.store, clock=lambda: T0)
+            second = restarted.tick(now=T0)
+
+        self.assertEqual(second["signal_scan_cycle_id"], first["signal_scan_cycle_id"])
+        self.assertEqual(second["signal_scan_checked_this_cycle"], 12)
+        self.assertEqual(checked[:10], candidate_ids[:10])
+        self.assertEqual(set(checked[10:]), set(candidate_ids[10:]))
+        self.assertEqual(second["signal_scan_ranking_run_id"], "reason-run-b")
+        self._assert_reason_counts(
+            second,
+            {"NO_STRATEGY_SIGNAL": 12},
+            checked=12,
+        )
+
+    def test_reason_counts_reset_only_when_durable_cycle_is_new(self):
+        candidate_ids = self._seed_durable_candidates(2, prefix="reason-reset")
+        self._enable_worker()
+        checked: list[str] = []
+
+        def evaluate(service, candidate_id, **kwargs):
+            checked.append(candidate_id)
+            return self._signal_evaluation(candidate_id, "NO_STRATEGY_SIGNAL")
+
+        ranking_patch = self._durable_ranking_patch(
+            candidate_ids,
+            ["reason-reset-run"] * 2,
+        )
+        worker = AutonomousCanaryWorker(self.store, clock=lambda: T0)
+        with ranking_patch, patch.object(
+            CandidateCanaryRanker,
+            "validate_persisted_ranking",
+            return_value=True,
+        ), patch.object(
+            CanaryService,
+            "evaluate_signal",
+            autospec=True,
+            side_effect=evaluate,
+        ):
+            first = worker.tick(now=T0)
+            self._assert_reason_counts(
+                first,
+                {"NO_STRATEGY_SIGNAL": 2},
+                checked=2,
+            )
+            second = worker.tick(now=T0)
+
+        self.assertEqual(first["signal_scan_status"], "COMPLETE_NO_SIGNAL")
+        self.assertEqual(second["signal_scan_status"], "COMPLETE_NO_SIGNAL")
+        self.assertNotEqual(
+            first["signal_scan_cycle_id"],
+            second["signal_scan_cycle_id"],
+        )
+        self.assertEqual(checked, candidate_ids + candidate_ids)
+        self._assert_reason_counts(
+            second,
+            {"NO_STRATEGY_SIGNAL": 2},
+            checked=2,
+        )
+        cycle_counts = self.store.connection.execute(
+            "SELECT cycle_id,COUNT(*) AS n "
+            "FROM canary_signal_scan_checked GROUP BY cycle_id "
+            "ORDER BY cycle_id"
+        ).fetchall()
+        self.assertEqual(sorted(row["n"] for row in cycle_counts), [2, 2])
+
+    def test_scan_history_retains_latest_eight_cycles_and_active_restart_state(self):
+        completed_cycles = [f"completed-{index:02d}" for index in range(10)]
+        for index, cycle_id in enumerate(completed_cycles):
+            cycle_time = T0 + timedelta(minutes=index)
+            self.service.record_autonomous_decision(
+                next_decision="WAIT_FOR_NEXT_DECISION",
+                worker_status="IDLE",
+                timestamp=cycle_time,
+                signal_scan_cycle_id=cycle_id,
+                signal_scan_cycle_started_at=cycle_time.isoformat(),
+                signal_scan_cycle_completed_at=cycle_time.isoformat(),
+                signal_scan_cycle_complete=True,
+                signal_scan_checked_this_cycle=2,
+                signal_scan_remaining_this_cycle=0,
+                signal_scan_coverage_percentage=100.0,
+                signal_scan_reason_counts_json='{"NO_STRATEGY_SIGNAL":2}',
+                signal_scan_status="COMPLETE_NO_SIGNAL",
+                signal_scan_checked_keys=[
+                    {
+                        "cycle_id": cycle_id,
+                        "candidate_id": f"{cycle_id}-candidate-0",
+                        "qualification_hash": f"{cycle_id}-qualification-0",
+                        "checked_at": cycle_time.isoformat(),
+                    },
+                    {
+                        "cycle_id": cycle_id,
+                        "candidate_id": f"{cycle_id}-candidate-1",
+                        "qualification_hash": f"{cycle_id}-qualification-1",
+                        "checked_at": cycle_time.isoformat(),
+                    },
+                ],
+            )
+
+        active_cycle = "active-current"
+        active_time = T0 + timedelta(minutes=10)
+        active_reason_counts = {"NO_STRATEGY_SIGNAL": 1}
+        self.service.record_autonomous_decision(
+            next_decision="EVALUATING_CANDIDATES",
+            worker_status="RUNNING",
+            timestamp=active_time,
+            signal_scan_cycle_id=active_cycle,
+            signal_scan_cycle_started_at=active_time.isoformat(),
+            signal_scan_cycle_completed_at=None,
+            signal_scan_cycle_complete=False,
+            signal_scan_checked_this_cycle=1,
+            signal_scan_remaining_this_cycle=1,
+            signal_scan_coverage_percentage=50.0,
+            signal_scan_reason_counts_json=json.dumps(active_reason_counts),
+            signal_scan_status="IN_PROGRESS",
+            signal_scan_checked_keys=[
+                {
+                    "cycle_id": active_cycle,
+                    "candidate_id": "active-candidate",
+                    "qualification_hash": "active-qualification",
+                    "checked_at": active_time.isoformat(),
+                }
+            ],
+        )
+
+        rows = self.store.connection.execute(
+            "SELECT cycle_id,candidate_id,qualification_hash "
+            "FROM canary_signal_scan_checked "
+            "ORDER BY cycle_id,candidate_id"
+        ).fetchall()
+        self.assertEqual(
+            {str(row["cycle_id"]) for row in rows},
+            set(completed_cycles[3:]) | {active_cycle},
+        )
+        self.assertEqual(len(rows), 15)
+        self.assertEqual(
+            [(row["cycle_id"], row["candidate_id"]) for row in rows],
+            sorted(
+                [
+                    (cycle_id, f"{cycle_id}-candidate-{candidate_index}")
+                    for cycle_id in completed_cycles[3:]
+                    for candidate_index in range(2)
+                ]
+                + [(active_cycle, "active-candidate")]
+            ),
+        )
+
+        restarted = CanaryService(
+            self.store,
+            credentials=TestCredentials(True),
+            clock=lambda: active_time,
+        )
+        report = restarted.status_report()
+        for projection in (report["worker"], report["autonomous"]):
+            self.assertEqual(projection["signal_scan_cycle_id"], active_cycle)
+            self.assertEqual(projection["signal_scan_checked_this_cycle"], 1)
+            self.assertEqual(projection["signal_scan_remaining_this_cycle"], 1)
+            self.assertEqual(projection["signal_scan_coverage_percentage"], 50.0)
+            self.assertEqual(
+                self._normalized_reason_counts(
+                    projection["signal_scan_reason_counts_json"]
+                ),
+                active_reason_counts,
+            )
+        self.assertEqual(
+            report["worker"]["signal_scan_checked_keys"],
+            [
+                {
+                    "cycle_id": active_cycle,
+                    "candidate_id": "active-candidate",
+                    "qualification_hash": "active-qualification",
+                    "checked_at": active_time.isoformat(),
+                    "rank_at_check": None,
+                    "ranking_run_id": None,
+                }
+            ],
+        )
+
+    def test_ready_reason_count_and_selection_are_rank_ordered_without_order(self):
+        candidate_ids = self._seed_durable_candidates(3, prefix="reason-ready")
+        self._enable_worker()
+        checked: list[str] = []
+        venue_calls: list[bool] = []
+
+        def evaluate(service, candidate_id, **kwargs):
+            checked.append(candidate_id)
+            if candidate_id in candidate_ids[:2]:
+                signal = self._ready_signal(candidate_id)
+                return self._signal_evaluation(
+                    candidate_id,
+                    "READY_SIGNAL",
+                    signal=signal,
+                    market_id="market-1",
+                )
+            return self._signal_evaluation(candidate_id, "NO_STRATEGY_SIGNAL")
+
+        worker = AutonomousCanaryWorker(
+            self.store,
+            clock=lambda: T0,
+            venue_factory=lambda: venue_calls.append(True),
+        )
+        with patch.object(
+            CanaryService,
+            "evaluate_signal",
+            autospec=True,
+            side_effect=evaluate,
+        ), patch.object(CredentialStore, "configured", return_value=False):
+            result = worker.tick(now=T0)
+
+        self.assertEqual(checked, candidate_ids)
+        self.assertEqual(result["actionable_candidates_found"], 2)
+        self.assertEqual(result["selected_actionable_candidate"], candidate_ids[0])
+        self.assertEqual(result["selected_actionable_rank"], 1)
+        self.assertEqual(result["blocker"], "CREDENTIALS_NOT_CONFIGURED")
+        self.assertEqual(venue_calls, [])
+        self._assert_reason_counts(
+            result,
+            {"READY_SIGNAL": 2, "NO_STRATEGY_SIGNAL": 1},
+            checked=3,
+        )
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM canary_ledger"
+            ).fetchone()[0],
+            0,
+        )
+
+    def test_ready_candidates_produce_at_most_one_order_decision(self):
+        candidate_ids = self._seed_durable_candidates(3, prefix="reason-order")
+        self._enable_worker()
+        checked: list[str] = []
+        venue = TestVenue()
+
+        def evaluate(service, candidate_id, **kwargs):
+            checked.append(candidate_id)
+            signal = self._ready_signal(candidate_id)
+            return self._signal_evaluation(
+                candidate_id,
+                "READY_SIGNAL",
+                signal=signal,
+                market_id="market-1",
+            )
+
+        worker = AutonomousCanaryWorker(
+            self.store,
+            clock=lambda: T0,
+            venue_factory=lambda: venue,
+            allow_test_venue=True,
+        )
+        with patch.object(
+            CanaryService,
+            "evaluate_signal",
+            autospec=True,
+            side_effect=evaluate,
+        ), patch.object(
+            CanaryService,
+            "bind_autonomous_actionable_candidate",
+            return_value={"bound": True},
+        ) as bind, patch.object(
+            CanaryService,
+            "submit_signal",
+            return_value={"ok": True, "order_id": "reason-order"},
+        ) as submit, patch.object(
+            CredentialStore,
+            "configured",
+            return_value=True,
+        ):
+            result = worker.tick(now=T0)
+
+        self.assertEqual(result["status"], "SUBMITTED")
+        self.assertEqual(checked, candidate_ids)
+        self.assertEqual(result["actionable_candidates_found"], 3)
+        self.assertEqual(result["selected_actionable_candidate"], candidate_ids[0])
+        submit.assert_called_once_with(
+            "signal-" + candidate_ids[0],
+            venue=venue,
+            allow_test_venue=True,
+        )
+        bind.assert_called_once_with(
+            candidate_ids[0],
+            ranking_run_id=result["ranking"]["ranking_run_id"],
+            signal_id="signal-" + candidate_ids[0],
+        )
+        self.assertEqual(len(venue.submissions), 0)
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT orders_attempted FROM canary_autonomous_state "
+                "WHERE singleton=1"
+            ).fetchone()[0],
+            1,
+        )
+        self._assert_reason_counts(
+            result,
+            {"READY_SIGNAL": 3},
+            checked=3,
+        )
+
+    def test_lifecycle_snapshot_changed_retries_at_most_three_times_without_reset(self):
+        candidate_ids = self._seed_durable_candidates(12, prefix="reason-race")
+        self._enable_worker()
+        checked: list[str] = []
+
+        def evaluate(service, candidate_id, **kwargs):
+            checked.append(candidate_id)
+            return self._signal_evaluation(candidate_id, "NO_STRATEGY_SIGNAL")
+
+        first_patches = self._durable_scan_patches(
+            candidate_ids,
+            ["reason-race-run"],
+            checked,
+        )
+        worker = AutonomousCanaryWorker(self.store, clock=lambda: T0)
+        with first_patches[0], first_patches[1], patch.object(
+            CanaryService,
+            "evaluate_signal",
+            autospec=True,
+            side_effect=evaluate,
+        ):
+            first = worker.tick(now=T0)
+
+        self.assertEqual(first["signal_scan_checked_this_cycle"], 10)
+        cycle_id = first["signal_scan_cycle_id"]
+        self._assert_reason_counts(
+            first,
+            {"NO_STRATEGY_SIGNAL": 10},
+            checked=10,
+        )
+
+        class LifecycleSnapshotChanged(RuntimeError):
+            error_code = "LIFECYCLE_SNAPSHOT_CHANGED"
+
+        restarted = AutonomousCanaryWorker(self.store, clock=lambda: T0)
+        with patch.object(
+            CandidateCanaryRanker,
+            "evaluate_and_select",
+            autospec=True,
+            side_effect=LifecycleSnapshotChanged("ranker race"),
+        ) as evaluate_and_select, patch.object(
+            CanaryService,
+            "evaluate_signal",
+            autospec=True,
+            side_effect=AssertionError("transient rank race must not scan candidates"),
+        ):
+            raced = restarted.tick(now=T0)
+
+        self.assertEqual(evaluate_and_select.call_count, 3)
+        self.assertEqual(raced["status"], "ERROR")
+        self.assertEqual(checked, candidate_ids[:10])
+        state = self.store.connection.execute(
+            "SELECT signal_scan_cycle_id,signal_scan_checked_this_cycle,"
+            "signal_scan_remaining_this_cycle,signal_scan_reason_counts_json "
+            "FROM canary_autonomous_state WHERE singleton=1"
+        ).fetchone()
+        self.assertEqual(state["signal_scan_cycle_id"], cycle_id)
+        self.assertEqual(state["signal_scan_checked_this_cycle"], 10)
+        self.assertEqual(state["signal_scan_remaining_this_cycle"], 2)
+        self.assertEqual(
+            self._normalized_reason_counts(
+                state["signal_scan_reason_counts_json"]
+            ),
+            {
+                reason: 10 if reason == "NO_STRATEGY_SIGNAL" else 0
+                for reason in self._SIGNAL_REASON_CODES
+            },
+        )
+        report = self.service.status_report()
+        self.assertEqual(
+            self._normalized_reason_counts(
+                report["worker"]["signal_scan_reason_counts_json"]
+            ),
+            {
+                reason: 10 if reason == "NO_STRATEGY_SIGNAL" else 0
+                for reason in self._SIGNAL_REASON_CODES
+            },
+        )
+        self.assertEqual(
+            self._normalized_reason_counts(
+                report["autonomous"]["signal_scan_reason_counts_json"]
+            ),
+            {
+                reason: 10 if reason == "NO_STRATEGY_SIGNAL" else 0
+                for reason in self._SIGNAL_REASON_CODES
+            },
+        )
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM canary_signal_scan_checked "
+                "WHERE cycle_id=?",
+                (cycle_id,),
+            ).fetchone()[0],
+            10,
         )
 
     def test_durable_no_signal_cycle_is_exactly_10_10_8_then_next_tick_starts_cycle(self):
@@ -2428,10 +3048,30 @@ class AutonomousWorkflowTests(unittest.TestCase):
         worker = AutonomousCanaryWorker(self.store, clock=lambda: T0)
         with patches[0], patches[1], patches[2]:
             first = worker.tick(now=T0)
+            self._assert_reason_counts(
+                first,
+                {"NO_STRATEGY_SIGNAL": 10},
+                checked=10,
+            )
             second = worker.tick(now=T0)
+            self._assert_reason_counts(
+                second,
+                {"NO_STRATEGY_SIGNAL": 20},
+                checked=20,
+            )
             restarted = AutonomousCanaryWorker(self.store, clock=lambda: T0)
             third = restarted.tick(now=T0)
+            self._assert_reason_counts(
+                third,
+                {"NO_STRATEGY_SIGNAL": 28},
+                checked=28,
+            )
             complete = restarted.tick(now=T0)
+            self._assert_reason_counts(
+                complete,
+                {"NO_STRATEGY_SIGNAL": 10},
+                checked=10,
+            )
 
         self.assertEqual(
             [first["candidates_signal_checked"],
@@ -2492,9 +3132,6 @@ class AutonomousWorkflowTests(unittest.TestCase):
         ranking = CandidateCanaryRanker(self.store, clock=lambda: T0).evaluate_and_select(T0)
         self._enable_worker()
 
-        def signal(candidate_id):
-            checked.append(candidate_id)
-            return None
 
         worker = AutonomousCanaryWorker(self.store, clock=lambda: T0)
         with patch.object(
@@ -2508,8 +3145,12 @@ class AutonomousWorkflowTests(unittest.TestCase):
             return_value=True,
         ), patch.object(
             CanaryService,
-            "generate_signal",
-            side_effect=signal,
+            "evaluate_signal",
+            autospec=True,
+            side_effect=lambda service, candidate_id, **kwargs: (
+                checked.append(candidate_id)
+                or self._signal_evaluation(candidate_id, "NO_STRATEGY_SIGNAL")
+            ),
         ):
             first = worker.tick(now=T0)
             failed = worker.tick(now=T0)
@@ -2572,19 +3213,19 @@ class AutonomousWorkflowTests(unittest.TestCase):
             20,
         )
 
-    def test_signal_generation_exception_persists_active_cycle_for_restart(self):
+    def test_signal_evaluation_exception_persists_active_cycle_for_restart(self):
         candidate_ids = self._seed_durable_candidates(11, prefix="signal-failure")
         self._enable_worker()
         calls: list[str] = []
         failed_once = True
 
-        def signal(candidate_id):
+        def evaluate(service, candidate_id, **kwargs):
             nonlocal failed_once
             calls.append(candidate_id)
             if failed_once and len(calls) == 2:
                 failed_once = False
-                raise RuntimeError("injected signal-generation failure")
-            return None
+                raise RuntimeError("injected signal-evaluation failure")
+            return self._signal_evaluation(candidate_id, "NO_STRATEGY_SIGNAL")
 
         ranking_patch = self._durable_ranking_patch(
             candidate_ids,
@@ -2595,7 +3236,12 @@ class AutonomousWorkflowTests(unittest.TestCase):
             CandidateCanaryRanker,
             "validate_persisted_ranking",
             return_value=True,
-        ), patch.object(CanaryService, "generate_signal", side_effect=signal):
+        ), patch.object(
+            CanaryService,
+            "evaluate_signal",
+            autospec=True,
+            side_effect=evaluate,
+        ):
             failed = worker.tick(now=T0)
 
             self.assertEqual(failed["status"], "ERROR")
@@ -2866,9 +3512,9 @@ class AutonomousWorkflowTests(unittest.TestCase):
                     )
             return result
 
-        def signal(candidate_id):
+        def signal_evaluation(service, candidate_id, **kwargs):
             checked.append(candidate_id)
-            return None
+            return self._signal_evaluation(candidate_id, "NO_STRATEGY_SIGNAL")
 
         with patch.object(
             CandidateCanaryRanker,
@@ -2881,8 +3527,9 @@ class AutonomousWorkflowTests(unittest.TestCase):
             return_value=True,
         ), patch.object(
             CanaryService,
-            "generate_signal",
-            side_effect=signal,
+            "evaluate_signal",
+            autospec=True,
+            side_effect=signal_evaluation,
         ):
             first = worker.tick(now=T0)
             second = worker.tick(now=T0)
@@ -2908,11 +3555,17 @@ class AutonomousWorkflowTests(unittest.TestCase):
             allow_test_venue=True,
         )
 
-        def signal(candidate_id):
+        def signal_evaluation(service, candidate_id, **kwargs):
             checked.append(candidate_id)
             if candidate_id == candidate_ids[1]:
-                return self._ready_signal(candidate_id)
-            return None
+                signal = self._ready_signal(candidate_id)
+                return self._signal_evaluation(
+                    candidate_id,
+                    "READY_SIGNAL",
+                    signal=signal,
+                    market_id="market-1",
+                )
+            return self._signal_evaluation(candidate_id, "NO_STRATEGY_SIGNAL")
 
         ranking_patch = self._durable_ranking_patch(candidate_ids, ["ready-run"])
         with ranking_patch, patch.object(
@@ -2921,8 +3574,9 @@ class AutonomousWorkflowTests(unittest.TestCase):
             return_value=True,
         ), patch.object(
             CanaryService,
-            "generate_signal",
-            side_effect=signal,
+            "evaluate_signal",
+            autospec=True,
+            side_effect=signal_evaluation,
         ), patch.object(
             CanaryService,
             "bind_autonomous_actionable_candidate",
@@ -2973,15 +3627,19 @@ class AutonomousWorkflowTests(unittest.TestCase):
             self.store, clock=lambda: T0, venue_factory=lambda: venue
         )
 
-        def signal(candidate_id):
+        def signal_evaluation(service, candidate_id, **kwargs):
             checked.append(candidate_id)
-            return (
-                self._ready_signal(candidate_id)
-                if candidate_id == "rank-two"
-                else None
-            )
+            if candidate_id == "rank-two":
+                signal = self._ready_signal(candidate_id)
+                return self._signal_evaluation(
+                    candidate_id,
+                    "READY_SIGNAL",
+                    signal=signal,
+                    market_id="market-1",
+                )
+            return self._signal_evaluation(candidate_id, "NO_STRATEGY_SIGNAL")
 
-        with patch.object(CanaryService, "generate_signal", side_effect=signal), \
+        with patch.object(CanaryService, "evaluate_signal", autospec=True, side_effect=signal_evaluation), \
             patch.object(
                 CanaryService,
                 "submit_signal",
@@ -3087,11 +3745,17 @@ class AutonomousWorkflowTests(unittest.TestCase):
             self.store, clock=lambda: T0, venue_factory=TestVenue
         )
 
-        def signal(candidate_id):
+        def signal_evaluation(service, candidate_id, **kwargs):
             checked.append(candidate_id)
-            return self._ready_signal(candidate_id)
+            signal = self._ready_signal(candidate_id)
+            return self._signal_evaluation(
+                candidate_id,
+                "READY_SIGNAL",
+                signal=signal,
+                market_id="market-1",
+            )
 
-        with patch.object(CanaryService, "generate_signal", side_effect=signal), \
+        with patch.object(CanaryService, "evaluate_signal", autospec=True, side_effect=signal_evaluation), \
             patch.object(
                 CanaryService,
                 "submit_signal",
@@ -3170,19 +3834,27 @@ class AutonomousWorkflowTests(unittest.TestCase):
             venue_factory=lambda: venue,
             allow_test_venue=True,
         )
-        original_generate_signal = CanaryService.generate_signal
+        original_evaluate_signal = CanaryService.evaluate_signal
 
-        def generate_signal(service, candidate_id):
+        def evaluate_signal(service, candidate_id, **kwargs):
             checked.append(candidate_id)
-            signal = original_generate_signal(service, candidate_id)
-            generated[candidate_id] = signal
-            return signal
+            evaluation = original_evaluate_signal(
+                service,
+                candidate_id,
+                **kwargs,
+            )
+            generated[candidate_id] = (
+                evaluation.get("signal")
+                if isinstance(evaluation, Mapping)
+                else None
+            )
+            return evaluation
 
         with patch.object(
             CanaryService,
-            "generate_signal",
+            "evaluate_signal",
             autospec=True,
-            side_effect=generate_signal,
+            side_effect=evaluate_signal,
         ), patch.object(CredentialStore, "configured", return_value=True):
             result = worker.tick(now=T0)
 
@@ -3328,8 +4000,12 @@ class AutonomousWorkflowTests(unittest.TestCase):
 
         with patch.object(
             CanaryService,
-            "generate_signal",
-            side_effect=lambda candidate_id: checked.append(candidate_id) or None,
+            "evaluate_signal",
+            autospec=True,
+            side_effect=lambda service, candidate_id, **kwargs: (
+                checked.append(candidate_id)
+                or self._signal_evaluation(candidate_id, "NO_STRATEGY_SIGNAL")
+            ),
         ):
             first = worker.tick(now=T0)
             first_state = self.store.connection.execute(
@@ -3416,11 +4092,16 @@ class AutonomousWorkflowTests(unittest.TestCase):
             venue_factory=lambda: venue_calls.append(True),
         )
 
-        def signal(candidate_id):
+        def signal_evaluation(service, candidate_id, **kwargs):
             checked.append(candidate_id)
-            return None
+            return self._signal_evaluation(candidate_id, "NO_STRATEGY_SIGNAL")
 
-        with patch.object(CanaryService, "generate_signal", side_effect=signal), \
+        with patch.object(
+            CanaryService,
+            "evaluate_signal",
+            autospec=True,
+            side_effect=signal_evaluation,
+        ), \
             patch.object(CanaryService, "submit_signal") as submit:
             result = worker.tick(now=T0)
 
@@ -3459,15 +4140,19 @@ class AutonomousWorkflowTests(unittest.TestCase):
             self.store, clock=lambda: T0, venue_factory=TestVenue
         )
 
-        def signal(candidate_id):
+        def signal_evaluation(service, candidate_id, **kwargs):
             checked.append(candidate_id)
-            return (
-                self._ready_signal(candidate_id)
-                if candidate_id == "window-12"
-                else None
-            )
+            if candidate_id == "window-12":
+                signal = self._ready_signal(candidate_id)
+                return self._signal_evaluation(
+                    candidate_id,
+                    "READY_SIGNAL",
+                    signal=signal,
+                    market_id="market-1",
+                )
+            return self._signal_evaluation(candidate_id, "NO_STRATEGY_SIGNAL")
 
-        with patch.object(CanaryService, "generate_signal", side_effect=signal), \
+        with patch.object(CanaryService, "evaluate_signal", autospec=True, side_effect=signal_evaluation), \
             patch.object(
                 CanaryService,
                 "submit_signal",
@@ -3522,8 +4207,12 @@ class AutonomousWorkflowTests(unittest.TestCase):
 
         with patch.object(
             CanaryService,
-            "generate_signal",
-            side_effect=lambda candidate_id: checked.append(candidate_id) or None,
+            "evaluate_signal",
+            autospec=True,
+            side_effect=lambda service, candidate_id, **kwargs: (
+                checked.append(candidate_id)
+                or self._signal_evaluation(candidate_id, "NO_STRATEGY_SIGNAL")
+            ),
         ):
             first = worker.tick(now=T0)
             first_state = self.store.connection.execute(
@@ -3580,15 +4269,19 @@ class AutonomousWorkflowTests(unittest.TestCase):
             self.store, clock=lambda: T0, venue_factory=TestVenue
         )
 
-        def signal(candidate_id):
+        def signal_evaluation(service, candidate_id, **kwargs):
             checked.append(candidate_id)
-            return (
-                self._ready_signal(candidate_id)
-                if candidate_id == "cluster-j-one"
-                else None
-            )
+            if candidate_id == "cluster-j-one":
+                signal = self._ready_signal(candidate_id)
+                return self._signal_evaluation(
+                    candidate_id,
+                    "READY_SIGNAL",
+                    signal=signal,
+                    market_id="market-1",
+                )
+            return self._signal_evaluation(candidate_id, "NO_STRATEGY_SIGNAL")
 
-        with patch.object(CanaryService, "generate_signal", side_effect=signal), \
+        with patch.object(CanaryService, "evaluate_signal", autospec=True, side_effect=signal_evaluation), \
             patch.object(
                 CanaryService,
                 "submit_signal",
@@ -3646,8 +4339,12 @@ class AutonomousWorkflowTests(unittest.TestCase):
 
         with patch.object(
             CanaryService,
-            "generate_signal",
-            side_effect=lambda candidate_id: checked.append(candidate_id) or None,
+            "evaluate_signal",
+            autospec=True,
+            side_effect=lambda service, candidate_id, **kwargs: (
+                checked.append(candidate_id)
+                or self._signal_evaluation(candidate_id, "NO_STRATEGY_SIGNAL")
+            ),
         ):
             first = worker.tick(now=T0)
             second = worker.tick(now=T0)
@@ -3668,7 +4365,7 @@ class AutonomousWorkflowTests(unittest.TestCase):
         self.assertEqual(set(checked[10:]), set(followers))
         self.assertEqual(set(checked), set(representatives + followers))
 
-    def test_stale_and_invalid_rankings_are_skipped_before_signal_generation(self):
+    def test_stale_and_invalid_rankings_are_skipped_before_signal_evaluation(self):
         self.seed_candidate("stale-ranking", cluster="stale", score=0.90)
         self.seed_candidate("valid-ranking", cluster="valid", score=0.80)
         self.seed_candidate("invalid-ranking", cluster="invalid", score=0.70)
@@ -3691,16 +4388,20 @@ class AutonomousWorkflowTests(unittest.TestCase):
                     ("invalid-ranking",),
                 )
 
-        def signal(candidate_id):
+        def signal_evaluation(service, candidate_id, **kwargs):
             checked.append(candidate_id)
-            return (
-                self._ready_signal(candidate_id)
-                if candidate_id == "valid-ranking"
-                else None
-            )
+            if candidate_id == "valid-ranking":
+                signal = self._ready_signal(candidate_id)
+                return self._signal_evaluation(
+                    candidate_id,
+                    "READY_SIGNAL",
+                    signal=signal,
+                    market_id="market-1",
+                )
+            return self._signal_evaluation(candidate_id, "NO_STRATEGY_SIGNAL")
 
         with self._post_rank_mutation(mutate), \
-            patch.object(CanaryService, "generate_signal", side_effect=signal), \
+            patch.object(CanaryService, "evaluate_signal", autospec=True, side_effect=signal_evaluation), \
             patch.object(
                 CanaryService,
                 "submit_signal",
@@ -3743,8 +4444,14 @@ class AutonomousWorkflowTests(unittest.TestCase):
         )
         with patch.object(
             CanaryService,
-            "generate_signal",
-            side_effect=lambda candidate_id: self._ready_signal(candidate_id),
+            "evaluate_signal",
+            autospec=True,
+            side_effect=lambda service, candidate_id, **kwargs: self._signal_evaluation(
+                candidate_id,
+                "READY_SIGNAL",
+                signal=self._ready_signal(candidate_id),
+                market_id="market-1",
+            ),
         ), patch.object(
             CanaryService,
             "submit_signal",
@@ -3786,8 +4493,14 @@ class AutonomousWorkflowTests(unittest.TestCase):
         )
         with patch.object(
             CanaryService,
-            "generate_signal",
-            side_effect=lambda candidate_id: self._ready_signal(candidate_id),
+            "evaluate_signal",
+            autospec=True,
+            side_effect=lambda service, candidate_id, **kwargs: self._signal_evaluation(
+                candidate_id,
+                "READY_SIGNAL",
+                signal=self._ready_signal(candidate_id),
+                market_id="market-1",
+            ),
         ), patch.object(
             CanaryService,
             "submit_signal",
@@ -3857,6 +4570,17 @@ class AutonomousWorkflowTests(unittest.TestCase):
 
     def test_execution_quality_deltas_are_persisted(self):
         payload = self.seed_candidate("executable", executable=True)
+        self.store.save_polymarket_market_metadata(
+            "market-1",
+            {
+                "market_id": "market-1",
+                "active": True,
+                "closed": False,
+                "settlement": "open",
+            },
+            observed_at=T0,
+            source_type="FORWARD_COLLECTED",
+        )
         self.store.save_polymarket_snapshot(
             "snapshot-1",
             "market-1",

@@ -1,8 +1,11 @@
 from __future__ import annotations
 from copy import deepcopy
+from dataclasses import replace
 
 from datetime import datetime, timedelta, timezone
 import io
+import threading
+import time
 import json
 from pathlib import Path
 import tempfile
@@ -12,6 +15,7 @@ from urllib.request import Request
 from axiom.collector import CollectorConfig, PolymarketCollector
 from axiom.data import InMemoryPredictionProvider, PolymarketAdapter
 from axiom.data._http import HTTPFetchError, fetch_json_strict
+from axiom.canary import CanaryService
 from axiom.director import research_summary, validate_hermes_proposal
 from axiom.domain import (
     CryptoTicker,
@@ -89,6 +93,120 @@ class _StaticCryptoProvider:
 
     def order_book(self, symbol: str, *, depth: int = 20) -> OrderBookSnapshot:
         return OrderBookSnapshot(T0, (OrderBookLevel(99.0, 10.0),), (OrderBookLevel(101.0, 10.0),))
+class _RecordingPredictionProvider(InMemoryPredictionProvider):
+    provider_name = "recording-memory"
+
+    def __init__(self, markets: tuple[PredictionMarketSnapshot, ...], *, failures: set[tuple[str, str]] | None = None) -> None:
+        super().__init__(markets)
+        self.calls: list[tuple[str, str]] = []
+        self.failures = set(failures or ())
+
+    def _call(self, operation: str, market_id: str) -> None:
+        self.calls.append((operation, market_id))
+        if (operation, market_id) in self.failures:
+            raise OSError(f"{operation} failed for {market_id}")
+
+    def market(self, market_id: str) -> PredictionMarketSnapshot | None:
+        self._call("market", market_id)
+        return super().market(market_id)
+
+    def metadata(self, market_id: str):
+        self._call("metadata", market_id)
+        return super().metadata(market_id)
+
+    def order_books(self, market_id: str, depth: int = 20):
+        self._call("order_books", market_id)
+        return super().order_books(market_id, depth=depth)
+
+    def trades(self, market_id: str, start: datetime | None = None, end: datetime | None = None):
+        self._call("trades", market_id)
+        return super().trades(market_id, start=start, end=end)
+
+
+def _seed_frozen_candidate(store: AxiomStore, candidate_id: str, market_ids: tuple[str, ...]) -> None:
+    lifecycle = CandidateLifecycleManager(store)
+    lifecycle.register_idea(candidate_id, {"candidate_id": candidate_id, "market_ids": list(market_ids)})
+    lifecycle.advance(candidate_id, CandidateStage.SCHEMA_VALIDATED, {"schema_valid": True})
+    lifecycle.advance(candidate_id, CandidateStage.BACKTESTED, {"backtest_complete": True})
+    lifecycle.advance(candidate_id, CandidateStage.VALIDATED, {"validation_complete": True, "holdout_used": False})
+    lifecycle.advance(candidate_id, CandidateStage.ROBUSTNESS_CHECKED, {"robustness_passed": True})
+    lifecycle.advance(
+        candidate_id,
+        CandidateStage.FROZEN,
+        {
+            "frozen": True,
+            "frozen_hash": f"frozen-{candidate_id}",
+            "holdout_used": False,
+            "strategy_hash": f"strategy-{candidate_id}",
+            "model_hash": f"model-{candidate_id}",
+            "config_hash": f"config-{candidate_id}",
+            "risk_snapshot": {"max_position_fraction": 0.05},
+        },
+    )
+
+
+def _seed_candidate_authority(store: AxiomStore, candidate_id: str, rank: int) -> None:
+    CanaryService(store, initialize=True)
+    payload = store.load_candidate_lifecycle(candidate_id)["payload"]
+    frozen_hash = str(payload.get("frozen_hash", f"frozen-{candidate_id}"))
+    timestamp = T0.isoformat()
+    store.connection.execute(
+        "INSERT OR REPLACE INTO canary_eligibility(candidate_id,eligible_at,frozen_hash,evidence_json) VALUES (?,?,?,?)",
+        (candidate_id, timestamp, frozen_hash, json.dumps(payload, sort_keys=True)),
+    )
+    store.connection.execute(
+        "INSERT OR REPLACE INTO canary_rankings("
+        "candidate_id,ranking_run_id,ranking_timestamp,rank,total_score,component_scores_json,"
+        "evidence_versions_json,cluster_key,cluster_representative,selected,reason"
+        ") VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            candidate_id,
+            "test-ranking",
+            timestamp,
+            rank,
+            float(1.0 / max(rank, 1)),
+            "{}",
+            "{}",
+            f"cluster-{candidate_id}",
+            1,
+            1,
+            "selected for collector fixture",
+        ),
+    )
+    store.connection.commit()
+
+
+def _seed_forward_metadata(store: AxiomStore, market_ids: tuple[str, ...]) -> None:
+    for market_id in market_ids:
+        store.save_polymarket_market_metadata(
+            market_id,
+            {
+                "source_type": "FORWARD_COLLECTED",
+                "active": True,
+                "closed": False,
+                "metadata": {"category": "test"},
+                "snapshot": {
+                    "market_id": market_id,
+                    "settlement": "open",
+                    "expiry": (T0 + timedelta(days=2)).isoformat(),
+                },
+            },
+            observed_at=T0,
+            source_type="FORWARD_COLLECTED",
+        )
+def _timestamped_market(market_id: str, timestamp: datetime) -> PredictionMarketSnapshot:
+    base = market(market_id)
+    book = OrderBookSnapshot(
+        timestamp,
+        (OrderBookLevel(base.yes_bid or 0.49, 10.0),),
+        (OrderBookLevel(base.yes_ask or 0.51, 10.0),),
+        "yes",
+    )
+    return replace(base, timestamp=timestamp, order_book=book)
+
+
+
+
 
 
 
@@ -123,6 +241,27 @@ class Phase3CollectionTests(unittest.TestCase):
         self.assertEqual(snapshot.market_id, "condition-1")
         self.assertEqual(adapter.token_ids("condition-1"), {"yes": "yes-token", "no": "no-token"})
         self.assertEqual(adapter.metadata("condition-1").market_id, "condition-1")
+    def test_crossed_yes_quote_is_sanitized_before_snapshot_construction(self) -> None:
+        raw = {
+            "conditionId": "crossed",
+            "question": "Will it happen?",
+            "outcomes": ["Yes", "No"],
+            "clobTokenIds": ["yes-token", "no-token"],
+            "outcomePrices": ["0.5", "0.5"],
+            "yesBid": "0.80",
+            "yesAsk": "0.20",
+            "updatedAt": "2025-01-01T00:00:00Z",
+        }
+
+        adapter = PolymarketAdapter(opener=lambda _request, timeout: _Response(raw))
+        snapshot = adapter.market("crossed")
+
+        self.assertIsNotNone(snapshot)
+        self.assertIsNone(snapshot.yes_bid)
+        self.assertIsNone(snapshot.yes_ask)
+        self.assertIsNone(snapshot.no_bid)
+        self.assertIsNone(snapshot.no_ask)
+
 
     def test_collector_retries_and_retains_bounded_cycles(self) -> None:
         base = market("m", expiry=T0 + timedelta(days=3))
@@ -192,6 +331,495 @@ class Phase3CollectionTests(unittest.TestCase):
             collector.collect_once(now=T0 + timedelta(seconds=1))
             self.assertIsNone(store.get_collector_state(state_key)["last_trade_cursor"])
             self.assertEqual(len(store.load_polymarket_trades("m")), 2)
+
+    def test_candidate_paper_discovery_priority_keeps_required_markets_inside_total_cap(self) -> None:
+        ids = ("candidate-a", "candidate-b", "paper-a", "discovery-a", "discovery-b")
+        snapshots = tuple(market(identifier) for identifier in ids)
+        provider = _RecordingPredictionProvider(snapshots)
+        with AxiomStore(":memory:") as store:
+            _seed_forward_metadata(store, ids)
+            _seed_frozen_candidate(store, "candidate-priority", ("candidate-a", "candidate-b"))
+            _seed_candidate_authority(store, "candidate-priority", 1)
+            _seed_frozen_candidate(store, "paper-priority", ("paper-a",))
+            CandidateLifecycleManager(store).advance(
+                "paper-priority",
+                CandidateStage.PAPER_FORWARD,
+                {"paper_forward_started": True, "forward_test_id": "paper-priority"},
+            )
+            collector = PolymarketCollector(
+                provider,
+                store,
+                CollectorConfig(
+                    interval_seconds=60,
+                    max_markets=4,
+                    discovery_budget_per_cycle=1,
+                    backoff_initial_seconds=0,
+                    jitter_seconds=0,
+                ),
+                clock=lambda: T0,
+                sleep=lambda _seconds: None,
+            )
+            cycle = collector.collect_once(now=T0)
+
+            self.assertEqual(list(cycle.candidate_bound_markets), ["candidate-a", "candidate-b"])
+            self.assertEqual(list(cycle.candidate_bound_scheduled), ["candidate-a", "candidate-b"])
+            self.assertEqual(list(cycle.candidate_bound_fresh), ["candidate-a", "candidate-b"])
+            self.assertEqual(list(cycle.candidate_bound_stale), [])
+            self.assertEqual(list(cycle.candidate_bound_missing), [])
+            self.assertEqual(list(cycle.paper_forward_markets), ["paper-a"])
+            self.assertEqual(list(cycle.paper_forward_scheduled), ["paper-a"])
+            self.assertEqual(list(cycle.discovery_scheduled), ["discovery-a"])
+            self.assertEqual(list(cycle.discovery_deferred), ["discovery-b"])
+            self.assertEqual(cycle.tier_attempts["candidate"], 2)  # type: ignore[index]
+            self.assertEqual(cycle.tier_successes["candidate"], 2)  # type: ignore[index]
+            self.assertEqual(cycle.tier_attempts["paper_forward"], 1)  # type: ignore[index]
+            self.assertEqual(cycle.tier_successes["paper_forward"], 1)  # type: ignore[index]
+            self.assertEqual(cycle.tier_attempts["discovery"], 1)  # type: ignore[index]
+            self.assertEqual(cycle.tier_successes["discovery"], 1)  # type: ignore[index]
+            self.assertEqual(cycle.markets_seen, 4)
+            self.assertEqual(cycle.markets_attempted, 4)
+            self.assertEqual(
+                list(dict.fromkeys(item[1] for item in provider.calls if item[0] == "market")),
+                ["candidate-a", "candidate-b", "paper-a", "discovery-a"],
+            )
+            self.assertLessEqual(
+                len([item for item in provider.calls if item[0] == "market"]),
+                4 * CollectorConfig().max_attempts,
+            )
+            self.assertFalse(any(item[0] in {"order", "submit", "sign"} for item in provider.calls))
+    def test_discovery_budget_rotates_with_persisted_carry_cursor(self) -> None:
+        provider = _RecordingPredictionProvider(tuple(market(f"discovery-{index}") for index in range(3)))
+        with AxiomStore(":memory:") as store:
+            collector = PolymarketCollector(
+                provider,
+                store,
+                CollectorConfig(
+                    interval_seconds=60,
+                    max_markets=1,
+                    discovery_budget_per_cycle=1,
+                    max_attempts=1,
+                    jitter_seconds=0,
+                ),
+                clock=lambda: T0,
+                sleep=lambda _seconds: None,
+            )
+            first = collector.collect_once(now=T0)
+            second = collector.collect_once(now=T0 + timedelta(seconds=60))
+
+            self.assertEqual(list(first.discovery_scheduled), ["discovery-0"])
+            self.assertEqual(list(first.discovery_deferred), ["discovery-1", "discovery-2"])
+            self.assertEqual(list(second.discovery_scheduled), ["discovery-1"])
+            self.assertEqual(list(second.discovery_deferred), ["discovery-2", "discovery-0"])
+            state = store.get_collector_state("polymarket")
+            self.assertTrue(any(key in state for key in ("discovery_carry_cursor", "discovery_cursor")))
+
+
+    def test_capacity_reason_is_explicit_only_when_candidate_coverage_cannot_fit(self) -> None:
+        identifiers = ("required-a", "required-b")
+        provider = _RecordingPredictionProvider(tuple(market(identifier) for identifier in identifiers))
+        with AxiomStore(":memory:") as store:
+            _seed_forward_metadata(store, identifiers)
+            _seed_frozen_candidate(store, "capacity-candidate", identifiers)
+            _seed_candidate_authority(store, "capacity-candidate", 1)
+            collector = PolymarketCollector(
+                provider,
+                store,
+                CollectorConfig(
+                    interval_seconds=60,
+                    max_markets=1,
+                    discovery_budget_per_cycle=0,
+                    stale_after_seconds=30,
+                    max_attempts=1,
+                    jitter_seconds=0,
+                ),
+                clock=lambda: T0,
+                sleep=lambda _seconds: None,
+            )
+            cycle = collector.collect_once(now=T0)
+            state = store.get_collector_state("polymarket")
+
+        self.assertEqual(cycle.capacity_reason, "COLLECTOR_CAPACITY_INSUFFICIENT")
+        self.assertEqual(state["capacity_reason"], "COLLECTOR_CAPACITY_INSUFFICIENT")
+        self.assertEqual(list(cycle.candidate_bound_markets), list(identifiers))
+        self.assertEqual(list(cycle.candidate_bound_missing), ["required-b"])
+        self.assertLess(len(cycle.candidate_bound_scheduled), len(cycle.candidate_bound_markets))
+    def test_required_health_assesses_all_markets_above_default_health_cap(self) -> None:
+        market_ids = tuple(f"required-{index:03d}" for index in range(150))
+        candidate_ids = tuple(f"candidate-{index:03d}" for index in range(19))
+        provider = _RecordingPredictionProvider(tuple(market(identifier) for identifier in market_ids))
+        with AxiomStore(":memory:") as store:
+            _seed_forward_metadata(store, market_ids)
+            for index, candidate_id in enumerate(candidate_ids):
+                start = index * 8
+                _seed_frozen_candidate(store, candidate_id, market_ids[start : start + 8])
+                _seed_candidate_authority(store, candidate_id, index + 1)
+            collector = PolymarketCollector(
+                provider,
+                store,
+                CollectorConfig(
+                    interval_seconds=60,
+                    max_markets=150,
+                    discovery_budget_per_cycle=0,
+                    max_attempts=1,
+                    jitter_seconds=0,
+                ),
+                clock=lambda: T0,
+                sleep=lambda _seconds: None,
+            )
+            cycle = collector.collect_once(now=T0)
+
+        self.assertEqual(len(cycle.candidate_bound_markets), 150)
+        self.assertEqual(len(cycle.candidate_bound_scheduled), 150)
+        self.assertEqual(len(cycle.candidate_bound_fresh), 150)
+        self.assertEqual(list(cycle.candidate_bound_stale), [])
+        self.assertEqual(list(cycle.candidate_bound_missing), [])
+        self.assertIsNone(cycle.capacity_reason)
+
+    def test_provider_failure_isolated_to_market_and_metadata_is_not_requested_twice(self) -> None:
+        snapshots = (market("ok"), market("bad"))
+        provider = _RecordingPredictionProvider(snapshots, failures={("metadata", "bad")})
+        with AxiomStore(":memory:") as store:
+            collector = PolymarketCollector(
+                provider,
+                store,
+                CollectorConfig(
+                    interval_seconds=60,
+                    market_ids=("ok", "ok", "bad"),
+                    max_attempts=1,
+                    backoff_initial_seconds=0,
+                    jitter_seconds=0,
+                ),
+                clock=lambda: T0,
+                sleep=lambda _seconds: None,
+            )
+            cycle = collector.collect_once()
+            metadata_calls = [market_id for operation, market_id in provider.calls if operation == "metadata"]
+
+            self.assertEqual(metadata_calls, ["ok", "bad"])
+            self.assertEqual(cycle.markets_attempted, 2)
+            self.assertGreaterEqual(cycle.markets_failed, 1)
+            self.assertEqual(store.get_collector_state("polymarket:ok")["errors"], 0)
+            self.assertGreater(store.get_collector_state("polymarket:bad")["errors"], 0)
+            self.assertFalse(any("bad" in str(error) for error in store.list_collection_errors("ok")))
+            self.assertEqual(cycle.metadata_failures, 1)
+            self.assertEqual(cycle.errors, 1)
+            self.assertEqual(cycle.markets_failed, 1)
+
+    def test_raised_planned_tasks_count_once_in_sequential_and_concurrent_paths(self) -> None:
+        identifiers = ("raised-a", "raised-b")
+
+        class RaisingProvider(_RecordingPredictionProvider):
+            def isolated_worker_factory(self):
+                return RaisingProvider(())
+
+        class RaisingCollector(PolymarketCollector):
+            def _collect_market(self, *args, **kwargs):
+                del args, kwargs
+                raise RuntimeError("planned task exploded")
+
+        for concurrency in (1, 2):
+            with self.subTest(concurrency=concurrency), AxiomStore(":memory:") as store:
+                collector = RaisingCollector(
+                    RaisingProvider(tuple(market(identifier) for identifier in identifiers)),
+                    store,
+                    CollectorConfig(
+                        interval_seconds=60,
+                        market_ids=identifiers,
+                        max_attempts=1,
+                        max_concurrency=concurrency,
+                        jitter_seconds=0,
+                    ),
+                    clock=lambda: T0,
+                    sleep=lambda _seconds: None,
+                )
+                cycle = collector.collect_once(now=T0)
+
+                self.assertEqual(cycle.markets_attempted, len(identifiers))
+                self.assertEqual(cycle.markets_failed, len(identifiers))
+                self.assertEqual(cycle.markets_successful, 0)
+                self.assertEqual(cycle.errors, len(identifiers))
+                self.assertEqual(cycle.tier_attempts["candidate"], len(identifiers))  # type: ignore[index]
+                self.assertEqual(cycle.tier_failures["candidate"], len(identifiers))  # type: ignore[index]
+                self.assertEqual(cycle.tier_successes["candidate"], 0)  # type: ignore[index]
+                for identifier in identifiers:
+                    self.assertEqual(len(store.list_collection_errors(identifier)), 1)
+
+    def test_isolated_workers_are_reused_only_after_their_prior_task_finishes(self) -> None:
+        class Activity:
+            def __init__(self) -> None:
+                self.lock = threading.Lock()
+                self.created = 0
+                self.active: dict[int, int] = {}
+                self.max_active: dict[int, int] = {}
+                self.max_total_active = 0
+
+        activity = Activity()
+
+        class BlockingProvider(InMemoryPredictionProvider):
+            provider_name = "blocking-isolated"
+
+            def __init__(self, *, worker_number: int) -> None:
+                super().__init__([])
+                self.worker_number = worker_number
+
+            def isolated_worker_factory(self):
+                with activity.lock:
+                    worker_number = activity.created
+                    activity.created += 1
+                return BlockingProvider(worker_number=worker_number)
+
+            def market(self, market_id: str):
+                del market_id
+                with activity.lock:
+                    active = activity.active.get(self.worker_number, 0) + 1
+                    activity.active[self.worker_number] = active
+                    activity.max_active[self.worker_number] = max(
+                        activity.max_active.get(self.worker_number, 0), active
+                    )
+                    activity.max_total_active = max(
+                        activity.max_total_active, sum(activity.active.values())
+                    )
+                try:
+                    time.sleep(0.04 if self.worker_number == 0 else 0.005)
+                    return None
+                finally:
+                    with activity.lock:
+                        activity.active[self.worker_number] -= 1
+
+        identifiers = ("worker-a", "worker-b", "worker-c", "worker-d")
+        with AxiomStore(":memory:") as store:
+            collector = PolymarketCollector(
+                BlockingProvider(worker_number=-1),
+                store,
+                CollectorConfig(
+                    interval_seconds=60,
+                    market_ids=identifiers,
+                    max_markets=len(identifiers),
+                    max_attempts=1,
+                    max_concurrency=2,
+                    jitter_seconds=0,
+                ),
+                clock=lambda: T0,
+                sleep=lambda _seconds: None,
+            )
+            cycle = collector.collect_once(now=T0)
+
+        self.assertEqual(activity.created, 2)
+        self.assertLessEqual(activity.max_total_active, 2)
+        self.assertTrue(activity.max_active)
+        self.assertTrue(all(value <= 1 for value in activity.max_active.values()))
+        self.assertEqual(cycle.markets_attempted, len(identifiers))
+        self.assertEqual(cycle.markets_failed, len(identifiers))
+
+    def test_retry_after_is_never_shortened_by_exponential_backoff(self) -> None:
+        provider = _RecordingPredictionProvider((market("retry"),))
+        provider.failures = set()
+        sleeps: list[float] = []
+
+        class RateLimitedProvider(_RecordingPredictionProvider):
+            def __init__(self) -> None:
+                super().__init__((market("retry"),))
+                self.remaining = 1
+
+            def metadata(self, market_id: str):
+                self._call("metadata", market_id)
+                if self.remaining:
+                    self.remaining -= 1
+                    raise HTTPFetchError("busy", url="https://example.invalid/metadata", status=429, retry_after=9.0, retryable=True)
+                return super(_RecordingPredictionProvider, self).metadata(market_id)
+
+        with AxiomStore(":memory:") as store:
+            collector = PolymarketCollector(
+                RateLimitedProvider(),
+                store,
+                CollectorConfig(
+                    interval_seconds=60,
+                    market_ids=("retry",),
+                    max_attempts=2,
+                    backoff_initial_seconds=1,
+                    backoff_multiplier=2,
+                    backoff_max_seconds=30,
+                    jitter_seconds=0,
+                ),
+                clock=lambda: T0,
+                sleep=sleeps.append,
+            )
+            collector.collect_once(now=T0)
+        self.assertEqual(sleeps, [9.0])
+
+    def test_request_provider_response_and_observed_timestamps_remain_distinct(self) -> None:
+        source = T0 - timedelta(seconds=1)
+        provider = _RecordingPredictionProvider((_timestamped_market("timed", source),))
+        ticks = [
+            T0,
+            T0 + timedelta(milliseconds=10),
+            T0 + timedelta(milliseconds=20),
+            T0 + timedelta(milliseconds=30),
+            T0 + timedelta(milliseconds=40),
+            T0 + timedelta(milliseconds=50),
+            T0 + timedelta(milliseconds=60),
+            T0 + timedelta(milliseconds=70),
+        ]
+        tick_index = 0
+
+        def clock() -> datetime:
+            nonlocal tick_index
+            value = ticks[min(tick_index, len(ticks) - 1)]
+            tick_index += 1
+            return value
+
+        with AxiomStore(":memory:") as store:
+            collector = PolymarketCollector(
+                provider,
+                store,
+                CollectorConfig(interval_seconds=60, market_ids=("timed",), max_attempts=1, jitter_seconds=0),
+                clock=clock,
+                sleep=lambda _seconds: None,
+            )
+            cycle = collector.collect_once()
+            payload = store.load_polymarket_snapshots("timed")[0]["payload"]
+
+        self.assertEqual(payload["provider_timestamp"], source.isoformat())
+        self.assertNotEqual(payload["request_started_at"], payload["response_received_at"])
+        self.assertEqual(payload["observed_at"], payload["response_received_at"])
+        self.assertGreater(
+            datetime.fromisoformat(payload["response_received_at"]),
+            datetime.fromisoformat(payload["request_started_at"]),
+        )
+        summary = cycle.request_latency_summary
+        self.assertGreater(summary["count"], 0)  # type: ignore[index]
+        for field in ("min_seconds", "max_seconds", "mean_seconds", "p50_seconds"):
+            self.assertIsNotNone(summary[field])  # type: ignore[index]
+    def test_missing_provider_timestamp_uses_canonical_book_timestamp(self) -> None:
+        class NoTimestampProvider(_RecordingPredictionProvider):
+            def provider_timestamp_for(self, market_id: str, *, kind: str) -> None:
+                del market_id, kind
+                return None
+
+        source = T0 - timedelta(seconds=2)
+        provider = NoTimestampProvider((_timestamped_market("no-timestamp", source),))
+        with AxiomStore(":memory:") as store:
+            collector = PolymarketCollector(
+                provider,
+                store,
+                CollectorConfig(interval_seconds=60, market_ids=("no-timestamp",), max_attempts=1, jitter_seconds=0),
+                clock=lambda: T0,
+                sleep=lambda _seconds: None,
+            )
+            collector.collect_once(now=T0)
+            row = store.load_polymarket_snapshots("no-timestamp")[0]
+            payload = row["payload"]
+
+        self.assertIsNone(payload["provider_timestamp"])
+        self.assertEqual(payload["source_timestamp"], source.isoformat())
+        self.assertEqual(row["source_timestamp"], source)
+        self.assertEqual(payload["snapshot"]["timestamp"], source.isoformat())
+        self.assertEqual(payload["yes_order_book"]["timestamp"], source.isoformat())
+        self.assertEqual(payload["source_timestamp"], payload["yes_order_book"]["timestamp"])
+        self.assertEqual(payload["response_received_at"], T0.isoformat())
+        self.assertEqual(payload["observed_at"], T0.isoformat())
+
+
+    def test_source_timestamp_matches_canonical_when_provider_timestamp_is_stale(self) -> None:
+        canonical_stamp = T0 - timedelta(seconds=1)
+        provider_stamp = T0 - timedelta(hours=1)
+
+        class StaleTimestampProvider(_RecordingPredictionProvider):
+            def provider_timestamp_for(self, market_id: str, *, kind: str) -> datetime:
+                del market_id, kind
+                return provider_stamp
+
+        provider = StaleTimestampProvider((_timestamped_market("aligned", canonical_stamp),))
+        with AxiomStore(":memory:") as store:
+            collector = PolymarketCollector(
+                provider,
+                store,
+                CollectorConfig(interval_seconds=60, market_ids=("aligned",), max_attempts=1, jitter_seconds=0),
+                clock=lambda: T0,
+                sleep=lambda _seconds: None,
+            )
+            collector.collect_once(now=T0)
+            row = store.load_polymarket_snapshots("aligned")[0]
+            payload = row["payload"]
+
+        self.assertEqual(payload["provider_timestamp"], provider_stamp.isoformat())
+        self.assertEqual(payload["source_timestamp"], canonical_stamp.isoformat())
+        self.assertEqual(row["source_timestamp"], canonical_stamp)
+        self.assertEqual(payload["snapshot"]["timestamp"], canonical_stamp.isoformat())
+
+    def test_old_and_future_provider_timestamps_are_rejected_without_rewriting_prior_timestamp(self) -> None:
+        old_provider = _RecordingPredictionProvider((_timestamped_market("timed", T0 - timedelta(hours=2)),))
+        future_provider = _RecordingPredictionProvider((_timestamped_market("timed", T0 + timedelta(minutes=10)),))
+        with AxiomStore(":memory:") as store:
+            first = PolymarketCollector(
+                old_provider,
+                store,
+                CollectorConfig(interval_seconds=60, market_ids=("timed",), max_attempts=1, jitter_seconds=0),
+                clock=lambda: T0,
+                sleep=lambda _seconds: None,
+            )
+            first.collect_once(now=T0)
+            saved = store.load_polymarket_snapshots("timed")[0]["payload"]["provider_timestamp"]
+            second = PolymarketCollector(
+                future_provider,
+                store,
+                CollectorConfig(interval_seconds=60, market_ids=("timed",), max_attempts=1, jitter_seconds=0),
+                clock=lambda: T0,
+                sleep=lambda _seconds: None,
+            )
+            cycle = second.collect_once(now=T0)
+            rows = store.load_polymarket_snapshots("timed")
+            errors = store.list_collection_errors("timed")
+
+        self.assertEqual(saved, (T0 - timedelta(hours=2)).isoformat())
+        self.assertEqual(rows[0]["payload"]["provider_timestamp"], saved)
+        self.assertGreater(cycle.errors, 0)
+        self.assertTrue(any("future" in error["kind"] for error in errors))
+    def test_canonical_market_and_book_future_timestamps_rejected_without_provider_timestamp(self) -> None:
+        class NoTimestampProvider(_RecordingPredictionProvider):
+            def provider_timestamp_for(self, market_id: str, *, kind: str) -> None:
+                del market_id, kind
+                return None
+
+        future = T0 + timedelta(minutes=10)
+        market_future = NoTimestampProvider((_timestamped_market("future-market", future),))
+        old = _timestamped_market("future-book", T0 - timedelta(seconds=1))
+
+        class FutureBookProvider(NoTimestampProvider):
+            def order_books(self, market_id: str, depth: int = 20):
+                del depth
+                self._call("order_books", market_id)
+                return {
+                    "yes": OrderBookSnapshot(
+                        future,
+                        (OrderBookLevel(0.4, 10.0),),
+                        (OrderBookLevel(0.6, 10.0),),
+                        "yes",
+                    )
+                }
+
+        book_future = FutureBookProvider((old,))
+        for provider, market_id in ((market_future, "future-market"), (book_future, "future-book")):
+            with self.subTest(market_id=market_id), AxiomStore(":memory:") as store:
+                collector = PolymarketCollector(
+                    provider,
+                    store,
+                    CollectorConfig(
+                        interval_seconds=60,
+                        market_ids=(market_id,),
+                        max_attempts=1,
+                        jitter_seconds=0,
+                    ),
+                    clock=lambda: T0,
+                    sleep=lambda _seconds: None,
+                )
+                cycle = collector.collect_once(now=T0)
+                self.assertGreater(cycle.errors, 0)
+                self.assertEqual(store.load_polymarket_snapshots(market_id), [])
+                self.assertTrue(store.list_collection_errors(market_id))
+
+
+
 
     def test_active_market_filter_and_health_scopes_are_distinct(self) -> None:
         with AxiomStore(":memory:") as store:
@@ -842,5 +1470,248 @@ class Phase3NodeDashboardTests(unittest.TestCase):
             self.assertIn("Research queue and node status", html)
 
 
+class CandidateForwardAuthorityTests(unittest.TestCase):
+    @staticmethod
+    def _metadata(
+        store: AxiomStore,
+        market_id: str,
+        *,
+        category: str = "politics",
+        observed_at: datetime = T0,
+        closed: bool = False,
+    ) -> None:
+        store.save_polymarket_market_metadata(
+            market_id,
+            {
+                "source_type": "FORWARD_COLLECTED",
+                "active": not closed,
+                "closed": closed,
+                "metadata": {"category": category},
+                "snapshot": {
+                    "market_id": market_id,
+                    "settlement": "resolved_yes" if closed else "open",
+                    "expiry": (observed_at + timedelta(days=1)).isoformat(),
+                },
+            },
+            observed_at=observed_at,
+            source_type="FORWARD_COLLECTED",
+        )
+
+    @staticmethod
+    def _historical_catalog(store: AxiomStore) -> None:
+        store.save_dataset_catalog(
+            "Polymarket-historical",
+            "aggregate-v1",
+            provider="fixture",
+            instrument="POLYMARKET",
+            market_type="prediction",
+            timeframe="event",
+            start_timestamp=T0 - timedelta(days=2),
+            end_timestamp=T0 - timedelta(days=1),
+            row_count=1,
+            completeness=1.0,
+            quality="PRICE_PROXY",
+            source_type="HISTORICAL",
+            snapshot_id="Polymarket-historical:aggregate-v1",
+            metadata={
+                "source_type": "HISTORICAL",
+                "market_versions": [
+                    {
+                        "market_id": "historical-constituent",
+                        "dataset_id": "prediction:historical-constituent",
+                        "version": "constituent-v1",
+                        "records": 1,
+                    }
+                ],
+            },
+        )
+
+    @staticmethod
+    def _freeze_candidate(
+        store: AxiomStore,
+        candidate_id: str,
+        payload: dict[str, object],
+    ) -> None:
+        lifecycle = CandidateLifecycleManager(store)
+        lifecycle.register_idea(candidate_id, {"candidate_id": candidate_id, **payload})
+        lifecycle.advance(candidate_id, CandidateStage.SCHEMA_VALIDATED, {"schema_valid": True})
+        lifecycle.advance(candidate_id, CandidateStage.BACKTESTED, {"backtest_complete": True})
+        lifecycle.advance(
+            candidate_id,
+            CandidateStage.VALIDATED,
+            {"validation_complete": True, "holdout_used": False},
+        )
+        lifecycle.advance(
+            candidate_id,
+            CandidateStage.ROBUSTNESS_CHECKED,
+            {"robustness_passed": True},
+        )
+        lifecycle.advance(
+            candidate_id,
+            CandidateStage.FROZEN,
+            {
+                "frozen": True,
+                "strategy_hash": "strategy-hash",
+                "model_hash": "model-hash",
+                "config_hash": "config-hash",
+                "risk_snapshot": {"max_position_fraction": 0.05},
+            },
+        )
+
+    def test_historical_constituents_are_not_executable_and_exact_current_target_survives(self) -> None:
+        with AxiomStore(":memory:") as store:
+            self._historical_catalog(store)
+            self._metadata(store, "current-exact")
+            self._freeze_candidate(
+                store,
+                "candidate-exact",
+                {
+                    "dataset_provenance": {
+                        "dataset_id": "Polymarket-historical",
+                        "dataset_version": "aggregate-v1",
+                        "source_type": "HISTORICAL",
+                        "market_versions": [
+                            {
+                                "market_id": "historical-constituent",
+                                "version": "constituent-v1",
+                                "records": 1,
+                            }
+                        ],
+                    },
+                    "market_ids": ["historical-constituent", "current-exact"],
+                },
+            )
+
+            requirements = store.candidate_forward_requirements(
+                candidate_ids=["candidate-exact"],
+                now=T0,
+            )
+
+        self.assertEqual(requirements["market_ids"], ["current-exact"])
+        self.assertEqual(requirements["candidate_bound_markets"], {"candidate-exact": ["current-exact"]})
+        candidate = requirements["candidates"][0]
+        self.assertEqual(candidate["candidate_id"], "candidate-exact")
+        self.assertEqual(candidate["market_ids"], ["current-exact"])
+        self.assertEqual(candidate["historical_market_ids_ignored"], ["historical-constituent"])
+        self.assertEqual(candidate["reason_code"], "CANDIDATE_FORWARD_MARKET_RESOLVED")
+        self.assertEqual(candidate["permitted_market_ids"], ["current-exact"])
+        self.assertEqual(candidate["resolution"], "RESOLVED")
+
+    def test_frozen_filters_match_only_open_forward_markets_and_remain_bounded(self) -> None:
+        with AxiomStore(":memory:") as store:
+            for market_id in ("politics-a", "politics-b", "politics-c"):
+                self._metadata(store, market_id, category="politics")
+            self._metadata(store, "politics-closed", category="politics", closed=True)
+            self._metadata(store, "economics-open", category="economics")
+            self._freeze_candidate(
+                store,
+                "candidate-filter",
+                {"frozen_filters": {"category": "PoLiTiCs"}},
+            )
+
+            requirements = store.candidate_forward_requirements(
+                candidate_ids=["candidate-filter"],
+                now=T0,
+                max_markets_per_candidate=2,
+                max_total_markets=2,
+            )
+
+        candidate = requirements["candidates"][0]
+        self.assertEqual(candidate["normalized_frozen_filters"], {"category": "politics"})
+        self.assertEqual(candidate["market_ids"], ["politics-a", "politics-b"])
+        self.assertEqual(requirements["market_ids"], ["politics-a", "politics-b"])
+        self.assertNotIn("politics-closed", requirements["market_ids"])
+        self.assertNotIn("economics-open", requirements["market_ids"])
+        self.assertLessEqual(len(requirements["market_ids"]), 2)
+        self.assertEqual(candidate["reason_code"], "CANDIDATE_FORWARD_MARKET_RESOLVED")
+        self.assertEqual(candidate["permitted_market_ids"], ["politics-a", "politics-b"])
+        self.assertEqual(candidate["resolution"], "RESOLVED")
+
+    def test_empty_or_unsupported_authority_is_unresolved_without_tracked_fallback(self) -> None:
+        with AxiomStore(":memory:") as store:
+            self._metadata(store, "tracked-but-unbound")
+            self._freeze_candidate(store, "candidate-empty", {})
+            self._freeze_candidate(
+                store,
+                "candidate-unsupported",
+                {"frozen_filters": {"unsupported_selector": "value"}},
+            )
+
+            requirements = store.candidate_forward_requirements(
+                candidate_ids=["candidate-empty", "candidate-unsupported"],
+                now=T0,
+            )
+
+        self.assertEqual(
+            requirements["candidate_bound_markets"],
+            {"candidate-empty": [], "candidate-unsupported": []},
+        )
+        self.assertEqual(requirements["unresolved_candidates"], ["candidate-empty", "candidate-unsupported"])
+        self.assertEqual(requirements["closed_candidates"], [])
+        for candidate in requirements["candidates"]:
+            self.assertEqual(candidate["market_ids"], [])
+            self.assertEqual(candidate["resolution"], "UNRESOLVED")
+            self.assertEqual(candidate["reason_code"], "CANDIDATE_FORWARD_MARKET_UNRESOLVED")
+
+    def test_exact_target_beyond_tracked_inventory_page_is_loaded_directly(self) -> None:
+        target = "market-1000"
+        with AxiomStore(":memory:") as store:
+            for index in range(1001):
+                self._metadata(store, f"market-{index:04d}")
+            _seed_frozen_candidate(store, "candidate-beyond-page", (target,))
+
+            requirements = store.candidate_forward_requirements(
+                candidate_ids=["candidate-beyond-page"],
+                now=T0,
+            )
+
+        candidate = requirements["candidates"][0]
+        self.assertEqual(requirements["market_ids"], [target])
+        self.assertEqual(candidate["market_ids"], [target])
+        self.assertEqual(candidate["resolution"], "RESOLVED")
+        self.assertEqual(candidate["reason_code"], "CANDIDATE_FORWARD_MARKET_RESOLVED")
+    def test_terminal_exact_target_is_closed_not_executable(self) -> None:
+        with AxiomStore(":memory:") as store:
+            self._metadata(store, "terminal-target", closed=True)
+            self._freeze_candidate(
+                store,
+                "candidate-terminal",
+                {"market_ids": ["terminal-target"]},
+            )
+
+            requirements = store.candidate_forward_requirements(
+                candidate_ids=["candidate-terminal"],
+                now=T0,
+            )
+
+        candidate = requirements["candidates"][0]
+        self.assertEqual(candidate["market_ids"], [])
+        self.assertEqual(candidate["resolution"], "CLOSED")
+        self.assertEqual(candidate["reason_code"], "CANDIDATE_MARKET_CLOSED")
+        self.assertEqual(requirements["closed_candidates"], ["candidate-terminal"])
+
+    def test_authority_and_required_health_are_read_only(self) -> None:
+        with AxiomStore(":memory:") as store:
+            self._metadata(store, "current-exact")
+            self._freeze_candidate(
+                store,
+                "candidate-read-only",
+                {"market_ids": ["current-exact"]},
+            )
+            before = store.connection.total_changes
+            requirements = store.candidate_forward_requirements(
+                candidate_ids=["candidate-read-only"],
+                now=T0,
+            )
+            health = store.polymarket_required_health(
+                requirements=requirements,
+                scheduled_market_ids=["current-exact"],
+                now=T0,
+                stale_after_seconds=60,
+            )
+            after = store.connection.total_changes
+
+        self.assertEqual(before, after)
+        self.assertEqual(health["candidate_bound_markets"], ["current-exact"])
 if __name__ == "__main__":
     unittest.main()

@@ -183,11 +183,21 @@ class AxiomStore:
             raise
 
     def _database_filename(self) -> str:
-        rows = self._conn.execute("PRAGMA database_list").fetchall()
+        with self._lock:
+            rows = self._conn.execute("PRAGMA database_list").fetchall()
         for row in rows:
-            name = str(row[1] if not isinstance(row, Mapping) else row["name"])
+            if isinstance(row, Mapping):
+                name = row.get("name")
+                value = row.get("file")
+            else:
+                try:
+                    if len(row) < 3:
+                        continue
+                    name = row[1]
+                    value = row[2]
+                except (IndexError, KeyError, TypeError):
+                    continue
             if name == "main":
-                value = row[2] if not isinstance(row, Mapping) else row["file"]
                 return str(value or "")
         return ""
 
@@ -1429,12 +1439,14 @@ class AxiomStore:
             connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA query_only=ON")
             return connection
-        # ``:memory:`` has no independently addressable database.  Backup while
-        # holding the lock, then release it before doing any historical scan.
+        # ``:memory:`` has no independently addressable database.  Serialize
+        # while holding the lock, then release it before doing any historical
+        # scan.  ``Connection.backup`` waits forever when the source owns an
+        # active SAVEPOINT (the normal queue-processing transaction).
         connection = sqlite3.connect(":memory:", check_same_thread=False)
         connection.row_factory = sqlite3.Row
         with self._lock:
-            self._conn.backup(connection)
+            connection.deserialize(self._conn.serialize())
         connection.execute("PRAGMA query_only=ON")
         return connection
 
@@ -5606,6 +5618,502 @@ class AxiomStore:
             for row in rows
         ]
 
+    def candidate_forward_requirements(
+        self,
+        candidate_ids: Sequence[str] | None = None,
+        now: datetime | None = None,
+        max_candidates: int = 100,
+        max_markets_per_candidate: int = 8,
+        max_total_markets: int = 100,
+    ) -> dict[str, Any]:
+        """Return the bounded, read-only current-market authority.
+
+        Historical dataset constituents are evidence for validation only.  They
+        are removed from executable authority when their provenance identifies
+        them as historical constituents; no empty authority is replaced by
+        discovery of all tracked markets.
+        """
+        for name, value in (
+            ("max_candidates", max_candidates),
+            ("max_markets_per_candidate", max_markets_per_candidate),
+            ("max_total_markets", max_total_markets),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+        current = ensure_utc(now or utc_now())
+        requested_ids = (
+            tuple(dict.fromkeys(str(value).strip() for value in candidate_ids if str(value).strip()))
+            if candidate_ids is not None
+            else None
+        )
+        if requested_ids is not None and len(requested_ids) > max_candidates:
+            requested_ids = requested_ids[:max_candidates]
+
+        if requested_ids is None:
+            rows = self.load_candidate_lifecycle(limit=max_candidates)
+            candidate_rows = [item for item in rows if isinstance(item, Mapping)]
+        else:
+            candidate_rows = []
+            for identifier in requested_ids:
+                record = self.load_candidate_lifecycle(identifier)
+                if isinstance(record, Mapping):
+                    candidate_rows.append(record)
+                else:
+                    candidate_rows.append({"candidate_id": identifier, "stage": "UNKNOWN", "payload": {}})
+
+        # The market tracker is itself a read-only snapshot projection and is
+        # restricted to forward-collected provenance.
+        active_records = self.tracked_polymarket_markets(
+            active_only=True,
+            now=current,
+            include_payload=True,
+            limit=1000,
+        )
+        all_records = self.tracked_polymarket_markets(
+            active_only=False,
+            now=current,
+            include_payload=True,
+            limit=1000,
+        )
+        active_by_id = {
+            str(item.get("market_id")).strip(): item
+            for item in active_records
+            if isinstance(item, Mapping) and str(item.get("market_id", "")).strip()
+        }
+        all_by_id = {
+            str(item.get("market_id")).strip(): item
+            for item in all_records
+            if isinstance(item, Mapping) and str(item.get("market_id", "")).strip()
+        }
+
+        from .experiment_plan import (
+            ExperimentPlan,
+            ExperimentPlanError,
+            forward_market_matches,
+            historical_market_ids,
+            normalize_forward_filters,
+        )
+
+        def plain(value: Any) -> Any:
+            if isinstance(value, Mapping):
+                return {str(key): plain(child) for key, child in value.items()}
+            if isinstance(value, (list, tuple)):
+                return [plain(child) for child in value]
+            return value
+
+        def source_is_historical(value: Any) -> bool:
+            if not isinstance(value, Mapping):
+                return False
+            for key in ("source_type", "dataset_source_type", "historical_source_type"):
+                if str(value.get(key, "")).strip().upper() == "HISTORICAL":
+                    return True
+            for key in ("dataset_provenance", "provenance", "dataset_selector", "metadata"):
+                child = value.get(key)
+                if source_is_historical(child):
+                    return True
+            return False
+
+        def market_closed(record: Mapping[str, Any]) -> bool:
+            payload = record.get("payload", {})
+            payload = payload if isinstance(payload, Mapping) else {}
+            snapshot = payload.get("snapshot", {})
+            snapshot = snapshot if isinstance(snapshot, Mapping) else {}
+            metadata = payload.get("metadata", {})
+            if record.get("active") is False:
+                return True
+            settlement = str(
+                snapshot.get("settlement", payload.get("settlement", metadata.get("settlement", "")))
+                or ""
+            ).strip().lower()
+            if settlement in {"resolved_yes", "resolved_no", "void", "closed", "expired"}:
+                return True
+            closed = metadata.get("closed", payload.get("closed"))
+            if isinstance(closed, bool) and closed:
+                return True
+            if str(closed).strip().lower() in {"1", "true", "yes", "closed"}:
+                return True
+            expiry = _parse_datetime(
+                snapshot.get("expiry")
+                or metadata.get("expiry")
+                or payload.get("expiry")
+            )
+            return expiry is not None and expiry <= current
+
+        candidates: list[dict[str, Any]] = []
+        union_markets: list[str] = []
+        candidate_references: dict[str, list[str]] = {}
+        candidate_bound_markets: dict[str, list[str]] = {}
+        unresolved: list[str] = []
+        closed: list[str] = []
+        capacity_excluded_candidates: list[str] = []
+
+        for row in candidate_rows[:max_candidates]:
+            candidate_id = str(row.get("candidate_id", "")).strip()
+            if not candidate_id:
+                continue
+            payload = row.get("payload", {})
+            payload = dict(payload) if isinstance(payload, Mapping) else {}
+            plan: ExperimentPlan | None = None
+            plan_record = None
+            plan_id = str(payload.get("plan_id", "")).strip()
+            if plan_id:
+                plan_record = self.load_experiment_plan(plan_id)
+            raw_plan = plan_record.get("plan") if isinstance(plan_record, Mapping) else None
+            if not isinstance(raw_plan, Mapping):
+                raw_plan = payload.get("experiment_plan")
+            try:
+                if isinstance(raw_plan, Mapping):
+                    plan = ExperimentPlan.from_mapping(
+                        raw_plan,
+                        hypothesis_id=str(payload.get("hypothesis_id", "")).strip() or None,
+                    )
+            except (ExperimentPlanError, TypeError, ValueError):
+                plan = None
+
+            declared_market_ids: tuple[str, ...] = ()
+            target_markets: tuple[str, ...] = ()
+            target_instrument: str | None = None
+            filters: Mapping[str, Any] = {}
+            restrictions: Mapping[str, Any] = {}
+            historical_ids: tuple[str, ...] = ()
+            if plan is not None:
+                # ExperimentPlan.target_markets is the normalized, deduped
+                # target list and enforces the plan's 1000-id bound.  Keep
+                # this declaration separate from executable resolution so
+                # omitted targets remain visible without broadening authority.
+                declared_market_ids = tuple(plan.target_markets)
+                target_markets = declared_market_ids
+                target_instrument = plan.target_instrument
+                filters = plan.filters
+                restrictions = plan.regime_restrictions
+                historical_source = source_is_historical(payload) or source_is_historical(plan.dataset_selector)
+                provenance = payload.get("dataset_provenance")
+                historical_ids = historical_market_ids(provenance)
+                if historical_source or historical_ids:
+                    historical_ids = tuple(dict.fromkeys((*historical_ids, *historical_market_ids(plan.as_dict()))))
+                    catalog = (
+                        self.load_dataset_catalog(plan.dataset_id, plan.dataset_version)
+                        if plan.dataset_id
+                        else None
+                    )
+                    if isinstance(catalog, Mapping):
+                        historical_ids = tuple(
+                            dict.fromkeys((*historical_ids, *historical_market_ids(catalog)))
+                        )
+            else:
+                target_value = payload.get("target_market_ids", payload.get("market_ids"))
+                if isinstance(target_value, (list, tuple)):
+                    # Legacy candidate payloads predate normalized plans. Keep
+                    # their declaration bounded to the same plan limit.
+                    declared_market_ids = tuple(
+                        dict.fromkeys(str(item).strip() for item in target_value if str(item).strip())
+                    )[:1000]
+                    target_markets = declared_market_ids
+                filters = payload.get("filters", payload.get("frozen_filters", {}))
+                filters = filters if isinstance(filters, Mapping) else {}
+                provenance = payload.get("dataset_provenance")
+                historical_ids = historical_market_ids(provenance)
+            historical_set = set(historical_ids)
+            executable_targets = tuple(item for item in target_markets if item not in historical_set)
+            ignored = tuple(item for item in target_markets if item in historical_set)
+            try:
+                normalized_filters = normalize_forward_filters(filters, restrictions)
+            except (ExperimentPlanError, TypeError, ValueError):
+                normalized_filters = {}
+                filter_error = True
+            else:
+                filter_error = False
+            if not filter_error and executable_targets:
+                # The bounded inventory projection must not hide an explicit
+                # target that sorts after its first page.  Fetch only missing
+                # target ids, preserving the bounded batched lookup.
+                explicit_ids = tuple(
+                    market_id
+                    for market_id in executable_targets
+                    if market_id not in active_by_id or market_id not in all_by_id
+                )
+                if explicit_ids:
+                    explicit_active = self.tracked_polymarket_markets(
+                        active_only=True,
+                        now=current,
+                        include_payload=True,
+                        limit=len(explicit_ids),
+                        market_ids=explicit_ids,
+                    )
+                    explicit_all = self.tracked_polymarket_markets(
+                        active_only=False,
+                        now=current,
+                        include_payload=True,
+                        limit=len(explicit_ids),
+                        market_ids=explicit_ids,
+                    )
+                    for record in explicit_active:
+                        if isinstance(record, Mapping):
+                            market_id = str(record.get("market_id", "")).strip()
+                            if market_id:
+                                active_by_id[market_id] = record
+                    for record in explicit_all:
+                        if isinstance(record, Mapping):
+                            market_id = str(record.get("market_id", "")).strip()
+                            if market_id:
+                                all_by_id[market_id] = record
+
+            permitted: list[str] = []
+            closed_targets: list[str] = []
+            if not filter_error:
+                if executable_targets:
+                    for market_id in executable_targets:
+                        record = active_by_id.get(market_id)
+                        if (
+                            record is not None
+                            and forward_market_matches(
+                                record,
+                                normalized_filters,
+                                now=current,
+                                target_instrument=target_instrument,
+                            )
+                        ):
+                            permitted.append(market_id)
+                        elif market_id in all_by_id and market_closed(all_by_id[market_id]):
+                            closed_targets.append(market_id)
+                elif normalized_filters:
+                    for market_id, record in active_by_id.items():
+                        if market_id in historical_set:
+                            continue
+                        if forward_market_matches(
+                            record,
+                            normalized_filters,
+                            now=current,
+                            target_instrument=target_instrument,
+                        ):
+                            permitted.append(market_id)
+
+            permitted = list(dict.fromkeys(permitted))[:max_markets_per_candidate]
+            # Apply the global cap only while admitting new unique markets.
+            # A market already admitted for another candidate remains
+            # authoritative for every candidate whose requirements authorize it.
+            candidate_markets: list[str] = []
+            capacity_excluded_markets: list[str] = []
+            for market_id in permitted:
+                if market_id in union_markets:
+                    candidate_markets.append(market_id)
+                    continue
+                if len(union_markets) >= max_total_markets:
+                    capacity_excluded_markets.append(market_id)
+                    continue
+                union_markets.append(market_id)
+                candidate_markets.append(market_id)
+            if candidate_markets:
+                resolution, reason_code = "RESOLVED", "CANDIDATE_FORWARD_MARKET_RESOLVED"
+            elif capacity_excluded_markets:
+                resolution, reason_code = "UNRESOLVED", "COLLECTOR_CAPACITY_INSUFFICIENT"
+                capacity_excluded_candidates.append(candidate_id)
+                unresolved.append(candidate_id)
+            elif closed_targets:
+                resolution, reason_code = "CLOSED", "CANDIDATE_MARKET_CLOSED"
+            else:
+                resolution, reason_code = "UNRESOLVED", "CANDIDATE_FORWARD_MARKET_UNRESOLVED"
+            if resolution == "UNRESOLVED" and candidate_id not in unresolved:
+                unresolved.append(candidate_id)
+            elif resolution == "CLOSED":
+                closed.append(candidate_id)
+            candidate_bound_markets[candidate_id] = list(candidate_markets)
+            for market_id in candidate_markets:
+                candidate_references.setdefault(market_id, []).append(candidate_id)
+            candidates.append(
+                {
+                    "candidate_id": candidate_id,
+                    "stage": str(row.get("stage", "")),
+                    "resolution": resolution,
+                    "reason_code": reason_code,
+                    "declared_market_ids": list(declared_market_ids),
+                    "market_ids": list(candidate_markets),
+                    "permitted_market_ids": list(candidate_markets),
+                    "capacity_excluded_market_ids": list(capacity_excluded_markets),
+                    "normalized_frozen_filters": plain(normalized_filters),
+                    "normalized_filters": plain(normalized_filters),
+                    "frozen_filters": plain(normalized_filters),
+                    "historical_market_ids_ignored": list(ignored),
+                }
+            )
+
+        return {
+            "candidates": candidates,
+            "market_ids": list(union_markets),
+            "candidate_references": candidate_references,
+            "candidate_bound_markets": candidate_bound_markets,
+            "unresolved_candidates": unresolved,
+            "closed_candidates": closed,
+            "capacity_excluded_candidates": capacity_excluded_candidates,
+            "capacity_excluded_candidate_count": len(capacity_excluded_candidates),
+            "as_of": current.isoformat(),
+        }
+
+    def polymarket_required_health(
+        self,
+        requirements: Mapping[str, Any] | None = None,
+        scheduled_market_ids: Sequence[str] | None = None,
+        now: datetime | None = None,
+        stale_after_seconds: float | None = None,
+        max_markets: int = 100,
+    ) -> dict[str, Any]:
+        """Aggregate fresh/stale/missing health for required authority only."""
+        if isinstance(max_markets, bool) or not isinstance(max_markets, int) or max_markets < 0:
+            raise ValueError("max_markets must be a non-negative integer")
+        bounded_max_markets = min(max_markets, _MAX_LATEST_SCAN_ROWS)
+        current = ensure_utc(now or utc_now())
+        stale_after = float(stale_after_seconds if stale_after_seconds is not None else 180.0)
+        if not math.isfinite(stale_after) or stale_after <= 0 or stale_after > _MAX_OPERATIONAL_WINDOW_SECONDS:
+            raise ValueError("stale_after_seconds must be finite, positive, and bounded")
+        authority = requirements if isinstance(requirements, Mapping) else self.candidate_forward_requirements(now=current)
+        raw_required = authority.get("market_ids")
+        if raw_required is None:
+            raw_bound = authority.get("candidate_bound_markets", ())
+            if isinstance(raw_bound, Mapping):
+                raw_required = [market for values in raw_bound.values() for market in values] if all(
+                    isinstance(values, (list, tuple, set, frozenset)) for values in raw_bound.values()
+                ) else ()
+            else:
+                raw_required = raw_bound
+        if not isinstance(raw_required, (list, tuple, set, frozenset)):
+            raw_required = ()
+        required = tuple(dict.fromkeys(str(item).strip() for item in raw_required if str(item).strip()))
+        assessed_required = required[:bounded_max_markets]
+        capacity_truncated = required[bounded_max_markets:]
+        refs = authority.get("candidate_references", {})
+        refs = refs if isinstance(refs, Mapping) else {}
+        normalized_refs = {
+            str(market_id): tuple(
+                dict.fromkeys(str(candidate).strip() for candidate in values if str(candidate).strip())
+            )
+            if isinstance(values, (list, tuple, set, frozenset))
+            else ()
+            for market_id, values in refs.items()
+        }
+        scheduled = (
+            tuple(dict.fromkeys(str(item).strip() for item in scheduled_market_ids if str(item).strip()))
+            if scheduled_market_ids is not None
+            else tuple(
+                dict.fromkeys(
+                    str(item).strip()
+                    for item in (
+                        (self.get_collector_state("polymarket") or {}).get("scheduled_market_ids", ())
+                        if isinstance(self.get_collector_state("polymarket") or {}, Mapping)
+                        else ()
+                    )
+                    if str(item).strip()
+                )
+            )
+        )
+        latest_rows = self.load_latest_polymarket_snapshots(
+            assessed_required,
+            source_type="FORWARD_COLLECTED",
+            limit=len(assessed_required),
+        ) if assessed_required else []
+        latest_by_market = {}
+        for row in latest_rows:
+            market_id = str(row.get("market_id", "")).strip() if isinstance(row, Mapping) else ""
+            observed = _parse_datetime(row.get("observed_at")) if isinstance(row, Mapping) else None
+            if market_id and (observed is None or observed <= current):
+                latest_by_market[market_id] = row
+        fresh: list[str] = []
+        stale: list[str] = []
+        missing: list[str] = []
+        diagnostics: list[dict[str, Any]] = []
+        required_snapshots: list[tuple[datetime, str]] = []
+        for market_id in assessed_required:
+            row = latest_by_market.get(market_id)
+            if row is None:
+                missing.append(market_id)
+                diagnostics.append(
+                    {
+                        "market_id": market_id,
+                        "candidate_bound": True,
+                        "candidate_references": list(normalized_refs.get(market_id, ())),
+                        "source_timestamp": None,
+                        "observed_at": None,
+                        "freshness_age_seconds": None,
+                        "collection_state": "missing",
+                        "reason_code": "REQUIRED_MARKET_SNAPSHOT_MISSING",
+                    }
+                )
+                continue
+            source_stamp = _parse_datetime(row.get("source_timestamp"))
+            observed_stamp = _parse_datetime(row.get("observed_at"))
+            if observed_stamp is None:
+                missing.append(market_id)
+                state, reason = "missing", "REQUIRED_MARKET_SNAPSHOT_MISSING"
+                age = None
+            else:
+                age = max(0.0, (current - observed_stamp).total_seconds())
+                if age <= stale_after:
+                    fresh.append(market_id)
+                    state, reason = "fresh", "REQUIRED_MARKET_SNAPSHOT_FRESH"
+                else:
+                    stale.append(market_id)
+                    state, reason = "stale", "REQUIRED_MARKET_SNAPSHOT_STALE"
+            if source_stamp is not None:
+                required_snapshots.append((source_stamp, market_id))
+            diagnostics.append(
+                {
+                    "market_id": market_id,
+                    "candidate_bound": True,
+                    "candidate_references": list(normalized_refs.get(market_id, ())),
+                    "source_timestamp": source_stamp.isoformat() if source_stamp is not None else None,
+                    "observed_at": observed_stamp.isoformat() if observed_stamp is not None else None,
+                    "freshness_age_seconds": age,
+                    "collection_state": state,
+                    "reason_code": reason,
+                }
+            )
+        if capacity_truncated:
+            missing.extend(capacity_truncated)
+
+        unresolved = authority.get("unresolved_candidates", ())
+        closed = authority.get("closed_candidates", ())
+        capacity_excluded = authority.get("capacity_excluded_candidates", ())
+        unresolved = list(unresolved) if isinstance(unresolved, (list, tuple)) else []
+        closed = list(closed) if isinstance(closed, (list, tuple)) else []
+        capacity_excluded = list(capacity_excluded) if isinstance(capacity_excluded, (list, tuple)) else []
+        if capacity_excluded or capacity_truncated:
+            grade, reason_code = "D", "COLLECTOR_CAPACITY_INSUFFICIENT"
+        elif unresolved:
+            grade, reason_code = "D", "CANDIDATE_FORWARD_MARKET_UNRESOLVED"
+        elif closed:
+            grade, reason_code = "D", "CANDIDATE_MARKET_CLOSED"
+        elif missing:
+            grade, reason_code = "D", "REQUIRED_MARKETS_MISSING"
+        elif stale:
+            grade, reason_code = "C", "REQUIRED_MARKETS_STALE"
+        elif required:
+            grade, reason_code = "A", "REQUIRED_MARKETS_FRESH"
+        else:
+            grade, reason_code = "D", "CANDIDATE_FORWARD_MARKET_UNRESOLVED"
+        ordered_snapshots = sorted(required_snapshots, key=lambda pair: (pair[0], pair[1]))
+        return {
+            "candidate_bound_markets": list(required),
+            "scheduled": list(scheduled),
+            "fresh": fresh,
+            "stale": stale,
+            "missing": missing,
+            "newest_required_snapshot": ordered_snapshots[-1][0].isoformat() if ordered_snapshots else None,
+            "oldest_required_snapshot": ordered_snapshots[0][0].isoformat() if ordered_snapshots else None,
+            "grade": grade,
+            "grade_scope": "required_forward_markets",
+            "reason_code": reason_code,
+            "candidate_references": {
+                market_id: list(normalized_refs.get(market_id, ())) for market_id in required
+            },
+            "market_diagnostics": diagnostics[:100],
+            "diagnostics": diagnostics[:100],
+            "required_market_count": len(required),
+            "unresolved_candidates": unresolved,
+            "closed_candidates": closed,
+            "capacity_excluded_candidates": capacity_excluded,
+            "capacity_excluded_candidate_count": len(capacity_excluded),
+            "as_of": current.isoformat(),
+        }
+
     def tracked_polymarket_markets(
         self,
         *,
@@ -5613,25 +6121,41 @@ class AxiomStore:
         now: datetime | None = None,
         include_payload: bool = False,
         limit: int = 1000,
+        market_ids: Sequence[str] | None = None,
     ) -> list[Any]:
         if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
             raise ValueError("limit must be a non-negative integer")
+        requested_ids = (
+            tuple(dict.fromkeys(str(item).strip() for item in market_ids if str(item).strip()))
+            if market_ids is not None
+            else ()
+        )
         current = ensure_utc(now or utc_now())
         snapshot = self._snapshot_read_connection()
         try:
+            metadata_where = "source_type='FORWARD_COLLECTED' AND observed_at<=?"
+            metadata_values: list[Any] = [current.isoformat()]
+            snapshot_where = "source_type='FORWARD_COLLECTED' AND observed_at<=?"
+            snapshot_values: list[Any] = [current.isoformat()]
+            if requested_ids:
+                placeholders = ",".join("?" for _ in requested_ids)
+                metadata_where += f" AND market_id IN ({placeholders})"
+                metadata_values.extend(requested_ids)
+                snapshot_where += f" AND market_id IN ({placeholders})"
+                snapshot_values.extend(requested_ids)
             metadata_rows = snapshot.execute(
                 "SELECT market_id,observed_at,metadata_hash,payload_json,source_type FROM ("
                 "SELECT market_id,observed_at,metadata_hash,payload_json,source_type,"
                 "ROW_NUMBER() OVER (PARTITION BY market_id ORDER BY observed_at DESC,metadata_hash DESC) AS row_number "
-                "FROM polymarket_markets WHERE source_type='FORWARD_COLLECTED' AND observed_at<=?) WHERE row_number=1 ORDER BY market_id LIMIT ?",
-                (current.isoformat(), int(limit)),
+                f"FROM polymarket_markets WHERE {metadata_where}) WHERE row_number=1 ORDER BY market_id LIMIT ?",
+                [*metadata_values, int(limit)],
             ).fetchall()
             snapshot_rows = snapshot.execute(
                 "SELECT market_id,observed_at,source_timestamp,snapshot_id,payload_json,source_type FROM ("
                 "SELECT market_id,observed_at,source_timestamp,snapshot_id,payload_json,source_type,"
                 "ROW_NUMBER() OVER (PARTITION BY market_id ORDER BY observed_at DESC,source_timestamp DESC,snapshot_id DESC) AS row_number "
-                "FROM polymarket_snapshots WHERE source_type='FORWARD_COLLECTED' AND observed_at<=?) WHERE row_number=1 ORDER BY market_id LIMIT ?",
-                (current.isoformat(), int(limit)),
+                f"FROM polymarket_snapshots WHERE {snapshot_where}) WHERE row_number=1 ORDER BY market_id LIMIT ?",
+                [*snapshot_values, int(limit)],
             ).fetchall()
         finally:
             snapshot.close()

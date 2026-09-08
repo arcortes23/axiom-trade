@@ -48,12 +48,60 @@ class AutonomousCanaryWorker:
             reason: 0 for reason in self._SCAN_SKIP_REASONS
         }
     _SCAN_CAP = 10
-    _SCAN_SKIP_REASONS = (
-        "INVALID_RANKING_BINDING",
-        "QUALIFICATION_INVALID",
-        "DUPLICATE_CLUSTER_DEFERRED",
-        "CYCLE_REMAINDER",
+    _SIGNAL_REASON_CODES = (
+        "READY_SIGNAL",
+        "NO_STRATEGY_SIGNAL",
+        "NO_FORWARD_SNAPSHOT",
+        "STALE_FORWARD_EVIDENCE",
+        "MARKET_CLOSED",
+        "MARKET_FILTER_MISMATCH",
+        "CANDIDATE_FORWARD_MARKET_UNRESOLVED",
+        "COLLECTOR_CANDIDATE_HEALTH_BLOCKED",
     )
+    _REASON_COUNT_CAP = 10_000
+
+    @classmethod
+    def _normalize_reason_counts(cls, value: Any) -> dict[str, int]:
+        parsed: Any = value
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                parsed = {}
+        result = {reason: 0 for reason in cls._SIGNAL_REASON_CODES}
+        if not isinstance(parsed, Mapping):
+            return result
+        for reason in cls._SIGNAL_REASON_CODES:
+            try:
+                count = int(parsed.get(reason, 0) or 0)
+            except (TypeError, ValueError, OverflowError):
+                count = 0
+            result[reason] = min(cls._REASON_COUNT_CAP, max(0, count))
+        return result
+
+    @classmethod
+    def _evaluation_reason(cls, evaluation: Any, signal: Any) -> str:
+        if isinstance(evaluation, Mapping):
+            reason = str(evaluation.get("reason_code") or "").strip().upper()
+            if reason in cls._SIGNAL_REASON_CODES:
+                return reason
+        if isinstance(signal, Mapping) and str(signal.get("status") or "").upper() == "READY":
+            return "READY_SIGNAL"
+        return "NO_STRATEGY_SIGNAL"
+
+    @classmethod
+    def _increment_reason_count(
+        cls,
+        counts: dict[str, int],
+        reason: str,
+    ) -> None:
+        if reason not in cls._SIGNAL_REASON_CODES:
+            reason = "NO_STRATEGY_SIGNAL"
+        counts[reason] = min(
+            cls._REASON_COUNT_CAP,
+            max(0, int(counts.get(reason, 0))) + 1,
+        )
+
     _SCAN_FIELDS = (
         "candidates_ranked",
         "candidates_signal_checked",
@@ -75,7 +123,14 @@ class AutonomousCanaryWorker:
         "signal_scan_remaining_this_cycle",
         "signal_scan_coverage_percentage",
         "signal_scan_skip_reasons_json",
+        "signal_scan_reason_counts_json",
         "signal_scan_status",
+    )
+    _SCAN_SKIP_REASONS = (
+        "INVALID_RANKING_BINDING",
+        "QUALIFICATION_INVALID",
+        "DUPLICATE_CLUSTER_DEFERRED",
+        "CYCLE_REMAINDER",
     )
 
     @staticmethod
@@ -308,7 +363,8 @@ class AutonomousCanaryWorker:
                 "signal_scan_cycle_started_at,signal_scan_cycle_completed_at,"
                 "signal_scan_cycle_complete,signal_scan_checked_this_cycle,"
                 "signal_scan_remaining_this_cycle,signal_scan_coverage_percentage,"
-                "signal_scan_skip_reasons_json,signal_scan_status "
+                "signal_scan_skip_reasons_json,signal_scan_reason_counts_json,"
+                "signal_scan_status "
                 "FROM canary_autonomous_state WHERE singleton=1"
             ).fetchone()
         return dict(row) if row is not None else {}
@@ -361,13 +417,14 @@ class AutonomousCanaryWorker:
         next_signal_scan_end_rank: int | None | object = _UNSET,
         signal_scan_cycle_id: str | None | object = _UNSET,
         signal_scan_candidate_universe_hash: str | None | object = _UNSET,
+        signal_scan_skip_reasons_json: str | None | object = _UNSET,
+        signal_scan_reason_counts_json: str | None | object = _UNSET,
         signal_scan_cycle_started_at: str | None | object = _UNSET,
         signal_scan_cycle_completed_at: str | None | object = _UNSET,
         signal_scan_cycle_complete: int | bool | None | object = _UNSET,
         signal_scan_checked_this_cycle: int | None | object = _UNSET,
         signal_scan_remaining_this_cycle: int | None | object = _UNSET,
         signal_scan_coverage_percentage: float | None | object = _UNSET,
-        signal_scan_skip_reasons_json: str | None | object = _UNSET,
         signal_scan_status: str | None | object = _UNSET,
         signal_scan_checked_keys: list[Mapping[str, Any]] | None = None,
         error_code: str | None = None,
@@ -416,6 +473,12 @@ class AutonomousCanaryWorker:
                 else 0.0
             )
 
+        def reason_counts(value: Any) -> str | None | object:
+            if value is _UNSET:
+                return _UNSET
+            normalized = self._normalize_reason_counts(value)
+            return json.dumps(normalized, sort_keys=True, separators=(",", ":"))[:4096]
+
         def skip_reasons(value: Any) -> str | None | object:
             if value is _UNSET:
                 return _UNSET
@@ -459,6 +522,9 @@ class AutonomousCanaryWorker:
                 ),
                 signal_scan_skip_reasons_json=skip_reasons(
                     signal_scan_skip_reasons_json
+                ),
+                signal_scan_reason_counts_json=reason_counts(
+                    signal_scan_reason_counts_json
                 ),
                 signal_scan_status=text(signal_scan_status),
                 signal_scan_checked_keys=signal_scan_checked_keys,
@@ -551,6 +617,9 @@ class AutonomousCanaryWorker:
         signal_scan_skip_reasons_json = str(
             previous_scan_projection.get("signal_scan_skip_reasons_json") or "{}"
         )
+        signal_scan_reason_counts = self._normalize_reason_counts(
+            previous_scan_projection.get("signal_scan_reason_counts_json")
+        )
         signal_scan_status = str(
             previous_scan_projection.get("signal_scan_status") or "UNKNOWN"
         )
@@ -569,7 +638,18 @@ class AutonomousCanaryWorker:
                 service=service,
                 clock=self.clock,
             )
-            ranking = ranker.evaluate_and_select(timestamp)
+            ranking = {}
+            for attempt in range(3):
+                try:
+                    ranking = ranker.evaluate_and_select(timestamp)
+                    break
+                except Exception as exc:
+                    if (
+                        getattr(exc, "error_code", None)
+                        != "LIFECYCLE_SNAPSHOT_CHANGED"
+                        or attempt >= 2
+                    ):
+                        raise
             if isinstance(ranking, Mapping):
                 try:
                     candidates_evaluated = max(
@@ -613,6 +693,9 @@ class AutonomousCanaryWorker:
                 signal_scan_cycle_started_at = (
                     str(previous.get("signal_scan_cycle_started_at") or timestamp.isoformat())
                 )
+                signal_scan_reason_counts = self._normalize_reason_counts(
+                    previous.get("signal_scan_reason_counts_json")
+                )
                 with self.store._lock:
                     checked_rows = self.store.connection.execute(
                         "SELECT candidate_id,qualification_hash "
@@ -631,6 +714,7 @@ class AutonomousCanaryWorker:
             else:
                 signal_scan_cycle_id = "scan-" + uuid.uuid4().hex[:24]
                 signal_scan_cycle_started_at = timestamp.isoformat()
+                signal_scan_reason_counts = self._normalize_reason_counts({})
                 scan_checked_set = set()
             if candidates_ranked == 0:
                 ordered = []
@@ -784,6 +868,7 @@ class AutonomousCanaryWorker:
                     "signal_scan_skip_reasons_json": json.loads(
                         signal_scan_skip_reasons_json
                     ),
+                    "signal_scan_reason_counts_json": dict(signal_scan_reason_counts),
                     "signal_scan_status": signal_scan_status,
                     "signal_scan_checked_keys": signal_scan_checked_keys,
                 }
@@ -799,6 +884,11 @@ class AutonomousCanaryWorker:
             ) -> None:
                 payload = scan_payload()
                 payload["signal_scan_skip_reasons_json"] = signal_scan_skip_reasons_json
+                payload["signal_scan_reason_counts_json"] = json.dumps(
+                    signal_scan_reason_counts,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
                 self._record_finish(
                     service,
                     timestamp=timestamp,
@@ -857,7 +947,17 @@ class AutonomousCanaryWorker:
             for row in scan_rows:
                 candidate_id = str(row.get("candidate_id") or "").strip()
                 qualification_hash = str(row.get("qualification_hash") or "").strip()
-                signal = service.generate_signal(candidate_id)
+                evaluation = service.evaluate_signal(
+                    candidate_id,
+                    cycle_id=signal_scan_cycle_id,
+                )
+                signal = (
+                    evaluation.get("signal")
+                    if isinstance(evaluation, Mapping)
+                    else None
+                )
+                reason = self._evaluation_reason(evaluation, signal)
+                self._increment_reason_count(signal_scan_reason_counts, reason)
                 candidates_signal_checked += 1
                 scan_checked_set.add((candidate_id, qualification_hash))
                 signal_scan_checked_keys.append(
@@ -872,7 +972,11 @@ class AutonomousCanaryWorker:
                 )
                 if isinstance(signal, Mapping):
                     signals_generated += 1
-                status = str(signal.get("status") or "").upper() if isinstance(signal, Mapping) else "NONE"
+                status = (
+                    str(signal.get("status") or "").upper()
+                    if isinstance(signal, Mapping)
+                    else "NONE"
+                )
                 signal_id = (
                     str(signal.get("signal_id") or "").strip()
                     if isinstance(signal, Mapping)
@@ -886,7 +990,8 @@ class AutonomousCanaryWorker:
                     candidates_no_signal += 1
                     continue
                 if (
-                    status == "READY"
+                    reason == "READY_SIGNAL"
+                    and status == "READY"
                     and signal_id
                     and signal_id not in self._unknown_signal_ids
                     and str(signal.get("candidate_id") or candidate_id) == candidate_id

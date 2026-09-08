@@ -1,16 +1,34 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
+import json
 from concurrent.futures import ThreadPoolExecutor
 import threading
 import time
 import unittest
 from typing import Any
 
+from axiom.data import PolymarketAdapter
 from axiom.data_quality import (
     PRICE_PROXY,
     TIMESTAMPED_DEPTH,
     evaluate_prediction_data_quality,
 )
+
+
+class _Response:
+    def __init__(self, payload: object = None, *, raw: bytes | None = None) -> None:
+        self.payload = payload
+        self.raw = raw
+        self.status = 200
+        self.headers: dict[str, str] = {}
+
+    def read(self) -> bytes:
+        return self.raw if self.raw is not None else json.dumps(self.payload).encode("utf-8")
+
+    def close(self) -> None:
+        return None
+
 
 
 DATASET_ID = "prediction:market-1"
@@ -191,6 +209,72 @@ def _payload(
 
 
 class PredictionDataQualityCacheTests(unittest.TestCase):
+    def test_book_provider_timestamp_clears_after_unusable_response(self) -> None:
+        responses = [
+            _Response(
+                {
+                    "conditionId": "market-1",
+                    "question": "Will it happen?",
+                    "outcomes": ["Yes", "No"],
+                    "clobTokenIds": ["yes-token", "no-token"],
+                }
+            ),
+            _Response(
+                {
+                    "timestamp": "2025-01-01T00:00:00Z",
+                    "bids": [{"price": "0.40", "size": "2"}],
+                    "asks": [{"price": "0.60", "size": "2"}],
+                }
+            ),
+            _Response(None),
+            _Response(raw=b"not-json"),
+            _Response({"bids": [], "asks": []}),
+        ]
+
+        def opener(_request: object, timeout: float) -> _Response:
+            del timeout
+            return responses.pop(0)
+
+        adapter = PolymarketAdapter(opener=opener)
+        self.assertIsNotNone(adapter.market("market-1"))
+        self.assertIsNotNone(adapter.order_book_for_token("yes-token"))
+        self.assertEqual(
+            adapter.provider_timestamp_for("market-1", kind="yes_order_book"),
+            datetime(2025, 1, 1, tzinfo=timezone.utc),
+        )
+
+        for _ in range(3):
+            self.assertIsNone(adapter.order_book_for_token("yes-token"))
+            self.assertIsNone(adapter.provider_timestamp_for("market-1", kind="yes_order_book"))
+
+    def test_market_provider_timestamp_clears_after_unusable_response(self) -> None:
+        stamp = datetime(2025, 1, 1, tzinfo=timezone.utc)
+        valid = {
+            "conditionId": "market-1",
+            "question": "Will it happen?",
+            "outcomes": ["Yes", "No"],
+            "clobTokenIds": ["yes-token", "no-token"],
+            "updatedAt": stamp.isoformat(),
+        }
+        responses = [
+            _Response(valid),
+            _Response(None),
+            _Response(raw=b"not-json"),
+            _Response({"conditionId": "market-1", "question": ""}),
+        ]
+
+        def opener(_request: object, timeout: float) -> _Response:
+            del timeout
+            return responses.pop(0)
+
+        adapter = PolymarketAdapter(opener=opener)
+        self.assertIsNotNone(adapter.market("market-1"))
+        self.assertEqual(adapter.provider_timestamp_for("market-1"), stamp)
+
+        for _ in range(3):
+            self.assertIsNone(adapter.market("market-1"))
+            self.assertIsNone(adapter.provider_timestamp_for("market-1"))
+
     def test_repeated_evaluations_scan_once_but_reproject_each_payload(self) -> None:
         store = _QualityStore()
 

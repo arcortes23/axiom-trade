@@ -7,7 +7,7 @@ import tempfile
 import threading
 import time
 import unittest
-
+from axiom.dashboard import DashboardData
 from axiom.storage import AxiomStore
 
 
@@ -70,6 +70,31 @@ class DashboardScaleFixtureTests(unittest.TestCase):
                 self.assertLess(concurrent_elapsed, 1.0)
             finally:
                 writer.close()
+                store.close()
+
+    def test_overview_forward_evidence_stays_bounded_at_catalog_scale(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database_path = Path(temporary_directory) / "dashboard-forward-scale.sqlite3"
+            store = AxiomStore(str(database_path))
+            try:
+                self._seed_catalog(store, 2_000)
+                dashboard = DashboardData(store=store)
+
+                started = time.perf_counter()
+                overview = dashboard.overview_summary()
+                elapsed = time.perf_counter() - started
+
+                self.assertIsInstance(overview, dict)
+                evidence = overview["forward_evidence"]
+                self.assertLessEqual(len(evidence["candidate_bound_markets"]), 100)
+                self.assertLessEqual(len(evidence["scheduled"]), 100)
+                self.assertLessEqual(len(evidence["fresh"]), 100)
+                self.assertLessEqual(len(evidence["stale"]), 100)
+                self.assertLessEqual(len(evidence["missing"]), 100)
+                self.assertIn(evidence["grade"], {"A", "B", "C", "D", "F", "UNKNOWN"})
+                self.assertIsInstance(evidence["reason_code"], str)
+                self.assertLess(elapsed, 1.0)
+            finally:
                 store.close()
 
     @staticmethod

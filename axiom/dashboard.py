@@ -324,6 +324,43 @@ def _signal_projection(value: Any) -> dict[str, Any] | None:
         return None
     projected = dict(value)
     return projected or None
+def _signal_scan_reason_counts(*sources: Mapping[str, Any] | None) -> dict[str, int]:
+    """Decode only the bounded reason counts for the persisted scan cycle."""
+    flattened: list[Mapping[str, Any]] = []
+    for source in sources:
+        if not isinstance(source, Mapping):
+            continue
+        flattened.append(source)
+        for nested_name in ("autonomous", "autonomous_canary", "worker", "readiness", "status_report"):
+            nested = source.get(nested_name)
+            if isinstance(nested, Mapping):
+                flattened.append(nested)
+    for source in flattened:
+        raw = source.get("signal_scan_reason_counts")
+        if _display_value_missing(raw):
+            raw = source.get("signal_scan_reason_counts_json")
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                raw = None
+        if not isinstance(raw, Mapping):
+            continue
+        counts: dict[str, int] = {}
+        for key, value in list(raw.items())[:64]:
+            try:
+                count = int(value)
+            except (TypeError, ValueError):
+                continue
+            if count < 0:
+                continue
+            reason = str(key).strip()[:128]
+            if reason:
+                counts[reason] = count
+        return counts
+    return {}
+
+
 
 
 def _canonical_blocker(*sources: Mapping[str, Any] | None) -> Any:
@@ -336,26 +373,17 @@ def _canonical_blocker(*sources: Mapping[str, Any] | None) -> Any:
             return value
     return None
 def _canary_control_state(*sources: Mapping[str, Any] | None) -> str:
-    """Return the bounded control state represented by an authoritative report."""
-    states: list[str] = []
+    """Return the first authoritative, non-unknown control state."""
     for source in sources:
         if not isinstance(source, Mapping):
             continue
-        for key in ("state", "control_state", "micro_live_canary"):
+        for key in ("control_state", "micro_live_canary", "state"):
             value = source.get(key)
             if _display_value_missing(value):
                 continue
             state = str(value).strip().upper()
-            if state:
-                states.append(state)
-    if "KILLED" in states:
-        return "KILLED"
-    for state in states:
-        if state in {"DISABLED", "DISARMED"}:
-            return state
-    for state in states:
-        if state != "UNKNOWN":
-            return state
+            if state and state != "UNKNOWN":
+                return state
     return "UNKNOWN"
 
 
@@ -363,10 +391,17 @@ def _normalized_canary_blocker(
     blocker: Any,
     *control_sources: Mapping[str, Any] | None,
 ) -> Any:
-    """Fill only absent blockers from the authoritative control state."""
+    """Fill absent blockers from control state and hide stale disabled state."""
+    control_state = _canary_control_state(*control_sources)
+    normalized = str(blocker).strip().upper() if not _display_value_missing(blocker) else ""
+    if normalized == "AUTONOMOUS_CANARY_DISABLED" and control_state in {
+        "ARMED",
+        "AUTONOMOUS_MICRO_LIVE",
+        "LIVE",
+    }:
+        return None
     if not _display_value_missing(blocker):
         return blocker
-    control_state = _canary_control_state(*control_sources)
     if control_state in {"DISABLED", "DISARMED"}:
         return "AUTONOMOUS_CANARY_DISABLED"
     if control_state == "UNKNOWN":
@@ -502,17 +537,19 @@ def _hermes_row(item: Mapping[str, Any]) -> dict[str, Any]:
 
 def _hermes_outcome_type(status: Any, reason_code: Any) -> tuple[str | None, str | None]:
     normalized_status = str(status or "").strip().upper()
-    normalized_reason = str(reason_code or "").strip().upper()
-    if normalized_status not in {"ACCEPTED", "COMPLETED", "REJECTED", "FAILED"}:
-        return None, None
-    if normalized_reason == "DATASET_NOT_FOUND":
+    normalized_reason_code = str(reason_code or "").strip().upper()
+    if normalized_reason_code == "DATASET_NOT_FOUND" and normalized_status in {"REJECTED", "FAILED"}:
         return "PROPOSAL_REJECTED", "PROPOSAL REJECTED"
     if normalized_status in {"REJECTED", "FAILED"}:
         return "EXPERIMENT_REJECTED", "EXPERIMENT REJECTED"
-    return "EXPERIMENT_COMPLETED", "EXPERIMENT COMPLETED"
+    if normalized_status in {"ACCEPTED", "COMPLETED"}:
+        return "EXPERIMENT_COMPLETED", "EXPERIMENT COMPLETED"
+    return None, None
+
 
 def _is_terminal_hermes_status(value: Any) -> bool:
     return str(value or "").upper() in {"ACCEPTED", "COMPLETED", "REJECTED", "FAILED"}
+
 
 def _candidate_record(candidate: Any) -> dict[str, Any]:
     strategy = getattr(candidate, "strategy", None)
@@ -529,12 +566,15 @@ def _candidate_record(candidate: Any) -> dict[str, Any]:
         "rejection_reason": getattr(candidate, "rejection_reason", None),
         "strategy": strategy_record,
     }
+
+
 def _number_or_zero(value: Any) -> float:
     try:
         number = float(value)
     except (TypeError, ValueError):
         return 0.0
     return number if math.isfinite(number) else 0.0
+
 
 _CANARY_SELECTION_STATUSES = frozenset({"CURRENT", "STALE", "NONE", "UNKNOWN"})
 _CANARY_AUTONOMOUS_FIELDS = (
@@ -550,6 +590,17 @@ _CANARY_AUTONOMOUS_FIELDS = (
     "signal_scan_ranking_run_id",
     "next_signal_scan_start_rank",
     "next_signal_scan_end_rank",
+    "signal_scan_cycle_id",
+    "signal_scan_candidate_universe_hash",
+    "signal_scan_cycle_started_at",
+    "signal_scan_cycle_completed_at",
+    "signal_scan_cycle_complete",
+    "signal_scan_checked_this_cycle",
+    "signal_scan_remaining_this_cycle",
+    "signal_scan_coverage_percentage",
+    "signal_scan_skip_reasons_json",
+    "signal_scan_reason_counts_json",
+    "signal_scan_status",
 )
 _CANARY_STATUS_FIELDS = (
     "eligibility_raw_count",
@@ -724,6 +775,7 @@ def _canary_status_projection(status: Mapping[str, Any] | None) -> dict[str, Any
             "latest_signal": _signal_projection(value("latest_signal")),
             "next_decision": value("next_decision"),
             "blocker": value("blocker"),
+            "signal_scan_reason_counts": _signal_scan_reason_counts(source),
             **_canary_autonomous_projection(source),
         }
     )
@@ -777,6 +829,11 @@ def _canary_status_projection(status: Mapping[str, Any] | None) -> dict[str, Any
     )
     for name in _CANARY_RESEARCH_WINNER_FIELDS:
         autonomous[name] = projection[name]
+    autonomous["signal_scan_reason_counts"] = _signal_scan_reason_counts(
+        projection,
+        autonomous,
+        source,
+    )
     for name, fallback in (
         ("rank", "winner_rank"),
         ("score", "winner_score"),
@@ -981,6 +1038,8 @@ class DashboardData:
     ) -> None:
         self._data = dict(data or {})
         self.tracker = tracker
+        # Compatibility-only inputs: worker-owned providers are never consulted
+        # by dashboard reads, which project persisted storage below.
         self.crypto_provider = crypto_provider
         self.prediction_provider = prediction_provider
         self.evolution = evolution
@@ -1030,109 +1089,64 @@ class DashboardData:
         configured = self._configured("crypto")
         if configured is not None:
             return configured
-        provider = self.crypto_provider
-        if provider is None:
-            summary = self.store.dashboard_summary() if self.store is not None else {}
-            return {
-                "available": bool(summary.get("bars", 0)),
-                "provider": "persisted",
-                "symbols": [],
-                "bars": summary.get("bars", 0),
-                "datasets": summary.get("datasets", 0),
-                "live_execution": False,
-            }
-        symbols = self._data.get("crypto_symbols", ())
-        tickers = {}
-        provider_errors = 0
-        for symbol in symbols:
-            try:
-                ticker = provider.ticker(symbol)
-            except Exception:
-                provider_errors += 1
-                ticker = None
-            if ticker is not None:
-                tickers[symbol] = ticker
-        result = {
-            "available": bool(tickers),
-            "provider": provider.__class__.__name__,
-            "tickers": tickers,
-            "provider_errors": provider_errors,
+        summary = self.store.dashboard_summary() if self.store is not None else {}
+        return {
+            "available": bool(summary.get("bars", 0)),
+            "provider": "persisted",
+            "symbols": [],
+            "bars": summary.get("bars", 0),
+            "datasets": summary.get("datasets", 0),
             "live_execution": False,
         }
-        if provider_errors and not tickers:
-            result["error"] = "crypto provider unavailable"
-        return result
 
     def prediction(self) -> Any:
         configured = self._configured("prediction")
         if configured is not None:
             return configured
-        provider = self.prediction_provider
-        if provider is None:
-            markets: list[dict[str, Any]] = []
-            if self.store is not None:
-                try:
-                    tracked = self.store.tracked_polymarket_markets(active_only=True, include_payload=True)
-                    active_ids = {
-                        str(item.get("market_id"))
-                        for item in tracked
-                        if isinstance(item, Mapping) and item.get("market_id")
-                    }
-                    snapshots = self.store.load_latest_polymarket_snapshots(active_ids, limit=1000)
-                except AttributeError:
-                    snapshots = self.store.load_polymarket_snapshots(limit=1000, latest=True)
-                    active_ids = {
-                        str(item.get("market_id"))
-                        for item in snapshots
-                        if isinstance(item, Mapping) and item.get("market_id")
-                    }
-                latest_by_market: dict[str, Mapping[str, Any]] = {}
-                for item in snapshots:
-                    market_id = str(item.get("market_id", "")).strip()
-                    if not market_id or market_id not in active_ids:
-                        continue
-                    payload = item.get("payload", {})
-                    if isinstance(payload, Mapping) and str(payload.get("source_type", "")).upper() == "HISTORICAL":
-                        continue
-                    latest_by_market.setdefault(market_id, item)
-                for item in latest_by_market.values():
-                    payload = item.get("payload", {})
-                    if not isinstance(payload, Mapping):
-                        payload = {}
-                    snapshot = payload.get("snapshot")
-                    record = dict(snapshot) if isinstance(snapshot, Mapping) else dict(payload)
-                    record.setdefault("market_id", item.get("market_id"))
-                    record["research_quality"] = item.get("quality", payload.get("research_quality"))
-                    record["source_type"] = payload.get("source_type", "FORWARD_COLLECTED")
-                    markets.append(record)
-            return {
-                "available": bool(markets),
-                "provider": "persisted",
-                "markets": markets,
-                "source_type": "FORWARD_COLLECTED",
-                "live_execution": False,
-            }
-        try:
+        markets: list[dict[str, Any]] = []
+        if self.store is not None:
             try:
-                markets = provider.markets(active=True, limit=1000)
-            except TypeError:
-                markets = provider.markets(active=True)
-            markets = list(islice(markets, 1000))
-        except Exception:
-            return {
-                "available": False,
-                "provider": provider.__class__.__name__,
-                "markets": [],
-                "error": "prediction provider unavailable",
-                "live_execution": False,
-            }
+                tracked = self.store.tracked_polymarket_markets(active_only=True, include_payload=True)
+                active_ids = {
+                    str(item.get("market_id"))
+                    for item in tracked
+                    if isinstance(item, Mapping) and item.get("market_id")
+                }
+                snapshots = self.store.load_latest_polymarket_snapshots(active_ids, limit=1000)
+            except AttributeError:
+                snapshots = self.store.load_polymarket_snapshots(limit=1000, latest=True)
+                active_ids = {
+                    str(item.get("market_id"))
+                    for item in snapshots
+                    if isinstance(item, Mapping) and item.get("market_id")
+                }
+            latest_by_market: dict[str, Mapping[str, Any]] = {}
+            for item in snapshots:
+                market_id = str(item.get("market_id", "")).strip()
+                if not market_id or market_id not in active_ids:
+                    continue
+                payload = item.get("payload", {})
+                if isinstance(payload, Mapping) and str(payload.get("source_type", "")).upper() == "HISTORICAL":
+                    continue
+                latest_by_market.setdefault(market_id, item)
+            for item in latest_by_market.values():
+                payload = item.get("payload", {})
+                if not isinstance(payload, Mapping):
+                    payload = {}
+                snapshot = payload.get("snapshot")
+                record = dict(snapshot) if isinstance(snapshot, Mapping) else dict(payload)
+                record.setdefault("market_id", item.get("market_id"))
+                record["research_quality"] = item.get("quality", payload.get("research_quality"))
+                record["source_type"] = payload.get("source_type", "FORWARD_COLLECTED")
+                markets.append(record)
         return {
             "available": bool(markets),
-            "provider": provider.__class__.__name__,
+            "provider": "persisted",
             "markets": markets,
             "source_type": "FORWARD_COLLECTED",
             "live_execution": False,
         }
+
     def evolution_data(self) -> Any:
         configured = self._configured("evolution")
         if configured is not None:
@@ -1332,6 +1346,49 @@ class DashboardData:
         offset = (values["page"] - 1) * values["page_size"]
         return _page_result(items[offset : offset + values["page_size"]], page=values["page"], page_size=values["page_size"], total=len(items))
 
+    def _enrich_polymarket_rows(self, result: dict[str, Any]) -> dict[str, Any]:
+        evidence = self._required_forward_evidence()
+        diagnostics = evidence.get("market_diagnostics", [])
+        by_market = {
+            str(item.get("market_id")): item
+            for item in diagnostics
+            if isinstance(item, Mapping) and item.get("market_id")
+        }
+        for item in result.get("items", []):
+            if not isinstance(item, Mapping):
+                continue
+            market_id = str(item.get("market_id") or "").strip()
+            diagnostic = by_market.get(market_id)
+            candidate_bound = bool(diagnostic and diagnostic.get("candidate_bound", False))
+            item["candidate_bound"] = candidate_bound
+            item["candidate_bound_priority"] = candidate_bound
+            item["required_priority"] = "CANDIDATE_BOUND" if candidate_bound else None
+            item["forward_required"] = candidate_bound
+            item["candidate_references"] = (
+                list(diagnostic.get("candidate_references", ()))[:32]
+                if diagnostic is not None
+                else []
+            )
+            # Health diagnostics describe only candidate-bound requirements.
+            # Ordinary discovery rows must retain their persisted provenance
+            # and collection fields rather than receiving diagnostic nulls.
+            if diagnostic is not None:
+                for key in (
+                    "source_timestamp",
+                    "observed_at",
+                    "freshness_age_seconds",
+                    "collection_state",
+                    "reason_code",
+                    "reason_display",
+                ):
+                    item[key] = diagnostic.get(key)
+            quality_label, quality_context = _polymarket_quality_display(item)
+            item["quality_label"] = quality_label
+            item["quality_context"] = quality_context
+        result["forward_evidence"] = evidence
+        return result
+
+
     def paginate_polymarket_markets(self, params: Mapping[str, Any] | None = None) -> dict[str, Any]:
         values = _pagination_params(params)
         values["sort"] = values.get("sort") or "observed_at"
@@ -1358,10 +1415,7 @@ class DashboardData:
                     for key in ("question", "yes_mid", "liquidity", "category", "settlement", "timeframe"):
                         if key not in item and key in snapshot:
                             item[key] = snapshot[key]
-                quality_label, quality_context = _polymarket_quality_display(item)
-                item["quality_label"] = quality_label
-                item["quality_context"] = quality_context
-            return result
+            return self._enrich_polymarket_rows(result)
         data = self.prediction()
         items = data.get("markets", []) if isinstance(data, Mapping) else []
         items = items if isinstance(items, list) else []
@@ -1378,7 +1432,14 @@ class DashboardData:
                 item["quality_label"] = label
                 item["quality_context"] = context
         offset = (values["page"] - 1) * values["page_size"]
-        return _page_result(items[offset : offset + values["page_size"]], page=values["page"], page_size=values["page_size"], total=len(items))
+        return self._enrich_polymarket_rows(
+            _page_result(
+                items[offset : offset + values["page_size"]],
+                page=values["page"],
+                page_size=values["page_size"],
+                total=len(items),
+            )
+        )
 
     def paginate_research_queue(self, params: Mapping[str, Any] | None = None) -> dict[str, Any]:
         values = _pagination_params(params)
@@ -3044,6 +3105,182 @@ class DashboardData:
             "live_execution": False,
         }
 
+    def _required_forward_evidence(self) -> dict[str, Any]:
+        """Read bounded candidate-bound market health without provider calls."""
+        empty: dict[str, Any] = {
+            "candidate_bound_markets": [],
+            "scheduled": [],
+            "fresh": [],
+            "stale": [],
+            "missing": [],
+            "newest_required_source_timestamp": None,
+            "oldest_required_source_timestamp": None,
+            "newest_required_observed_at": None,
+            "oldest_required_observed_at": None,
+            "newest_required_source": None,
+            "oldest_required_source": None,
+            "newest_required_observed": None,
+            "oldest_required_observed": None,
+            "newest_required_snapshot": None,
+            "oldest_required_snapshot": None,
+            "grade": "D",
+            "grade_scope": "required_forward_markets",
+            "reason_code": "CANDIDATE_FORWARD_MARKET_UNRESOLVED",
+            "reason_display": "UNRESOLVED_MARKET",
+            "candidate_references": {},
+            "market_diagnostics": [],
+            "diagnostics": [],
+            "required_market_count": 0,
+            "unresolved_candidates": [],
+            "closed_candidates": [],
+        }
+        if self.store is None:
+            return empty
+        requirements_method = getattr(self.store, "candidate_forward_requirements", None)
+        if not callable(requirements_method):
+            return empty
+        try:
+            requirements = requirements_method(
+                max_candidates=100,
+                max_markets_per_candidate=8,
+                max_total_markets=100,
+            )
+        except TypeError:
+            try:
+                requirements = requirements_method()
+            except (AttributeError, TypeError, ValueError, sqlite3.Error):
+                return empty
+        except (AttributeError, TypeError, ValueError, sqlite3.Error):
+            return empty
+        requirements = requirements if isinstance(requirements, Mapping) else {}
+        health_method = getattr(self.store, "polymarket_required_health", None)
+        if not callable(health_method):
+            return empty
+        try:
+            health = health_method(requirements=requirements)
+        except TypeError:
+            try:
+                health = health_method(requirements)
+            except (AttributeError, TypeError, ValueError, sqlite3.Error):
+                health = {}
+        except (AttributeError, TypeError, ValueError, sqlite3.Error):
+            health = {}
+        health = health if isinstance(health, Mapping) else {}
+
+        def bounded_ids(value: Any, limit: int = 100) -> list[str]:
+            if not isinstance(value, (list, tuple, set, frozenset)):
+                return []
+            return list(dict.fromkeys(str(item).strip() for item in list(value)[:limit] if str(item).strip()))
+
+        raw_diagnostics = health.get("market_diagnostics", health.get("diagnostics", []))
+        diagnostics: list[dict[str, Any]] = []
+        if isinstance(raw_diagnostics, (list, tuple)):
+            for raw in list(raw_diagnostics)[:100]:
+                if not isinstance(raw, Mapping):
+                    continue
+                market_id = str(raw.get("market_id") or "").strip()
+                if not market_id:
+                    continue
+                reason_code = str(raw.get("reason_code") or "").strip() or None
+                refs = bounded_ids(raw.get("candidate_references"), 32)
+                diagnostics.append(
+                    {
+                        "market_id": market_id,
+                        "candidate_bound": bool(raw.get("candidate_bound", True)),
+                        "candidate_references": refs,
+                        "source_timestamp": raw.get("source_timestamp"),
+                        "observed_at": raw.get("observed_at"),
+                        "freshness_age_seconds": raw.get("freshness_age_seconds"),
+                        "collection_state": raw.get("collection_state"),
+                        "reason_code": reason_code,
+                        "reason_display": (
+                            "UNRESOLVED_MARKET"
+                            if reason_code == "CANDIDATE_FORWARD_MARKET_UNRESOLVED"
+                            else reason_code
+                        ),
+                    }
+                )
+        diagnostic_by_market = {item["market_id"]: item for item in diagnostics}
+        source_stamps = [
+            (parse_timestamp(item.get("source_timestamp")), item.get("source_timestamp"))
+            for item in diagnostics
+            if parse_timestamp(item.get("source_timestamp")) is not None
+        ]
+        observed_stamps = [
+            (parse_timestamp(item.get("observed_at")), item.get("observed_at"))
+            for item in diagnostics
+            if parse_timestamp(item.get("observed_at")) is not None
+        ]
+        source_stamps.sort(key=lambda item: item[0])
+        observed_stamps.sort(key=lambda item: item[0])
+        references = health.get("candidate_references", requirements.get("candidate_references", {}))
+        references = references if isinstance(references, Mapping) else {}
+        bounded_references = {
+            str(market_id): bounded_ids(values, 32)
+            for market_id, values in list(references.items())[:100]
+        }
+        reason_code = str(
+            health.get("reason_code")
+            or requirements.get("reason_code")
+            or empty["reason_code"]
+        ).strip()
+        return {
+            "candidate_bound_markets": bounded_ids(
+                health.get("candidate_bound_markets", requirements.get("market_ids", []))
+            ),
+            "scheduled": bounded_ids(health.get("scheduled", [])),
+            "fresh": bounded_ids(health.get("fresh", [])),
+            "stale": bounded_ids(health.get("stale", [])),
+            "missing": bounded_ids(health.get("missing", [])),
+            "newest_required_source_timestamp": (
+                source_stamps[-1][1]
+                if source_stamps
+                else health.get("newest_required_source_timestamp", health.get("newest_required_snapshot"))
+            ),
+            "oldest_required_source_timestamp": (
+                source_stamps[0][1]
+                if source_stamps
+                else health.get("oldest_required_source_timestamp", health.get("oldest_required_snapshot"))
+            ),
+            "newest_required_observed_at": (
+                observed_stamps[-1][1] if observed_stamps else health.get("newest_required_observed_at")
+            ),
+            "oldest_required_observed_at": (
+                observed_stamps[0][1] if observed_stamps else health.get("oldest_required_observed_at")
+            ),
+            "newest_required_source": (
+                source_stamps[-1][1]
+                if source_stamps
+                else health.get("newest_required_source_timestamp", health.get("newest_required_snapshot"))
+            ),
+            "oldest_required_source": (
+                source_stamps[0][1]
+                if source_stamps
+                else health.get("oldest_required_source_timestamp", health.get("oldest_required_snapshot"))
+            ),
+            "newest_required_observed": (
+                observed_stamps[-1][1] if observed_stamps else health.get("newest_required_observed_at")
+            ),
+            "oldest_required_observed": (
+                observed_stamps[0][1] if observed_stamps else health.get("oldest_required_observed_at")
+            ),
+            "grade": health.get("grade"),
+            "grade_scope": health.get("grade_scope", "required_forward_markets"),
+            "reason_code": reason_code,
+            "reason_display": (
+                "UNRESOLVED_MARKET"
+                if reason_code == "CANDIDATE_FORWARD_MARKET_UNRESOLVED"
+                else reason_code
+            ),
+            "candidate_references": bounded_references,
+            "market_diagnostics": diagnostics,
+            "diagnostics": diagnostics,
+            "required_market_count": health.get("required_market_count", len(diagnostics)),
+            "unresolved_candidates": bounded_ids(health.get("unresolved_candidates", [])),
+            "closed_candidates": bounded_ids(health.get("closed_candidates", [])),
+            "as_of": health.get("as_of") or requirements.get("as_of"),
+        }
+
     def overview_summary(
         self,
         *,
@@ -3060,6 +3297,8 @@ class DashboardData:
                 "research_cards": {},
                 "coverage": {},
                 "latest_activity": [],
+                "forward_evidence": self._required_forward_evidence(),
+                "signal_scan_reason_counts": {},
                 "live_execution": False,
             }
         aggregate = self.store.dashboard_overview_summary(activity_limit=8)
@@ -3258,22 +3497,34 @@ class DashboardData:
             canary_status,
             _canary_autonomous_projection(autonomous),
         )
+        raw_blocker = _canonical_blocker(
+            worker_section if isinstance(worker_section, Mapping) else None,
+            autonomous,
+            canary_status,
+        )
         blocker = _normalized_canary_blocker(
-            _canonical_blocker(
-                worker_section if isinstance(worker_section, Mapping) else None,
-                autonomous,
-                canary_status,
-            ),
+            raw_blocker,
             canary_report.get("control") if isinstance(canary_report, Mapping) else None,
             canary_report.get("authoritative_control") if isinstance(canary_report, Mapping) else None,
             canary_report.get("readiness") if isinstance(canary_report, Mapping) else None,
             canary_status,
         )
+        signal_scan_reason_counts = _signal_scan_reason_counts(
+            canary_status,
+            autonomous,
+            worker_section if isinstance(worker_section, Mapping) else None,
+            canary_report,
+        )
         canary_status["blocker"] = blocker
+        canary_status["last_cycle_blocker"] = raw_blocker
+        canary_status["signal_scan_reason_counts"] = signal_scan_reason_counts
         autonomous["blocker"] = blocker
+        autonomous["last_cycle_blocker"] = raw_blocker
+        autonomous["signal_scan_reason_counts"] = signal_scan_reason_counts
         canary_status["autonomous"] = autonomous
         latest_signal = _signal_projection(canary_status.get("latest_signal"))
         canary_status["latest_signal"] = latest_signal
+        forward_evidence = self._required_forward_evidence()
         def worker_state(name: str, default: str = "NOT INITIALIZED") -> str:
             item = worker_map.get(name, {})
             status = str(item.get("status") or "").upper()
@@ -3431,6 +3682,8 @@ class DashboardData:
             "candidates": latest_candidates,
             "canary": canary_status,
             "canary_signal": latest_signal,
+            "forward_evidence": forward_evidence,
+            "signal_scan_reason_counts": signal_scan_reason_counts,
             "candidate_status": {
                 "canary_eligible": candidate_canary_count,
                 "rankable": canary_status.get("rankable_count") if isinstance(canary_status, Mapping) else None,
@@ -3453,7 +3706,6 @@ class DashboardData:
         }
 
     def canary_data(self) -> dict[str, Any]:
-        credentials = canary_module.CredentialStore().safe_projection(allow_environment=False)
         canary_report: dict[str, Any] = {}
         if self.store is None:
             canary: Mapping[str, Any] = {
@@ -3571,7 +3823,7 @@ class DashboardData:
             autonomous = _patch_non_missing_values(autonomous, worker_fields)
         autonomous = _patch_non_missing_values(
             autonomous,
-            _canary_autonomous_projection(canary, worker_section),
+            _canary_autonomous_projection(worker_section, canary),
         )
         autonomous.setdefault("rank", canary.get("winner_rank"))
         autonomous.setdefault("score", canary.get("winner_score"))
@@ -3582,25 +3834,38 @@ class DashboardData:
             canary,
             _canary_autonomous_projection(autonomous),
         )
+        raw_blocker = _canonical_blocker(
+            worker_section if isinstance(worker_section, Mapping) else None,
+            autonomous,
+            canary,
+        )
+        blocker = _normalized_canary_blocker(
+            raw_blocker,
+            canary_report.get("control") if isinstance(canary_report, Mapping) else None,
+            canary_report.get("authoritative_control") if isinstance(canary_report, Mapping) else None,
+            canary_report.get("readiness") if isinstance(canary_report, Mapping) else None,
+            canary,
+        )
         control_state = _canary_control_state(
             canary_report.get("control") if isinstance(canary_report, Mapping) else None,
             canary_report.get("authoritative_control") if isinstance(canary_report, Mapping) else None,
             canary_report.get("readiness") if isinstance(canary_report, Mapping) else None,
             canary,
         )
-        blocker = _normalized_canary_blocker(
-            _canonical_blocker(
-                worker_section if isinstance(worker_section, Mapping) else None,
-                autonomous,
-                canary,
-            ),
-            canary_report.get("control") if isinstance(canary_report, Mapping) else None,
-            canary_report.get("authoritative_control") if isinstance(canary_report, Mapping) else None,
-            canary_report.get("readiness") if isinstance(canary_report, Mapping) else None,
+        signal_scan_reason_counts = _signal_scan_reason_counts(
             canary,
+            autonomous,
+            worker_section if isinstance(worker_section, Mapping) else None,
+            canary_report,
         )
+        forward_evidence = self._required_forward_evidence()
         canary["blocker"] = blocker
+        canary["last_cycle_blocker"] = raw_blocker
+        canary["signal_scan_reason_counts"] = signal_scan_reason_counts
         autonomous["blocker"] = blocker
+        autonomous["last_cycle_blocker"] = raw_blocker
+        autonomous["signal_scan_reason_counts"] = signal_scan_reason_counts
+        canary["autonomous"] = autonomous
         canary["latest_signal"] = signal
         canary["control_state"] = control_state
         canary.setdefault("display_state", canary.get("control_state"))
@@ -3651,6 +3916,41 @@ class DashboardData:
             except (AttributeError, TypeError, ValueError, sqlite3.Error):
                 persisted_connectivity = None
         connectivity = _stored_connectivity_projection(persisted_connectivity)
+        credential_type = canary_module.CredentialStore
+        try:
+            credentials = credential_type.cached_projection(
+                allow_environment=False,
+                persisted={
+                    "canary": canary,
+                    "status_report": canary_report,
+                    "connectivity": connectivity,
+                },
+            )
+        except BaseException:
+            credentials = None
+        if not isinstance(credentials, Mapping):
+            try:
+                credential_store = credential_type()
+                credentials = credential_store.cached_projection(
+                    allow_environment=False,
+                    persisted={
+                        "canary": canary,
+                        "status_report": canary_report,
+                        "connectivity": connectivity,
+                    },
+                )
+            except BaseException:
+                credentials = None
+        if not isinstance(credentials, Mapping):
+            credentials = {
+                "configured": None,
+                "status": "NOT CHECKED",
+                "secret_values_exposed": False,
+            }
+        else:
+            credentials = dict(credentials)
+        credentials["secret_values_exposed"] = False
+        canary["credentials"] = dict(credentials)
         projection = {
             "canary": canary,
             "status_report": canary_report,
@@ -3688,6 +3988,8 @@ class DashboardData:
             "credentials": credentials,
             "real_execution_events": execution_events,
             "live_execution": False,
+            "forward_evidence": forward_evidence,
+            "signal_scan_reason_counts": signal_scan_reason_counts,
         }
         projection.update({name: canary[name] for name in _CANARY_STATUS_FIELDS})
         return projection
@@ -3742,17 +4044,31 @@ class DashboardData:
             )
         )
         # ``OperatorControlPlane.status`` already returns the bounded
-        # credential metadata projection.  Re-project only its boolean state;
-        # never load credential values during a dashboard read.
+        # credential metadata projection.  Preserve unknown/not-checked
+        # values instead of coercing a missing value to ``False``.
         raw_credentials = controls.get("credentials")
         configured = (
-            bool(raw_credentials.get("configured"))
+            raw_credentials.get("configured")
             if isinstance(raw_credentials, Mapping)
-            else False
+            and isinstance(raw_credentials.get("configured"), bool)
+            else None
         )
+        raw_status = (
+            str(raw_credentials.get("status") or "").strip().upper()
+            if isinstance(raw_credentials, Mapping)
+            else ""
+        )
+        if raw_status not in {"CONFIGURED", "NOT CONFIGURED", "UNKNOWN", "NOT CHECKED"}:
+            raw_status = (
+                "CONFIGURED"
+                if configured is True
+                else "NOT CONFIGURED"
+                if configured is False
+                else "NOT CHECKED"
+            )
         result["credentials"] = {
             "configured": configured,
-            "status": "CONFIGURED" if configured else "NOT CONFIGURED",
+            "status": raw_status,
             "secret_values_exposed": False,
         }
         # Keep control-only status available without colliding with the
@@ -3967,7 +4283,6 @@ class DashboardData:
                         if key in worker_section
                     },
                 )
-            canary_status["autonomous"] = autonomous
         else:
             canary_report = {}
             canary_status = _canary_status_projection(self.canary_data()["canary"])
@@ -3983,16 +4298,50 @@ class DashboardData:
             else None
         )
         if isinstance(raw_credentials, Mapping):
-            configured = bool(raw_credentials.get("configured"))
+            configured = (
+                raw_credentials.get("configured")
+                if isinstance(raw_credentials.get("configured"), bool)
+                else None
+            )
+            raw_status = str(raw_credentials.get("status") or "").strip().upper()
+            if raw_status not in {
+                "CONFIGURED",
+                "NOT CONFIGURED",
+                "UNKNOWN",
+                "NOT CHECKED",
+            }:
+                raw_status = (
+                    "CONFIGURED"
+                    if configured is True
+                    else "NOT CONFIGURED"
+                    if configured is False
+                    else "NOT CHECKED"
+                )
             credentials = {
                 "configured": configured,
-                "status": "CONFIGURED" if configured else "NOT CONFIGURED",
+                "status": raw_status,
                 "secret_values_exposed": False,
             }
         else:
-            credentials = canary_module.CredentialStore().safe_projection(
-                allow_environment=False
-            )
+            try:
+                credentials = canary_module.CredentialStore.cached_projection(
+                    allow_environment=False,
+                    persisted={
+                        "canary": canary_status,
+                        "status_report": canary_report,
+                    },
+                )
+            except BaseException:
+                credentials = None
+            if not isinstance(credentials, Mapping):
+                credentials = {
+                    "configured": None,
+                    "status": "NOT CHECKED",
+                    "secret_values_exposed": False,
+                }
+            else:
+                credentials = dict(credentials)
+            credentials["secret_values_exposed"] = False
         return {
             "title": "AXIOM / operator research console",
             "live_trading": {"status": "Disabled", "enabled": False},
@@ -4283,12 +4632,12 @@ def _dashboard_html(control_token: str | None = None) -> str:
       const manualCandidate=backendState==="ARMED"&&c.candidate?`<div class="panel"><div class="metric">${safe(c.candidate)}</div><div class="metric-label">Manual armed candidate</div></div>`:"";
       const connectivityReady=connectivity?.ready===true, connectivityBlocker=connectivityReady?"":arr(connectivity?.failure_codes)[0]||"CONNECTIVITY_BLOCKED";
       const selectionReason=c.selection_invalidation_reason||"", selectionBlocker=selectionValid&&currentCandidate?"":(selectionReason||(selectionStatus==="STALE"?"REEVALUATION_REQUIRED":selectionStatus==="UNKNOWN"?"READINESS_UNKNOWN":selectionStatus==="NONE"?"NO_CURRENT_SELECTION":"SELECTION_INVALID"));
-      const autonomousBlocker=!connectivity?"CONNECTIVITY_CHECK_REQUIRED":!connectivityReady?connectivityBlocker:backendState==="KILLED"?"CANARY_KILLED":selectionBlocker||String(auto.blocker||"AUTONOMOUS_CANARY_DISABLED");
+      const autonomousBlocker=enabled?"ENABLED":!connectivity?"CONNECTIVITY_CHECK_REQUIRED":!connectivityReady?connectivityBlocker:backendState==="KILLED"?"CANARY_KILLED":selectionBlocker||String(auto.blocker||"AUTONOMOUS_CANARY_DISABLED");
       const autoReady=connectivityReady&&backendState!=="KILLED"&&!enabled&&selectionValid&&Boolean(currentCandidate);
       const enable=stateValue==="KILLED"?"":enabled?controlButton("canary.disarm","DISARM","","DISARM"):controlButton("canary.enable_auto","ENABLE AUTO CANARY","","ENABLE AUTO CANARY");
       const riskMarkup=Object.entries(risk).map(([key,value])=>`<div class="key-value"><span class="key">${safe(key.replaceAll("_"," "))}</span><strong>${safe(value)}</strong></div>`).join("")||empty("Risk envelope unavailable","No frozen risk limits are persisted.");
       const currentRank=selectionValid&&selectionStatus==="CURRENT"?auto.rank:"—", currentScore=selectionValid&&selectionStatus==="CURRENT"?auto.score:"—", selectionReasonLabel=c.selection_reason||"—", historicalMarkup=historicalCandidate?`<div class="panel"><div class="metric">${safe(historicalCandidate)}</div><div class="metric-label">Selected winner · Historical selected ID</div><p class="page-note"><span class="badge ${statusClass(selectionStatus)}">${safe(selectionLabel)}</span></p></div>`:"";
-      $("canary-controls").innerHTML=`<article class="panel"><div class="section-title"><h2>AUTONOMOUS CANARY CONTROL</h2><span class="badge ${statusClass(stateValue)}">${safe(stateValue)}</span></div><p class="page-note"><strong>${safe(autoReady?"AUTO CANARY READY TO ENABLE":`AUTO CANARY BLOCKED: ${autonomousBlocker}`)}</strong></p><div class="page-note">${controlButton("canary.connectivity_check","Connectivity check")} · ${enable} · ${controlButton("canary.kill","KILL","","KILL")}</div><p class="page-note">One confirmation enables the frozen prediction-only $1 envelope. Research, eligibility, ranking, and submission decisions run in the node worker; Hermes cannot change this envelope.</p></article>`;
+      $("canary-controls").innerHTML=`<article class="panel"><div class="section-title"><h2>AUTONOMOUS CANARY CONTROL</h2><span class="badge ${statusClass(stateValue)}">${safe(stateValue)}</span></div><p class="page-note"><strong>${safe(enabled?"AUTO CANARY ENABLED":autoReady?"AUTO CANARY READY TO ENABLE":`AUTO CANARY BLOCKED: ${autonomousBlocker}`)}</strong></p><div class="page-note">${controlButton("canary.connectivity_check","Connectivity check")} · ${enable} · ${controlButton("canary.kill","KILL","","KILL")}</div><p class="page-note">One confirmation enables the frozen prediction-only $1 envelope. Research, eligibility, ranking, and submission decisions run in the node worker; Hermes cannot change this envelope.</p></article>`;
       $("canary-summary").innerHTML=`<div class="card-grid"><div class="panel"><div class="metric">${safe(stateValue)}</div><div class="metric-label">Autonomous canary state</div></div>${currentCandidate?`<div class="panel"><div class="metric">${safe(currentCandidate)}</div><div class="metric-label">Selected winner · Current selection</div><p class="page-note"><span class="badge ${statusClass(selectionStatus)}">${safe(selectionLabel)}</span></p></div>`:historicalMarkup||`<div class="panel"><div class="metric">—</div><div class="metric-label">Current selection</div><p class="page-note"><span class="badge ${statusClass(selectionStatus)}">${safe(selectionLabel)}</span></p></div>`}${manualCandidate}<div class="panel"><div class="metric">${safe(currentRank)} · ${safe(currentScore)}</div><div class="metric-label">Current rank / score</div></div><div class="panel"><div class="metric">${count(rawEligible)}</div><div class="metric-label">Eligible candidates (raw)</div></div><div class="panel"><div class="metric">${count(eligible)}</div><div class="metric-label">Eligible candidates (validated)</div></div><div class="panel"><div class="metric">${count(rawRankable)}</div><div class="metric-label">Rankable candidates (raw)</div></div><div class="panel"><div class="metric">${count(rankable)}</div><div class="metric-label">Rankable candidates (validated)</div></div><div class="panel"><div class="metric">${count(events)}</div><div class="metric-label">Real execution events</div></div></div><article class="panel"><div class="section-title"><h2>Autonomous readiness</h2><span class="badge ${statusClass(autonomousBlocker)}">${safe(autoReady?"READY":autonomousBlocker)}</span></div><div class="three-col"><div class="key-value"><span class="key">Selection status</span><strong>${safe(selectionLabel)}</strong></div><div class="key-value"><span class="key">Selection valid</span><strong>${safe(selectionValid)}</strong></div><div class="key-value"><span class="key">Current selection</span><strong>${safe(currentCandidate||"—")}</strong></div><div class="key-value"><span class="key">Historical selection</span><strong>${safe(historicalCandidate||"—")}</strong></div><div class="key-value"><span class="key">Selection reason</span><strong>${safe(selectionReasonLabel)}</strong></div><div class="key-value"><span class="key">Invalidation reason</span><strong>${safe(selectionReason||"—")}</strong></div><div class="key-value"><span class="key">Last ranking run ID</span><strong>${safe(c.ranking_run_id||"—")}</strong></div><div class="key-value"><span class="key">Last ranking timestamp</span><strong>${safe(dateText(c.ranking_timestamp))}</strong></div><div class="key-value"><span class="key">Historical data integrity</span><strong>${safe(c.historical_data_integrity||"UNKNOWN")}</strong></div><div class="key-value"><span class="key">Historical execution fidelity</span><strong>${safe(c.historical_execution_fidelity||"UNKNOWN")}</strong></div><div class="key-value"><span class="key">Current execution evidence</span><strong>${safe(c.current_execution_evidence||"CURRENT_ORDER_BOOK_REQUIRED")}</strong></div><div class="key-value"><span class="key">Next decision</span><strong>${safe(auto.next_decision||"—")}</strong></div><div class="key-value"><span class="key">Blocker</span><strong>${safe(selectionReason||auto.blocker||"—")}</strong></div></div></article><article class="panel"><div class="section-title"><h2>Risk envelope</h2><span class="badge warn">bounded $1</span></div>${riskMarkup}</article>`;
       const readiness=signal?String(signal.status||"READY"):"NO SIGNAL", detail=signal?`<div class="three-col"><div class="key-value"><span class="key">Signal readiness</span><strong>${safe(readiness)}</strong></div><div class="key-value"><span class="key">Market / outcome</span><strong>${safe(signal.market_id)} / ${safe(signal.outcome)}</strong></div><div class="key-value"><span class="key">Expected price</span><strong>${safe(signal.paper_expected_price)}</strong></div><div class="key-value"><span class="key">Generated</span><strong>${safe(dateText(signal.generated_at))}</strong></div><div class="key-value"><span class="key">Order result</span><strong>${safe(c.last_request_status||"NO ORDER")}</strong></div></div>`:empty("No latest signal","No persisted signal is available.");
       $("canary-summary").insertAdjacentHTML("beforeend",`<article class="panel"><div class="section-title"><h2>Latest signal</h2><span class="badge ${statusClass(readiness)}">${safe(readiness)}</span></div>${detail}<p class="page-note">Kill prevents new submissions; an in-flight request is recorded, in-flight not retracted, and never retried automatically.</p></article>`);
@@ -4315,6 +4664,11 @@ def _dashboard_html(control_token: str | None = None) -> str:
       const existing=$("canary-actionable-opportunity");
       if(existing)existing.remove();
       $("canary-summary")?.insertAdjacentHTML("afterbegin",`<article id="canary-actionable-opportunity" class="panel"><div class="section-title"><h2>ACTIONABLE SIGNAL SCAN</h2><span class="badge ${statusClass(status)}">${safe(status)}</span></div><div class="three-col"><div class="key-value"><span class="key">Research winner · candidate</span><strong>${safe(researchCandidate)}</strong></div><div class="key-value"><span class="key">Research rank</span><strong>${safe(researchRank)}</strong></div><div class="key-value"><span class="key">Current actionable candidate</span><strong>${safe(currentCandidate)}</strong></div><div class="key-value"><span class="key">Candidates ranked</span><strong>${count(read("candidates_ranked"))}</strong></div><div class="key-value"><span class="key">Signal checked this tick</span><strong>${count(signalChecked)}</strong></div><div class="key-value"><span class="key">No signal</span><strong>${count(noSignal)}</strong></div><div class="key-value"><span class="key">Actionable</span><strong>${count(actionableFound)}</strong></div><div class="key-value"><span class="key">Chosen actionable rank</span><strong>${safe(read("selected_actionable_rank"))}</strong></div><div class="key-value"><span class="key">Chosen score</span><strong>${safe(read("selected_actionable_score"))}</strong></div></div>${noAction?`<p class="page-note"><strong>NO ACTIONABLE SIGNAL</strong> · checked ${count(signalChecked)} candidate(s) · next scan window ranks ${scanWindow}</p>`:""}<p class="page-note">Signal scan ranking run ${safe(read("signal_scan_ranking_run_id"))} · cursor ${safe(read("signal_scan_cursor"))}</p></article>`);
+      const forwardEvidence=data?.forward_evidence||c.forward_evidence||{}, reasonCounts=data?.signal_scan_reason_counts||auto.signal_scan_reason_counts||{};
+      const displayReason=(value)=>String(value||"").toUpperCase()==="CANDIDATE_FORWARD_MARKET_UNRESOLVED"?"UNRESOLVED_MARKET":value;
+      const evidenceRows=[["Candidate-bound markets",arr(forwardEvidence.candidate_bound_markets).length],["Scheduled",arr(forwardEvidence.scheduled).length],["Fresh",arr(forwardEvidence.fresh).length],["Stale",arr(forwardEvidence.stale).length],["Missing",arr(forwardEvidence.missing).length],["Grade",forwardEvidence.grade],["Reason",displayReason(forwardEvidence.reason_display||forwardEvidence.reason_code)],["Newest source",dateText(forwardEvidence.newest_required_source_timestamp)],["Oldest source",dateText(forwardEvidence.oldest_required_source_timestamp)],["Newest observed",dateText(forwardEvidence.newest_required_observed_at)],["Oldest observed",dateText(forwardEvidence.oldest_required_observed_at)]];
+      $("canary-summary")?.insertAdjacentHTML("beforeend",`<article id="canary-forward-evidence" class="panel"><div class="section-title"><h2>FORWARD EVIDENCE</h2><span class="badge ${statusClass(forwardEvidence.grade)}">${safe(forwardEvidence.grade||"UNKNOWN")}</span></div><div class="three-col">${evidenceRows.map(([label,value])=>`<div class="key-value"><span class="key">${safe(label)}</span><strong>${safe(value??"—")}</strong></div>`).join("")}</div><p class="page-note">Signal scan reason counts: ${safe(Object.entries(reasonCounts).map(([key,value])=>`${key}=${value}`).join(", ")||"—")}</p>${c.last_cycle_blocker?`<p class="page-note">Last-cycle blocker: ${safe(c.last_cycle_blocker)} (control state ${safe(c.control_state||"UNKNOWN")})</p>`:""}</article>`);
+      $("canary-summary")?.insertAdjacentHTML("beforeend",`<p class="page-note signal-scan-coverage">Signal scan coverage: ${safe(read("signal_scan_coverage_percentage"))}% · checked ${safe(read("signal_scan_checked_this_cycle"))} · remaining ${safe(read("signal_scan_remaining_this_cycle"))} · cycle ${safe(read("signal_scan_cycle_id"))} · status ${safe(read("signal_scan_status"))}</p>`);
     }
     const _renderCanaryResearchAndAction = renderCanary;
     renderCanary = (data) => { _renderCanaryResearchAndAction(data); renderCanaryAutonomousState(data); };
@@ -4436,13 +4790,15 @@ def _dashboard_html(control_token: str | None = None) -> str:
       const paper = components["PAPER ENGINE"]?.detail || {};
       const research = components["RESEARCH ENGINE"]?.detail || {};
       $("coverage").insertAdjacentHTML("beforeend", `<p class="page-note">Next collection ${safe(dateText(h.next_scheduled_collection_at || collector.next_scheduled_collection_at))} · collector heartbeat ${safe(dateText(h.worker_heartbeat_at || collector.worker_heartbeat_at))} · PAPER_FORWARD pass ${safe(paper.status || "—")} · research pass ${safe(research.status || "—")}</p>`);
+      const forwardEvidence=data.forward_evidence||{}, reasonCounts=data.signal_scan_reason_counts||{};
+      $("coverage").insertAdjacentHTML("beforeend",`<article class="panel"><div class="section-title"><h3>Candidate-bound forward evidence</h3><span class="badge ${statusClass(forwardEvidence.grade)}">${safe(forwardEvidence.grade||"UNKNOWN")}</span></div><div class="three-col"><div class="key-value"><span class="key">Required / scheduled</span><strong>${count(arr(forwardEvidence.candidate_bound_markets).length)} / ${count(arr(forwardEvidence.scheduled).length)}</strong></div><div class="key-value"><span class="key">Fresh / stale / missing</span><strong>${count(arr(forwardEvidence.fresh).length)} / ${count(arr(forwardEvidence.stale).length)} / ${count(arr(forwardEvidence.missing).length)}</strong></div><div class="key-value"><span class="key">Reason</span><strong>${safe(forwardEvidence.reason_display||forwardEvidence.reason_code||"—")}</strong></div><div class="key-value"><span class="key">Newest source</span><strong>${safe(dateText(forwardEvidence.newest_required_source_timestamp))}</strong></div><div class="key-value"><span class="key">Oldest source</span><strong>${safe(dateText(forwardEvidence.oldest_required_source_timestamp))}</strong></div><div class="key-value"><span class="key">Newest observed</span><strong>${safe(dateText(forwardEvidence.newest_required_observed_at))}</strong></div></div><p class="page-note">Signal scan reason counts: ${safe(Object.entries(reasonCounts).map(([key,value])=>`${key}=${value}`).join(", ")||"—")}</p></article>`);
       const latestCandidates = arr(data.latest_candidates || data.candidates);
       $("overview-candidates").innerHTML = latestCandidates.length
         ? tableCandidates(latestCandidates, false)
         : empty("No candidates yet", "No persisted lifecycle candidates are available.");
       const funnel = data.lifecycle_funnel || {};
       const max = Math.max(1, ...Object.values(funnel).map(Number));
-      $("funnel").innerHTML = Object.entries(funnel).map(([k, v]) => `<div class="funnel-row"><span>${safe(k)}</span><span class="funnel-track"><span class="funnel-bar" style="width:${Math.min(100, Number(v) / max * 100)}%"></span></span><span class="right">${count(v)}</span></div>`).join("") || empty("No candidate lifecycle", "Hermes hypotheses appear after a durable queue item is processed.");
+    renderPolymarket = (data) => { const items=arr(data.items),categories=[...new Set(items.map(i=>i.category).filter(Boolean))].sort(),cat=$("polymarket-category"),old=cat.value||params.get("category")||""; cat.innerHTML=`<option value="">All categories</option>${categories.map(c=>`<option value="${safe(c)}">${safe(c)}</option>`).join("")}`;if(old&&!categories.includes(old))cat.insertAdjacentHTML("beforeend",`<option value="${safe(old)}">${safe(old)}</option>`);cat.value=old;const quality=items.map(i=>i.quality_label||i.quality).find(Boolean)||"—";$("pm-summary").innerHTML=`<div class="three-col"><div class="key-value"><span class="key">Markets</span><strong>${count(data.total)}</strong></div><div class="key-value"><span class="key">Evidence quality</span><strong>${safe(quality)}</strong></div><div class="key-value"><span class="key">Execution</span><strong>SIMULATED ONLY</strong></div></div>`;$("pm-markets").innerHTML=items.length?`<table><thead><tr><th>Priority</th><th>Market</th><th>Question</th><th>Category</th><th>Quality</th><th>Source</th><th>Observed</th><th>Age</th><th>State / reason</th><th>Candidate references</th></tr></thead><tbody>${items.map(i=>{const priority=i.candidate_bound_priority||i.candidate_bound,reason=i.reason_display||i.reason_code;return `<tr><td>${priority?`<span class="badge warn">REQUIRED</span>`:"—"}</td><td>${identity(shortId(i.market_id),i.market_id)}</td><td title="${safe(i.question||"")}">${safe(i.question||"—")}</td><td>${safe(i.category)}</td><td><strong>${safe(i.quality_label||i.quality||"UNKNOWN")}</strong><span class="quality-context">${safe(i.quality_context||"")}</span></td><td>${safe(dateText(i.source_timestamp))}</td><td>${safe(dateText(i.observed_at))}</td><td>${i.freshness_age_seconds==null?"—":safe(Number(i.freshness_age_seconds).toFixed(1)+"s")}</td><td>${safe(i.collection_state||"—")}${reason?` · ${safe(reason)}`:""}</td><td>${safe(arr(i.candidate_references).join(", ")||"—")}</td></tr>`}).join("")}</tbody></table>`:empty("No Polymarket observations","No persisted market page matches the current filters.");pager("polymarket",data);bindTable(); };
     };
     renderDatasets = (data) => { $("dataset-total").textContent=`${count(data.total)} datasets`; const rows=arr(data.items); $("datasets-table").innerHTML=rows.length?`<table><thead><tr>${[["dataset_id","Dataset"],["source_type","Source"],["market_type","Market"],["instrument","Instrument"],["timeframe","Timeframe"],["quality","Quality"],["row_count","Rows"],["updated_at","Updated"]].map(([k,l])=>`<th>${sortButton(k,l)}</th>`).join("")}</tr></thead><tbody>${rows.map(i=>`<tr><td><button class="link dataset" data-id="${encodeURIComponent(i.dataset_id||"")}">${identity(datasetPrimary(i),i.dataset_id,i.dataset_id===datasetPrimary(i)?"":`full ${shortId(i.dataset_id)}`)}</button></td><td>${safe(i.source_type)}</td><td>${safe(i.market_type)}</td><td>${safe(i.instrument)}</td><td>${safe(i.timeframe)}</td><td>${safe(i.quality)}</td><td>${count(i.row_count)}</td><td>${safe(dateText(i.updated_at))}</td></tr>`).join("")}</tbody></table>`:empty("No datasets","No catalog records match the current filters."); pager("datasets",data); bindTable(); };
     renderActivity = (data) => { ensureActivityKind(); $("activity-total").textContent=`${count(data.total)} events`; $("activity-table").innerHTML=arr(data.items).length?`<div class="timeline">${activityMarkup(data.items)}</div>`:empty("No research activity","Durable activity will appear after workers run."); pager("activity",data); bindTable(); };

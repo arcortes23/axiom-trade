@@ -189,6 +189,41 @@ def _model_probability(data: Any, item: Any, index: int = -1) -> float | None:
         if math.isfinite(result) and 0.0 <= result <= 1.0:
             return result
     return None
+def evaluate_model_document_probability(
+    model_document: Mapping[str, Any] | None,
+    observation: Mapping[str, Any] | Any,
+) -> float | None:
+    """Evaluate a declarative model document without mutating its inputs.
+
+    Forward and canary execution persist model documents rather than executable
+    model objects.  Keep this evaluator deliberately small and pure so both
+    paths apply the exact same probability semantics to persisted observations.
+    """
+    if not isinstance(model_document, Mapping):
+        return None
+    value: Any = None
+    if "probability" in model_document:
+        value = model_document["probability"]
+    elif "yes_probability" in model_document:
+        value = model_document["yes_probability"]
+    else:
+        field = model_document.get("field")
+        if isinstance(field, str) and field.strip():
+            if isinstance(observation, Mapping):
+                value = observation.get(field)
+            else:
+                value = getattr(observation, field, None)
+    if isinstance(value, Mapping):
+        value = value.get("probability", value.get("yes_probability", value.get("prediction")))
+    try:
+        probability = float(value)
+    except (TypeError, ValueError):
+        return None
+    return probability if math.isfinite(probability) and 0.0 <= probability <= 1.0 else None
+
+
+evaluate_model_probability = evaluate_model_document_probability
+
 
 
 def _time_to_expiry(item: Any) -> float | None:
@@ -373,10 +408,8 @@ class BuiltinSignalEvaluator:
     __call__ = evaluate
 SignalEvaluator = BuiltinSignalEvaluator
 
-
 __all__ = [
     "BuiltinSignalEvaluator", "Signal", "SignalEvaluator", "evaluate_crypto_family",
-    "evaluate_prediction_family", "evaluate_signal", "evaluate_signal_record",
+    "evaluate_model_document_probability", "evaluate_prediction_family",
+    "evaluate_signal", "evaluate_signal_record",
 ]
-
-

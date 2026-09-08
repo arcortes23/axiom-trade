@@ -19,6 +19,89 @@ separate for historical inspection; production-like paper operation should
 use only `runtime-data/axiom.sqlite`. Merge or copy data only as an explicit,
 reviewed migration outside the normal startup commands.
 
+## Persisted Polymarket forward evidence
+
+The read-only collector persists immutable forward records in
+`polymarket_markets`, `polymarket_snapshots`, `polymarket_trades`, and
+`collection_errors`.  `polymarket_markets` and `polymarket_snapshots` carry a
+queryable `source_type` (`FORWARD_COLLECTED` or `HISTORICAL`); forward
+snapshots also carry `quality`.  `collection_cycles` stores each bounded cycle
+and `collector_state` stores the latest collector projection, including:
+`candidate_bound_markets`, `candidate_bound_scheduled`,
+`candidate_bound_fresh`, `candidate_bound_stale`,
+`candidate_bound_missing`, `paper_forward_markets`,
+`paper_forward_scheduled`, `discovery_scheduled`, `discovery_deferred`,
+`candidate_references`, per-tier attempt/success/failure counts,
+`request_latency_summary`, and `capacity_reason`.
+
+Forward snapshot payload timestamps are intentionally distinct:
+
+- `request_started_at` is when the order-book request began.
+- `source_timestamp` is the canonical market/order-book timestamp persisted
+  in the snapshot table and used for chronology.
+- `provider_timestamp` is optional adapter timestamp evidence and may be
+  `null` when the provider does not expose it; its absence does not replace or
+  rewrite `source_timestamp`.
+- `response_received_at` is when the response was received.
+- `observed_at` is AXIOM's collection observation time.
+
+Provider/source timestamps are rejected when they are too far in the future;
+network or malformed-data failures become `collection_errors`, never synthetic
+prices or settlements.
+
+## Candidate authority and health
+
+`candidate_forward_requirements` is the bounded, read-only authority for
+current executable markets.  A candidate's declared targets remain visible,
+but historical dataset constituents are recorded as
+`historical_market_ids_ignored` and are never executable.  `market_ids` and
+`permitted_market_ids` are the authorized current targets after frozen-filter
+and target-instrument checks; they are not a global discovery list.
+
+`polymarket_required_health` grades only those candidate-bound required
+markets (`grade_scope: required_forward_markets`).  Its `fresh`, `stale`, and
+`missing` sets, market diagnostics, candidate references, and source/observed
+time bounds must not be read as health for every tracked or discovered market.
+Global discovery is separately bounded by `discovery_budget_per_cycle` and
+reported as scheduled or deferred; candidate-required work is prioritized
+before paper-forward and discovery work.
+
+Operator interpretation of authority and signal outcomes:
+
+- `RESOLVED` / `CANDIDATE_FORWARD_MARKET_RESOLVED`: an executable current
+  market was authorized.
+- `UNRESOLVED` / `CANDIDATE_FORWARD_MARKET_UNRESOLVED`: no executable current
+  market was resolved. `COLLECTOR_CAPACITY_INSUFFICIENT` is the separate
+  capacity form of this outcome.
+- `CLOSED` / `CANDIDATE_MARKET_CLOSED` and `MARKET_CLOSED`: the declared
+  market is terminal, expired, inactive, or closed.
+- `MARKET_FILTER_MISMATCH`: an active declared target is outside the frozen
+  filters and remains diagnostic-only.
+- `NO_FORWARD_SNAPSHOT`: an authorized market has no current persisted
+  snapshot. A source or observed timestamp outside the canary's 60-second
+  age limit is `STALE_FORWARD_EVIDENCE`.
+- `COLLECTOR_CANDIDATE_HEALTH_BLOCKED`: required-health or binding data could
+  not safely authorize evaluation. `NO_STRATEGY_SIGNAL` is non-actionable
+  strategy output, not a collection failure.
+
+`canary_signal_evaluations` is the durable audit row for each candidate
+evaluation: `evaluation_id`, `candidate_id`, optional `cycle_id`,
+`evaluated_at`, `reason_code`, optional `market_id`/`signal_id`, and the
+bounded `signal`, `required_health`, and `evidence` JSON projections.
+Reason counts include `READY_SIGNAL`, `NO_STRATEGY_SIGNAL`,
+`NO_FORWARD_SNAPSHOT`, `STALE_FORWARD_EVIDENCE`, `MARKET_CLOSED`,
+`MARKET_FILTER_MISMATCH`, `CANDIDATE_FORWARD_MARKET_UNRESOLVED`, and
+`COLLECTOR_CANDIDATE_HEALTH_BLOCKED`.
+
+The singleton `canary_autonomous_state` stores the latest signal-scan
+projection (`signal_scan_*` cursor, ranking binding, cycle, coverage,
+remaining count, status, skip reasons, and reason counts).  Each tick checks
+at most 10 ranked candidates.  `canary_signal_scan_checked` retains the eight
+most recent scan cycles.  `canary_signal_evaluations` retains the newest 4096
+evaluations.  Unreferenced transient `canary_signals` are bounded to 4096;
+signals referenced by evaluation/execution state and the newest `READY` signal
+per candidate are protected.
+
 ## Normal operation examples
 
 ```powershell
@@ -58,6 +141,22 @@ python -m axiom.cli canary-kill
 
 `canary-check` is no-order. `canary-kill` prevents further submissions
 immediately. An expired arm returns to paper-only automatically.
+
+Forward-evidence changes do not relax live-order gates. `canary-signal`
+evaluates persisted authorized evidence and remains paper-only. The
+order-capable `canary-submit` path still rechecks signal expiry and immutable
+candidate bindings, candidate research/data-quality gates, candidate-bound
+health, the fresh source snapshot and current order book, arm/control state,
+credentials, geoblock, and risk limits; any failed check remains fail-closed.
+
+Dashboard HTTP `GET` endpoints and `canary-status` read persisted projections.
+They never probe a provider or the keyring; a credential cache miss is shown as
+`NOT CHECKED`, not treated as a fresh credential result. The
+`node-run --cycles 0 --disable-research --disable-mutations` example is
+paper-only, but `--cycles 0` means run until stopped and collection still uses
+configured public providers. It is therefore not a provider-free dry proof or
+live-order readiness proof. Use `node-status`, `canary-status`,
+`dataset-catalog --status`, or dashboard `GET` for storage-only inspection.
 
 PowerShell lifecycle commands use the same default:
 

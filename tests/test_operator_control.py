@@ -1131,7 +1131,7 @@ class OperatorControlTests(unittest.TestCase):
             "wallet_address": secrets[1],
             "relayer_api_key": secrets[2],
         }
-        credentials.safe_projection.return_value = {
+        credentials.cached_projection.return_value = {
             "configured": True,
             "status": "CONFIGURED",
             "secret_values_exposed": False,

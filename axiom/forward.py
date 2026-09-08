@@ -119,6 +119,8 @@ class ForwardTestSpec:
             raise ValueError("forward risk_limits are invalid") from exc
         _validate_private_fields(self.risk_limits, path="risk_limits")
         normalized_markets = tuple(dict.fromkeys(str(item).strip() for item in self.allowed_markets if str(item).strip()))
+        if bool(self.config.get("market_authority_required", False)) and not normalized_markets:
+            raise ValueError("forward test requires a non-empty frozen market authority")
         if len(normalized_markets) > 1000:
             raise ValueError("forward test allowed_markets exceeds 1000 entries")
         object.__setattr__(self, "allowed_markets", normalized_markets)

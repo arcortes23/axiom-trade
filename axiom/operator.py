@@ -1281,22 +1281,6 @@ class OperatorControlPlane:
                 "started_at": row.get("started_at"),
             }
 
-        try:
-            projected_credentials = CredentialStore().safe_projection(
-                allow_environment=False
-            )
-            configured = (
-                bool(projected_credentials.get("configured"))
-                if isinstance(projected_credentials, Mapping)
-                else False
-            )
-        except BaseException:
-            configured = False
-        credentials = {
-            "configured": configured,
-            "status": "CONFIGURED" if configured else "NOT CONFIGURED",
-            "secret_values_exposed": False,
-        }
 
         canary = CanaryService(self.store, initialize=False)
         report: Mapping[str, Any] = {}
@@ -1488,6 +1472,43 @@ class OperatorControlPlane:
         latest_connectivity = _stored_connectivity_projection(
             self.store.get_operator_config(CANARY_CONNECTIVITY_CONFIG_KEY, None)
         )
+        credential_type = CredentialStore
+        try:
+            projected_credentials = credential_type.cached_projection(
+                allow_environment=False,
+                persisted={
+                    "canary": canary_status,
+                    "status_report": report,
+                    "readiness": readiness_report,
+                    "connectivity": latest_connectivity,
+                },
+            )
+        except BaseException:
+            projected_credentials = None
+        if not isinstance(projected_credentials, Mapping):
+            try:
+                credential_store = credential_type()
+                projected_credentials = credential_store.cached_projection(
+                    allow_environment=False,
+                    persisted={
+                        "canary": canary_status,
+                        "status_report": report,
+                        "readiness": readiness_report,
+                        "connectivity": latest_connectivity,
+                    },
+                )
+            except BaseException:
+                projected_credentials = None
+        credentials = (
+            dict(projected_credentials)
+            if isinstance(projected_credentials, Mapping)
+            else {
+                "configured": None,
+                "status": "NOT CHECKED",
+                "secret_values_exposed": False,
+            }
+        )
+        credentials["secret_values_exposed"] = False
         return {
             "canary_status_report": dict(report),
             "connectivity": latest_connectivity,

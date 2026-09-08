@@ -32,6 +32,7 @@ from .data_quality import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+from .strategy.signals import evaluate_model_document_probability
 
 SUPPORTED_POLYMARKET_SDK = "0.9"
 _OFFICIAL_GEOBLOCK_URL = "https://polymarket.com/api/geoblock"
@@ -53,6 +54,8 @@ AUTONOMOUS_CANARY_LIMITS = {
     "max_slippage_bps": DEFAULT_MAX_SLIPPAGE_BPS,
 }
 _UNSET = object()
+_AUTONOMOUS_SCAN_CYCLE_RETENTION = 8
+CANARY_SIGNAL_TRANSIENT_RETENTION = 4096
 CANARY_SUBMISSION_TIMEOUT_SECONDS = 15.0
 CANARY_SIGNAL_TTL_SECONDS = 60.0
 CANARY_SIGNAL_MAX_AGE_SECONDS = 60.0
@@ -182,6 +185,12 @@ def _sdk_value(source: Any, name: str, default: Any = None) -> Any:
     if isinstance(source, Mapping):
         return source.get(name, default)
     return getattr(source, name, default)
+
+def _canary_closed_flag(value: Any) -> bool:
+    """Normalize persisted closed flags like the storage market projection."""
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on", "closed"}
 
 def _base_units(value: Any, *, field: str) -> int:
     """Normalize an SDK base-unit value without accepting lossy numbers."""
@@ -633,6 +642,127 @@ class CredentialStore:
 
     def configured(self, *, allow_environment: bool = False) -> bool:
         return bool(self.load(allow_environment=allow_environment))
+    @classmethod
+    def cached_projection(
+        cls,
+        *,
+        allow_environment: bool = False,
+        persisted: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Return credential metadata without touching any credential provider.
+
+        A dashboard read may only use metadata produced by an earlier explicit
+        credential check or by a persisted public canary projection.  A cache
+        miss is deliberately represented as ``NOT CHECKED`` rather than
+        triggering a keyring lookup.
+        """
+        key = (cls, bool(allow_environment))
+        cached_configured: bool | None = None
+        with _SAFE_PROBE_LOCK:
+            cached = _SAFE_PROBE_CACHE.get(key)
+            if cached is not None:
+                try:
+                    cache_age = time.monotonic() - float(cached[0])
+                except (TypeError, ValueError):
+                    cache_age = float("inf")
+                if 0 <= cache_age < _SAFE_PROBE_TTL_SECONDS:
+                    cached_configured = bool(cached[1])
+        if cached_configured is not None:
+            return {
+                "configured": cached_configured,
+                "status": (
+                    "CONFIGURED" if cached_configured else "NOT CONFIGURED"
+                ),
+                "secret_values_exposed": False,
+            }
+
+        if isinstance(persisted, Mapping):
+            sources: list[Mapping[str, Any]] = [persisted]
+            for source in tuple(sources):
+                for name in (
+                    "credentials",
+                    "credential",
+                    "readiness",
+                    "status_report",
+                    "canary",
+                    "connectivity",
+                ):
+                    nested = source.get(name)
+                    if isinstance(nested, Mapping):
+                        sources.append(nested)
+            for source in sources:
+                candidates: list[Mapping[str, Any]] = []
+                nested_credentials = source.get("credentials")
+                if isinstance(nested_credentials, Mapping):
+                    candidates.append(nested_credentials)
+                nested_credential = source.get("credential")
+                if isinstance(nested_credential, Mapping):
+                    candidates.append(nested_credential)
+                if any(
+                    name in source
+                    for name in (
+                        "credentials_configured",
+                        "credential_configured",
+                        "credentials_status",
+                        "credential_status",
+                    )
+                ):
+                    candidates.append(source)
+                for candidate in candidates:
+                    configured = candidate.get("configured")
+                    if isinstance(configured, bool):
+                        return {
+                            "configured": configured,
+                            "status": (
+                                "CONFIGURED"
+                                if configured
+                                else "NOT CONFIGURED"
+                            ),
+                            "secret_values_exposed": False,
+                        }
+                    configured = candidate.get("credentials_configured")
+                    if not isinstance(configured, bool):
+                        configured = candidate.get("credential_configured")
+                    if isinstance(configured, bool):
+                        return {
+                            "configured": configured,
+                            "status": (
+                                "CONFIGURED"
+                                if configured
+                                else "NOT CONFIGURED"
+                            ),
+                            "secret_values_exposed": False,
+                        }
+                    raw_status = candidate.get("status")
+                    if not isinstance(raw_status, str):
+                        raw_status = candidate.get("credentials_status")
+                    if not isinstance(raw_status, str):
+                        raw_status = candidate.get("credential_status")
+                    status = raw_status.strip().upper() if isinstance(raw_status, str) else ""
+                    if status == "CONFIGURED":
+                        return {
+                            "configured": True,
+                            "status": "CONFIGURED",
+                            "secret_values_exposed": False,
+                        }
+                    if status == "NOT CONFIGURED":
+                        return {
+                            "configured": False,
+                            "status": "NOT CONFIGURED",
+                            "secret_values_exposed": False,
+                        }
+                    if status in {"UNKNOWN", "NOT CHECKED"}:
+                        return {
+                            "configured": None,
+                            "status": status,
+                            "secret_values_exposed": False,
+                        }
+        return {
+            "configured": None,
+            "status": "NOT CHECKED",
+            "secret_values_exposed": False,
+        }
+
 
     def safe_projection(
         self,
@@ -1588,6 +1718,15 @@ class CanaryService:
               ON canary_signals(candidate_id, generated_at, signal_id);
             CREATE INDEX IF NOT EXISTS idx_canary_signals_status_time
               ON canary_signals(status, generated_at, signal_id);
+            CREATE TABLE IF NOT EXISTS canary_signal_evaluations (
+              evaluation_id TEXT PRIMARY KEY, candidate_id TEXT NOT NULL,
+              cycle_id TEXT, evaluated_at TEXT NOT NULL, reason_code TEXT NOT NULL,
+              market_id TEXT, signal_id TEXT, signal_json TEXT,
+              required_health_json TEXT NOT NULL, evidence_json TEXT NOT NULL);
+            CREATE INDEX IF NOT EXISTS idx_canary_signal_evaluations_candidate_time
+              ON canary_signal_evaluations(candidate_id, evaluated_at, evaluation_id);
+            CREATE INDEX IF NOT EXISTS idx_canary_signal_evaluations_cycle_time
+              ON canary_signal_evaluations(cycle_id, evaluated_at, evaluation_id);
             CREATE TABLE IF NOT EXISTS canary_rankings (
               candidate_id TEXT PRIMARY KEY, ranking_run_id TEXT NOT NULL,
               ranking_timestamp TEXT NOT NULL, rank INTEGER NOT NULL DEFAULT 0,
@@ -1639,6 +1778,7 @@ class CanaryService:
               signal_scan_remaining_this_cycle INTEGER NOT NULL DEFAULT 0,
               signal_scan_coverage_percentage REAL NOT NULL DEFAULT 0,
               signal_scan_skip_reasons_json TEXT NOT NULL DEFAULT '{}',
+              signal_scan_reason_counts_json TEXT NOT NULL DEFAULT '{}',
               signal_scan_status TEXT NOT NULL DEFAULT 'UNKNOWN'
             );
             CREATE TABLE IF NOT EXISTS canary_signal_scan_checked (
@@ -1741,6 +1881,7 @@ class CanaryService:
                         ("signal_scan_remaining_this_cycle", "INTEGER NOT NULL DEFAULT 0"),
                         ("signal_scan_coverage_percentage", "REAL NOT NULL DEFAULT 0"),
                         ("signal_scan_skip_reasons_json", "TEXT NOT NULL DEFAULT '{}'"),
+                        ("signal_scan_reason_counts_json", "TEXT NOT NULL DEFAULT '{}'"),
                         ("signal_scan_status", "TEXT NOT NULL DEFAULT 'UNKNOWN'"),
                     ),
                 ),
@@ -2041,9 +2182,9 @@ class CanaryService:
             "signal_scan_cycle_completed_at": None,
             "signal_scan_cycle_complete": 0,
             "signal_scan_checked_this_cycle": 0,
-            "signal_scan_remaining_this_cycle": 0,
             "signal_scan_coverage_percentage": 0.0,
             "signal_scan_skip_reasons_json": "{}",
+            "signal_scan_reason_counts_json": "{}",
             "signal_scan_status": "UNKNOWN",
             "signal_scan_checked_keys": [],
             "last_signal_id": None,
@@ -2101,6 +2242,7 @@ class CanaryService:
             "signal_scan_remaining_this_cycle": 0,
             "signal_scan_coverage_percentage": 0.0,
             "signal_scan_skip_reasons_json": "{}",
+            "signal_scan_reason_counts_json": "{}",
             "signal_scan_status": "UNKNOWN",
             "signal_scan_checked_keys": [],
             "real_execution_events": None,
@@ -2171,7 +2313,7 @@ class CanaryService:
             "signal_scan_cycle_started_at,signal_scan_cycle_completed_at,"
             "signal_scan_cycle_complete,signal_scan_checked_this_cycle,"
             "signal_scan_remaining_this_cycle,signal_scan_coverage_percentage,"
-            "signal_scan_skip_reasons_json,signal_scan_status,"
+            "signal_scan_skip_reasons_json,signal_scan_reason_counts_json,signal_scan_status,"
             "next_decision,blocker,last_signal_id,worker_status FROM canary_autonomous_state "
             "WHERE singleton=1"
         )
@@ -2249,6 +2391,7 @@ class CanaryService:
                         "signal_scan_remaining_this_cycle",
                         "signal_scan_coverage_percentage",
                         "signal_scan_skip_reasons_json",
+                        "signal_scan_reason_counts_json",
                         "signal_scan_status",
                         "next_decision",
                         "blocker",
@@ -2268,6 +2411,7 @@ class CanaryService:
                 "signal_scan_remaining_this_cycle",
                 "signal_scan_coverage_percentage",
                 "signal_scan_skip_reasons_json",
+                "signal_scan_reason_counts_json",
                 "signal_scan_status",
             )
             for name in cycle_fields:
@@ -2484,6 +2628,7 @@ class CanaryService:
             "signal_scan_remaining_this_cycle",
             "signal_scan_coverage_percentage",
             "signal_scan_skip_reasons_json",
+            "signal_scan_reason_counts_json",
             "signal_scan_status",
             "next_decision",
             "blocker",
@@ -2550,6 +2695,7 @@ class CanaryService:
                     "signal_scan_remaining_this_cycle",
                     "signal_scan_coverage_percentage",
                     "signal_scan_skip_reasons_json",
+                    "signal_scan_reason_counts_json",
                     "signal_scan_status",
                 )
                 auto.update({name: state[name] for name in fields})
@@ -3484,6 +3630,7 @@ class CanaryService:
             "signal_scan_remaining_this_cycle",
             "signal_scan_coverage_percentage",
             "signal_scan_skip_reasons_json",
+            "signal_scan_reason_counts_json",
             "signal_scan_status",
             "signal_scan_checked_keys",
             "next_decision",
@@ -3559,7 +3706,7 @@ class CanaryService:
             "signal_scan_cycle_started_at,signal_scan_cycle_completed_at,"
             "signal_scan_cycle_complete,signal_scan_checked_this_cycle,"
             "signal_scan_remaining_this_cycle,signal_scan_coverage_percentage,"
-            "signal_scan_skip_reasons_json,signal_scan_status,"
+            "signal_scan_skip_reasons_json,signal_scan_reason_counts_json,signal_scan_status,"
             "next_decision,blocker,last_signal_id,worker_status FROM canary_autonomous_state "
             "WHERE singleton=1"
         )
@@ -3585,6 +3732,7 @@ class CanaryService:
             "signal_scan_remaining_this_cycle",
             "signal_scan_coverage_percentage",
             "signal_scan_skip_reasons_json",
+            "signal_scan_reason_counts_json",
             "signal_scan_status",
             "selected_actionable_score",
             "signal_scan_cursor",
@@ -3642,6 +3790,7 @@ class CanaryService:
             "signal_scan_remaining_this_cycle",
             "signal_scan_coverage_percentage",
             "signal_scan_skip_reasons_json",
+            "signal_scan_reason_counts_json",
             "signal_scan_status",
         )
         if worker_row is not None:
@@ -3923,6 +4072,7 @@ class CanaryService:
         signal_scan_remaining_this_cycle: int | None | object = _UNSET,
         signal_scan_coverage_percentage: float | None | object = _UNSET,
         signal_scan_skip_reasons_json: str | None | object = _UNSET,
+        signal_scan_reason_counts_json: str | None | object = _UNSET,
         signal_scan_status: str | None | object = _UNSET,
         signal_scan_checked_keys: list[Mapping[str, Any]] | None = None,
         publish: bool = False,
@@ -3952,6 +4102,7 @@ class CanaryService:
             "signal_scan_remaining_this_cycle": signal_scan_remaining_this_cycle,
             "signal_scan_coverage_percentage": signal_scan_coverage_percentage,
             "signal_scan_skip_reasons_json": signal_scan_skip_reasons_json,
+            "signal_scan_reason_counts_json": signal_scan_reason_counts_json,
             "signal_scan_status": signal_scan_status,
             "selected_actionable_rank": selected_actionable_rank,
             "selected_actionable_score": selected_actionable_score,
@@ -3972,6 +4123,24 @@ class CanaryService:
                 "selected_actionable_candidate",
             }:
                 metadata[key] = str(value) if value is not None else None
+            elif key == "signal_scan_reason_counts_json":
+                try:
+                    decoded_counts = json.loads(str(value or "{}"))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    decoded_counts = {}
+                bounded_counts: dict[str, int] = {}
+                if isinstance(decoded_counts, Mapping):
+                    for count_key in sorted(decoded_counts, key=lambda item: str(item))[:64]:
+                        try:
+                            count_value = int(decoded_counts[count_key])
+                        except (TypeError, ValueError):
+                            continue
+                        if count_value >= 0:
+                            bounded_counts[str(count_key)[:128]] = count_value
+                encoded_counts = json.dumps(
+                    bounded_counts, sort_keys=True, separators=(",", ":")
+                )
+                metadata[key] = encoded_counts if len(encoded_counts) <= 4096 else "{}"
             elif key == "signal_scan_skip_reasons_json":
                 metadata[key] = str(value or "{}")[:4096]
             elif key == "signal_scan_coverage_percentage":
@@ -4000,6 +4169,23 @@ class CanaryService:
                 metadata[key] = max(0, parsed) if parsed is not None else None
         with self.store._lock:
             with self.store.connection:
+                incoming_cycle_id = metadata.get("signal_scan_cycle_id")
+                if incoming_cycle_id is _UNSET:
+                    incoming_cycle_id = None
+                else:
+                    incoming_cycle_id = str(incoming_cycle_id or "").strip() or None
+                previous_state = self.store.connection.execute(
+                    "SELECT signal_scan_cycle_id FROM canary_autonomous_state "
+                    "WHERE singleton=1"
+                ).fetchone()
+                previous_cycle_id = (
+                    str(previous_state["signal_scan_cycle_id"] or "").strip()
+                    if previous_state is not None
+                    else ""
+                )
+                new_cycle_transition = bool(
+                    incoming_cycle_id and incoming_cycle_id != previous_cycle_id
+                )
                 for checked in signal_scan_checked_keys or ():
                     if not isinstance(checked, Mapping):
                         continue
@@ -4066,6 +4252,34 @@ class CanaryService:
                     + ",".join(updates),
                     tuple(values),
                 )
+                if new_cycle_transition:
+                    cycle_rows = self.store.connection.execute(
+                        "WITH cycle_times AS ("
+                        "SELECT cycle_id,MAX(checked_at) AS latest_time "
+                        "FROM canary_signal_scan_checked GROUP BY cycle_id "
+                        "UNION ALL SELECT ?,? "
+                        "), ranked_cycles AS ("
+                        "SELECT cycle_id,MAX(latest_time) AS latest_time "
+                        "FROM cycle_times GROUP BY cycle_id"
+                        ") SELECT cycle_id FROM ranked_cycles "
+                        "ORDER BY latest_time DESC,cycle_id DESC",
+                        (incoming_cycle_id, when),
+                    ).fetchall()
+                    retained_cycle_ids = [incoming_cycle_id]
+                    retained_cycle_ids.extend(
+                        str(row["cycle_id"])
+                        for row in cycle_rows
+                        if str(row["cycle_id"]) != incoming_cycle_id
+                    )
+                    retained_cycle_ids = retained_cycle_ids[
+                        :_AUTONOMOUS_SCAN_CYCLE_RETENTION
+                    ]
+                    placeholders = ",".join("?" for _ in retained_cycle_ids)
+                    self.store.connection.execute(
+                        "DELETE FROM canary_signal_scan_checked "
+                        f"WHERE cycle_id NOT IN ({placeholders})",
+                        tuple(retained_cycle_ids),
+                    )
         self._patch_autonomous_snapshot()
         if publish:
             self.publish_readiness_snapshot(reason="AUTONOMOUS_DECISION")
@@ -4583,27 +4797,12 @@ class CanaryService:
     def _apply_signal_model(
         observations: list[dict[str, Any]], model_document: Mapping[str, Any]
     ) -> bool:
-        static_probability = model_document.get(
-            "probability", model_document.get("yes_probability")
-        )
-        field = model_document.get("field")
-        if static_probability is None and not isinstance(field, str):
-            return False
         for observation in observations:
-            if static_probability is not None:
-                value = static_probability
-            elif isinstance(field, str):
-                value = observation.get(field)
-            else:
-                value = None
-            try:
-                probability = float(value)
-            except (TypeError, ValueError):
-                return False
-            if not math.isfinite(probability) or not 0.0 <= probability <= 1.0:
+            probability = evaluate_model_document_probability(model_document, observation)
+            if probability is None:
                 return False
             observation["model_probability"] = probability
-        return True
+        return bool(observations)
 
     def _current_signal_market(
         self, market_id: str, *, now: datetime
@@ -4622,69 +4821,801 @@ class CanaryService:
             return None
         settlement = str(observation.get("settlement", "open")).strip().lower()
         if (
-            bool(observation.get("closed"))
+            _canary_closed_flag(observation.get("closed", False))
             or observation.get("active") is False
             or settlement in {"resolved_yes", "resolved_no", "void", "closed"}
         ):
             return None
         return row, observation
 
-    def generate_signal(self, candidate_id: str) -> Mapping[str, Any] | None:
-        """Evaluate one frozen candidate against the latest stored live observation.
+    def _prune_canary_signals(self) -> None:
+        """Bound unreferenced transient signal history in the current transaction.
 
-        This method only reads persisted research/market data and writes a
-        deterministic signal record.  It never constructs a venue or makes a
-        network request.
+        Signal rows are also execution/idempotency state.  A row is therefore
+        retained when another persisted canary record names it or when it is
+        the newest READY signal for its candidate.  Every other unreferenced
+        row is transient history and is subject to the fixed global bound.
         """
-        now = ensure_utc(self.clock())
-        try:
-            binding = self._candidate_signal_binding(candidate_id)
-        except CanaryBlocked:
-            return None
-        try:
-            health_grade = str(self.store.polymarket_health(now=now).get("grade", "F")).upper()
-        except Exception:
-            return None
-        if health_grade not in {"A", "B"}:
-            return None
-        payload = binding["payload"]
-        forward_test = binding.get("forward_test")
-        market_values: Any = (
-            forward_test.get("allowed_markets")
-            if isinstance(forward_test, Mapping)
+        transient_limit = max(0, int(CANARY_SIGNAL_TRANSIENT_RETENTION))
+        self.store.connection.execute(
+            """
+            DELETE FROM canary_signals
+            WHERE signal_id IN (
+                SELECT signal.signal_id
+                FROM canary_signals AS signal
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM canary_signal_evaluations AS evaluation
+                    WHERE evaluation.signal_id = signal.signal_id
+                )
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM canary_ledger AS ledger
+                    WHERE ledger.signal_id = signal.signal_id
+                )
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM canary_execution_events AS execution
+                    JOIN canary_ledger AS ledger
+                      ON ledger.event_id = execution.canary_event_id
+                    WHERE ledger.signal_id = signal.signal_id
+                )
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM canary_autonomous_state AS autonomous
+                    WHERE autonomous.last_signal_id = signal.signal_id
+                )
+                AND NOT (
+                    UPPER(signal.status) = 'READY'
+                    AND NOT EXISTS (
+                        SELECT 1
+                        FROM canary_signals AS newer
+                        WHERE newer.candidate_id = signal.candidate_id
+                          AND UPPER(newer.status) = 'READY'
+                          AND (
+                              newer.generated_at > signal.generated_at
+                              OR (
+                                  newer.generated_at = signal.generated_at
+                                  AND newer.signal_id > signal.signal_id
+                              )
+                          )
+                    )
+                )
+                ORDER BY signal.generated_at DESC, signal.signal_id DESC
+                LIMIT -1 OFFSET ?
+            )
+            """,
+            (transient_limit,),
+        )
+
+    def _persist_signal_evaluation(self, result: Mapping[str, Any]) -> dict[str, Any]:
+        """Persist one bounded, queryable outcome of signal evaluation."""
+        evaluated_at = str(result.get("evaluated_at") or "").strip()
+        candidate_id = str(result.get("candidate_id") or "").strip()
+        reason_code = str(result.get("reason_code") or "").strip().upper()
+        if not evaluated_at or not candidate_id or not reason_code:
+            raise ValueError("signal evaluation is incomplete")
+        cycle_id = str(result.get("cycle_id") or "").strip() or None
+        market_id = str(result.get("market_id") or "").strip() or None
+        signal = result.get("signal")
+        signal_id = (
+            str(signal.get("signal_id") or "").strip()
+            if isinstance(signal, Mapping)
             else None
         )
-        if not isinstance(market_values, (list, tuple)):
-            plan = payload.get("experiment_plan", {})
-            market_values = plan.get("target_markets") if isinstance(plan, Mapping) else ()
+        required_health = result.get("required_health")
+        if not isinstance(required_health, Mapping):
+            required_health = {}
+        evidence = result.get("evidence")
+        if not isinstance(evidence, Mapping):
+            evidence = {}
+        signal_json = (
+            json.dumps(dict(signal), sort_keys=True, separators=(",", ":"), allow_nan=False)
+            if isinstance(signal, Mapping)
+            else None
+        )
+        health_json = json.dumps(
+            dict(required_health), sort_keys=True, separators=(",", ":"), allow_nan=False
+        )
+        evidence_json = json.dumps(
+            dict(evidence), sort_keys=True, separators=(",", ":"), allow_nan=False
+        )
+        evaluation_id = "canary-evaluation-" + hashlib.sha256(
+            (
+                candidate_id
+                + "|"
+                + evaluated_at
+                + "|"
+                + str(time.time_ns())
+            ).encode("utf-8")
+        ).hexdigest()[:32]
+        with self.store._lock:
+            self.store.connection.execute(
+                "INSERT INTO canary_signal_evaluations("
+                "evaluation_id,candidate_id,cycle_id,evaluated_at,reason_code,"
+                "market_id,signal_id,signal_json,required_health_json,evidence_json) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (
+                    evaluation_id,
+                    candidate_id,
+                    cycle_id,
+                    evaluated_at,
+                    reason_code,
+                    market_id,
+                    signal_id,
+                    signal_json,
+                    health_json,
+                    evidence_json,
+                ),
+            )
+            self.store.connection.execute(
+                "DELETE FROM canary_signal_evaluations "
+                "WHERE evaluation_id IN ("
+                "SELECT evaluation_id FROM canary_signal_evaluations "
+                "ORDER BY evaluated_at DESC,evaluation_id DESC LIMIT -1 OFFSET 4096)"
+            )
+            self._prune_canary_signals()
+            self.store.connection.commit()
+        persisted = dict(result)
+        persisted["evaluation_id"] = evaluation_id
+        return persisted
+
+    def list_signal_evaluations(
+        self,
+        candidate_id: str | None = None,
+        *,
+        cycle_id: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Return recent persisted evaluations using bounded indexed queries."""
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+            raise ValueError("limit must be a non-negative integer")
+        clauses: list[str] = []
+        values: list[Any] = []
+        if candidate_id is not None:
+            clauses.append("candidate_id=?")
+            values.append(str(candidate_id).strip())
+        if cycle_id is not None:
+            clauses.append("cycle_id=?")
+            values.append(str(cycle_id).strip())
+        query = "SELECT * FROM canary_signal_evaluations"
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY evaluated_at DESC,evaluation_id DESC LIMIT ?"
+        values.append(min(int(limit), 4096))
+        with self.store._lock:
+            rows = self.store.connection.execute(query, values).fetchall()
+        records: list[dict[str, Any]] = []
+        for row in rows:
+            record = dict(row)
+            for field in ("signal_json", "required_health_json", "evidence_json"):
+                raw = record.pop(field, None)
+                if field == "signal_json" and not raw:
+                    decoded = None
+                else:
+                    try:
+                        decoded = json.loads(raw or "{}")
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        decoded = {}
+                record[field.removesuffix("_json")] = (
+                    dict(decoded) if isinstance(decoded, Mapping) else None
+                )
+            records.append(record)
+        return records
+
+    def _persist_ready_signal(
+        self,
+        binding: Mapping[str, Any],
+        *,
+        market_id: str,
+        current_row: Mapping[str, Any],
+        current_observation: Mapping[str, Any],
+        current_book: Mapping[str, Any],
+        outcome: str,
+        score: float,
+        expected_price: Decimal,
+        token_id: str,
+        now: datetime,
+    ) -> dict[str, Any] | None:
+        source_snapshot_id = str(current_row.get("snapshot_id") or "").strip()
+        source_timestamp = parse_timestamp(current_row.get("source_timestamp"))
+        if not source_snapshot_id or source_timestamp is None:
+            return None
+        side = "BUY"
+        identity = {
+            "candidate_id": binding["candidate_id"],
+            "frozen_hash": binding["frozen_hash"],
+            "source_snapshot_id": source_snapshot_id,
+            "market_id": market_id,
+            "token_id": token_id,
+            "outcome": outcome,
+            "side": side,
+            "paper_expected_price": str(expected_price),
+            "score": score,
+            "current_order_book_hash": _canary_document_hash(current_book),
+        }
+        base_signal_id = "canary-signal-" + hashlib.sha256(
+            json.dumps(identity, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+        ).hexdigest()[:32]
+        signal_id = base_signal_id
+        expires_at = now + timedelta(seconds=CANARY_SIGNAL_TTL_SECONDS)
+        existing_signal: dict[str, Any] | None = None
+        expired_ready_invalidated = False
+        with self.store._lock:
+            if self.store.connection.in_transaction:
+                raise CanaryBlocked("CANARY_TRANSACTION_ACTIVE")
+            matching = self.store.connection.execute(
+                "SELECT * FROM canary_signals WHERE signal_id LIKE ? || '%' "
+                "AND candidate_id=? AND frozen_hash=? "
+                "AND strategy_hash=? AND model_hash=? AND config_hash=? "
+                "AND market_id=? AND token_id=? AND outcome=? AND side=? "
+                "AND paper_expected_price=? AND source_snapshot_id=? "
+                "ORDER BY generated_at DESC,signal_id DESC",
+                (
+                    base_signal_id,
+                    binding["candidate_id"],
+                    binding["frozen_hash"],
+                    binding["strategy_hash"],
+                    binding["model_hash"],
+                    binding["config_hash"],
+                    market_id,
+                    token_id,
+                    outcome,
+                    side,
+                    str(expected_price),
+                    source_snapshot_id,
+                ),
+            ).fetchall()
+            protected = next(
+                (
+                    row
+                    for row in matching
+                    if str(row["status"] or "").upper()
+                    in {"SUBMITTED", "SUBMITTING", "UNKNOWN", "REJECTED"}
+                ),
+                None,
+            )
+            if protected is not None:
+                existing_signal = self._signal_from_row(protected)
+            else:
+                ready = next(
+                    (
+                        row
+                        for row in matching
+                        if str(row["status"] or "").upper() == "READY"
+                    ),
+                    None,
+                )
+                if ready is not None:
+                    ready_expires = parse_timestamp(ready["expires_at"])
+                    if ready_expires is not None and ready_expires > now:
+                        existing_signal = self._signal_from_row(ready)
+                    else:
+                        updated = self.store.connection.execute(
+                            "UPDATE canary_signals SET status='EXPIRED',"
+                            "reason='SIGNAL_EXPIRED',updated_at=? "
+                            "WHERE signal_id=? AND status='READY'",
+                            (now.isoformat(), ready["signal_id"]),
+                        )
+                        expired_ready_invalidated = updated.rowcount == 1
+                if existing_signal is None and (
+                    ready is None or expired_ready_invalidated
+                ):
+                    if matching:
+                        previous = matching[0]
+                        refresh_seed = (
+                            str(previous["signal_id"]) + "|" + str(previous["expires_at"] or "")
+                        )
+                        signal_id = (
+                            base_signal_id
+                            + "-refresh-"
+                            + hashlib.sha256(refresh_seed.encode()).hexdigest()[:16]
+                        )
+                    source_observed_at = current_row.get("observed_at")
+                    if isinstance(source_observed_at, datetime):
+                        source_observed_at = ensure_utc(source_observed_at).isoformat()
+                    evidence = {
+                        "score": score,
+                        "model_probability": current_observation.get("model_probability"),
+                        "market_price": str(expected_price),
+                        "research_quality": current_observation.get("research_quality"),
+                        "current_execution_evidence": CURRENT_ORDER_BOOK,
+                        "current_order_book_timestamp": current_book.get("timestamp"),
+                        "current_order_book_source": "FORWARD_COLLECTED",
+                        "source_type": current_row.get("source_type"),
+                        "source_observed_at": source_observed_at,
+                        "source_snapshot_id": source_snapshot_id,
+                        "source_timestamp": source_timestamp.isoformat(),
+                    }
+                    self.store.connection.execute(
+                        "INSERT INTO canary_signals("
+                        "signal_id,candidate_id,frozen_hash,strategy_hash,model_hash,config_hash,"
+                        "market_id,token_id,outcome,side,paper_expected_price,source_snapshot_id,"
+                        "source_timestamp,generated_at,expires_at,status,reason,evidence_json,updated_at) "
+                        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (
+                            signal_id,
+                            binding["candidate_id"],
+                            binding["frozen_hash"],
+                            binding["strategy_hash"],
+                            binding["model_hash"],
+                            binding["config_hash"],
+                            market_id,
+                            token_id,
+                            outcome,
+                            side,
+                            str(expected_price),
+                            source_snapshot_id,
+                            source_timestamp.isoformat(),
+                            now.isoformat(),
+                            expires_at.isoformat(),
+                            "READY",
+                            None,
+                            json.dumps(evidence, sort_keys=True, allow_nan=False),
+                            now.isoformat(),
+                        ),
+                    )
+            self._prune_canary_signals()
+            self.store.connection.commit()
+        self.publish_readiness_snapshot(reason="SIGNAL_GENERATED")
+        if existing_signal is not None:
+            return existing_signal
+        return self.get_signal(signal_id)
+
+    def evaluate_signal(
+        self,
+        candidate_id: str,
+        *,
+        cycle_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Evaluate one candidate from authorized persisted forward evidence."""
+        now = ensure_utc(self.clock())
+        identifier = str(candidate_id).strip()
+        if not identifier:
+            identifier = str(candidate_id)
+        evaluated_at = now.isoformat()
+        cycle = str(cycle_id).strip() if cycle_id is not None else None
+
+        def finish(
+            reason_code: str,
+            *,
+            market_id: str | None = None,
+            signal: Mapping[str, Any] | None = None,
+            required_health: Mapping[str, Any] | None = None,
+            evidence: Mapping[str, Any] | None = None,
+        ) -> dict[str, Any]:
+            result = {
+                "candidate_id": identifier,
+                "cycle_id": cycle,
+                "evaluated_at": evaluated_at,
+                "reason_code": str(reason_code).strip().upper(),
+                "market_id": market_id,
+                "signal": dict(signal) if isinstance(signal, Mapping) else None,
+                "required_health": (
+                    dict(required_health) if isinstance(required_health, Mapping) else {}
+                ),
+                "evidence": dict(evidence) if isinstance(evidence, Mapping) else {},
+            }
+            return self._persist_signal_evaluation(result)
+
+        authority: Mapping[str, Any] = {}
+        try:
+            loaded = self.store.candidate_forward_requirements(
+                candidate_ids=(identifier,),
+                now=now,
+                max_candidates=1,
+                max_markets_per_candidate=8,
+                max_total_markets=8,
+            )
+            if isinstance(loaded, Mapping):
+                authority = loaded
+        except Exception as exc:
+            return finish(
+                "CANDIDATE_FORWARD_MARKET_UNRESOLVED",
+                evidence={"authority_error": type(exc).__name__},
+            )
+
+        candidate_entry: Mapping[str, Any] = {}
+        candidates = authority.get("candidates")
+        if isinstance(candidates, (list, tuple)):
+            candidate_entry = next(
+                (
+                    item
+                    for item in candidates
+                    if isinstance(item, Mapping)
+                    and str(item.get("candidate_id") or "").strip() == identifier
+                ),
+                {},
+            )
+        raw_markets = candidate_entry.get("market_ids", candidate_entry.get("permitted_market_ids", ()))
         market_ids = tuple(
             dict.fromkeys(
-                str(item).strip() for item in (market_values or ()) if str(item).strip()
+                str(value).strip()
+                for value in (raw_markets if isinstance(raw_markets, (list, tuple, set, frozenset)) else ())
+                if str(value).strip()
             )
-        )
-        if not market_ids:
-            market_ids = tuple(
-                self.store.tracked_polymarket_markets(
-                    active_only=True, now=now, limit=1000
+        )[:8]
+        authority_reason = str(
+            candidate_entry.get("reason_code", authority.get("reason_code", ""))
+        ).strip().upper()
+        raw_declared_markets = candidate_entry.get("declared_market_ids", ())
+        declared_market_ids = tuple(
+            dict.fromkeys(
+                str(value).strip()
+                for value in (
+                    raw_declared_markets
+                    if isinstance(
+                        raw_declared_markets,
+                        (list, tuple, set, frozenset),
+                    )
+                    else ()
                 )
+                if str(value).strip()
             )
-        for market_id in sorted(market_ids):
+        )[:8]
+        required_health: Mapping[str, Any] = {}
+        try:
+            health = self.store.polymarket_required_health(
+                requirements=authority,
+                now=now,
+                stale_after_seconds=CANARY_SIGNAL_MAX_AGE_SECONDS,
+            )
+            if isinstance(health, Mapping):
+                required_health = health
+        except Exception as exc:
+            return finish(
+                "COLLECTOR_CANDIDATE_HEALTH_BLOCKED",
+                required_health={},
+                evidence={"health_error": type(exc).__name__},
+            )
+
+        evidence: dict[str, Any] = {
+            "authority": {
+                "market_ids": list(market_ids),
+                "candidate_reason_code": authority_reason or None,
+                "as_of": authority.get("as_of"),
+            },
+            "required_health_reason_code": required_health.get("reason_code"),
+            "required_market_count": required_health.get("required_market_count"),
+        }
+        for key in ("fresh", "stale", "missing", "closed_candidates", "unresolved_candidates"):
+            value = required_health.get(key, authority.get(key, ()))
+            if isinstance(value, (list, tuple)):
+                evidence[key] = list(value)
+
+        filter_values = candidate_entry.get(
+            "normalized_frozen_filters", candidate_entry.get("normalized_filters", {})
+        )
+        if not isinstance(filter_values, Mapping):
+            filter_values = {}
+
+        # ``candidate_forward_requirements`` deliberately omits exact targets
+        # which are currently missing, closed, or outside frozen filters.  Keep
+        # those declared targets in the bounded scan when they can be diagnosed
+        # locally, while retaining the authority order for permitted markets.
+        filter_mismatch_ids: set[str] = set()
+        closed_market_ids: set[str] = set()
+        missing_market_ids: set[str] = set()
+        active_inventory_by_id: dict[str, Mapping[str, Any]] = {}
+        all_inventory_by_id: dict[str, Mapping[str, Any]] = {}
+        inventory_loaded = False
+        if declared_market_ids:
+            try:
+                active_inventory = self.store.tracked_polymarket_markets(
+                    active_only=True,
+                    now=now,
+                    include_payload=True,
+                    limit=len(declared_market_ids),
+                    market_ids=declared_market_ids,
+                )
+                active_inventory_by_id = {
+                    str(item.get("market_id") or "").strip(): item
+                    for item in active_inventory
+                    if isinstance(item, Mapping) and str(item.get("market_id") or "").strip()
+                }
+                all_inventory = self.store.tracked_polymarket_markets(
+                    active_only=False,
+                    now=now,
+                    include_payload=True,
+                    limit=len(declared_market_ids),
+                    market_ids=declared_market_ids,
+                )
+                all_inventory_by_id = {
+                    str(item.get("market_id") or "").strip(): item
+                    for item in all_inventory
+                    if isinstance(item, Mapping) and str(item.get("market_id") or "").strip()
+                }
+                inventory_loaded = True
+            except Exception:
+                active_inventory_by_id = {}
+                all_inventory_by_id = {}
+
+        for declared_market_id in declared_market_ids:
+            record = all_inventory_by_id.get(declared_market_id)
+            if not isinstance(record, Mapping):
+                continue
+            payload = record.get("payload")
+            payload = payload if isinstance(payload, Mapping) else {}
+            snapshot = payload.get("snapshot")
+            snapshot = snapshot if isinstance(snapshot, Mapping) else {}
+            metadata = payload.get("metadata")
+            metadata = metadata if isinstance(metadata, Mapping) else {}
+            settlement = str(
+                snapshot.get(
+                    "settlement",
+                    payload.get("settlement", metadata.get("settlement", "")),
+                )
+                or ""
+            ).strip().lower()
+            closed = (
+                record.get("active") is False
+                or _canary_closed_flag(payload.get("closed", False))
+                or _canary_closed_flag(metadata.get("closed", False))
+            )
+            if (
+                closed
+                or settlement in {"resolved_yes", "resolved_no", "void", "closed", "expired"}
+            ):
+                closed_market_ids.add(declared_market_id)
+
+        if inventory_loaded:
+            ignored_values = candidate_entry.get("historical_market_ids_ignored", ())
+            ignored_market_ids = (
+                {
+                    str(value).strip()
+                    for value in ignored_values
+                    if str(value).strip()
+                }
+                if isinstance(ignored_values, (list, tuple, set, frozenset))
+                else set()
+            )
+            missing_market_ids = {
+                market_id
+                for market_id in declared_market_ids
+                if market_id not in all_inventory_by_id
+                and market_id not in ignored_market_ids
+            }
+
+        if filter_values and declared_market_ids:
+            try:
+                from .experiment_plan import forward_market_matches
+
+                permitted_set = set(market_ids)
+                for declared_market_id in declared_market_ids:
+                    if (
+                        declared_market_id not in permitted_set
+                        and declared_market_id in active_inventory_by_id
+                        and not forward_market_matches(
+                            active_inventory_by_id[declared_market_id],
+                            filter_values,
+                            now=now,
+                        )
+                    ):
+                        filter_mismatch_ids.add(declared_market_id)
+            except (TypeError, ValueError, KeyError):
+                filter_mismatch_ids = set()
+
+        if authority_reason == "COLLECTOR_CAPACITY_INSUFFICIENT":
+            return finish(
+                "COLLECTOR_CANDIDATE_HEALTH_BLOCKED",
+                market_id=market_ids[0] if market_ids else None,
+                required_health=required_health,
+                evidence={**evidence, "authority_reason_code": authority_reason},
+            )
+
+        # The authority list is already bounded to eight.  Declared targets
+        # omitted by requirements remain diagnostic-only: their closed,
+        # filter-mismatch, and unresolved classifications were resolved above,
+        # but they must never enter executable signal evaluation.
+        #
+        # Keep the executable loop restricted to authority-permitted market
+        # ids.  In particular, do not append declared ids here: a target
+        # excluded by frozen filters or target_instrument could otherwise
+        # produce a READY signal despite not being authorized.
+
+        missing = required_health.get("missing", ())
+        stale = required_health.get("stale", ())
+        missing_markets = (
+            {str(value).strip() for value in missing if str(value).strip()}
+            if isinstance(missing, (list, tuple, set, frozenset))
+            else set()
+        )
+        stale_markets = (
+            {str(value).strip() for value in stale if str(value).strip()}
+            if isinstance(stale, (list, tuple, set, frozenset))
+            else set()
+        )
+        health_blocked_markets: set[str] = set()
+        for field in ("blocked", "health_blocked", "blocked_markets", "degraded"):
+            values = required_health.get(field, ())
+            if isinstance(values, (list, tuple, set, frozenset)):
+                health_blocked_markets.update(
+                    str(value).strip() for value in values if str(value).strip()
+                )
+        health_states: dict[str, str] = {}
+        diagnostics = required_health.get("market_diagnostics", required_health.get("diagnostics", ()))
+        if isinstance(diagnostics, (list, tuple)):
+            for diagnostic in diagnostics:
+                if not isinstance(diagnostic, Mapping):
+                    continue
+                diagnostic_market_id = str(diagnostic.get("market_id") or "").strip()
+                state = str(diagnostic.get("collection_state") or "").strip().lower()
+                if diagnostic_market_id and state:
+                    health_states[diagnostic_market_id] = state
+                    if state in {"blocked", "degraded", "unhealthy"}:
+                        health_blocked_markets.add(diagnostic_market_id)
+        for market_id in missing_markets:
+            health_states.setdefault(market_id, "missing")
+        for market_id in stale_markets:
+            health_states.setdefault(market_id, "stale")
+        fresh_values = required_health.get("fresh", ())
+        fresh_markets = (
+            {str(value).strip() for value in fresh_values if str(value).strip()}
+            if isinstance(fresh_values, (list, tuple, set, frozenset))
+            else set()
+        )
+        for market_id in fresh_markets:
+            health_states.setdefault(market_id, "fresh")
+        health_grade = str(required_health.get("grade") or "").strip().upper()
+        health_reason = str(required_health.get("reason_code") or "").strip().upper()
+        health_has_market_detail = bool(
+            missing_markets
+            or stale_markets
+            or fresh_markets
+            or health_blocked_markets
+            or health_states
+        )
+
+        binding: Mapping[str, Any] | None = None
+        if market_ids:
+            try:
+                binding = self._candidate_signal_binding(identifier)
+            except CanaryBlocked as exc:
+                evidence["binding_reason"] = str(exc)
+                return finish(
+                    "COLLECTOR_CANDIDATE_HEALTH_BLOCKED",
+                    market_id=market_ids[0],
+                    required_health=required_health,
+                    evidence=evidence,
+                )
+
+        # A failed market is diagnostic evidence, not a terminal evaluation.
+        # Higher values are the canonical aggregate severity: terminal market
+        # state, authority mismatch, missing/stale evidence, collector health,
+        # then a strategy that is simply non-actionable.  Ties retain the
+        # deterministic permitted-market order.
+        failure_precedence = {
+            "MARKET_CLOSED": 60,
+            "MARKET_FILTER_MISMATCH": 50,
+            "NO_FORWARD_SNAPSHOT": 40,
+            "STALE_FORWARD_EVIDENCE": 30,
+            "COLLECTOR_CANDIDATE_HEALTH_BLOCKED": 20,
+            "NO_STRATEGY_SIGNAL": 10,
+        }
+        failures: list[dict[str, Any]] = []
+
+        def record_failure(
+            reason_code: str,
+            market_id: str,
+            *,
+            details: Mapping[str, Any] | None = None,
+        ) -> None:
+            failure_reason = str(reason_code).strip().upper()
+            failure_evidence = dict(evidence)
+            if isinstance(details, Mapping):
+                failure_evidence.update(dict(details))
+            failure_evidence["market_id"] = market_id
+            failure_evidence["failure_reason_code"] = failure_reason
+            failures.append(
+                {
+                    "reason_code": failure_reason,
+                    "market_id": market_id,
+                    "evidence": failure_evidence,
+                    "order": len(failures),
+                }
+            )
+
+        for market_id in market_ids:
+            if market_id in closed_market_ids:
+                record_failure(
+                    "MARKET_CLOSED",
+                    market_id,
+                    details={"signal_blocker": "MARKET_CLOSED"},
+                )
+                continue
+            market_health_state = health_states.get(market_id, "")
+            if market_id in filter_mismatch_ids:
+                record_failure(
+                    "MARKET_FILTER_MISMATCH",
+                    market_id,
+                    details={"signal_blocker": "FROZEN_MARKET_FILTER"},
+                )
+                continue
+            if market_health_state == "missing" or market_id in missing_markets:
+                record_failure(
+                    "NO_FORWARD_SNAPSHOT",
+                    market_id,
+                    details={"signal_blocker": "FORWARD_SNAPSHOT_REQUIRED"},
+                )
+                continue
+            if market_health_state == "stale" or market_id in stale_markets:
+                record_failure(
+                    "STALE_FORWARD_EVIDENCE",
+                    market_id,
+                    details={"signal_blocker": "FORWARD_SNAPSHOT_STALE"},
+                )
+                continue
+            if market_id in health_blocked_markets:
+                record_failure(
+                    "COLLECTOR_CANDIDATE_HEALTH_BLOCKED",
+                    market_id,
+                    details={
+                        "signal_blocker": "REQUIRED_MARKET_HEALTH",
+                        "health_state": market_health_state or "blocked",
+                    },
+                )
+                continue
+            if health_grade not in {"A", "B"} and (
+                not health_has_market_detail
+                or (
+                    health_reason == "COLLECTOR_DEGRADED"
+                    and not health_blocked_markets
+                )
+            ):
+                record_failure(
+                    "COLLECTOR_CANDIDATE_HEALTH_BLOCKED",
+                    market_id,
+                    details={
+                        "signal_blocker": "REQUIRED_MARKET_HEALTH",
+                        "health_state": market_health_state or None,
+                    },
+                )
+                continue
+
             rows = self._forward_snapshot_rows(market_id)
             if not rows:
+                record_failure(
+                    "NO_FORWARD_SNAPSHOT",
+                    market_id,
+                    details={"signal_blocker": "FORWARD_SNAPSHOT_REQUIRED"},
+                )
                 continue
-            current_row, current_observation = rows[-1], self._signal_observation(rows[-1])
+            current_row = rows[-1]
+            current_observation = self._signal_observation(current_row)
             if current_observation is None:
+                record_failure(
+                    "STALE_FORWARD_EVIDENCE",
+                    market_id,
+                    details={"signal_blocker": "FORWARD_OBSERVATION_INVALID"},
+                )
                 continue
             source_timestamp = parse_timestamp(current_row.get("source_timestamp"))
+            observed_at = parse_timestamp(current_row.get("observed_at"))
             if (
                 source_timestamp is None
+                or observed_at is None
                 or source_timestamp > now
+                or observed_at > now
                 or (now - source_timestamp).total_seconds() > CANARY_SIGNAL_MAX_AGE_SECONDS
-                or bool(current_observation.get("closed"))
-                or current_observation.get("active") is False
-                or str(current_observation.get("settlement", "open")).strip().lower()
-                in {"resolved_yes", "resolved_no", "void", "closed"}
+                or (now - observed_at).total_seconds() > CANARY_SIGNAL_MAX_AGE_SECONDS
             ):
+                record_failure(
+                    "STALE_FORWARD_EVIDENCE",
+                    market_id,
+                    details={"signal_blocker": "FORWARD_SNAPSHOT_STALE"},
+                )
+                continue
+            settlement = str(current_observation.get("settlement", "open")).strip().lower()
+            if (
+                _canary_closed_flag(current_observation.get("closed", False))
+                or current_observation.get("active") is False
+                or settlement in {"resolved_yes", "resolved_no", "void", "closed", "expired"}
+            ):
+                record_failure(
+                    "MARKET_CLOSED",
+                    market_id,
+                    details={"signal_blocker": "MARKET_CLOSED"},
+                )
                 continue
             observations: list[dict[str, Any]] = []
             for row in rows:
@@ -4695,7 +5626,15 @@ class CanaryService:
             if not observations or not self._apply_signal_model(
                 observations, binding["model_document"]
             ):
+                record_failure(
+                    "NO_STRATEGY_SIGNAL",
+                    market_id,
+                    details={"signal_blocker": "STRATEGY_NOT_ACTIONABLE"},
+                )
                 continue
+            current_observation["model_probability"] = observations[-1].get(
+                "model_probability"
+            )
             try:
                 from .strategy import evaluate_signal_record
 
@@ -4704,189 +5643,151 @@ class CanaryService:
                 )
                 score = float(evaluated.score)
             except (TypeError, ValueError, OverflowError):
-                continue
-            if not math.isfinite(score) or not evaluated.actionable:
+                score = 0.0
+                evaluated = None
+            if not math.isfinite(score) or evaluated is None or not evaluated.actionable:
+                record_failure(
+                    "NO_STRATEGY_SIGNAL",
+                    market_id,
+                    details={"signal_blocker": "STRATEGY_NOT_ACTIONABLE"},
+                )
                 continue
             outcome = "yes" if score > 0 else "no"
-            side = "BUY"
             token_ids = current_observation.get("token_ids")
             token_id = current_observation.get(f"{outcome}_token_id")
             if isinstance(token_ids, Mapping):
                 token_id = token_id or token_ids.get(outcome)
             token_id = str(token_id or "").strip()
-            if not token_id:
-                continue
             current_book = self._current_order_book(
                 current_observation,
                 outcome,
                 now=now,
                 token_id=token_id,
             )
-            if current_book is None:
+            if not token_id or current_book is None:
+                record_failure(
+                    "COLLECTOR_CANDIDATE_HEALTH_BLOCKED",
+                    market_id,
+                    details={"signal_blocker": "CURRENT_ORDER_BOOK_REQUIRED"},
+                )
                 continue
             raw_price = current_observation.get(f"{outcome}_ask")
             if raw_price is None:
                 try:
                     raw_price = _best_ask_price(current_book.get("asks"))
                 except (TypeError, ValueError, ArithmeticError):
-                    continue
+                    raw_price = None
             try:
                 expected_price = Decimal(str(raw_price))
             except (TypeError, ValueError, ArithmeticError):
-                continue
+                expected_price = Decimal("NaN")
             if not expected_price.is_finite() or not 0 < expected_price <= 1:
-                continue
-            source_snapshot_id = str(current_row.get("snapshot_id") or "").strip()
-            if not source_snapshot_id:
-                continue
-            identity = {
-                "candidate_id": binding["candidate_id"],
-                "frozen_hash": binding["frozen_hash"],
-                "source_snapshot_id": source_snapshot_id,
-                "market_id": market_id,
-                "token_id": token_id,
-                "outcome": outcome,
-                "side": side,
-                "paper_expected_price": str(expected_price),
-                "score": score,
-                # The snapshot id is the durable source binding, while this
-                # digest also prevents a mutable/legacy snapshot projection
-                # from reusing a signal whose executable book has changed.
-                "current_order_book_hash": _canary_document_hash(current_book),
-            }
-            base_signal_id = "canary-signal-" + hashlib.sha256(
-                json.dumps(identity, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
-            ).hexdigest()[:32]
-            signal_id = base_signal_id
-            expires_at = now + timedelta(seconds=CANARY_SIGNAL_TTL_SECONDS)
-            existing_signal: dict[str, Any] | None = None
-            expired_ready_invalidated = False
-            with self.store._lock:
-                if self.store.connection.in_transaction:
-                    raise CanaryBlocked("CANARY_TRANSACTION_ACTIVE")
-                matching = self.store.connection.execute(
-                    "SELECT * FROM canary_signals WHERE signal_id LIKE ? || '%' "
-                    "AND candidate_id=? AND frozen_hash=? "
-                    "AND strategy_hash=? AND model_hash=? AND config_hash=? "
-                    "AND market_id=? AND token_id=? AND outcome=? AND side=? "
-                    "AND paper_expected_price=? AND source_snapshot_id=? "
-                    "ORDER BY generated_at DESC,signal_id DESC",
-                    (
-                        base_signal_id,
-                        binding["candidate_id"],
-                        binding["frozen_hash"],
-                        binding["strategy_hash"],
-                        binding["model_hash"],
-                        binding["config_hash"],
-                        market_id,
-                        token_id,
-                        outcome,
-                        side,
-                        str(expected_price),
-                        source_snapshot_id,
-                    ),
-                ).fetchall()
-                # A submission outcome is a terminal fence for this exact
-                # evidence.  Never refresh, rewrite, or otherwise touch such
-                # rows; this preserves one-submit and UNKNOWN semantics.
-                protected = next(
-                    (
-                        row
-                        for row in matching
-                        if str(row["status"] or "").upper()
-                        in {"SUBMITTED", "SUBMITTING", "UNKNOWN", "REJECTED"}
-                    ),
-                    None,
+                record_failure(
+                    "COLLECTOR_CANDIDATE_HEALTH_BLOCKED",
+                    market_id,
+                    details={"signal_blocker": "INVALID_EXECUTABLE_QUOTE"},
                 )
-                if protected is not None:
-                    existing_signal = self._signal_from_row(protected)
-                else:
-                    ready = next(
-                        (
-                            row
-                            for row in matching
-                            if str(row["status"] or "").upper() == "READY"
-                        ),
-                        None,
-                    )
-                    if ready is not None:
-                        ready_expires = parse_timestamp(ready["expires_at"])
-                        if ready_expires is not None and ready_expires > now:
-                            existing_signal = self._signal_from_row(ready)
-                        else:
-                            # CAS the stale READY row out of the actionable
-                            # state before allocating replacement evidence.
-                            updated = self.store.connection.execute(
-                                "UPDATE canary_signals SET status='EXPIRED',"
-                                "reason='SIGNAL_EXPIRED',updated_at=? "
-                                "WHERE signal_id=? AND status='READY'",
-                                (now.isoformat(), ready["signal_id"]),
-                            )
-                            expired_ready_invalidated = updated.rowcount == 1
-                    if existing_signal is None and (
-                        ready is None or expired_ready_invalidated
-                    ):
-                        if matching:
-                            previous = matching[0]
-                            refresh_seed = (
-                                str(previous["signal_id"])
-                                + "|"
-                                + str(previous["expires_at"] or "")
-                            )
-                            signal_id = (
-                                base_signal_id
-                                + "-refresh-"
-                                + hashlib.sha256(refresh_seed.encode()).hexdigest()[:16]
-                            )
-                        evidence = {
-                            "score": score,
-                            "model_probability": current_observation.get("model_probability"),
-                            "market_price": str(expected_price),
-                            "research_quality": current_observation.get("research_quality"),
-                            "current_execution_evidence": CURRENT_ORDER_BOOK,
-                            "current_order_book_timestamp": current_book.get("timestamp"),
-                            "current_order_book_source": "FORWARD_COLLECTED",
-                            "source_observed_at": (
-                                current_row.get("observed_at").isoformat()
-                                if isinstance(current_row.get("observed_at"), datetime)
-                                else current_row.get("observed_at")
-                            ),
-                            "source_snapshot_id": source_snapshot_id,
-                        }
-                        self.store.connection.execute(
-                            "INSERT INTO canary_signals("
-                            "signal_id,candidate_id,frozen_hash,strategy_hash,model_hash,config_hash,"
-                            "market_id,token_id,outcome,side,paper_expected_price,source_snapshot_id,"
-                            "source_timestamp,generated_at,expires_at,status,reason,evidence_json,updated_at) "
-                            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                            (
-                                signal_id,
-                                binding["candidate_id"],
-                                binding["frozen_hash"],
-                                binding["strategy_hash"],
-                                binding["model_hash"],
-                                binding["config_hash"],
-                                market_id,
-                                token_id,
-                                outcome,
-                                side,
-                                str(expected_price),
-                                source_snapshot_id,
-                                source_timestamp.isoformat(),
-                                now.isoformat(),
-                                expires_at.isoformat(),
-                                "READY",
-                                None,
-                                json.dumps(evidence, sort_keys=True, allow_nan=False),
-                                now.isoformat(),
-                            ),
-                        )
-                self.store.connection.commit()
-            self.publish_readiness_snapshot(reason="SIGNAL_GENERATED")
-            if existing_signal is not None:
-                return existing_signal
-            return self.get_signal(signal_id)
-        return None
+                continue
+            signal = self._persist_ready_signal(
+                binding,
+                market_id=market_id,
+                current_row=current_row,
+                current_observation=current_observation,
+                current_book=current_book,
+                outcome=outcome,
+                score=score,
+                expected_price=expected_price,
+                token_id=token_id,
+                now=now,
+            )
+            if signal is None:
+                record_failure(
+                    "COLLECTOR_CANDIDATE_HEALTH_BLOCKED",
+                    market_id,
+                    details={"signal_blocker": "SIGNAL_PERSISTENCE_FAILED"},
+                )
+                continue
+            ready_evidence = dict(evidence)
+            ready_evidence.update(
+                {
+                    "market_id": market_id,
+                    "source_type": current_row.get("source_type"),
+                    "source_snapshot_id": current_row.get("snapshot_id"),
+                    "source_timestamp": source_timestamp.isoformat(),
+                    "observed_at": observed_at.isoformat(),
+                    "current_order_book_timestamp": current_book.get("timestamp"),
+                    "current_execution_evidence": CURRENT_ORDER_BOOK,
+                }
+            )
+            return finish(
+                "READY_SIGNAL",
+                market_id=market_id,
+                signal=signal,
+                required_health=required_health,
+                evidence=ready_evidence,
+            )
+
+        # Keep exact diagnostics for declared targets that requirements
+        # intentionally omitted, but never run snapshot/model/strategy
+        # evaluation for them.  Append these after the executable loop so
+        # permitted-market order remains the tie-breaker for executable
+        # failures, matching the historical bounded-scan ordering.
+        for declared_market_id in declared_market_ids:
+            if declared_market_id in market_ids:
+                continue
+            if declared_market_id in closed_market_ids:
+                record_failure(
+                    "MARKET_CLOSED",
+                    declared_market_id,
+                    details={"signal_blocker": "MARKET_CLOSED"},
+                )
+            elif declared_market_id in filter_mismatch_ids:
+                record_failure(
+                    "MARKET_FILTER_MISMATCH",
+                    declared_market_id,
+                    details={"signal_blocker": "FROZEN_MARKET_FILTER"},
+                )
+            elif declared_market_id in missing_market_ids:
+                record_failure(
+                    "NO_FORWARD_SNAPSHOT",
+                    declared_market_id,
+                    details={"signal_blocker": "FORWARD_SNAPSHOT_REQUIRED"},
+                )
+
+        if failures:
+            selected = min(
+                failures,
+                key=lambda item: (
+                    -failure_precedence.get(str(item["reason_code"]), 0),
+                    int(item["order"]),
+                ),
+            )
+            selected_evidence = dict(selected["evidence"])
+            selected_evidence["market_failures"] = [
+                {
+                    "market_id": item["market_id"],
+                    "reason_code": item["reason_code"],
+                }
+                for item in failures
+            ]
+            return finish(
+                selected["reason_code"],
+                market_id=selected["market_id"],
+                required_health=required_health,
+                evidence=selected_evidence,
+            )
+        return finish(
+            "COLLECTOR_CANDIDATE_HEALTH_BLOCKED",
+            market_id=market_ids[0] if market_ids else None,
+            required_health=required_health,
+            evidence=evidence,
+        )
+
+    def generate_signal(self, candidate_id: str) -> Mapping[str, Any] | None:
+        """Compatibility wrapper around :meth:`evaluate_signal`."""
+        result = self.evaluate_signal(candidate_id)
+        signal = result.get("signal") if isinstance(result, Mapping) else None
+        return dict(signal) if isinstance(signal, Mapping) else None
 
     @staticmethod
     def _signal_from_row(row: Mapping[str, Any]) -> dict[str, Any]:
@@ -4997,6 +5898,36 @@ class CanaryService:
             if not control_candidate or not signal_candidate or control_candidate != signal_candidate:
                 self._invalidate_signal(signal_id, "AUTO_CANARY_CANDIDATE_NOT_SELECTED")
                 raise CanaryBlocked("AUTO_CANARY_CANDIDATE_NOT_SELECTED")
+        try:
+            requirements = self.store.candidate_forward_requirements(
+                candidate_ids=(str(signal["candidate_id"]),),
+                now=now,
+                max_candidates=1,
+                max_markets_per_candidate=8,
+                max_total_markets=8,
+            )
+            required_health = self.store.polymarket_required_health(
+                requirements=requirements,
+                now=now,
+                stale_after_seconds=CANARY_SIGNAL_MAX_AGE_SECONDS,
+            )
+        except Exception:
+            self._set_signal_status(
+                signal_id, "STALE", reason="REQUIRED_MARKET_HEALTH_BLOCKED"
+            )
+            raise CanaryBlocked("CANARY_SIGNAL_STALE")
+        selected_market = str(signal.get("market_id") or "").strip()
+        fresh_markets = required_health.get("fresh", ())
+        grade = str(required_health.get("grade") or "").strip().upper()
+        if (
+            grade not in {"A", "B"}
+            or not isinstance(fresh_markets, (list, tuple, set, frozenset))
+            or selected_market not in fresh_markets
+        ):
+            self._set_signal_status(
+                signal_id, "STALE", reason="REQUIRED_MARKET_HEALTH_BLOCKED"
+            )
+            raise CanaryBlocked("CANARY_SIGNAL_STALE")
         current = self._current_signal_market(str(signal["market_id"]), now=now)
         if current is None:
             self._set_signal_status(signal_id, "STALE", reason="SOURCE_OBSERVATION_STALE")
@@ -6166,7 +7097,7 @@ class CanaryService:
                 "signal_scan_cycle_started_at,signal_scan_cycle_completed_at,"
                 "signal_scan_cycle_complete,signal_scan_checked_this_cycle,"
                 "signal_scan_remaining_this_cycle,signal_scan_coverage_percentage,"
-                "signal_scan_skip_reasons_json,signal_scan_status,"
+                "signal_scan_skip_reasons_json,signal_scan_reason_counts_json,signal_scan_status,"
                 "next_decision,blocker,last_signal_id,worker_status "
                 "FROM canary_autonomous_state WHERE singleton=1"
             )
@@ -6296,6 +7227,10 @@ class CanaryService:
                 autonomous_state["signal_scan_skip_reasons_json"]
                 if autonomous_state is not None else "{}"
             ),
+            "signal_scan_reason_counts_json": (
+                autonomous_state["signal_scan_reason_counts_json"]
+                if autonomous_state is not None else "{}"
+            ),
             "signal_scan_status": (
                 autonomous_state["signal_scan_status"]
                 if autonomous_state is not None else "UNKNOWN"
@@ -6382,11 +7317,11 @@ class CanaryService:
                 "signal_scan_candidate_universe_hash",
                 "signal_scan_cycle_started_at",
                 "signal_scan_cycle_completed_at",
-                "signal_scan_cycle_complete",
                 "signal_scan_checked_this_cycle",
                 "signal_scan_remaining_this_cycle",
                 "signal_scan_coverage_percentage",
                 "signal_scan_skip_reasons_json",
+                "signal_scan_reason_counts_json",
                 "signal_scan_status",
                 "signal_scan_checked_keys",
             )
@@ -7715,5 +8650,4 @@ class CanaryService:
             "requested_notional": str(notional),
             "production_live_execution": False,
         }
-
-__all__=["AUTONOMOUS_MICRO_LIVE","AUTONOMOUS_CANARY_VENUE","AUTONOMOUS_CANARY_LIMITS","CANARY_READINESS_SNAPSHOT_MAX_AGE_SECONDS","CanaryBlocked","CanaryLimits","CanaryService","CanaryVenue","CredentialStore","PolymarketClobV2Venue","PRODUCTION_LIVE_EXECUTION"]
+__all__=["AUTONOMOUS_MICRO_LIVE","AUTONOMOUS_CANARY_VENUE","AUTONOMOUS_CANARY_LIMITS","CANARY_READINESS_SNAPSHOT_MAX_AGE_SECONDS","CANARY_SIGNAL_TRANSIENT_RETENTION","CanaryBlocked","CanaryLimits","CanaryService","CanaryVenue","CredentialStore","PolymarketClobV2Venue","PRODUCTION_LIVE_EXECUTION"]

@@ -32,6 +32,7 @@ def prediction_rows(*, version: str = "v1", model_probability: float = 0.8) -> l
         common: dict[str, object] = {
             "market_id": f"market-{index}",
             "question": "Will the public event resolve YES?",
+            "category": "politics",
             "yes_bid": 0.49,
             "yes_ask": 0.51,
             "yes_mid": 0.50,
@@ -55,12 +56,20 @@ def prediction_rows(*, version: str = "v1", model_probability: float = 0.8) -> l
     return rows
 
 
-def experiment_plan(*, dataset_id: str | None = "dataset", dataset_version: str = "v1", max_variants: int = 1) -> dict[str, object]:
+def experiment_plan(
+    *,
+    dataset_id: str | None = "dataset",
+    dataset_version: str = "v1",
+    max_variants: int = 1,
+    target_market_ids: tuple[str, ...] = (),
+) -> dict[str, object]:
     return {
         "market_type": "prediction",
         "template": "probability_mispricing",
         "dataset_id": dataset_id,
         "dataset_version": dataset_version,
+        "target": {"market_ids": list(target_market_ids)},
+        "filters": {"category": "politics"},
         "parameters": {"threshold": [0.03, 0.05][:max_variants]},
         "min_samples": 1,
         "min_trades": 0,
@@ -76,8 +85,14 @@ def proposal(
     dataset_version: str = "v1",
     model_probability: float | None = None,
     max_variants: int = 1,
+    target_market_ids: tuple[str, ...] = (),
 ) -> dict[str, object]:
-    plan = experiment_plan(dataset_id=dataset_id, dataset_version=dataset_version, max_variants=max_variants)
+    plan = experiment_plan(
+        dataset_id=dataset_id,
+        dataset_version=dataset_version,
+        max_variants=max_variants,
+        target_market_ids=target_market_ids,
+    )
     if model_probability is not None:
         plan["model_document"] = {"probability": model_probability}
     return {
@@ -161,15 +176,45 @@ def _observation(
         "settlement": settlement,
         **extra,
     }
+def _seed_forward_metadata(
+    store: AxiomStore,
+    market_ids: tuple[str, ...],
+    *,
+    observed_at: datetime = T0,
+) -> None:
+    for market_id in market_ids:
+        store.save_polymarket_market_metadata(
+            market_id,
+            {
+                "market_id": market_id,
+                "category": "politics",
+                "source_type": "FORWARD_COLLECTED",
+                "active": True,
+                "closed": False,
+                "metadata": {"active": True, "closed": False, "category": "politics"},
+                "snapshot": {
+                    "market_id": market_id,
+                    "category": "politics",
+                    "settlement": "open",
+                    "expiry": (observed_at + timedelta(days=2)).isoformat(),
+                },
+            },
+            observed_at=observed_at,
+            source_type="FORWARD_COLLECTED",
+        )
+
+
 def _register_forward_candidate(
     store: AxiomStore,
     bus: DurableResearchBus,
     *,
     proposal_id: str,
     criteria: PromotionCriteria,
+    target_market_ids: tuple[str, ...],
     dataset_id: str | None = "dataset",
 ) -> tuple[AutonomousResearchProcessor, dict[str, object], object]:
     store.save_dataset("dataset", "v1", prediction_rows())
+    _seed_forward_metadata(store, target_market_ids)
     item = bus.submit_hypothesis(
         proposal(proposal_id, dataset_id=dataset_id),
         available_at=T0,
@@ -293,15 +338,81 @@ class Phase4AutonomousLoopTests(unittest.TestCase):
                 {
                     **experiment_plan(),
                     "hypothesis_id": "hypothesis-unbounded",
+
                     "parameters": {"threshold": {"min": 0.0, "max": 100.0, "step": 0.01}},
                 }
             )
 
+    def test_target_membership_and_category_filters_are_all_required(self) -> None:
+        filters = {
+            "category": "politics",
+            "entry_price": [0.40, 0.60],
+            "minimum_hours_to_resolution": 1,
+            "min_liquidity": 50,
+            "max_spread": 0.05,
+            "regimes": ["calm"],
+        }
+        rows = [
+            _observation(
+                "target-good",
+                T0,
+                category="politics",
+                time_to_expiry_seconds=7200,
+                liquidity=100,
+                spread=0.02,
+                regime="calm",
+            ),
+            _observation(
+                "target-price-fail",
+                T0,
+                category="politics",
+                yes_mid=0.80,
+                time_to_expiry_seconds=7200,
+                liquidity=100,
+                spread=0.02,
+                regime="calm",
+            ),
+            _observation(
+                "target-category-fail",
+                T0,
+                category="economics",
+                time_to_expiry_seconds=7200,
+                liquidity=100,
+                spread=0.02,
+                regime="calm",
+            ),
+            _observation(
+                "unauthorized-good",
+                T0,
+                category="politics",
+                time_to_expiry_seconds=7200,
+                liquidity=100,
+                spread=0.02,
+                regime="calm",
+            ),
+        ]
+        plan = ExperimentPlan.from_mapping(
+            {
+                **experiment_plan(target_market_ids=("target-good", "target-price-fail", "target-category-fail")),
+                "hypothesis_id": "target-filtering",
+                "filters": filters,
+            }
+        )
+        with AxiomStore(":memory:") as store:
+            selected = processor(store, DurableResearchBus(store))._apply_plan_filters(plan, rows)
+        self.assertEqual([row["market_id"] for row in selected], ["target-good"])
+
     def test_declarative_plan_runs_historical_lifecycle_and_registers_forward(self) -> None:
         with AxiomStore(":memory:") as store:
+            target_market_ids = ("declarative-forward-market",)
             store.save_dataset("dataset", "v1", prediction_rows())
+            _seed_forward_metadata(store, target_market_ids)
             bus = DurableResearchBus(store)
-            item = bus.submit_hypothesis(proposal("hypothesis-complete"), available_at=T0, dedupe_key="hypothesis-complete")
+            item = bus.submit_hypothesis(
+                proposal("hypothesis-complete"),
+                available_at=T0,
+                dedupe_key="hypothesis-complete",
+            )
             cycle = processor(store, bus).process_pending(now=T0)
 
             self.assertEqual(cycle.completed, 1)
@@ -352,14 +463,20 @@ class Phase4AutonomousLoopTests(unittest.TestCase):
             budget = store.load_experiment_budget("autonomous")
             self.assertEqual(budget["budget"]["used_by_family"], {"probability_mispricing": 1})
             forward_config = store.load_forward_tests()[0]["config"]
-            self.assertFalse(forward_config["live_execution"])
-            self.assertNotIn("broker", json.dumps(forward_config).lower())
+            self.assertEqual(forward_config["execution"], "paper_only")
+            self.assertNotIn("live_execution", forward_config)
 
     def test_forward_paper_evidence_reaches_human_review_gate_without_live_route(self) -> None:
         with AxiomStore(":memory:") as store:
+            target_market_ids = ("forward-market", "forward-market-2")
             store.save_dataset("dataset", "v1", prediction_rows())
+            _seed_forward_metadata(store, target_market_ids)
             bus = DurableResearchBus(store)
-            bus.submit_hypothesis(proposal("hypothesis-forward"), available_at=T0, dedupe_key="hypothesis-forward")
+            bus.submit_hypothesis(
+                proposal("hypothesis-forward"),
+                available_at=T0,
+                dedupe_key="hypothesis-forward",
+            )
             active = processor(store, bus, criteria=relaxed_criteria(forward_trades=1))
             active.process_pending(now=T0)
             record = store.load_candidate_lifecycle(limit=None)[0]
@@ -472,6 +589,7 @@ class Phase4AutonomousLoopTests(unittest.TestCase):
                 bus,
                 proposal_id="forged-experiment-result",
                 criteria=relaxed_criteria(),
+                target_market_ids=("forged-result-market",),
             )
             candidate_id = str(record["candidate_id"])
             before = store.load_candidate_lifecycle(candidate_id)
@@ -511,6 +629,7 @@ class Phase4AutonomousLoopTests(unittest.TestCase):
                 bus,
                 proposal_id="prediction-result-without-dataset-id",
                 criteria=relaxed_criteria(),
+                target_market_ids=("datasetless-market",),
                 dataset_id=None,
             )
             candidate_id = str(record["candidate_id"])
@@ -608,6 +727,7 @@ class Phase4AutonomousLoopTests(unittest.TestCase):
                 bus,
                 proposal_id="prediction-result-forged-dataset-id",
                 criteria=relaxed_criteria(),
+                target_market_ids=("forged-dataset-market",),
                 dataset_id=None,
             )
             candidate_id = str(record["candidate_id"])
@@ -638,7 +758,9 @@ class Phase4AutonomousLoopTests(unittest.TestCase):
 
     def test_plan_budget_limits_cannot_poison_node_owned_autonomous_budget(self) -> None:
         with AxiomStore(":memory:") as store:
+            target_market_ids = ("budget-low-market", "budget-normal-market")
             store.save_dataset("dataset", "v1", prediction_rows())
+            _seed_forward_metadata(store, target_market_ids)
             bus = DurableResearchBus(store)
             low_limit = proposal("low-limit-plan")
             low_limit["experiment_plan"]["family_budget"] = {"total_limit": 1, "per_family_limit": 1}
@@ -720,6 +842,7 @@ class Phase4AutonomousLoopTests(unittest.TestCase):
                 bus,
                 proposal_id="one-losing-forward-bet",
                 criteria=criteria,
+                target_market_ids=("losing-market",),
             )
             start = T0 + timedelta(hours=1)
             observations = [
@@ -871,6 +994,7 @@ class Phase4AutonomousLoopTests(unittest.TestCase):
                 bus,
                 proposal_id="validation-not-forward",
                 criteria=relaxed_criteria(),
+                target_market_ids=("validation-market",),
             )
             result = active.reevaluate_forward_candidates(now=T0 + timedelta(days=1))[0]
             evidence = result["forward_evidence"]
@@ -949,6 +1073,7 @@ class Phase4AutonomousLoopTests(unittest.TestCase):
                 bus,
                 proposal_id="hard-drawdown",
                 criteria=criteria,
+                target_market_ids=("drawdown-market",),
             )
             store.save_paper_state(
                 spec.experiment_id,
@@ -969,7 +1094,9 @@ class Phase4AutonomousLoopTests(unittest.TestCase):
             if row["market_id"] == "market-9":
                 row["question"] = marker
         with AxiomStore(":memory:") as store:
+            target_market_ids = ("holdout-forward-market",)
             store.save_dataset("dataset", "v1", rows)
+            _seed_forward_metadata(store, target_market_ids)
             bus = DurableResearchBus(store)
 
             class RecordingProcessor(AutonomousResearchProcessor):
@@ -990,7 +1117,9 @@ class Phase4AutonomousLoopTests(unittest.TestCase):
                 config=processor(store, bus).config,
                 clock=lambda: T0,
             )
-            plan = ExperimentPlan.from_proposal(proposal("holdout-isolation"))
+            plan = ExperimentPlan.from_proposal(
+                proposal("holdout-isolation")
+            )
             _, split = active._load_split(plan)
             self.assertTrue(any(marker in str(row.get("question")) for row in split.holdout))
             self.assertFalse(any(marker in str(row.get("question")) for row in split.train))
@@ -1014,9 +1143,15 @@ class Phase4AutonomousLoopTests(unittest.TestCase):
 
     def test_restart_after_crash_retries_transaction_without_duplicates(self) -> None:
         with AxiomStore(":memory:") as store:
+            target_market_ids = ("restart-forward-market",)
             store.save_dataset("dataset", "v1", prediction_rows())
+            _seed_forward_metadata(store, target_market_ids)
             bus = DurableResearchBus(store)
-            item = bus.submit_hypothesis(proposal("hypothesis-restart"), available_at=T0, dedupe_key="hypothesis-restart")
+            item = bus.submit_hypothesis(
+                proposal("hypothesis-restart"),
+                available_at=T0,
+                dedupe_key="hypothesis-restart",
+            )
 
             class CrashAfterWork(AutonomousResearchProcessor):
                 crashed = False
@@ -1089,7 +1224,9 @@ class Phase4AutonomousLoopTests(unittest.TestCase):
 
     def test_mutation_limits_daily_budget_and_queue_types_are_deterministic(self) -> None:
         with AxiomStore(":memory:") as store:
+            target_market_ids = ("mutation-forward-market",)
             store.save_dataset("dataset", "v1", prediction_rows())
+            _seed_forward_metadata(store, target_market_ids)
             bus = DurableResearchBus(store)
             root = bus.submit_hypothesis(
                 proposal("hypothesis-mutations", max_variants=2),
@@ -1140,7 +1277,9 @@ class Phase4AutonomousLoopTests(unittest.TestCase):
 
     def test_forged_candidate_parameters_and_identity_are_rejected(self) -> None:
         with AxiomStore(":memory:") as store:
+            target_market_ids = ("candidate-binding-market",)
             store.save_dataset("dataset", "v1", prediction_rows())
+            _seed_forward_metadata(store, target_market_ids)
             bus = DurableResearchBus(store)
             root = bus.submit_hypothesis(
                 proposal("candidate-binding", max_variants=1),

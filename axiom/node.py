@@ -152,6 +152,9 @@ class NodeConfig:
     interval_seconds: float = 60.0
     depth: int = 20
     max_markets: int = 100
+    discovery_budget_per_cycle: int = 20
+    max_concurrency: int = 1
+    freshness_sla_seconds: float | None = None
     max_attempts: int = 3
     max_provider_clock_skew_seconds: float = 5.0
     failure_cooldown_seconds: float = 30.0
@@ -218,12 +221,20 @@ class NodeConfig:
             raise ValueError("interval_seconds must be finite and positive")
         if isinstance(self.depth, bool) or not isinstance(self.depth, int) or self.depth <= 0:
             raise ValueError("depth must be a positive integer")
-        if isinstance(self.max_markets, bool) or not isinstance(self.max_markets, int) or self.max_markets <= 0:
-            raise ValueError("max_markets must be a positive integer")
-        if isinstance(self.max_attempts, bool) or not isinstance(self.max_attempts, int) or self.max_attempts <= 0:
-            raise ValueError("max_attempts must be a positive integer")
         if not math.isfinite(cooldown) or cooldown < 0:
             raise ValueError("failure_cooldown_seconds must be finite and non-negative")
+        if isinstance(self.max_markets, bool) or not isinstance(self.max_markets, int) or self.max_markets <= 0:
+            raise ValueError("max_markets must be a positive integer")
+        if isinstance(self.discovery_budget_per_cycle, bool) or not isinstance(self.discovery_budget_per_cycle, int) or self.discovery_budget_per_cycle < 0:
+            raise ValueError("discovery_budget_per_cycle must be a non-negative integer")
+        if isinstance(self.max_concurrency, bool) or not isinstance(self.max_concurrency, int) or self.max_concurrency not in {1, 2}:
+            raise ValueError("max_concurrency must be one or two")
+        if self.freshness_sla_seconds is not None:
+            freshness = float(self.freshness_sla_seconds)
+            if not math.isfinite(freshness) or freshness <= 0:
+                raise ValueError("freshness_sla_seconds must be finite and positive")
+        if isinstance(self.max_attempts, bool) or not isinstance(self.max_attempts, int) or self.max_attempts <= 0:
+            raise ValueError("max_attempts must be a positive integer")
         provider_clock_skew = float(self.max_provider_clock_skew_seconds)
         if not math.isfinite(provider_clock_skew) or provider_clock_skew < 0:
             raise ValueError("max_provider_clock_skew_seconds must be finite and non-negative")
@@ -381,6 +392,9 @@ class ResearchNode:
                 interval_seconds=config.interval_seconds,
                 depth=config.depth,
                 max_markets=config.max_markets,
+                discovery_budget_per_cycle=config.discovery_budget_per_cycle,
+                max_concurrency=config.max_concurrency,
+                freshness_sla_seconds=config.freshness_sla_seconds,
                 max_attempts=config.max_attempts,
                 failure_cooldown_seconds=config.failure_cooldown_seconds,
                 max_provider_clock_skew_seconds=config.max_provider_clock_skew_seconds,
