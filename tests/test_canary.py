@@ -14,6 +14,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from axiom.auto_canary import AutonomousCanaryWorker
+from axiom.ranker import CandidateCanaryRanker
 from axiom.canary import CanaryBlocked, CanaryLimits, CanaryService, CredentialStore, PolymarketClobV2Venue, PRODUCTION_LIVE_EXECUTION
 from axiom.cli import main
 from axiom.dashboard import DashboardData, _dashboard_html
@@ -1110,9 +1112,11 @@ class CanaryTests(unittest.TestCase):
             ),
         )
         self.assertEqual(service.status()["micro_live_canary"], "KILLED")
-    def test_degraded_collector_prevents_arming(self):
-        self.store.polymarket_health=lambda **kwargs:{"grade":"D"}
-        self.assertBlocked("COLLECTOR_DEGRADED",self.arm)
+    def test_collector_grades_c_and_d_prevent_arming(self):
+        for grade in ("C", "D"):
+            with self.subTest(grade=grade):
+                self.store.polymarket_health = lambda **kwargs: {"grade": grade}
+                self.assertBlocked("COLLECTOR_DEGRADED", self.arm)
     def test_geoblock_prevents_arming_and_submission(self):
         blocked=FakeVenue(blocked=True); self.assertBlocked("GEOGRAPHICALLY_BLOCKED",lambda:self.arm(venue=blocked))
         self.arm(); self.assertBlocked("GEOGRAPHICALLY_BLOCKED",lambda:self.submit(venue=blocked))
@@ -1518,6 +1522,85 @@ class CanaryTests(unittest.TestCase):
         service=CanaryService(self.store,credentials=FakeCredentials(False),clock=lambda:T0); result=service.check(candidate_id="C123",venue=None); self.assertFalse(result["ready"]); self.assertIn("CREDENTIALS_NOT_CONFIGURED",result["failures"]); self.assertFalse(self.venue.submissions)
     def test_dashboard_labels_real_canary_and_production_disabled(self):
         data=DashboardData(store=self.store).operator_data(); self.assertFalse(data["live_execution"]); self.assertFalse(PRODUCTION_LIVE_EXECUTION); self.assertIn("REAL CANARY MONEY",_dashboard_html()); self.assertEqual(data["canary"]["production_live_trading"],"DISABLED")
+    def test_autonomous_scan_reaches_persisted_rank_after_1000_without_exceeding_tick_cap(self):
+        self.service.enable_autonomous_micro_live()
+        ranking_run_id = "persisted-run-after-1000"
+        ranking_timestamp = T0.isoformat()
+        rows = [
+            (
+                f"scan-candidate-{rank:04d}",
+                ranking_run_id,
+                ranking_timestamp,
+                rank,
+                1.0 - rank / 10000.0,
+                json.dumps({"expectancy": 0.5}, sort_keys=True),
+                json.dumps({"formula_version": "test"}, sort_keys=True),
+                f"scan-cluster-{rank:04d}",
+                1,
+                0,
+                "",
+                "qualification-hash",
+                "ranking-hash",
+            )
+            for rank in range(1, 1002)
+        ]
+        with self.store.connection:
+            self.store.connection.executemany(
+                "INSERT INTO canary_rankings("
+                "candidate_id,ranking_run_id,ranking_timestamp,rank,total_score,"
+                "component_scores_json,evidence_versions_json,cluster_key,"
+                "cluster_representative,selected,reason,qualification_hash,"
+                "ranking_snapshot_hash) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                rows,
+            )
+
+        checked: list[str] = []
+
+        def signal(candidate_id):
+            checked.append(candidate_id)
+            if candidate_id == "scan-candidate-1001":
+                return {
+                    "status": "READY",
+                    "signal_id": "scan-signal-1001",
+                    "candidate_id": candidate_id,
+                }
+            return None
+
+        worker = AutonomousCanaryWorker(self.store, clock=lambda: T0)
+        ranking = {
+            "ranking_run_id": ranking_run_id,
+            "eligible_count": 1001,
+            "rankable_count": 1001,
+        }
+        with patch.object(
+            CandidateCanaryRanker,
+            "evaluate_and_select",
+            return_value=ranking,
+        ), patch.object(
+            CandidateCanaryRanker,
+            "validate_persisted_ranking",
+            return_value=True,
+        ), patch.object(
+            CanaryService,
+            "generate_signal",
+            side_effect=signal,
+        ), patch.object(
+            CredentialStore,
+            "configured",
+            return_value=False,
+        ):
+            results = [worker.tick(now=T0) for _ in range(101)]
+
+        self.assertEqual(len(checked), 1001)
+        self.assertEqual(checked[-1], "scan-candidate-1001")
+        self.assertEqual(
+            max(result["candidates_signal_checked"] for result in results),
+            10,
+        )
+        self.assertEqual(results[-1]["candidates_signal_checked"], 1)
+        self.assertEqual(results[-1]["candidate_id"], "scan-candidate-1001")
+        self.assertEqual(results[-1]["blocker"], "CREDENTIALS_NOT_CONFIGURED")
+
 
 class CanarySignalTests(unittest.TestCase):
     def setUp(self):
@@ -1710,6 +1793,7 @@ class CanarySignalTests(unittest.TestCase):
             credentials_configured=True,
         )
 
+
     def test_eligible_candidate_generates_persisted_signal(self):
         signal = self._signal()
         self.assertEqual(signal["status"], "READY")
@@ -1719,6 +1803,52 @@ class CanarySignalTests(unittest.TestCase):
                 "SELECT COUNT(*) FROM canary_signals"
             ).fetchone()[0],
             1,
+        )
+
+    def test_autonomous_binding_rejects_forged_rank_zero_representative(self):
+        ranking = CandidateCanaryRanker(
+            self.store,
+            clock=lambda: self.now,
+        ).evaluate_and_select(self.now)
+        signal = self._signal()
+        self.service.enable_autonomous_micro_live()
+        with self.store.connection:
+            self.store.connection.execute(
+                "UPDATE canary_rankings SET rank=0, cluster_representative=1, "
+                "reason=? WHERE candidate_id=?",
+                ("FORGED_RANK_ZERO_REPRESENTATIVE", "C"),
+            )
+        forged = self.store.connection.execute(
+            "SELECT rank,cluster_representative,reason FROM canary_rankings "
+            "WHERE candidate_id=?",
+            ("C",),
+        ).fetchone()
+        self.assertEqual(forged["rank"], 0)
+        self.assertEqual(forged["cluster_representative"], 1)
+        self.assertEqual(forged["reason"], "FORGED_RANK_ZERO_REPRESENTATIVE")
+
+        control_candidate_before_bind = self.service.authoritative_status()[
+            "control_candidate"
+        ]
+        with self.assertRaisesRegex(
+            CanaryBlocked,
+            "AUTONOMOUS_RANKING_NOT_CURRENT",
+        ):
+            self.service.bind_autonomous_actionable_candidate(
+                "C",
+                ranking_run_id=ranking["ranking_run_id"],
+                signal_id=signal["signal_id"],
+            )
+        self.assertEqual(
+            self.service.authoritative_status()["control_candidate"],
+            control_candidate_before_bind,
+        )
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT status FROM canary_signals WHERE signal_id=?",
+                (signal["signal_id"],),
+            ).fetchone()[0],
+            "READY",
         )
 
     def test_inactive_candidate_has_no_signal(self):

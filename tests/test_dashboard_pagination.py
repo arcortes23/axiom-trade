@@ -29,6 +29,22 @@ CANDIDATE_COUNT = 23
 QUEUE_COUNT = 23
 PAPER_COUNT = 23
 ACTIVITY_COUNT = DATASET_COUNT + 1 + 45 + 25
+ACTIONABLE_SCAN_FIELDS = (
+    "candidates_ranked",
+    "candidates_signal_checked",
+    "candidates_no_signal",
+    "actionable_candidates_found",
+    "selected_actionable_candidate",
+    "selected_actionable_rank",
+    "selected_actionable_score",
+    "signal_scan_cursor",
+    "signal_scan_ranking_run_id",
+    "next_signal_scan_start_rank",
+    "next_signal_scan_end_rank",
+)
+
+
+
 
 CANARY_ALLOWANCE_INSUFFICIENT_REASON = (
     "Current allowance is below the amount required for a $1 canary."
@@ -440,6 +456,50 @@ class DashboardPaginationFixture(unittest.TestCase):
         self.assertEqual(result["selected_candidate"], candidate_id)
         self.canary_service.publish_readiness_snapshot(reason="DASHBOARD_FIXTURE")
         return payload
+    def _persist_actionable_scan(
+        self,
+        *,
+        candidates_ranked: int,
+        candidates_signal_checked: int,
+        candidates_no_signal: int,
+        actionable_candidates_found: int,
+        selected_actionable_candidate: str | None,
+        selected_actionable_rank: int | None,
+        selected_actionable_score: float | None,
+        signal_scan_cursor: int,
+        signal_scan_ranking_run_id: str | None,
+        next_signal_scan_start_rank: int | None,
+        next_signal_scan_end_rank: int | None,
+    ) -> None:
+        """Persist a completed bounded scan without constructing a venue."""
+        self.canary_service.record_autonomous_decision(
+            next_decision="WAIT_FOR_FRESH_ACTIONABLE_SIGNAL",
+            blocker=(
+                None
+                if actionable_candidates_found
+                else "NO_ACTIONABLE_SIGNAL"
+            ),
+            worker_status="IDLE",
+            timestamp=T0,
+            candidates_evaluated=candidates_ranked,
+            signals_generated=actionable_candidates_found,
+            orders_attempted=0,
+            candidates_ranked=candidates_ranked,
+            candidates_signal_checked=candidates_signal_checked,
+            candidates_no_signal=candidates_no_signal,
+            actionable_candidates_found=actionable_candidates_found,
+            selected_actionable_candidate=selected_actionable_candidate,
+            selected_actionable_rank=selected_actionable_rank,
+            selected_actionable_score=selected_actionable_score,
+            signal_scan_cursor=signal_scan_cursor,
+            signal_scan_ranking_run_id=signal_scan_ranking_run_id,
+            next_signal_scan_start_rank=next_signal_scan_start_rank,
+            next_signal_scan_end_rank=next_signal_scan_end_rank,
+        )
+        self.canary_service.publish_readiness_snapshot(
+            reason="DASHBOARD_ACTIONABLE_SCAN"
+        )
+
 
     def _seed_queue(self) -> None:
         for index in range(QUEUE_COUNT):
@@ -673,6 +733,119 @@ class DashboardPaginationEndpointTests(DashboardPaginationFixture):
             selected_winner["selection_invalidation_reason"],
             "REEVALUATION_REQUIRED",
         )
+    def test_canary_endpoint_separates_research_winner_from_actionable_candidate(self) -> None:
+        self._seed_ranked_selection("research-winner")
+        status, before, _ = self._request("api/v2/canary")
+        self.assertEqual(status, 200)
+        self.assertIsInstance(before, dict)
+        assert isinstance(before, dict)
+        research = before["canary"]
+        ranking_run_id = research["ranking_run_id"]
+        research_score = research["winner_score"]
+        self.assertEqual(research["winner_id"], "research-winner")
+        self.assertEqual(research["winner_rank"], 1)
+        self.assertIsInstance(research_score, (int, float))
+        self.assertIsInstance(ranking_run_id, str)
+
+        self._persist_actionable_scan(
+            candidates_ranked=20,
+            candidates_signal_checked=10,
+            candidates_no_signal=9,
+            actionable_candidates_found=1,
+            selected_actionable_candidate="current-actionable",
+            selected_actionable_rank=2,
+            selected_actionable_score=0.73,
+            signal_scan_cursor=0,
+            signal_scan_ranking_run_id=ranking_run_id,
+            next_signal_scan_start_rank=1,
+            next_signal_scan_end_rank=10,
+        )
+        status, payload, _ = self._request("api/v2/canary")
+        self.assertEqual(status, 200)
+        self.assertIsInstance(payload, dict)
+        assert isinstance(payload, dict)
+        for projection in (payload["canary"], payload["autonomous_canary"]):
+            self.assertEqual(projection["winner_id"], "research-winner")
+            self.assertEqual(projection["winner_rank"], 1)
+            self.assertEqual(projection["winner_score"], research_score)
+            self.assertEqual(projection["selected_actionable_candidate"], "current-actionable")
+            self.assertEqual(projection["selected_actionable_rank"], 2)
+            self.assertEqual(projection["selected_actionable_score"], 0.73)
+            self.assertEqual(projection["signal_scan_ranking_run_id"], ranking_run_id)
+            self.assertEqual(
+                {name: projection[name] for name in ACTIONABLE_SCAN_FIELDS},
+                {
+                    "candidates_ranked": 20,
+                    "candidates_signal_checked": 10,
+                    "candidates_no_signal": 9,
+                    "actionable_candidates_found": 1,
+                    "selected_actionable_candidate": "current-actionable",
+                    "selected_actionable_rank": 2,
+                    "selected_actionable_score": 0.73,
+                    "signal_scan_cursor": 0,
+                    "signal_scan_ranking_run_id": ranking_run_id,
+                    "next_signal_scan_start_rank": 1,
+                    "next_signal_scan_end_rank": 10,
+                },
+            )
+
+    def test_canary_endpoint_reports_none_and_advances_after_no_signal_window(self) -> None:
+        ranking = CandidateCanaryRanker(self.store, clock=lambda: T0).evaluate_and_select(T0)
+        self.assertEqual(ranking["selection_status"], "NONE")
+        ranking_run_id = ranking["ranking_run_id"]
+        self._persist_actionable_scan(
+            candidates_ranked=20,
+            candidates_signal_checked=10,
+            candidates_no_signal=10,
+            actionable_candidates_found=0,
+            selected_actionable_candidate=None,
+            selected_actionable_rank=None,
+            selected_actionable_score=None,
+            signal_scan_cursor=10,
+            signal_scan_ranking_run_id=ranking_run_id,
+            next_signal_scan_start_rank=11,
+            next_signal_scan_end_rank=20,
+        )
+
+        status, payload, body = self._request("api/v2/canary")
+        self.assertEqual(status, 200)
+        self.assertIsInstance(payload, dict)
+        assert isinstance(payload, dict)
+        for projection in (payload["canary"], payload["autonomous_canary"]):
+            self.assertEqual(projection["selection_status"], "NONE")
+            self.assertIsNone(projection["winner_id"])
+            self.assertIsNone(projection["winner_rank"])
+            self.assertIsNone(projection["winner_score"])
+            self.assertIsNone(projection["selected_actionable_candidate"])
+            self.assertIsNone(projection["selected_actionable_rank"])
+            self.assertIsNone(projection["selected_actionable_score"])
+            self.assertEqual(projection["candidates_ranked"], 20)
+            self.assertEqual(projection["candidates_signal_checked"], 10)
+            self.assertEqual(projection["candidates_no_signal"], 10)
+            self.assertEqual(projection["actionable_candidates_found"], 0)
+            self.assertEqual(projection["signal_scan_cursor"], 10)
+            self.assertEqual(projection["signal_scan_ranking_run_id"], ranking_run_id)
+            self.assertEqual(projection["next_signal_scan_start_rank"], 11)
+            self.assertEqual(projection["next_signal_scan_end_rank"], 20)
+        self.assertIn("NONE", body)
+
+    def test_canary_endpoint_keeps_actionable_scan_unknown_before_completed_scan(self) -> None:
+        status, payload, body = self._request("api/v2/canary")
+        self.assertEqual(status, 200)
+        self.assertIsInstance(payload, dict)
+        assert isinstance(payload, dict)
+        for projection in (payload["canary"], payload["autonomous_canary"]):
+            self.assertEqual(projection["selection_status"], "UNKNOWN")
+            for field in ACTIONABLE_SCAN_FIELDS:
+                if field == "signal_scan_cursor":
+                    self.assertEqual(projection[field], 0)
+                else:
+                    self.assertIsNone(
+                        projection[field],
+                        f"{field} must remain UNKNOWN/null without a completed scan",
+                    )
+        self.assertIn("UNKNOWN", body)
+
 
     def test_datasets_cover_page_navigation_filters_and_detail_path(self) -> None:
         first = self._page(
@@ -1762,6 +1935,30 @@ class DashboardPaginationSurfaceTests(DashboardPaginationFixture):
         # literal in the initial HTML document.
         self.assertNotIn("dataset-00", html)
         self.assertNotIn("market-00", html)
+    def test_canary_renderer_labels_research_and_actionable_scan_separately(self) -> None:
+        html = _dashboard_html()
+        start = html.index("function renderCanary(data)")
+        end = html.index("function renderBtc", start)
+        renderer = html[start:end]
+        for label in (
+            "Research winner",
+            "Research rank",
+            "Current actionable candidate",
+            "Candidates ranked",
+            "Signal checked this tick",
+            "next scan window ranks",
+            "Actionable",
+            "Chosen actionable rank",
+            "Chosen score",
+            "NO ACTIONABLE SIGNAL",
+        ):
+            self.assertIn(label, renderer)
+        for field in ACTIONABLE_SCAN_FIELDS:
+            self.assertIn(field, renderer)
+        self.assertIn("winner_id", renderer)
+        self.assertIn("selected_actionable_candidate", renderer)
+        self.assertIn("selected_actionable_rank", renderer)
+        self.assertIn("selected_actionable_score", renderer)
 
 
     def test_load_page_initializes_generation_controller_and_refresh_timer(self) -> None:

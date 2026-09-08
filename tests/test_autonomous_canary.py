@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import hashlib
 import json
@@ -838,6 +838,150 @@ class AutonomousWorkflowTests(unittest.TestCase):
         blocked = worker.tick(now=T0)
         self.assertEqual(blocked["blocker"], "NO_ELIGIBLE_RANKABLE_CANDIDATE")
         self.assertEqual(calls, [])
+    def test_worker_scans_rank0_follower_after_empty_representative_and_submits_same_tick(self):
+        shared_payload = candidate_payload(
+            "shared-strategy",
+            cluster="shared-cluster",
+            score=0.90,
+            executable=True,
+        )
+        follower_payload = dict(shared_payload)
+        follower_payload["validation_expectancy"] = 0.80
+        follower_payload["validation_confidence_lower_bound"] = 0.80
+        for candidate_id, payload in (
+            ("same-cluster-representative", shared_payload),
+            ("same-cluster-follower", follower_payload),
+        ):
+            self.store.save_candidate_lifecycle(
+                candidate_id,
+                "IDEA",
+                payload,
+                timestamp=T0,
+            )
+            self.store.save_candidate_lifecycle(
+                candidate_id,
+                "FROZEN",
+                payload,
+                timestamp=T0,
+            )
+        self.save_forward_canary_snapshot()
+        self.service.enable_autonomous_micro_live()
+        venue = TestVenue()
+        checked: list[str] = []
+        generated_follower_signal: dict[str, object] = {}
+        original_generate_signal = CanaryService.generate_signal
+
+        def generate_signal(service, candidate_id):
+            checked.append(candidate_id)
+            if candidate_id == "same-cluster-representative":
+                return None
+            signal = original_generate_signal(service, candidate_id)
+            generated_follower_signal["signal"] = signal
+            return signal
+
+        worker = AutonomousCanaryWorker(
+            self.store,
+            clock=lambda: T0,
+            venue_factory=lambda: venue,
+            allow_test_venue=True,
+        )
+        with patch.object(
+            CanaryService,
+            "generate_signal",
+            autospec=True,
+            side_effect=generate_signal,
+        ), patch.object(CredentialStore, "configured", return_value=True):
+            result = worker.tick(now=T0)
+
+        self.assertEqual(result["status"], "SUBMITTED")
+        self.assertEqual(result["candidate_id"], "same-cluster-follower")
+        self.assertEqual(result["candidates_ranked"], 2)
+        self.assertEqual(result["candidates_signal_checked"], 2)
+        self.assertEqual(result["candidates_no_signal"], 1)
+        self.assertEqual(result["actionable_candidates_found"], 1)
+        self.assertEqual(result["selected_actionable_candidate"], "same-cluster-follower")
+        self.assertEqual(result["selected_actionable_rank"], 2)
+        self.assertEqual(result["signal_scan_cursor"], 0)
+        self.assertEqual(result["next_signal_scan_start_rank"], 0)
+        self.assertEqual(result["next_signal_scan_end_rank"], 2)
+        self.assertEqual(
+            checked,
+            ["same-cluster-representative", "same-cluster-follower"],
+        )
+        follower_signal = generated_follower_signal["signal"]
+        self.assertIsInstance(follower_signal, dict)
+        assert isinstance(follower_signal, dict)
+        self.assertEqual(follower_signal["status"], "READY")
+        self.assertEqual(follower_signal["candidate_id"], "same-cluster-follower")
+        self.assertEqual(len(venue.submissions), 1)
+        ranking_rows = {
+            row["candidate_id"]: row
+            for row in CandidateCanaryRanker(self.store, clock=lambda: T0).rankings()
+        }
+        self.assertEqual(ranking_rows["same-cluster-representative"]["rank"], 1)
+        self.assertEqual(ranking_rows["same-cluster-representative"]["cluster_representative"], 1)
+        self.assertEqual(ranking_rows["same-cluster-follower"]["rank"], 0)
+        self.assertEqual(
+            ranking_rows["same-cluster-follower"]["reason"],
+            "DIVERSITY_CLUSTER_NON_REPRESENTATIVE",
+        )
+
+    def test_venue_factory_failure_is_retryable_without_unknown_signal_or_order_attempt(self):
+        self.seed_candidate("venue-retry", executable=True)
+        self.save_forward_canary_snapshot()
+        self.service.enable_autonomous_micro_live()
+        venues: list[TestVenue] = []
+        factory_calls = 0
+
+        def venue_factory():
+            nonlocal factory_calls
+            factory_calls += 1
+            if factory_calls == 1:
+                raise RuntimeError("venue construction failed")
+            venue = TestVenue()
+            venues.append(venue)
+            return venue
+
+        worker = AutonomousCanaryWorker(
+            self.store,
+            clock=lambda: T0,
+            venue_factory=venue_factory,
+            allow_test_venue=True,
+        )
+        with patch.object(CredentialStore, "configured", return_value=True):
+            first = worker.tick(now=T0)
+            signal = self.service.latest_signal("venue-retry")
+            self.assertIsNotNone(signal)
+            assert signal is not None
+            self.assertEqual(signal["status"], "READY")
+            self.assertEqual(
+                self.service.status()["autonomous"]["orders_attempted"],
+                0,
+            )
+            self.assertEqual(
+                self.store.connection.execute(
+                    "SELECT COUNT(*) FROM canary_ledger"
+                ).fetchone()[0],
+                0,
+            )
+            second = worker.tick(now=T0)
+
+        self.assertEqual(first["status"], "ERROR")
+        self.assertEqual(first["decision"], "AUTONOMOUS_WORKER_EXCEPTION")
+        self.assertEqual(first["blocker"], "AUTONOMOUS_WORKER_EXCEPTION")
+        self.assertEqual(first["error_type"], "RuntimeError")
+        self.assertEqual(second["status"], "SUBMITTED")
+        self.assertEqual(second["candidate_id"], "venue-retry")
+        self.assertEqual(factory_calls, 2)
+        self.assertEqual(len(venues), 1)
+        self.assertEqual(len(venues[0].submissions), 1)
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT status FROM canary_ledger WHERE signal_id=?",
+                (signal["signal_id"],),
+            ).fetchone()[0],
+            "SUBMITTED",
+        )
 
     def test_worker_uses_authoritative_control_when_dashboard_snapshot_is_missing(self):
         self.seed_candidate("durable-winner", score=0.90)
@@ -1800,6 +1944,865 @@ class AutonomousWorkflowTests(unittest.TestCase):
         self.assertEqual(worker_state["next_decision"], "WAIT_FOR_FRESH_ACTIONABLE_SIGNAL")
         self.assertEqual(worker_state["blocker"], "UNKNOWN_NO_RETRY")
         self.assertEqual(worker_state["last_signal_id"], "unknown-signal")
+
+    _SCAN_FIELDS = (
+        "candidates_ranked",
+        "candidates_signal_checked",
+        "candidates_no_signal",
+        "actionable_candidates_found",
+        "selected_actionable_candidate",
+        "selected_actionable_rank",
+        "selected_actionable_score",
+        "signal_scan_cursor",
+        "signal_scan_ranking_run_id",
+        "next_signal_scan_start_rank",
+        "next_signal_scan_end_rank",
+    )
+
+    def _enable_worker(self):
+        self.service.enable_autonomous_micro_live()
+
+    @staticmethod
+    def _ready_signal(candidate_id: str, *, feasible: bool = True) -> dict[str, object]:
+        return {
+            "status": "READY",
+            "signal_id": f"signal-{candidate_id}",
+            "candidate_id": candidate_id,
+            "execution_feasible": feasible,
+            "liquidity_feasible": feasible,
+            "slippage_feasible": feasible,
+        }
+
+    def _assert_scan_metrics(self, result, expected):
+        state = self.store.connection.execute(
+            "SELECT * FROM canary_autonomous_state WHERE singleton=1"
+        ).fetchone()
+        self.assertIsNotNone(state)
+        worker = self.service.status_report()["worker"]
+        for field in self._SCAN_FIELDS:
+            self.assertIn(field, result)
+            self.assertIn(field, state.keys())
+            self.assertIn(field, worker)
+            self.assertEqual(result[field], expected[field], field)
+            self.assertEqual(state[field], expected[field], field)
+            self.assertEqual(worker[field], expected[field], field)
+
+    def _post_rank_mutation(self, mutation):
+        real_ranker = CandidateCanaryRanker(self.store, clock=lambda: T0)
+        original = CandidateCanaryRanker.evaluate_and_select
+
+        def evaluate(*args, **kwargs):
+            timestamp = kwargs.get("now")
+            if timestamp is None and args:
+                timestamp = args[0]
+            result = original(real_ranker, timestamp)
+            mutation(result)
+            return result
+
+        return patch.object(
+            CandidateCanaryRanker,
+            "evaluate_and_select",
+            side_effect=evaluate,
+        )
+
+    def test_scan_continues_after_rank_one_no_signal_to_rank_two_ready(self):
+        self.seed_candidate("rank-one", cluster="cluster-one", score=0.90)
+        self.seed_candidate("rank-two", cluster="cluster-two", score=0.80)
+        self._enable_worker()
+        checked = []
+        venue = TestVenue()
+        worker = AutonomousCanaryWorker(
+            self.store, clock=lambda: T0, venue_factory=lambda: venue
+        )
+
+        def signal(candidate_id):
+            checked.append(candidate_id)
+            return (
+                self._ready_signal(candidate_id)
+                if candidate_id == "rank-two"
+                else None
+            )
+
+        with patch.object(CanaryService, "generate_signal", side_effect=signal), \
+            patch.object(
+                CanaryService,
+                "submit_signal",
+                return_value={"ok": True, "order_id": "one"},
+            ) as submit, \
+            patch.object(
+                CanaryService,
+                "bind_autonomous_actionable_candidate",
+                return_value={"bound": True},
+            ) as bind, \
+            patch.object(CredentialStore, "configured", return_value=True):
+            result = worker.tick(now=T0)
+
+        self.assertEqual(checked, ["rank-one", "rank-two"])
+        self.assertEqual(result["status"], "SUBMITTED")
+        self.assertEqual(result["candidate_id"], "rank-two")
+        submit.assert_called_once()
+        bind.assert_called_once_with(
+            "rank-two",
+            ranking_run_id=result["ranking"]["ranking_run_id"],
+            signal_id="signal-rank-two",
+        )
+        ranking = result["ranking"]
+        rank_two = next(
+            row for row in ranking["rankings"] if row["candidate_id"] == "rank-two"
+        )
+        self._assert_scan_metrics(
+            result,
+            {
+                "candidates_ranked": 2,
+                "candidates_signal_checked": 2,
+                "candidates_no_signal": 1,
+                "actionable_candidates_found": 1,
+                "selected_actionable_candidate": "rank-two",
+                "selected_actionable_rank": 2,
+                "selected_actionable_score": rank_two["total_score"],
+                "signal_scan_cursor": 0,
+                "signal_scan_ranking_run_id": ranking["ranking_run_id"],
+                "next_signal_scan_start_rank": 0,
+                "next_signal_scan_end_rank": 2,
+            },
+        )
+    def test_real_worker_rebinds_actionable_rank_two_without_replacing_research_winner(self):
+        self.seed_candidate(
+            "research-rank-one",
+            cluster="research-cluster-one",
+            score=0.90,
+            executable=False,
+        )
+        self.seed_candidate(
+            "actionable-rank-two",
+            cluster="research-cluster-two",
+            score=0.80,
+            executable=True,
+        )
+        self.save_forward_canary_snapshot("rank-two-ready-snapshot")
+        initial = CandidateCanaryRanker(self.store, clock=lambda: T0).evaluate_and_select(T0)
+        self.assertEqual(initial["selected_candidate"], "research-rank-one")
+        self.assertEqual(initial["winner_id"], "research-rank-one")
+
+        self.service.enable_autonomous_micro_live()
+        venue = TestVenue()
+        worker = AutonomousCanaryWorker(
+            self.store,
+            clock=lambda: T0,
+            venue_factory=lambda: venue,
+            allow_test_venue=True,
+        )
+        with patch.object(CredentialStore, "configured", return_value=True):
+            result = worker.tick(now=T0)
+
+        self.assertEqual(result["status"], "SUBMITTED")
+        self.assertEqual(result["candidate_id"], "actionable-rank-two")
+        self.assertEqual(result["selected_actionable_candidate"], "actionable-rank-two")
+        self.assertEqual(result["ranking"]["selected_candidate"], "research-rank-one")
+        self.assertEqual(result["ranking"]["winner_id"], "research-rank-one")
+        self.assertEqual(len(venue.submissions), 1)
+        self.assertEqual(venue.submissions[0]["token_id"], "yes")
+
+        signal = self.service.latest_signal("actionable-rank-two")
+        self.assertIsNotNone(signal)
+        self.assertEqual(signal["status"], "SUBMITTED")
+        self.assertEqual(signal["candidate_id"], "actionable-rank-two")
+        self.assertIsNone(self.service.latest_signal("research-rank-one"))
+
+        control = self.service.authoritative_status()
+        self.assertEqual(control["candidate"], "research-rank-one")
+        self.assertEqual(control["selected_candidate"], "research-rank-one")
+        self.assertEqual(control["control_candidate"], "actionable-rank-two")
+        self.assertEqual(control["winner_id"], "research-rank-one")
+        selection = self.store.connection.execute(
+            "SELECT candidate_id FROM canary_selection WHERE singleton=1"
+        ).fetchone()
+        self.assertEqual(selection["candidate_id"], "research-rank-one")
+
+
+    def test_ready_rank_one_is_preferred_over_later_ready_candidate(self):
+        self.seed_candidate("rank-one-ready", cluster="cluster-one", score=0.90)
+        self.seed_candidate("rank-two-ready", cluster="cluster-two", score=0.80)
+        self._enable_worker()
+        checked = []
+        worker = AutonomousCanaryWorker(
+            self.store, clock=lambda: T0, venue_factory=TestVenue
+        )
+
+        def signal(candidate_id):
+            checked.append(candidate_id)
+            return self._ready_signal(candidate_id)
+
+        with patch.object(CanaryService, "generate_signal", side_effect=signal), \
+            patch.object(
+                CanaryService,
+                "submit_signal",
+                return_value={"ok": True, "order_id": "rank-one-order"},
+            ) as submit, \
+            patch.object(
+                CanaryService,
+                "bind_autonomous_actionable_candidate",
+                return_value={"bound": True},
+            ) as bind, \
+            patch.object(CredentialStore, "configured", return_value=True):
+            result = worker.tick(now=T0)
+
+        self.assertEqual(checked, ["rank-one-ready", "rank-two-ready"])
+        self.assertEqual(result["candidate_id"], "rank-one-ready")
+        submit.assert_called_once()
+        bind.assert_called_once_with(
+            "rank-one-ready",
+            ranking_run_id=result["ranking"]["ranking_run_id"],
+            signal_id="signal-rank-one-ready",
+        )
+        self._assert_scan_metrics(
+            result,
+            {
+                "candidates_ranked": 2,
+                "candidates_signal_checked": 2,
+                "candidates_no_signal": 0,
+                "actionable_candidates_found": 2,
+                "selected_actionable_candidate": "rank-one-ready",
+                "selected_actionable_rank": 1,
+                "selected_actionable_score": next(
+                    row["total_score"]
+                    for row in result["ranking"]["rankings"]
+                    if row["candidate_id"] == "rank-one-ready"
+                ),
+                "signal_scan_cursor": 0,
+                "signal_scan_ranking_run_id": result["ranking"]["ranking_run_id"],
+                "next_signal_scan_start_rank": 0,
+                "next_signal_scan_end_rank": 2,
+            },
+        )
+
+    def test_expired_persisted_ready_signal_refreshes_same_tick_and_prefers_rank_one(self):
+        self.seed_candidate(
+            "expired-persisted",
+            cluster="expired-cluster",
+            score=0.90,
+            executable=True,
+        )
+        self.seed_candidate(
+            "later-valid",
+            cluster="later-cluster",
+            score=0.80,
+            executable=True,
+        )
+        self.save_forward_canary_snapshot("expired-signal-snapshot")
+        self._enable_worker()
+        CandidateCanaryRanker(self.store, clock=lambda: T0).evaluate_and_select(T0)
+
+        persisted = self.service.generate_signal("expired-persisted")
+        self.assertIsNotNone(persisted)
+        assert persisted is not None
+        signal_id = str(persisted["signal_id"])
+        with self.store.connection:
+            self.store.connection.execute(
+                "UPDATE canary_signals SET expires_at=? WHERE signal_id=?",
+                ((T0 - timedelta(seconds=1)).isoformat(), signal_id),
+            )
+
+        checked: list[str] = []
+        generated: dict[str, object] = {}
+        venue = TestVenue()
+        worker = AutonomousCanaryWorker(
+            self.store,
+            clock=lambda: T0,
+            venue_factory=lambda: venue,
+            allow_test_venue=True,
+        )
+        original_generate_signal = CanaryService.generate_signal
+
+        def generate_signal(service, candidate_id):
+            checked.append(candidate_id)
+            signal = original_generate_signal(service, candidate_id)
+            generated[candidate_id] = signal
+            return signal
+
+        with patch.object(
+            CanaryService,
+            "generate_signal",
+            autospec=True,
+            side_effect=generate_signal,
+        ), patch.object(CredentialStore, "configured", return_value=True):
+            result = worker.tick(now=T0)
+
+        self.assertEqual(checked, ["expired-persisted", "later-valid"])
+        self.assertEqual(result["status"], "SUBMITTED")
+        self.assertEqual(result["candidate_id"], "expired-persisted")
+        self.assertEqual(result["selected_actionable_candidate"], "expired-persisted")
+        self.assertEqual(result["selected_actionable_rank"], 1)
+        self.assertEqual(result["candidates_ranked"], 2)
+        self.assertEqual(result["candidates_signal_checked"], 2)
+        self.assertEqual(result["candidates_no_signal"], 0)
+        self.assertEqual(result["actionable_candidates_found"], 2)
+        state = self.store.connection.execute(
+            "SELECT candidates_evaluated, signals_generated, orders_attempted "
+            "FROM canary_autonomous_state WHERE singleton=1"
+        ).fetchone()
+        self.assertIsNotNone(state)
+        assert state is not None
+        self.assertEqual(state["candidates_evaluated"], 2)
+        self.assertEqual(state["signals_generated"], 2)
+        self.assertEqual(state["orders_attempted"], 1)
+
+        old_signal = self.service.get_signal(signal_id)
+        self.assertIsNotNone(old_signal)
+        assert old_signal is not None
+        self.assertEqual(old_signal["status"], "EXPIRED")
+        self.assertEqual(old_signal["reason"], "SIGNAL_EXPIRED")
+
+        refreshed = generated["expired-persisted"]
+        self.assertIsInstance(refreshed, dict)
+        assert isinstance(refreshed, dict)
+        self.assertEqual(refreshed["status"], "READY")
+        self.assertEqual(refreshed["candidate_id"], "expired-persisted")
+        self.assertNotEqual(refreshed["signal_id"], signal_id)
+        self.assertEqual(result["signal_id"], refreshed["signal_id"])
+
+        latest_expired_candidate = self.service.latest_signal("expired-persisted")
+        self.assertIsNotNone(latest_expired_candidate)
+        assert latest_expired_candidate is not None
+        self.assertEqual(latest_expired_candidate["status"], "SUBMITTED")
+        self.assertEqual(latest_expired_candidate["signal_id"], refreshed["signal_id"])
+
+        later = generated["later-valid"]
+        self.assertIsInstance(later, dict)
+        assert isinstance(later, dict)
+        self.assertEqual(later["status"], "READY")
+        self.assertEqual(later["candidate_id"], "later-valid")
+        self.assertEqual(self.service.latest_signal("later-valid"), later)
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM canary_ledger WHERE signal_id=?",
+                (later["signal_id"],),
+            ).fetchone()[0],
+            0,
+        )
+
+        submit_rows = self.store.connection.execute(
+            "SELECT signal_id,candidate_id,status FROM canary_signals "
+            "WHERE status='SUBMITTED'"
+        ).fetchall()
+        self.assertEqual(len(submit_rows), 1)
+        self.assertEqual(submit_rows[0]["candidate_id"], "expired-persisted")
+        self.assertEqual(len(venue.submissions), 1)
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM canary_ledger"
+            ).fetchone()[0],
+            1,
+        )
+        signal_rows = self.store.connection.execute(
+            "SELECT status FROM canary_signals WHERE candidate_id=?",
+            ("expired-persisted",),
+        ).fetchall()
+        self.assertEqual(
+            sorted(row["status"] for row in signal_rows),
+            ["EXPIRED", "SUBMITTED"],
+        )
+
+        ranking = result["ranking"]
+        rank_one = next(
+            row for row in ranking["rankings"] if row["candidate_id"] == "expired-persisted"
+        )
+        self._assert_scan_metrics(
+            result,
+            {
+                "candidates_ranked": 2,
+                "candidates_signal_checked": 2,
+                "candidates_no_signal": 0,
+                "actionable_candidates_found": 2,
+                "selected_actionable_candidate": "expired-persisted",
+                "selected_actionable_rank": 1,
+                "selected_actionable_score": rank_one["total_score"],
+                "signal_scan_cursor": 0,
+                "signal_scan_ranking_run_id": ranking["ranking_run_id"],
+                "next_signal_scan_start_rank": 0,
+                "next_signal_scan_end_rank": 2,
+            },
+        )
+
+
+    def test_follower_evidence_change_rebases_scan_cursor_to_preferred_window(self):
+        for index in range(1, 13):
+            self.seed_candidate(
+                f"follower-reset-{index:02d}",
+                cluster=f"follower-reset-cluster-{index:02d}",
+                score=1.0 - index / 100.0,
+            )
+        follower_a = candidate_payload(
+            "follower-reset-follower-a",
+            cluster="follower-reset-cluster-01",
+            score=0.10,
+        )
+        follower_a["forward_expectancy"] = 0.20
+        follower_b = candidate_payload(
+            "follower-reset-follower-b",
+            cluster="follower-reset-cluster-01",
+            score=0.09,
+        )
+        follower_b["forward_expectancy"] = 0.10
+        for candidate_id, payload in (
+            ("follower-reset-follower-a", follower_a),
+            ("follower-reset-follower-b", follower_b),
+        ):
+            self.store.save_candidate_lifecycle(
+                candidate_id,
+                "IDEA",
+                payload,
+                timestamp=T0,
+            )
+            self.store.save_candidate_lifecycle(
+                candidate_id,
+                "FROZEN",
+                payload,
+                timestamp=T0,
+            )
+        self._enable_worker()
+        checked: list[str] = []
+        worker = AutonomousCanaryWorker(
+            self.store,
+            clock=lambda: T0,
+            venue_factory=TestVenue,
+        )
+
+        with patch.object(
+            CanaryService,
+            "generate_signal",
+            side_effect=lambda candidate_id: checked.append(candidate_id) or None,
+        ):
+            first = worker.tick(now=T0)
+            first_state = self.store.connection.execute(
+                "SELECT * FROM canary_autonomous_state WHERE singleton=1"
+            ).fetchone()
+            mutated_a = dict(follower_a)
+            mutated_a["forward_expectancy"] = 0.10
+            mutated_b = dict(follower_b)
+            mutated_b["forward_expectancy"] = 0.20
+            self.store.save_candidate_lifecycle(
+                "follower-reset-follower-a",
+                "FROZEN",
+                mutated_a,
+                from_stage="FROZEN",
+                timestamp=T0 + timedelta(seconds=1),
+            )
+            self.store.save_candidate_lifecycle(
+                "follower-reset-follower-b",
+                "FROZEN",
+                mutated_b,
+                from_stage="FROZEN",
+                timestamp=T0 + timedelta(seconds=1),
+            )
+            second = worker.tick(now=T0 + timedelta(seconds=2))
+
+        first_rows = first["ranking"]["rankings"]
+        second_rows = second["ranking"]["rankings"]
+        first_representatives = [
+            row["candidate_id"]
+            for row in first_rows
+            if int(row["cluster_representative"] or 0) == 1
+        ]
+        second_representatives = [
+            row["candidate_id"]
+            for row in second_rows
+            if int(row["cluster_representative"] or 0) == 1
+        ]
+        first_followers = [
+            row["candidate_id"]
+            for row in first_rows
+            if int(row["cluster_representative"] or 0) == 0
+        ]
+        second_followers = [
+            row["candidate_id"]
+            for row in second_rows
+            if int(row["cluster_representative"] or 0) == 0
+        ]
+        self.assertEqual(first["signal_scan_cursor"], 10)
+        self.assertEqual(first_state["signal_scan_cursor"], 10)
+        self.assertEqual(first_representatives, second_representatives)
+        self.assertNotEqual(first_followers, second_followers)
+        self.assertNotEqual(
+            first["signal_scan_ranking_run_id"],
+            second["signal_scan_ranking_run_id"],
+        )
+        self.assertEqual(checked[10:20], checked[:10])
+        self.assertEqual(second["signal_scan_cursor"], 10)
+        self.assertEqual(second["next_signal_scan_start_rank"], 10)
+
+
+
+    def test_no_actionable_signal_never_submits(self):
+        self.seed_candidate("no-signal-one", cluster="cluster-one", score=0.90)
+        self.seed_candidate("no-signal-two", cluster="cluster-two", score=0.80)
+        self._enable_worker()
+        checked = []
+        venue_calls = []
+        worker = AutonomousCanaryWorker(
+            self.store,
+            clock=lambda: T0,
+            venue_factory=lambda: venue_calls.append(True),
+        )
+
+        def signal(candidate_id):
+            checked.append(candidate_id)
+            return None
+
+        with patch.object(CanaryService, "generate_signal", side_effect=signal), \
+            patch.object(CanaryService, "submit_signal") as submit:
+            result = worker.tick(now=T0)
+
+        self.assertEqual(checked, ["no-signal-one", "no-signal-two"])
+        self.assertEqual(result["status"], "NO_SIGNAL")
+        self.assertEqual(result["blocker"], "NO_ACTIONABLE_SIGNAL")
+        submit.assert_not_called()
+        self.assertEqual(venue_calls, [])
+        self._assert_scan_metrics(
+            result,
+            {
+                "candidates_ranked": 2,
+                "candidates_signal_checked": 2,
+                "candidates_no_signal": 2,
+                "actionable_candidates_found": 0,
+                "selected_actionable_candidate": None,
+                "selected_actionable_rank": None,
+                "selected_actionable_score": None,
+                "signal_scan_cursor": 0,
+                "signal_scan_ranking_run_id": result["ranking"]["ranking_run_id"],
+                "next_signal_scan_start_rank": 0,
+                "next_signal_scan_end_rank": 2,
+            },
+        )
+
+    def test_scan_window_advances_without_starving_later_ranked_candidate(self):
+        for index in range(1, 13):
+            self.seed_candidate(
+                f"window-{index:02d}",
+                cluster=f"window-cluster-{index:02d}",
+                score=1.0 - index / 100.0,
+            )
+        self._enable_worker()
+        checked = []
+        worker = AutonomousCanaryWorker(
+            self.store, clock=lambda: T0, venue_factory=TestVenue
+        )
+
+        def signal(candidate_id):
+            checked.append(candidate_id)
+            return (
+                self._ready_signal(candidate_id)
+                if candidate_id == "window-12"
+                else None
+            )
+
+        with patch.object(CanaryService, "generate_signal", side_effect=signal), \
+            patch.object(
+                CanaryService,
+                "submit_signal",
+                return_value={"ok": True, "order_id": "window-order"},
+            ) as submit, \
+            patch.object(
+                CanaryService,
+                "bind_autonomous_actionable_candidate",
+                return_value={"bound": True},
+            ) as bind, \
+            patch.object(CredentialStore, "configured", return_value=True):
+            first = worker.tick(now=T0)
+            self.assertEqual(first["status"], "NO_SIGNAL")
+            first_state = self.store.connection.execute(
+                "SELECT * FROM canary_autonomous_state WHERE singleton=1"
+            ).fetchone()
+            second = worker.tick(now=T0)
+
+        self.assertEqual(
+            checked[:10],
+            [f"window-{index:02d}" for index in range(1, 11)],
+        )
+        self.assertEqual(first["candidates_signal_checked"], 10)
+        self.assertEqual(first_state["signal_scan_cursor"], 10)
+        self.assertEqual(first_state["next_signal_scan_start_rank"], 10)
+        self.assertEqual(first_state["next_signal_scan_end_rank"], 12)
+        self.assertEqual(checked[10:], ["window-11", "window-12"])
+        self.assertEqual(second["status"], "SUBMITTED")
+        self.assertEqual(second["candidate_id"], "window-12")
+        submit.assert_called_once()
+        bind.assert_called_once_with(
+            "window-12",
+            ranking_run_id=second["ranking"]["ranking_run_id"],
+            signal_id="signal-window-12",
+        )
+        self.assertEqual(second["selected_actionable_rank"], 12)
+        self.assertEqual(second["signal_scan_cursor"], 0)
+        self.assertEqual(second["next_signal_scan_start_rank"], 0)
+        self.assertEqual(second["next_signal_scan_end_rank"], 10)
+    def test_ranking_change_resets_scan_cursor_to_preferred_window(self):
+        for index in range(1, 13):
+            self.seed_candidate(
+                f"reset-{index:02d}",
+                cluster=f"reset-cluster-{index:02d}",
+                score=1.0 - index / 100.0,
+            )
+        self._enable_worker()
+        checked = []
+        worker = AutonomousCanaryWorker(
+            self.store, clock=lambda: T0, venue_factory=TestVenue
+        )
+
+        with patch.object(
+            CanaryService,
+            "generate_signal",
+            side_effect=lambda candidate_id: checked.append(candidate_id) or None,
+        ):
+            first = worker.tick(now=T0)
+            first_state = self.store.connection.execute(
+                "SELECT * FROM canary_autonomous_state WHERE singleton=1"
+            ).fetchone()
+            self.seed_candidate(
+                "ranking-reset-new",
+                cluster="reset-new-cluster",
+                score=2.0,
+            )
+            second = worker.tick(now=T0)
+
+        self.assertEqual(first["signal_scan_cursor"], 10)
+        self.assertEqual(first_state["signal_scan_cursor"], 10)
+        self.assertEqual(first_state["next_signal_scan_start_rank"], 10)
+        self.assertEqual(second["signal_scan_cursor"], 10)
+        self.assertEqual(second["next_signal_scan_start_rank"], 10)
+        self.assertNotEqual(
+            first_state["signal_scan_ranking_run_id"],
+            second["signal_scan_ranking_run_id"],
+        )
+        self.assertEqual(checked[10], "ranking-reset-new")
+        self.assertEqual(second["candidates_ranked"], 13)
+        self.assertEqual(second["candidates_signal_checked"], 10)
+        self.assertEqual(second["actionable_candidates_found"], 0)
+
+
+    def test_equivalent_mutation_clusters_do_not_consume_initial_scan_budget(self):
+        self.seed_candidate("cluster-a-one", cluster="a", score=0.99)
+        self.seed_candidate("cluster-a-two", cluster="a", score=0.98)
+        self.seed_candidate("cluster-b-one", cluster="b", score=0.97)
+        self.seed_candidate("cluster-b-two", cluster="b", score=0.96)
+        for index, cluster in enumerate("cdefghij", start=3):
+            self.seed_candidate(
+                f"cluster-{cluster}-one",
+                cluster=cluster,
+                score=1.0 - index / 100.0,
+            )
+        self._enable_worker()
+        checked = []
+        worker = AutonomousCanaryWorker(
+            self.store, clock=lambda: T0, venue_factory=TestVenue
+        )
+
+        def signal(candidate_id):
+            checked.append(candidate_id)
+            return (
+                self._ready_signal(candidate_id)
+                if candidate_id == "cluster-j-one"
+                else None
+            )
+
+        with patch.object(CanaryService, "generate_signal", side_effect=signal), \
+            patch.object(
+                CanaryService,
+                "submit_signal",
+                return_value={"ok": True, "order_id": "cluster-order"},
+            ), \
+            patch.object(
+                CanaryService,
+                "bind_autonomous_actionable_candidate",
+                return_value={"bound": True},
+            ) as bind, \
+            patch.object(CredentialStore, "configured", return_value=True):
+            result = worker.tick(now=T0)
+
+        self.assertEqual(result["status"], "SUBMITTED")
+        self.assertEqual(result["candidate_id"], "cluster-j-one")
+        bind.assert_called_once_with(
+            "cluster-j-one",
+            ranking_run_id=result["ranking"]["ranking_run_id"],
+            signal_id="signal-cluster-j-one",
+        )
+        self.assertIn("cluster-j-one", checked)
+        self.assertLessEqual(len(checked), 10)
+        checked_clusters = {
+            candidate_id.rsplit("-", 2)[1]
+            for candidate_id in checked
+            if candidate_id.endswith("-one")
+        }
+        self.assertEqual(len(checked_clusters), len(checked))
+        self.assertNotIn("cluster-a-two", checked)
+        self.assertNotIn("cluster-b-two", checked)
+        self.assertEqual(result["candidates_signal_checked"], len(checked))
+
+    def test_stale_and_invalid_rankings_are_skipped_before_signal_generation(self):
+        self.seed_candidate("stale-ranking", cluster="stale", score=0.90)
+        self.seed_candidate("valid-ranking", cluster="valid", score=0.80)
+        self.seed_candidate("invalid-ranking", cluster="invalid", score=0.70)
+        self._enable_worker()
+        checked = []
+        worker = AutonomousCanaryWorker(
+            self.store, clock=lambda: T0, venue_factory=TestVenue
+        )
+
+        def mutate(result):
+            with self.store.connection:
+                self.store.connection.execute(
+                    "UPDATE canary_rankings SET ranking_snapshot_hash=? "
+                    "WHERE candidate_id=?",
+                    ("stale-hash", "stale-ranking"),
+                )
+                self.store.connection.execute(
+                    "UPDATE canary_rankings SET total_score=NULL "
+                    "WHERE candidate_id=?",
+                    ("invalid-ranking",),
+                )
+
+        def signal(candidate_id):
+            checked.append(candidate_id)
+            return (
+                self._ready_signal(candidate_id)
+                if candidate_id == "valid-ranking"
+                else None
+            )
+
+        with self._post_rank_mutation(mutate), \
+            patch.object(CanaryService, "generate_signal", side_effect=signal), \
+            patch.object(
+                CanaryService,
+                "submit_signal",
+                return_value={"ok": True, "order_id": "valid-order"},
+            ) as submit, \
+            patch.object(
+                CanaryService,
+                "bind_autonomous_actionable_candidate",
+                return_value={"bound": True},
+            ) as bind, \
+            patch.object(CredentialStore, "configured", return_value=True):
+            result = worker.tick(now=T0)
+
+        self.assertEqual(checked, ["valid-ranking"])
+        self.assertEqual(result["candidate_id"], "valid-ranking")
+        submit.assert_called_once()
+        bind.assert_called_once_with(
+            "valid-ranking",
+            ranking_run_id=result["ranking"]["ranking_run_id"],
+            signal_id="signal-valid-ranking",
+        )
+        self.assertEqual(result["candidates_ranked"], 3)
+        self.assertEqual(result["candidates_signal_checked"], 1)
+        self.assertEqual(result["candidates_no_signal"], 0)
+
+    def test_multiple_ready_signals_use_deterministic_fallback_order(self):
+        for candidate_id, score in (
+            ("fallback-alpha", 0.90),
+            ("fallback-beta", 0.80),
+            ("fallback-gamma", 0.70),
+        ):
+            self.seed_candidate(
+                candidate_id,
+                cluster=candidate_id,
+                score=score,
+            )
+        self._enable_worker()
+        worker = AutonomousCanaryWorker(
+            self.store, clock=lambda: T0, venue_factory=TestVenue
+        )
+        with patch.object(
+            CanaryService,
+            "generate_signal",
+            side_effect=lambda candidate_id: self._ready_signal(candidate_id),
+        ), patch.object(
+            CanaryService,
+            "submit_signal",
+            return_value={"ok": True, "order_id": "fallback-order"},
+        ) as submit, patch.object(
+            CanaryService,
+            "bind_autonomous_actionable_candidate",
+            return_value={"bound": True},
+        ) as bind, patch.object(
+            CredentialStore, "configured", return_value=True
+        ):
+            result = worker.tick(now=T0)
+
+        self.assertEqual(result["candidate_id"], "fallback-alpha")
+        submit.assert_called_once()
+        bind.assert_called_once_with(
+            "fallback-alpha",
+            ranking_run_id=result["ranking"]["ranking_run_id"],
+            signal_id="signal-fallback-alpha",
+        )
+        self.assertEqual(result["actionable_candidates_found"], 3)
+        self.assertEqual(result["selected_actionable_rank"], 1)
+        self.assertEqual(
+            result["selected_actionable_score"],
+            next(
+                row["total_score"]
+                for row in result["ranking"]["rankings"]
+                if row["candidate_id"] == "fallback-alpha"
+            ),
+        )
+
+    def test_worker_makes_exactly_one_submission_decision(self):
+        self.seed_candidate("one-submit", cluster="one-submit", score=0.90)
+        self.seed_candidate("not-submitted", cluster="not-submitted", score=0.80)
+        self._enable_worker()
+        submit_calls = []
+        worker = AutonomousCanaryWorker(
+            self.store, clock=lambda: T0, venue_factory=TestVenue
+        )
+        with patch.object(
+            CanaryService,
+            "generate_signal",
+            side_effect=lambda candidate_id: self._ready_signal(candidate_id),
+        ), patch.object(
+            CanaryService,
+            "submit_signal",
+            side_effect=lambda signal_id, **kwargs: submit_calls.append(signal_id)
+            or {"ok": True, "order_id": "exactly-one"},
+        ) as submit, patch.object(
+            CanaryService,
+            "bind_autonomous_actionable_candidate",
+            return_value={"bound": True},
+        ) as bind, patch.object(
+            CredentialStore, "configured", return_value=True
+        ):
+            result = worker.tick(now=T0)
+
+        self.assertEqual(result["status"], "SUBMITTED")
+        self.assertEqual(submit.call_count, 1)
+        self.assertEqual(submit_calls, ["signal-one-submit"])
+        bind.assert_called_once_with(
+            "one-submit",
+            ranking_run_id=result["ranking"]["ranking_run_id"],
+            signal_id="signal-one-submit",
+        )
+
+    def test_actionable_scan_preserves_autonomous_risk_limits(self):
+        self._enable_worker()
+        before = self.service.status()["limits"]
+        worker = AutonomousCanaryWorker(
+            self.store, clock=lambda: T0, venue_factory=TestVenue
+        )
+        with patch.object(CandidateCanaryRanker, "evaluate_and_select") as evaluate:
+            evaluate.return_value = {
+                "ranking_run_id": "empty-run",
+                "rankings": [],
+                "selected_candidate": None,
+            }
+            result = worker.tick(now=T0)
+        after = self.service.status()["limits"]
+        self.assertEqual(before, after)
+        self.assertEqual(result["selected_actionable_candidate"], None)
+        stored_limits = json.loads(
+            self.store.connection.execute(
+                "SELECT limits_json FROM canary_control WHERE singleton=1"
+            ).fetchone()["limits_json"]
+        )
+        self.assertEqual(stored_limits, before)
 
     def test_node_worker_isolated_from_collector(self):
         node = ResearchNode(

@@ -415,6 +415,100 @@ class CandidateCanaryRanker:
         if not qualification_hash or not ranking_snapshot_hash:
             return None
         return qualification, qualification_hash, ranking_snapshot_hash
+    def validate_persisted_ranking(
+        self,
+        row: Mapping[str, Any],
+        *,
+        ranking_run_id: str,
+        now: datetime,
+    ) -> bool:
+        """Reject ranking rows that are not part of the current fenced run."""
+        if not isinstance(row, Mapping):
+            return False
+        candidate_id = str(row.get("candidate_id") or "").strip()
+        if not candidate_id or str(row.get("ranking_run_id") or "") != str(ranking_run_id):
+            return False
+        try:
+            stamp = ensure_utc(datetime.fromisoformat(str(row.get("ranking_timestamp"))))
+            age = (ensure_utc(now) - stamp).total_seconds()
+            score = float(row.get("total_score"))
+            rank = int(row.get("rank"))
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if age < 0 or age > 60.0 or not math.isfinite(score) or rank < 0:
+            return False
+        cluster_key = str(row.get("cluster_key") or "").strip()
+        if not cluster_key:
+            return False
+        try:
+            representative = int(row.get("cluster_representative"))
+        except (TypeError, ValueError):
+            return False
+        if representative not in (0, 1):
+            return False
+        versions = row.get("evidence_versions")
+        if not isinstance(versions, Mapping):
+            raw_versions = row.get("evidence_versions_json")
+            try:
+                versions = json.loads(str(raw_versions or "{}"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                versions = None
+        if not isinstance(versions, Mapping) or not versions:
+            return False
+        components = row.get("component_scores")
+        if not isinstance(components, Mapping):
+            raw_components = row.get("component_scores_json")
+            try:
+                components = json.loads(str(raw_components or "{}"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                components = None
+        if not isinstance(components, Mapping):
+            return False
+        lifecycle = self.store.load_candidate_lifecycle(candidate_id)
+        if not isinstance(lifecycle, Mapping) or str(lifecycle.get("stage") or "") not in self._STAGES:
+            return False
+        payload = self.service._merged_lifecycle_payload(lifecycle)
+        if not isinstance(payload, Mapping):
+            return False
+        eligibility = self.store.connection.execute(
+            "SELECT candidate_id,frozen_hash,evidence_json "
+            "FROM canary_eligibility WHERE candidate_id=?",
+            (candidate_id,),
+        ).fetchone()
+        binding = self.service._eligibility_binding_result(
+            candidate_id,
+            eligibility,
+            record=lifecycle,
+            verify_attestation=False,
+        )
+        if not binding.get("bound") or binding.get("reevaluation_required"):
+            return False
+        if not self.service.validate_eligibility(
+            candidate_id,
+            _record=lifecycle,
+            _verify_attestation=False,
+        ).get("eligible"):
+            return False
+        quality = evaluate_prediction_data_quality(
+            self.store,
+            payload,
+            verify_attestation=False,
+        )
+        expected_hash = _canary_ranking_snapshot_hash(
+            candidate_id,
+            str(lifecycle.get("stage") or ""),
+            payload,
+            qualification_hash=str(binding.get("qualification_hash") or ""),
+            quality=quality,
+        )
+        return bool(
+            row.get("qualification_hash")
+            and row.get("qualification_hash") == binding.get("qualification_hash")
+            and row.get("ranking_snapshot_hash")
+            and row.get("ranking_snapshot_hash") == expected_hash
+            and str(versions.get("frozen_hash") or "")
+            == str(self.service._lifecycle_frozen_hash(lifecycle) or "")
+        )
 
     def evaluate_and_select(self, now: datetime | None = None) -> dict[str, Any]:
         expected_projection_version = self.service._readiness_projection_version()
@@ -782,23 +876,63 @@ class CandidateCanaryRanker:
                     if selected_representatives
                     else None
                 )
-                evidence_seed = [
-                    (
-                        str(item["candidate_id"]),
-                        item["versions"],
-                        float(item["evidence"]["total_score"]),
+                persisted: list[dict[str, Any]] = []
+                fingerprint_rows: list[dict[str, Any]] = []
+                for item in stable:
+                    evidence = item["evidence"]
+                    candidate_id = str(item["candidate_id"])
+                    representative = bool(
+                        evidence is not None
+                        and representatives.get(str(item.get("cluster_key"))) is item
                     )
-                    for item in selected_representatives
-                ]
+                    rank = int(rank_by_id.get(candidate_id, 0))
+                    reason = (
+                        "DIVERSITY_CLUSTER_NON_REPRESENTATIVE"
+                        if evidence is not None and not representative
+                        else str(item["reason"])
+                    )
+                    fingerprint_rows.append(
+                        {
+                            "candidate_id": candidate_id,
+                            "rank": rank,
+                            "total_score": (
+                                float(evidence["total_score"])
+                                if evidence is not None
+                                else None
+                            ),
+                            "component_scores": evidence or {},
+                            "evidence_versions": item["versions"],
+                            "cluster_key": str(item.get("cluster_key") or ""),
+                            "cluster_representative": int(representative),
+                            "selected": int(candidate_id == selected_id and representative),
+                            "reason": reason,
+                            "qualification_hash": item["qualification_hash"],
+                            "ranking_snapshot_hash": item["ranking_snapshot_hash"],
+                        }
+                    )
+                fingerprint_rows.sort(
+                    key=lambda row: (
+                        1 if int(row["rank"]) == 0 else 0,
+                        int(row["rank"]),
+                        (
+                            -float(row["total_score"])
+                            if row["total_score"] is not None
+                            else float("inf")
+                        ),
+                        str(row["candidate_id"]),
+                    )
+                )
                 run_id = "rank-" + hashlib.sha256(
                     json.dumps(
-                        evidence_seed,
+                        {
+                            "formula_version": self.FORMULA_VERSION,
+                            "ordered_rows": fingerprint_rows,
+                        },
                         sort_keys=True,
                         separators=(",", ":"),
                         allow_nan=False,
                     ).encode("utf-8")
                 ).hexdigest()[:24]
-                persisted: list[dict[str, Any]] = []
                 for item in stable:
                     evidence = item["evidence"]
                     candidate_id = str(item["candidate_id"])
@@ -980,8 +1114,10 @@ class CandidateCanaryRanker:
     def rank(self, now: datetime | None = None) -> dict[str, Any]:
         return self.evaluate_and_select(now)
 
+    MAX_RANKINGS = 10_000
+
     def rankings(self, *, limit: int = 100) -> list[dict[str, Any]]:
-        bounded = max(1, min(int(limit), 1000))
+        bounded = max(1, min(int(limit), self.MAX_RANKINGS))
         with self.store._lock:
             rows = self.store.connection.execute(
                 "SELECT * FROM canary_rankings ORDER BY CASE WHEN rank=0 THEN 1 ELSE 0 END,rank,total_score DESC,candidate_id LIMIT ?",

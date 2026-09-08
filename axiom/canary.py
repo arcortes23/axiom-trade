@@ -1398,7 +1398,18 @@ class CanaryService:
               next_retry_at TEXT,
               candidates_evaluated INTEGER,
               signals_generated INTEGER,
-              orders_attempted INTEGER
+              orders_attempted INTEGER,
+              candidates_ranked INTEGER,
+              candidates_signal_checked INTEGER,
+              candidates_no_signal INTEGER,
+              actionable_candidates_found INTEGER,
+              selected_actionable_candidate TEXT,
+              selected_actionable_rank INTEGER,
+              selected_actionable_score REAL,
+              signal_scan_cursor INTEGER NOT NULL DEFAULT 0,
+              signal_scan_ranking_run_id TEXT,
+              next_signal_scan_start_rank INTEGER,
+              next_signal_scan_end_rank INTEGER
             );
             CREATE TABLE IF NOT EXISTS canary_readiness_snapshot (
               singleton INTEGER PRIMARY KEY CHECK(singleton=1),
@@ -1467,6 +1478,17 @@ class CanaryService:
                         ("candidates_evaluated", "INTEGER"),
                         ("signals_generated", "INTEGER"),
                         ("orders_attempted", "INTEGER"),
+                        ("candidates_ranked", "INTEGER"),
+                        ("candidates_signal_checked", "INTEGER"),
+                        ("candidates_no_signal", "INTEGER"),
+                        ("actionable_candidates_found", "INTEGER"),
+                        ("selected_actionable_candidate", "TEXT"),
+                        ("selected_actionable_rank", "INTEGER"),
+                        ("selected_actionable_score", "REAL"),
+                        ("signal_scan_cursor", "INTEGER NOT NULL DEFAULT 0"),
+                        ("signal_scan_ranking_run_id", "TEXT"),
+                        ("next_signal_scan_start_rank", "INTEGER"),
+                        ("next_signal_scan_end_rank", "INTEGER"),
                     ),
                 ),
                 (
@@ -1718,8 +1740,30 @@ class CanaryService:
             "candidates_evaluated": None,
             "signals_generated": None,
             "orders_attempted": None,
+            "candidates_ranked": None,
+            "candidates_signal_checked": None,
+            "candidates_no_signal": None,
+            "actionable_candidates_found": None,
+            "selected_actionable_candidate": None,
+            "selected_actionable_rank": None,
+            "selected_actionable_score": None,
+            "signal_scan_cursor": 0,
+            "signal_scan_ranking_run_id": None,
+            "next_signal_scan_start_rank": None,
+            "next_signal_scan_end_rank": None,
             "last_signal_id": None,
             "worker_status": "UNKNOWN",
+            "candidates_ranked": None,
+            "candidates_signal_checked": None,
+            "candidates_no_signal": None,
+            "actionable_candidates_found": None,
+            "selected_actionable_candidate": None,
+            "selected_actionable_rank": None,
+            "selected_actionable_score": None,
+            "signal_scan_cursor": 0,
+            "signal_scan_ranking_run_id": None,
+            "next_signal_scan_start_rank": None,
+            "next_signal_scan_end_rank": None,
         }
         return {
             "production_live_trading": "DISABLED",
@@ -1753,6 +1797,17 @@ class CanaryService:
             "eligible_count": None,
             "rankable_raw_count": None,
             "rankable_count": None,
+            "candidates_ranked": None,
+            "candidates_signal_checked": None,
+            "candidates_no_signal": None,
+            "actionable_candidates_found": None,
+            "selected_actionable_candidate": None,
+            "selected_actionable_rank": None,
+            "selected_actionable_score": None,
+            "signal_scan_cursor": 0,
+            "signal_scan_ranking_run_id": None,
+            "next_signal_scan_start_rank": None,
+            "next_signal_scan_end_rank": None,
             "real_execution_events": None,
             "execution_event_count": None,
             "historical_data_integrity": "UNKNOWN",
@@ -1803,8 +1858,12 @@ class CanaryService:
         autonomous = fetchone(
             "SELECT last_tick_at,last_tick_started_at,last_tick_completed_at,"
             "last_successful_tick,last_error_code,consecutive_failures,next_retry_at,"
-            "candidates_evaluated,signals_generated,orders_attempted,next_decision,"
-            "blocker,last_signal_id,worker_status FROM canary_autonomous_state "
+            "candidates_evaluated,signals_generated,orders_attempted,"
+            "candidates_ranked,candidates_signal_checked,candidates_no_signal,"
+            "actionable_candidates_found,selected_actionable_candidate,"
+            "selected_actionable_rank,selected_actionable_score,signal_scan_cursor,"
+            "signal_scan_ranking_run_id,next_signal_scan_start_rank,next_signal_scan_end_rank,"
+            "next_decision,blocker,last_signal_id,worker_status FROM canary_autonomous_state "
             "WHERE singleton=1"
         )
         if control is not None:
@@ -1861,6 +1920,17 @@ class CanaryService:
                         "candidates_evaluated",
                         "signals_generated",
                         "orders_attempted",
+                        "candidates_ranked",
+                        "candidates_signal_checked",
+                        "candidates_no_signal",
+                        "actionable_candidates_found",
+                        "selected_actionable_candidate",
+                        "selected_actionable_rank",
+                        "selected_actionable_score",
+                        "signal_scan_cursor",
+                        "signal_scan_ranking_run_id",
+                        "next_signal_scan_start_rank",
+                        "next_signal_scan_end_rank",
                         "next_decision",
                         "blocker",
                         "last_signal_id",
@@ -2051,6 +2121,17 @@ class CanaryService:
             "candidates_evaluated",
             "signals_generated",
             "orders_attempted",
+            "candidates_ranked",
+            "candidates_signal_checked",
+            "candidates_no_signal",
+            "actionable_candidates_found",
+            "selected_actionable_candidate",
+            "selected_actionable_rank",
+            "selected_actionable_score",
+            "signal_scan_cursor",
+            "signal_scan_ranking_run_id",
+            "next_signal_scan_start_rank",
+            "next_signal_scan_end_rank",
             "next_decision",
             "blocker",
             "last_signal_id",
@@ -2991,6 +3072,17 @@ class CanaryService:
             "trades",
             "rank",
             "score",
+            "candidates_ranked",
+            "candidates_signal_checked",
+            "candidates_no_signal",
+            "actionable_candidates_found",
+            "selected_actionable_candidate",
+            "selected_actionable_rank",
+            "selected_actionable_score",
+            "signal_scan_cursor",
+            "signal_scan_ranking_run_id",
+            "next_signal_scan_start_rank",
+            "next_signal_scan_end_rank",
             "next_decision",
             "blocker",
             "last_signal_id",
@@ -3055,8 +3147,12 @@ class CanaryService:
         worker_row = fetchone(
             "SELECT last_tick_at,last_tick_started_at,last_tick_completed_at,"
             "last_successful_tick,last_error_code,consecutive_failures,next_retry_at,"
-            "candidates_evaluated,signals_generated,orders_attempted,next_decision,"
-            "blocker,last_signal_id,worker_status FROM canary_autonomous_state "
+            "candidates_evaluated,signals_generated,orders_attempted,"
+            "candidates_ranked,candidates_signal_checked,candidates_no_signal,"
+            "actionable_candidates_found,selected_actionable_candidate,"
+            "selected_actionable_rank,selected_actionable_score,signal_scan_cursor,"
+            "signal_scan_ranking_run_id,next_signal_scan_start_rank,next_signal_scan_end_rank,"
+            "next_decision,blocker,last_signal_id,worker_status FROM canary_autonomous_state "
             "WHERE singleton=1"
         )
         worker_keys = (
@@ -3066,6 +3162,17 @@ class CanaryService:
             "last_successful_tick",
             "last_error_code",
             "consecutive_failures",
+            "candidates_ranked",
+            "candidates_signal_checked",
+            "candidates_no_signal",
+            "actionable_candidates_found",
+            "selected_actionable_candidate",
+            "selected_actionable_rank",
+            "selected_actionable_score",
+            "signal_scan_cursor",
+            "signal_scan_ranking_run_id",
+            "next_signal_scan_start_rank",
+            "next_signal_scan_end_rank",
             "next_retry_at",
             "candidates_evaluated",
             "signals_generated",
@@ -3327,6 +3434,17 @@ class CanaryService:
         candidates_evaluated: int | None | object = _UNSET,
         signals_generated: int | None | object = _UNSET,
         orders_attempted: int | None | object = _UNSET,
+        candidates_ranked: int | None | object = _UNSET,
+        candidates_signal_checked: int | None | object = _UNSET,
+        candidates_no_signal: int | None | object = _UNSET,
+        actionable_candidates_found: int | None | object = _UNSET,
+        selected_actionable_candidate: str | None | object = _UNSET,
+        selected_actionable_rank: int | None | object = _UNSET,
+        selected_actionable_score: float | None | object = _UNSET,
+        signal_scan_cursor: int | None | object = _UNSET,
+        signal_scan_ranking_run_id: str | None | object = _UNSET,
+        next_signal_scan_start_rank: int | None | object = _UNSET,
+        next_signal_scan_end_rank: int | None | object = _UNSET,
         publish: bool = False,
     ) -> None:
         when = ensure_utc(timestamp or self.clock()).isoformat()
@@ -3340,14 +3458,35 @@ class CanaryService:
             "candidates_evaluated": candidates_evaluated,
             "signals_generated": signals_generated,
             "orders_attempted": orders_attempted,
+            "candidates_ranked": candidates_ranked,
+            "candidates_signal_checked": candidates_signal_checked,
+            "candidates_no_signal": candidates_no_signal,
+            "actionable_candidates_found": actionable_candidates_found,
+            "selected_actionable_candidate": selected_actionable_candidate,
+            "selected_actionable_rank": selected_actionable_rank,
+            "selected_actionable_score": selected_actionable_score,
+            "signal_scan_cursor": signal_scan_cursor,
+            "signal_scan_ranking_run_id": signal_scan_ranking_run_id,
+            "next_signal_scan_start_rank": next_signal_scan_start_rank,
+            "next_signal_scan_end_rank": next_signal_scan_end_rank,
         }
         for key, value in tuple(metadata.items()):
             if value is _UNSET:
                 continue
-            if key.endswith("_at") or key == "last_successful_tick":
+            if key.endswith("_at") or key in {
+                "last_successful_tick",
+                "signal_scan_ranking_run_id",
+                "selected_actionable_candidate",
+            }:
                 metadata[key] = str(value) if value is not None else None
             elif key == "last_error_code":
                 metadata[key] = str(value)[:128] if value is not None else None
+            elif key == "selected_actionable_score":
+                try:
+                    parsed_score = float(value) if value is not None else None
+                except (TypeError, ValueError):
+                    parsed_score = None
+                metadata[key] = parsed_score if parsed_score is not None and math.isfinite(parsed_score) else None
             else:
                 try:
                     parsed = int(value) if value is not None else None
@@ -3390,8 +3529,6 @@ class CanaryService:
                     + ",".join(updates),
                     tuple(values),
                 )
-        # Keep the singleton display projection in sync immediately, but do
-        # not make a heartbeat look like a new qualification/publication.
         self._patch_autonomous_snapshot()
         if publish:
             self.publish_readiness_snapshot(reason="AUTONOMOUS_DECISION")
@@ -3498,6 +3635,212 @@ class CanaryService:
                 )
         if publish_readiness:
             self.publish_readiness_snapshot(reason="AUTONOMOUS_SELECTION_CHANGED")
+    def bind_autonomous_actionable_candidate(
+        self,
+        candidate_id: str,
+        *,
+        ranking_run_id: str,
+        signal_id: str,
+        publish_readiness: bool = True,
+    ) -> Mapping[str, Any]:
+        """Atomically bind a current READY candidate into autonomous control.
+
+        ``canary_selection`` remains the immutable research winner.  This
+        operation only moves the candidate fence owned by ``canary_control``
+        after revalidating the current ranking run and the persisted signal
+        under the same writer transaction.
+        """
+        identifier = str(candidate_id).strip()
+        run_id = str(ranking_run_id).strip()
+        persisted_signal_id = str(signal_id).strip()
+        if not identifier or not run_id or not persisted_signal_id:
+            raise CanaryBlocked("AUTONOMOUS_ACTIONABLE_BINDING_INVALID")
+        connection = self.store.connection
+        now = ensure_utc(self.clock())
+        now_text = now.isoformat()
+        with self.store._lock:
+            if connection.in_transaction:
+                raise CanaryBlocked("CANARY_TRANSACTION_ACTIVE")
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                control = connection.execute(
+                    "SELECT state,candidate_id,limits_json,integrity_hash,"
+                    "control_generation FROM canary_control WHERE singleton=1"
+                ).fetchone()
+                if control is None:
+                    raise CanaryBlocked("CANARY_NOT_ARMED")
+                control_state = str(control["state"] or "").upper()
+                if control_state == "KILLED":
+                    raise CanaryBlocked("CANARY_KILLED")
+                if control_state != AUTONOMOUS_MICRO_LIVE:
+                    raise CanaryBlocked("AUTONOMOUS_CANARY_DISABLED")
+                try:
+                    control_generation = int(control["control_generation"] or 0)
+                    control_limits = json.loads(control["limits_json"] or "{}")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    raise CanaryBlocked("CANARY_CONTROL_CORRUPT") from None
+                if control_generation <= 0 or not isinstance(control_limits, Mapping):
+                    raise CanaryBlocked("CANARY_CONTROL_CORRUPT")
+                control_limits = dict(control_limits)
+                if control_limits != self.autonomous_limits():
+                    raise CanaryBlocked("AUTONOMOUS_RISK_ENVELOPE_CORRUPT")
+                expected_integrity = self._integrity(
+                    "",
+                    AUTONOMOUS_CANARY_VENUE,
+                    "",
+                    control_limits,
+                )
+                if expected_integrity != control["integrity_hash"]:
+                    raise CanaryBlocked("CANARY_CONTROL_CORRUPT")
+
+                lifecycle = self.store.load_candidate_lifecycle(identifier)
+                if (
+                    not isinstance(lifecycle, Mapping)
+                    or str(lifecycle.get("stage") or "") not in _CANARY_ELIGIBLE_STAGES
+                ):
+                    raise CanaryBlocked("CANDIDATE_NOT_CANARY_ELIGIBLE")
+                eligibility = connection.execute(
+                    "SELECT candidate_id,frozen_hash,evidence_json "
+                    "FROM canary_eligibility WHERE candidate_id=?",
+                    (identifier,),
+                ).fetchone()
+                binding = self._eligibility_binding_result(
+                    identifier,
+                    eligibility,
+                    record=lifecycle,
+                    verify_attestation=False,
+                )
+                if not binding.get("bound") or binding.get("reevaluation_required"):
+                    raise CanaryBlocked("CANDIDATE_NOT_CANARY_ELIGIBLE")
+                validation = self.validate_eligibility(
+                    identifier,
+                    _record=lifecycle,
+                    _verify_attestation=False,
+                )
+                if not validation.get("eligible"):
+                    raise CanaryBlocked("CANDIDATE_RESEARCH_GATES_INCOMPLETE")
+                payload = self._merged_lifecycle_payload(lifecycle)
+                if not isinstance(payload, Mapping):
+                    raise CanaryBlocked("CANDIDATE_FROZEN_BINDING_INVALID")
+                quality = evaluate_prediction_data_quality(
+                    self.store,
+                    payload if isinstance(payload, Mapping) else {},
+                    verify_attestation=False,
+                )
+                expected_ranking_hash = _canary_ranking_snapshot_hash(
+                    identifier,
+                    str(lifecycle.get("stage") or ""),
+                    payload if isinstance(payload, Mapping) else {},
+                    qualification_hash=str(binding.get("qualification_hash") or ""),
+                    quality=quality,
+                )
+                ranking = connection.execute(
+                    "SELECT candidate_id,ranking_run_id,ranking_timestamp,rank,total_score,"
+                    "qualification_hash,ranking_snapshot_hash,cluster_representative,reason "
+                    "FROM canary_rankings WHERE candidate_id=?",
+                    (identifier,),
+                ).fetchone()
+                if ranking is None:
+                    raise CanaryBlocked("AUTONOMOUS_RANKING_NOT_CURRENT")
+                try:
+                    ranking_timestamp = parse_timestamp(ranking["ranking_timestamp"])
+                    ranking_score = float(ranking["total_score"])
+                    ranking_rank = int(ranking["rank"])
+                except (TypeError, ValueError, OverflowError):
+                    ranking_timestamp = None
+                    ranking_score = float("nan")
+                    ranking_rank = None
+                try:
+                    ranking_representative = int(ranking["cluster_representative"])
+                except (TypeError, ValueError, OverflowError):
+                    ranking_representative = None
+                rank_zero_follower = (
+                    ranking_rank == 0
+                    and ranking_representative == 0
+                    and str(ranking["reason"] or "").strip()
+                    == "DIVERSITY_CLUSTER_NON_REPRESENTATIVE"
+                )
+                if (
+                    str(ranking["candidate_id"] or "").strip() != identifier
+                    or str(ranking["ranking_run_id"] or "").strip() != run_id
+                    or ranking_timestamp is None
+                    or ranking_timestamp > now
+                    or (now - ranking_timestamp).total_seconds()
+                    > CANARY_READINESS_SNAPSHOT_MAX_AGE_SECONDS
+                    or ranking_rank is None
+                    or ranking_rank < 0
+                    or (ranking_rank == 0 and not rank_zero_follower)
+                    or not math.isfinite(ranking_score)
+                    or not binding.get("qualification_hash")
+                    or ranking["qualification_hash"] != binding.get("qualification_hash")
+                    or ranking["ranking_snapshot_hash"] != expected_ranking_hash
+                ):
+                    raise CanaryBlocked("AUTONOMOUS_RANKING_NOT_CURRENT")
+
+                signal = connection.execute(
+                    "SELECT * FROM canary_signals WHERE signal_id=?",
+                    (persisted_signal_id,),
+                ).fetchone()
+                if signal is None:
+                    raise CanaryBlocked("CANARY_SIGNAL_NOT_FOUND")
+                try:
+                    signal_expires = parse_timestamp(signal["expires_at"])
+                except (TypeError, ValueError):
+                    signal_expires = None
+                try:
+                    signal_evidence = json.loads(signal["evidence_json"] or "{}")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    signal_evidence = None
+                frozen_hash = self._lifecycle_frozen_hash(lifecycle)
+                if (
+                    str(signal["candidate_id"] or "").strip() != identifier
+                    or str(signal["status"] or "").upper() != "READY"
+                    or signal_expires is None
+                    or signal_expires <= now
+                    or signal["frozen_hash"] != frozen_hash
+                    or signal["strategy_hash"] != payload.get("strategy_hash")
+                    or signal["model_hash"] != payload.get("model_hash")
+                    or signal["config_hash"] != payload.get("config_hash")
+                    or not isinstance(signal_evidence, Mapping)
+                    or signal_evidence.get("current_execution_evidence") != CURRENT_ORDER_BOOK
+                ):
+                    raise CanaryBlocked("CANARY_SIGNAL_NO_LONGER_VALID")
+
+                current_candidate = (
+                    str(control["candidate_id"]).strip()
+                    if control["candidate_id"] is not None
+                    else None
+                )
+                if current_candidate != identifier:
+                    updated = connection.execute(
+                        "UPDATE canary_control SET candidate_id=?,updated_at=?,"
+                        "control_generation=? WHERE singleton=1 AND state=? "
+                        "AND control_generation=?",
+                        (
+                            identifier,
+                            now_text,
+                            control_generation + 1,
+                            AUTONOMOUS_MICRO_LIVE,
+                            control_generation,
+                        ),
+                    )
+                    if updated.rowcount != 1:
+                        raise CanaryBlocked("CANARY_CONTROL_CHANGED")
+                    control_generation += 1
+                connection.commit()
+            except BaseException:
+                if connection.in_transaction:
+                    connection.rollback()
+                raise
+        if publish_readiness:
+            self.publish_readiness_snapshot(reason="AUTONOMOUS_ACTIONABLE_BOUND")
+        return {
+            "candidate_id": identifier,
+            "ranking_run_id": run_id,
+            "signal_id": persisted_signal_id,
+            "control_generation": control_generation,
+        }
+
 
     def _candidate_signal_binding(self, candidate_id: str) -> dict[str, Any]:
         """Load the candidate's immutable executable documents and binding."""
@@ -3869,37 +4212,30 @@ class CanaryService:
                 "side": side,
                 "paper_expected_price": str(expected_price),
                 "score": score,
+                # The snapshot id is the durable source binding, while this
+                # digest also prevents a mutable/legacy snapshot projection
+                # from reusing a signal whose executable book has changed.
+                "current_order_book_hash": _canary_document_hash(current_book),
             }
-            signal_id = "canary-signal-" + hashlib.sha256(
+            base_signal_id = "canary-signal-" + hashlib.sha256(
                 json.dumps(identity, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
             ).hexdigest()[:32]
-            evidence = {
-                "score": score,
-                "model_probability": current_observation.get("model_probability"),
-                "market_price": str(expected_price),
-                "research_quality": current_observation.get("research_quality"),
-                "current_execution_evidence": CURRENT_ORDER_BOOK,
-                "current_order_book_timestamp": current_book.get("timestamp"),
-                "current_order_book_source": "FORWARD_COLLECTED",
-                "source_observed_at": (
-                    current_row.get("observed_at").isoformat()
-                    if isinstance(current_row.get("observed_at"), datetime)
-                    else current_row.get("observed_at")
-                ),
-                "source_snapshot_id": source_snapshot_id,
-            }
+            signal_id = base_signal_id
             expires_at = now + timedelta(seconds=CANARY_SIGNAL_TTL_SECONDS)
+            existing_signal: dict[str, Any] | None = None
+            expired_ready_invalidated = False
             with self.store._lock:
                 if self.store.connection.in_transaction:
                     raise CanaryBlocked("CANARY_TRANSACTION_ACTIVE")
-                self.store.connection.execute(
-                    "INSERT OR IGNORE INTO canary_signals("
-                    "signal_id,candidate_id,frozen_hash,strategy_hash,model_hash,config_hash,"
-                    "market_id,token_id,outcome,side,paper_expected_price,source_snapshot_id,"
-                    "source_timestamp,generated_at,expires_at,status,reason,evidence_json,updated_at) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                matching = self.store.connection.execute(
+                    "SELECT * FROM canary_signals WHERE signal_id LIKE ? || '%' "
+                    "AND candidate_id=? AND frozen_hash=? "
+                    "AND strategy_hash=? AND model_hash=? AND config_hash=? "
+                    "AND market_id=? AND token_id=? AND outcome=? AND side=? "
+                    "AND paper_expected_price=? AND source_snapshot_id=? "
+                    "ORDER BY generated_at DESC,signal_id DESC",
                     (
-                        signal_id,
+                        base_signal_id,
                         binding["candidate_id"],
                         binding["frozen_hash"],
                         binding["strategy_hash"],
@@ -3911,17 +4247,107 @@ class CanaryService:
                         side,
                         str(expected_price),
                         source_snapshot_id,
-                        source_timestamp.isoformat(),
-                        now.isoformat(),
-                        expires_at.isoformat(),
-                        "READY",
-                        None,
-                        json.dumps(evidence, sort_keys=True, allow_nan=False),
-                        now.isoformat(),
                     ),
+                ).fetchall()
+                # A submission outcome is a terminal fence for this exact
+                # evidence.  Never refresh, rewrite, or otherwise touch such
+                # rows; this preserves one-submit and UNKNOWN semantics.
+                protected = next(
+                    (
+                        row
+                        for row in matching
+                        if str(row["status"] or "").upper()
+                        in {"SUBMITTED", "SUBMITTING", "UNKNOWN", "REJECTED"}
+                    ),
+                    None,
                 )
+                if protected is not None:
+                    existing_signal = self._signal_from_row(protected)
+                else:
+                    ready = next(
+                        (
+                            row
+                            for row in matching
+                            if str(row["status"] or "").upper() == "READY"
+                        ),
+                        None,
+                    )
+                    if ready is not None:
+                        ready_expires = parse_timestamp(ready["expires_at"])
+                        if ready_expires is not None and ready_expires > now:
+                            existing_signal = self._signal_from_row(ready)
+                        else:
+                            # CAS the stale READY row out of the actionable
+                            # state before allocating replacement evidence.
+                            updated = self.store.connection.execute(
+                                "UPDATE canary_signals SET status='EXPIRED',"
+                                "reason='SIGNAL_EXPIRED',updated_at=? "
+                                "WHERE signal_id=? AND status='READY'",
+                                (now.isoformat(), ready["signal_id"]),
+                            )
+                            expired_ready_invalidated = updated.rowcount == 1
+                    if existing_signal is None and (
+                        ready is None or expired_ready_invalidated
+                    ):
+                        if matching:
+                            previous = matching[0]
+                            refresh_seed = (
+                                str(previous["signal_id"])
+                                + "|"
+                                + str(previous["expires_at"] or "")
+                            )
+                            signal_id = (
+                                base_signal_id
+                                + "-refresh-"
+                                + hashlib.sha256(refresh_seed.encode()).hexdigest()[:16]
+                            )
+                        evidence = {
+                            "score": score,
+                            "model_probability": current_observation.get("model_probability"),
+                            "market_price": str(expected_price),
+                            "research_quality": current_observation.get("research_quality"),
+                            "current_execution_evidence": CURRENT_ORDER_BOOK,
+                            "current_order_book_timestamp": current_book.get("timestamp"),
+                            "current_order_book_source": "FORWARD_COLLECTED",
+                            "source_observed_at": (
+                                current_row.get("observed_at").isoformat()
+                                if isinstance(current_row.get("observed_at"), datetime)
+                                else current_row.get("observed_at")
+                            ),
+                            "source_snapshot_id": source_snapshot_id,
+                        }
+                        self.store.connection.execute(
+                            "INSERT INTO canary_signals("
+                            "signal_id,candidate_id,frozen_hash,strategy_hash,model_hash,config_hash,"
+                            "market_id,token_id,outcome,side,paper_expected_price,source_snapshot_id,"
+                            "source_timestamp,generated_at,expires_at,status,reason,evidence_json,updated_at) "
+                            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                            (
+                                signal_id,
+                                binding["candidate_id"],
+                                binding["frozen_hash"],
+                                binding["strategy_hash"],
+                                binding["model_hash"],
+                                binding["config_hash"],
+                                market_id,
+                                token_id,
+                                outcome,
+                                side,
+                                str(expected_price),
+                                source_snapshot_id,
+                                source_timestamp.isoformat(),
+                                now.isoformat(),
+                                expires_at.isoformat(),
+                                "READY",
+                                None,
+                                json.dumps(evidence, sort_keys=True, allow_nan=False),
+                                now.isoformat(),
+                            ),
+                        )
                 self.store.connection.commit()
             self.publish_readiness_snapshot(reason="SIGNAL_GENERATED")
+            if existing_signal is not None:
+                return existing_signal
             return self.get_signal(signal_id)
         return None
 
@@ -3979,7 +4405,7 @@ class CanaryService:
                 raise CanaryBlocked("CANARY_TRANSACTION_ACTIVE")
             self.store.connection.execute(
                 "UPDATE canary_signals SET status=?,reason=?,updated_at=? "
-                "WHERE signal_id=? AND status IN ('READY','STALE')",
+                "WHERE signal_id=? AND status='READY'",
                 (str(status).upper(), reason, now, str(signal_id)),
             )
             self.store.connection.commit()
@@ -4027,7 +4453,11 @@ class CanaryService:
             raise CanaryBlocked("CANARY_SIGNAL_NO_LONGER_VALID")
         control_snapshot = self.authoritative_status()
         if control_snapshot.get("micro_live_canary") == AUTONOMOUS_MICRO_LIVE:
-            if str(control_snapshot.get("candidate") or "") != str(signal.get("candidate_id") or ""):
+            control_candidate = str(
+                control_snapshot.get("control_candidate") or ""
+            ).strip()
+            signal_candidate = str(signal.get("candidate_id") or "").strip()
+            if not control_candidate or not signal_candidate or control_candidate != signal_candidate:
                 self._invalidate_signal(signal_id, "AUTO_CANARY_CANDIDATE_NOT_SELECTED")
                 raise CanaryBlocked("AUTO_CANARY_CANDIDATE_NOT_SELECTED")
         current = self._current_signal_market(str(signal["market_id"]), now=now)
@@ -5157,6 +5587,10 @@ class CanaryService:
                 "SELECT last_tick_at,last_tick_started_at,last_tick_completed_at,"
                 "last_successful_tick,last_error_code,consecutive_failures,next_retry_at,"
                 "candidates_evaluated,signals_generated,orders_attempted,"
+                "candidates_ranked,candidates_signal_checked,candidates_no_signal,"
+                "actionable_candidates_found,selected_actionable_candidate,"
+                "selected_actionable_rank,selected_actionable_score,signal_scan_cursor,"
+                "signal_scan_ranking_run_id,next_signal_scan_start_rank,next_signal_scan_end_rank,"
                 "next_decision,blocker,last_signal_id,worker_status "
                 "FROM canary_autonomous_state WHERE singleton=1"
             )
@@ -5192,6 +5626,50 @@ class CanaryService:
             "eligible_count": eligible_count,
             "rankable_raw_count": rankable_raw_count,
             "rankable_count": rankable_count,
+            "candidates_ranked": (
+                autonomous_state["candidates_ranked"]
+                if autonomous_state is not None else None
+            ),
+            "candidates_signal_checked": (
+                autonomous_state["candidates_signal_checked"]
+                if autonomous_state is not None else None
+            ),
+            "candidates_no_signal": (
+                autonomous_state["candidates_no_signal"]
+                if autonomous_state is not None else None
+            ),
+            "actionable_candidates_found": (
+                autonomous_state["actionable_candidates_found"]
+                if autonomous_state is not None else None
+            ),
+            "selected_actionable_candidate": (
+                autonomous_state["selected_actionable_candidate"]
+                if autonomous_state is not None else None
+            ),
+            "selected_actionable_rank": (
+                autonomous_state["selected_actionable_rank"]
+                if autonomous_state is not None else None
+            ),
+            "selected_actionable_score": (
+                autonomous_state["selected_actionable_score"]
+                if autonomous_state is not None else None
+            ),
+            "signal_scan_cursor": (
+                autonomous_state["signal_scan_cursor"]
+                if autonomous_state is not None else 0
+            ),
+            "signal_scan_ranking_run_id": (
+                autonomous_state["signal_scan_ranking_run_id"]
+                if autonomous_state is not None else None
+            ),
+            "next_signal_scan_start_rank": (
+                autonomous_state["next_signal_scan_start_rank"]
+                if autonomous_state is not None else None
+            ),
+            "next_signal_scan_end_rank": (
+                autonomous_state["next_signal_scan_end_rank"]
+                if autonomous_state is not None else None
+            ),
             **winner_quality,
             "next_decision": (
                 autonomous_state["next_decision"]
@@ -5255,6 +5733,22 @@ class CanaryService:
                 if autonomous_state is not None else None
             ),
         }
+        scan_projection = {
+            name: disabled_auto.get(name)
+            for name in (
+                "candidates_ranked",
+                "candidates_signal_checked",
+                "candidates_no_signal",
+                "actionable_candidates_found",
+                "selected_actionable_candidate",
+                "selected_actionable_rank",
+                "selected_actionable_score",
+                "signal_scan_cursor",
+                "signal_scan_ranking_run_id",
+                "next_signal_scan_start_rank",
+                "next_signal_scan_end_rank",
+            )
+        }
         selection_audit = dict(selection) if isinstance(selection, Mapping) else None
         if selection_audit is not None:
             selection_audit.update(
@@ -5276,6 +5770,7 @@ class CanaryService:
                 "display_state": display_state,
                 "control_state": "DISABLED",
                 "candidate": winner_id,
+                "control_candidate": None,
                 "winner_id": winner_id,
                 "winner_rank": selection.get("rank") if winner_id and selection else None,
                 "winner_score": selection.get("total_score") if winner_id and selection else None,
@@ -5289,6 +5784,7 @@ class CanaryService:
                 "ranking_timestamp": ranking_timestamp,
                 "eligibility_raw_count": eligibility_raw_count,
                 "eligible_count": eligible_count,
+                **scan_projection,
                 "rankable_raw_count": rankable_raw_count,
                 "rankable_count": rankable_count,
                 "venue": None,
@@ -5451,6 +5947,7 @@ class CanaryService:
             "display_state": display_state,
             "control_state": state,
             "candidate": selected_candidate,
+            "control_candidate": control_candidate,
             "winner_id": winner_id,
             "winner_rank": selection.get("rank") if winner_id and selection else None,
             "winner_score": selection.get("total_score") if winner_id and selection else None,
@@ -5460,6 +5957,7 @@ class CanaryService:
             "selection_invalidation_reason": selection_invalidation_reason,
             "selected_candidate": winner_id,
             "last_selected_candidate": last_selected_candidate,
+            **scan_projection,
             "ranking_run_id": ranking_run_id,
             "ranking_timestamp": ranking_timestamp,
             "venue": data.get("venue"),
@@ -5797,7 +6295,18 @@ class CanaryService:
             ).fetchone()
             if existing is not None and existing["event_id"] != reservation_event_id:
                 block("DUPLICATE_SIGNAL")
-            if candidate_id != snapshot.get("candidate"):
+            if state == AUTONOMOUS_MICRO_LIVE:
+                control_candidate = str(
+                    snapshot.get("control_candidate") or ""
+                ).strip()
+                candidate_matches = (
+                    bool(control_candidate)
+                    and bool(str(candidate_id).strip())
+                    and control_candidate == str(candidate_id).strip()
+                )
+            else:
+                candidate_matches = candidate_id == snapshot.get("candidate")
+            if not candidate_matches:
                 block(
                     "AUTO_CANARY_CANDIDATE_NOT_SELECTED"
                     if state == AUTONOMOUS_MICRO_LIVE
@@ -6148,10 +6657,24 @@ class CanaryService:
                     block("CANARY_KILLED")
                 if locked_snapshot["micro_live_canary"] not in {"ARMED", AUTONOMOUS_MICRO_LIVE}:
                     block("CANARY_NOT_ARMED")
-                if candidate_id != locked_snapshot.get("candidate"):
+                locked_state = str(
+                    locked_snapshot.get("micro_live_canary") or ""
+                ).upper()
+                if locked_state == AUTONOMOUS_MICRO_LIVE:
+                    control_candidate = str(
+                        locked_snapshot.get("control_candidate") or ""
+                    ).strip()
+                    candidate_matches = (
+                        bool(control_candidate)
+                        and bool(str(candidate_id).strip())
+                        and control_candidate == str(candidate_id).strip()
+                    )
+                else:
+                    candidate_matches = candidate_id == locked_snapshot.get("candidate")
+                if not candidate_matches:
                     block(
                         "AUTO_CANARY_CANDIDATE_NOT_SELECTED"
-                        if locked_snapshot["micro_live_canary"] == AUTONOMOUS_MICRO_LIVE
+                        if locked_state == AUTONOMOUS_MICRO_LIVE
                         else "CANDIDATE_MISMATCH"
                     )
                 expiry = locked_snapshot.get("expiry")
@@ -6254,17 +6777,17 @@ class CanaryService:
                 if control_state not in {"ARMED", AUTONOMOUS_MICRO_LIVE}:
                     block("CANARY_NOT_ARMED")
                 if control_state == AUTONOMOUS_MICRO_LIVE:
-                    selected = connection.execute(
-                        "SELECT * FROM canary_selection WHERE singleton=1"
-                    ).fetchone()
-                    selected_state = (
-                        self._selection_validation(dict(selected))
-                        if selected is not None
-                        else {}
-                    )
+                    # Autonomous actionable candidates are fenced by the
+                    # current control row.  The research winner in
+                    # ``canary_selection`` is intentionally not rewritten
+                    # when a READY fallback is bound.
+                    control_candidate = str(
+                        control["candidate_id"] or ""
+                    ).strip()
                     if (
-                        not selected_state.get("selection_valid")
-                        or selected_state.get("selected_candidate") != candidate_id
+                        not control_candidate
+                        or not str(candidate_id).strip()
+                        or control_candidate != str(candidate_id).strip()
                     ):
                         block("AUTO_CANARY_CANDIDATE_NOT_SELECTED")
                 elif str(control["candidate_id"]) != candidate_id:

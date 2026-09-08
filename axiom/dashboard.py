@@ -537,6 +537,19 @@ def _number_or_zero(value: Any) -> float:
     return number if math.isfinite(number) else 0.0
 
 _CANARY_SELECTION_STATUSES = frozenset({"CURRENT", "STALE", "NONE", "UNKNOWN"})
+_CANARY_AUTONOMOUS_FIELDS = (
+    "candidates_ranked",
+    "candidates_signal_checked",
+    "candidates_no_signal",
+    "actionable_candidates_found",
+    "selected_actionable_candidate",
+    "selected_actionable_rank",
+    "selected_actionable_score",
+    "signal_scan_cursor",
+    "signal_scan_ranking_run_id",
+    "next_signal_scan_start_rank",
+    "next_signal_scan_end_rank",
+)
 _CANARY_STATUS_FIELDS = (
     "eligibility_raw_count",
     "eligible_count",
@@ -550,13 +563,48 @@ _CANARY_STATUS_FIELDS = (
     "selection_reason",
     "selected_candidate",
     "last_selected_candidate",
+    *_CANARY_AUTONOMOUS_FIELDS,
 )
+_CANARY_RESEARCH_WINNER_FIELDS = ("winner_id", "winner_rank", "winner_score")
 _CANARY_READINESS_FIELDS = (
     "readiness_snapshot_status",
     "readiness_snapshot_stale",
     "readiness_snapshot_reason",
     "readiness_snapshot_updated_at",
 )
+
+
+def _canary_autonomous_projection(
+    *sources: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Project bounded autonomous scan fields without inventing values."""
+    flattened: list[Mapping[str, Any]] = []
+    for source in sources:
+        if not isinstance(source, Mapping):
+            continue
+        flattened.append(source)
+        for nested_name in (
+            "autonomous",
+            "autonomous_canary",
+            "status",
+            "status_report",
+            "readiness",
+            "worker",
+            "execution",
+        ):
+            nested = source.get(nested_name)
+            if isinstance(nested, Mapping):
+                flattened.append(nested)
+    projection: dict[str, Any] = {}
+    for name in _CANARY_AUTONOMOUS_FIELDS:
+        value: Any = None
+        for source in flattened:
+            candidate = source.get(name)
+            if not _display_value_missing(candidate):
+                value = _bounded_value(candidate)
+                break
+        projection[name] = value
+    return projection
 
 
 def _canary_status_projection(status: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -675,15 +723,30 @@ def _canary_status_projection(status: Mapping[str, Any] | None) -> dict[str, Any
             "latest_signal": _signal_projection(value("latest_signal")),
             "next_decision": value("next_decision"),
             "blocker": value("blocker"),
+            **_canary_autonomous_projection(source),
         }
     )
-    # ``winner_id`` remains current-only. Historical selections are represented
-    # by ``last_selected_candidate`` and never become executable again.
+    # Research winner fields describe the persisted ranking selection.  Keep
+    # them distinct from the actionable scan's selected candidate/rank/score.
     current_selection = selection_valid is True and selection_status == "CURRENT"
     projection["winner_id"] = selected_candidate if current_selection else None
-    if not current_selection:
-        projection["winner_rank"] = None
-        projection["winner_score"] = None
+    selected_winner = projection.get("selected_winner")
+    for name, aliases in (
+        ("winner_rank", ("rank",)),
+        ("winner_score", ("score", "total_score")),
+    ):
+        candidate = value(name)
+        if _display_value_missing(candidate):
+            for alias in aliases:
+                candidate = value(alias)
+                if not _display_value_missing(candidate):
+                    break
+        if _display_value_missing(candidate) and isinstance(selected_winner, Mapping):
+            for alias in (name, *aliases):
+                candidate = selected_winner.get(alias)
+                if not _display_value_missing(candidate):
+                    break
+        projection[name] = candidate if current_selection else None
     selected_winner = projection.get("selected_winner")
     if isinstance(selected_winner, Mapping):
         selected_winner = dict(selected_winner)
@@ -711,7 +774,8 @@ def _canary_status_projection(status: Mapping[str, Any] | None) -> dict[str, Any
             if name in projection
         }
     )
-    autonomous["winner_id"] = projection["winner_id"]
+    for name in _CANARY_RESEARCH_WINNER_FIELDS:
+        autonomous[name] = projection[name]
     for name, fallback in (
         ("rank", "winner_rank"),
         ("score", "winner_score"),
@@ -3179,10 +3243,15 @@ class DashboardData:
                         "blocker",
                         "last_signal_id",
                         "worker_status",
+                        *_CANARY_AUTONOMOUS_FIELDS,
                     )
                     if key in worker_section
                 }
                 autonomous = _patch_non_missing_values(autonomous, worker_fields)
+        canary_status = _patch_non_missing_values(
+            canary_status,
+            _canary_autonomous_projection(autonomous),
+        )
         blocker = _normalized_canary_blocker(
             _canonical_blocker(
                 worker_section if isinstance(worker_section, Mapping) else None,
@@ -3488,15 +3557,24 @@ class DashboardData:
                     "blocker",
                     "last_signal_id",
                     "worker_status",
+                    *_CANARY_AUTONOMOUS_FIELDS,
                 )
                 if key in worker_section
             }
             autonomous = _patch_non_missing_values(autonomous, worker_fields)
+        autonomous = _patch_non_missing_values(
+            autonomous,
+            _canary_autonomous_projection(canary, worker_section),
+        )
         autonomous.setdefault("rank", canary.get("winner_rank"))
         autonomous.setdefault("score", canary.get("winner_score"))
         autonomous.setdefault("selection_reason", canary.get("selection_reason"))
         autonomous.setdefault("next_decision", canary.get("next_decision"))
         canary["autonomous"] = autonomous
+        canary = _patch_non_missing_values(
+            canary,
+            _canary_autonomous_projection(autonomous),
+        )
         control_state = _canary_control_state(
             canary_report.get("control") if isinstance(canary_report, Mapping) else None,
             canary_report.get("authoritative_control") if isinstance(canary_report, Mapping) else None,
@@ -3641,20 +3719,35 @@ class DashboardData:
                 canary.get("real_execution_events", canary.get("execution_event_count", 0)),
             )
             result.setdefault("autonomous_canary", canary.get("autonomous", {}))
-        credentials = controls.get("credentials")
-        if isinstance(credentials, Mapping):
-            configured = bool(credentials.get("configured"))
-            result["credentials"] = {
-                "configured": configured,
-                "status": (
-                    "CONFIGURED" if configured else "NOT CONFIGURED"
+            result["autonomous_canary"] = _patch_non_missing_values(
+                result.get("autonomous_canary"),
+                _canary_autonomous_projection(
+                    canary,
+                    control_canary if isinstance(control_canary, Mapping) else None,
+                    controls.get("autonomous_canary_worker"),
                 ),
-                "secret_values_exposed": False,
-            }
-        else:
-            result["credentials"] = canary_module.CredentialStore().safe_projection(
-                allow_environment=False
             )
+        result.update(
+            _canary_autonomous_projection(
+                result,
+                result.get("autonomous_canary"),
+                result.get("autonomous_canary_worker"),
+            )
+        )
+        # ``OperatorControlPlane.status`` already returns the bounded
+        # credential metadata projection.  Re-project only its boolean state;
+        # never load credential values during a dashboard read.
+        raw_credentials = controls.get("credentials")
+        configured = (
+            bool(raw_credentials.get("configured"))
+            if isinstance(raw_credentials, Mapping)
+            else False
+        )
+        result["credentials"] = {
+            "configured": configured,
+            "status": "CONFIGURED" if configured else "NOT CONFIGURED",
+            "secret_values_exposed": False,
+        }
         # Keep control-only status available without colliding with the
         # persisted ``raw`` research payload.
         result.setdefault("control_status", controls)
@@ -3664,6 +3757,11 @@ class DashboardData:
         configured = self._configured("operator")
         if configured is not None:
             result = dict(configured) if isinstance(configured, Mapping) else {"value": configured}
+            result["autonomous_canary"] = _patch_non_missing_values(
+                result.get("autonomous_canary"),
+                _canary_autonomous_projection(result),
+            )
+            result.update(_canary_autonomous_projection(result.get("autonomous_canary")))
             if self.control is not None:
                 result["operator_controls"] = self.control.status()
             return result
@@ -4188,6 +4286,30 @@ def _dashboard_html(control_token: str | None = None) -> str:
       $("canary-summary").insertAdjacentHTML("beforeend",`<article class="panel"><div class="section-title"><h2>Latest signal</h2><span class="badge ${statusClass(readiness)}">${safe(readiness)}</span></div>${detail}<p class="page-note">Kill prevents new submissions; an in-flight request is recorded, in-flight not retracted, and never retried automatically.</p></article>`);
       $("canary-trades").innerHTML=arr(c.trades).length?`<table><thead><tr><th>Time</th><th>Candidate</th><th>Market</th><th>Side</th><th>Status</th><th>Price Δ</th></tr></thead><tbody>${arr(c.trades).map(t=>`<tr><td>${safe(dateText(t.timestamp))}</td><td>${safe(t.candidate_id)}</td><td>${safe(t.market_id)}</td><td>${safe(t.side)}</td><td><span class="badge ${statusClass(t.status)}">${safe(t.status)}</span></td><td>${safe(t.price_difference)}</td></tr>`).join("")}</tbody></table>`:empty("No canary execution evidence","No order has been submitted by the autonomous worker.");
     }
+    function renderCanaryAutonomousState(data) {
+      const c=data?.canary||{}, auto=data?.autonomous_canary||c.autonomous||{};
+      const read=(name)=>auto[name]??c[name]??null;
+      const researchCandidate=c.selected_candidate??c.last_selected_candidate??auto.selected_candidate??auto.last_selected_candidate??null;
+      const researchRank=c.winner_rank??auto.rank??null;
+      const actionableCandidate=read("selected_actionable_candidate");
+      const actionableFound=read("actionable_candidates_found");
+      const signalChecked=read("candidates_signal_checked");
+      const noSignal=read("candidates_no_signal");
+      const observed=actionableFound!=null||signalChecked!=null||noSignal!=null;
+      const hasActionable=actionableCandidate!=null&&String(actionableCandidate).trim()!=="";
+      const noAction=!hasActionable&&observed&&(
+        (actionableFound!=null&&Number(actionableFound)===0)||
+        (actionableFound==null&&noSignal!=null&&Number(noSignal)>0)
+      );
+      const status=noAction?"NO ACTIONABLE SIGNAL":hasActionable?"ACTIONABLE SIGNAL":"UNKNOWN";
+      const currentCandidate=hasActionable?actionableCandidate:noAction?"NONE":null;
+      const scanWindow=`${safe(read("next_signal_scan_start_rank"))}–${safe(read("next_signal_scan_end_rank"))}`;
+      const existing=$("canary-actionable-opportunity");
+      if(existing)existing.remove();
+      $("canary-summary")?.insertAdjacentHTML("afterbegin",`<article id="canary-actionable-opportunity" class="panel"><div class="section-title"><h2>ACTIONABLE SIGNAL SCAN</h2><span class="badge ${statusClass(status)}">${safe(status)}</span></div><div class="three-col"><div class="key-value"><span class="key">Research winner · candidate</span><strong>${safe(researchCandidate)}</strong></div><div class="key-value"><span class="key">Research rank</span><strong>${safe(researchRank)}</strong></div><div class="key-value"><span class="key">Current actionable candidate</span><strong>${safe(currentCandidate)}</strong></div><div class="key-value"><span class="key">Candidates ranked</span><strong>${count(read("candidates_ranked"))}</strong></div><div class="key-value"><span class="key">Signal checked this tick</span><strong>${count(signalChecked)}</strong></div><div class="key-value"><span class="key">No signal</span><strong>${count(noSignal)}</strong></div><div class="key-value"><span class="key">Actionable</span><strong>${count(actionableFound)}</strong></div><div class="key-value"><span class="key">Chosen actionable rank</span><strong>${safe(read("selected_actionable_rank"))}</strong></div><div class="key-value"><span class="key">Chosen score</span><strong>${safe(read("selected_actionable_score"))}</strong></div></div>${noAction?`<p class="page-note"><strong>NO ACTIONABLE SIGNAL</strong> · checked ${count(signalChecked)} candidate(s) · next scan window ranks ${scanWindow}</p>`:""}<p class="page-note">Signal scan ranking run ${safe(read("signal_scan_ranking_run_id"))} · cursor ${safe(read("signal_scan_cursor"))}</p></article>`);
+    }
+    const _renderCanaryResearchAndAction = renderCanary;
+    renderCanary = (data) => { _renderCanaryResearchAndAction(data); renderCanaryAutonomousState(data); };
     function renderBtc(data) { const b=operator.btc||{},summary=b.catalog_summary||{},rows=arr(summary.latest_by_timeframe||summary.timeframes),fallback=arr(b.catalog),catalogRows=rows.length?rows:fallback; $("btc-summary").innerHTML=catalogRows.length?`<div class="three-col"><div class="key-value"><span class="key">Catalog timeframes</span><strong>${count(catalogRows.length)}</strong></div><div class="key-value"><span class="key">Rows observed</span><strong>${count(catalogRows.reduce((total,item)=>total+Number(item.row_count||0),0))}</strong></div><div class="key-value"><span class="key">Latest report</span><strong>${safe(dateText(b.latest_report?.created_at))}</strong></div></div>`:empty("BTC history not initialized","Run bootstrap-history --crypto, then btc-research."); $("btc-experiments").innerHTML=""; }
     async function loadCrypto(symbol,persist=true) { state.selected=symbol; state.expanded=true; if(persist)saveState(true); try { const response=await fetch(`/api/v2/crypto-research/${encodeURIComponent(symbol)}`,{cache:"no-store"}),data=await response.json(); $("crypto-detail").innerHTML=arr(data.items).length?`<details open><summary>Crypto detail · ${safe(symbol)}</summary><div class="three-col"><div class="key-value"><span class="key">Universe version</span><strong>${safe(data.universe_version)}</strong></div><div class="key-value"><span class="key">Strategies</span><strong>${count(arr(data.strategies).length)}</strong></div><div class="key-value"><span class="key">Families</span><strong>${count(arr(data.families).length)}</strong></div></div><pre>${safe(json({catalogs:data.items,reports:data.reports,validation:data.validation,coverage:data.coverage}))}</pre></details>`:empty("Crypto symbol unavailable","No catalog is persisted for this symbol."); } catch(e) { $("crypto-detail").innerHTML=empty("Crypto detail unavailable",e.message); } }
     function renderCrypto(data) { const rows=arr(data.items),symbols=arr(data.symbols),summary={universe_version:data.universe_version,symbols:data.symbol_count??symbols.length,assets:data.asset_count??arr(data.assets).length,catalogs:data.total,reports:arr(data.reports).length}; $("crypto-summary").innerHTML=`<div class="three-col">${[["Universe version",summary.universe_version],["Symbols",summary.symbols],["Assets",summary.assets],["Catalogs",summary.catalogs],["Reports",summary.reports],["Families",arr(data.families).length]].map(([label,value])=>`<div class="key-value"><span class="key">${safe(label)}</span><strong>${safe(value)}</strong></div>`).join("")}</div>`; $("crypto-table").innerHTML=rows.length?`<table><thead><tr><th>Symbol</th><th>Dataset</th><th>Version</th><th>Source</th><th>Coverage</th><th>Strategies</th><th>Experiments</th><th>Validation</th><th>Families</th></tr></thead><tbody>${rows.map(i=>`<tr><td><button class="link crypto-symbol-row" data-symbol="${encodeURIComponent(i.symbol||"")}">${safe(i.symbol)}</button></td><td>${safe(i.dataset_id)}</td><td>${safe(i.dataset_version)}</td><td>${safe(i.source_type)}</td><td>${safe(json(i.coverage))}</td><td>${safe(json(i.strategies))}</td><td>${safe(json(i.experiments))}</td><td>${safe(json(i.validation))}</td><td>${safe(json(i.families))}</td></tr>`).join("")}</tbody></table>`:empty("No crypto catalogs","No crypto catalog or report has been persisted."); pager("crypto",data); document.querySelectorAll(".crypto-symbol-row").forEach(b=>b.addEventListener("click",()=>loadCrypto(decodeURIComponent(b.dataset.symbol)))); }
