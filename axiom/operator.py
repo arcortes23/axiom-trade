@@ -36,6 +36,15 @@ from .storage import AxiomStore
 DEFAULT_HERMES_JOB_ID = "f1d27bf8c27a"
 BOOTSTRAP_JOB_NAME = "crypto-universe-bootstrap"
 HERMES_STATE_NAME = "hermes-control"
+# The configured Hermes job is an external reference only.  The operator has
+# no local verifier for that process, so scheduler state must never be exposed
+# as the external job's status.
+HERMES_CONTROL_SCOPE = "INTERNAL_RESEARCH_QUEUE_PROCESSOR"
+HERMES_EXTERNAL_STATUS = "UNKNOWN"
+HERMES_EXTERNAL_EVIDENCE = (
+    "No local verifier is available for the external Hermes job; "
+    "scheduler state is internal-only."
+)
 _SAFE_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$")
 _SECRET_KEY = re.compile(r"(?:secret|private|password|token|api[_-]?key|credential|mnemonic)", re.I)
 _ALLOWED_ACTIONS = frozenset(
@@ -782,6 +791,7 @@ _OPERATOR_PRESERVE_KEYS = (
     "winner_rank",
     "winner_score",
     "autonomous",
+    "candidate_status",
 )
 
 
@@ -849,7 +859,6 @@ def _operator_job_payload(job: Mapping[str, Any] | None) -> dict[str, Any]:
 
 class HermesOperatorAdapter:
     """Fixed in-process Hermes adapter; it accepts no executable or argv."""
-
     def __init__(self, store: AxiomStore, job_id: str) -> None:
         self.store = store
         self.job_id = _safe_identifier(job_id, "Hermes job ID")
@@ -857,17 +866,38 @@ class HermesOperatorAdapter:
     def state(self) -> dict[str, Any]:
         raw = self.store.get_scheduler_state(HERMES_STATE_NAME) or {}
         state = dict(raw) if isinstance(raw, Mapping) else {}
+        # This is the control state of Axiom's in-process queue processor.
+        # It is deliberately kept separate from the external Hermes status,
+        # which cannot be verified by this adapter.
         status = str(state.get("status") or "ACTIVE").upper()
         if status not in {"ACTIVE", "PAUSED"}:
             status = "ACTIVE"
+        schedule = state.get("schedule") or "after_each_collection"
+        last_cycle_at = state.get("last_cycle_at")
+        if last_cycle_at is None:
+            last_cycle_at = state.get("last_run_at")
+        trigger = state.get("trigger") or schedule
         return {
+            # Legacy scheduler fields remain available for the node and
+            # existing callers; status is explicitly the local queue status.
             "job_id": self.job_id,
             "status": status,
-            "schedule": state.get("schedule") or "after_each_collection",
+            "schedule": schedule,
             "last_run_at": state.get("last_run_at"),
             "next_run_at": state.get("next_run_at"),
             "last_result": _safe_value(state.get("last_result")),
             "run_requested_at": state.get("run_requested_at"),
+            "control_scope": HERMES_CONTROL_SCOPE,
+            "external_hermes": {
+                "job_id": self.job_id,
+                "status": HERMES_EXTERNAL_STATUS,
+                "evidence": HERMES_EXTERNAL_EVIDENCE,
+            },
+            "internal_queue": {
+                "status": status,
+                "trigger": trigger,
+                "last_cycle_at": last_cycle_at,
+            },
         }
 
     def set_status(self, status: str) -> dict[str, Any]:
@@ -1272,7 +1302,9 @@ class OperatorControlPlane:
         report: Mapping[str, Any] = {}
         legacy_readiness: Mapping[str, Any] = {}
         try:
-            readiness_method = getattr(canary, "readiness_snapshot", None)
+            readiness_method = getattr(canary, "status", None)
+            if not callable(readiness_method):
+                readiness_method = getattr(canary, "readiness_snapshot", None)
             if callable(readiness_method):
                 raw_readiness = readiness_method()
                 candidate_readiness = _operator_safe_mapping(raw_readiness)
@@ -1598,7 +1630,17 @@ class OperatorControlPlane:
             else:
                 public = _safe_value(result)
             self._audit(action_value, target_value, success=True, result=public)
-            return {"ok": True, "action": action_value, "target": target_value, "result": public, "paper_only": True, "live_execution": False}
+            response = {
+                "ok": True,
+                "action": action_value,
+                "target": target_value,
+                "result": public,
+                "paper_only": True,
+                "live_execution": False,
+            }
+            if action_value.startswith("hermes."):
+                response["control_scope"] = HERMES_CONTROL_SCOPE
+            return response
         except OperatorControlError as exc:
             reason = exc.code
         except CanaryBlocked as exc:
@@ -1607,13 +1649,30 @@ class OperatorControlPlane:
             reason = type(exc).__name__.upper()
         except Exception as exc:
             reason = type(exc).__name__.upper()
-        self._audit(action_value or "invalid", target_value, success=False, reason=reason, result={"ok": False, "reason": reason})
-        return {"ok": False, "action": action_value, "target": target_value, "reason": reason, "paper_only": True, "live_execution": False}
+        failure = {
+            "ok": False,
+            "action": action_value,
+            "target": target_value,
+            "reason": reason,
+            "paper_only": True,
+            "live_execution": False,
+        }
+        if action_value.startswith("hermes."):
+            failure["control_scope"] = HERMES_CONTROL_SCOPE
+        self._audit(
+            action_value or "invalid",
+            target_value,
+            success=False,
+            reason=reason,
+            result={"ok": False, "reason": reason},
+        )
+        return failure
 
 
 __all__ = [
     "DEFAULT_HERMES_JOB_ID",
     "BOOTSTRAP_JOB_NAME",
+    "HERMES_CONTROL_SCOPE",
     "CANARY_CONNECTIVITY_CONFIG_KEY",
     "HermesOperatorAdapter",
     "OperatorControlError",

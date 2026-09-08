@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+import hashlib
+import json
 import math
 import threading
+import uuid
 from typing import Any, Callable, Mapping
 
 from .canary import (
@@ -12,6 +15,7 @@ from .canary import (
     CanaryBlocked,
     CanaryService,
     PolymarketClobV2Venue,
+    _UNSET,
 )
 from .domain import ensure_utc, utc_now
 from .ranker import CandidateCanaryRanker
@@ -40,7 +44,16 @@ class AutonomousCanaryWorker:
         self._consecutive_failures = 0
         self._next_retry_at: datetime | None = None
         self._unknown_signal_ids: set[str] = set()
+        self._last_scan_skip_reasons: dict[str, int] = {
+            reason: 0 for reason in self._SCAN_SKIP_REASONS
+        }
     _SCAN_CAP = 10
+    _SCAN_SKIP_REASONS = (
+        "INVALID_RANKING_BINDING",
+        "QUALIFICATION_INVALID",
+        "DUPLICATE_CLUSTER_DEFERRED",
+        "CYCLE_REMAINDER",
+    )
     _SCAN_FIELDS = (
         "candidates_ranked",
         "candidates_signal_checked",
@@ -53,6 +66,16 @@ class AutonomousCanaryWorker:
         "signal_scan_ranking_run_id",
         "next_signal_scan_start_rank",
         "next_signal_scan_end_rank",
+        "signal_scan_cycle_id",
+        "signal_scan_candidate_universe_hash",
+        "signal_scan_cycle_started_at",
+        "signal_scan_cycle_completed_at",
+        "signal_scan_cycle_complete",
+        "signal_scan_checked_this_cycle",
+        "signal_scan_remaining_this_cycle",
+        "signal_scan_coverage_percentage",
+        "signal_scan_skip_reasons_json",
+        "signal_scan_status",
     )
 
     @staticmethod
@@ -164,15 +187,42 @@ class AutonomousCanaryWorker:
         ranking_run_id: str | None,
         timestamp: datetime,
     ) -> list[Mapping[str, Any]]:
+        """Return rows fenced to the current run and current qualification evidence."""
+        self._last_scan_skip_reasons = {
+            reason: 0 for reason in self._SCAN_SKIP_REASONS
+        }
         if not ranking_run_id:
             return []
         try:
             rows = ranker.rankings(limit=10_000)
         except Exception:
+            self._last_scan_skip_reasons["INVALID_RANKING_BINDING"] += 1
             return []
         valid: list[tuple[Mapping[str, Any], int]] = []
         representative_clusters: set[str] = set()
         for row in rows:
+            candidate_id = str(row.get("candidate_id") or "").strip()
+            if not candidate_id:
+                self._last_scan_skip_reasons["INVALID_RANKING_BINDING"] += 1
+                continue
+            with self.store._lock:
+                eligibility = self.store.connection.execute(
+                    "SELECT candidate_id,frozen_hash,evidence_json "
+                    "FROM canary_eligibility WHERE candidate_id=?",
+                    (candidate_id,),
+                ).fetchone()
+            binding = ranker.service._eligibility_binding_result(
+                candidate_id,
+                eligibility,
+                verify_attestation=False,
+            )
+            qualification_hash = str(binding.get("qualification_hash") or "").strip()
+            if not binding.get("bound") or not qualification_hash:
+                self._last_scan_skip_reasons["QUALIFICATION_INVALID"] += 1
+                continue
+            if str(row.get("qualification_hash") or "").strip() != qualification_hash:
+                self._last_scan_skip_reasons["QUALIFICATION_INVALID"] += 1
+                continue
             try:
                 accepted = ranker.validate_persisted_ranking(
                     row,
@@ -182,19 +232,20 @@ class AutonomousCanaryWorker:
             except Exception:
                 accepted = False
             if not accepted:
+                self._last_scan_skip_reasons["INVALID_RANKING_BINDING"] += 1
                 continue
-            # Rank zero is reserved for the persisted diversity follower
-            # representation.  A representative (or a row with a forged
-            # reason marker) must never become actionable.
             try:
                 persisted_rank = int(row.get("rank"))
             except (TypeError, ValueError, OverflowError):
+                self._last_scan_skip_reasons["INVALID_RANKING_BINDING"] += 1
                 continue
             if persisted_rank < 0:
+                self._last_scan_skip_reasons["INVALID_RANKING_BINDING"] += 1
                 continue
             try:
                 representative_marker = int(row.get("cluster_representative"))
             except (TypeError, ValueError, OverflowError):
+                self._last_scan_skip_reasons["INVALID_RANKING_BINDING"] += 1
                 continue
             if persisted_rank == 0:
                 if not (
@@ -202,19 +253,27 @@ class AutonomousCanaryWorker:
                     == "DIVERSITY_CLUSTER_NON_REPRESENTATIVE"
                     and representative_marker == 0
                 ):
+                    self._last_scan_skip_reasons["INVALID_RANKING_BINDING"] += 1
                     continue
             elif representative_marker == 1:
                 representative_clusters.add(str(row.get("cluster_key") or ""))
             valid.append((row, persisted_rank))
-        # A follower is meaningful only when this same fenced run persisted
-        # its cluster representative.  In particular, an orphaned or forged
-        # rank-zero follower must not turn a no-rankable run into a candidate.
-        return [
+        ordered_rows = [
             row
             for row, persisted_rank in valid
             if persisted_rank > 0
             or str(row.get("cluster_key") or "") in representative_clusters
         ]
+        self._last_scan_skip_reasons["DUPLICATE_CLUSTER_DEFERRED"] = min(
+            10_000,
+            sum(
+                1
+                for row, persisted_rank in valid
+                if persisted_rank == 0
+                and str(row.get("cluster_key") or "") in representative_clusters
+            ),
+        )
+        return ordered_rows
 
     @staticmethod
     def _actionable_rank(
@@ -244,7 +303,12 @@ class AutonomousCanaryWorker:
         with self.store._lock:
             row = self.store.connection.execute(
                 "SELECT signal_scan_cursor,signal_scan_ranking_run_id,"
-                "next_signal_scan_start_rank,next_signal_scan_end_rank "
+                "next_signal_scan_start_rank,next_signal_scan_end_rank,"
+                "signal_scan_cycle_id,signal_scan_candidate_universe_hash,"
+                "signal_scan_cycle_started_at,signal_scan_cycle_completed_at,"
+                "signal_scan_cycle_complete,signal_scan_checked_this_cycle,"
+                "signal_scan_remaining_this_cycle,signal_scan_coverage_percentage,"
+                "signal_scan_skip_reasons_json,signal_scan_status "
                 "FROM canary_autonomous_state WHERE singleton=1"
             ).fetchone()
         return dict(row) if row is not None else {}
@@ -291,10 +355,21 @@ class AutonomousCanaryWorker:
         selected_actionable_candidate: str | None = None,
         selected_actionable_rank: int | None = None,
         selected_actionable_score: float | None = None,
-        signal_scan_cursor: int = 0,
-        signal_scan_ranking_run_id: str | None = None,
-        next_signal_scan_start_rank: int | None = None,
-        next_signal_scan_end_rank: int | None = None,
+        signal_scan_cursor: int | None | object = _UNSET,
+        signal_scan_ranking_run_id: str | None | object = _UNSET,
+        next_signal_scan_start_rank: int | None | object = _UNSET,
+        next_signal_scan_end_rank: int | None | object = _UNSET,
+        signal_scan_cycle_id: str | None | object = _UNSET,
+        signal_scan_candidate_universe_hash: str | None | object = _UNSET,
+        signal_scan_cycle_started_at: str | None | object = _UNSET,
+        signal_scan_cycle_completed_at: str | None | object = _UNSET,
+        signal_scan_cycle_complete: int | bool | None | object = _UNSET,
+        signal_scan_checked_this_cycle: int | None | object = _UNSET,
+        signal_scan_remaining_this_cycle: int | None | object = _UNSET,
+        signal_scan_coverage_percentage: float | None | object = _UNSET,
+        signal_scan_skip_reasons_json: str | None | object = _UNSET,
+        signal_scan_status: str | None | object = _UNSET,
+        signal_scan_checked_keys: list[Mapping[str, Any]] | None = None,
         error_code: str | None = None,
     ) -> None:
         failed = error_code is not None
@@ -308,6 +383,44 @@ class AutonomousCanaryWorker:
         else:
             self._consecutive_failures = 0
             self._next_retry_at = None
+
+        def nonnegative(value: Any) -> int | None | object:
+            if value is _UNSET:
+                return _UNSET
+            try:
+                parsed = int(value) if value is not None else None
+            except (TypeError, ValueError):
+                parsed = None
+            return max(0, parsed) if parsed is not None else None
+
+        def text(value: Any) -> str | None | object:
+            if value is _UNSET:
+                return _UNSET
+            return str(value) if value is not None else None
+
+        def complete(value: Any) -> int | None | object:
+            if value is _UNSET:
+                return _UNSET
+            return int(bool(value)) if value is not None else None
+
+        def coverage(value: Any) -> float | None | object:
+            if value is _UNSET:
+                return _UNSET
+            try:
+                parsed = float(value) if value is not None else None
+            except (TypeError, ValueError):
+                parsed = None
+            return (
+                min(100.0, max(0.0, parsed))
+                if parsed is not None and math.isfinite(parsed)
+                else 0.0
+            )
+
+        def skip_reasons(value: Any) -> str | None | object:
+            if value is _UNSET:
+                return _UNSET
+            return str(value or "{}")[:4096]
+
         try:
             service.record_autonomous_decision(
                 next_decision=next_decision,
@@ -328,16 +441,39 @@ class AutonomousCanaryWorker:
                 signals_generated=max(0, int(signals_generated)),
                 orders_attempted=max(0, int(orders_attempted)),
                 candidates_ranked=max(0, int(candidates_ranked)),
+                signal_scan_cycle_id=text(signal_scan_cycle_id),
+                signal_scan_candidate_universe_hash=text(
+                    signal_scan_candidate_universe_hash
+                ),
+                signal_scan_cycle_started_at=text(signal_scan_cycle_started_at),
+                signal_scan_cycle_completed_at=text(signal_scan_cycle_completed_at),
+                signal_scan_cycle_complete=complete(signal_scan_cycle_complete),
+                signal_scan_checked_this_cycle=nonnegative(
+                    signal_scan_checked_this_cycle
+                ),
+                signal_scan_remaining_this_cycle=nonnegative(
+                    signal_scan_remaining_this_cycle
+                ),
+                signal_scan_coverage_percentage=coverage(
+                    signal_scan_coverage_percentage
+                ),
+                signal_scan_skip_reasons_json=skip_reasons(
+                    signal_scan_skip_reasons_json
+                ),
+                signal_scan_status=text(signal_scan_status),
+                signal_scan_checked_keys=signal_scan_checked_keys,
                 candidates_signal_checked=max(0, int(candidates_signal_checked)),
                 candidates_no_signal=max(0, int(candidates_no_signal)),
                 actionable_candidates_found=max(0, int(actionable_candidates_found)),
                 selected_actionable_candidate=selected_actionable_candidate,
                 selected_actionable_rank=selected_actionable_rank,
                 selected_actionable_score=selected_actionable_score,
-                signal_scan_cursor=max(0, int(signal_scan_cursor)),
-                signal_scan_ranking_run_id=signal_scan_ranking_run_id,
-                next_signal_scan_start_rank=next_signal_scan_start_rank,
-                next_signal_scan_end_rank=next_signal_scan_end_rank,
+                signal_scan_cursor=nonnegative(signal_scan_cursor),
+                signal_scan_ranking_run_id=text(signal_scan_ranking_run_id),
+                next_signal_scan_start_rank=nonnegative(
+                    next_signal_scan_start_rank
+                ),
+                next_signal_scan_end_rank=nonnegative(next_signal_scan_end_rank),
             )
         except Exception:
             return
@@ -359,10 +495,72 @@ class AutonomousCanaryWorker:
         selected_actionable_candidate: str | None = None
         selected_actionable_rank: int | None = None
         selected_actionable_score: float | None = None
-        signal_scan_cursor = 0
-        signal_scan_ranking_run_id: str | None = None
-        next_signal_scan_start_rank: int | None = None
-        next_signal_scan_end_rank: int | None = None
+        try:
+            previous_scan_projection = self._scan_state()
+        except Exception:
+            previous_scan_projection = {}
+
+        def previous_int(name: str, default: int | None = None) -> int | None:
+            try:
+                value = previous_scan_projection.get(name)
+                return int(value) if value is not None else default
+            except (TypeError, ValueError):
+                return default
+
+        signal_scan_cursor = previous_int("signal_scan_cursor", 0) or 0
+        signal_scan_ranking_run_id = (
+            str(previous_scan_projection.get("signal_scan_ranking_run_id") or "").strip()
+            or None
+        )
+        next_signal_scan_start_rank = previous_int("next_signal_scan_start_rank")
+        next_signal_scan_end_rank = previous_int("next_signal_scan_end_rank")
+        signal_scan_cycle_id = (
+            str(previous_scan_projection.get("signal_scan_cycle_id") or "").strip()
+            or None
+        )
+        signal_scan_candidate_universe_hash = (
+            str(
+                previous_scan_projection.get(
+                    "signal_scan_candidate_universe_hash"
+                )
+                or ""
+            ).strip()
+            or None
+        )
+        signal_scan_cycle_started_at = (
+            str(previous_scan_projection.get("signal_scan_cycle_started_at") or "")
+            or None
+        )
+        signal_scan_cycle_completed_at = (
+            str(previous_scan_projection.get("signal_scan_cycle_completed_at") or "")
+            or None
+        )
+        signal_scan_cycle_complete = int(
+            bool(previous_int("signal_scan_cycle_complete", 0))
+        )
+        signal_scan_checked_this_cycle = previous_int(
+            "signal_scan_checked_this_cycle", 0
+        ) or 0
+        signal_scan_remaining_this_cycle = previous_int(
+            "signal_scan_remaining_this_cycle", 0
+        ) or 0
+        signal_scan_coverage_percentage = self._finite(
+            previous_scan_projection.get("signal_scan_coverage_percentage"),
+            0.0,
+        )
+        signal_scan_skip_reasons_json = str(
+            previous_scan_projection.get("signal_scan_skip_reasons_json") or "{}"
+        )
+        signal_scan_status = str(
+            previous_scan_projection.get("signal_scan_status") or "UNKNOWN"
+        )
+        signal_scan_checked_keys: list[Mapping[str, Any]] = []
+        scan_checked_set: set[tuple[str, str]] = set()
+        scan_universe_keys: set[tuple[str, str]] = set()
+        ordered: list[Mapping[str, Any]] = []
+        scan_rows: list[Mapping[str, Any]] = []
+        update_scan_projection_fn: Callable[..., None] | None = None
+        scan_payload_fn: Callable[[], dict[str, Any]] | None = None
         try:
             service = CanaryService(self.store, clock=self.clock)
             self._record_start(service, timestamp)
@@ -404,35 +602,163 @@ class AutonomousCanaryWorker:
                     if isinstance(ranking.get("rankings"), list)
                     else []
                 )
-            candidates_evaluated = max(candidates_evaluated, candidates_ranked)
-            # A ranking run with no rankable candidates cannot authorize a
-            # signal scan.  The persisted ranking table may still contain
-            # structural rows (for example, rank-zero followers), but those
-            # rows are not actionable without a rankable representative in
-            # this run.
+            previous = self._scan_state()
+            previous_cycle_id = str(previous.get("signal_scan_cycle_id") or "").strip()
+            try:
+                previous_complete = int(previous.get("signal_scan_cycle_complete") or 0) == 1
+            except (TypeError, ValueError):
+                previous_complete = False
+            if previous_cycle_id and not previous_complete:
+                signal_scan_cycle_id = previous_cycle_id
+                signal_scan_cycle_started_at = (
+                    str(previous.get("signal_scan_cycle_started_at") or timestamp.isoformat())
+                )
+                with self.store._lock:
+                    checked_rows = self.store.connection.execute(
+                        "SELECT candidate_id,qualification_hash "
+                        "FROM canary_signal_scan_checked WHERE cycle_id=?",
+                        (signal_scan_cycle_id,),
+                    ).fetchall()
+                scan_checked_set = {
+                    (
+                        str(item["candidate_id"] or "").strip(),
+                        str(item["qualification_hash"] or "").strip(),
+                    )
+                    for item in checked_rows
+                    if str(item["candidate_id"] or "").strip()
+                    and str(item["qualification_hash"] or "").strip()
+                }
+            else:
+                signal_scan_cycle_id = "scan-" + uuid.uuid4().hex[:24]
+                signal_scan_cycle_started_at = timestamp.isoformat()
+                scan_checked_set = set()
             if candidates_ranked == 0:
                 ordered = []
-            previous = self._scan_state()
-            try:
-                previous_cursor = max(0, int(previous.get("signal_scan_cursor") or 0))
-            except (TypeError, ValueError):
-                previous_cursor = 0
-            ranking_changed = (
-                signal_scan_ranking_run_id is not None
-                and str(previous.get("signal_scan_ranking_run_id") or "")
-                != signal_scan_ranking_run_id
-            )
-            signal_scan_cursor = 0 if ranking_changed else previous_cursor
-            if not ordered:
-                signal_scan_cursor = 0
-                scan_start = scan_end = next_signal_scan_start_rank = next_signal_scan_end_rank = 0
+            scan_universe_keys = {
+                (
+                    str(row.get("candidate_id") or "").strip(),
+                    str(row.get("qualification_hash") or "").strip(),
+                )
+                for row in ordered
+                if str(row.get("candidate_id") or "").strip()
+                and str(row.get("qualification_hash") or "").strip()
+            }
+            scan_checked_set.intersection_update(scan_universe_keys)
+            signal_scan_candidate_universe_hash = hashlib.sha256(
+                json.dumps(
+                    sorted(
+                        (
+                            {
+                                "candidate_id": candidate_id,
+                                "qualification_hash": qualification_hash,
+                            }
+                            for candidate_id, qualification_hash in scan_universe_keys
+                        ),
+                        key=lambda item: (
+                            item["candidate_id"],
+                            item["qualification_hash"],
+                        ),
+                    ),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+
+            def remaining_rows() -> list[Mapping[str, Any]]:
+                return [
+                    row
+                    for row in ordered
+                    if (
+                        str(row.get("candidate_id") or "").strip(),
+                        str(row.get("qualification_hash") or "").strip(),
+                    )
+                    not in scan_checked_set
+                ]
+
+            remaining = remaining_rows()
+            scan_rows = remaining[: self._SCAN_CAP]
+            if scan_rows:
+                first_remaining = next(
+                    (
+                        index
+                        for index, row in enumerate(ordered)
+                        if row is scan_rows[0]
+                    ),
+                    0,
+                )
+                scan_start = first_remaining
+                scan_end = min(first_remaining + self._SCAN_CAP, len(ordered))
             else:
-                if signal_scan_cursor >= len(ordered):
+                scan_start = scan_end = 0
+            signal_scan_cursor = scan_start
+            next_signal_scan_start_rank = scan_start
+            next_signal_scan_end_rank = scan_end
+
+            def update_scan_projection(*, force_complete: bool = False, actionable: bool = False) -> None:
+                nonlocal signal_scan_checked_this_cycle
+                nonlocal signal_scan_remaining_this_cycle
+                nonlocal signal_scan_coverage_percentage
+                nonlocal signal_scan_cycle_complete
+                nonlocal signal_scan_cycle_completed_at
+                nonlocal signal_scan_cursor
+                nonlocal next_signal_scan_start_rank
+                nonlocal next_signal_scan_end_rank
+                nonlocal signal_scan_skip_reasons_json
+                nonlocal signal_scan_status
+                remaining_now = remaining_rows()
+                signal_scan_checked_this_cycle = len(scan_checked_set)
+                signal_scan_remaining_this_cycle = len(remaining_now)
+                total = len(scan_universe_keys)
+                signal_scan_coverage_percentage = (
+                    100.0 * signal_scan_checked_this_cycle / total if total else 100.0
+                )
+                complete = force_complete or not remaining_now
+                signal_scan_cycle_complete = int(complete)
+                signal_scan_cycle_completed_at = (
+                    timestamp.isoformat() if complete else None
+                )
+                if remaining_now:
+                    first = next(
+                        (
+                            index
+                            for index, row in enumerate(ordered)
+                            if row is remaining_now[0]
+                        ),
+                        0,
+                    )
+                    signal_scan_cursor = first
+                    next_signal_scan_start_rank = first
+                    next_signal_scan_end_rank = min(first + self._SCAN_CAP, len(ordered))
+                else:
                     signal_scan_cursor = 0
-                scan_start = signal_scan_cursor
-                scan_end = min(scan_start + self._SCAN_CAP, len(ordered))
-                next_signal_scan_start_rank = scan_start
-                next_signal_scan_end_rank = scan_end
+                    next_signal_scan_start_rank = 0
+                    next_signal_scan_end_rank = (
+                        min(self._SCAN_CAP, len(ordered)) if actionable else 0
+                    )
+                skips = {
+                    reason: min(
+                        10_000,
+                        max(0, int(self._last_scan_skip_reasons.get(reason, 0))),
+                    )
+                    for reason in self._SCAN_SKIP_REASONS
+                }
+                skips["CYCLE_REMAINDER"] = min(
+                    10_000,
+                    max(0, signal_scan_remaining_this_cycle),
+                )
+                signal_scan_skip_reasons_json = json.dumps(
+                    skips, sort_keys=True, separators=(",", ":")
+                )
+                signal_scan_status = (
+                    "COMPLETE_NO_SIGNAL"
+                    if complete and not actionable
+                    else "COMPLETE_ACTIONABLE"
+                    if complete
+                    else "IN_PROGRESS"
+                )
+
+            update_scan_projection_fn = update_scan_projection
+            update_scan_projection()
 
             def scan_payload() -> dict[str, Any]:
                 return {
@@ -447,7 +773,21 @@ class AutonomousCanaryWorker:
                     "signal_scan_ranking_run_id": signal_scan_ranking_run_id,
                     "next_signal_scan_start_rank": next_signal_scan_start_rank,
                     "next_signal_scan_end_rank": next_signal_scan_end_rank,
+                    "signal_scan_cycle_id": signal_scan_cycle_id,
+                    "signal_scan_candidate_universe_hash": signal_scan_candidate_universe_hash,
+                    "signal_scan_cycle_started_at": signal_scan_cycle_started_at,
+                    "signal_scan_cycle_completed_at": signal_scan_cycle_completed_at,
+                    "signal_scan_cycle_complete": signal_scan_cycle_complete,
+                    "signal_scan_checked_this_cycle": signal_scan_checked_this_cycle,
+                    "signal_scan_remaining_this_cycle": signal_scan_remaining_this_cycle,
+                    "signal_scan_coverage_percentage": signal_scan_coverage_percentage,
+                    "signal_scan_skip_reasons_json": json.loads(
+                        signal_scan_skip_reasons_json
+                    ),
+                    "signal_scan_status": signal_scan_status,
+                    "signal_scan_checked_keys": signal_scan_checked_keys,
                 }
+            scan_payload_fn = scan_payload
 
             def finish(
                 *,
@@ -457,6 +797,8 @@ class AutonomousCanaryWorker:
                 worker_status: str = "IDLE",
                 error_code: str | None = None,
             ) -> None:
+                payload = scan_payload()
+                payload["signal_scan_skip_reasons_json"] = signal_scan_skip_reasons_json
                 self._record_finish(
                     service,
                     timestamp=timestamp,
@@ -468,7 +810,7 @@ class AutonomousCanaryWorker:
                     signals_generated=signals_generated,
                     orders_attempted=orders_attempted,
                     error_code=error_code,
-                    **scan_payload(),
+                    **payload,
                 )
 
             def result(**extra: Any) -> dict[str, Any]:
@@ -498,6 +840,7 @@ class AutonomousCanaryWorker:
                 )
             if candidates_ranked == 0:
                 blocker = "NO_ELIGIBLE_RANKABLE_CANDIDATE"
+                update_scan_projection(force_complete=True)
                 finish(
                     next_decision="WAIT_FOR_RANKABLE_CANDIDATE",
                     blocker=blocker,
@@ -508,14 +851,25 @@ class AutonomousCanaryWorker:
                     blocker=blocker,
                 )
 
-
             ready: list[tuple[Mapping[str, Any], Mapping[str, Any]]] = []
             unknown_signal_id: str | None = None
             unknown_seen = False
-            for row in ordered[scan_start:scan_end]:
+            for row in scan_rows:
                 candidate_id = str(row.get("candidate_id") or "").strip()
-                candidates_signal_checked += 1
+                qualification_hash = str(row.get("qualification_hash") or "").strip()
                 signal = service.generate_signal(candidate_id)
+                candidates_signal_checked += 1
+                scan_checked_set.add((candidate_id, qualification_hash))
+                signal_scan_checked_keys.append(
+                    {
+                        "cycle_id": signal_scan_cycle_id,
+                        "candidate_id": candidate_id,
+                        "qualification_hash": qualification_hash,
+                        "checked_at": timestamp.isoformat(),
+                        "rank_at_check": self._actionable_rank(row, ordered),
+                        "ranking_run_id": signal_scan_ranking_run_id,
+                    }
+                )
                 if isinstance(signal, Mapping):
                     signals_generated += 1
                 status = str(signal.get("status") or "").upper() if isinstance(signal, Mapping) else "NONE"
@@ -554,21 +908,11 @@ class AutonomousCanaryWorker:
                     0.0,
                 )
                 signal_id = str(signal.get("signal_id") or "")
-                signal_scan_cursor = 0
-                next_signal_scan_start_rank = 0
-                next_signal_scan_end_rank = min(self._SCAN_CAP, len(ordered))
+                update_scan_projection(actionable=True)
             else:
                 signal_id = unknown_signal_id
                 blocker = "UNKNOWN_NO_RETRY" if unknown_seen else "NO_ACTIONABLE_SIGNAL"
-                if scan_end >= len(ordered):
-                    signal_scan_cursor = 0
-                else:
-                    signal_scan_cursor = scan_end
-                next_signal_scan_start_rank = signal_scan_cursor
-                next_signal_scan_end_rank = min(
-                    signal_scan_cursor + self._SCAN_CAP,
-                    len(ordered),
-                )
+                update_scan_projection()
                 finish(
                     next_decision="WAIT_FOR_FRESH_ACTIONABLE_SIGNAL",
                     blocker=blocker,
@@ -579,8 +923,8 @@ class AutonomousCanaryWorker:
                     decision="NO_ACTIONABLE_SIGNAL" if not unknown_seen else "UNKNOWN_NO_RETRY",
                     blocker=blocker,
                     candidate_id=(
-                        str(ordered[scan_start].get("candidate_id") or "")
-                        if ordered[scan_start:scan_end]
+                        str(scan_rows[0].get("candidate_id") or "")
+                        if scan_rows
                         else None
                     ),
                     signal_id=signal_id,
@@ -697,34 +1041,62 @@ class AutonomousCanaryWorker:
                 submission=dict(submission),
             )
         except BaseException as exc:
+            persisted_payload: dict[str, Any] = {}
+            if update_scan_projection_fn is not None and scan_payload_fn is not None:
+                try:
+                    update_scan_projection_fn()
+                    persisted_payload = scan_payload_fn()
+                    # ``scan_payload`` exposes the diagnostic as an object,
+                    # while the durable state contract stores its JSON text.
+                    persisted_payload["signal_scan_skip_reasons_json"] = (
+                        signal_scan_skip_reasons_json
+                    )
+                except Exception:
+                    persisted_payload = {}
             if service is not None:
-                self._record_finish(
-                    service,
-                    timestamp=timestamp,
-                    next_decision="WORKER_ERROR_REVIEW_REQUIRED",
-                    blocker="AUTONOMOUS_WORKER_EXCEPTION",
-                    worker_status="DEGRADED",
-                    candidates_evaluated=candidates_evaluated,
-                    signals_generated=signals_generated,
-                    orders_attempted=orders_attempted,
-                    candidates_ranked=candidates_ranked,
-                    candidates_signal_checked=candidates_signal_checked,
-                    candidates_no_signal=candidates_no_signal,
-                    actionable_candidates_found=actionable_candidates_found,
-                    selected_actionable_candidate=selected_actionable_candidate,
-                    selected_actionable_rank=selected_actionable_rank,
-                    selected_actionable_score=selected_actionable_score,
-                    signal_scan_cursor=signal_scan_cursor,
-                    signal_scan_ranking_run_id=signal_scan_ranking_run_id,
-                    next_signal_scan_start_rank=next_signal_scan_start_rank,
-                    next_signal_scan_end_rank=next_signal_scan_end_rank,
-                    error_code="AUTONOMOUS_WORKER_EXCEPTION",
-                )
+                if persisted_payload:
+                    self._record_finish(
+                        service,
+                        timestamp=timestamp,
+                        next_decision="WORKER_ERROR_REVIEW_REQUIRED",
+                        blocker="AUTONOMOUS_WORKER_EXCEPTION",
+                        worker_status="DEGRADED",
+                        candidates_evaluated=candidates_evaluated,
+                        signals_generated=signals_generated,
+                        orders_attempted=orders_attempted,
+                        error_code="AUTONOMOUS_WORKER_EXCEPTION",
+                        **persisted_payload,
+                    )
+                else:
+                    # A failure before cycle setup must not overwrite a
+                    # previously persisted incomplete cycle.
+                    self._record_finish(
+                        service,
+                        timestamp=timestamp,
+                        next_decision="WORKER_ERROR_REVIEW_REQUIRED",
+                        blocker="AUTONOMOUS_WORKER_EXCEPTION",
+                        worker_status="DEGRADED",
+                        candidates_evaluated=candidates_evaluated,
+                        signals_generated=signals_generated,
+                        orders_attempted=orders_attempted,
+                        signal_scan_checked_keys=signal_scan_checked_keys,
+                        error_code="AUTONOMOUS_WORKER_EXCEPTION",
+                    )
+            if persisted_payload:
+                return {
+                    "status": "ERROR",
+                    "decision": "AUTONOMOUS_WORKER_EXCEPTION",
+                    "blocker": "AUTONOMOUS_WORKER_EXCEPTION",
+                    "error_type": type(exc).__name__,
+                    **persisted_payload,
+                    "ranking": ranking,
+                }
             return {
                 "status": "ERROR",
                 "decision": "AUTONOMOUS_WORKER_EXCEPTION",
                 "blocker": "AUTONOMOUS_WORKER_EXCEPTION",
                 "error_type": type(exc).__name__,
+                "ranking": ranking,
             }
         finally:
             self._decision_lock.release()

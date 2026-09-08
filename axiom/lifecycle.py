@@ -416,6 +416,39 @@ class CandidateLifecycleManager:
         body.update(dict(evidence))
         body.setdefault("candidate_id", str(candidate_id))
         body.setdefault("holdout_used", False)
+        after_record = {
+            "candidate_id": str(candidate_id),
+            "stage": current.stage.value,
+            "payload": body,
+        }
+        try:
+            from .canary import (
+                _canary_lifecycle_evidence_class,
+                _canary_lifecycle_evidence_reason,
+                _canary_lifecycle_snapshot_hashes,
+            )
+
+            evidence_class = _canary_lifecycle_evidence_class(
+                self.store,
+                {
+                    "candidate_id": current.candidate_id,
+                    "stage": current.stage.value,
+                    "payload": dict(current.payload),
+                },
+                after_record,
+            )
+            if evidence_class == "A":
+                _, qualification_hash, _ = _canary_lifecycle_snapshot_hashes(
+                    self.store,
+                    after_record,
+                )
+                if qualification_hash:
+                    body["qualification_hash"] = qualification_hash
+            readiness_reason = _canary_lifecycle_evidence_reason(evidence_class)
+        except Exception:
+            # An unclassifiable lifecycle write must fail closed rather than
+            # silently retaining a potentially stale readiness projection.
+            readiness_reason = "LIFECYCLE_QUALIFICATION_UPDATED"
         committed = self.store.save_candidate_lifecycle(
             str(candidate_id),
             current.stage.value,
@@ -423,8 +456,8 @@ class CandidateLifecycleManager:
             from_stage=current.stage.value,
             reason=reason,
         )
-        if committed:
-            self._schedule_readiness_snapshot_stale("LIFECYCLE_EVIDENCE_UPDATED")
+        if committed and readiness_reason is not None:
+            self._schedule_readiness_snapshot_stale(readiness_reason)
         result = self.get(str(candidate_id))
         if result is None:
             raise RuntimeError("candidate evidence update did not persist")

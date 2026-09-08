@@ -855,6 +855,22 @@ class OperatorControlTests(unittest.TestCase):
         self.assertNotIn(exception_secret, encoded)
 
 
+    def test_operator_status_separates_unknown_external_hermes_from_internal_queue(self) -> None:
+        before_changes = self.store.connection.total_changes
+        status = self.control.status()
+        self.assertEqual(self.store.connection.total_changes, before_changes)
+
+        hermes = status["hermes"]
+        external = hermes["external_hermes"]
+        self.assertEqual(external["job_id"], DEFAULT_HERMES_JOB_ID)
+        self.assertEqual(external["status"], "UNKNOWN")
+        self.assertIn("evidence", external)
+        self.assertNotEqual(external["status"], hermes["internal_queue"]["status"])
+        self.assertEqual(hermes["internal_queue"]["status"], "ACTIVE")
+        self.assertIn("trigger", hermes["internal_queue"])
+        self.assertIsNone(hermes["internal_queue"]["last_cycle_at"])
+        self.assertEqual(hermes["control_scope"], "INTERNAL_RESEARCH_QUEUE_PROCESSOR")
+
     def test_operator_status_retains_latest_canary_signal(self) -> None:
         latest_signal = {
             "signal_id": "signal-status-regression",
@@ -864,6 +880,7 @@ class OperatorControlTests(unittest.TestCase):
         with patch.object(CanaryService, "latest_signal", return_value=latest_signal):
             status = self.control.status()
         self.assertEqual(status["canary"]["latest_signal"], latest_signal)
+
 
     def test_operator_exports_default_hermes_job_id_and_checks_loopback_hosts(self) -> None:
         exported: dict[str, object] = {}
@@ -958,17 +975,36 @@ class OperatorControlTests(unittest.TestCase):
         launcher.assert_not_called()
 
     def test_fixed_hermes_adapter_operations_are_persisted(self) -> None:
-        self.assertTrue(self.control.execute("hermes.pause")["ok"])
+        paused = self.control.execute("hermes.pause")
+        self.assertTrue(paused["ok"])
+        self.assertEqual(paused["control_scope"], "INTERNAL_RESEARCH_QUEUE_PROCESSOR")
+        self.assertEqual(paused["result"]["hermes"]["control_scope"], "INTERNAL_RESEARCH_QUEUE_PROCESSOR")
+        blocked = self.control.execute("hermes.run_now")
+        self.assertFalse(blocked["ok"])
+        self.assertEqual(blocked["reason"], "HERMES_PAUSED")
+        self.assertEqual(blocked["control_scope"], "INTERNAL_RESEARCH_QUEUE_PROCESSOR")
+        self.assertEqual(paused["result"]["hermes"]["internal_queue"]["status"], "PAUSED")
+        self.assertEqual(paused["result"]["hermes"]["external_hermes"]["status"], "UNKNOWN")
         self.assertEqual(self.control.status()["hermes"]["status"], "PAUSED")
-        self.assertTrue(self.control.execute("hermes.resume")["ok"])
+
+        resumed = self.control.execute("hermes.resume")
+        self.assertTrue(resumed["ok"])
+        self.assertEqual(resumed["control_scope"], "INTERNAL_RESEARCH_QUEUE_PROCESSOR")
+        self.assertEqual(resumed["result"]["hermes"]["internal_queue"]["status"], "ACTIVE")
+        self.assertEqual(resumed["result"]["hermes"]["external_hermes"]["status"], "UNKNOWN")
         self.assertEqual(self.control.status()["hermes"]["status"], "ACTIVE")
+
         processor = Mock()
         processor.process_pending.return_value = SimpleNamespace(claimed=1, completed=1, rejected=0, failed=0)
         with patch("axiom.operator.AutonomousResearchProcessor", return_value=processor):
             result = self.control.execute("hermes.run_now")
         self.assertTrue(result["ok"])
+        self.assertEqual(result["control_scope"], "INTERNAL_RESEARCH_QUEUE_PROCESSOR")
+        self.assertEqual(result["result"]["hermes"]["external_hermes"]["status"], "UNKNOWN")
+        self.assertEqual(result["result"]["hermes"]["internal_queue"]["status"], "ACTIVE")
         processor.process_pending.assert_called_once_with(worker="operator-hermes")
         self.assertNotIn("argv", json.dumps(result).lower())
+
 
     def test_bootstrap_duplicate_and_resume_behavior(self) -> None:
         snapshot = SimpleNamespace(selected_symbols=("BTCUSDT",))

@@ -11,7 +11,10 @@ from .canary import (
     CanaryService,
     _canary_qualification_hash,
     _canary_qualification_projection,
+    _canary_lifecycle_snapshot_hashes,
     _canary_ranking_snapshot_hash,
+    _canary_prediction_market,
+    _CANARY_RANKING_EVIDENCE_ALIASES,
 )
 from .domain import ensure_utc, utc_now
 
@@ -99,21 +102,11 @@ class CandidateCanaryRanker:
 
     @classmethod
     def _prediction_market(cls, payload: Mapping[str, Any]) -> str | None:
-        plan = payload.get("experiment_plan")
-        strategy = payload.get("strategy")
-        forward = payload.get("forward_config")
-        market = payload.get("market")
-        for source in (payload, plan, strategy, forward, market):
-            if isinstance(source, Mapping):
-                value = source.get("market_type", source.get("type"))
-                if value is not None:
-                    return str(value).strip().lower()
-        value = payload.get("market_type")
-        return str(value).strip().lower() if value is not None else None
+        return _canary_prediction_market(payload)
 
     @classmethod
     def _sample_count(cls, payload: Mapping[str, Any]) -> int | None:
-        value = cls._value(payload, "validation_sample_count", "sample_count")
+        value = cls._value(payload, *_CANARY_RANKING_EVIDENCE_ALIASES["sample_count"])
         if value is None:
             minimum = payload.get("minimum_sample_check")
             if isinstance(minimum, Mapping):
@@ -126,7 +119,7 @@ class CandidateCanaryRanker:
 
     @classmethod
     def _trade_count(cls, payload: Mapping[str, Any]) -> int | None:
-        value = cls._value(payload, "validation_trade_count", "validation_trades", "trade_count")
+        value = cls._value(payload, *_CANARY_RANKING_EVIDENCE_ALIASES["trade_count"])
         if value is None:
             minimum = payload.get("minimum_sample_check")
             if isinstance(minimum, Mapping):
@@ -204,7 +197,7 @@ class CandidateCanaryRanker:
         if not frozen_hash:
             return None, "FROZEN_HASH_MISSING", versions
         legacy_quality = cls._quality(
-            payload, "validation_data_quality", "data_quality", "quality", "data_quality_passed"
+            payload, *_CANARY_RANKING_EVIDENCE_ALIASES["quality"]
         )
         if isinstance(quality, Mapping) and quality.get("applicable"):
             integrity_score = (
@@ -213,18 +206,32 @@ class CandidateCanaryRanker:
             fidelity_score = cls._number(quality.get("historical_execution_fidelity_score"))
         else:
             integrity_score = legacy_quality
-            fidelity_score = cls._number(payload.get("execution_fidelity_score", legacy_quality))
+            fidelity_score = cls._number(
+                payload.get(
+                    _CANARY_RANKING_EVIDENCE_ALIASES["execution_fidelity_score"][0],
+                    legacy_quality,
+                )
+            )
         required = {
-            "expectancy": cls._number(cls._value(payload, "validation_expectancy", "expectancy")),
-            "confidence_lower_bound": cls._number(
-                cls._value(payload, "validation_confidence_lower_bound", "confidence_lower_bound")
+            "expectancy": cls._number(
+                cls._value(payload, *_CANARY_RANKING_EVIDENCE_ALIASES["expectancy"])
             ),
-            "robustness": cls._number(cls._value(payload, "validation_stability", "stability")),
-            "calibration": cls._number(cls._value(payload, "validation_calibration", "calibration")),
+            "confidence_lower_bound": cls._number(
+                cls._value(
+                    payload,
+                    *_CANARY_RANKING_EVIDENCE_ALIASES["confidence_lower_bound"],
+                )
+            ),
+            "robustness": cls._number(
+                cls._value(payload, *_CANARY_RANKING_EVIDENCE_ALIASES["stability"])
+            ),
+            "calibration": cls._number(
+                cls._value(payload, *_CANARY_RANKING_EVIDENCE_ALIASES["calibration"])
+            ),
             "sample_count": cls._sample_count(payload),
             "trade_count": cls._trade_count(payload),
             "execution_feasibility": cls._quality(
-                payload, "validation_execution_quality", "execution_quality"
+                payload, *_CANARY_RANKING_EVIDENCE_ALIASES["execution_quality"]
             ),
             "historical_data_integrity": integrity_score,
             "execution_fidelity_score": fidelity_score,
@@ -238,7 +245,9 @@ class CandidateCanaryRanker:
         if required["sample_count"] < min_samples or required["trade_count"] < min_trades:
             return None, "RANKING_EVIDENCE_BELOW_MINIMUM_SAMPLE", versions
         forward_evidence = payload.get("forward_evidence")
-        forward_expectancy = cls._number(payload.get("forward_expectancy"))
+        forward_expectancy = cls._number(
+            payload.get(_CANARY_RANKING_EVIDENCE_ALIASES["forward_expectancy"][0])
+        )
         if forward_expectancy is None and isinstance(forward_evidence, Mapping):
             forward_expectancy = cls._number(forward_evidence.get("forward_expectancy"))
         components: dict[str, float] = {
@@ -252,10 +261,14 @@ class CandidateCanaryRanker:
             "calibration": cls._clamp(float(required["calibration"])),
         }
         optional: dict[str, float] = {}
-        drawdown = cls._number(cls._value(payload, "validation_max_drawdown", "max_drawdown"))
+        drawdown = cls._number(
+            cls._value(payload, *_CANARY_RANKING_EVIDENCE_ALIASES["max_drawdown"])
+        )
         if drawdown is not None:
             optional["drawdown"] = cls._clamp(1.0 - drawdown)
-        liquidity = cls._number(cls._value(payload, "validation_liquidity", "liquidity"))
+        liquidity = cls._number(
+            cls._value(payload, *_CANARY_RANKING_EVIDENCE_ALIASES["liquidity"])
+        )
         if liquidity is not None:
             optional["liquidity"] = cls._clamp(liquidity)
         if forward_expectancy is not None:
@@ -300,32 +313,43 @@ class CandidateCanaryRanker:
         self,
         records: list[Mapping[str, Any]],
     ) -> str:
-        """Hash the complete rankable lifecycle inventory prevalidation saw."""
+        """Hash the ranker-visible lifecycle evidence fence.
+
+        Mutable timestamps and full JSON payloads are deliberately excluded:
+        signal telemetry and harmless counters must not restart an in-progress
+        scan.  Stage, frozen binding, dataset attestation, and the canonical
+        qualification/ranking hashes remain fenced.
+        """
         inventory: list[dict[str, Any]] = []
         for record in records:
             stage = str(record.get("stage") or "")
             candidate_id = str(record.get("candidate_id") or "").strip()
             if not candidate_id or stage not in self._STAGES:
                 continue
-            updated_at = record.get("updated_at")
-            if isinstance(updated_at, datetime):
-                updated_at = ensure_utc(updated_at).isoformat()
-            elif updated_at is not None:
-                updated_at = str(updated_at)
+            payload = self.service._merged_lifecycle_payload(record)
+            if not isinstance(payload, Mapping):
+                continue
+            _, qualification_hash, ranking_snapshot_hash = (
+                _canary_lifecycle_snapshot_hashes(self.store, record)
+            )
             inventory.append(
                 {
                     "candidate_id": candidate_id,
                     "stage": stage,
-                    "updated_at": updated_at,
                     "frozen_hash": self.service._lifecycle_frozen_hash(record),
+                    "attestation": self._dataset_attestation_snapshot(payload),
+                    "qualification_hash": qualification_hash,
+                    "ranking_snapshot_hash": ranking_snapshot_hash,
                 }
             )
         inventory.sort(
             key=lambda item: (
                 str(item["candidate_id"]),
                 str(item["stage"]),
-                str(item["updated_at"]),
                 str(item["frozen_hash"]),
+                str(item["qualification_hash"]),
+                str(item["ranking_snapshot_hash"]),
+                json.dumps(item["attestation"], sort_keys=True),
             )
         )
         encoded = json.dumps(
@@ -530,7 +554,15 @@ class CandidateCanaryRanker:
         invalidated_reasons: dict[str, str] = {}
         prevalidated: list[dict[str, Any]] = []
         inventory = self._candidate_records()
-        inventory_token = self._candidate_inventory_token(inventory)
+        # Keep the initial membership fence separate from the mutable
+        # evidence token.  Projection/eligibility preparation may intentionally
+        # rewrite lifecycle evidence, but an externally added or removed
+        # candidate must still fail closed.
+        inventory_candidate_ids = frozenset(
+            str(record.get("candidate_id") or "").strip()
+            for record in inventory
+            if str(record.get("candidate_id") or "").strip()
+        )
         verified_datasets: set[tuple[str, str]] = set()
         for original_record in inventory:
             candidate_id = str(original_record.get("candidate_id") or "").strip()
@@ -609,12 +641,19 @@ class CandidateCanaryRanker:
                 candidate_id,
                 _record=record,
             )
-            if not validation.get("eligible"):
-                binding_reason = (
-                    validation.get("binding", {}).get("reason_code")
-                    if isinstance(validation.get("binding"), Mapping)
-                    else None
-                )
+            binding = validation.get("binding")
+            binding_reason = (
+                binding.get("reason_code")
+                if isinstance(binding, Mapping)
+                else None
+            )
+            binding_missing = binding_reason == "ELIGIBILITY_MISSING"
+            binding_bound = (
+                isinstance(binding, Mapping) and bool(binding.get("bound"))
+            )
+            if not validation.get("eligible") or (
+                not binding_bound and not binding_missing
+            ):
                 invalidated_reasons[candidate_id] = (
                     str(binding_reason)
                     if binding_reason in {
@@ -641,19 +680,15 @@ class CandidateCanaryRanker:
                 }
             )
 
-        persisted_ids = self.service._batch_mark_eligible_prevalidated(prevalidated)
         candidates: list[dict[str, Any]] = []
         for prepared in prevalidated:
             candidate_id = str(prepared["candidate_id"])
-            if candidate_id not in persisted_ids:
-                invalidated_reasons[candidate_id] = "ELIGIBILITY_SNAPSHOT_CHANGED"
-                continue
-            record = self.store.load_candidate_lifecycle(candidate_id)
-            payload = (
-                self.service._merged_lifecycle_payload(record)
-                if isinstance(record, Mapping)
-                else None
-            )
+            # Keep the original prevalidation record as the ranking baseline.
+            # Re-reading here could absorb an A/B lifecycle mutation that
+            # happened while ranking evidence was being prepared, defeating
+            # the fenced commit's change detection.
+            record = prepared["record"]
+            payload = prepared["payload"]
             if not isinstance(record, Mapping) or not isinstance(payload, Mapping):
                 invalidated_reasons[candidate_id] = "ELIGIBILITY_INVALID"
                 self.service.invalidate_eligibility(
@@ -681,31 +716,39 @@ class CandidateCanaryRanker:
                 )
                 continue
             _, qualification_hash, ranking_snapshot_hash = hashes
-            eligibility_attestation = self.store.connection.execute(
-                "SELECT candidate_id,frozen_hash,evidence_json "
-                "FROM canary_eligibility WHERE candidate_id=?",
-                (candidate_id,),
-            ).fetchone()
-            if eligibility_attestation is None:
-                invalidated_reasons[candidate_id] = "ELIGIBILITY_MISSING"
+            validation_qualification = validation.get("qualification")
+            validation_hash = validation.get("qualification_hash")
+            eligibility_frozen_hash = str(validation.get("frozen_hash") or "")
+            if (
+                not isinstance(validation_qualification, Mapping)
+                or not isinstance(validation_hash, str)
+                or not validation_hash
+                or validation_hash != qualification_hash
+                or not eligibility_frozen_hash
+            ):
+                invalidated_reasons[candidate_id] = "ELIGIBILITY_INVALID"
                 self.service.invalidate_eligibility(
                     candidate_id,
                     invalidated_reasons[candidate_id],
                     publish_readiness=False,
                 )
                 continue
-            eligibility_candidate_id = str(
-                eligibility_attestation["candidate_id"] or ""
-            ).strip()
-            eligibility_frozen_hash = eligibility_attestation["frozen_hash"]
-            eligibility_evidence_json = eligibility_attestation["evidence_json"]
-            if (
-                eligibility_candidate_id != candidate_id
-                or not isinstance(eligibility_frozen_hash, str)
-                or not eligibility_frozen_hash
-                or not isinstance(eligibility_evidence_json, str)
-                or not eligibility_evidence_json
-            ):
+            try:
+                # Always stage canonical qualification evidence derived from
+                # the current lifecycle. A legacy full-payload binding is
+                # accepted only after re-evaluation and is rewritten before
+                # the ranking commit, so the final fence observes the same
+                # evidence it will persist.
+                eligibility_evidence_json = json.dumps(
+                    {
+                        **dict(validation_qualification),
+                        "qualification_hash": validation_hash,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                )
+            except (TypeError, ValueError):
                 invalidated_reasons[candidate_id] = "ELIGIBILITY_INVALID"
                 self.service.invalidate_eligibility(
                     candidate_id,
@@ -754,15 +797,36 @@ class CandidateCanaryRanker:
                 )
             candidates.append(item)
 
+        # Persist ranker's eligibility attestations only after the evidence
+        # preparation fence.  A concurrent C/D telemetry update can then
+        # leave the prior CURRENT readiness reason untouched until release;
+        # A/B changes remain fenced by the final lifecycle hash checks.
+        self.service._batch_mark_eligible_prevalidated(prevalidated)
+
         changed_ids: set[str] = set()
         stable: list[dict[str, Any]] = []
         with self.store._lock:
             connection = self.store.connection
             if connection.in_transaction:
                 raise RuntimeError("ranking transaction already active")
+            # Capture the mutable evidence baseline only after all intentional
+            # projection, eligibility, and candidate preparation writes have
+            # completed.  The transaction re-reads the same persisted records
+            # so external A/B changes between these fences still abort.
+            inventory_token = self._candidate_inventory_token(self._candidate_records())
             connection.execute("BEGIN IMMEDIATE")
             try:
-                if self._candidate_inventory_token(self._candidate_records()) != inventory_token:
+                current_inventory = self._candidate_records()
+                current_candidate_ids = frozenset(
+                    str(record.get("candidate_id") or "").strip()
+                    for record in current_inventory
+                    if str(record.get("candidate_id") or "").strip()
+                )
+                if (
+                    current_candidate_ids != inventory_candidate_ids
+                    or self._candidate_inventory_token(current_inventory)
+                    != inventory_token
+                ):
                     raise _LifecycleEvidenceChanged(
                         "candidate inventory changed during ranking"
                     )
@@ -792,21 +856,18 @@ class CandidateCanaryRanker:
                         not isinstance(expected_attestation, Mapping)
                         or attestation != expected_attestation
                     )
-                    lifecycle_changed = (
+                    stage_changed = (
                         str(current.get("stage") or "")
                         != str(item["record"].get("stage") or "")
-                        or current.get("payload") != item["record"].get("payload")
-                        or current.get("updated_at") != item["record"].get("updated_at")
-                        or current_frozen_hash
-                        != expected_frozen_hash
                     )
+                    frozen_changed = current_frozen_hash != expected_frozen_hash
                     if attestation_changed:
                         raise _DatasetEvidenceChanged(
                             f"dataset attestation changed for {candidate_id}"
                         )
-                    if lifecycle_changed:
+                    if stage_changed or frozen_changed:
                         raise _LifecycleEvidenceChanged(
-                            f"lifecycle snapshot changed for {candidate_id}"
+                            f"lifecycle binding changed for {candidate_id}"
                         )
                     # Historical evidence and eligibility were fully computed
                     # before BEGIN IMMEDIATE.  The fenced section only checks
@@ -817,6 +878,18 @@ class CandidateCanaryRanker:
                         quality,
                         current_frozen_hash,
                     )
+                    if current_hashes is None:
+                        changed_ids.add(candidate_id)
+                        continue
+                    # A ranking-input mutation (for example, forward
+                    # expectancy or duration) invalidates the entire fenced
+                    # run.  It is not safe to publish a mixed-time ranking.
+                    # C/D telemetry and harmless metadata are intentionally
+                    # absent from this hash and therefore continue normally.
+                    if current_hashes[2] != item["ranking_snapshot_hash"]:
+                        raise _LifecycleEvidenceChanged(
+                            f"ranking snapshot changed for {candidate_id}"
+                        )
                     eligibility_attestation = connection.execute(
                         "SELECT candidate_id,frozen_hash,evidence_json "
                         "FROM canary_eligibility WHERE candidate_id=?",
@@ -830,9 +903,7 @@ class CandidateCanaryRanker:
                         != item["eligibility_frozen_hash"]
                         or eligibility_attestation["evidence_json"]
                         != item["eligibility_evidence_json"]
-                        or current_hashes is None
                         or current_hashes[1] != item["qualification_hash"]
-                        or current_hashes[2] != item["ranking_snapshot_hash"]
                     ):
                         changed_ids.add(candidate_id)
                         continue

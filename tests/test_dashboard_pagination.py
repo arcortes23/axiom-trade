@@ -8,6 +8,7 @@ import re
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.parse import quote, urlencode
 from urllib.request import urlopen
@@ -15,7 +16,7 @@ from urllib.request import urlopen
 from axiom.canary import CanaryService
 from axiom.dashboard import DashboardData, DashboardServer, _dashboard_html, _jsonable
 from axiom.domain import MarketType
-from axiom.operator import CANARY_CONNECTIVITY_CONFIG_KEY
+from axiom.operator import CANARY_CONNECTIVITY_CONFIG_KEY, DEFAULT_HERMES_JOB_ID
 from axiom.ranker import CandidateCanaryRanker
 from axiom.storage import AxiomStore
 
@@ -846,6 +847,424 @@ class DashboardPaginationEndpointTests(DashboardPaginationFixture):
                     )
         self.assertIn("UNKNOWN", body)
 
+
+    def test_research_feed_empty_snapshot_is_read_only_and_truthful(self) -> None:
+        with AxiomStore(":memory:") as store:
+            before_changes = store.connection.total_changes
+            snapshot = store.research_feed_status(now=T0, hermes_job_id=DEFAULT_HERMES_JOB_ID)
+            self.assertEqual(store.connection.total_changes, before_changes)
+
+        self.assertEqual(
+            set(snapshot),
+            {
+                "external_hermes",
+                "internal_queue",
+                "proposals",
+                "candidates",
+                "budgets",
+                "no_new_candidates_reason",
+            },
+        )
+        self.assertEqual(snapshot["external_hermes"]["job_id"], DEFAULT_HERMES_JOB_ID)
+        self.assertEqual(snapshot["external_hermes"]["status"], "UNKNOWN")
+        self.assertIn("evidence", snapshot["external_hermes"])
+        self.assertEqual(snapshot["internal_queue"]["status"], "ACTIVE")
+        self.assertIn("trigger", snapshot["internal_queue"])
+        self.assertIsNone(snapshot["internal_queue"]["last_cycle_at"])
+
+        proposals = snapshot["proposals"]
+        for key in (
+            "latest_submitted_at",
+            "latest_accepted_at",
+        ):
+            self.assertIsNone(proposals[key])
+        for key in (
+            "submitted_24h",
+            "accepted_24h",
+            "rejected_24h",
+            "failed_24h",
+            "pending",
+            "processing",
+            "completed",
+            "rejected",
+        ):
+            self.assertEqual(proposals[key], 0)
+
+        candidates = snapshot["candidates"]
+        self.assertIsNone(candidates["latest_created_at"])
+        for key in ("created_24h", "mutations_24h", "total", "new", "eligible", "rejected"):
+            self.assertEqual(candidates[key], 0)
+
+        budgets = snapshot["budgets"]
+        self.assertEqual(budgets["total_limit"], 0)
+        self.assertEqual(budgets["total_used"], 0)
+        self.assertEqual(budgets["total_remaining"], 0)
+        self.assertEqual(budgets["families"], {})
+        self.assertEqual(snapshot["no_new_candidates_reason"], "NO_NEW_HERMES_PROPOSALS")
+
+    def test_research_feed_same_stage_idea_evidence_update_does_not_count_as_creation(self) -> None:
+        with AxiomStore(":memory:") as store:
+            initial_payload = {"experiment_family": "trend", "generation": 0}
+            store.save_candidate_lifecycle(
+                "same-stage-evidence",
+                "IDEA",
+                initial_payload,
+                timestamp=T0,
+            )
+            before = store.research_feed_status(now=T0 + timedelta(hours=1))
+            store.save_candidate_lifecycle(
+                "same-stage-evidence",
+                "IDEA",
+                {
+                    **initial_payload,
+                    "evidence": {"confidence": 0.9},
+                    "parent_id": "same-stage-parent",
+                    "lineage": ["same-stage-parent", "same-stage-evidence"],
+                },
+                from_stage="IDEA",
+                reason="same-stage evidence update",
+                timestamp=T0 + timedelta(minutes=30),
+            )
+            after = store.research_feed_status(now=T0 + timedelta(hours=1))
+
+        before_candidates = before["candidates"]
+        after_candidates = after["candidates"]
+        self.assertEqual(before_candidates["created_24h"], 1)
+        self.assertEqual(before_candidates["mutations_24h"], 0)
+        self.assertEqual(before_candidates["latest_created_at"], T0.isoformat())
+        self.assertEqual(after_candidates["created_24h"], before_candidates["created_24h"])
+        self.assertEqual(after_candidates["mutations_24h"], before_candidates["mutations_24h"])
+        self.assertEqual(after_candidates["latest_created_at"], before_candidates["latest_created_at"])
+
+    def test_research_feed_excludes_eligibility_with_mismatched_frozen_hash(self) -> None:
+        def candidate_payload(prefix: str) -> dict[str, str]:
+            strategy_hash = f"{prefix}-strategy"
+            model_hash = f"{prefix}-model"
+            config_hash = f"{prefix}-config"
+            frozen_hash = hashlib.sha256(
+                "|".join((strategy_hash, model_hash, config_hash)).encode()
+            ).hexdigest()
+            return {
+                "strategy_hash": strategy_hash,
+                "model_hash": model_hash,
+                "config_hash": config_hash,
+                "frozen_hash": frozen_hash,
+                "qualification_hash": f"{prefix}-qualification",
+            }
+
+        with AxiomStore(":memory:") as store:
+            CanaryService(store)
+            for candidate_id, prefix, eligibility_hash in (
+                ("bound-candidate", "bound", None),
+                ("mismatched-candidate", "mismatched", "wrong-frozen-hash"),
+            ):
+                payload = candidate_payload(prefix)
+                store.save_candidate_lifecycle(
+                    candidate_id,
+                    "IDEA",
+                    payload,
+                    timestamp=T0,
+                )
+                store.save_candidate_lifecycle(
+                    candidate_id,
+                    "FROZEN",
+                    payload,
+                    from_stage="IDEA",
+                    timestamp=T0,
+                )
+                store.connection.execute(
+                    "INSERT INTO canary_eligibility("
+                    "candidate_id,eligible_at,frozen_hash,evidence_json) VALUES (?,?,?,?)",
+                    (
+                        candidate_id,
+                        T0.isoformat(),
+                        eligibility_hash or payload["frozen_hash"],
+                        json.dumps(payload, sort_keys=True),
+                    ),
+                )
+            store.connection.commit()
+            snapshot = store.research_feed_status(now=T0 + timedelta(hours=1))
+
+        self.assertEqual(snapshot["candidates"]["eligible"], 1)
+
+    def test_overview_research_feed_uses_persisted_hermes_control_job_id(self) -> None:
+        custom_job_id = "fixture-hermes-job-2026"
+        self.store.set_scheduler_state(
+            "hermes-control",
+            {"status": "ACTIVE", "trigger": "fixture", "job_id": custom_job_id},
+        )
+
+        status, overview, _ = self._request("api/v2/overview-summary")
+        self.assertEqual(status, 200)
+        self.assertIsInstance(overview, dict)
+        assert isinstance(overview, dict)
+        feed = overview["research_feed"]
+        self.assertEqual(feed["external_hermes"]["job_id"], custom_job_id)
+        self.assertEqual(feed["external_hermes"]["status"], "UNKNOWN")
+
+    def test_research_feed_fresh_proposal_without_budget_is_not_budget_exhausted(self) -> None:
+        with AxiomStore(":memory:") as store:
+            with patch("axiom.storage._now_iso", return_value=T0.isoformat()):
+                store.enqueue_research_item(
+                    "hypothesis",
+                    {"proposal_id": "fresh-no-budget"},
+                    dedupe_key="fresh-no-budget",
+                    source="fixture-hermes",
+                    item_id="fresh-no-budget",
+                    available_at=T0,
+                )
+            snapshot = store.research_feed_status(now=T0 + timedelta(minutes=5))
+
+        self.assertEqual(snapshot["proposals"]["pending"], 1)
+        self.assertNotEqual(snapshot["no_new_candidates_reason"], "RESEARCH_BUDGET_EXHAUSTED")
+
+    def test_research_feed_persisted_zero_limit_budget_is_exhausted(self) -> None:
+        with AxiomStore(":memory:") as store:
+            with patch("axiom.storage._now_iso", return_value=T0.isoformat()):
+                store.enqueue_research_item(
+                    "hypothesis",
+                    {"proposal_id": "zero-budget"},
+                    dedupe_key="zero-budget",
+                    source="fixture-hermes",
+                    item_id="zero-budget",
+                    available_at=T0,
+                )
+            store.save_experiment_budget(
+                "autonomous",
+                {
+                    "total_limit": 0,
+                    "per_family_limit": 5,
+                    "used_total": 0,
+                    "used_by_family": {},
+                },
+                timestamp=T0,
+            )
+            snapshot = store.research_feed_status(now=T0 + timedelta(minutes=5))
+
+        self.assertEqual(snapshot["budgets"]["total_limit"], 0)
+        self.assertEqual(snapshot["budgets"]["total_used"], 0)
+        self.assertEqual(snapshot["budgets"]["total_remaining"], 0)
+        self.assertEqual(snapshot["no_new_candidates_reason"], "RESEARCH_BUDGET_EXHAUSTED")
+
+    def test_research_feed_does_not_count_or_release_expired_testing_lease(self) -> None:
+        with AxiomStore(":memory:") as store:
+            with patch("axiom.storage._now_iso", return_value=T0.isoformat()):
+                store.enqueue_research_item(
+                    "hypothesis",
+                    {"proposal_id": "expired-lease"},
+                    dedupe_key="expired-lease",
+                    source="fixture-hermes",
+                    item_id="expired-lease",
+                    available_at=T0,
+                )
+            claimed = store.claim_research_item(
+                "fixture-worker",
+                now=T0,
+                lease_seconds=60,
+            )
+            self.assertIsNotNone(claimed)
+            before_item = store.get_research_item("expired-lease")
+            before_changes = store.connection.total_changes
+
+            snapshot = store.research_feed_status(now=T0 + timedelta(minutes=2))
+
+            after_item = store.get_research_item("expired-lease")
+            self.assertEqual(store.connection.total_changes, before_changes)
+
+        self.assertEqual(snapshot["proposals"]["processing"], 0)
+        self.assertIsNotNone(before_item)
+        self.assertIsNotNone(after_item)
+        assert before_item is not None
+        assert after_item is not None
+        self.assertEqual(after_item["status"], "TESTING")
+        self.assertEqual(after_item["lease_until"], before_item["lease_until"])
+        self.assertEqual(after_item["lease_owner"], before_item["lease_owner"])
+
+
+    def test_research_feed_populated_snapshot_reports_windows_and_latest_times(self) -> None:
+        now = T0
+        with AxiomStore(":memory:") as store:
+            CanaryService(store)
+            created_at = (now - timedelta(hours=6)).isoformat()
+            with patch("axiom.storage._now_iso", return_value=created_at):
+                for item_id, outcome in (
+                    ("feed-accepted", "ACCEPTED"),
+                    ("feed-completed", "COMPLETED"),
+                    ("feed-rejected", "REJECTED"),
+                    ("feed-failed", "FAILED"),
+                ):
+                    store.enqueue_research_item(
+                        "hypothesis",
+                        {"proposal_id": item_id, "family": "trend"},
+                        dedupe_key=item_id,
+                        source="fixture-hermes",
+                        item_id=item_id,
+                        available_at=now - timedelta(hours=5),
+                    )
+                    claimed = store.claim_research_item(
+                        f"worker-{item_id}",
+                        now=now - timedelta(hours=3, minutes=1),
+                    )
+                    self.assertIsNotNone(claimed)
+                    store.complete_research_item(
+                        item_id,
+                        outcome,
+                        now=now - timedelta(hours=3),
+                        worker=f"worker-{item_id}",
+                    )
+                store.enqueue_research_item(
+                    "hypothesis",
+                    {"proposal_id": "feed-pending", "family": "trend"},
+                    dedupe_key="feed-pending",
+                    source="fixture-hermes",
+                    item_id="feed-pending",
+                    available_at=now + timedelta(hours=1),
+                )
+                store.enqueue_research_item(
+                    "hypothesis",
+                    {"proposal_id": "feed-processing", "family": "trend"},
+                    dedupe_key="feed-processing",
+                    source="fixture-hermes",
+                    item_id="feed-processing",
+                    available_at=now - timedelta(hours=1),
+                )
+            processing = store.claim_research_item("worker-processing", now=now)
+            self.assertIsNotNone(processing)
+
+            candidate_payload = {
+                "experiment_family": "trend",
+                "generation": 0,
+                "frozen_hash": "feed-frozen-hash",
+                "qualification_hash": "feed-qualification-hash",
+            }
+            store.save_candidate_lifecycle(
+                "feed-new",
+                "IDEA",
+                candidate_payload,
+                timestamp=now - timedelta(hours=5),
+            )
+            store.save_candidate_lifecycle(
+                "feed-mutated",
+                "IDEA",
+                {
+                    **candidate_payload,
+                    "generation": 1,
+                    "parent_id": "feed-new",
+                },
+                timestamp=now - timedelta(hours=4),
+            )
+            store.save_candidate_lifecycle(
+                "feed-eligible",
+                "IDEA",
+                candidate_payload,
+                timestamp=now - timedelta(hours=4),
+            )
+            store.save_candidate_lifecycle(
+                "feed-eligible",
+                "FROZEN",
+                candidate_payload,
+                from_stage="IDEA",
+                timestamp=now - timedelta(hours=3),
+            )
+            store.save_candidate_lifecycle(
+                "feed-rejected",
+                "IDEA",
+                {**candidate_payload, "rejection_reason": "fixture"},
+                timestamp=now - timedelta(hours=3),
+            )
+            store.save_candidate_lifecycle(
+                "feed-rejected",
+                "REJECTED",
+                {**candidate_payload, "rejection_reason": "fixture"},
+                from_stage="IDEA",
+                reason="fixture",
+                timestamp=now - timedelta(hours=2),
+            )
+            store.connection.execute(
+                "INSERT INTO canary_eligibility(candidate_id,eligible_at,frozen_hash,evidence_json) "
+                "VALUES (?,?,?,?)",
+                (
+                    "feed-eligible",
+                    (now - timedelta(hours=3)).isoformat(),
+                    "feed-frozen-hash",
+                    json.dumps(candidate_payload, sort_keys=True),
+                ),
+            )
+            store.connection.commit()
+            store.save_experiment_budget(
+                "autonomous",
+                {
+                    "total_limit": 10,
+                    "per_family_limit": 5,
+                    "used_total": 3,
+                    "used_by_family": {"trend": 3},
+                },
+                timestamp=now,
+            )
+
+            snapshot = store.research_feed_status(now=now, hermes_job_id=DEFAULT_HERMES_JOB_ID)
+
+        self.assertEqual(snapshot["external_hermes"]["status"], "UNKNOWN")
+        self.assertEqual(snapshot["external_hermes"]["job_id"], DEFAULT_HERMES_JOB_ID)
+        self.assertEqual(snapshot["internal_queue"]["status"], "ACTIVE")
+        proposals = snapshot["proposals"]
+        self.assertEqual(proposals["submitted_24h"], 6)
+        self.assertEqual(proposals["accepted_24h"], 1)
+        self.assertEqual(proposals["rejected_24h"], 1)
+        self.assertEqual(proposals["failed_24h"], 1)
+        self.assertEqual(proposals["pending"], 1)
+        self.assertEqual(proposals["processing"], 1)
+        self.assertEqual(proposals["completed"], 1)
+        self.assertEqual(proposals["rejected"], 1)
+        self.assertIsNotNone(proposals["latest_submitted_at"])
+        self.assertEqual(proposals["latest_accepted_at"], (now - timedelta(hours=3)).isoformat())
+
+        candidates = snapshot["candidates"]
+        self.assertEqual(candidates["total"], 4)
+        self.assertGreaterEqual(candidates["created_24h"], 4)
+        self.assertGreaterEqual(candidates["mutations_24h"], 1)
+        self.assertGreaterEqual(candidates["new"], 1)
+        self.assertGreaterEqual(candidates["eligible"], 1)
+        self.assertGreaterEqual(candidates["rejected"], 1)
+        self.assertIsNotNone(candidates["latest_created_at"])
+
+        budgets = snapshot["budgets"]
+        self.assertEqual(budgets["total_limit"], 10)
+        self.assertEqual(budgets["total_used"], 3)
+        self.assertEqual(budgets["total_remaining"], 7)
+        self.assertIn("trend", budgets["families"])
+        self.assertNotEqual(snapshot["no_new_candidates_reason"], "NO_NEW_HERMES_PROPOSALS")
+
+    def test_research_feed_is_exposed_in_empty_dashboard_snapshot(self) -> None:
+        with AxiomStore(":memory:") as store:
+            server = DashboardServer(port=0, data=DashboardData(store=store)).start()
+            try:
+                assert server.url is not None
+                with urlopen(server.url + "/api/v2/overview-summary", timeout=3) as response:
+                    self.assertEqual(response.status, 200)
+                    payload = json.loads(response.read().decode("utf-8"))
+            finally:
+                server.stop()
+
+        self.assertIn("research_feed", payload)
+        feed = payload["research_feed"]
+        self.assertEqual(feed["external_hermes"]["status"], "UNKNOWN")
+        self.assertEqual(feed["external_hermes"]["job_id"], DEFAULT_HERMES_JOB_ID)
+        self.assertEqual(feed["internal_queue"]["status"], "ACTIVE")
+        self.assertEqual(feed["no_new_candidates_reason"], "NO_NEW_HERMES_PROPOSALS")
+
+    def test_research_feed_ui_labels_keep_external_and_internal_controls_truthful(self) -> None:
+        html = _dashboard_html()
+        for label in (
+            "External Hermes feed",
+            "External status UNKNOWN",
+            "Internal research queue processing",
+            "Pause processing",
+            "Resume processing",
+            "Process next pending item now",
+        ):
+            self.assertIn(label, html)
+        self.assertNotIn("External status ACTIVE", html)
 
     def test_datasets_cover_page_navigation_filters_and_detail_path(self) -> None:
         first = self._page(
@@ -1837,6 +2256,61 @@ class DashboardPaginationSurfaceTests(DashboardPaginationFixture):
         self.assertTrue(funnel)
         self.assertGreater(sum(funnel.values()), 0)
         self.assertEqual(funnel["FROZEN"], 1)
+
+    def test_overview_local_research_worker_is_not_labeled_as_hermes(self) -> None:
+        self.store.save_worker_state(
+            "research-queue",
+            "RUNNING",
+            {"queue_items_processed": 3},
+            heartbeat_at=T0,
+        )
+        self.store.save_worker_state(
+            "autonomous-research",
+            "ACTIVE",
+            {"passes": 2},
+            heartbeat_at=T0,
+        )
+
+        for endpoint in ("api/v2/overview-summary", "api/operator"):
+            with self.subTest(endpoint=endpoint):
+                status, payload, _body = self._request(endpoint)
+                self.assertEqual(status, 200)
+                self.assertIsInstance(payload, dict)
+                assert isinstance(payload, dict)
+
+                components = payload.get("components")
+                self.assertIsInstance(components, list)
+                assert isinstance(components, list)
+                internal_queue = [
+                    item
+                    for item in components
+                    if isinstance(item, dict)
+                    and item.get("name") == "INTERNAL RESEARCH QUEUE"
+                ]
+                self.assertEqual(len(internal_queue), 1)
+                self.assertEqual(internal_queue[0]["state"], "RUNNING")
+                hermes_components = [
+                    item
+                    for item in components
+                    if isinstance(item, dict)
+                    and str(item.get("name", "")).upper() == "HERMES"
+                ]
+                self.assertTrue(
+                    all(
+                        str(item.get("state", "")).upper()
+                        not in {"READY", "RUNNING", "ACTIVE"}
+                        for item in hermes_components
+                    )
+                )
+
+                research_feed = payload.get("research_feed")
+                self.assertIsInstance(research_feed, dict)
+                assert isinstance(research_feed, dict)
+                external_hermes = research_feed.get("external_hermes")
+                self.assertIsInstance(external_hermes, dict)
+                assert isinstance(external_hermes, dict)
+                self.assertEqual(external_hermes["status"], "UNKNOWN")
+
 
     def test_final_overview_renderer_consumes_lifecycle_funnel(self) -> None:
         html = _dashboard_html()

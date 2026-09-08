@@ -26,6 +26,7 @@ _MAX_LATEST_SCAN_ROWS = 10_000
 _MAX_EVIDENCE_SCAN_ROWS = 100_000
 _QUEUE_RELEASE_BATCH = 256
 _QUEUE_LINEAGE_LIMIT = 256
+_DEFAULT_HERMES_JOB_ID = "f1d27bf8c27a"
 _PAGINATION_PAGE_SIZES = (10, 25, 50, 100)
 _DEFAULT_PAGE_SIZE = 25
 _POLYMARKET_SOURCE_TYPES = frozenset({"HISTORICAL", "FORWARD_COLLECTED"})
@@ -4455,6 +4456,307 @@ class AxiomStore:
         result = {str(row["status"]): int(row["n"]) for row in rows}
         result["total"] = sum(result.values())
         return result
+    def research_feed_status(
+        self,
+        *,
+        now: datetime | None = None,
+        hermes_job_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Return one bounded, read-only research-feed status projection.
+
+        The Hermes job is external to this process, so local scheduler state is
+        intentionally projected only as ``internal_queue`` evidence.  Every
+        aggregate below is computed in SQLite; this method never hydrates queue
+        or lifecycle rows and never performs qualification, network, or write
+        operations.
+        """
+        current = ensure_utc(now or utc_now())
+        current_iso = current.isoformat()
+        window_start = (current - timedelta(days=1)).isoformat()
+        accepted_sql = (
+            "(status='ACCEPTED' OR "
+            "(status='COMPLETED' AND json_valid(COALESCE(result_json,''))=1 "
+            "AND json_extract(result_json,'$.accepted')=1))"
+        )
+
+        with self._lock:
+            proposal_row = self._conn.execute(
+                "SELECT "
+                "MAX(CASE WHEN created_at<=? THEN created_at END) AS latest_submitted_at,"
+                "MAX(CASE WHEN " + accepted_sql + " AND updated_at<=? THEN updated_at END) AS latest_accepted_at,"
+                "COALESCE(SUM(CASE WHEN created_at>=? AND created_at<=? THEN 1 ELSE 0 END),0) AS submitted_24h,"
+                "COALESCE(SUM(CASE WHEN " + accepted_sql + " AND updated_at>=? AND updated_at<=? THEN 1 ELSE 0 END),0) AS accepted_24h,"
+                "COALESCE(SUM(CASE WHEN status='REJECTED' AND updated_at>=? AND updated_at<=? THEN 1 ELSE 0 END),0) AS rejected_24h,"
+                "COALESCE(SUM(CASE WHEN status='FAILED' AND updated_at>=? AND updated_at<=? THEN 1 ELSE 0 END),0) AS failed_24h,"
+                "COALESCE(SUM(CASE WHEN status='COMPLETED' THEN 1 ELSE 0 END),0) AS completed,"
+                "COALESCE(SUM(CASE WHEN status='PENDING' THEN 1 ELSE 0 END),0) AS pending,"
+                "COALESCE(SUM(CASE WHEN status='TESTING' AND lease_until IS NOT NULL AND lease_until>? THEN 1 ELSE 0 END),0) AS processing,"
+                "COALESCE(SUM(CASE WHEN status='REJECTED' THEN 1 ELSE 0 END),0) AS rejected,"
+                "COALESCE(SUM(CASE WHEN updated_at>=? AND updated_at<=? "
+                "AND status IN ('ACCEPTED','COMPLETED','REJECTED','FAILED') THEN 1 ELSE 0 END),0) AS terminal_24h "
+                "FROM research_queue WHERE lower(item_type)='hypothesis'",
+                (
+                    current_iso,
+                    current_iso,
+                    window_start,
+                    current_iso,
+                    window_start,
+                    current_iso,
+                    window_start,
+                    current_iso,
+                    window_start,
+                    current_iso,
+                    current_iso,
+                    window_start,
+                    current_iso,
+                ),
+            ).fetchone()
+            candidate_row = self._conn.execute(
+                "SELECT COUNT(*) AS total,"
+                "COALESCE(SUM(CASE WHEN stage='IDEA' THEN 1 ELSE 0 END),0) AS new,"
+                "COALESCE(SUM(CASE WHEN stage='REJECTED' THEN 1 ELSE 0 END),0) AS rejected "
+                "FROM candidate_lifecycle"
+            ).fetchone()
+            candidate_event_row = self._conn.execute(
+                "SELECT "
+                "MAX(CASE WHEN from_stage IS NULL AND to_stage='IDEA' AND created_at<=? THEN created_at END) AS latest_created_at,"
+                "COALESCE(SUM(CASE WHEN from_stage IS NULL AND to_stage='IDEA' THEN 1 ELSE 0 END),0) AS idea_events,"
+                "COALESCE(SUM(CASE WHEN from_stage IS NULL AND to_stage='IDEA' AND created_at>=? AND created_at<=? THEN 1 ELSE 0 END),0) AS created_24h,"
+                "COALESCE(SUM(CASE WHEN from_stage IS NULL AND to_stage='IDEA' AND created_at>=? AND created_at<=? "
+                "AND json_valid(COALESCE(payload_json,''))=1 "
+                "AND (NULLIF(TRIM(COALESCE(json_extract(payload_json,'$.parent_id'),'')),'') IS NOT NULL "
+                "OR NULLIF(TRIM(COALESCE(json_extract(payload_json,'$.lineage[0]'),'')),'') IS NOT NULL) "
+                "THEN 1 ELSE 0 END),0) AS mutations_24h "
+                "FROM candidate_lifecycle_events",
+                (current_iso, window_start, current_iso, window_start, current_iso),
+            ).fetchone()
+            # AxiomStore creates lifecycle events for normal writes.  This
+            # fallback keeps the aggregate useful for older/imported rows that
+            # predate that event table's creation.
+            candidate_fallback_row = None
+            if candidate_event_row is None or int(candidate_event_row["idea_events"] or 0) == 0:
+                candidate_fallback_row = self._conn.execute(
+                    "SELECT "
+                    "MAX(CASE WHEN updated_at<=? THEN updated_at END) AS latest_created_at,"
+                    "COALESCE(SUM(CASE WHEN updated_at>=? AND updated_at<=? THEN 1 ELSE 0 END),0) AS created_24h,"
+                    "COALESCE(SUM(CASE WHEN updated_at>=? AND updated_at<=? "
+                    "AND json_valid(COALESCE(payload_json,''))=1 "
+                    "AND (NULLIF(TRIM(COALESCE(json_extract(payload_json,'$.parent_id'),'')),'') IS NOT NULL "
+                    "OR NULLIF(TRIM(COALESCE(json_extract(payload_json,'$.lineage[0]'),'')),'') IS NOT NULL) "
+                    "THEN 1 ELSE 0 END),0) AS mutations_24h "
+                    "FROM candidate_lifecycle",
+                    (current_iso, window_start, current_iso, window_start, current_iso),
+                ).fetchone()
+            scheduler_row = self._conn.execute(
+                "SELECT state_json FROM scheduler_state WHERE scheduler_name='hermes-control'"
+            ).fetchone()
+            worker_row = self._conn.execute(
+                "SELECT status,payload_json,updated_at FROM worker_state "
+                "WHERE worker_name='research-queue' LIMIT 1"
+            ).fetchone()
+            budget_row = self._conn.execute(
+                "SELECT payload_json FROM experiment_budget WHERE budget_id='autonomous' LIMIT 1"
+            ).fetchone()
+            eligibility_table = self._conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='canary_eligibility' LIMIT 1"
+            ).fetchone()
+            eligible_count = 0
+            if eligibility_table is not None:
+                eligible_count = int(
+                    self._conn.execute(
+                        "SELECT COUNT(*) AS n "
+                        "FROM canary_eligibility AS e "
+                        "JOIN candidate_lifecycle AS c ON c.candidate_id=e.candidate_id "
+                        "WHERE c.stage IN ('FROZEN','PAPER_FORWARD','PAPER_PROMOTABLE') "
+                        "AND LENGTH(TRIM(COALESCE(e.frozen_hash,'')))>0 "
+                        "AND json_valid(COALESCE(c.payload_json,''))=1 "
+                        "AND LENGTH(TRIM(COALESCE(json_extract(c.payload_json,'$.frozen_hash'),'')))>0 "
+                        "AND json_type(c.payload_json,'$.frozen_hash')='text' "
+                        "AND json_extract(c.payload_json,'$.frozen_hash')=e.frozen_hash "
+                        "AND LENGTH(TRIM(COALESCE(json_extract(c.payload_json,'$.qualification_hash'),'')))>0 "
+                        "AND json_type(c.payload_json,'$.qualification_hash')='text' "
+                        "AND json_valid(COALESCE(e.evidence_json,''))=1 "
+                        "AND LENGTH(TRIM(COALESCE(json_extract(e.evidence_json,'$.qualification_hash'),'')))>0 "
+                        "AND json_type(e.evidence_json,'$.qualification_hash')='text' "
+                        "AND json_extract(c.payload_json,'$.qualification_hash')="
+                        "json_extract(e.evidence_json,'$.qualification_hash')"
+                    ).fetchone()["n"]
+                )
+
+        def _count(row: sqlite3.Row | None, name: str) -> int:
+            if row is None:
+                return 0
+            try:
+                value = row[name]
+                return max(0, int(value or 0))
+            except (KeyError, TypeError, ValueError, OverflowError):
+                return 0
+
+        def _timestamp(value: Any) -> str | None:
+            if value is None:
+                return None
+            if isinstance(value, datetime):
+                return ensure_utc(value).isoformat()
+            text = str(value).strip()
+            return text or None
+
+        proposal_submitted = _count(proposal_row, "submitted_24h")
+        proposal_accepted = _count(proposal_row, "accepted_24h")
+        proposal_rejected = _count(proposal_row, "rejected_24h")
+        proposal_failed = _count(proposal_row, "failed_24h")
+        proposal_pending = _count(proposal_row, "pending")
+        proposal_processing = _count(proposal_row, "processing")
+        candidate_created = _count(candidate_event_row, "created_24h")
+        candidate_mutations = _count(candidate_event_row, "mutations_24h")
+        if _count(candidate_event_row, "idea_events") == 0 and candidate_fallback_row is not None:
+            candidate_created = _count(candidate_fallback_row, "created_24h")
+            candidate_mutations = _count(candidate_fallback_row, "mutations_24h")
+        latest_created = (
+            _timestamp(candidate_event_row["latest_created_at"])
+            if candidate_event_row is not None and _count(candidate_event_row, "idea_events") > 0
+            else _timestamp(candidate_fallback_row["latest_created_at"])
+            if candidate_fallback_row is not None
+            else None
+        )
+
+        scheduler_state = _load(scheduler_row["state_json"]) if scheduler_row is not None else {}
+        scheduler_state = scheduler_state if isinstance(scheduler_state, Mapping) else {}
+
+        def _safe_job_id(value: Any) -> str | None:
+            text = str(value or "").strip()
+            if (
+                not text
+                or len(text) > 256
+                or not (text[0].isascii() and text[0].isalnum())
+                or any(not (char.isascii() and (char.isalnum() or char in "_.:-")) for char in text)
+            ):
+                return None
+            return text
+
+        if hermes_job_id is not None:
+            job_id = _safe_job_id(hermes_job_id) or _DEFAULT_HERMES_JOB_ID
+        else:
+            job_id = _safe_job_id(scheduler_state.get("job_id")) or _DEFAULT_HERMES_JOB_ID
+
+        queue_status = str(scheduler_state.get("status") or "ACTIVE").strip().upper()
+        if queue_status not in {"ACTIVE", "PAUSED"}:
+            queue_status = "ACTIVE"
+        trigger = scheduler_state.get("trigger", scheduler_state.get("schedule", "after_each_collection"))
+        trigger = str(trigger).strip() if trigger is not None else "after_each_collection"
+        if not trigger:
+            trigger = "after_each_collection"
+        worker_payload = (
+            _load(worker_row["payload_json"])
+            if worker_row is not None and worker_row["payload_json"]
+            else {}
+        )
+        worker_payload = worker_payload if isinstance(worker_payload, Mapping) else {}
+        last_cycle_at = (
+            worker_payload.get("last_cycle_at")
+            or worker_payload.get("cycle_at")
+            or scheduler_state.get("last_cycle_at")
+            or (worker_row["updated_at"] if worker_row is not None else None)
+            or scheduler_state.get("last_run_at")
+        )
+
+        budget_payload = _load(budget_row["payload_json"]) if budget_row is not None else {}
+        budget_payload = budget_payload if isinstance(budget_payload, Mapping) else {}
+
+        def _nonnegative_int(value: Any, default: int = 0) -> int:
+            if isinstance(value, bool):
+                return default
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError, OverflowError):
+                return default
+            return parsed if parsed >= 0 else default
+
+        total_limit = _nonnegative_int(budget_payload.get("total_limit"))
+        total_used = min(total_limit, _nonnegative_int(budget_payload.get("used_total")))
+        total_remaining = max(0, total_limit - total_used)
+        raw_total_limit = budget_payload.get("total_limit")
+        raw_total_used = budget_payload.get("used_total")
+        budget_exhausted = (
+            budget_row is not None
+            and isinstance(raw_total_limit, int)
+            and not isinstance(raw_total_limit, bool)
+            and isinstance(raw_total_used, int)
+            and not isinstance(raw_total_used, bool)
+            and raw_total_limit >= 0
+            and raw_total_used >= 0
+            and raw_total_used >= raw_total_limit
+        )
+
+        per_family_limit = _nonnegative_int(budget_payload.get("per_family_limit"))
+        raw_families = budget_payload.get("used_by_family", {})
+        raw_families = raw_families if isinstance(raw_families, Mapping) else {}
+        families: dict[str, dict[str, int]] = {}
+        for family, used in raw_families.items():
+            used_value = min(per_family_limit, _nonnegative_int(used))
+            family_name = str(family).strip()
+            if family_name:
+                families[family_name] = {
+                    "limit": per_family_limit,
+                    "used": used_value,
+                    "remaining": max(0, per_family_limit - used_value),
+                }
+
+        if proposal_submitted == 0:
+            no_new_reason = "NO_NEW_HERMES_PROPOSALS"
+        elif budget_exhausted:
+            no_new_reason = "RESEARCH_BUDGET_EXHAUSTED"
+        elif proposal_pending + proposal_processing > 0:
+            no_new_reason = "INTERNAL_QUEUE_HAS_WORK"
+        elif (
+            _count(proposal_row, "terminal_24h") > 0
+            and candidate_created == 0
+        ):
+            no_new_reason = "QUEUE_CONSUMED_WITHOUT_NEW_CANDIDATES"
+        elif candidate_created > 0:
+            no_new_reason = "CANDIDATE_FLOW_ACTIVE"
+        else:
+            no_new_reason = "NO_NEW_CANDIDATES_OBSERVED"
+
+        return {
+            "external_hermes": {
+                "job_id": job_id,
+                "status": "UNKNOWN",
+                "evidence": "No local verifier is available for the external Hermes job; scheduler state is internal-only.",
+            },
+            "internal_queue": {
+                "status": queue_status,
+                "trigger": trigger,
+                "last_cycle_at": _timestamp(last_cycle_at),
+            },
+            "proposals": {
+                "latest_submitted_at": _timestamp(proposal_row["latest_submitted_at"]) if proposal_row is not None else None,
+                "latest_accepted_at": _timestamp(proposal_row["latest_accepted_at"]) if proposal_row is not None else None,
+                "submitted_24h": proposal_submitted,
+                "accepted_24h": proposal_accepted,
+                "rejected_24h": proposal_rejected,
+                "failed_24h": proposal_failed,
+                "pending": proposal_pending,
+                "processing": proposal_processing,
+                "completed": _count(proposal_row, "completed"),
+                "rejected": _count(proposal_row, "rejected"),
+            },
+            "candidates": {
+                "latest_created_at": latest_created,
+                "created_24h": candidate_created,
+                "mutations_24h": candidate_mutations,
+                "total": _count(candidate_row, "total"),
+                "new": _count(candidate_row, "new"),
+                "eligible": eligible_count,
+                "rejected": _count(candidate_row, "rejected"),
+            },
+            "budgets": {
+                "total_limit": total_limit,
+                "total_used": total_used,
+                "total_remaining": total_remaining,
+                "families": families,
+            },
+            "no_new_candidates_reason": no_new_reason,
+        }
 
     def save_candidate_lifecycle(
         self,

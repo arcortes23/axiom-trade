@@ -869,6 +869,34 @@ _CANARY_FORWARD_RANKING_FIELDS = frozenset(
         "observations_without_signal",
     }
 )
+_CANARY_RANKING_EVIDENCE_ALIASES: dict[str, tuple[str, ...]] = {
+    "expectancy": ("validation_expectancy", "expectancy"),
+    "confidence_lower_bound": (
+        "validation_confidence_lower_bound",
+        "confidence_lower_bound",
+    ),
+    "stability": ("validation_stability", "stability"),
+    "calibration": ("validation_calibration", "calibration"),
+    "sample_count": ("validation_sample_count", "sample_count"),
+    "trade_count": ("validation_trade_count", "validation_trades", "trade_count"),
+    "execution_quality": ("validation_execution_quality", "execution_quality"),
+    "quality": (
+        "validation_data_quality",
+        "data_quality",
+        "quality",
+        "data_quality_passed",
+    ),
+    "execution_fidelity_score": ("execution_fidelity_score",),
+    "max_drawdown": ("validation_max_drawdown", "max_drawdown"),
+    "liquidity": ("validation_liquidity", "liquidity"),
+    "forward_expectancy": ("forward_expectancy",),
+}
+_CANARY_RANKING_EVIDENCE_TOP_LEVEL_KEYS = frozenset(
+    alias
+    for aliases in _CANARY_RANKING_EVIDENCE_ALIASES.values()
+    for alias in aliases
+)
+
 _CANARY_TELEMETRY_WORDS = (
     "duration",
     "observation",
@@ -888,7 +916,6 @@ _CANARY_QUALIFICATION_KEYS = frozenset(
         "market_type",
         "market",
         "strategy_id",
-        "instrument",
         "timeframe",
         "source_type",
         "dataset_id",
@@ -907,6 +934,7 @@ _CANARY_QUALIFICATION_KEYS = frozenset(
         "validation_complete",
         "robustness_passed",
         "holdout_used",
+        "critical_error",
         "experiment_plan",
         "minimum_sample_check",
         "data_quality",
@@ -933,6 +961,7 @@ def _canary_qualification_value(
     *,
     key: str = "",
     preserve_telemetry: bool = False,
+    exclude_prediction_market_fields: bool = False,
 ) -> Any:
     """Copy JSON evidence while removing mutable paper-forward telemetry."""
     preserve_telemetry = preserve_telemetry or key in {
@@ -949,7 +978,11 @@ def _canary_qualification_value(
             )
             for name, item in value.items()
             if not (
-                str(name).lower().startswith("forward_")
+                (
+                    exclude_prediction_market_fields
+                    and str(name).lower() in {"market_type", "type"}
+                )
+                or str(name).lower().startswith("forward_")
                 or (
                     not preserve_telemetry
                     and str(name).lower() not in _CANARY_QUALIFICATION_KEYS
@@ -976,6 +1009,56 @@ def _canary_qualification_value(
             for item in value
         ]
     return value
+
+
+_CANARY_PREDICTION_MARKET_SOURCES = (
+    "payload",
+    "experiment_plan",
+    "strategy",
+    "forward_config",
+    "market",
+)
+_CANARY_PREDICTION_MARKET_FIELDS = ("market_type", "type")
+
+
+def _canary_prediction_market(payload: Mapping[str, Any]) -> str | None:
+    """Resolve the effective market type with ranker's exact precedence."""
+    body = payload if isinstance(payload, Mapping) else {}
+    for source_name in _CANARY_PREDICTION_MARKET_SOURCES:
+        source = body if source_name == "payload" else body.get(source_name)
+        if not isinstance(source, Mapping):
+            continue
+        value = source.get("market_type", source.get("type"))
+        if value is not None:
+            return str(value).strip().lower()
+    value = body.get("market_type")
+    return str(value).strip().lower() if value is not None else None
+
+
+def _canary_prediction_market_inputs(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Capture every market-type source and its precedence inputs."""
+    body = payload if isinstance(payload, Mapping) else {}
+    sources: list[dict[str, Any]] = []
+    for source_name in _CANARY_PREDICTION_MARKET_SOURCES:
+        source = body if source_name == "payload" else body.get(source_name)
+        entry: dict[str, Any] = {
+            "source": source_name,
+            "present": isinstance(source, Mapping),
+        }
+        if isinstance(source, Mapping):
+            for field in _CANARY_PREDICTION_MARKET_FIELDS:
+                entry[f"{field}_present"] = field in source
+                if field in source:
+                    entry[field] = _canary_qualification_value(
+                        source[field],
+                        key=field,
+                        preserve_telemetry=True,
+                    )
+        sources.append(entry)
+    return {
+        "sources": sources,
+        "effective": _canary_prediction_market(body),
+    }
 
 
 def _canary_qualification_projection(
@@ -1008,7 +1091,14 @@ def _canary_qualification_projection(
             ("validation_", "historical_", "robustness_")
         ):
             continue
-        result[name] = _canary_qualification_value(value, key=name)
+        result[name] = _canary_qualification_value(
+            value,
+            key=name,
+            exclude_prediction_market_fields=name in {
+                "experiment_plan",
+                "market",
+            },
+        )
     if isinstance(quality, Mapping):
         derived_quality = _canary_qualification_value(
             persisted_quality_fields(quality)
@@ -1038,21 +1128,25 @@ def _canary_ranking_snapshot_hash(
     """Hash every mutable input that can affect a persisted ranking."""
     body = payload if isinstance(payload, Mapping) else {}
     ranking: dict[str, Any] = {}
+    ranking["prediction_market"] = _canary_prediction_market_inputs(body)
     for key, value in body.items():
         name = str(key)
         lower = name.lower()
         if name == "forward_evidence":
             if isinstance(value, Mapping):
-                ranking[name] = {
+                forward_ranking = {
                     str(item): _canary_qualification_value(raw, key=str(item))
                     for item, raw in value.items()
                     if str(item) in _CANARY_FORWARD_RANKING_FIELDS
                 }
+                if forward_ranking:
+                    ranking[name] = forward_ranking
             continue
         if (
             lower.startswith("validation_")
             or lower.startswith("historical_")
             or lower.startswith("robustness_")
+            or lower in _CANARY_RANKING_EVIDENCE_TOP_LEVEL_KEYS
             or name in (
                 {
                     "experiment_plan",
@@ -1094,6 +1188,132 @@ def _canary_ranking_snapshot_hash(
             "ranking_inputs": ranking,
         }
     )
+def _canary_lifecycle_snapshot_hashes(
+    store: AxiomStore,
+    record: Mapping[str, Any] | None,
+    *,
+    quality: Mapping[str, Any] | None | object = _UNSET,
+) -> tuple[str, str | None, str | None]:
+    """Return the stage, qualification hash, and ranking-input hash for a row.
+
+    This is the shared hash boundary for lifecycle writers and rankers.  Keep
+    the projection and ranking-input definitions in one place so readiness
+    invalidation cannot drift from submission/ranking revalidation.
+    """
+    if not isinstance(record, Mapping):
+        return "", None, None
+    stage = str(record.get("stage") or "")
+    payload = _canary_merged_lifecycle_payload(record)
+    if payload is None:
+        return stage, None, None
+    frozen_hash = _canary_lifecycle_frozen_hash(store, record)
+    if quality is _UNSET:
+        quality = evaluate_prediction_data_quality(
+            store,
+            payload,
+            verify_attestation=False,
+        )
+    qualification = _canary_qualification_projection(
+        str(record.get("candidate_id") or ""),
+        payload,
+        frozen_hash=frozen_hash,
+        quality=quality if isinstance(quality, Mapping) else None,
+    )
+    qualification_hash = _canary_qualification_hash(qualification)
+    ranking_hash = _canary_ranking_snapshot_hash(
+        str(record.get("candidate_id") or ""),
+        stage,
+        payload,
+        qualification_hash=qualification_hash,
+        quality=quality if isinstance(quality, Mapping) else None,
+    )
+    return stage, qualification_hash, ranking_hash
+
+
+def _canary_lifecycle_payload_has_telemetry_change(
+    before: Any,
+    after: Any,
+    *,
+    key: str = "",
+) -> bool:
+    """Identify ignored signal/forward telemetry for the C evidence class."""
+    if before == after:
+        return False
+    lower = str(key).lower()
+    if (
+        lower.startswith(("signal_", "telemetry_"))
+        or lower in {"signal", "telemetry", "latest_signal"}
+        or any(word in lower for word in _CANARY_TELEMETRY_WORDS)
+    ):
+        return True
+    if isinstance(before, Mapping) and isinstance(after, Mapping):
+        names = {str(name) for name in before} | {str(name) for name in after}
+        return any(
+            _canary_lifecycle_payload_has_telemetry_change(
+                before.get(name),
+                after.get(name),
+                key=name,
+            )
+            for name in names
+        )
+    if isinstance(before, (list, tuple)) and isinstance(after, (list, tuple)):
+        if len(before) != len(after):
+            return "signal" in lower or "telemetry" in lower
+        return any(
+            _canary_lifecycle_payload_has_telemetry_change(
+                old,
+                new,
+                key=key,
+            )
+            for old, new in zip(before, after)
+        )
+    return False
+
+
+def _canary_lifecycle_evidence_class(
+    store: AxiomStore,
+    before: Mapping[str, Any] | None,
+    after: Mapping[str, Any] | None,
+) -> str:
+    """Classify one lifecycle write as qualification, ranking, telemetry, or harmless.
+
+    ``A`` changes immutable qualification, ``B`` changes ranking evidence
+    without changing qualification, ``C`` changes ignored signal telemetry,
+    and ``D`` changes neither hash projection.  Hash failures are treated as
+    qualification changes so an unclassifiable write fails closed.
+    """
+    before_stage, before_qualification, before_ranking = (
+        _canary_lifecycle_snapshot_hashes(store, before)
+    )
+    after_stage, after_qualification, after_ranking = (
+        _canary_lifecycle_snapshot_hashes(store, after)
+    )
+    if before_stage != after_stage:
+        return "A"
+    if before_qualification is None or after_qualification is None:
+        return "A"
+    if before_qualification != after_qualification:
+        return "A"
+    if before_ranking is None or after_ranking is None:
+        return "A"
+    if before_ranking != after_ranking:
+        return "B"
+    before_payload = _canary_merged_lifecycle_payload(before) or {}
+    after_payload = _canary_merged_lifecycle_payload(after) or {}
+    if _canary_lifecycle_payload_has_telemetry_change(before_payload, after_payload):
+        return "C"
+    return "D"
+
+
+def _canary_lifecycle_evidence_reason(evidence_class: str) -> str | None:
+    """Map the A/B lifecycle classes to precise readiness invalidations."""
+    return {
+        "A": "LIFECYCLE_QUALIFICATION_UPDATED",
+        "B": "LIFECYCLE_RANKING_EVIDENCE_UPDATED",
+    }.get(str(evidence_class).strip().upper())
+
+
+
 
 
 def _canary_lifecycle_frozen_hash(store: AxiomStore, record: Mapping[str, Any] | None) -> str | None:
@@ -1409,8 +1629,31 @@ class CanaryService:
               signal_scan_cursor INTEGER NOT NULL DEFAULT 0,
               signal_scan_ranking_run_id TEXT,
               next_signal_scan_start_rank INTEGER,
-              next_signal_scan_end_rank INTEGER
+              next_signal_scan_end_rank INTEGER,
+              signal_scan_cycle_id TEXT,
+              signal_scan_candidate_universe_hash TEXT,
+              signal_scan_cycle_started_at TEXT,
+              signal_scan_cycle_completed_at TEXT,
+              signal_scan_cycle_complete INTEGER NOT NULL DEFAULT 0,
+              signal_scan_checked_this_cycle INTEGER NOT NULL DEFAULT 0,
+              signal_scan_remaining_this_cycle INTEGER NOT NULL DEFAULT 0,
+              signal_scan_coverage_percentage REAL NOT NULL DEFAULT 0,
+              signal_scan_skip_reasons_json TEXT NOT NULL DEFAULT '{}',
+              signal_scan_status TEXT NOT NULL DEFAULT 'UNKNOWN'
             );
+            CREATE TABLE IF NOT EXISTS canary_signal_scan_checked (
+              cycle_id TEXT NOT NULL,
+              candidate_id TEXT NOT NULL,
+              qualification_hash TEXT NOT NULL,
+              checked_at TEXT NOT NULL,
+              rank_at_check INTEGER,
+              ranking_run_id TEXT,
+              PRIMARY KEY(cycle_id,candidate_id,qualification_hash)
+            );
+            CREATE INDEX IF NOT EXISTS idx_canary_signal_scan_checked_cycle
+              ON canary_signal_scan_checked(cycle_id,checked_at,candidate_id);
+            CREATE INDEX IF NOT EXISTS idx_canary_signal_scan_checked_candidate
+              ON canary_signal_scan_checked(candidate_id,qualification_hash);
             CREATE TABLE IF NOT EXISTS canary_readiness_snapshot (
               singleton INTEGER PRIMARY KEY CHECK(singleton=1),
               payload_json TEXT NOT NULL,
@@ -1489,6 +1732,16 @@ class CanaryService:
                         ("signal_scan_ranking_run_id", "TEXT"),
                         ("next_signal_scan_start_rank", "INTEGER"),
                         ("next_signal_scan_end_rank", "INTEGER"),
+                        ("signal_scan_cycle_id", "TEXT"),
+                        ("signal_scan_candidate_universe_hash", "TEXT"),
+                        ("signal_scan_cycle_started_at", "TEXT"),
+                        ("signal_scan_cycle_completed_at", "TEXT"),
+                        ("signal_scan_cycle_complete", "INTEGER NOT NULL DEFAULT 0"),
+                        ("signal_scan_checked_this_cycle", "INTEGER NOT NULL DEFAULT 0"),
+                        ("signal_scan_remaining_this_cycle", "INTEGER NOT NULL DEFAULT 0"),
+                        ("signal_scan_coverage_percentage", "REAL NOT NULL DEFAULT 0"),
+                        ("signal_scan_skip_reasons_json", "TEXT NOT NULL DEFAULT '{}'"),
+                        ("signal_scan_status", "TEXT NOT NULL DEFAULT 'UNKNOWN'"),
                     ),
                 ),
                 (
@@ -1509,6 +1762,35 @@ class CanaryService:
                             f"ALTER TABLE {table} ADD COLUMN {column} {declaration}"
                         )
 
+            # Readiness trigger definitions changed over time.  Do not leave
+            # an older same-name trigger (notably the pre-stage-filter
+            # lifecycle update trigger) active in a reopened database: SQLite
+            # CREATE TRIGGER IF NOT EXISTS preserves that stale definition.
+            self.store.connection.executescript("""
+            DROP TRIGGER IF EXISTS canary_readiness_stale_lifecycle_insert;
+            DROP TRIGGER IF EXISTS canary_readiness_stale_lifecycle_update;
+            DROP TRIGGER IF EXISTS canary_readiness_stale_eligibility;
+            DROP TRIGGER IF EXISTS canary_readiness_stale_eligibility_update;
+            DROP TRIGGER IF EXISTS canary_readiness_stale_rankings;
+            DROP TRIGGER IF EXISTS canary_readiness_stale_rankings_update;
+            DROP TRIGGER IF EXISTS canary_readiness_stale_selection;
+            DROP TRIGGER IF EXISTS canary_readiness_stale_selection_update;
+            DROP TRIGGER IF EXISTS canary_readiness_stale_control;
+            DROP TRIGGER IF EXISTS canary_readiness_stale_control_update;
+            DROP TRIGGER IF EXISTS canary_readiness_stale_signal;
+            DROP TRIGGER IF EXISTS canary_readiness_stale_signal_update;
+            DROP TRIGGER IF EXISTS canary_readiness_stale_ledger;
+            DROP TRIGGER IF EXISTS canary_readiness_stale_ledger_update;
+            DROP TRIGGER IF EXISTS canary_readiness_stale_execution;
+            DROP TRIGGER IF EXISTS canary_readiness_stale_execution_update;
+            DROP TRIGGER IF EXISTS canary_readiness_stale_lifecycle_delete;
+            DROP TRIGGER IF EXISTS canary_readiness_stale_eligibility_delete;
+            DROP TRIGGER IF EXISTS canary_readiness_stale_rankings_delete;
+            DROP TRIGGER IF EXISTS canary_readiness_stale_selection_delete;
+            DROP TRIGGER IF EXISTS canary_readiness_stale_autonomous;
+            DROP TRIGGER IF EXISTS canary_readiness_stale_autonomous_update;
+            """)
+
             self.store.connection.executescript("""
             CREATE TRIGGER IF NOT EXISTS canary_readiness_stale_lifecycle_insert
             AFTER INSERT ON candidate_lifecycle BEGIN
@@ -1518,8 +1800,10 @@ class CanaryService:
                 readiness_snapshot_reason='LIFECYCLE_CHANGED'
               WHERE singleton=1;
             END;
-            CREATE TRIGGER IF NOT EXISTS canary_readiness_stale_lifecycle_update
-            AFTER UPDATE ON candidate_lifecycle BEGIN
+            DROP TRIGGER IF EXISTS canary_readiness_stale_lifecycle_update;
+            CREATE TRIGGER canary_readiness_stale_lifecycle_update
+            AFTER UPDATE OF stage ON candidate_lifecycle
+            WHEN OLD.stage IS NOT NEW.stage BEGIN
               UPDATE canary_readiness_snapshot SET
                 readiness_snapshot_status='STALE',
                 readiness_snapshot_stale=1,
@@ -1751,19 +2035,19 @@ class CanaryService:
             "signal_scan_ranking_run_id": None,
             "next_signal_scan_start_rank": None,
             "next_signal_scan_end_rank": None,
+            "signal_scan_cycle_id": None,
+            "signal_scan_candidate_universe_hash": None,
+            "signal_scan_cycle_started_at": None,
+            "signal_scan_cycle_completed_at": None,
+            "signal_scan_cycle_complete": 0,
+            "signal_scan_checked_this_cycle": 0,
+            "signal_scan_remaining_this_cycle": 0,
+            "signal_scan_coverage_percentage": 0.0,
+            "signal_scan_skip_reasons_json": "{}",
+            "signal_scan_status": "UNKNOWN",
+            "signal_scan_checked_keys": [],
             "last_signal_id": None,
             "worker_status": "UNKNOWN",
-            "candidates_ranked": None,
-            "candidates_signal_checked": None,
-            "candidates_no_signal": None,
-            "actionable_candidates_found": None,
-            "selected_actionable_candidate": None,
-            "selected_actionable_rank": None,
-            "selected_actionable_score": None,
-            "signal_scan_cursor": 0,
-            "signal_scan_ranking_run_id": None,
-            "next_signal_scan_start_rank": None,
-            "next_signal_scan_end_rank": None,
         }
         return {
             "production_live_trading": "DISABLED",
@@ -1808,6 +2092,17 @@ class CanaryService:
             "signal_scan_ranking_run_id": None,
             "next_signal_scan_start_rank": None,
             "next_signal_scan_end_rank": None,
+            "signal_scan_cycle_id": None,
+            "signal_scan_candidate_universe_hash": None,
+            "signal_scan_cycle_started_at": None,
+            "signal_scan_cycle_completed_at": None,
+            "signal_scan_cycle_complete": 0,
+            "signal_scan_checked_this_cycle": 0,
+            "signal_scan_remaining_this_cycle": 0,
+            "signal_scan_coverage_percentage": 0.0,
+            "signal_scan_skip_reasons_json": "{}",
+            "signal_scan_status": "UNKNOWN",
+            "signal_scan_checked_keys": [],
             "real_execution_events": None,
             "execution_event_count": None,
             "historical_data_integrity": "UNKNOWN",
@@ -1843,6 +2138,15 @@ class CanaryService:
             except sqlite3.OperationalError:
                 return None
 
+        def fetchall(query: str, parameters: tuple[Any, ...] = ()) -> list[Any]:
+            try:
+                if lock is None:
+                    return connection.execute(query, parameters).fetchall()
+                with lock:
+                    return connection.execute(query, parameters).fetchall()
+            except sqlite3.OperationalError:
+                return []
+
         control = fetchone(
             "SELECT state,candidate_id,venue,expires_at,control_generation,"
             "updated_at,limits_json FROM canary_control WHERE singleton=1"
@@ -1863,6 +2167,11 @@ class CanaryService:
             "actionable_candidates_found,selected_actionable_candidate,"
             "selected_actionable_rank,selected_actionable_score,signal_scan_cursor,"
             "signal_scan_ranking_run_id,next_signal_scan_start_rank,next_signal_scan_end_rank,"
+            "signal_scan_cycle_id,signal_scan_candidate_universe_hash,"
+            "signal_scan_cycle_started_at,signal_scan_cycle_completed_at,"
+            "signal_scan_cycle_complete,signal_scan_checked_this_cycle,"
+            "signal_scan_remaining_this_cycle,signal_scan_coverage_percentage,"
+            "signal_scan_skip_reasons_json,signal_scan_status,"
             "next_decision,blocker,last_signal_id,worker_status FROM canary_autonomous_state "
             "WHERE singleton=1"
         )
@@ -1931,6 +2240,16 @@ class CanaryService:
                         "signal_scan_ranking_run_id",
                         "next_signal_scan_start_rank",
                         "next_signal_scan_end_rank",
+                        "signal_scan_cycle_id",
+                        "signal_scan_candidate_universe_hash",
+                        "signal_scan_cycle_started_at",
+                        "signal_scan_cycle_completed_at",
+                        "signal_scan_cycle_complete",
+                        "signal_scan_checked_this_cycle",
+                        "signal_scan_remaining_this_cycle",
+                        "signal_scan_coverage_percentage",
+                        "signal_scan_skip_reasons_json",
+                        "signal_scan_status",
                         "next_decision",
                         "blocker",
                         "last_signal_id",
@@ -1938,6 +2257,29 @@ class CanaryService:
                     )
                 }
             )
+        if autonomous is not None:
+            cycle_fields = (
+                "signal_scan_cycle_id",
+                "signal_scan_candidate_universe_hash",
+                "signal_scan_cycle_started_at",
+                "signal_scan_cycle_completed_at",
+                "signal_scan_cycle_complete",
+                "signal_scan_checked_this_cycle",
+                "signal_scan_remaining_this_cycle",
+                "signal_scan_coverage_percentage",
+                "signal_scan_skip_reasons_json",
+                "signal_scan_status",
+            )
+            for name in cycle_fields:
+                payload[name] = autonomous[name]
+            cycle_id = str(autonomous["signal_scan_cycle_id"] or "").strip()
+            checked_rows = fetchall(
+                "SELECT cycle_id,candidate_id,qualification_hash,checked_at,"
+                "rank_at_check,ranking_run_id FROM canary_signal_scan_checked "
+                "WHERE cycle_id=? ORDER BY checked_at,candidate_id,qualification_hash",
+                (cycle_id,),
+            ) if cycle_id else []
+            payload["signal_scan_checked_keys"] = [dict(row) for row in checked_rows]
         # Keep the nested autonomous object a complete legacy projection even
         # before the first authoritative evaluation.  Selection values are
         # durable metadata and are safe to copy here; qualification counts
@@ -1960,6 +2302,7 @@ class CanaryService:
                     "selection_invalidation_reason": payload[
                         "selection_invalidation_reason"
                     ],
+                    "signal_scan_checked_keys": payload["signal_scan_checked_keys"],
                 }
             )
             payload["autonomous"] = auto
@@ -2132,6 +2475,16 @@ class CanaryService:
             "signal_scan_ranking_run_id",
             "next_signal_scan_start_rank",
             "next_signal_scan_end_rank",
+            "signal_scan_cycle_id",
+            "signal_scan_candidate_universe_hash",
+            "signal_scan_cycle_started_at",
+            "signal_scan_cycle_completed_at",
+            "signal_scan_cycle_complete",
+            "signal_scan_checked_this_cycle",
+            "signal_scan_remaining_this_cycle",
+            "signal_scan_coverage_percentage",
+            "signal_scan_skip_reasons_json",
+            "signal_scan_status",
             "next_decision",
             "blocker",
             "last_signal_id",
@@ -2187,7 +2540,38 @@ class CanaryService:
                     if isinstance(auto, Mapping)
                     else dict(self._readiness_snapshot_default()["autonomous"])
                 )
+                cycle_fields = (
+                    "signal_scan_cycle_id",
+                    "signal_scan_candidate_universe_hash",
+                    "signal_scan_cycle_started_at",
+                    "signal_scan_cycle_completed_at",
+                    "signal_scan_cycle_complete",
+                    "signal_scan_checked_this_cycle",
+                    "signal_scan_remaining_this_cycle",
+                    "signal_scan_coverage_percentage",
+                    "signal_scan_skip_reasons_json",
+                    "signal_scan_status",
+                )
                 auto.update({name: state[name] for name in fields})
+                auto.update({name: state[name] for name in cycle_fields})
+                cycle_id = str(state["signal_scan_cycle_id"] or "").strip()
+                checked_rows = (
+                    self.store.connection.execute(
+                        "SELECT cycle_id,candidate_id,qualification_hash,checked_at,"
+                        "rank_at_check,ranking_run_id "
+                        "FROM canary_signal_scan_checked WHERE cycle_id=? "
+                        "ORDER BY checked_at,candidate_id,qualification_hash",
+                        (cycle_id,),
+                    ).fetchall()
+                    if cycle_id
+                    else []
+                )
+                checked_keys = [dict(row) for row in checked_rows]
+                auto["signal_scan_checked_keys"] = checked_keys
+                payload.update(
+                    {name: state[name] for name in cycle_fields}
+                )
+                payload["signal_scan_checked_keys"] = checked_keys
                 payload["autonomous"] = auto
                 encoded = json.dumps(
                     payload,
@@ -2987,6 +3371,14 @@ class CanaryService:
                     return connection.execute(query, parameters).fetchone()
             except sqlite3.Error:
                 return None
+        def fetchall(query: str, parameters: tuple[Any, ...] = ()) -> list[Any]:
+            try:
+                if lock is None:
+                    return connection.execute(query, parameters).fetchall()
+                with lock:
+                    return connection.execute(query, parameters).fetchall()
+            except sqlite3.Error:
+                return []
 
         control_row = fetchone(
             "SELECT state,candidate_id,venue,expires_at,control_generation,"
@@ -3083,6 +3475,17 @@ class CanaryService:
             "signal_scan_ranking_run_id",
             "next_signal_scan_start_rank",
             "next_signal_scan_end_rank",
+            "signal_scan_cycle_id",
+            "signal_scan_candidate_universe_hash",
+            "signal_scan_cycle_started_at",
+            "signal_scan_cycle_completed_at",
+            "signal_scan_cycle_complete",
+            "signal_scan_checked_this_cycle",
+            "signal_scan_remaining_this_cycle",
+            "signal_scan_coverage_percentage",
+            "signal_scan_skip_reasons_json",
+            "signal_scan_status",
+            "signal_scan_checked_keys",
             "next_decision",
             "blocker",
             "last_signal_id",
@@ -3152,6 +3555,11 @@ class CanaryService:
             "actionable_candidates_found,selected_actionable_candidate,"
             "selected_actionable_rank,selected_actionable_score,signal_scan_cursor,"
             "signal_scan_ranking_run_id,next_signal_scan_start_rank,next_signal_scan_end_rank,"
+            "signal_scan_cycle_id,signal_scan_candidate_universe_hash,"
+            "signal_scan_cycle_started_at,signal_scan_cycle_completed_at,"
+            "signal_scan_cycle_complete,signal_scan_checked_this_cycle,"
+            "signal_scan_remaining_this_cycle,signal_scan_coverage_percentage,"
+            "signal_scan_skip_reasons_json,signal_scan_status,"
             "next_decision,blocker,last_signal_id,worker_status FROM canary_autonomous_state "
             "WHERE singleton=1"
         )
@@ -3168,6 +3576,16 @@ class CanaryService:
             "actionable_candidates_found",
             "selected_actionable_candidate",
             "selected_actionable_rank",
+            "signal_scan_cycle_id",
+            "signal_scan_candidate_universe_hash",
+            "signal_scan_cycle_started_at",
+            "signal_scan_cycle_completed_at",
+            "signal_scan_cycle_complete",
+            "signal_scan_checked_this_cycle",
+            "signal_scan_remaining_this_cycle",
+            "signal_scan_coverage_percentage",
+            "signal_scan_skip_reasons_json",
+            "signal_scan_status",
             "selected_actionable_score",
             "signal_scan_cursor",
             "signal_scan_ranking_run_id",
@@ -3189,6 +3607,57 @@ class CanaryService:
         )
         if worker_row is None:
             worker["worker_status"] = "UNKNOWN"
+        worker_cycle_id = str(worker.get("signal_scan_cycle_id") or "").strip()
+        worker_checked_keys = (
+            [
+                dict(item)
+                for item in fetchall(
+                    "SELECT cycle_id,candidate_id,qualification_hash,checked_at,"
+                    "rank_at_check,ranking_run_id "
+                    "FROM canary_signal_scan_checked WHERE cycle_id=? "
+                    "ORDER BY checked_at,candidate_id,qualification_hash",
+                    (worker_cycle_id,),
+                )
+            ]
+            if worker_cycle_id
+            else (
+                projection.get(
+                    "signal_scan_checked_keys",
+                    autonomous_projection.get("signal_scan_checked_keys", []),
+                )
+                if worker_row is None
+                else []
+            )
+        )
+        worker["signal_scan_checked_keys"] = worker_checked_keys
+        legacy_projection["signal_scan_checked_keys"] = worker_checked_keys
+        readiness["signal_scan_checked_keys"] = worker_checked_keys
+        cycle_projection_fields = (
+            "signal_scan_cycle_id",
+            "signal_scan_candidate_universe_hash",
+            "signal_scan_cycle_started_at",
+            "signal_scan_cycle_completed_at",
+            "signal_scan_cycle_complete",
+            "signal_scan_checked_this_cycle",
+            "signal_scan_remaining_this_cycle",
+            "signal_scan_coverage_percentage",
+            "signal_scan_skip_reasons_json",
+            "signal_scan_status",
+        )
+        if worker_row is not None:
+            report_autonomous = dict(
+                legacy_projection.get("autonomous")
+                if isinstance(legacy_projection.get("autonomous"), Mapping)
+                else {}
+            )
+            for name in cycle_projection_fields:
+                value = worker.get(name)
+                legacy_projection[name] = value
+                readiness[name] = value
+                report_autonomous[name] = value
+            report_autonomous["signal_scan_checked_keys"] = worker_checked_keys
+            legacy_projection["autonomous"] = report_autonomous
+            readiness["autonomous"] = report_autonomous
 
         now = ensure_utc(self.clock())
         start = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
@@ -3445,6 +3914,17 @@ class CanaryService:
         signal_scan_ranking_run_id: str | None | object = _UNSET,
         next_signal_scan_start_rank: int | None | object = _UNSET,
         next_signal_scan_end_rank: int | None | object = _UNSET,
+        signal_scan_cycle_id: str | None | object = _UNSET,
+        signal_scan_candidate_universe_hash: str | None | object = _UNSET,
+        signal_scan_cycle_started_at: str | None | object = _UNSET,
+        signal_scan_cycle_completed_at: str | None | object = _UNSET,
+        signal_scan_cycle_complete: int | bool | None | object = _UNSET,
+        signal_scan_checked_this_cycle: int | None | object = _UNSET,
+        signal_scan_remaining_this_cycle: int | None | object = _UNSET,
+        signal_scan_coverage_percentage: float | None | object = _UNSET,
+        signal_scan_skip_reasons_json: str | None | object = _UNSET,
+        signal_scan_status: str | None | object = _UNSET,
+        signal_scan_checked_keys: list[Mapping[str, Any]] | None = None,
         publish: bool = False,
     ) -> None:
         when = ensure_utc(timestamp or self.clock()).isoformat()
@@ -3463,6 +3943,16 @@ class CanaryService:
             "candidates_no_signal": candidates_no_signal,
             "actionable_candidates_found": actionable_candidates_found,
             "selected_actionable_candidate": selected_actionable_candidate,
+            "signal_scan_cycle_id": signal_scan_cycle_id,
+            "signal_scan_candidate_universe_hash": signal_scan_candidate_universe_hash,
+            "signal_scan_cycle_started_at": signal_scan_cycle_started_at,
+            "signal_scan_cycle_completed_at": signal_scan_cycle_completed_at,
+            "signal_scan_cycle_complete": signal_scan_cycle_complete,
+            "signal_scan_checked_this_cycle": signal_scan_checked_this_cycle,
+            "signal_scan_remaining_this_cycle": signal_scan_remaining_this_cycle,
+            "signal_scan_coverage_percentage": signal_scan_coverage_percentage,
+            "signal_scan_skip_reasons_json": signal_scan_skip_reasons_json,
+            "signal_scan_status": signal_scan_status,
             "selected_actionable_rank": selected_actionable_rank,
             "selected_actionable_score": selected_actionable_score,
             "signal_scan_cursor": signal_scan_cursor,
@@ -3476,9 +3966,24 @@ class CanaryService:
             if key.endswith("_at") or key in {
                 "last_successful_tick",
                 "signal_scan_ranking_run_id",
+                "signal_scan_cycle_id",
+                "signal_scan_candidate_universe_hash",
+                "signal_scan_status",
                 "selected_actionable_candidate",
             }:
                 metadata[key] = str(value) if value is not None else None
+            elif key == "signal_scan_skip_reasons_json":
+                metadata[key] = str(value or "{}")[:4096]
+            elif key == "signal_scan_coverage_percentage":
+                try:
+                    parsed_coverage = float(value) if value is not None else None
+                except (TypeError, ValueError):
+                    parsed_coverage = None
+                metadata[key] = (
+                    min(100.0, max(0.0, parsed_coverage))
+                    if parsed_coverage is not None and math.isfinite(parsed_coverage)
+                    else 0.0
+                )
             elif key == "last_error_code":
                 metadata[key] = str(value)[:128] if value is not None else None
             elif key == "selected_actionable_score":
@@ -3495,6 +4000,38 @@ class CanaryService:
                 metadata[key] = max(0, parsed) if parsed is not None else None
         with self.store._lock:
             with self.store.connection:
+                for checked in signal_scan_checked_keys or ():
+                    if not isinstance(checked, Mapping):
+                        continue
+                    cycle_id = str(checked.get("cycle_id") or "").strip()
+                    candidate_id = str(checked.get("candidate_id") or "").strip()
+                    qualification_hash = str(
+                        checked.get("qualification_hash") or ""
+                    ).strip()
+                    if not cycle_id or not candidate_id or not qualification_hash:
+                        continue
+                    checked_at = str(checked.get("checked_at") or when)
+                    rank_at_check = checked.get("rank_at_check")
+                    try:
+                        rank_at_check = (
+                            int(rank_at_check) if rank_at_check is not None else None
+                        )
+                    except (TypeError, ValueError):
+                        rank_at_check = None
+                    ranking_run_id = checked.get("ranking_run_id")
+                    self.store.connection.execute(
+                        "INSERT OR IGNORE INTO canary_signal_scan_checked("
+                        "cycle_id,candidate_id,qualification_hash,checked_at,"
+                        "rank_at_check,ranking_run_id) VALUES(?,?,?,?,?,?)",
+                        (
+                            cycle_id,
+                            candidate_id,
+                            qualification_hash,
+                            checked_at,
+                            rank_at_check,
+                            str(ranking_run_id) if ranking_run_id else None,
+                        ),
+                    )
                 columns = [
                     "singleton",
                     "last_tick_at",
@@ -4736,10 +5273,11 @@ class CanaryService:
         """Persist caller-attested eligibility rows in one fenced transaction.
 
         Ranking performs all quality and gate evaluation before entering this
-        transaction.  The write path only checks the lifecycle snapshot and
-        immutable frozen hash, then stores the already-computed qualification
-        evidence.  This keeps batch ranking from taking one writer lock per
-        candidate or evaluating historical quality while that lock is held.
+        transaction.  The lifecycle fence intentionally ignores C/D telemetry
+        and harmless metadata, while A/B qualification or ranking changes
+        remain excluded from the write.  This keeps batch ranking from taking
+        one writer lock per candidate or evaluating historical quality while
+        that lock is held.
         """
         if not entries:
             return set()
@@ -4748,6 +5286,16 @@ class CanaryService:
             candidate_id = str(entry.get("candidate_id") or "").strip()
             initial = entry.get("record")
             validation = entry.get("validation")
+            binding = (
+                validation.get("binding")
+                if isinstance(validation, Mapping)
+                else None
+            )
+            binding_reason = (
+                binding.get("reason_code")
+                if isinstance(binding, Mapping)
+                else None
+            )
             qualification = (
                 validation.get("qualification")
                 if isinstance(validation, Mapping)
@@ -4768,6 +5316,11 @@ class CanaryService:
                 or not isinstance(initial, Mapping)
                 or not isinstance(validation, Mapping)
                 or validation.get("eligible") is not True
+                or not isinstance(binding, Mapping)
+                or (
+                    not binding.get("bound")
+                    and binding_reason != "ELIGIBILITY_MISSING"
+                )
                 or not isinstance(qualification, Mapping)
                 or not isinstance(qualification_hash, str)
                 or not qualification_hash
@@ -4791,6 +5344,7 @@ class CanaryService:
                     "initial": initial,
                     "frozen_hash": frozen_hash,
                     "evidence_json": evidence_json,
+                    "quality": entry.get("quality"),
                 }
             )
         if not prepared:
@@ -4807,11 +5361,26 @@ class CanaryService:
                     candidate_id = str(item["candidate_id"])
                     initial = item["initial"]
                     current = self.store.load_candidate_lifecycle(candidate_id)
+                    initial_quality = item.get("quality")
+                    initial_stage, initial_qualification, initial_ranking = (
+                        _canary_lifecycle_snapshot_hashes(
+                            self.store,
+                            initial,
+                            quality=initial_quality,
+                        )
+                    )
+                    current_stage, current_qualification, current_ranking = (
+                        _canary_lifecycle_snapshot_hashes(
+                            self.store,
+                            current,
+                            quality=initial_quality,
+                        )
+                    )
                     if (
                         not isinstance(current, Mapping)
-                        or current.get("stage") != initial.get("stage")
-                        or current.get("payload") != initial.get("payload")
-                        or current.get("updated_at") != initial.get("updated_at")
+                        or current_stage != initial_stage
+                        or current_qualification != initial_qualification
+                        or current_ranking != initial_ranking
                         or self._lifecycle_frozen_hash(current) != item["frozen_hash"]
                     ):
                         continue
@@ -4819,7 +5388,9 @@ class CanaryService:
                         "INSERT INTO canary_eligibility(candidate_id,eligible_at,frozen_hash,evidence_json) "
                         "VALUES(?,?,?,?) ON CONFLICT(candidate_id) DO UPDATE SET "
                         "eligible_at=excluded.eligible_at,frozen_hash=excluded.frozen_hash,"
-                        "evidence_json=excluded.evidence_json",
+                        "evidence_json=excluded.evidence_json "
+                        "WHERE canary_eligibility.frozen_hash IS NOT excluded.frozen_hash "
+                        "OR canary_eligibility.evidence_json IS NOT excluded.evidence_json",
                         (
                             candidate_id,
                             eligible_at,
@@ -5591,11 +6162,30 @@ class CanaryService:
                 "actionable_candidates_found,selected_actionable_candidate,"
                 "selected_actionable_rank,selected_actionable_score,signal_scan_cursor,"
                 "signal_scan_ranking_run_id,next_signal_scan_start_rank,next_signal_scan_end_rank,"
+                "signal_scan_cycle_id,signal_scan_candidate_universe_hash,"
+                "signal_scan_cycle_started_at,signal_scan_cycle_completed_at,"
+                "signal_scan_cycle_complete,signal_scan_checked_this_cycle,"
+                "signal_scan_remaining_this_cycle,signal_scan_coverage_percentage,"
+                "signal_scan_skip_reasons_json,signal_scan_status,"
                 "next_decision,blocker,last_signal_id,worker_status "
                 "FROM canary_autonomous_state WHERE singleton=1"
             )
         except sqlite3.OperationalError:
             autonomous_state = None
+        checked_keys: list[dict[str, Any]] = []
+        if autonomous_state is not None:
+            cycle_id = str(autonomous_state["signal_scan_cycle_id"] or "").strip()
+            if cycle_id:
+                checked_keys = [
+                    dict(item)
+                    for item in _optional_fetchall(
+                        "SELECT cycle_id,candidate_id,qualification_hash,checked_at,"
+                        "rank_at_check,ranking_run_id "
+                        "FROM canary_signal_scan_checked WHERE cycle_id=? "
+                        "ORDER BY checked_at,candidate_id,qualification_hash",
+                        (cycle_id,),
+                    )
+                ]
 
         ranking_run_id = selection.get("ranking_run_id") if selection else None
         ranking_timestamp = selection.get("ranking_timestamp") if selection else None
@@ -5670,6 +6260,47 @@ class CanaryService:
                 autonomous_state["next_signal_scan_end_rank"]
                 if autonomous_state is not None else None
             ),
+            "signal_scan_cycle_id": (
+                autonomous_state["signal_scan_cycle_id"]
+                if autonomous_state is not None else None
+            ),
+            "signal_scan_candidate_universe_hash": (
+                autonomous_state["signal_scan_candidate_universe_hash"]
+                if autonomous_state is not None else None
+            ),
+            "signal_scan_cycle_started_at": (
+                autonomous_state["signal_scan_cycle_started_at"]
+                if autonomous_state is not None else None
+            ),
+            "signal_scan_cycle_completed_at": (
+                autonomous_state["signal_scan_cycle_completed_at"]
+                if autonomous_state is not None else None
+            ),
+            "signal_scan_cycle_complete": (
+                autonomous_state["signal_scan_cycle_complete"]
+                if autonomous_state is not None else 0
+            ),
+            "signal_scan_checked_this_cycle": (
+                autonomous_state["signal_scan_checked_this_cycle"]
+                if autonomous_state is not None else 0
+            ),
+            "signal_scan_remaining_this_cycle": (
+                autonomous_state["signal_scan_remaining_this_cycle"]
+                if autonomous_state is not None else 0
+            ),
+            "signal_scan_coverage_percentage": (
+                autonomous_state["signal_scan_coverage_percentage"]
+                if autonomous_state is not None else 0.0
+            ),
+            "signal_scan_skip_reasons_json": (
+                autonomous_state["signal_scan_skip_reasons_json"]
+                if autonomous_state is not None else "{}"
+            ),
+            "signal_scan_status": (
+                autonomous_state["signal_scan_status"]
+                if autonomous_state is not None else "UNKNOWN"
+            ),
+            "signal_scan_checked_keys": checked_keys,
             **winner_quality,
             "next_decision": (
                 autonomous_state["next_decision"]
@@ -5747,6 +6378,17 @@ class CanaryService:
                 "signal_scan_ranking_run_id",
                 "next_signal_scan_start_rank",
                 "next_signal_scan_end_rank",
+                "signal_scan_cycle_id",
+                "signal_scan_candidate_universe_hash",
+                "signal_scan_cycle_started_at",
+                "signal_scan_cycle_completed_at",
+                "signal_scan_cycle_complete",
+                "signal_scan_checked_this_cycle",
+                "signal_scan_remaining_this_cycle",
+                "signal_scan_coverage_percentage",
+                "signal_scan_skip_reasons_json",
+                "signal_scan_status",
+                "signal_scan_checked_keys",
             )
         }
         selection_audit = dict(selection) if isinstance(selection, Mapping) else None

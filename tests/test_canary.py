@@ -14,9 +14,20 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from axiom.lifecycle import CandidateLifecycleManager, CandidateStage
 from axiom.auto_canary import AutonomousCanaryWorker
 from axiom.ranker import CandidateCanaryRanker
-from axiom.canary import CanaryBlocked, CanaryLimits, CanaryService, CredentialStore, PolymarketClobV2Venue, PRODUCTION_LIVE_EXECUTION
+from axiom.canary import (
+    AUTONOMOUS_CANARY_LIMITS,
+    CanaryBlocked,
+    CanaryLimits,
+    CanaryService,
+    CredentialStore,
+    PolymarketClobV2Venue,
+    PRODUCTION_LIVE_EXECUTION,
+    _canary_lifecycle_snapshot_hashes,
+    _canary_lifecycle_evidence_class,
+)
 from axiom.cli import main
 from axiom.dashboard import DashboardData, _dashboard_html
 from axiom.storage import AxiomStore, SQLiteBusyTimeout
@@ -954,6 +965,377 @@ class CanaryTests(unittest.TestCase):
         self.arm()
         self.assertEqual(self.service.status()["micro_live_canary"], "ARMED")
 
+    def test_lifecycle_evidence_is_classified_without_weakening_binding(self):
+        baseline_record = self.store.load_candidate_lifecycle("C123")
+        _, baseline_qualification_hash, baseline_ranking_hash = (
+            _canary_lifecycle_snapshot_hashes(self.store, baseline_record)
+        )
+        for hash_name, hash_value in (
+            ("qualification_hash", baseline_qualification_hash),
+            ("ranking_snapshot_hash", baseline_ranking_hash),
+        ):
+            with self.subTest(hash_name=hash_name):
+                self.assertIsInstance(hash_value, str)
+                self.assertTrue(hash_value)
+        self.service.publish_readiness_snapshot(reason="CLASSIFICATION_BASELINE")
+        readiness_row = self.store.connection.execute(
+            "SELECT readiness_snapshot_status,readiness_snapshot_stale "
+            "FROM canary_readiness_snapshot WHERE singleton=1"
+        ).fetchone()
+        self.assertIsNotNone(readiness_row)
+        self.assertEqual(readiness_row["readiness_snapshot_status"], "CURRENT")
+        self.assertFalse(readiness_row["readiness_snapshot_stale"])
+        eligibility_row = self.store.connection.execute(
+            "SELECT evidence_json FROM canary_eligibility WHERE candidate_id='C123'"
+        ).fetchone()
+        self.assertIsNotNone(eligibility_row)
+        before_evidence = json.loads(eligibility_row["evidence_json"])
+        self.assertEqual(
+            before_evidence["qualification_hash"],
+            baseline_qualification_hash,
+        )
+        lifecycle = CandidateLifecycleManager(self.store)
+
+        # A: changing the immutable config/frozen binding and quality projection
+        # invalidates the old qualification and requires a fresh attestation.
+        config_hash = "config-v2"
+        frozen_hash = hashlib.sha256(
+            "|".join(("strategy-v1", "model-v1", config_hash)).encode()
+        ).hexdigest()
+        lifecycle.record_evidence(
+            "C123",
+            {
+                "config_hash": config_hash,
+                "frozen_hash": frozen_hash,
+                "data_quality": "TIMESTAMPED_DEPTH",
+            },
+            expected_stage=CandidateStage.PAPER_PROMOTABLE,
+            reason="qualification evidence changed",
+        )
+        stale = self.service.status()
+        self.assertEqual(stale["readiness_snapshot_status"], "STALE")
+        self.assertTrue(stale["readiness_snapshot_stale"])
+        self.assertEqual(
+            stale["readiness_snapshot_reason"],
+            "LIFECYCLE_QUALIFICATION_UPDATED",
+        )
+        changed_binding = self.service.validate_eligibility("C123")
+        self.assertTrue(changed_binding["eligible"], changed_binding)
+        self.assertFalse(changed_binding["binding"]["bound"], changed_binding)
+        self.assertEqual(
+            changed_binding["binding"]["reason_code"],
+            "QUALIFICATION_CHANGED",
+        )
+
+        self.service.mark_eligible("C123")
+        after_a_eligibility_row = self.store.connection.execute(
+            "SELECT evidence_json FROM canary_eligibility WHERE candidate_id='C123'"
+        ).fetchone()
+        self.assertIsNotNone(after_a_eligibility_row)
+        after_a_evidence = json.loads(after_a_eligibility_row["evidence_json"])
+        after_a_record = self.store.load_candidate_lifecycle("C123")
+        _, after_a_qualification_hash, after_a_ranking_hash = (
+            _canary_lifecycle_snapshot_hashes(self.store, after_a_record)
+        )
+        self.assertNotEqual(
+            before_evidence["qualification_hash"],
+            after_a_evidence["qualification_hash"],
+        )
+        self.assertEqual(
+            after_a_evidence["qualification_hash"],
+            after_a_qualification_hash,
+        )
+        before_b_record = self.store.load_candidate_lifecycle("C123")
+        _, before_b_qualification_hash, before_b_ranking_hash = (
+            _canary_lifecycle_snapshot_hashes(self.store, before_b_record)
+        )
+        self.assertEqual(after_a_qualification_hash, before_b_qualification_hash)
+        self.assertEqual(after_a_ranking_hash, before_b_ranking_hash)
+
+        # B: forward duration/expectancy affect ranking but not qualification.
+        self.service.publish_readiness_snapshot(reason="QUALIFICATION_REBOUND")
+        lifecycle.record_evidence(
+            "C123",
+            {
+                "forward_evidence": {
+                    **dict(self.store.load_candidate_lifecycle("C123")["payload"]["forward_evidence"]),
+                    "forward_duration_seconds": 30 * 86400,
+                    "forward_expectancy": -0.15,
+                }
+            },
+            expected_stage=CandidateStage.PAPER_PROMOTABLE,
+            reason="ranking evidence changed",
+        )
+        stale = self.service.status()
+        self.assertEqual(stale["readiness_snapshot_status"], "STALE")
+        self.assertEqual(
+            stale["readiness_snapshot_reason"],
+            "LIFECYCLE_RANKING_EVIDENCE_UPDATED",
+        )
+        b_eligibility_row = self.store.connection.execute(
+            "SELECT evidence_json FROM canary_eligibility "
+            "WHERE candidate_id='C123'"
+        ).fetchone()
+        self.assertIsNotNone(b_eligibility_row)
+        self.assertEqual(
+            json.loads(b_eligibility_row["evidence_json"])["qualification_hash"],
+            after_a_evidence["qualification_hash"],
+        )
+        after_b_record = self.store.load_candidate_lifecycle("C123")
+        _, after_b_qualification_hash, after_b_ranking_hash = (
+            _canary_lifecycle_snapshot_hashes(self.store, after_b_record)
+        )
+        self.assertEqual(
+            before_b_qualification_hash,
+            after_b_qualification_hash,
+        )
+        self.assertNotEqual(
+            before_b_ranking_hash,
+            after_b_ranking_hash,
+        )
+
+        # C/D: liquidity/drawdown telemetry and fill/observation counters are
+        # deliberately outside both immutable qualification and ranking hashes.
+        self.service.publish_readiness_snapshot(reason="RANKING_REBOUND")
+        lifecycle.record_evidence(
+            "C123",
+            {
+                "forward_evidence": {
+                    **dict(self.store.load_candidate_lifecycle("C123")["payload"]["forward_evidence"]),
+                    "forward_liquidity": 42.0,
+                    "forward_max_drawdown": 0.04,
+                    "forward_fills": 17,
+                    "forward_observations": 101,
+                }
+            },
+            expected_stage=CandidateStage.PAPER_PROMOTABLE,
+            reason="telemetry-only evidence changed",
+        )
+        current = self.service.status()
+        self.assertEqual(current["readiness_snapshot_status"], "CURRENT")
+        self.assertFalse(current["readiness_snapshot_stale"])
+        self.assertEqual(current["readiness_snapshot_reason"], "RANKING_REBOUND")
+        self.assertEqual(
+            self.service.validate_eligibility("C123")["binding"]["reason_code"],
+            None,
+        )
+        # D: harmless lifecycle metadata changes neither hash projection nor
+        # telemetry, so the current readiness publication remains current.
+        self.service.publish_readiness_snapshot(reason="TELEMETRY_REBOUND")
+        lifecycle.record_evidence(
+            "C123",
+            {"operator_note": "classification metadata"},
+            expected_stage=CandidateStage.PAPER_PROMOTABLE,
+            reason="harmless classification metadata changed",
+        )
+        current = self.service.status()
+        self.assertEqual(current["readiness_snapshot_status"], "CURRENT")
+        self.assertFalse(current["readiness_snapshot_stale"])
+        self.assertEqual(current["readiness_snapshot_reason"], "TELEMETRY_REBOUND")
+        self.assertEqual(
+            self.service.validate_eligibility("C123")["binding"]["reason_code"],
+            None,
+        )
+        # Stage changes remain a hard fail-closed boundary even when the
+        # preceding telemetry update was intentionally ignored.
+        lifecycle.reject(
+            "C123",
+            "classification stage safety",
+            expected_stage=CandidateStage.PAPER_PROMOTABLE,
+        )
+        self.assertFalse(self.service.validate_eligibility("C123")["eligible"])
+
+    def test_qualification_record_evidence_refreshes_lifecycle_hash_before_requalification(self):
+        before_record = self.store.load_candidate_lifecycle("C123")
+        self.assertIsNotNone(before_record)
+        _, before_qualification_hash, _ = _canary_lifecycle_snapshot_hashes(
+            self.store,
+            before_record,
+        )
+        canonical_payload = dict(before_record["payload"])
+        canonical_payload["qualification_hash"] = before_qualification_hash
+        self.store.save_candidate_lifecycle(
+            "C123",
+            "PAPER_PROMOTABLE",
+            canonical_payload,
+            from_stage="PAPER_PROMOTABLE",
+            timestamp=T0,
+        )
+        self.service.mark_eligible("C123")
+
+        before_eligibility = self.store.connection.execute(
+            "SELECT evidence_json FROM canary_eligibility WHERE candidate_id=?",
+            ("C123",),
+        ).fetchone()
+        self.assertIsNotNone(before_eligibility)
+        before_evidence = json.loads(before_eligibility["evidence_json"])
+        self.assertEqual(before_evidence["qualification_hash"], before_qualification_hash)
+
+        changed_config = "config-before-requalification"
+        changed_frozen = hashlib.sha256(
+            "|".join(("strategy-v1", "model-v1", changed_config)).encode()
+        ).hexdigest()
+        CandidateLifecycleManager(self.store).record_evidence(
+            "C123",
+            {
+                "config_hash": changed_config,
+                "frozen_hash": changed_frozen,
+            },
+            expected_stage=CandidateStage.PAPER_PROMOTABLE,
+            reason="qualification changed before requalification",
+        )
+
+        changed_record = self.store.load_candidate_lifecycle("C123")
+        self.assertIsNotNone(changed_record)
+        _, changed_qualification_hash, _ = _canary_lifecycle_snapshot_hashes(
+            self.store,
+            changed_record,
+        )
+        self.assertNotEqual(changed_qualification_hash, before_qualification_hash)
+        self.assertEqual(
+            changed_record["payload"]["qualification_hash"],
+            changed_qualification_hash,
+        )
+        stale_feed = self.store.research_feed_status(now=T0)
+        self.assertEqual(stale_feed["candidates"]["eligible"], 0)
+
+        self.service.mark_eligible("C123")
+        after_eligibility = self.store.connection.execute(
+            "SELECT evidence_json FROM canary_eligibility WHERE candidate_id=?",
+            ("C123",),
+        ).fetchone()
+        self.assertIsNotNone(after_eligibility)
+        after_evidence = json.loads(after_eligibility["evidence_json"])
+        self.assertEqual(
+            after_evidence["qualification_hash"],
+            changed_qualification_hash,
+        )
+        refreshed_feed = self.store.research_feed_status(now=T0)
+        self.assertEqual(refreshed_feed["candidates"]["eligible"], 1)
+
+    def test_top_level_ranking_aliases_are_classified_as_b_and_change_hash(self):
+        base_payload = dict(self.store.load_candidate_lifecycle("C123")["payload"])
+        aliases = (
+            ("expectancy", "validation_expectancy", 0.31),
+            ("confidence_lower_bound", "validation_confidence_lower_bound", 0.21),
+            ("stability", "validation_stability", 0.71),
+            ("calibration", "validation_calibration", 0.72),
+            ("sample_count", "validation_sample_count", 90),
+            ("trade_count", "validation_trade_count", 19),
+            ("execution_quality", "validation_execution_quality", 0.31),
+            ("max_drawdown", "validation_max_drawdown", 0.19),
+            ("liquidity", "validation_liquidity", 0.31),
+            ("quality", "data_quality", "TIMESTAMPED_DEPTH"),
+            ("execution_fidelity_score", None, 0.31),
+        )
+        lifecycle = CandidateLifecycleManager(self.store)
+        for alias, canonical, value in aliases:
+            with self.subTest(alias=alias):
+                candidate_id = f"ranking-alias-{alias}"
+                payload = {**base_payload, "candidate_id": candidate_id}
+                if canonical is not None:
+                    payload.pop(canonical, None)
+                if alias == "quality":
+                    payload.pop("validation_data_quality", None)
+                    payload.pop("data_quality", None)
+                self.store.save_candidate_lifecycle(
+                    candidate_id,
+                    "IDEA",
+                    payload,
+                    timestamp=T0,
+                )
+                self.store.save_candidate_lifecycle(
+                    candidate_id,
+                    "FROZEN",
+                    payload,
+                    timestamp=T0,
+                )
+                before = self.store.load_candidate_lifecycle(candidate_id)
+                self.assertIsNotNone(before)
+                _, before_qualification, before_ranking = (
+                    _canary_lifecycle_snapshot_hashes(self.store, before)
+                )
+                lifecycle.record_evidence(
+                    candidate_id,
+                    {alias: value},
+                    expected_stage=CandidateStage.FROZEN,
+                    reason=f"ranking alias {alias} changed",
+                )
+                after = self.store.load_candidate_lifecycle(candidate_id)
+                self.assertIsNotNone(after)
+                _, after_qualification, after_ranking = (
+                    _canary_lifecycle_snapshot_hashes(self.store, after)
+                )
+                self.assertEqual(after_qualification, before_qualification)
+                self.assertNotEqual(after_ranking, before_ranking)
+                self.assertEqual(
+                    _canary_lifecycle_evidence_class(self.store, before, after),
+                    "B",
+                )
+
+    def test_prediction_market_sources_are_b_ranking_inputs_without_requalifying(self):
+        base_payload = dict(self.store.load_candidate_lifecycle("C123")["payload"])
+        base_payload["type"] = "prediction"
+        for source in ("experiment_plan", "strategy", "forward_config", "market"):
+            existing = base_payload.get(source)
+            source_payload = dict(existing) if isinstance(existing, dict) else {}
+            source_payload["market_type"] = "prediction"
+            base_payload[source] = source_payload
+
+        source_mutations = (
+            ("top-level-type", "type"),
+            ("experiment-plan-market-type", "experiment_plan"),
+            ("nested-strategy-market-type", "strategy"),
+            ("nested-forward-config-market-type", "forward_config"),
+            ("nested-market-market-type", "market"),
+        )
+        lifecycle = CandidateLifecycleManager(self.store)
+        for label, source in source_mutations:
+            with self.subTest(source=label):
+                candidate_id = f"ranking-market-source-{label}"
+                payload = {**base_payload, "candidate_id": candidate_id}
+                self.store.save_candidate_lifecycle(
+                    candidate_id,
+                    "IDEA",
+                    payload,
+                    timestamp=T0,
+                )
+                self.store.save_candidate_lifecycle(
+                    candidate_id,
+                    "FROZEN",
+                    payload,
+                    from_stage="IDEA",
+                    timestamp=T0,
+                )
+                before = self.store.load_candidate_lifecycle(candidate_id)
+                self.assertIsNotNone(before)
+                _, before_qualification, before_ranking = (
+                    _canary_lifecycle_snapshot_hashes(self.store, before)
+                )
+                if source == "type":
+                    changed_evidence = {"type": "crypto_spot"}
+                else:
+                    changed_source = dict(payload[source])
+                    changed_source["market_type"] = "crypto_spot"
+                    changed_evidence = {source: changed_source}
+                lifecycle.record_evidence(
+                    candidate_id,
+                    changed_evidence,
+                    expected_stage=CandidateStage.FROZEN,
+                    reason=f"{label} changed",
+                )
+                after = self.store.load_candidate_lifecycle(candidate_id)
+                self.assertIsNotNone(after)
+                _, after_qualification, after_ranking = (
+                    _canary_lifecycle_snapshot_hashes(self.store, after)
+                )
+                self.assertEqual(after_qualification, before_qualification)
+                self.assertNotEqual(after_ranking, before_ranking)
+                self.assertEqual(
+                    _canary_lifecycle_evidence_class(self.store, before, after),
+                    "B",
+                )
+
     def test_current_hard_gate_blocks_even_with_immutable_binding(self):
         payload = dict(self.store.load_candidate_lifecycle("C123")["payload"])
         payload["critical_error"] = "runtime-failure"
@@ -1544,6 +1926,18 @@ class CanaryTests(unittest.TestCase):
             )
             for rank in range(1, 1002)
         ]
+        scan_rows = [
+            {
+                "candidate_id": row[0],
+                "rank": row[3],
+                "total_score": row[4],
+                "cluster_key": row[7],
+                "cluster_representative": row[8],
+                "reason": row[10],
+                "qualification_hash": row[11],
+            }
+            for row in rows
+        ]
         with self.store.connection:
             self.store.connection.executemany(
                 "INSERT INTO canary_rankings("
@@ -1581,6 +1975,10 @@ class CanaryTests(unittest.TestCase):
             "validate_persisted_ranking",
             return_value=True,
         ), patch.object(
+            AutonomousCanaryWorker,
+            "_current_rankings",
+            return_value=scan_rows,
+        ), patch.object(
             CanaryService,
             "generate_signal",
             side_effect=signal,
@@ -1600,6 +1998,149 @@ class CanaryTests(unittest.TestCase):
         self.assertEqual(results[-1]["candidates_signal_checked"], 1)
         self.assertEqual(results[-1]["candidate_id"], "scan-candidate-1001")
         self.assertEqual(results[-1]["blocker"], "CREDENTIALS_NOT_CONFIGURED")
+
+    def test_published_readiness_projects_scan_cycle_fields_consistently(self):
+        self.service.enable_autonomous_micro_live()
+        ranking_run_id = "readiness-cycle-run"
+        scan_rows = [
+            {
+                "candidate_id": f"readiness-candidate-{rank:02d}",
+                "rank": rank,
+                "total_score": 1.0 - rank / 100.0,
+                "cluster_key": f"readiness-cluster-{rank:02d}",
+                "cluster_representative": 1,
+                "qualification_hash": f"qualification-{rank:02d}",
+            }
+            for rank in range(1, 13)
+        ]
+        ranking = {
+            "ranking_run_id": ranking_run_id,
+            "eligible_count": len(scan_rows),
+            "rankable_count": len(scan_rows),
+        }
+        worker = AutonomousCanaryWorker(self.store, clock=lambda: T0)
+        with patch.object(
+            CandidateCanaryRanker,
+            "evaluate_and_select",
+            return_value=ranking,
+        ), patch.object(
+            CandidateCanaryRanker,
+            "validate_persisted_ranking",
+            return_value=True,
+        ), patch.object(
+            AutonomousCanaryWorker,
+            "_current_rankings",
+            return_value=scan_rows,
+        ), patch.object(
+            CanaryService,
+            "generate_signal",
+            return_value=None,
+        ):
+            result = worker.tick(now=T0)
+
+        self.assertEqual(result["signal_scan_cycle_complete"], 0)
+        self.assertEqual(result["signal_scan_checked_this_cycle"], 10)
+        self.assertEqual(result["signal_scan_remaining_this_cycle"], 2)
+        self.assertEqual(result["signal_scan_status"], "IN_PROGRESS")
+        published = self.service.publish_readiness_snapshot(reason="SCAN_PUBLISHED")
+        read_back = self.service.readiness_snapshot()
+        report = self.service.status_report()
+        worker_projection = report["worker"]
+        state = self.store.connection.execute(
+            "SELECT signal_scan_cycle_id,signal_scan_candidate_universe_hash,"
+            "signal_scan_cycle_started_at,signal_scan_cycle_completed_at,"
+            "signal_scan_cycle_complete,signal_scan_checked_this_cycle,"
+            "signal_scan_remaining_this_cycle,signal_scan_coverage_percentage,"
+            "signal_scan_skip_reasons_json,signal_scan_status,worker_status "
+            "FROM canary_autonomous_state WHERE singleton=1"
+        ).fetchone()
+        cycle_fields = (
+            "signal_scan_cycle_id",
+            "signal_scan_candidate_universe_hash",
+            "signal_scan_cycle_started_at",
+            "signal_scan_cycle_completed_at",
+            "signal_scan_cycle_complete",
+            "signal_scan_checked_this_cycle",
+            "signal_scan_remaining_this_cycle",
+            "signal_scan_coverage_percentage",
+            "signal_scan_skip_reasons_json",
+            "signal_scan_status",
+        )
+        self.assertEqual(state["signal_scan_cycle_id"], result["signal_scan_cycle_id"])
+        self.assertEqual(state["signal_scan_checked_this_cycle"], 10)
+        self.assertEqual(state["signal_scan_remaining_this_cycle"], 2)
+        self.assertEqual(state["signal_scan_status"], "IN_PROGRESS")
+        self.assertEqual(published["readiness_snapshot_status"], "CURRENT")
+        self.assertEqual(read_back["readiness_snapshot_status"], "CURRENT")
+        for field in cycle_fields:
+            with self.subTest(field=field):
+                expected = state[field]
+                if field == "signal_scan_skip_reasons_json":
+                    expected = json.loads(expected)
+                for projection in (
+                    result,
+                    published,
+                    read_back,
+                    published["autonomous"],
+                    read_back["autonomous"],
+                    worker_projection,
+                ):
+                    actual = projection[field]
+                    if field == "signal_scan_skip_reasons_json" and isinstance(actual, str):
+                        actual = json.loads(actual)
+                    self.assertEqual(actual, expected)
+
+    def test_durable_scan_schema_and_autonomous_risk_envelope_are_persisted(self):
+        state_columns = {
+            row["name"]
+            for row in self.store.connection.execute(
+                "PRAGMA table_info(canary_autonomous_state)"
+            ).fetchall()
+        }
+        self.assertTrue(
+            {
+                "signal_scan_cycle_id",
+                "signal_scan_candidate_universe_hash",
+                "signal_scan_cycle_started_at",
+                "signal_scan_cycle_completed_at",
+                "signal_scan_cycle_complete",
+                "signal_scan_checked_this_cycle",
+                "signal_scan_remaining_this_cycle",
+                "signal_scan_coverage_percentage",
+                "signal_scan_skip_reasons_json",
+                "signal_scan_status",
+            }.issubset(state_columns)
+        )
+        checked_columns = {
+            row["name"]: row["pk"]
+            for row in self.store.connection.execute(
+                "PRAGMA table_info(canary_signal_scan_checked)"
+            ).fetchall()
+        }
+        self.assertEqual(
+            {
+                "cycle_id": 1,
+                "candidate_id": 2,
+                "qualification_hash": 3,
+            },
+            {
+                key: checked_columns.get(key)
+                for key in ("cycle_id", "candidate_id", "qualification_hash")
+            },
+        )
+        self.assertEqual(self.service.autonomous_limits(), AUTONOMOUS_CANARY_LIMITS)
+        self.assertFalse(PRODUCTION_LIVE_EXECUTION)
+        self.service.enable_autonomous_micro_live()
+        control = self.store.connection.execute(
+            "SELECT limits_json FROM canary_control WHERE singleton=1"
+        ).fetchone()
+        self.assertEqual(json.loads(control["limits_json"]), AUTONOMOUS_CANARY_LIMITS)
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM canary_ledger"
+            ).fetchone()[0],
+            0,
+        )
 
 
 class CanarySignalTests(unittest.TestCase):

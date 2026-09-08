@@ -1210,6 +1210,89 @@ class AutonomousWorkflowTests(unittest.TestCase):
         failure = json.loads(snapshot["payload_json"])
         self.assertEqual(failure["readiness_snapshot_reason"], "EVALUATION_FAILED")
         self.assertEqual(failure["readiness_evaluation_error_code"], "LIFECYCLE_SNAPSHOT_CHANGED")
+        retried = ranker.evaluate_and_select(T0)
+        self.assertEqual(retried["selection_status"], "CURRENT")
+        self.assertEqual(retried["selected_candidate"], "paper-race")
+        self.assertEqual(self.service.status()["readiness_snapshot_status"], "CURRENT")
+        self.assertEqual(
+            self.service.status()["readiness_snapshot_reason"],
+            "RANKING_EVALUATED",
+        )
+
+    def test_concurrent_c_d_telemetry_update_does_not_abort_ranker(self):
+        candidate_id = "telemetry-race"
+        payload = self.seed_candidate(candidate_id, score=0.40)
+        paper_payload = {**payload, "forward_expectancy": 0.40}
+        self.store.save_candidate_lifecycle(
+            candidate_id,
+            "PAPER_FORWARD",
+            paper_payload,
+            from_stage="FROZEN",
+            timestamp=T0,
+        )
+        ranker = CandidateCanaryRanker(self.store, clock=lambda: T0)
+        self.service.publish_readiness_snapshot(reason="C_D_BASELINE")
+        entered = threading.Event()
+        release = threading.Event()
+        result_holder = {}
+        original_rank_evidence = ranker._rank_evidence
+        first_call = True
+
+        def blocked_rank_evidence(payload, frozen_hash, quality=None):
+            nonlocal first_call
+            if first_call:
+                first_call = False
+                entered.set()
+                if not release.wait(timeout=5):
+                    raise AssertionError("ranking barrier was not released")
+            return original_rank_evidence(payload, frozen_hash, quality=quality)
+
+        ranker._rank_evidence = blocked_rank_evidence
+
+        def run_ranker():
+            try:
+                result_holder["result"] = ranker.evaluate_and_select(T0)
+            except BaseException as exc:
+                result_holder["error"] = exc
+
+        ranking_thread = threading.Thread(target=run_ranker)
+        ranking_thread.start()
+        try:
+            self.assertTrue(entered.wait(timeout=5))
+            CandidateLifecycleManager(self.store).record_evidence(
+                candidate_id,
+                {
+                    "forward_evidence": {
+                        "forward_liquidity": 0.42,
+                        "forward_max_drawdown": 0.05,
+                        "forward_fills": 9,
+                        "forward_observations": 77,
+                    }
+                },
+                expected_stage=CandidateStage.PAPER_FORWARD,
+                reason="concurrent telemetry-only update",
+            )
+            mid_update = self.service.status()
+            self.assertEqual(mid_update["readiness_snapshot_status"], "CURRENT")
+            self.assertEqual(
+                mid_update["readiness_snapshot_reason"],
+                "C_D_BASELINE",
+            )
+        finally:
+            release.set()
+            ranking_thread.join(timeout=5)
+
+        self.assertFalse(ranking_thread.is_alive())
+        self.assertNotIn("error", result_holder)
+        self.assertEqual(result_holder["result"]["selection_status"], "CURRENT")
+        self.assertEqual(
+            result_holder["result"]["selected_candidate"],
+            candidate_id,
+        )
+        self.assertEqual(
+            self.service.status()["readiness_snapshot_status"],
+            "CURRENT",
+        )
 
     def test_new_candidate_between_prevalidation_and_commit_fails_closed(self):
         candidate_id = "inventory-race"
@@ -1386,8 +1469,8 @@ class AutonomousWorkflowTests(unittest.TestCase):
             "DATASET_EVIDENCE_CHANGED",
         )
 
-    def test_critical_error_lifecycle_change_between_prevalidation_and_commit_fails_closed(self):
-        candidate_id = "critical-error-race"
+    def test_qualification_lifecycle_change_between_prevalidation_and_commit_fails_closed(self):
+        candidate_id = "qualification-race"
         payload = self.seed_candidate(candidate_id, score=0.40)
         ranker = CandidateCanaryRanker(self.store, clock=lambda: T0)
         initial = ranker.evaluate_and_select(T0)
@@ -1427,7 +1510,16 @@ class AutonomousWorkflowTests(unittest.TestCase):
         try:
             self.assertTrue(entered.wait(timeout=5))
             changed = dict(payload)
-            changed["critical_error"] = "concurrent critical evidence update"
+            changed["config_hash"] = "config-race"
+            changed["frozen_hash"] = hashlib.sha256(
+                "|".join(
+                    (
+                        changed["strategy_hash"],
+                        changed["model_hash"],
+                        changed["config_hash"],
+                    )
+                ).encode()
+            ).hexdigest()
             self.store.save_candidate_lifecycle(
                 candidate_id,
                 "FROZEN",
@@ -1473,6 +1565,255 @@ class AutonomousWorkflowTests(unittest.TestCase):
             "LIFECYCLE_SNAPSHOT_CHANGED",
         )
 
+    def test_critical_error_toggle_between_prevalidation_and_commit_aborts_stale_rank(self):
+        candidate_id = "critical-error-race"
+        self.seed_candidate(candidate_id, score=0.40)
+        ranker = CandidateCanaryRanker(self.store, clock=lambda: T0)
+        initial = ranker.evaluate_and_select(T0)
+        self.assertEqual(initial["selection_status"], "CURRENT")
+        baseline_ranking = dict(
+            self.store.connection.execute(
+                "SELECT * FROM canary_rankings WHERE candidate_id=?",
+                (candidate_id,),
+            ).fetchone()
+        )
+        baseline_selection = dict(
+            self.store.connection.execute(
+                "SELECT * FROM canary_selection WHERE singleton=1"
+            ).fetchone()
+        )
+        entered = threading.Event()
+        release = threading.Event()
+        result_holder = {}
+        original_rank_evidence = ranker._rank_evidence
+
+        def blocked_rank_evidence(payload, frozen_hash, quality=None):
+            entered.set()
+            if not release.wait(timeout=5):
+                raise AssertionError("ranking barrier was not released")
+            return original_rank_evidence(payload, frozen_hash, quality=quality)
+
+        ranker._rank_evidence = blocked_rank_evidence
+
+        def run_ranker():
+            try:
+                ranker.evaluate_and_select(T0)
+            except BaseException as exc:
+                result_holder["error"] = exc
+
+        ranking_thread = threading.Thread(target=run_ranker)
+        ranking_thread.start()
+        try:
+            self.assertTrue(entered.wait(timeout=5))
+            CandidateLifecycleManager(self.store).record_evidence(
+                candidate_id,
+                {"critical_error": "runtime-failure"},
+                expected_stage=CandidateStage.FROZEN,
+                reason="critical error toggled during ranking",
+            )
+        finally:
+            release.set()
+            ranking_thread.join(timeout=5)
+
+        self.assertFalse(ranking_thread.is_alive())
+        self.assertEqual(
+            getattr(result_holder.get("error"), "error_code", None),
+            "LIFECYCLE_SNAPSHOT_CHANGED",
+        )
+        after_ranking = dict(
+            self.store.connection.execute(
+                "SELECT * FROM canary_rankings WHERE candidate_id=?",
+                (candidate_id,),
+            ).fetchone()
+        )
+        after_selection = dict(
+            self.store.connection.execute(
+                "SELECT * FROM canary_selection WHERE singleton=1"
+            ).fetchone()
+        )
+        self.assertEqual(after_ranking, baseline_ranking)
+        self.assertEqual(after_selection, baseline_selection)
+        validation = self.service.validate_eligibility(candidate_id)
+        self.assertFalse(validation["eligible"])
+        self.assertFalse(
+            next(check for check in validation["checks"] if check["name"] == "Critical errors")[
+                "passed"
+            ]
+        )
+        snapshot = self.store.connection.execute(
+            "SELECT readiness_snapshot_status,readiness_snapshot_stale,"
+            "readiness_snapshot_reason,payload_json "
+            "FROM canary_readiness_snapshot WHERE singleton=1"
+        ).fetchone()
+        self.assertEqual(snapshot["readiness_snapshot_status"], "STALE")
+        self.assertEqual(snapshot["readiness_snapshot_stale"], 1)
+        self.assertEqual(snapshot["readiness_snapshot_reason"], "EVALUATION_FAILED")
+        self.assertEqual(
+            json.loads(snapshot["payload_json"])["readiness_evaluation_error_code"],
+            "LIFECYCLE_SNAPSHOT_CHANGED",
+        )
+
+    def test_top_level_ranking_alias_change_aborts_stale_rank_commit(self):
+        candidate_id = "ranking-alias-race"
+        payload = candidate_payload(candidate_id, score=0.40)
+        payload.pop("validation_expectancy")
+        payload["expectancy"] = 0.40
+        self.store.save_candidate_lifecycle(candidate_id, "IDEA", payload, timestamp=T0)
+        self.store.save_candidate_lifecycle(candidate_id, "FROZEN", payload, timestamp=T0)
+        ranker = CandidateCanaryRanker(self.store, clock=lambda: T0)
+        initial = ranker.evaluate_and_select(T0)
+        self.assertEqual(initial["selection_status"], "CURRENT")
+        baseline_ranking = dict(
+            self.store.connection.execute(
+                "SELECT * FROM canary_rankings WHERE candidate_id=?",
+                (candidate_id,),
+            ).fetchone()
+        )
+        baseline_selection = dict(
+            self.store.connection.execute(
+                "SELECT * FROM canary_selection WHERE singleton=1"
+            ).fetchone()
+        )
+        entered = threading.Event()
+        release = threading.Event()
+        result_holder = {}
+        original_rank_evidence = ranker._rank_evidence
+
+        def blocked_rank_evidence(payload, frozen_hash, quality=None):
+            entered.set()
+            if not release.wait(timeout=5):
+                raise AssertionError("ranking barrier was not released")
+            return original_rank_evidence(payload, frozen_hash, quality=quality)
+
+        ranker._rank_evidence = blocked_rank_evidence
+
+        def run_ranker():
+            try:
+                ranker.evaluate_and_select(T0)
+            except BaseException as exc:
+                result_holder["error"] = exc
+
+        ranking_thread = threading.Thread(target=run_ranker)
+        ranking_thread.start()
+        try:
+            self.assertTrue(entered.wait(timeout=5))
+            CandidateLifecycleManager(self.store).record_evidence(
+                candidate_id,
+                {"expectancy": 0.80},
+                expected_stage=CandidateStage.FROZEN,
+                reason="ranking alias changed during ranking",
+            )
+        finally:
+            release.set()
+            ranking_thread.join(timeout=5)
+
+        self.assertFalse(ranking_thread.is_alive())
+        self.assertEqual(
+            getattr(result_holder.get("error"), "error_code", None),
+            "LIFECYCLE_SNAPSHOT_CHANGED",
+        )
+        self.assertEqual(
+            dict(
+                self.store.connection.execute(
+                    "SELECT * FROM canary_rankings WHERE candidate_id=?",
+                    (candidate_id,),
+                ).fetchone()
+            ),
+            baseline_ranking,
+        )
+        self.assertEqual(
+            dict(
+                self.store.connection.execute(
+                    "SELECT * FROM canary_selection WHERE singleton=1"
+                ).fetchone()
+            ),
+            baseline_selection,
+        )
+        status = self.service.status()
+        self.assertEqual(status["selection_status"], "STALE")
+        self.assertFalse(status["selection_valid"])
+        self.assertIsNone(status["selected_candidate"])
+
+    def test_nested_market_source_change_aborts_stale_rank_commit(self):
+        candidate_id = "nested-market-source-race"
+        payload = candidate_payload(candidate_id, score=0.40)
+        payload["strategy"] = {"market_type": "prediction"}
+        self.store.save_candidate_lifecycle(candidate_id, "IDEA", payload, timestamp=T0)
+        self.store.save_candidate_lifecycle(candidate_id, "FROZEN", payload, timestamp=T0)
+        ranker = CandidateCanaryRanker(self.store, clock=lambda: T0)
+        initial = ranker.evaluate_and_select(T0)
+        self.assertEqual(initial["selection_status"], "CURRENT")
+        baseline_ranking = dict(
+            self.store.connection.execute(
+                "SELECT * FROM canary_rankings WHERE candidate_id=?",
+                (candidate_id,),
+            ).fetchone()
+        )
+        baseline_selection = dict(
+            self.store.connection.execute(
+                "SELECT * FROM canary_selection WHERE singleton=1"
+            ).fetchone()
+        )
+        entered = threading.Event()
+        release = threading.Event()
+        result_holder = {}
+        original_rank_evidence = ranker._rank_evidence
+
+        def blocked_rank_evidence(payload, frozen_hash, quality=None):
+            entered.set()
+            if not release.wait(timeout=5):
+                raise AssertionError("ranking barrier was not released")
+            return original_rank_evidence(payload, frozen_hash, quality=quality)
+
+        ranker._rank_evidence = blocked_rank_evidence
+
+        def run_ranker():
+            try:
+                ranker.evaluate_and_select(T0)
+            except BaseException as exc:
+                result_holder["error"] = exc
+
+        ranking_thread = threading.Thread(target=run_ranker)
+        ranking_thread.start()
+        try:
+            self.assertTrue(entered.wait(timeout=5))
+            CandidateLifecycleManager(self.store).record_evidence(
+                candidate_id,
+                {"strategy": {"market_type": "crypto_spot"}},
+                expected_stage=CandidateStage.FROZEN,
+                reason="nested market source changed during ranking",
+            )
+        finally:
+            release.set()
+            ranking_thread.join(timeout=5)
+
+        self.assertFalse(ranking_thread.is_alive())
+        self.assertEqual(
+            getattr(result_holder.get("error"), "error_code", None),
+            "LIFECYCLE_SNAPSHOT_CHANGED",
+        )
+        self.assertEqual(
+            dict(
+                self.store.connection.execute(
+                    "SELECT * FROM canary_rankings WHERE candidate_id=?",
+                    (candidate_id,),
+                ).fetchone()
+            ),
+            baseline_ranking,
+        )
+        self.assertEqual(
+            dict(
+                self.store.connection.execute(
+                    "SELECT * FROM canary_selection WHERE singleton=1"
+                ).fetchone()
+            ),
+            baseline_selection,
+        )
+        status = self.service.status()
+        self.assertEqual(status["selection_status"], "STALE")
+        self.assertFalse(status["selection_valid"])
+        self.assertIsNone(status["selected_candidate"])
+
     def test_ranking_relevant_forward_change_stales_selection_until_reevaluation(self):
         self.seed_candidate("forward-change", score=0.40)
         lifecycle = CandidateLifecycleManager(self.store)
@@ -1505,7 +1846,7 @@ class AutonomousWorkflowTests(unittest.TestCase):
         stale = self.service.status()
         self.assertEqual(stale["selection_status"], "STALE")
         self.assertFalse(stale["selection_valid"])
-        self.assertEqual(stale["selection_invalidation_reason"], "LIFECYCLE_EVIDENCE_UPDATED")
+        self.assertEqual(stale["selection_invalidation_reason"], "LIFECYCLE_RANKING_EVIDENCE_UPDATED")
         self.assertIsNone(stale["selected_candidate"])
         self.assertIsNone(stale["winner_id"])
         authoritative = self.service.authoritative_status()
@@ -1563,7 +1904,7 @@ class AutonomousWorkflowTests(unittest.TestCase):
         stale = self.service.status()
         self.assertEqual(stale["selection_status"], "STALE")
         self.assertFalse(stale["selection_valid"])
-        self.assertEqual(stale["selection_invalidation_reason"], "LIFECYCLE_EVIDENCE_UPDATED")
+        self.assertEqual(stale["selection_invalidation_reason"], "LIFECYCLE_RANKING_EVIDENCE_UPDATED")
         self.assertIsNone(stale["selected_candidate"])
         self.assertIsNone(stale["winner_id"])
         authoritative = self.service.authoritative_status()
@@ -1986,6 +2327,623 @@ class AutonomousWorkflowTests(unittest.TestCase):
             self.assertEqual(result[field], expected[field], field)
             self.assertEqual(state[field], expected[field], field)
             self.assertEqual(worker[field], expected[field], field)
+    def _durable_ranking_patch(self, candidate_ids, run_ids):
+        """Install a deterministic ranking feed while exercising durable scan state."""
+        real_ranker = CandidateCanaryRanker(self.store, clock=lambda: T0)
+        real_ranker.evaluate_and_select(T0)
+        original_evaluate = CandidateCanaryRanker.evaluate_and_select
+        runs = iter(run_ids)
+
+        def evaluate(*args, **kwargs):
+            try:
+                ranking_run_id = next(runs)
+            except StopIteration:
+                ranking_run_id = run_ids[-1]
+            existing = {
+                row["candidate_id"]
+                for row in self.store.connection.execute(
+                    "SELECT candidate_id FROM canary_rankings"
+                ).fetchall()
+            }
+            if any(candidate_id not in existing for candidate_id in candidate_ids):
+                original_evaluate(real_ranker, T0)
+            valid_rows = self.store.connection.execute(
+                "SELECT r.* FROM canary_rankings r "
+                "JOIN candidate_lifecycle l ON l.candidate_id=r.candidate_id "
+                "WHERE l.stage <> 'REJECTED' "
+                "ORDER BY r.candidate_id"
+            ).fetchall()
+            with self.store.connection:
+                for rank, row in enumerate(valid_rows, start=1):
+                    evidence_row = self.store.connection.execute(
+                        "SELECT evidence_json FROM canary_eligibility WHERE candidate_id=?",
+                        (row["candidate_id"],),
+                    ).fetchone()
+                    qualification_hash = row["qualification_hash"]
+                    if evidence_row is not None:
+                        qualification_hash = json.loads(
+                            evidence_row["evidence_json"]
+                        ).get("qualification_hash", qualification_hash)
+                    self.store.connection.execute(
+                        "UPDATE canary_rankings SET ranking_run_id=?,rank=?,"
+                        "qualification_hash=? WHERE candidate_id=?",
+                        (
+                            ranking_run_id,
+                            rank,
+                            qualification_hash,
+                            row["candidate_id"],
+                        ),
+                    )
+            rows = [
+                dict(row)
+                for row in self.store.connection.execute(
+                    "SELECT * FROM canary_rankings WHERE ranking_run_id=? "
+                    "ORDER BY rank,candidate_id",
+                    (ranking_run_id,),
+                ).fetchall()
+            ]
+            return {
+                "ranking_run_id": ranking_run_id,
+                "eligible_count": len(rows),
+                "rankable_count": len(rows),
+                "rankings": rows,
+            }
+
+        return patch.object(
+            CandidateCanaryRanker,
+            "evaluate_and_select",
+            side_effect=evaluate,
+        )
+
+    def _seed_durable_candidates(self, count, *, prefix="cycle"):
+        candidate_ids = [f"{prefix}-{index:02d}" for index in range(count)]
+        for index, candidate_id in enumerate(candidate_ids):
+            self.seed_candidate(
+                candidate_id,
+                cluster=f"{prefix}-cluster-{index}",
+                score=0.90 - index / 1000,
+            )
+        return candidate_ids
+
+    def _durable_scan_patches(self, candidate_ids, run_ids, checked):
+        def signal(candidate_id):
+            checked.append(candidate_id)
+            return None
+
+        return (
+            self._durable_ranking_patch(candidate_ids, run_ids),
+            patch.object(CandidateCanaryRanker, "validate_persisted_ranking", return_value=True),
+            patch.object(CanaryService, "generate_signal", side_effect=signal),
+        )
+
+    def test_durable_no_signal_cycle_is_exactly_10_10_8_then_next_tick_starts_cycle(self):
+        candidate_ids = self._seed_durable_candidates(28, prefix="exact")
+        checked = []
+        self._enable_worker()
+        patches = self._durable_scan_patches(
+            candidate_ids,
+            ["run-exact"] * 4,
+            checked,
+        )
+        worker = AutonomousCanaryWorker(self.store, clock=lambda: T0)
+        with patches[0], patches[1], patches[2]:
+            first = worker.tick(now=T0)
+            second = worker.tick(now=T0)
+            restarted = AutonomousCanaryWorker(self.store, clock=lambda: T0)
+            third = restarted.tick(now=T0)
+            complete = restarted.tick(now=T0)
+
+        self.assertEqual(
+            [first["candidates_signal_checked"],
+             second["candidates_signal_checked"],
+             third["candidates_signal_checked"]],
+            [10, 10, 8],
+        )
+        self.assertEqual(
+            [first["signal_scan_checked_this_cycle"],
+             second["signal_scan_checked_this_cycle"],
+             third["signal_scan_checked_this_cycle"]],
+            [10, 20, 28],
+        )
+        self.assertEqual(first["signal_scan_status"], "IN_PROGRESS")
+        self.assertEqual(second["signal_scan_status"], "IN_PROGRESS")
+        self.assertEqual(third["signal_scan_status"], "COMPLETE_NO_SIGNAL")
+        self.assertTrue(third["signal_scan_cycle_complete"])
+        self.assertEqual(third["signal_scan_remaining_this_cycle"], 0)
+        self.assertEqual(third["signal_scan_coverage_percentage"], 100.0)
+        skip_reasons = third["signal_scan_skip_reasons_json"]
+        self.assertEqual(
+            set(skip_reasons),
+            {
+                "INVALID_RANKING_BINDING",
+                "QUALIFICATION_INVALID",
+                "DUPLICATE_CLUSTER_DEFERRED",
+                "CYCLE_REMAINDER",
+            },
+        )
+        self.assertTrue(
+            all(
+                isinstance(count, int) and 0 <= count <= 28
+                for count in skip_reasons.values()
+            )
+        )
+        self.assertEqual(complete["signal_scan_checked_this_cycle"], 10)
+        self.assertEqual(complete["signal_scan_status"], "IN_PROGRESS")
+        self.assertNotEqual(
+            third["signal_scan_cycle_id"],
+            complete["signal_scan_cycle_id"],
+        )
+        self.assertEqual(len(checked), 38)
+        self.assertEqual(len(set(checked[:28])), 28)
+        persisted = self.store.connection.execute(
+            "SELECT COUNT(*) FROM canary_signal_scan_checked WHERE cycle_id=?",
+            (third["signal_scan_cycle_id"],),
+        ).fetchone()[0]
+        self.assertEqual(persisted, 28)
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM canary_ledger"
+            ).fetchone()[0],
+            0,
+        )
+    def test_ranker_failure_after_first_scan_window_preserves_cycle_and_checked_rows(self):
+        candidate_ids = self._seed_durable_candidates(20, prefix="failure")
+        checked: list[str] = []
+        ranking = CandidateCanaryRanker(self.store, clock=lambda: T0).evaluate_and_select(T0)
+        self._enable_worker()
+
+        def signal(candidate_id):
+            checked.append(candidate_id)
+            return None
+
+        worker = AutonomousCanaryWorker(self.store, clock=lambda: T0)
+        with patch.object(
+            CandidateCanaryRanker,
+            "evaluate_and_select",
+            autospec=True,
+            side_effect=[ranking, RuntimeError("injected ranking failure"), ranking],
+        ), patch.object(
+            CandidateCanaryRanker,
+            "validate_persisted_ranking",
+            return_value=True,
+        ), patch.object(
+            CanaryService,
+            "generate_signal",
+            side_effect=signal,
+        ):
+            first = worker.tick(now=T0)
+            failed = worker.tick(now=T0)
+
+            self.assertEqual(first["status"], "NO_SIGNAL")
+            self.assertEqual(first["candidates_signal_checked"], 10)
+            self.assertEqual(first["signal_scan_checked_this_cycle"], 10)
+            self.assertEqual(first["signal_scan_remaining_this_cycle"], 10)
+            self.assertEqual(first["signal_scan_status"], "IN_PROGRESS")
+            cycle_id = first["signal_scan_cycle_id"]
+            self.assertTrue(cycle_id)
+            self.assertEqual(failed["status"], "ERROR")
+            self.assertEqual(failed["blocker"], "AUTONOMOUS_WORKER_EXCEPTION")
+
+            state = self.store.connection.execute(
+                "SELECT signal_scan_cycle_id,signal_scan_cycle_complete,"
+                "signal_scan_checked_this_cycle,signal_scan_remaining_this_cycle,"
+                "signal_scan_status,worker_status,last_error_code "
+                "FROM canary_autonomous_state WHERE singleton=1"
+            ).fetchone()
+            self.assertEqual(state["signal_scan_cycle_id"], cycle_id)
+            self.assertEqual(state["signal_scan_cycle_complete"], 0)
+            self.assertEqual(state["signal_scan_checked_this_cycle"], 10)
+            self.assertEqual(state["signal_scan_remaining_this_cycle"], 10)
+            self.assertEqual(state["worker_status"], "DEGRADED")
+            self.assertEqual(state["last_error_code"], "AUTONOMOUS_WORKER_EXCEPTION")
+            self.assertEqual(state["signal_scan_status"], "IN_PROGRESS")
+            self.assertEqual(
+                self.store.connection.execute(
+                    "SELECT COUNT(*) FROM canary_signal_scan_checked "
+                    "WHERE cycle_id=?",
+                    (cycle_id,),
+                ).fetchone()[0],
+                10,
+            )
+            worker_state = self.service.status_report()["worker"]
+            self.assertEqual(worker_state["worker_status"], "DEGRADED")
+            self.assertEqual(
+                worker_state["last_error_code"],
+                "AUTONOMOUS_WORKER_EXCEPTION",
+            )
+
+            recovered = worker.tick(now=T0)
+
+        self.assertEqual(recovered["status"], "NO_SIGNAL")
+        self.assertEqual(recovered["candidates_signal_checked"], 10)
+        self.assertEqual(recovered["signal_scan_cycle_id"], cycle_id)
+        self.assertEqual(recovered["signal_scan_checked_this_cycle"], 20)
+        self.assertEqual(recovered["signal_scan_remaining_this_cycle"], 0)
+        self.assertEqual(recovered["signal_scan_status"], "COMPLETE_NO_SIGNAL")
+        self.assertEqual(checked[:10], candidate_ids[:10])
+        self.assertEqual(checked[10:], candidate_ids[10:])
+        self.assertNotEqual(checked[:10], checked[10:])
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM canary_signal_scan_checked "
+                "WHERE cycle_id=?",
+                (cycle_id,),
+            ).fetchone()[0],
+            20,
+        )
+
+    def test_signal_generation_exception_persists_active_cycle_for_restart(self):
+        candidate_ids = self._seed_durable_candidates(11, prefix="signal-failure")
+        self._enable_worker()
+        calls: list[str] = []
+        failed_once = True
+
+        def signal(candidate_id):
+            nonlocal failed_once
+            calls.append(candidate_id)
+            if failed_once and len(calls) == 2:
+                failed_once = False
+                raise RuntimeError("injected signal-generation failure")
+            return None
+
+        ranking_patch = self._durable_ranking_patch(
+            candidate_ids,
+            ["signal-failure"],
+        )
+        worker = AutonomousCanaryWorker(self.store, clock=lambda: T0)
+        with ranking_patch, patch.object(
+            CandidateCanaryRanker,
+            "validate_persisted_ranking",
+            return_value=True,
+        ), patch.object(CanaryService, "generate_signal", side_effect=signal):
+            failed = worker.tick(now=T0)
+
+            self.assertEqual(failed["status"], "ERROR")
+            self.assertEqual(failed["blocker"], "AUTONOMOUS_WORKER_EXCEPTION")
+            state = self.store.connection.execute(
+                "SELECT signal_scan_cycle_id,signal_scan_cycle_complete,"
+                "signal_scan_checked_this_cycle,signal_scan_remaining_this_cycle,"
+                "signal_scan_coverage_percentage,signal_scan_status,"
+                "last_error_code,worker_status "
+                "FROM canary_autonomous_state WHERE singleton=1"
+            ).fetchone()
+            self.assertTrue(state["signal_scan_cycle_id"])
+            self.assertEqual(state["signal_scan_cycle_complete"], 0)
+            self.assertEqual(state["signal_scan_checked_this_cycle"], 1)
+            self.assertEqual(state["signal_scan_remaining_this_cycle"], 10)
+            self.assertAlmostEqual(state["signal_scan_coverage_percentage"], 100 / 11)
+            self.assertEqual(state["signal_scan_status"], "IN_PROGRESS")
+            self.assertEqual(state["last_error_code"], "AUTONOMOUS_WORKER_EXCEPTION")
+            self.assertEqual(state["worker_status"], "DEGRADED")
+            cycle_id = state["signal_scan_cycle_id"]
+            self.assertEqual(
+                self.store.connection.execute(
+                    "SELECT COUNT(*) FROM canary_signal_scan_checked "
+                    "WHERE cycle_id=?",
+                    (cycle_id,),
+                ).fetchone()[0],
+                1,
+            )
+
+            restarted = AutonomousCanaryWorker(self.store, clock=lambda: T0)
+            recovered = restarted.tick(now=T0)
+
+        self.assertEqual(recovered["status"], "NO_SIGNAL")
+        self.assertEqual(recovered["candidates_signal_checked"], 10)
+        self.assertEqual(recovered["signal_scan_cycle_id"], cycle_id)
+        self.assertEqual(recovered["signal_scan_checked_this_cycle"], 11)
+        self.assertEqual(recovered["signal_scan_remaining_this_cycle"], 0)
+        self.assertEqual(recovered["signal_scan_coverage_percentage"], 100.0)
+        self.assertEqual(recovered["signal_scan_status"], "COMPLETE_NO_SIGNAL")
+        self.assertEqual(calls[0], candidate_ids[0])
+        self.assertNotIn(candidate_ids[0], calls[2:])
+        self.assertEqual(set(calls[2:]), set(candidate_ids[1:]))
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM canary_signal_scan_checked "
+                "WHERE cycle_id=?",
+                (cycle_id,),
+            ).fetchone()[0],
+            11,
+        )
+
+    def test_ranking_evidence_change_preserves_checked_coverage(self):
+        candidate_ids = self._seed_durable_candidates(12, prefix="ranking")
+        self._enable_worker()
+        checked = []
+        patches = self._durable_scan_patches(
+            candidate_ids,
+            ["ranking-a", "ranking-b"],
+            checked,
+        )
+        worker = AutonomousCanaryWorker(self.store, clock=lambda: T0)
+        with patches[0], patches[1], patches[2]:
+            first = worker.tick(now=T0)
+            CandidateLifecycleManager(self.store).record_evidence(
+                candidate_ids[0],
+                {
+                    "forward_evidence": {
+                        "forward_duration_seconds": 30 * 86400,
+                        "forward_expectancy": -0.15,
+                    }
+                },
+                expected_stage=CandidateStage.FROZEN,
+                reason="ranking evidence update",
+            )
+            stale = self.service.status()
+            self.assertEqual(stale["readiness_snapshot_status"], "STALE")
+            self.assertEqual(
+                stale["readiness_snapshot_reason"],
+                "LIFECYCLE_RANKING_EVIDENCE_UPDATED",
+            )
+            second = worker.tick(now=T0)
+
+        self.assertEqual(first["signal_scan_checked_this_cycle"], 10)
+        self.assertEqual(second["signal_scan_checked_this_cycle"], 12)
+        self.assertEqual(
+            first["signal_scan_cycle_id"],
+            second["signal_scan_cycle_id"],
+        )
+        self.assertNotIn(candidate_ids[0], checked[10:])
+        self.assertEqual(second["signal_scan_status"], "COMPLETE_NO_SIGNAL")
+
+    def test_ranking_run_change_and_telemetry_change_do_not_reset_cycle(self):
+        candidate_ids = self._seed_durable_candidates(12, prefix="stable")
+        self._enable_worker()
+        checked = []
+        patches = self._durable_scan_patches(
+            candidate_ids,
+            ["run-a", "run-b"],
+            checked,
+        )
+        worker = AutonomousCanaryWorker(self.store, clock=lambda: T0)
+        with patches[0], patches[1], patches[2]:
+            first = worker.tick(now=T0)
+            lifecycle = CandidateLifecycleManager(self.store)
+            status_before_update = self.service.status()
+            lifecycle.record_evidence(
+                candidate_ids[0],
+                {
+                    "forward_evidence": {
+                        "forward_liquidity": 0.42,
+                        "forward_max_drawdown": 0.05,
+                        "forward_fills": 17,
+                        "forward_observations": 99,
+                    }
+                },
+                expected_stage=CandidateStage.FROZEN,
+                reason="telemetry-only update",
+            )
+            status_after_update = self.service.status()
+            for key in (
+                "readiness_snapshot_status",
+                "readiness_snapshot_stale",
+                "readiness_snapshot_reason",
+            ):
+                self.assertEqual(status_after_update[key], status_before_update[key])
+            second = worker.tick(now=T0)
+
+        self.assertEqual(first["candidates_signal_checked"], 10)
+        self.assertEqual(second["candidates_signal_checked"], 2)
+        self.assertEqual(first["signal_scan_checked_this_cycle"], 10)
+        self.assertEqual(second["signal_scan_checked_this_cycle"], 12)
+        self.assertEqual(
+            first["signal_scan_cycle_id"],
+            second["signal_scan_cycle_id"],
+        )
+        self.assertEqual(first["signal_scan_ranking_run_id"], "run-a")
+        self.assertEqual(second["signal_scan_ranking_run_id"], "run-b")
+        self.assertEqual(
+            checked[:10],
+            candidate_ids[:10],
+        )
+        self.assertEqual(
+            set(checked[10:]),
+            set(candidate_ids[10:]),
+        )
+        self.assertEqual(second["signal_scan_status"], "COMPLETE_NO_SIGNAL")
+
+    def test_qualification_hash_change_rechecks_only_affected_candidate(self):
+        candidate_ids = self._seed_durable_candidates(12, prefix="qualification")
+        self._enable_worker()
+        checked = []
+        patches = self._durable_scan_patches(
+            candidate_ids,
+            ["qualification-run"] * 2,
+            checked,
+        )
+        worker = AutonomousCanaryWorker(self.store, clock=lambda: T0)
+        with patches[0], patches[1], patches[2]:
+            first = worker.tick(now=T0)
+            old_key = self.store.connection.execute(
+                "SELECT qualification_hash FROM canary_signal_scan_checked "
+                "WHERE cycle_id=? AND candidate_id=?",
+                (first["signal_scan_cycle_id"], candidate_ids[0]),
+            ).fetchone()["qualification_hash"]
+            lifecycle = CandidateLifecycleManager(self.store)
+            lifecycle.record_evidence(
+                candidate_ids[0],
+                {"validation_expectancy": 0.55},
+                expected_stage=CandidateStage.FROZEN,
+                reason="qualification change",
+            )
+            stale = self.service.status()
+            self.assertEqual(stale["readiness_snapshot_status"], "STALE")
+            self.assertTrue(stale["readiness_snapshot_stale"])
+            self.assertEqual(
+                stale["readiness_snapshot_reason"],
+                "LIFECYCLE_QUALIFICATION_UPDATED",
+            )
+            self.service.mark_eligible(candidate_ids[0])
+            second = worker.tick(now=T0)
+        self.assertEqual(first["candidates_signal_checked"], 10)
+        self.assertEqual(second["candidates_signal_checked"], 3)
+        self.assertEqual(first["signal_scan_checked_this_cycle"], 10)
+        self.assertEqual(second["signal_scan_checked_this_cycle"], 12)
+        self.assertEqual(
+            first["signal_scan_cycle_id"],
+            second["signal_scan_cycle_id"],
+        )
+        self.assertIn(candidate_ids[0], checked[10:])
+        self.assertEqual(
+            set(checked[10:]),
+            {candidate_ids[0], candidate_ids[10], candidate_ids[11]},
+        )
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM canary_signal_scan_checked "
+                "WHERE cycle_id=? AND candidate_id=?",
+                (first["signal_scan_cycle_id"], candidate_ids[0]),
+            ).fetchone()[0],
+            2,
+        )
+        qualification_keys = {
+            row["qualification_hash"]
+            for row in self.store.connection.execute(
+                "SELECT qualification_hash FROM canary_signal_scan_checked "
+                "WHERE cycle_id=? AND candidate_id=?",
+                (first["signal_scan_cycle_id"], candidate_ids[0]),
+            ).fetchall()
+        }
+        self.assertEqual(len(qualification_keys), 2)
+        self.assertIn(old_key, qualification_keys)
+        self.assertEqual(len(qualification_keys - {old_key}), 1)
+
+    def test_candidate_addition_joins_active_cycle_and_ineligible_removal_disappears(self):
+        candidate_ids = self._seed_durable_candidates(12, prefix="membership")
+        self._enable_worker()
+        checked = []
+        patches = self._durable_scan_patches(
+            candidate_ids + ["membership-new"],
+            ["membership-run"] * 3,
+            checked,
+        )
+        worker = AutonomousCanaryWorker(self.store, clock=lambda: T0)
+        with patches[0], patches[1], patches[2]:
+            first = worker.tick(now=T0)
+            self.seed_candidate(
+                "membership-new",
+                cluster="membership-new-cluster",
+                score=0.95,
+            )
+            CandidateLifecycleManager(self.store).reject(
+                candidate_ids[10],
+                "test ineligibility",
+                expected_stage=CandidateStage.FROZEN,
+            )
+            second = worker.tick(now=T0)
+        self.assertEqual(first["candidates_signal_checked"], 10)
+        self.assertEqual(second["candidates_signal_checked"], 2)
+        self.assertEqual(first["signal_scan_checked_this_cycle"], 10)
+        self.assertEqual(second["signal_scan_checked_this_cycle"], 12)
+        self.assertEqual(second["signal_scan_cycle_id"], first["signal_scan_cycle_id"])
+        self.assertIn("membership-new", checked[10:])
+        self.assertNotIn(candidate_ids[10], checked[10:])
+        self.assertEqual(second["signal_scan_status"], "COMPLETE_NO_SIGNAL")
+        self.assertEqual(second["signal_scan_remaining_this_cycle"], 0)
+
+    def test_remaining_candidates_follow_current_rank_order_after_score_change(self):
+        candidate_ids = self._seed_durable_candidates(12, prefix="rescore")
+        self._enable_worker()
+        checked = []
+        worker = AutonomousCanaryWorker(self.store, clock=lambda: T0)
+        original_evaluate = CandidateCanaryRanker.evaluate_and_select
+        calls = 0
+
+        def evaluate(ranker, *args, **kwargs):
+            nonlocal calls
+            calls += 1
+            result = original_evaluate(ranker, T0)
+            if calls == 2:
+                with self.store.connection:
+                    self.store.connection.execute(
+                        "UPDATE canary_rankings SET rank=? WHERE candidate_id=?",
+                        (1, candidate_ids[11]),
+                    )
+                    self.store.connection.execute(
+                        "UPDATE canary_rankings SET rank=? WHERE candidate_id=?",
+                        (2, candidate_ids[10]),
+                    )
+            return result
+
+        def signal(candidate_id):
+            checked.append(candidate_id)
+            return None
+
+        with patch.object(
+            CandidateCanaryRanker,
+            "evaluate_and_select",
+            autospec=True,
+            side_effect=evaluate,
+        ), patch.object(
+            CandidateCanaryRanker,
+            "validate_persisted_ranking",
+            return_value=True,
+        ), patch.object(
+            CanaryService,
+            "generate_signal",
+            side_effect=signal,
+        ):
+            first = worker.tick(now=T0)
+            second = worker.tick(now=T0)
+
+        self.assertEqual(first["candidates_signal_checked"], 10)
+        self.assertEqual(second["candidates_signal_checked"], 2)
+        self.assertEqual(first["signal_scan_checked_this_cycle"], 10)
+        self.assertEqual(second["signal_scan_checked_this_cycle"], 12)
+        self.assertEqual(
+            checked[10:],
+            [candidate_ids[11], candidate_ids[10]],
+        )
+
+    def test_lower_rank_ready_is_submitted_once_without_replacing_research_order(self):
+        candidate_ids = self._seed_durable_candidates(2, prefix="ready")
+        self._enable_worker()
+        checked = []
+        venue = TestVenue()
+        worker = AutonomousCanaryWorker(
+            self.store,
+            clock=lambda: T0,
+            venue_factory=lambda: venue,
+            allow_test_venue=True,
+        )
+
+        def signal(candidate_id):
+            checked.append(candidate_id)
+            if candidate_id == candidate_ids[1]:
+                return self._ready_signal(candidate_id)
+            return None
+
+        ranking_patch = self._durable_ranking_patch(candidate_ids, ["ready-run"])
+        with ranking_patch, patch.object(
+            CandidateCanaryRanker,
+            "validate_persisted_ranking",
+            return_value=True,
+        ), patch.object(
+            CanaryService,
+            "generate_signal",
+            side_effect=signal,
+        ), patch.object(
+            CanaryService,
+            "bind_autonomous_actionable_candidate",
+            return_value={"bound": True},
+        ), patch.object(
+            CanaryService,
+            "submit_signal",
+            return_value={"ok": True, "order_id": "one"},
+        ) as submit, patch.object(
+            CredentialStore,
+            "configured",
+            return_value=True,
+        ):
+            result = worker.tick(now=T0)
+
+        self.assertEqual(result["status"], "SUBMITTED")
+        self.assertEqual(result["candidate_id"], candidate_ids[1])
+        self.assertEqual(result["selected_actionable_rank"], 2)
+        self.assertEqual(checked, candidate_ids)
+        submit.assert_called_once()
+        self.assertEqual(len(venue.submissions), 0)
 
     def _post_rank_mutation(self, mutation):
         real_ranker = CandidateCanaryRanker(self.store, clock=lambda: T0)
@@ -2325,7 +3283,7 @@ class AutonomousWorkflowTests(unittest.TestCase):
         )
 
 
-    def test_follower_evidence_change_rebases_scan_cursor_to_preferred_window(self):
+    def test_follower_evidence_change_preserves_checked_ids_and_reorders_remaining_candidates(self):
         for index in range(1, 13):
             self.seed_candidate(
                 f"follower-reset-{index:02d}",
@@ -2427,9 +3385,22 @@ class AutonomousWorkflowTests(unittest.TestCase):
             first["signal_scan_ranking_run_id"],
             second["signal_scan_ranking_run_id"],
         )
-        self.assertEqual(checked[10:20], checked[:10])
-        self.assertEqual(second["signal_scan_cursor"], 10)
-        self.assertEqual(second["next_signal_scan_start_rank"], 10)
+        self.assertEqual(
+            checked[:10],
+            [f"follower-reset-{index:02d}" for index in range(1, 11)],
+        )
+        self.assertTrue(set(checked[:10]).isdisjoint(checked[10:]))
+        self.assertEqual(
+            set(checked[10:]),
+            {
+                "follower-reset-11",
+                "follower-reset-12",
+                "follower-reset-follower-a",
+                "follower-reset-follower-b",
+            },
+        )
+        self.assertEqual(second["signal_scan_cursor"], 0)
+        self.assertEqual(second["next_signal_scan_start_rank"], 0)
 
 
 
@@ -2471,7 +3442,7 @@ class AutonomousWorkflowTests(unittest.TestCase):
                 "signal_scan_cursor": 0,
                 "signal_scan_ranking_run_id": result["ranking"]["ranking_run_id"],
                 "next_signal_scan_start_rank": 0,
-                "next_signal_scan_end_rank": 2,
+                "next_signal_scan_end_rank": 0,
             },
         )
 
@@ -2536,7 +3507,7 @@ class AutonomousWorkflowTests(unittest.TestCase):
         self.assertEqual(second["signal_scan_cursor"], 0)
         self.assertEqual(second["next_signal_scan_start_rank"], 0)
         self.assertEqual(second["next_signal_scan_end_rank"], 10)
-    def test_ranking_change_resets_scan_cursor_to_preferred_window(self):
+    def test_ranking_change_adds_candidate_to_current_cycle_without_rechecking_checked_ids(self):
         for index in range(1, 13):
             self.seed_candidate(
                 f"reset-{index:02d}",
@@ -2568,15 +3539,27 @@ class AutonomousWorkflowTests(unittest.TestCase):
         self.assertEqual(first["signal_scan_cursor"], 10)
         self.assertEqual(first_state["signal_scan_cursor"], 10)
         self.assertEqual(first_state["next_signal_scan_start_rank"], 10)
-        self.assertEqual(second["signal_scan_cursor"], 10)
-        self.assertEqual(second["next_signal_scan_start_rank"], 10)
+        self.assertEqual(second["signal_scan_cursor"], 0)
+        self.assertEqual(second["next_signal_scan_start_rank"], 0)
+        self.assertEqual(second["next_signal_scan_end_rank"], 0)
         self.assertNotEqual(
             first_state["signal_scan_ranking_run_id"],
             second["signal_scan_ranking_run_id"],
         )
-        self.assertEqual(checked[10], "ranking-reset-new")
+        self.assertEqual(
+            checked[:10],
+            [f"reset-{index:02d}" for index in range(1, 11)],
+        )
+        self.assertTrue(set(checked[:10]).isdisjoint(checked[10:]))
+        self.assertEqual(
+            set(checked[10:]),
+            {"ranking-reset-new", "reset-11", "reset-12"},
+        )
         self.assertEqual(second["candidates_ranked"], 13)
-        self.assertEqual(second["candidates_signal_checked"], 10)
+        self.assertEqual(second["candidates_signal_checked"], 3)
+        self.assertEqual(second["signal_scan_checked_this_cycle"], 13)
+        self.assertEqual(second["signal_scan_remaining_this_cycle"], 0)
+        self.assertEqual(second["signal_scan_status"], "COMPLETE_NO_SIGNAL")
         self.assertEqual(second["actionable_candidates_found"], 0)
 
 
@@ -2637,6 +3620,53 @@ class AutonomousWorkflowTests(unittest.TestCase):
         self.assertNotIn("cluster-a-two", checked)
         self.assertNotIn("cluster-b-two", checked)
         self.assertEqual(result["candidates_signal_checked"], len(checked))
+
+    def test_duplicate_cluster_followers_are_deferred_and_eventually_checked(self):
+        representatives = []
+        followers = []
+        for index in range(10):
+            cluster = f"follower-cluster-{index:02d}"
+            representative = f"{cluster}-representative"
+            follower = f"{cluster}-follower"
+            self.seed_candidate(
+                representative,
+                cluster=cluster,
+                score=0.99 - index / 1000,
+            )
+            self.seed_candidate(
+                follower,
+                cluster=cluster,
+                score=0.98 - index / 1000,
+            )
+            representatives.append(representative)
+            followers.append(follower)
+        self._enable_worker()
+        checked: list[str] = []
+        worker = AutonomousCanaryWorker(self.store, clock=lambda: T0)
+
+        with patch.object(
+            CanaryService,
+            "generate_signal",
+            side_effect=lambda candidate_id: checked.append(candidate_id) or None,
+        ):
+            first = worker.tick(now=T0)
+            second = worker.tick(now=T0)
+
+        self.assertGreater(
+            max(
+                first["signal_scan_skip_reasons_json"]["DUPLICATE_CLUSTER_DEFERRED"],
+                second["signal_scan_skip_reasons_json"]["DUPLICATE_CLUSTER_DEFERRED"],
+            ),
+            0,
+        )
+        self.assertEqual(first["candidates_signal_checked"], 10)
+        self.assertEqual(second["status"], "NO_SIGNAL")
+        self.assertEqual(second["signal_scan_status"], "COMPLETE_NO_SIGNAL")
+        self.assertEqual(second["signal_scan_checked_this_cycle"], 20)
+        self.assertEqual(second["signal_scan_coverage_percentage"], 100.0)
+        self.assertEqual(checked[:10], representatives)
+        self.assertEqual(set(checked[10:]), set(followers))
+        self.assertEqual(set(checked), set(representatives + followers))
 
     def test_stale_and_invalid_rankings_are_skipped_before_signal_generation(self):
         self.seed_candidate("stale-ranking", cluster="stale", score=0.90)

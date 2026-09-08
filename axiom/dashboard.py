@@ -538,6 +538,7 @@ def _number_or_zero(value: Any) -> float:
 
 _CANARY_SELECTION_STATUSES = frozenset({"CURRENT", "STALE", "NONE", "UNKNOWN"})
 _CANARY_AUTONOMOUS_FIELDS = (
+    "last_signal_id",
     "candidates_ranked",
     "candidates_signal_checked",
     "candidates_no_signal",
@@ -3062,6 +3063,11 @@ class DashboardData:
                 "live_execution": False,
             }
         aggregate = self.store.dashboard_overview_summary(activity_limit=8)
+        research_feed = (
+            self.store.research_feed_status()
+            if callable(getattr(self.store, "research_feed_status", None))
+            else {}
+        )
         counts = aggregate.get("counts", {}) if isinstance(aggregate, Mapping) else {}
         catalog = aggregate.get("catalog", {}) if isinstance(aggregate, Mapping) else {}
         stages = {
@@ -3350,7 +3356,7 @@ class DashboardData:
                 "detail": {"bootstrap_statuses": bootstrap_statuses},
             },
             {
-                "name": "HERMES",
+                "name": "INTERNAL RESEARCH QUEUE",
                 "state": worker_state("research-queue", "READY" if queue_statuses else "NOT INITIALIZED"),
                 "detail": {"queue_statuses": queue_statuses, "latest_outcome": latest_outcome},
             },
@@ -3434,6 +3440,7 @@ class DashboardData:
             "hermes": {"statuses": queue_statuses, "latest_outcome": latest_outcome},
             "hermes_latest_outcome": latest_outcome,
             "collector_health": collector_detail,
+            "research_feed": research_feed,
             "counts": counts,
             "paper_summary": {
                 "telemetry_records": counts.get("paper_observations", 0)
@@ -3921,17 +3928,17 @@ class DashboardData:
             if name in {"hermes", "research-queue", "autonomous-research"}
         ]
         if "running" in hermes_workers:
-            hermes_label, hermes_reason = "RUNNING", "Hermes queue worker is executing."
+            hermes_label, hermes_reason = "RUNNING", "Internal research queue worker is executing."
         elif "degraded" in hermes_workers or "stale" in hermes_workers:
-            hermes_label, hermes_reason = "DEGRADED", "Hermes queue worker heartbeat or identity is stale."
+            hermes_label, hermes_reason = "DEGRADED", "Internal research queue worker heartbeat or identity is stale."
         elif "stopped" in hermes_workers:
-            hermes_label, hermes_reason = "STOPPED", "Hermes queue worker is stopped."
+            hermes_label, hermes_reason = "STOPPED", "Internal research queue worker is stopped."
         elif hermes_workers:
-            hermes_label, hermes_reason = "READY", "Hermes queue worker is idle."
+            hermes_label, hermes_reason = "READY", "Internal research queue worker is idle."
         elif hermes.get("submitted", 0) or hermes.get("pending", 0):
-            hermes_label, hermes_reason = "STOPPED", "Hermes work is persisted but no queue worker is executing."
+            hermes_label, hermes_reason = "STOPPED", "Internal research queue work is persisted but no queue worker is executing."
         else:
-            hermes_label, hermes_reason = "NOT INITIALIZED", "No Hermes execution state is persisted."
+            hermes_label, hermes_reason = "NOT INITIALIZED", "No internal research queue execution state is persisted."
         paper_state_count = int(paper.get("state_count", 0) or 0)
         paper_label = "ACTIVE" if paper_state_count > 0 else "NOT INITIALIZED"
         canary_service = (
@@ -4010,7 +4017,7 @@ class DashboardData:
                 component("AXIOM NODE", node_label, {"status": node_state, "reason": node_reason}),
                 component("POLYMARKET COLLECTOR", polymarket_label, polymarket_detail),
                 component("CRYPTO DATA", crypto_label, {"historical_catalogs": catalogs.get("historical_count", 0), "reason": "No historical catalog is persisted." if crypto_label == "NOT INITIALIZED" else None}),
-                component("HERMES", hermes_label, {**dict(hermes), "execution_state": hermes_label, "reason": hermes_reason}),
+                component("INTERNAL RESEARCH QUEUE", hermes_label, {**dict(hermes), "execution_state": hermes_label, "reason": hermes_reason}),
                 component("PAPER ENGINE", paper_label, {"states": paper_state_count, "reason": "Waiting for PAPER_FORWARD." if paper_label == "NOT INITIALIZED" else None}),
             ],
             "research_cards": {
@@ -4148,6 +4155,7 @@ def _dashboard_html(control_token: str | None = None) -> str:
   </header>
   <main>
     <section id="view-overview" class="view active"><div id="component-grid" class="status-grid"></div><div id="overview-readiness-snapshot"></div><div id="research-cards" class="card-grid"></div>
+      <article id="research-feed" class="panel"><div class="section-title"><h2>RESEARCH FEED</h2><span class="badge warn">observability · paper-only</span></div><div id="research-feed-content"><section class="panel"><div class="section-title"><h3>External Hermes feed</h3><span class="badge warn">External status UNKNOWN</span></div><p class="page-note">Waiting for live external feed evidence.</p></section></div></article>
       <article class="panel"><div class="section-title"><h2>SYSTEM CONTROL</h2><span class="badge good">localhost + token</span></div><div id="operator-controls" class="three-col"></div><div id="control-result" class="page-note"></div></article>
       <div class="two-col"><div><article class="panel"><div class="section-title"><h2>Historical / forward coverage</h2><a class="link" href="#datasets" data-link="datasets">View all</a></div><div id="coverage"></div></article>
         <article class="panel"><div class="section-title"><h2>Candidate lifecycle funnel</h2><a class="link" href="#candidates" data-link="candidates">View all</a></div><div id="funnel" class="funnel"></div></article>
@@ -4213,7 +4221,7 @@ def _dashboard_html(control_token: str | None = None) -> str:
       $("operator-controls").innerHTML=[
         `<article><h3>AXIOM NODE</h3><div class="key-value"><span class="key">Status</span><strong>${safe(n.status)}</strong></div><div class="key-value"><span class="key">PID / heartbeat</span><strong>${safe(n.pid)} · ${safe(dateText(n.heartbeat_at))}</strong></div><p class="page-note">${controlButton("node.restart","Restart node","node")}</p></article>`,
         `<article><h3>CRYPTO BOOTSTRAP</h3><div class="key-value"><span class="key">Status</span><strong>${safe(b.status)}</strong></div><div class="key-value"><span class="key">Current</span><strong>${safe(b.current_symbol)} · ${safe(b.current_timeframe)}</strong></div><div class="key-value"><span class="key">Progress</span><strong>${safe(progress)}</strong></div><p class="page-note">${b.status==="FAILED"||b.resumable?controlButton("bootstrap.resume","Resume bootstrap","crypto-universe"):controlButton("bootstrap.start","Start bootstrap","crypto-universe")}</p></article>`,
-        `<article><h3>HERMES</h3><div class="key-value"><span class="key">Status / job</span><strong>${safe(h.status)} · ${safe(h.job_id)}</strong></div><div class="key-value"><span class="key">Last / next</span><strong>${safe(dateText(h.last_run_at))} · ${safe(dateText(h.next_run_at))}</strong></div><p class="page-note">${h.status==="PAUSED"?controlButton("hermes.resume","Resume Hermes"):controlButton("hermes.pause","Pause Hermes")} · ${controlButton("hermes.run_now","Run now")}</p></article>`,
+        `<article><h3>INTERNAL RESEARCH QUEUE</h3><div class="key-value"><span class="key">Internal queue status</span><strong>${safe(h.status||"UNKNOWN")}</strong></div><div class="key-value"><span class="key">Last / next</span><strong>${safe(dateText(h.last_run_at))} · ${safe(dateText(h.next_run_at))}</strong></div><p class="page-note">${String(h.status||"").toUpperCase()==="PAUSED"?controlButton("hermes.resume","Resume processing"):controlButton("hermes.pause","Pause processing")} · ${controlButton("hermes.run_now","Process next pending item now")}</p></article>`,
         `<article><h3>PAPER ENGINE</h3><div class="key-value"><span class="key">Status</span><strong>${safe(p.status)}</strong></div><p class="page-note">Read-only paper status. No browser configuration or trading controls.</p></article>`,
         `<article><h3>COLLECTOR</h3><div class="key-value"><span class="key">Status</span><strong>${safe(c.status)}</strong></div><p class="page-note">Safe independent restart is unavailable; restart the node instead.</p></article>`,
         `<article><h3>CREDENTIALS</h3><div class="key-value"><span class="key">Configured</span><strong>${cred.configured?"YES":"NO"}</strong></div><p class="page-note">Configuration is CLI-only. Secret values are never returned.</p></article>`
@@ -4394,10 +4402,32 @@ def _dashboard_html(control_token: str | None = None) -> str:
         if(parentSignal) parentSignal.removeEventListener("abort", abort);
       }
     }
+    function researchFeedValue(value) { if(value==null||value==="")return "UNKNOWN"; return typeof value==="object"?json(value):String(value); }
+    function researchFeedTimestamp(value) { if(value==null||value==="")return "UNKNOWN"; const formatted=dateText(value); return formatted==="—"?String(value):formatted; }
+    function researchFeedField(key,label,value,timestamp=false) { return `<div class="key-value" data-field="${safe(key)}"><span class="key">${safe(label)}</span><strong>${safe(timestamp?researchFeedTimestamp(value):researchFeedValue(value))}</strong></div>`; }
+    function renderResearchFeed(data) {
+      const feed=data?.research_feed&&typeof data.research_feed==="object"?data.research_feed:{},external=feed.external_hermes||{},internal=feed.internal_queue||{},proposals=feed.proposals||{},candidates=feed.candidates||{},budgets=feed.budgets||{};
+      const externalStatus=String(external.status??"UNKNOWN").toUpperCase(),internalStatus=String(internal.status??"UNKNOWN").toUpperCase();
+      const fields=(source,specs)=>specs.map(([key,label,timestamp])=>researchFeedField(key,label,source[key],timestamp)).join("");
+      const externalEvidence=researchFeedValue(external.evidence);
+      $("research-feed-content").innerHTML=`<div class="two-col">
+        <section class="panel"><div class="section-title"><h3>External Hermes feed</h3><span class="badge ${statusClass(externalStatus)}">External status ${safe(externalStatus)}</span></div>${researchFeedField("job_id","Job ID",external.job_id)}${researchFeedField("status","External status",externalStatus)}${researchFeedField("evidence","Evidence",externalEvidence)}</section>
+        <section class="panel"><div class="section-title"><h3>Internal research queue processing</h3><span class="badge ${statusClass(internalStatus)}">Internal queue ${safe(internalStatus)}</span></div>${researchFeedField("status","Status",internal.status)}${researchFeedField("trigger","Trigger",internal.trigger)}${researchFeedField("last_cycle_at","Last cycle at",internal.last_cycle_at,true)}</section>
+      </div>
+      <div class="two-col">
+        <section class="panel"><h3>Proposals</h3>${fields(proposals,[["latest_submitted_at","Latest submitted at",true],["latest_accepted_at","Latest accepted at",true],["submitted_24h","Submitted 24h"],["accepted_24h","Accepted 24h"],["rejected_24h","Rejected 24h"],["failed_24h","Failed 24h"],["pending","Pending"],["processing","Processing"],["completed","Completed"],["rejected","Rejected"]])}</section>
+        <section class="panel"><h3>Candidates</h3>${fields(candidates,[["latest_created_at","Latest created at",true],["created_24h","Created 24h"],["mutations_24h","Mutations 24h"],["total","Total"],["new","New"],["eligible","Eligible"],["rejected","Rejected"]])}</section>
+      </div>
+      <div class="two-col">
+        <section class="panel"><h3>Budgets</h3>${fields(budgets,[["total_limit","Total limit"],["total_used","Total used"],["total_remaining","Total remaining"],["families","Families"]])}</section>
+        <section class="panel"><h3>Candidate admission</h3>${researchFeedField("no_new_candidates_reason","No new candidates reason",feed.no_new_candidates_reason)}</section>
+      </div>`;
+    }
     renderOverview = (data) => { renderComponents(data); renderOutcomeCards(data); const c=data.coverage||{},h=data.collector_health||{}; $("coverage").innerHTML=`<div class="three-col"><div class="key-value"><span class="key">Historical datasets</span><strong>${count(c.historical_count)}</strong></div><div class="key-value"><span class="key">Historical rows</span><strong>${count(c.historical_rows)}</strong></div><div class="key-value"><span class="key">Forward datasets</span><strong>${count(c.forward_count)}</strong></div><div class="key-value"><span class="key">Forward rows</span><strong>${count(c.forward_rows)}</strong></div><div class="key-value"><span class="key">Logical observations</span><strong>${count((c.logical_rows||{}).bars)}</strong></div><div class="key-value"><span class="key">Collector errors</span><strong>${count(h.collection_errors)}</strong></div><div class="key-value"><span class="key">Last cycle duration</span><strong>${h.last_cycle_duration_seconds==null?"—":`${Number(h.last_cycle_duration_seconds).toFixed(1)}s`}</strong></div><div class="key-value"><span class="key">Effective cadence</span><strong>${h.effective_collection_cadence_seconds==null?"—":`${Number(h.effective_collection_cadence_seconds).toFixed(1)}s`}</strong></div><div class="key-value"><span class="key">Markets A / S / F</span><strong>${count(h.last_cycle_markets_attempted)} / ${count(h.last_cycle_markets_successful)} / ${count(h.last_cycle_markets_failed)}</strong></div></div><p class="page-note">Configured interval ${safe(h.configured_interval_seconds??"—")}s · stale threshold ${safe(h.stale_after_seconds??"—")}s · last successful cycle ${safe(dateText(h.last_successful_cycle))}</p>`; $("overview-activity").innerHTML=activityMarkup(arr(data.latest_activity||data.activity)); $("overview-candidates").innerHTML=empty("Candidate list is lazy","Open Candidates to load the bounded lifecycle page."); $("raw-overview").textContent=json({counts:data.counts,collector_health:h,latest_outcome:data.hermes_latest_outcome}); };
     const _renderOverviewScheduling = renderOverview;
     renderOverview = (data) => {
       _renderOverviewScheduling(data);
+      renderResearchFeed(data);
       $("overview-readiness-snapshot").innerHTML=readinessSnapshotMarkup(data);
       if(Object.prototype.hasOwnProperty.call(data,"operator_controls")||!operatorControlsRendered)renderOperatorControls(data);
       const h = data.collector_health || {};

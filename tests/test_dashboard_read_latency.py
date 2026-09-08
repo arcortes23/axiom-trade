@@ -442,6 +442,41 @@ class DashboardReadLatencyFixture(unittest.TestCase):
             timestamp=T0 + timedelta(minutes=1),
         )
 
+        current_after_marker = self.service.readiness_snapshot()
+        self.assertEqual(current_after_marker["readiness_snapshot_status"], "CURRENT")
+        self.assertFalse(current_after_marker["readiness_snapshot_stale"])
+        self.assertEqual(
+            current_after_marker["readiness_snapshot_reason"],
+            initial["readiness_snapshot_reason"],
+        )
+        self.assertEqual(
+            current_after_marker["readiness_snapshot_updated_at"],
+            initial_updated_at,
+        )
+        status, marker_payload, _body = self._request(self.server, "api/v2/canary")
+        self.assertEqual(status, 200)
+        self.assertIsInstance(marker_payload, dict)
+        assert isinstance(marker_payload, dict)
+        marker_canary = marker_payload["canary"]
+        self.assertEqual(marker_canary["readiness_snapshot_status"], "CURRENT")
+        self.assertFalse(marker_canary["readiness_snapshot_stale"])
+        self.assertEqual(
+            marker_canary["readiness_snapshot_reason"],
+            initial["readiness_snapshot_reason"],
+        )
+        self.assertEqual(marker_canary["readiness_snapshot_updated_at"], initial_updated_at)
+
+        stage_record = self.store.load_candidate_lifecycle("candidate-01")
+        assert isinstance(stage_record, dict)
+        self.store.save_candidate_lifecycle(
+            "candidate-01",
+            "REJECTED",
+            dict(stage_record["payload"]),
+            from_stage="PAPER_FORWARD",
+            reason="fixture stage update",
+            timestamp=T0 + timedelta(minutes=2),
+        )
+
         stale = self.service.readiness_snapshot()
         self.assertEqual(stale["readiness_snapshot_status"], "STALE")
         self.assertTrue(stale["readiness_snapshot_stale"])
