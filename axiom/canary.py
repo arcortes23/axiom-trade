@@ -5555,11 +5555,19 @@ class CanaryService:
                     },
                 )
                 continue
-            if health_grade not in {"A", "B"} and (
-                not health_has_market_detail
-                or (
-                    health_reason == "COLLECTOR_DEGRADED"
-                    and not health_blocked_markets
+            if (
+                health_reason not in {
+                    "REQUIRED_MARKETS_FRESH",
+                    "REQUIRED_MARKETS_MISSING",
+                    "REQUIRED_MARKETS_STALE",
+                }
+                and health_grade not in {"A", "B"}
+                and (
+                    not health_has_market_detail
+                    or (
+                        health_reason == "COLLECTOR_DEGRADED"
+                        and not health_blocked_markets
+                    )
                 )
             ):
                 record_failure(
@@ -5775,6 +5783,18 @@ class CanaryService:
                 market_id=selected["market_id"],
                 required_health=required_health,
                 evidence=selected_evidence,
+            )
+        if (
+            not market_ids
+            and authority_reason == "CANDIDATE_FORWARD_MARKET_UNRESOLVED"
+        ):
+            unresolved_evidence = dict(evidence)
+            unresolved_evidence["authority_reason_code"] = authority_reason
+            return finish(
+                authority_reason,
+                market_id=declared_market_ids[0] if declared_market_ids else None,
+                required_health=required_health,
+                evidence=unresolved_evidence,
             )
         return finish(
             "COLLECTOR_CANDIDATE_HEALTH_BLOCKED",

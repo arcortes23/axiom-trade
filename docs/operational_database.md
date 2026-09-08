@@ -169,7 +169,7 @@ PowerShell lifecycle commands use the same default:
 
 ## Binance Spot canary
 
-See [docs/binance_spot_canary.md](binance_spot_canary.md) for the isolated PAPER-only Binance Spot runtime, operator controls, evidence status, and later reviewed migration procedure. It is separate from the Polymarket canary.
+See [Binance Spot canary guide](binance_spot_canary.md) for the isolated strict Binance Spot `BINANCE_SPOT_TESTNET` runtime, operator controls, evidence status, and later reviewed migration procedure. Its fixed isolated database is `runtime-data/binance-testnet.sqlite`. The separate `PAPER` development runtime uses its own fixed isolated database, `runtime-data/binance-dev.sqlite`; both runtimes remain separate from the Polymarket canary and canonical `runtime-data/axiom.sqlite`.
 
 ## Historical bootstrap examples
 

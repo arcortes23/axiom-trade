@@ -29,6 +29,7 @@ from .robustness import bootstrap_confidence_interval, minimum_sample_check, nei
 from .storage import AxiomStore
 from .data_quality import evaluate_prediction_data_quality, persisted_quality_fields
 from .strategy import StrategyDefinition, load_strategy
+from .strategy.signals import evaluate_model_document_probability
 from .experiment_plan import AUTONOMOUS_BUDGET_ID, ExperimentPlan, ExperimentPlanError, MAX_PLAN_VARIANTS
 
 
@@ -1312,18 +1313,9 @@ class AutonomousResearchProcessor:
         result: list[Mapping[str, Any]] = []
         for row in rows:
             clean = dict(row)
-            if "probability" in model:
-                clean.setdefault("model_probability", model["probability"])
-            elif "yes_probability" in model:
-                clean.setdefault("model_probability", model["yes_probability"])
-            elif isinstance(model.get("field"), str):
-                value = clean.get(model["field"])
-                try:
-                    probability = float(value)
-                except (TypeError, ValueError):
-                    probability = math.nan
-                if math.isfinite(probability) and 0.0 <= probability <= 1.0:
-                    clean.setdefault("model_probability", probability)
+            probability = evaluate_model_document_probability(model, clean)
+            if probability is not None:
+                clean["model_probability"] = probability
             result.append(clean)
         return result
 

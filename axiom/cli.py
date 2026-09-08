@@ -6,7 +6,6 @@ import argparse
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
-import math
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 from decimal import Decimal
@@ -32,6 +31,7 @@ from .research import run_crypto_research, run_initial_research, write_report
 from .research import run_multi_symbol_crypto_research
 from .research_bus import DurableResearchBus, ResearchBusPermissionError, _validate_payload
 from .strategy import evaluate_signal_record, load_strategy
+from .strategy.signals import evaluate_model_document_probability
 from .tracking import ExperimentTracker
 from .storage import AxiomStore, SQLiteBusyTimeout
 from .binance_dev import BinanceDevelopmentRuntime, BinanceTestnetRuntime
@@ -154,18 +154,7 @@ class _CliProbabilityModel:
         self.document = dict(document)
 
     def predict_probability(self, observation: Mapping[str, Any]) -> float | None:
-        try:
-            if "probability" in self.document:
-                return float(self.document["probability"])
-            if "yes_probability" in self.document:
-                return float(self.document["yes_probability"])
-            field = self.document.get("field")
-            if isinstance(field, str) and field.strip():
-                value = observation.get(field)
-                return float(value) if value is not None else None
-        except (TypeError, ValueError):
-            return None
-        return None
+        return evaluate_model_document_probability(self.document, observation)
 
 
 
@@ -801,12 +790,7 @@ def _load_cli_documents(strategy_value: str, model_value: str) -> tuple[Any, Map
 
 
     if "probability" in model or "yes_probability" in model:
-        value = model.get("probability", model.get("yes_probability"))
-        try:
-            probability = float(value)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("model probability must be numeric") from exc
-        if not math.isfinite(probability) or not 0.0 <= probability <= 1.0:
+        if evaluate_model_document_probability(model, {}) is None:
             raise ValueError("model probability must be finite and within [0, 1]")
     elif not isinstance(model.get("field"), str) or not model["field"].strip():
         raise ValueError("model document requires probability, yes_probability, or field")

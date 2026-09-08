@@ -1111,6 +1111,28 @@ class BinanceDevelopmentTests(unittest.TestCase):
                     self.assertEqual(reopened.execute("SELECT 1").fetchone()[0], 1)
                 Path(runtime.db_path).unlink()
 
+    def test_testnet_dashboard_actions_honor_credential_removal_and_rotation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime, control, _ = self.configured_auto_runtime(Path(directory), _AutoWorker())
+            try:
+                self.assertIs(runtime.dashboard_data.binance_canary, runtime)
+                credential_store = runtime.credential_store
+                keyring = credential_store._keyring
+
+                keyring.values.clear()
+                removed = runtime.dashboard_data.binance_canary.action("PAUSE", {})
+                self.assertFalse(removed["ok"])
+                self.assertEqual(removed["reason"], "CREDENTIALS_NOT_CONFIGURED")
+                self.assertEqual(control.calls, [])
+
+                credential_store.configure("rotated-key", "rotated-secret")
+                rotated = runtime.dashboard_data.binance_canary.action("PAUSE", {})
+                self.assertFalse(rotated["ok"])
+                self.assertEqual(rotated["reason"], "CREDENTIALS_CHANGED")
+                self.assertEqual(control.calls, [])
+            finally:
+                runtime.stop()
+
     def test_testnet_auto_refuses_probe_unknown_before_authorization(self):
         class UnknownProbeGate(_TestnetGate):
             def probe_status(self):

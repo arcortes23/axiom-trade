@@ -9,7 +9,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_CEILING
-import hashlib
+import os
 import inspect
 import json
 import sqlite3
@@ -58,6 +58,15 @@ AUTH_REASONS = {
 }
 TERMINAL = frozenset({"FILLED", "CANCELED", "CANCELLED", "EXPIRED", "EXPIRED_IN_MATCH", "REJECTED", "DUST"})
 _RAW_SQLITE_LOCK = threading.RLock()
+_OPERATION_LOCK_GUARD = threading.Lock()
+_OPERATION_LOCKS: dict[str, threading.RLock] = {}
+
+
+def _operation_lock_for(profile: BinanceRuntimeProfile) -> threading.RLock:
+    key = os.path.normcase(os.path.realpath(os.path.abspath(profile.db_path)))
+    with _OPERATION_LOCK_GUARD:
+        return _OPERATION_LOCKS.setdefault(key, threading.RLock())
+
 
 
 
@@ -400,9 +409,12 @@ class BinanceTestnetGateService:
         self.profile = profile
         self.credential_store = credential_store
         self.credentials = self._normalize_credentials(credentials)
+        self._credential_source_fingerprint = credential_fingerprint(self.credentials)
+        self._credential_source_bound = self.credentials is not None
+        self._credential_state_error: str | None = None
         self.clock = clock or (lambda: datetime.now(UTC))
         self._lock = threading.RLock()
-        self._operation_lock = threading.RLock()
+        self._operation_lock = _operation_lock_for(profile)
         self._closed = False
         self._offset_ms: int | None = None
         self._venue = venue
@@ -521,11 +533,54 @@ class BinanceTestnetGateService:
                 raise
             else:
                 self.connection.commit()
-
-
     def _credential_value(self, deadline_monotonic: float | None = None) -> BinanceSpotCredentials | None:
         _deadline_checkpoint(deadline_monotonic)
+        if self.credential_store is not None:
+            # The exact credential store is authoritative at every operational
+            # boundary.  Never continue with startup credentials after a
+            # removal or rotation, even when the venue object still retains
+            # the old secret.
+            try:
+                loader = getattr(self.credential_store, "load", None)
+                loaded = loader() if callable(loader) else None
+                current = self._normalize_credentials(loaded)
+            except _AutoDeadlineExpired:
+                raise
+            except Exception:
+                self.credentials = None
+                self._credential_state_error = "CREDENTIALS_UNAVAILABLE"
+                return None
+            _deadline_checkpoint(deadline_monotonic)
+            current_fingerprint = credential_fingerprint(current)
+            if current is None:
+                self.credentials = None
+                self._credential_state_error = "CREDENTIALS_NOT_CONFIGURED"
+                return None
+            if self._credential_source_bound:
+                if current_fingerprint != self._credential_source_fingerprint:
+                    self.credentials = None
+                    self._credential_state_error = "CREDENTIALS_CHANGED"
+                    return None
+            else:
+                self._credential_source_fingerprint = current_fingerprint
+                self._credential_source_bound = True
+            venue_credentials = getattr(self._venue, "credentials", None) if self._venue is not None else None
+            if (
+                venue_credentials is not None
+                and credential_fingerprint(venue_credentials) != current_fingerprint
+            ):
+                self.credentials = None
+                self._credential_state_error = "CREDENTIALS_CHANGED"
+                return None
+            self._credential_state_error = None
+            self.credentials = current
+            if self._venue is None:
+                _deadline_checkpoint(deadline_monotonic)
+                self._venue = BinanceSpotRESTClient(self.profile, current, clock=self.clock, recv_window=5000)
+            _deadline_checkpoint(deadline_monotonic)
+            return current
         if self.credentials is not None:
+            self._credential_state_error = None
             if self._venue is None:
                 _deadline_checkpoint(deadline_monotonic)
                 self._venue = BinanceSpotRESTClient(self.profile, self.credentials, clock=self.clock, recv_window=5000)
@@ -539,27 +594,13 @@ class BinanceTestnetGateService:
                 self.credentials = self._normalize_credentials(venue_credentials)
                 _deadline_checkpoint(deadline_monotonic)
                 if self.credentials is not None:
+                    self._credential_state_error = None
                     return self.credentials
             except (TypeError, ValueError):
                 pass
         _deadline_checkpoint(deadline_monotonic)
-        if self.credential_store is None:
-            return None
-        try:
-            _deadline_checkpoint(deadline_monotonic)
-            loader = getattr(self.credential_store, "load", None)
-            loaded = loader() if callable(loader) else None
-            _deadline_checkpoint(deadline_monotonic)
-            self.credentials = self._normalize_credentials(loaded)
-            _deadline_checkpoint(deadline_monotonic)
-            if self.credentials is not None and self._venue is None:
-                self._venue = BinanceSpotRESTClient(self.profile, self.credentials, clock=self.clock, recv_window=5000)
-            _deadline_checkpoint(deadline_monotonic)
-            return self.credentials
-        except _AutoDeadlineExpired:
-            raise
-        except Exception:
-            return None
+        self._credential_state_error = "CREDENTIALS_NOT_CONFIGURED"
+        return None
 
     def _credential_projection(self, deadline_monotonic: float | None = None) -> dict[str, Any]:
         # Hydrate through the same source precedence used by connectivity and
@@ -568,33 +609,7 @@ class BinanceTestnetGateService:
         _deadline_checkpoint(deadline_monotonic)
         credential = self._credential_value(deadline_monotonic)
         _deadline_checkpoint(deadline_monotonic)
-        if credential is not None:
-            configured = True
-        else:
-            configured = False
-            if self.credential_store is not None:
-                try:
-                    _deadline_checkpoint(deadline_monotonic)
-                    projection = getattr(self.credential_store, "safe_projection", None)
-                    raw = projection() if callable(projection) else None
-                    _deadline_checkpoint(deadline_monotonic)
-                    if isinstance(raw, Mapping):
-                        if "api_key" in raw or "api_secret" in raw:
-                            configured = bool(
-                                str(raw.get("api_key") or "").strip()
-                                and str(raw.get("api_secret") or "").strip()
-                            )
-                        elif "api_key_configured" in raw or "api_secret_configured" in raw:
-                            configured = bool(
-                                raw.get("api_key_configured")
-                                and raw.get("api_secret_configured")
-                            )
-                        else:
-                            configured = bool(raw.get("configured"))
-                except _AutoDeadlineExpired:
-                    raise
-                except Exception:
-                    configured = False
+        configured = credential is not None
         _deadline_checkpoint(deadline_monotonic)
         return {
             "configured": configured,
@@ -735,7 +750,7 @@ class BinanceTestnetGateService:
         if _deadline_expired(deadline_monotonic):
             return self._deadline_connectivity_result(checked, projection)
         if creds is None:
-            result = {**self._base("BLOCKED", reason="CREDENTIALS_NOT_CONFIGURED", checked=checked), "credentials": projection, "account": {}}
+            result = {**self._base("BLOCKED", reason=self._credential_state_error or "CREDENTIALS_NOT_CONFIGURED", checked=checked), "credentials": projection, "account": {}}
             return self._persist_connectivity_guarded(result, deadline_monotonic)
         if self._venue is None:
             result = {**self._base("BLOCKED", reason="VENUE_NOT_CONFIGURED", checked=checked), "credentials": projection, "account": {}}
@@ -1440,13 +1455,24 @@ class BinanceTestnetGateService:
         result["exchange_order_id"] = _safe_id(value.get("exchange_order_id"))
         return result
 
-    def _reset_reason(self) -> str | None:
-        row = self.connection.execute(
-            "SELECT reason FROM binance_testnet_probe_intents "
-            "WHERE probe_kind=? AND reason=? ORDER BY updated_at_utc DESC LIMIT 1",
+    def _reset_generation(
+        self,
+        connection: sqlite3.Connection | None = None,
+    ) -> tuple[str, str, str, str, str] | None:
+        conn = connection or self.connection
+        row = conn.execute(
+            "SELECT intent_id,state,reason,updated_at_utc,raw_json "
+            "FROM binance_testnet_probe_intents "
+            "WHERE probe_kind=? AND reason=? ORDER BY updated_at_utc DESC, intent_id DESC LIMIT 1",
             (PROBE_LABEL, "TESTNET_RESET_HISTORY_MISSING"),
         ).fetchone()
-        return str(row["reason"]) if row is not None else None
+        if row is None:
+            return None
+        return tuple(str(row[key] or "") for key in ("intent_id", "state", "reason", "updated_at_utc", "raw_json"))
+
+    def _reset_reason(self, connection: sqlite3.Connection | None = None) -> str | None:
+        verdict = self._reset_generation(connection)
+        return verdict[2] if verdict is not None else None
 
     def _submission_count(self, *, connection: sqlite3.Connection | None = None) -> int:
         conn = connection or self.connection
@@ -2016,6 +2042,7 @@ class BinanceTestnetGateService:
         ).fetchall()
         owned = self._owned_quantity(str(buy["symbol"]))
         reset_reason = self._reset_reason()
+        exit_state = str(exit_row["state"]).upper() if exit_row is not None else ""
         if reset_reason is not None:
             status = "UNKNOWN"
             reason = reset_reason
@@ -2025,14 +2052,17 @@ class BinanceTestnetGateService:
             status = str(
                 exit_row["state"]
                 if exit_row is not None
-                and exit_row["state"] in {"DUST", "EXIT_BELOW_MINIMUM"}
+                and exit_state in {"UNKNOWN", "DUST", "EXIT_BELOW_MINIMUM"}
                 else buy["state"]
             )
             reason = str(
                 exit_row["reason"]
-                if status in {"DUST", "EXIT_BELOW_MINIMUM"} and exit_row
+                if exit_row is not None and exit_state in {"UNKNOWN", "DUST", "EXIT_BELOW_MINIMUM"}
                 else buy["reason"]
             )
+            if exit_state == "UNKNOWN":
+                risk["reasons"] = list(dict.fromkeys((*risk["reasons"], "PROBE_UNKNOWN")))
+                risk["admissible"] = False
         return {
             **self._base(status, reason=reason),
             "intent": self._intent_projection(buy),
@@ -2161,7 +2191,7 @@ class BinanceTestnetGateService:
         kwargs[client_key] = client_id
         _deadline_checkpoint(deadline_monotonic)
         return _invoke(method, kwargs, deadline_monotonic=deadline_monotonic)
-    def execute_probe(self, symbol: str | None = None, deadline_monotonic: float | None = None) -> dict[str, Any]:
+    def _execute_probe_unlocked(self, symbol: str | None = None, deadline_monotonic: float | None = None) -> dict[str, Any]:
         # A restarted service may have no explicit credentials of its own.
         # Resolve venue/store credentials before reading durable bindings.
         try:
@@ -2170,6 +2200,7 @@ class BinanceTestnetGateService:
             _deadline_checkpoint(deadline_monotonic)
         except _AutoDeadlineExpired:
             return self._deadline_probe_result(symbol)
+        expected_reset_generation = self._reset_generation()
         autonomous_peer = self._autonomous_peer_snapshot()
         if autonomous_peer.get("block_probe"):
             return self._probe_projection() | {
@@ -2284,6 +2315,34 @@ class BinanceTestnetGateService:
             return self._deadline_probe_result(selected)
         self._transition(intent_id, "SUBMITTING", "before venue call")
         try:
+            fence_reason = self._final_submission_fence(
+                intent_id,
+                expected={
+                    "environment": BINANCE_SPOT_TESTNET,
+                    "source": SOURCE,
+                    "probe_kind": PROBE_LABEL,
+                    "profile_hash": canonical_sha256(self.profile.projection()),
+                    "envelope_hash": DEFAULT_BINANCE_RISK_ENVELOPE.canonical_hash,
+                    "credential_hash": credential_fingerprint(self.credentials),
+                    "client_order_id": client_id,
+                    "symbol": selected,
+                    "side": "BUY",
+                    "order_type": "LIMIT",
+                    "time_in_force": tif,
+                    "price": _dstr(price),
+                    "quantity": _dstr(quantity),
+                    "notional": _dstr(notional),
+                    "fee_reserve": _dstr(fee),
+                },
+                expected_reset_generation=expected_reset_generation,
+                deadline_monotonic=deadline_monotonic,
+            )
+        except _AutoDeadlineExpired:
+            self._transition(intent_id, "UNKNOWN", AUTO_DEADLINE_EXPIRED)
+            return self._deadline_probe_result(selected)
+        if fence_reason is not None:
+            return self._submission_fence_failure(intent_id, fence_reason)
+        try:
             _deadline_checkpoint(deadline_monotonic)
             response = self._submit_venue(
                 symbol=selected,
@@ -2328,6 +2387,75 @@ class BinanceTestnetGateService:
             self._transition(intent_id, "UNKNOWN", AUTO_DEADLINE_EXPIRED, raw=response)
             return self._deadline_probe_result(selected)
         return self._probe_projection()
+    def execute_probe(
+        self,
+        symbol: str | None = None,
+        deadline_monotonic: float | None = None,
+    ) -> dict[str, Any]:
+        # Execute and reconcile share one reentrant operation boundary.  The
+        # lock covers local preparation and the venue call, while SQLite
+        # writer transactions remain scoped to local durable mutations.
+        with self._operation_lock:
+            return self._execute_probe_unlocked(
+                symbol=symbol,
+                deadline_monotonic=deadline_monotonic,
+            )
+
+    def _final_submission_fence(
+        self,
+        intent_id: str,
+        *,
+        expected: Mapping[str, str],
+        expected_reset_generation: tuple[str, str, str, str, str] | None,
+        deadline_monotonic: float | None = None,
+    ) -> str | None:
+        """Check durable intent and reset authority immediately before submit."""
+        _deadline_checkpoint(deadline_monotonic)
+        credential = self._credential_value(deadline_monotonic)
+        if credential is None:
+            return self._credential_state_error or (
+                "CREDENTIALS_CHANGED" if self._credential_source_bound else "CREDENTIALS_NOT_CONFIGURED"
+            )
+        current_credential_hash = credential_fingerprint(credential)
+        _deadline_checkpoint(deadline_monotonic)
+        with self._immediate_write() as conn:
+            row = conn.execute(
+                "SELECT * FROM binance_testnet_probe_intents WHERE intent_id=?",
+                (intent_id,),
+            ).fetchone()
+            if row is None:
+                return "INTENT_MISSING"
+            if str(row["state"]) != "SUBMITTING":
+                return "INTENT_STATE_CHANGED"
+            if row["exchange_order_id"] not in (None, ""):
+                return "INTENT_IDENTITY_CHANGED"
+            for key, value in expected.items():
+                if str(row[key] if row[key] is not None else "") != str(value):
+                    return "INTENT_IDENTITY_CHANGED"
+            if str(row["credential_hash"]) != current_credential_hash:
+                return "CREDENTIALS_CHANGED"
+            if self._reset_generation(conn) != expected_reset_generation:
+                return "TESTNET_RESET_HISTORY_MISSING"
+        _deadline_checkpoint(deadline_monotonic)
+        return None
+
+    def _submission_fence_failure(
+        self,
+        intent_id: str,
+        reason: str,
+    ) -> dict[str, Any]:
+        """Record a known-unsent fence rejection without touching the venue."""
+        row = self.connection.execute(
+            "SELECT state FROM binance_testnet_probe_intents WHERE intent_id=?",
+            (intent_id,),
+        ).fetchone()
+        if row is not None and str(row["state"]) == "SUBMITTING":
+            self._transition(intent_id, "UNKNOWN", reason)
+        projection = self._probe_projection()
+        if reason == "TESTNET_RESET_HISTORY_MISSING":
+            return projection
+        return projection | {"status": "BLOCKED", "reason": reason}
+
 
     def _order_query(self, row: Mapping[str, Any], *, deadline_monotonic: float | None = None) -> Any:
         method = next((getattr(self._venue, name, None) for name in ("query_order", "get_order", "query") if callable(getattr(self._venue, name, None))), None)
@@ -2662,6 +2790,7 @@ class BinanceTestnetGateService:
         latest_sell = self._latest_intent("SELL")
         if latest_sell is not None and str(latest_sell["state"]).upper() not in TERMINAL:
             return
+        expected_reset_generation = self._reset_generation()
         try:
             _deadline_checkpoint(deadline_monotonic)
             exchange_result = self._public(
@@ -2720,21 +2849,64 @@ class BinanceTestnetGateService:
             sized = size_limit_order(rules, "SELL", price, owned, envelope=DEFAULT_BINANCE_RISK_ENVELOPE, fee_rate=FEE_RATE, available_inventory=owned)
             if not sized.valid or sized.quantity <= 0:
                 reason = ";".join(sized.reasons) or "EXIT_BELOW_MINIMUM"
-                self._insert_intent(symbol=symbol, side="SELL", price=price, quantity=Decimal("0"), notional=Decimal("0"), fee_reserve=Decimal("0"), tif="IOC", client_id=self._new_client_id(symbol, "SELL"), state="DUST")
-                self._transition(str(self._latest_intent("SELL")["intent_id"]), "DUST", reason)
-                self._release_reservation(str(self._latest_intent("SELL")["intent_id"]))
+                dust_intent_id = self._insert_intent(
+                    symbol=symbol,
+                    side="SELL",
+                    price=price,
+                    quantity=Decimal("0"),
+                    notional=Decimal("0"),
+                    fee_reserve=Decimal("0"),
+                    tif="IOC",
+                    client_id=self._new_client_id(symbol, "SELL"),
+                    state="DUST",
+                )
+                self._transition(dust_intent_id, "DUST", reason)
+                self._release_reservation(dust_intent_id)
                 return
             if self._submission_count() >= DEFAULT_BINANCE_RISK_ENVELOPE.max_submissions_per_day:
                 return
             exit_client_id = f"AXIOM-TESTNET-EXIT-{uuid.uuid4().hex[:16]}"
-            intent_id = self._insert_intent(symbol=symbol, side="SELL", price=sized.price, quantity=sized.quantity, notional=sized.notional, fee_reserve=Decimal("0"), tif="IOC" if not rules.time_in_force or "IOC" in rules.time_in_force else "FOK", client_id=exit_client_id)
+            exit_tif = "IOC" if not rules.time_in_force or "IOC" in rules.time_in_force else "FOK"
+            intent_id = self._insert_intent(
+                symbol=symbol,
+                side="SELL",
+                price=sized.price,
+                quantity=sized.quantity,
+                notional=sized.notional,
+                fee_reserve=Decimal("0"),
+                tif=exit_tif,
+                client_id=exit_client_id,
+            )
+            self._transition(intent_id, "SUBMITTING", "before venue call")
             try:
-                _deadline_checkpoint(deadline_monotonic)
+                fence_reason = self._final_submission_fence(
+                    intent_id,
+                    expected={
+                        "environment": BINANCE_SPOT_TESTNET,
+                        "source": SOURCE,
+                        "probe_kind": PROBE_LABEL,
+                        "profile_hash": canonical_sha256(self.profile.projection()),
+                        "envelope_hash": DEFAULT_BINANCE_RISK_ENVELOPE.canonical_hash,
+                        "credential_hash": credential_fingerprint(self.credentials),
+                        "client_order_id": exit_client_id,
+                        "symbol": symbol,
+                        "side": "SELL",
+                        "order_type": "LIMIT",
+                        "time_in_force": exit_tif,
+                        "price": _dstr(sized.price),
+                        "quantity": _dstr(sized.quantity),
+                        "notional": _dstr(sized.notional),
+                        "fee_reserve": "0",
+                    },
+                    expected_reset_generation=expected_reset_generation,
+                    deadline_monotonic=deadline_monotonic,
+                )
             except _AutoDeadlineExpired:
                 self._transition(intent_id, "UNKNOWN", AUTO_DEADLINE_EXPIRED)
-                self._release_reservation(intent_id)
                 raise
-            self._transition(intent_id, "SUBMITTING", "before venue call")
+            if fence_reason is not None:
+                self._submission_fence_failure(intent_id, fence_reason)
+                return
             try:
                 _deadline_checkpoint(deadline_monotonic)
                 response = self._submit_venue(
@@ -2742,7 +2914,7 @@ class BinanceTestnetGateService:
                     side="SELL",
                     quantity=_dstr(sized.quantity),
                     price=_dstr(sized.price),
-                    tif="IOC" if not rules.time_in_force or "IOC" in rules.time_in_force else "FOK",
+                    tif=exit_tif,
                     client_id=exit_client_id,
                     deadline_monotonic=deadline_monotonic,
                 )

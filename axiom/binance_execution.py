@@ -1413,7 +1413,10 @@ class BinanceExecutionService:
         ).fetchall()
         pending: list[dict[str, Any]] = []
         held_exposure = ZERO
-        held_sell_quote = ZERO
+        # Local HELD BUY reservations are emitted as pending UNKNOWN orders
+        # below, where RiskSnapshot.pending_reservation accounts for amount
+        # plus fee exactly once.  Peer reservations have no local pending
+        # order, so the probe's held_quote belongs in reserved_exposure.
         for reservation in reservations:
             fills = self._conn.execute(
                 "SELECT quantity FROM binance_execution_fills WHERE intent_id=?",
@@ -1425,7 +1428,6 @@ class BinanceExecutionService:
             if side == "BUY":
                 held_exposure += _dec(reservation["amount"])
             elif side == "SELL":
-                held_sell_quote += _dec(reservation["amount"]) + _dec(reservation["fee_reserve"])
                 if remainder > ZERO:
                     symbol = str(reservation["symbol"]).upper()
                     available = max(ZERO, _dec(inventory.get(symbol, ZERO)) - remainder)
@@ -1467,7 +1469,10 @@ class BinanceExecutionService:
             (_dec(value["cost_basis"]) for value in peer["positions"].values()),
             ZERO,
         ) + _dec(peer["held_buy_exposure"])
-        reserved = held_sell_quote + _dec(peer["held_quote"])
+        # ``pending_reservation`` carries local BUY amount+fee; adding it here
+        # would double count local buying power.  SELL reservations reserve
+        # base inventory only, never quote buying power.
+        reserved = _dec(peer["held_quote"])
         submission_row = self._conn.execute(
             "SELECT "
             "COALESCE(SUM(CASE WHEN intent='ENTRY' THEN 1 ELSE 0 END),0) AS entry_count,"

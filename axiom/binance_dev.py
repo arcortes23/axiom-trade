@@ -465,11 +465,16 @@ class _CurrentPersistedUniverseLoader:
     snapshot = load
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class _RuntimeOwner:
     pid: int
     token: str
 
+
+@dataclass(frozen=True, slots=True)
+class _StopMarkerSnapshot:
+    identity: tuple[int, int]
+    content: bytes
 
 class BinanceDevelopmentRuntime:
     """Own the isolated PAPER development process and its resources."""
@@ -646,9 +651,11 @@ class BinanceDevelopmentRuntime:
         )
 
     def _release_owned_path(self, path: str) -> None:
-        owned = path in self._owned_paths or self._owns_file(path)
+        # Historical tracking only records that this runtime once wrote the
+        # path.  It is not proof that the current marker still belongs to us:
+        # another runtime may have replaced it after our write.
         self._owned_paths.discard(path)
-        if not owned:
+        if not self._owns_file(path):
             return
         try:
             Path(path).unlink()
@@ -656,40 +663,93 @@ class BinanceDevelopmentRuntime:
             return
         except OSError:
             # A fault-injected Path.unlink must not strand the marker when
-            # the lower-level unlink is still available.
+            # the lower-level unlink is still available.  Re-check ownership
+            # before the fallback so a replacement marker is preserved.
+            if not self._owns_file(path):
+                return
             try:
                 os.unlink(path)
             except (FileNotFoundError, OSError):
                 pass
 
     def _release_lock(self) -> None:
+        # Remove the PID while the lock descriptor and marker are still held.
+        # A contender can therefore never observe a free lock with this
+        # runtime's PID still present.  The lock marker is the final resource
+        # released, and every unlink still checks the current owner token.
+        self._release_owned_path(self.pid_path)
         fd = self._lock_fd
-        self._lock_fd = None
         if fd is not None:
             try:
                 os.close(fd)
             except OSError:
                 pass
+            finally:
+                self._lock_fd = None
         self._release_owned_path(self.lock_path)
-        self._release_owned_path(self.pid_path)
-    def _clear_stale_stop(self) -> None:
+
+    @staticmethod
+    def _marker_identity(stat_result: os.stat_result) -> tuple[int, int]:
+        return int(stat_result.st_dev), int(stat_result.st_ino)
+
+    def _snapshot_stop_marker(self, path: str | None = None) -> _StopMarkerSnapshot | None:
+        marker_path = path or self.stop_path
         try:
-            document = json.loads(Path(self.stop_path).read_text(encoding="utf-8"))
-        except (FileNotFoundError, OSError, ValueError, json.JSONDecodeError):
-            return
-        if document.get("runtime_identity") == self.runtime_identity:
+            with open(marker_path, "rb") as handle:
+                content = handle.read()
+                identity = self._marker_identity(os.fstat(handle.fileno()))
+        except (FileNotFoundError, OSError):
+            return None
+        return _StopMarkerSnapshot(identity=identity, content=content)
+
+    def _stop_marker_requests_stop(self, snapshot: _StopMarkerSnapshot) -> bool:
+        try:
+            document = json.loads(snapshot.content.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError, json.JSONDecodeError):
+            return False
+        return isinstance(document, Mapping) and document.get("runtime_identity") == self.runtime_identity
+
+    def _remove_stop_marker_if_snapshot(self, expected: _StopMarkerSnapshot) -> bool:
+        """Remove only ``expected`` while preserving a concurrent replacement."""
+        path = Path(self.stop_path)
+        temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.stale")
+        try:
+            # Moving the current name away makes the identity check and
+            # removal transactional with respect to atomic marker publishes.
+            os.replace(str(path), str(temporary))
+        except FileNotFoundError:
+            return False
+        current = self._snapshot_stop_marker(str(temporary))
+        if current == expected:
             try:
-                Path(self.stop_path).unlink()
+                temporary.unlink()
             except FileNotFoundError:
                 pass
-            except OSError:
-                # Preserve the cleanup failure for the transactional caller,
-                # but make a best effort to remove the owned stale marker.
-                try:
-                    os.unlink(self.stop_path)
-                except (FileNotFoundError, OSError):
-                    pass
-                raise
+            return True
+        try:
+            # Restore a replacement without ever overwriting a marker
+            # published while the path was temporarily absent.
+            os.link(str(temporary), str(path))
+        except FileExistsError:
+            pass
+        else:
+            temporary.unlink()
+        return False
+
+    def _clear_stale_stop(self, expected: _StopMarkerSnapshot | None) -> bool:
+        current = self._snapshot_stop_marker()
+        if current is None:
+            return False
+        if expected is not None and current == expected:
+            if self._stop_marker_requests_stop(current):
+                self._remove_stop_marker_if_snapshot(expected)
+                current = self._snapshot_stop_marker()
+                return current is not None and self._stop_marker_requests_stop(current)
+            return False
+        # A marker that appeared or changed after the pre-lock snapshot is a
+        # live stop request, not stale cleanup input.  Preserve it and carry
+        # the request into startup instead of clearing the stop event.
+        return self._stop_marker_requests_stop(current)
 
     def _run_worker(self, once: bool) -> None:
         try:
@@ -705,15 +765,31 @@ class BinanceDevelopmentRuntime:
             if not once:
                 self.stop_event.set()
 
+    def _acquire_paper(self) -> None:
+        # Snapshot before acquisition.  Only this exact marker may be stale;
+        # a marker published while acquisition is in progress is a live stop
+        # request and must survive startup.
+        stop_snapshot = self._snapshot_stop_marker()
+        self._acquire()
+        try:
+            if self._clear_stale_stop(stop_snapshot):
+                self.stop_event.set()
+            else:
+                self.stop_event.clear()
+        except BaseException:
+            try:
+                self._release_lock()
+            finally:
+                self._started = False
+            raise
+
     def start(self, *, once: bool = False) -> "BinanceDevelopmentRuntime":
         if self._started:
             return self
         if self._closed:
             raise RuntimeError("runtime is closed")
-        self._clear_stale_stop()
-        self._acquire()
+        self._acquire_paper()
         try:
-            self.stop_event.clear()
             starter = getattr(self.server, "start", None)
             if callable(starter):
                 starter()
@@ -1194,6 +1270,8 @@ class BinanceTestnetRuntime(BinanceDevelopmentRuntime):
     execution service, and autonomous worker; missing credentials construct
     none of those network/execution objects.
     """
+
+    strict_testnet = True
 
     TESTNET_CONFIRMATION = "ENABLE BINANCE TESTNET AUTO CANARY"
     PROBE_CONFIRMATION = "RUN BINANCE TESTNET EXECUTION PROBE"
@@ -1730,7 +1808,9 @@ class BinanceTestnetRuntime(BinanceDevelopmentRuntime):
         self.binance_testnet = control
         self.binance_canary = control
         try:
-            self.dashboard_data = DashboardData(store=self.dashboard_store, binance_canary=control)
+            # The runtime, not the raw control plane, owns the dashboard
+            # facade so every mutation crosses the credential refresh fence.
+            self.dashboard_data = DashboardData(store=self.dashboard_store, binance_canary=self)
             self.server = dashboard_server
             if self.server is None:
                 factory = dashboard_server_factory or DashboardServer
@@ -2050,13 +2130,15 @@ class BinanceTestnetRuntime(BinanceDevelopmentRuntime):
     execute = action
 
     def _acquire_testnet(self) -> None:
-        # Lock ownership is the first mutation.  A losing contender must not
-        # clear a stop marker or touch its stop event.  Stale-stop cleanup is
-        # part of this transaction and rolls the lock back on failure.
+        # TESTNET uses the same pre-lock marker snapshot as PAPER so a
+        # concurrent stop request is never mistaken for stale cleanup.
+        stop_snapshot = self._snapshot_stop_marker()
         self._acquire()
         try:
-            self._clear_stale_stop()
-            self.stop_event.clear()
+            if self._clear_stale_stop(stop_snapshot):
+                self.stop_event.set()
+            else:
+                self.stop_event.clear()
         except BaseException:
             try:
                 self._release_lock()

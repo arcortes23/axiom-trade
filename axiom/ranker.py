@@ -57,7 +57,7 @@ class CandidateCanaryRanker:
         "liquidity": 0.02,
         "forward_expectancy": 0.05,
     }
-    _STAGES = frozenset({"FROZEN", "PAPER_FORWARD"})
+    _STAGES = frozenset({"FROZEN", "PAPER_FORWARD", "PAPER_PROMOTABLE"})
     _QUALITY_SCORES = {
         "HIGH": 1.0,
         "MEDIUM": 0.5,
@@ -309,6 +309,110 @@ class CandidateCanaryRanker:
     def _candidate_records(self) -> list[Mapping[str, Any]]:
         records = self.store.load_candidate_lifecycle(limit=10000)
         return [item for item in records if isinstance(item, Mapping)] if isinstance(records, list) else []
+    def eligible_scan_rows(
+        self,
+        *,
+        now: datetime | None = None,
+        ranking_run_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return eligible candidates even when no positive ranking exists.
+
+        Autonomous signal coverage is intentionally independent from ranking
+        evidence.  A candidate can pass immutable qualification while its
+        validation metrics are absent or below the ranking minimum; those
+        candidates still need a durable bounded signal check.
+        """
+        timestamp = ensure_utc(now or self.clock())
+        result: list[dict[str, Any]] = []
+        for record in self._candidate_records():
+            candidate_id = str(record.get("candidate_id") or "").strip()
+            if (
+                not candidate_id
+                or str(record.get("stage") or "") not in self._STAGES
+            ):
+                continue
+            payload = self.service._merged_lifecycle_payload(record)
+            if not isinstance(payload, Mapping):
+                continue
+            if self._prediction_market(payload) not in {
+                "prediction",
+                "polymarket",
+                "prediction_market",
+            }:
+                continue
+            validation = self.service.validate_eligibility(
+                candidate_id,
+                _record=record,
+                _verify_attestation=True,
+            )
+            if not validation.get("eligible"):
+                continue
+            binding = validation.get("binding")
+            binding_reason = (
+                str(binding.get("reason_code") or "").strip().upper()
+                if isinstance(binding, Mapping)
+                else ""
+            )
+            if (
+                isinstance(binding, Mapping)
+                and (
+                    binding.get("reevaluation_required")
+                    or (
+                        not binding.get("bound")
+                        and binding_reason not in {"", "ELIGIBILITY_MISSING"}
+                    )
+                )
+            ):
+                continue
+            frozen_hash = str(
+                validation.get("frozen_hash")
+                or self.service._lifecycle_frozen_hash(record)
+                or ""
+            ).strip()
+            qualification_hash = str(
+                (
+                    binding.get("qualification_hash")
+                    if isinstance(binding, Mapping)
+                    else None
+                )
+                or validation.get("qualification_hash")
+                or ""
+            ).strip()
+            if not frozen_hash or not qualification_hash:
+                continue
+            quality = validation.get("data_quality")
+            ranking_snapshot_hash = _canary_ranking_snapshot_hash(
+                candidate_id,
+                str(record.get("stage") or ""),
+                payload,
+                qualification_hash=qualification_hash,
+                quality=quality if isinstance(quality, Mapping) else None,
+            )
+            versions = self._versions(payload, frozen_hash)
+            result.append(
+                {
+                    "candidate_id": candidate_id,
+                    "ranking_run_id": ranking_run_id,
+                    "ranking_timestamp": timestamp.isoformat(),
+                    "rank": 0,
+                    "total_score": None,
+                    "component_scores": {},
+                    "evidence_versions": versions,
+                    "cluster_key": self._cluster_key(
+                        candidate_id,
+                        payload,
+                        versions,
+                    ),
+                    "cluster_representative": 1,
+                    "selected": 0,
+                    "reason": "RANKING_EVIDENCE_MISSING",
+                    "qualification_hash": qualification_hash,
+                    "ranking_snapshot_hash": ranking_snapshot_hash,
+                }
+            )
+        result.sort(key=lambda row: str(row.get("candidate_id") or ""))
+        return result
+
     def _candidate_inventory_token(
         self,
         records: list[Mapping[str, Any]],
@@ -439,6 +543,30 @@ class CandidateCanaryRanker:
         if not qualification_hash or not ranking_snapshot_hash:
             return None
         return qualification, qualification_hash, ranking_snapshot_hash
+    @staticmethod
+    def _rankless_persisted_row(row: Mapping[str, Any]) -> bool:
+        if not isinstance(row, Mapping):
+            return False
+        if str(row.get("cluster_key") or "").strip():
+            return False
+        try:
+            rank = int(row.get("rank"))
+            representative = int(row.get("cluster_representative"))
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if (
+            rank != 0
+            or representative != 0
+            or row.get("total_score") is not None
+        ):
+            return False
+        reason = str(row.get("reason") or "").strip().upper()
+        return (
+            reason.startswith("RANKING_EVIDENCE_MISSING")
+            or reason == "RANKING_EVIDENCE_BELOW_MINIMUM_SAMPLE"
+            or reason == "FROZEN_HASH_MISSING"
+        )
+
     def validate_persisted_ranking(
         self,
         row: Mapping[str, Any],
@@ -455,20 +583,35 @@ class CandidateCanaryRanker:
         try:
             stamp = ensure_utc(datetime.fromisoformat(str(row.get("ranking_timestamp"))))
             age = (ensure_utc(now) - stamp).total_seconds()
-            score = float(row.get("total_score"))
             rank = int(row.get("rank"))
+            raw_score = row.get("total_score")
+            score = float(raw_score) if raw_score is not None else None
+            representative = int(row.get("cluster_representative"))
         except (TypeError, ValueError, OverflowError):
             return False
-        if age < 0 or age > 60.0 or not math.isfinite(score) or rank < 0:
+        rankless = self._rankless_persisted_row(row)
+        reason = str(row.get("reason") or "").strip().upper()
+        if (
+            age < 0
+            or age > 60.0
+            or (score is not None and not math.isfinite(score))
+            or (score is None and not rankless)
+            or rank < 0
+            or representative not in (0, 1)
+            or (
+                rank == 0
+                and (
+                    representative != 0
+                    or (
+                        reason != "DIVERSITY_CLUSTER_NON_REPRESENTATIVE"
+                        and not rankless
+                    )
+                )
+            )
+        ):
             return False
         cluster_key = str(row.get("cluster_key") or "").strip()
-        if not cluster_key:
-            return False
-        try:
-            representative = int(row.get("cluster_representative"))
-        except (TypeError, ValueError):
-            return False
-        if representative not in (0, 1):
+        if not cluster_key and not rankless:
             return False
         versions = row.get("evidence_versions")
         if not isinstance(versions, Mapping):
@@ -654,14 +797,33 @@ class CandidateCanaryRanker:
             if not validation.get("eligible") or (
                 not binding_bound and not binding_missing
             ):
+                normalized_binding_reason = str(binding_reason or "").strip().upper()
+                precise_reason = (
+                    normalized_binding_reason
+                    if normalized_binding_reason
+                    and normalized_binding_reason != "ELIGIBILITY_MISSING"
+                    else ""
+                )
+                quality_reasons = (
+                    validation.get("data_quality", {}).get("reasons")
+                    if isinstance(validation.get("data_quality"), Mapping)
+                    else ()
+                )
+                if not precise_reason and isinstance(quality_reasons, (list, tuple)):
+                    precise_reason = next(
+                        (
+                            str(reason).strip().upper()
+                            for reason in quality_reasons
+                            if str(reason).strip()
+                        ),
+                        "",
+                    )
+                if not precise_reason:
+                    precise_reason = str(
+                        validation.get("reason_code") or ""
+                    ).strip().upper()
                 invalidated_reasons[candidate_id] = (
-                    str(binding_reason)
-                    if binding_reason in {
-                        "QUALIFICATION_CHANGED",
-                        "ELIGIBILITY_MISSING",
-                        "ELIGIBILITY_INVALID",
-                    }
-                    else "ELIGIBILITY_INVALID"
+                    precise_reason or "ELIGIBILITY_INVALID"
                 )
                 self.service.invalidate_eligibility(
                     candidate_id,

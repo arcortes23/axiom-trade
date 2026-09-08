@@ -26,6 +26,7 @@ from .canary import (
     CredentialStore,
     PolymarketClobV2Venue,
 )
+from .bootstrap import BTC_HISTORY_START, HistoricalBootstrapper
 from .crypto_universe import load_crypto_universe
 from .data import BinanceAdapter
 from .domain import utc_now

@@ -8,6 +8,7 @@ import unittest
 from unittest.mock import patch
 
 from axiom.autonomous import AutonomousResearchConfig, AutonomousResearchProcessor
+from axiom.cli import _CliProbabilityModel
 from axiom.canary import CanaryService
 from axiom.dashboard import DashboardData, _dashboard_html
 from axiom.director import research_summary, validate_hermes_proposal
@@ -19,6 +20,7 @@ from axiom.paper_engine import run_forward_paper
 from axiom.research import ResearchReport, write_report
 from axiom.research_bus import DurableResearchBus, ResearchBusPermissionError, ResearchQueueStatus
 from axiom.storage import AxiomStore
+from axiom.strategy.signals import evaluate_model_document_probability
 
 
 UTC = timezone.utc
@@ -401,6 +403,44 @@ class Phase4AutonomousLoopTests(unittest.TestCase):
         with AxiomStore(":memory:") as store:
             selected = processor(store, DurableResearchBus(store))._apply_plan_filters(plan, rows)
         self.assertEqual([row["market_id"] for row in selected], ["target-good"])
+
+    def test_probability_projection_uses_canonical_fresh_nested_evidence(self) -> None:
+        model = {"field": "event_horizon"}
+        observation = {
+            "market_id": "fresh-probability",
+            "event_horizon": {"prediction": 0.73},
+            "model_probability": 0.11,
+        }
+        expected = evaluate_model_document_probability(model, observation)
+        self.assertEqual(expected, 0.73)
+
+        plan = ExperimentPlan.from_mapping(
+            {
+                **experiment_plan(),
+                "hypothesis_id": "hypothesis-probability-projection",
+                "model_document": model,
+            }
+        )
+        with AxiomStore(":memory:") as store:
+            projected = processor(store, DurableResearchBus(store))._apply_model_document(plan, [observation])
+        self.assertEqual(projected[0]["model_probability"], expected)
+        self.assertEqual(_CliProbabilityModel(model).predict_probability(observation), expected)
+        self.assertEqual(observation["model_probability"], 0.11)
+
+        nested_model = {"probability": {"prediction": 0.67}}
+        nested_observation = {"model_probability": 0.09}
+        nested_expected = evaluate_model_document_probability(nested_model, nested_observation)
+        nested_plan = type(
+            "NestedModelPlan",
+            (),
+            {"model_for": lambda self: nested_model},
+        )()
+        nested_projected = AutonomousResearchProcessor._apply_model_document(
+            nested_plan,
+            [nested_observation],
+        )
+        self.assertEqual(nested_projected[0]["model_probability"], nested_expected)
+        self.assertEqual(_CliProbabilityModel(nested_model).predict_probability(nested_observation), nested_expected)
 
     def test_declarative_plan_runs_historical_lifecycle_and_registers_forward(self) -> None:
         with AxiomStore(":memory:") as store:

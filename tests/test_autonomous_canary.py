@@ -850,6 +850,85 @@ class AutonomousWorkflowTests(unittest.TestCase):
         blocked = worker.tick(now=T0)
         self.assertEqual(blocked["blocker"], "NO_ELIGIBLE_RANKABLE_CANDIDATE")
         self.assertEqual(calls, [])
+
+    def test_worker_durably_scans_eligible_candidate_without_ranking_evidence(self):
+        candidate_id = "fresh-without-ranking"
+        self.seed_candidate(candidate_id)
+        self.service.mark_eligible(candidate_id)
+        self.service.enable_autonomous_micro_live()
+        checked: list[str] = []
+
+        def evaluate_signal(service, identifier, **kwargs):
+            checked.append(identifier)
+            return service._persist_signal_evaluation(
+                {
+                    "candidate_id": identifier,
+                    "cycle_id": kwargs.get("cycle_id"),
+                    "evaluated_at": T0.isoformat(),
+                    "reason_code": "CANDIDATE_FORWARD_MARKET_UNRESOLVED",
+                    "market_id": None,
+                    "signal": None,
+                    "required_health": {},
+                    "evidence": {
+                        "authority_reason_code": "CANDIDATE_FORWARD_MARKET_UNRESOLVED"
+                    },
+                }
+            )
+
+        worker = AutonomousCanaryWorker(self.store, clock=lambda: T0)
+        with patch.object(
+            CandidateCanaryRanker,
+            "evaluate_and_select",
+            return_value={
+                "ranking_run_id": "empty-ranking-run",
+                "eligible_count": 1,
+                "rankable_count": 0,
+                "rankings": [],
+            },
+        ), patch.object(
+            CanaryService,
+            "evaluate_signal",
+            autospec=True,
+            side_effect=evaluate_signal,
+        ):
+            result = worker.tick(now=T0)
+
+        self.assertEqual(result["status"], "BLOCKED")
+        self.assertEqual(
+            result["decision"],
+            "CANDIDATE_FORWARD_MARKET_UNRESOLVED",
+        )
+        self.assertEqual(result["candidates_ranked"], 0)
+        self.assertEqual(result["candidates_signal_checked"], 1)
+        self.assertEqual(result["candidate_id"], candidate_id)
+        self.assertEqual(result["signal_scan_remaining_this_cycle"], 0)
+        self.assertTrue(result["signal_scan_cycle_complete"])
+        reason_counts = result["signal_scan_reason_counts_json"]
+        if isinstance(reason_counts, str):
+            reason_counts = json.loads(reason_counts)
+        self.assertEqual(
+            reason_counts["CANDIDATE_FORWARD_MARKET_UNRESOLVED"],
+            1,
+        )
+        checked_row = self.store.connection.execute(
+            "SELECT candidate_id,qualification_hash FROM canary_signal_scan_checked "
+            "WHERE cycle_id=?",
+            (result["signal_scan_cycle_id"],),
+        ).fetchone()
+        self.assertIsNotNone(checked_row)
+        self.assertEqual(checked_row["candidate_id"], candidate_id)
+        self.assertTrue(checked_row["qualification_hash"])
+        evaluation_row = self.store.connection.execute(
+            "SELECT reason_code FROM canary_signal_evaluations "
+            "WHERE candidate_id=? ORDER BY evaluated_at DESC LIMIT 1",
+            (candidate_id,),
+        ).fetchone()
+        self.assertIsNotNone(evaluation_row)
+        self.assertEqual(
+            evaluation_row["reason_code"],
+            "CANDIDATE_FORWARD_MARKET_UNRESOLVED",
+        )
+
     def test_worker_scans_rank0_follower_after_empty_representative_and_submits_same_tick(self):
         shared_payload = candidate_payload(
             "shared-strategy",

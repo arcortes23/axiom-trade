@@ -89,6 +89,54 @@ class AutonomousCanaryWorker:
             return "READY_SIGNAL"
         return "NO_STRATEGY_SIGNAL"
 
+    @staticmethod
+    def _evaluation_blocker(evaluation: Any) -> str | None:
+        if not isinstance(evaluation, Mapping):
+            return None
+        evidence = evaluation.get("evidence")
+        if not isinstance(evidence, Mapping):
+            return None
+        evaluation_reason = str(evaluation.get("reason_code") or "").strip().upper()
+        authority_error = str(evidence.get("authority_error") or "").strip()
+        required_health_reason = str(
+            evidence.get("required_health_reason_code") or ""
+        ).strip().upper()
+        if (
+            authority_error
+            and evaluation_reason == "CANDIDATE_FORWARD_MARKET_UNRESOLVED"
+        ):
+            return evaluation_reason
+        for key in ("binding_reason", "authority_reason_code"):
+            if (
+                key == "authority_reason_code"
+                and (
+                    evaluation_reason
+                    not in {
+                        "CANDIDATE_FORWARD_MARKET_UNRESOLVED",
+                        "COLLECTOR_CANDIDATE_HEALTH_BLOCKED",
+                    }
+                    or (
+                        evaluation_reason
+                        == "CANDIDATE_FORWARD_MARKET_UNRESOLVED"
+                        and required_health_reason
+                    )
+                )
+            ):
+                continue
+            reason = str(evidence.get(key) or "").strip().upper()
+            if reason and not reason.startswith("REQUIRED_MARKETS_"):
+                return reason
+        if required_health_reason and (
+            not required_health_reason.startswith("REQUIRED_MARKETS_")
+            and required_health_reason
+            not in {
+                "CANDIDATE_FORWARD_MARKET_UNRESOLVED",
+                "CANDIDATE_MARKET_CLOSED",
+            }
+        ):
+            return required_health_reason
+        return None
+
     @classmethod
     def _increment_reason_count(
         cls,
@@ -242,20 +290,27 @@ class AutonomousCanaryWorker:
         ranking_run_id: str | None,
         timestamp: datetime,
     ) -> list[Mapping[str, Any]]:
-        """Return rows fenced to the current run and current qualification evidence."""
+        """Return current ranking rows plus independently scanable candidates."""
         self._last_scan_skip_reasons = {
             reason: 0 for reason in self._SCAN_SKIP_REASONS
         }
-        if not ranking_run_id:
-            return []
         try:
             rows = ranker.rankings(limit=10_000)
         except Exception:
             self._last_scan_skip_reasons["INVALID_RANKING_BINDING"] += 1
             return []
+        persisted_ids = {
+            str(row.get("candidate_id") or "").strip()
+            for row in rows
+            if isinstance(row, Mapping) and str(row.get("candidate_id") or "").strip()
+        }
         valid: list[tuple[Mapping[str, Any], int]] = []
+        accepted_ids: set[str] = set()
         representative_clusters: set[str] = set()
         for row in rows:
+            if not isinstance(row, Mapping):
+                self._last_scan_skip_reasons["INVALID_RANKING_BINDING"] += 1
+                continue
             candidate_id = str(row.get("candidate_id") or "").strip()
             if not candidate_id:
                 self._last_scan_skip_reasons["INVALID_RANKING_BINDING"] += 1
@@ -281,7 +336,7 @@ class AutonomousCanaryWorker:
             try:
                 accepted = ranker.validate_persisted_ranking(
                     row,
-                    ranking_run_id=str(ranking_run_id),
+                    ranking_run_id=str(ranking_run_id or ""),
                     now=timestamp,
                 )
             except Exception:
@@ -302,30 +357,74 @@ class AutonomousCanaryWorker:
             except (TypeError, ValueError, OverflowError):
                 self._last_scan_skip_reasons["INVALID_RANKING_BINDING"] += 1
                 continue
+            reason = str(row.get("reason") or "").strip().upper()
             if persisted_rank == 0:
-                if not (
-                    str(row.get("reason") or "").strip()
-                    == "DIVERSITY_CLUSTER_NON_REPRESENTATIVE"
-                    and representative_marker == 0
+                rankless_reason = (
+                    reason.startswith("RANKING_EVIDENCE_MISSING")
+                    or reason == "RANKING_EVIDENCE_BELOW_MINIMUM_SAMPLE"
+                    or reason == "FROZEN_HASH_MISSING"
+                )
+                if representative_marker != 0 or not (
+                    reason == "DIVERSITY_CLUSTER_NON_REPRESENTATIVE"
+                    or rankless_reason
                 ):
                     self._last_scan_skip_reasons["INVALID_RANKING_BINDING"] += 1
                     continue
             elif representative_marker == 1:
                 representative_clusters.add(str(row.get("cluster_key") or ""))
             valid.append((row, persisted_rank))
+            accepted_ids.add(candidate_id)
+
+        # A current ranking row is preferred, but ranking is not the
+        # qualification boundary.  Include every eligible lifecycle candidate
+        # that has no current positive ranking row so its signal is checked
+        # and its check is durably covered by the active scan cycle.
+        try:
+            fallback_rows = ranker.eligible_scan_rows(
+                now=timestamp,
+                ranking_run_id=ranking_run_id,
+            )
+        except Exception:
+            fallback_rows = []
+        for row in fallback_rows:
+            candidate_id = str(row.get("candidate_id") or "").strip()
+            if (
+                not candidate_id
+                or candidate_id in persisted_ids
+                or candidate_id in accepted_ids
+            ):
+                continue
+            qualification_hash = str(row.get("qualification_hash") or "").strip()
+            if not qualification_hash:
+                self._last_scan_skip_reasons["QUALIFICATION_INVALID"] += 1
+                continue
+            valid.append((row, 0))
+            accepted_ids.add(candidate_id)
+
+        def is_unranked_reason(row: Mapping[str, Any]) -> bool:
+            reason = str(row.get("reason") or "").strip().upper()
+            return reason.startswith("RANKING_EVIDENCE_MISSING") or reason in {
+                "FROZEN_HASH_MISSING",
+                "RANKING_EVIDENCE_BELOW_MINIMUM_SAMPLE",
+            }
+
         ordered_rows = [
             row
             for row, persisted_rank in valid
             if persisted_rank > 0
             or str(row.get("cluster_key") or "") in representative_clusters
+            or is_unranked_reason(row)
         ]
         self._last_scan_skip_reasons["DUPLICATE_CLUSTER_DEFERRED"] = min(
             10_000,
             sum(
                 1
                 for row, persisted_rank in valid
-                if persisted_rank == 0
-                and str(row.get("cluster_key") or "") in representative_clusters
+                if (
+                    persisted_rank == 0
+                    and str(row.get("cluster_key") or "") in representative_clusters
+                    and not is_unranked_reason(row)
+                )
             ),
         )
         return ordered_rows
@@ -716,8 +815,6 @@ class AutonomousCanaryWorker:
                 signal_scan_cycle_started_at = timestamp.isoformat()
                 signal_scan_reason_counts = self._normalize_reason_counts({})
                 scan_checked_set = set()
-            if candidates_ranked == 0:
-                ordered = []
             scan_universe_keys = {
                 (
                     str(row.get("candidate_id") or "").strip(),
@@ -928,7 +1025,7 @@ class AutonomousCanaryWorker:
                     decision="AUTONOMOUS_CANARY_DISABLED",
                     blocker="AUTONOMOUS_CANARY_DISABLED",
                 )
-            if candidates_ranked == 0:
+            if not ordered:
                 blocker = "NO_ELIGIBLE_RANKABLE_CANDIDATE"
                 update_scan_projection(force_complete=True)
                 finish(
@@ -944,6 +1041,7 @@ class AutonomousCanaryWorker:
             ready: list[tuple[Mapping[str, Any], Mapping[str, Any]]] = []
             unknown_signal_id: str | None = None
             unknown_seen = False
+            evaluation_blocker: str | None = None
             for row in scan_rows:
                 candidate_id = str(row.get("candidate_id") or "").strip()
                 qualification_hash = str(row.get("qualification_hash") or "").strip()
@@ -957,6 +1055,9 @@ class AutonomousCanaryWorker:
                     else None
                 )
                 reason = self._evaluation_reason(evaluation, signal)
+                evaluation_blocker = evaluation_blocker or self._evaluation_blocker(
+                    evaluation
+                )
                 self._increment_reason_count(signal_scan_reason_counts, reason)
                 candidates_signal_checked += 1
                 scan_checked_set.add((candidate_id, qualification_hash))
@@ -1016,16 +1117,31 @@ class AutonomousCanaryWorker:
                 update_scan_projection(actionable=True)
             else:
                 signal_id = unknown_signal_id
-                blocker = "UNKNOWN_NO_RETRY" if unknown_seen else "NO_ACTIONABLE_SIGNAL"
+                blocker = (
+                    "UNKNOWN_NO_RETRY"
+                    if unknown_seen
+                    else evaluation_blocker or "NO_ACTIONABLE_SIGNAL"
+                )
+                decision = (
+                    "UNKNOWN_NO_RETRY"
+                    if unknown_seen
+                    else blocker
+                )
                 update_scan_projection()
                 finish(
                     next_decision="WAIT_FOR_FRESH_ACTIONABLE_SIGNAL",
                     blocker=blocker,
                     signal_id=signal_id,
+                    worker_status="DEGRADED" if unknown_seen else "IDLE",
+                    error_code=(
+                        "CANARY_SUBMISSION_UNKNOWN"
+                        if unknown_seen
+                        else None
+                    ),
                 )
                 return result(
-                    status="NO_SIGNAL" if not unknown_seen else "BLOCKED",
-                    decision="NO_ACTIONABLE_SIGNAL" if not unknown_seen else "UNKNOWN_NO_RETRY",
+                    status="BLOCKED" if unknown_seen or evaluation_blocker else "NO_SIGNAL",
+                    decision=decision,
                     blocker=blocker,
                     candidate_id=(
                         str(scan_rows[0].get("candidate_id") or "")
@@ -1109,6 +1225,16 @@ class AutonomousCanaryWorker:
                     ),
                     blocker=decision,
                     signal_id=signal_id,
+                    worker_status=(
+                        "DEGRADED"
+                        if blocker == "CANARY_SUBMISSION_UNKNOWN"
+                        else "IDLE"
+                    ),
+                    error_code=(
+                        "CANARY_SUBMISSION_UNKNOWN"
+                        if blocker == "CANARY_SUBMISSION_UNKNOWN"
+                        else None
+                    ),
                 )
                 return result(
                     status="BLOCKED",

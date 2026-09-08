@@ -11,7 +11,7 @@ import time
 import unittest
 from unittest.mock import patch
 
-from axiom.binance_spot import BINANCE_SPOT_TESTNET, BinanceRuntimeProfile, BinanceSpotRESTClient, BinanceSpotResult
+from axiom.binance_spot import BINANCE_SPOT_TESTNET, BinanceCredentialRef, BinanceRuntimeProfile, BinanceSpotRESTClient, BinanceSpotResult
 from axiom.binance_testnet import AUTO_DEADLINE_EXPIRED, PROBE_LABEL, SOURCE, BinanceTestnetGateService, _invoke
 
 
@@ -153,6 +153,52 @@ class FakeVenue:
         if self.trades_status is not None:
             return BinanceSpotResult(self.trades_status, {"code": -1007, "msg": "trades unavailable"}, error_code=-1007)
         return BinanceSpotResult("OK", {"trades": list(self.fills.get(str(order_id), ()))})
+class BlockingSubmissionVenue(FakeVenue):
+    def __init__(self):
+        super().__init__()
+        self.submission_entered = threading.Event()
+        self.release_submission = threading.Event()
+        self.query_started = threading.Event()
+
+    def place_limit_order(
+        self,
+        *,
+        symbol,
+        side,
+        quantity,
+        price,
+        new_client_order_id,
+        time_in_force="IOC",
+    ):
+        self.submission_entered.set()
+        if not self.release_submission.wait(5):
+            raise RuntimeError("submission release not signaled")
+        return super().place_limit_order(
+            symbol=symbol,
+            side=side,
+            quantity=quantity,
+            price=price,
+            new_client_order_id=new_client_order_id,
+            time_in_force=time_in_force,
+        )
+
+    def query_order(self, **kwargs):
+        self.query_started.set()
+        return super().query_order(**kwargs)
+
+
+class MutableCredentialStore:
+    def __init__(self, value):
+        self.ref = BinanceCredentialRef("binance-testnet", BINANCE_SPOT_TESTNET)
+        self.value = value
+
+    def load(self):
+        return self.value
+
+    def safe_projection(self):
+        return {"configured": self.value is not None}
+
+
 
 
 class BookTickerReferenceVenue(FakeVenue):
@@ -352,12 +398,13 @@ class BinanceTestnetGateTests(unittest.TestCase):
         self.connection.close()
         self.temp.cleanup()
 
-    def service(self, venue=None, credentials=None):
+    def service(self, venue=None, credentials=None, credential_store=None):
         return BinanceTestnetGateService(
             self.connection,
             profile=self.profile,
             venue=venue,
             credentials=credentials,
+            credential_store=credential_store,
             clock=lambda: datetime.fromtimestamp(1_700_000_000, timezone.utc),
         )
 
@@ -659,6 +706,9 @@ class BinanceTestnetGateTests(unittest.TestCase):
         self.assertEqual(first["intent"]["state"], "FILLED")
         self.assertIsNotNone(first["exit"])
         self.assertEqual(first["exit"]["state"], "UNKNOWN")
+        self.assertEqual(first["status"], "UNKNOWN")
+        self.assertFalse(first["risk"]["admissible"])
+        self.assertIn("PROBE_UNKNOWN", first["risk"]["reasons"])
         self.assertEqual(first["exit"]["filled_quantity"], "0")
         self.assertEqual(first["exit"]["fee_paid"], "0")
         self.assertEqual(first["realized_pnl"], "0")
@@ -986,6 +1036,121 @@ class BinanceTestnetGateTests(unittest.TestCase):
             1,
         )
         self.assertEqual({result["exit"]["state"] for result in results}, {"FILLED"})
+    def test_execute_and_reconcile_share_operation_lock(self):
+        venue = BlockingSubmissionVenue()
+        service = self.service(venue, {"api_key": "public", "api_secret": "private-secret"})
+        execute_result: list[object] = []
+        reconcile_result: list[object] = []
+
+        execute_thread = threading.Thread(
+            target=lambda: execute_result.append(service.execute_probe())
+        )
+        execute_thread.start()
+        self.assertTrue(venue.submission_entered.wait(5))
+
+        reconcile_thread = threading.Thread(
+            target=lambda: reconcile_result.append(service.reconcile_probe())
+        )
+        reconcile_thread.start()
+        self.assertFalse(venue.query_started.wait(0.1))
+
+        venue.release_submission.set()
+        execute_thread.join(timeout=5)
+        reconcile_thread.join(timeout=5)
+        self.assertFalse(execute_thread.is_alive())
+        self.assertFalse(reconcile_thread.is_alive())
+        self.assertEqual(len(execute_result), 1)
+        self.assertEqual(len(reconcile_result), 1)
+        self.assertEqual(
+            len(
+                [
+                    name
+                    for name, _ in venue.calls
+                    if name == "place_limit_order" and _["side"] == "BUY"
+                ]
+            ),
+            1,
+        )
+        self.assertEqual(
+            len(
+                [
+                    name
+                    for name, _ in venue.calls
+                    if name == "place_limit_order" and _["side"] == "SELL"
+                ]
+            ),
+            1,
+        )
+
+    def test_credential_store_removal_and_rotation_block_before_network(self):
+        old = {"api_key": "old-key", "api_secret": "old-secret"}
+        store = MutableCredentialStore(old)
+        venue = FakeVenue(credentials=old)
+        service = self.service(venue, old, store)
+        store.value = None
+        removed = service.check_connectivity()
+        self.assertEqual(removed["status"], "BLOCKED")
+        self.assertEqual(removed["reason"], "CREDENTIALS_NOT_CONFIGURED")
+        self.assertEqual(venue.calls, [])
+
+        store = MutableCredentialStore(old)
+        venue = FakeVenue(credentials=old)
+        service = self.service(venue, old, store)
+        store.value = {"api_key": "rotated-key", "api_secret": "rotated-secret"}
+        rotated = service.check_connectivity()
+        self.assertEqual(rotated["status"], "BLOCKED")
+        self.assertEqual(rotated["reason"], "CREDENTIALS_CHANGED")
+        self.assertEqual(venue.calls, [])
+    def test_final_durable_fence_rejects_reset_before_submit(self):
+        venue = FakeVenue()
+        service = self.service(venue, {"api_key": "public", "api_secret": "private-secret"})
+        original_transition = service._transition
+
+        def transition(intent_id, state, reason, **kwargs):
+            original_transition(intent_id, state, reason, **kwargs)
+            if reason == "before venue call":
+                self.connection.execute(
+                    "UPDATE binance_testnet_probe_intents "
+                    "SET reason='TESTNET_RESET_HISTORY_MISSING' "
+                    "WHERE intent_id=?",
+                    (intent_id,),
+                )
+                self.connection.commit()
+
+        service._transition = transition
+        result = service.execute_probe()
+        self.assertEqual(result["status"], "UNKNOWN")
+        self.assertEqual(result["reason"], "TESTNET_RESET_HISTORY_MISSING")
+        self.assertEqual(
+            len([name for name, _ in venue.calls if name == "place_limit_order"]),
+            0,
+        )
+    def test_final_credential_fence_rejects_rotation_before_submit(self):
+        old = {"api_key": "old-key", "api_secret": "old-secret"}
+        store = MutableCredentialStore(old)
+        venue = FakeVenue(credentials=old)
+        service = self.service(venue, old, store)
+        original_transition = service._transition
+
+        def transition(intent_id, state, reason, **kwargs):
+            original_transition(intent_id, state, reason, **kwargs)
+            if reason == "before venue call":
+                store.value = {
+                    "api_key": "rotated-key",
+                    "api_secret": "rotated-secret",
+                }
+
+        service._transition = transition
+        result = service.execute_probe()
+        self.assertEqual(result["status"], "BLOCKED")
+        self.assertEqual(result["reason"], "CREDENTIALS_CHANGED")
+        self.assertEqual(
+            len([name for name, _ in venue.calls if name == "place_limit_order"]),
+            0,
+        )
+
+
+
     def test_reset_during_market_sizing_blocks_stale_exit(self):
         class HistoryDisappearsDuringMarketVenue(FakeVenue):
             def ticker_book(self, *, symbol):
