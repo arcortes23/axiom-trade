@@ -5661,31 +5661,6 @@ class AxiomStore:
                 else:
                     candidate_rows.append({"candidate_id": identifier, "stage": "UNKNOWN", "payload": {}})
 
-        # The market tracker is itself a read-only snapshot projection and is
-        # restricted to forward-collected provenance.
-        active_records = self.tracked_polymarket_markets(
-            active_only=True,
-            now=current,
-            include_payload=True,
-            limit=1000,
-        )
-        all_records = self.tracked_polymarket_markets(
-            active_only=False,
-            now=current,
-            include_payload=True,
-            limit=1000,
-        )
-        active_by_id = {
-            str(item.get("market_id")).strip(): item
-            for item in active_records
-            if isinstance(item, Mapping) and str(item.get("market_id", "")).strip()
-        }
-        all_by_id = {
-            str(item.get("market_id")).strip(): item
-            for item in all_records
-            if isinstance(item, Mapping) and str(item.get("market_id", "")).strip()
-        }
-
         from .experiment_plan import (
             ExperimentPlan,
             ExperimentPlanError,
@@ -5739,14 +5714,7 @@ class AxiomStore:
             )
             return expiry is not None and expiry <= current
 
-        candidates: list[dict[str, Any]] = []
-        union_markets: list[str] = []
-        candidate_references: dict[str, list[str]] = {}
-        candidate_bound_markets: dict[str, list[str]] = {}
-        unresolved: list[str] = []
-        closed: list[str] = []
-        capacity_excluded_candidates: list[str] = []
-
+        prepared: list[dict[str, Any]] = []
         for row in candidate_rows[:max_candidates]:
             candidate_id = str(row.get("candidate_id", "")).strip()
             if not candidate_id:
@@ -5823,41 +5791,107 @@ class AxiomStore:
                 filter_error = True
             else:
                 filter_error = False
-            if not filter_error and executable_targets:
-                # The bounded inventory projection must not hide an explicit
-                # target that sorts after its first page.  Fetch only missing
-                # target ids, preserving the bounded batched lookup.
-                explicit_ids = tuple(
-                    market_id
-                    for market_id in executable_targets
-                    if market_id not in active_by_id or market_id not in all_by_id
-                )
-                if explicit_ids:
-                    explicit_active = self.tracked_polymarket_markets(
-                        active_only=True,
-                        now=current,
-                        include_payload=True,
-                        limit=len(explicit_ids),
-                        market_ids=explicit_ids,
-                    )
-                    explicit_all = self.tracked_polymarket_markets(
-                        active_only=False,
-                        now=current,
-                        include_payload=True,
-                        limit=len(explicit_ids),
-                        market_ids=explicit_ids,
-                    )
-                    for record in explicit_active:
-                        if isinstance(record, Mapping):
-                            market_id = str(record.get("market_id", "")).strip()
-                            if market_id:
-                                active_by_id[market_id] = record
-                    for record in explicit_all:
-                        if isinstance(record, Mapping):
-                            market_id = str(record.get("market_id", "")).strip()
-                            if market_id:
-                                all_by_id[market_id] = record
+            prepared.append(
+                {
+                    "row": row,
+                    "candidate_id": candidate_id,
+                    "declared_market_ids": declared_market_ids,
+                    "target_instrument": target_instrument,
+                    "historical_set": historical_set,
+                    "executable_targets": executable_targets,
+                    "ignored": ignored,
+                    "normalized_filters": normalized_filters,
+                    "filter_error": filter_error,
+                }
+            )
 
+        # Keep the projection empty unless a candidate actually authorizes
+        # reusable filters.  Explicit targets are resolved in one bounded
+        # lookup per active/all projection and cached for every candidate.
+        active_by_id: dict[str, Mapping[str, Any]] = {}
+        all_by_id: dict[str, Mapping[str, Any]] = {}
+        needs_broad_inventory = any(
+            not item["filter_error"]
+            and not item["executable_targets"]
+            and item["normalized_filters"]
+            for item in prepared
+        )
+        if needs_broad_inventory:
+            active_records = self.tracked_polymarket_markets(
+                active_only=True,
+                now=current,
+                include_payload=True,
+                limit=1000,
+            )
+            for record in active_records:
+                if isinstance(record, Mapping):
+                    market_id = str(record.get("market_id", "")).strip()
+                    if market_id:
+                        active_by_id[market_id] = record
+
+        explicit_active_ids = tuple(
+            dict.fromkeys(
+                market_id
+                for item in prepared
+                if not item["filter_error"]
+                for market_id in item["executable_targets"]
+                if market_id not in active_by_id
+            )
+        )
+        explicit_all_ids = tuple(
+            dict.fromkeys(
+                market_id
+                for item in prepared
+                if not item["filter_error"]
+                for market_id in item["executable_targets"]
+                if market_id not in all_by_id
+            )
+        )
+        if explicit_active_ids:
+            explicit_active = self.tracked_polymarket_markets(
+                active_only=True,
+                now=current,
+                include_payload=True,
+                limit=len(explicit_active_ids),
+                market_ids=explicit_active_ids,
+            )
+            for record in explicit_active:
+                if isinstance(record, Mapping):
+                    market_id = str(record.get("market_id", "")).strip()
+                    if market_id:
+                        active_by_id[market_id] = record
+        if explicit_all_ids:
+            explicit_all = self.tracked_polymarket_markets(
+                active_only=False,
+                now=current,
+                include_payload=True,
+                limit=len(explicit_all_ids),
+                market_ids=explicit_all_ids,
+            )
+            for record in explicit_all:
+                if isinstance(record, Mapping):
+                    market_id = str(record.get("market_id", "")).strip()
+                    if market_id:
+                        all_by_id[market_id] = record
+
+        candidates: list[dict[str, Any]] = []
+        union_markets: list[str] = []
+        candidate_references: dict[str, list[str]] = {}
+        candidate_bound_markets: dict[str, list[str]] = {}
+        unresolved: list[str] = []
+        closed: list[str] = []
+        capacity_excluded_candidates: list[str] = []
+
+        for item in prepared:
+            row = item["row"]
+            candidate_id = item["candidate_id"]
+            declared_market_ids = item["declared_market_ids"]
+            target_instrument = item["target_instrument"]
+            historical_set = item["historical_set"]
+            executable_targets = item["executable_targets"]
+            ignored = item["ignored"]
+            normalized_filters = item["normalized_filters"]
+            filter_error = item["filter_error"]
             permitted: list[str] = []
             closed_targets: list[str] = []
             if not filter_error:
@@ -6130,6 +6164,8 @@ class AxiomStore:
             if market_ids is not None
             else ()
         )
+        if market_ids is not None and not requested_ids:
+            return []
         current = ensure_utc(now or utc_now())
         snapshot = self._snapshot_read_connection()
         try:
@@ -6144,17 +6180,23 @@ class AxiomStore:
                 snapshot_where += f" AND market_id IN ({placeholders})"
                 snapshot_values.extend(requested_ids)
             metadata_rows = snapshot.execute(
-                "SELECT market_id,observed_at,metadata_hash,payload_json,source_type FROM ("
-                "SELECT market_id,observed_at,metadata_hash,payload_json,source_type,"
+                "WITH latest_keys AS ("
+                "SELECT rowid AS row_id,market_id,observed_at,metadata_hash,"
                 "ROW_NUMBER() OVER (PARTITION BY market_id ORDER BY observed_at DESC,metadata_hash DESC) AS row_number "
-                f"FROM polymarket_markets WHERE {metadata_where}) WHERE row_number=1 ORDER BY market_id LIMIT ?",
+                f"FROM polymarket_markets WHERE {metadata_where}) "
+                "SELECT p.market_id,p.observed_at,p.metadata_hash,p.payload_json,p.source_type "
+                "FROM polymarket_markets AS p JOIN latest_keys AS latest ON p.rowid=latest.row_id "
+                "WHERE latest.row_number=1 ORDER BY p.market_id LIMIT ?",
                 [*metadata_values, int(limit)],
             ).fetchall()
             snapshot_rows = snapshot.execute(
-                "SELECT market_id,observed_at,source_timestamp,snapshot_id,payload_json,source_type FROM ("
-                "SELECT market_id,observed_at,source_timestamp,snapshot_id,payload_json,source_type,"
+                "WITH latest_keys AS ("
+                "SELECT rowid AS row_id,market_id,observed_at,source_timestamp,snapshot_id,"
                 "ROW_NUMBER() OVER (PARTITION BY market_id ORDER BY observed_at DESC,source_timestamp DESC,snapshot_id DESC) AS row_number "
-                f"FROM polymarket_snapshots WHERE {snapshot_where}) WHERE row_number=1 ORDER BY market_id LIMIT ?",
+                f"FROM polymarket_snapshots WHERE {snapshot_where}) "
+                "SELECT p.market_id,p.observed_at,p.source_timestamp,p.snapshot_id,p.payload_json,p.source_type "
+                "FROM polymarket_snapshots AS p JOIN latest_keys AS latest ON p.rowid=latest.row_id "
+                "WHERE latest.row_number=1 ORDER BY p.market_id LIMIT ?",
                 [*snapshot_values, int(limit)],
             ).fetchall()
         finally:

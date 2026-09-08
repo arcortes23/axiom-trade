@@ -207,6 +207,187 @@ class ForwardAuthorityPredicateTests(unittest.TestCase):
         self.assertEqual(requirements["market_ids"], ["current-filter-market"])
         self.assertEqual(candidate["resolution"], "RESOLVED")
 
+    def test_many_candidates_sharing_validation_only_ids_have_empty_authority(self) -> None:
+        normalized_plan = ExperimentPlan.from_mapping(
+            {
+                "hypothesis_id": "shared-validation-authority",
+                "market_type": "prediction",
+                "template": "probability_mispricing",
+                "dataset_version": "v1",
+                "target": {"market_ids": ["validation-only-market"]},
+                "paper_only": True,
+            }
+        ).as_dict()
+        candidate_ids = [f"candidate-shared-{index:02d}" for index in range(40)]
+        with AxiomStore(":memory:") as store:
+            for candidate_id in candidate_ids:
+                store.save_candidate_lifecycle(
+                    candidate_id,
+                    "IDEA",
+                    {
+                        "experiment_plan": normalized_plan,
+                        "dataset_provenance": {
+                            "source_type": "HISTORICAL",
+                            "historical_market_ids": ["validation-only-market"],
+                        },
+                    },
+                    timestamp=T0,
+                )
+            requirements = store.candidate_forward_requirements(
+                candidate_ids=candidate_ids,
+                now=T0,
+            )
+
+        self.assertEqual(requirements["market_ids"], [])
+        self.assertEqual(requirements["candidate_references"], {})
+        self.assertEqual(requirements["unresolved_candidates"], candidate_ids)
+        self.assertEqual(len(requirements["candidates"]), len(candidate_ids))
+        for candidate in requirements["candidates"]:
+            self.assertEqual(candidate["resolution"], "UNRESOLVED")
+            self.assertEqual(
+                candidate["reason_code"],
+                "CANDIDATE_FORWARD_MARKET_UNRESOLVED",
+            )
+            self.assertEqual(
+                candidate["historical_market_ids_ignored"],
+                ["validation-only-market"],
+            )
+            self.assertEqual(candidate["market_ids"], [])
+
+    def test_filter_only_candidate_resolves_current_market_without_declared_target(self) -> None:
+        normalized_plan = ExperimentPlan.from_mapping(
+            {
+                "hypothesis_id": "filter-only-current-authority",
+                "market_type": "prediction",
+                "template": "probability_mispricing",
+                "dataset_version": "v1",
+                "filters": {"category": "politics"},
+                "paper_only": True,
+            }
+        ).as_dict()
+        with AxiomStore(":memory:") as store:
+            store.save_polymarket_market_metadata(
+                "current-filter-only-market",
+                {
+                    "source_type": "FORWARD_COLLECTED",
+                    "active": True,
+                    "closed": False,
+                    "instrument": "Venue",
+                    "metadata": {"category": "politics"},
+                    "snapshot": {
+                        "market_id": "current-filter-only-market",
+                        "settlement": "open",
+                        "expiry": (T0 + timedelta(days=1)).isoformat(),
+                    },
+                },
+                observed_at=T0,
+                source_type="FORWARD_COLLECTED",
+            )
+            store.save_candidate_lifecycle(
+                "candidate-filter-only",
+                "IDEA",
+                {"experiment_plan": normalized_plan},
+                timestamp=T0,
+            )
+            requirements = store.candidate_forward_requirements(
+                candidate_ids=["candidate-filter-only"],
+                now=T0,
+            )
+
+        candidate = requirements["candidates"][0]
+        self.assertEqual(candidate["declared_market_ids"], [])
+        self.assertEqual(candidate["resolution"], "RESOLVED")
+        self.assertEqual(candidate["market_ids"], ["current-filter-only-market"])
+        self.assertEqual(
+            requirements["market_ids"],
+            ["current-filter-only-market"],
+        )
+
+    def test_repeated_exact_targets_share_authority_and_health_diagnostics(self) -> None:
+        normalized_plan = ExperimentPlan.from_mapping(
+            {
+                "hypothesis_id": "repeated-exact-authority",
+                "market_type": "prediction",
+                "template": "probability_mispricing",
+                "dataset_version": "v1",
+                "target": {"market_ids": ["shared-exact-market"]},
+                "paper_only": True,
+            }
+        ).as_dict()
+        candidate_ids = ["candidate-exact-a", "candidate-exact-b"]
+        with AxiomStore(":memory:") as store:
+            store.save_polymarket_market_metadata(
+                "shared-exact-market",
+                {
+                    "source_type": "FORWARD_COLLECTED",
+                    "active": True,
+                    "closed": False,
+                    "instrument": "Venue",
+                    "snapshot": {
+                        "market_id": "shared-exact-market",
+                        "settlement": "open",
+                        "expiry": (T0 + timedelta(days=1)).isoformat(),
+                    },
+                },
+                observed_at=T0,
+                source_type="FORWARD_COLLECTED",
+            )
+            store.save_polymarket_snapshot(
+                "shared-exact-market:snapshot",
+                "shared-exact-market",
+                T0,
+                T0,
+                {
+                    "source_type": "FORWARD_COLLECTED",
+                    "market_id": "shared-exact-market",
+                    "settlement": "open",
+                },
+                source_type="FORWARD_COLLECTED",
+            )
+            for candidate_id in candidate_ids:
+                store.save_candidate_lifecycle(
+                    candidate_id,
+                    "IDEA",
+                    {"experiment_plan": normalized_plan},
+                    timestamp=T0,
+                )
+            requirements = store.candidate_forward_requirements(
+                candidate_ids=candidate_ids,
+                now=T0,
+            )
+            health = store.polymarket_required_health(
+                requirements=requirements,
+                now=T0,
+            )
+
+        self.assertEqual(requirements["market_ids"], ["shared-exact-market"])
+        self.assertEqual(
+            requirements["candidate_references"],
+            {"shared-exact-market": candidate_ids},
+        )
+        self.assertEqual(
+            requirements["candidate_bound_markets"],
+            {"candidate-exact-a": ["shared-exact-market"], "candidate-exact-b": ["shared-exact-market"]},
+        )
+        for candidate in requirements["candidates"]:
+            self.assertEqual(candidate["resolution"], "RESOLVED")
+            self.assertEqual(candidate["market_ids"], ["shared-exact-market"])
+        self.assertEqual(health["grade"], "A")
+        self.assertEqual(health["reason_code"], "REQUIRED_MARKETS_FRESH")
+        self.assertEqual(
+            health["candidate_references"],
+            {"shared-exact-market": candidate_ids},
+        )
+        self.assertEqual(len(health["market_diagnostics"]), 1)
+        self.assertEqual(
+            health["market_diagnostics"][0]["candidate_references"],
+            candidate_ids,
+        )
+        self.assertEqual(
+            health["market_diagnostics"][0]["collection_state"],
+            "fresh",
+        )
+
 
     def test_normal_serialized_plan_declares_open_closed_and_filtered_targets(self) -> None:
         normalized_plan = ExperimentPlan.from_mapping(
@@ -589,6 +770,25 @@ class OperationalHealthTests(unittest.TestCase):
             observed_at=observed_at,
             source_type="FORWARD_COLLECTED",
         )
+    def test_empty_market_id_filters_do_not_return_broad_inventory(self) -> None:
+        with AxiomStore(":memory:") as store:
+            self._tracked_market(store, T0, market_id="tracked-market")
+
+            self.assertEqual(
+                store.tracked_polymarket_markets(
+                    market_ids=[],
+                    now=T0,
+                ),
+                [],
+            )
+            self.assertEqual(
+                store.tracked_polymarket_markets(
+                    market_ids=["", "  "],
+                    now=T0,
+                ),
+                [],
+            )
+
 
     def test_historical_only_rows_preserve_old_errors_but_current_health_is_f(self) -> None:
         with AxiomStore(":memory:") as store:

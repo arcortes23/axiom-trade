@@ -806,5 +806,198 @@ class DashboardReadLatencyFixture(unittest.TestCase):
                         self.assertEqual(credentials["status"], "NOT CHECKED")
                         self.assertFalse(credentials["secret_values_exposed"])
 
+LARGE_MARKET_COUNT = 8_192
+LARGE_VERSIONS_PER_MARKET = 64
+LARGE_CANDIDATE_COUNT = 49
+
+
+class LargeVersionCanaryReadLatencyTests(unittest.TestCase):
+    """Exercise the canary read against a deterministic persisted history."""
+
+    def setUp(self) -> None:
+        self.timestamp = datetime(2026, 1, 2, 12, 0, tzinfo=UTC)
+        self._temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temporary_directory.cleanup)
+        self.database_path = Path(self._temporary_directory.name) / "large-canary.sqlite3"
+        self.store = AxiomStore(str(self.database_path))
+        self.addCleanup(self.store.close)
+        self._seed_many_market_versions()
+        self._seed_historical_candidates()
+        self.server = DashboardServer(
+            port=0,
+            data=DashboardData(
+                store=self.store,
+                control=OperatorControlPlane(self.store),
+            ),
+        ).start()
+        self.addCleanup(self.server.stop)
+
+    def _seed_many_market_versions(self) -> None:
+        source_type = "FORWARD_COLLECTED"
+        timestamp = self.timestamp.isoformat()
+
+        def metadata_rows():
+            for market_index in range(LARGE_MARKET_COUNT):
+                market_id = f"inventory-market-{market_index:05d}"
+                for version in range(LARGE_VERSIONS_PER_MARKET):
+                    observed_at = self.timestamp - timedelta(
+                        minutes=LARGE_VERSIONS_PER_MARKET - version
+                    )
+                    payload = {
+                        "source_type": source_type,
+                        "active": True,
+                        "closed": False,
+                        "instrument": "Venue",
+                        "metadata": {
+                            "category": "noise",
+                            "version": version,
+                        },
+                        "snapshot": {
+                            "market_id": market_id,
+                            "settlement": "open",
+                            "expiry": (self.timestamp + timedelta(days=1)).isoformat(),
+                        },
+                    }
+                    payload_json = json.dumps(
+                        payload,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    yield (
+                        market_id,
+                        observed_at.isoformat(),
+                        hashlib.sha256(payload_json.encode("utf-8")).hexdigest(),
+                        payload_json,
+                        source_type,
+                        timestamp,
+                    )
+
+        def snapshot_rows():
+            for market_index in range(LARGE_MARKET_COUNT):
+                market_id = f"inventory-market-{market_index:05d}"
+                for version in range(LARGE_VERSIONS_PER_MARKET):
+                    observed_at = self.timestamp - timedelta(
+                        minutes=LARGE_VERSIONS_PER_MARKET - version
+                    )
+                    payload = {
+                        "source_type": source_type,
+                        "market_id": market_id,
+                        "settlement": "open",
+                        "snapshot": {
+                            "market_id": market_id,
+                            "settlement": "open",
+                            "expiry": (self.timestamp + timedelta(days=1)).isoformat(),
+                            "version": version,
+                        },
+                    }
+                    payload_json = json.dumps(
+                        payload,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    yield (
+                        f"{market_id}:snapshot:{version:02d}",
+                        market_id,
+                        observed_at.isoformat(),
+                        observed_at.isoformat(),
+                        payload_json,
+                        "ORDER_BOOK_SIMULATED",
+                        source_type,
+                        timestamp,
+                    )
+
+        with self.store.transaction(immediate=True):
+            self.store.connection.executemany(
+                "INSERT INTO polymarket_markets("
+                "market_id,observed_at,metadata_hash,payload_json,source_type,created_at"
+                ") VALUES(?,?,?,?,?,?)",
+                metadata_rows(),
+            )
+            self.store.connection.executemany(
+                "INSERT INTO polymarket_snapshots("
+                "snapshot_id,market_id,source_timestamp,observed_at,payload_json,"
+                "quality,source_type,created_at"
+                ") VALUES(?,?,?,?,?,?,?,?)",
+                snapshot_rows(),
+            )
+
+    def _seed_historical_candidates(self) -> None:
+        for index in range(LARGE_CANDIDATE_COUNT):
+            candidate_id = f"candidate-validation-{index:02d}"
+            plan = {
+                "hypothesis_id": f"validation-only-{index:02d}",
+                "market_type": "prediction",
+                "template": "probability_mispricing",
+                "dataset_version": "v1",
+                "target": {"market_ids": ["validation-only-market"]},
+                "paper_only": True,
+            }
+            payload = {
+                "experiment_plan": plan,
+                "dataset_provenance": {
+                    "source_type": "HISTORICAL",
+                    "historical_market_ids": ["validation-only-market"],
+                },
+            }
+            self.store.save_candidate_lifecycle(
+                candidate_id,
+                "IDEA",
+                payload,
+                timestamp=self.timestamp,
+            )
+            self.store.save_candidate_lifecycle(
+                candidate_id,
+                "PAPER_FORWARD",
+                payload,
+                from_stage="IDEA",
+                reason="large persisted history fixture",
+                timestamp=self.timestamp,
+            )
+
+    def _request(self, path: str) -> tuple[int, object, str]:
+        assert self.server.url is not None
+        try:
+            with urlopen(f"{self.server.url}/{path}", timeout=10) as response:
+                body = response.read().decode("utf-8")
+                return response.status, json.loads(body), body
+        except HTTPError as error:
+            body = error.read().decode("utf-8")
+            try:
+                payload: object = json.loads(body)
+            except json.JSONDecodeError:
+                payload = body
+            return error.code, payload, body
+
+    def test_warm_storage_only_canary_stays_below_two_seconds_at_history_scale(self) -> None:
+        status, payload, _body = self._request("api/v2/canary")
+        self.assertEqual(status, 200)
+        self.assertIsInstance(payload, dict)
+        assert isinstance(payload, dict)
+        first_evidence = payload["forward_evidence"]
+        self.assertEqual(first_evidence["candidate_bound_markets"], [])
+        self.assertEqual(first_evidence["required_market_count"], 0)
+        self.assertEqual(
+            set(first_evidence["unresolved_candidates"]),
+            {
+                f"candidate-validation-{index:02d}"
+                for index in range(LARGE_CANDIDATE_COUNT)
+            },
+        )
+
+        started = time.perf_counter()
+        status, payload, _body = self._request("api/v2/canary")
+        elapsed = time.perf_counter() - started
+
+        self.assertEqual(status, 200)
+        self.assertIsInstance(payload, dict)
+        self.assertLessEqual(elapsed, 2.0)
+        assert isinstance(payload, dict)
+        evidence = payload["forward_evidence"]
+        self.assertEqual(evidence["candidate_bound_markets"], [])
+        self.assertEqual(evidence["required_market_count"], 0)
+        self.assertEqual(evidence["reason_code"], "CANDIDATE_FORWARD_MARKET_UNRESOLVED")
+        self.assertEqual(evidence["market_diagnostics"], [])
+
+
 if __name__ == "__main__":
     unittest.main()
