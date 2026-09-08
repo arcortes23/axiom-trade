@@ -1233,6 +1233,7 @@ class AutonomousResearchProcessor:
             "max_spread",
             "regime",
             "regimes",
+            "category",
         }
         unknown = sorted(set(filters) - supported)
         if unknown:
@@ -1263,11 +1264,21 @@ class AutonomousResearchProcessor:
         result: list[Mapping[str, Any]] = []
         for row in rows:
             market_id = str(_value(row, "market_id", "")).strip()
-            symbol = str(_value(row, "symbol", _value(row, "instrument", ""))).strip()
             if target_markets and market_id not in target_markets:
                 continue
+            symbol = str(_value(row, "symbol", _value(row, "instrument", ""))).strip()
             if target_instrument and target_instrument not in {market_id, symbol}:
                 continue
+            if "category" in filters:
+                actual_category = str(_value(row, "category", "") or "").strip().casefold()
+                expected_category = filters["category"]
+                expected_categories = (
+                    expected_category
+                    if isinstance(expected_category, (list, tuple, set))
+                    else (expected_category,)
+                )
+                if actual_category not in {str(item).strip().casefold() for item in expected_categories if str(item).strip()}:
+                    continue
             price = _finite(_value(row, "yes_mid", _value(row, "yes_ask")), math.nan)
             if "entry_price" in filters and not _in_bound(price, filters["entry_price"]):
                 continue
@@ -1596,7 +1607,7 @@ class AutonomousResearchProcessor:
                 risk_snapshot = {"max_position_fraction": 0.05}
                 forward_config = {
                     "execution": "paper_only",
-                    "live_execution": False,
+                    "market_authority_required": True,
                     "plan_id": plan.plan_id,
                     "dataset_id": plan.dataset_id,
                     "dataset_version": plan.dataset_version,
@@ -1645,6 +1656,39 @@ class AutonomousResearchProcessor:
                     "paper_only": True,
                     "crypto_provenance": dict(crypto_binding or {}),
                 }
+            authority = self.store.candidate_forward_requirements(
+                candidate_ids=(candidate_id,),
+                now=now,
+                max_candidates=1,
+                max_markets_per_candidate=8,
+                max_total_markets=8,
+            )
+            authority_candidate = (
+                authority.get("candidates", [])[0]
+                if isinstance(authority.get("candidates"), list) and authority.get("candidates")
+                else {}
+            )
+            allowed_markets = tuple(
+                str(item).strip()
+                for item in authority_candidate.get("permitted_market_ids", ())
+                if str(item).strip()
+            )
+            if (
+                authority_candidate.get("resolution") != "RESOLVED"
+                or not allowed_markets
+            ):
+                return {
+                    "candidate_id": candidate_id,
+                    "stage": candidate.stage.value,
+                    "validation_expectancy": validation_expectancy,
+                    "variant_count": variant_count,
+                    "forward_test_id": None,
+                    "reason_code": authority_candidate.get(
+                        "reason_code", "CANDIDATE_FORWARD_MARKET_UNRESOLVED"
+                    ),
+                    "research_only": True,
+                    "paper_only": True,
+                }
             registry = ForwardTestRegistry(self.store)
             spec = registry.register_forward_test(
                 strategy=strategy.to_dict(),
@@ -1653,7 +1697,7 @@ class AutonomousResearchProcessor:
                 now=now,
                 config=forward_config,
                 bankroll=10_000.0,
-                allowed_markets=plan.target_markets,
+                allowed_markets=allowed_markets,
                 risk_limits=risk_snapshot,
                 experiment_id="forward-" + candidate_id,
             )

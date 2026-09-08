@@ -59,9 +59,31 @@ class PolymarketAdapter(PredictionMarketDataProvider):
         self._opener = opener
         self._raw_cache: dict[str, Mapping[str, Any]] = {}
         self._transport_errors: list[HTTPFetchError] = []
+        self._provider_timestamps: dict[tuple[str, str], datetime | None] = {}
+        self._book_provider_timestamps: dict[str, datetime | None] = {}
         self._last_trades_complete = True
         self._last_trade_cursor: str | None = None
 
+    def isolated_worker_factory(self) -> Callable[[], "PolymarketAdapter"]:
+        """Return a factory for workers with independent mutable adapter state."""
+        gamma_url, clob_url, timeout, opener = self.gamma_url, self.clob_url, self.timeout, self._opener
+
+        def create() -> "PolymarketAdapter":
+            return PolymarketAdapter(
+                gamma_url=gamma_url,
+                clob_url=clob_url,
+                timeout=timeout,
+                opener=opener,
+            )
+
+        return create
+
+    def provider_timestamp_for(self, market_id: str, kind: str = "market") -> datetime | None:
+        if kind in {"yes_order_book", "no_order_book", "order_book"}:
+            tokens = self.token_ids(str(market_id))
+            token = tokens.get("yes" if kind == "yes_order_book" else "no" if kind == "no_order_book" else "yes")
+            return self._book_provider_timestamps.get(str(token)) if token else None
+        return self._provider_timestamps.get((str(kind), str(market_id)))
     def consume_transport_errors(self) -> tuple[HTTPFetchError, ...]:
         errors = tuple(self._transport_errors)
         self._transport_errors.clear()
@@ -120,6 +142,7 @@ class PolymarketAdapter(PredictionMarketDataProvider):
         identifier = str(market_id)
         if not identifier:
             return None
+        self._provider_timestamps.pop(("market", identifier), None)
         payload = self._gamma_get("/markets/" + urllib.parse.quote(identifier, safe=""))
         if not isinstance(payload, Mapping):
             return None
@@ -190,7 +213,9 @@ class PolymarketAdapter(PredictionMarketDataProvider):
     def order_book_for_token(self, token_id: str, depth: int = 20) -> OrderBookSnapshot | None:
         if isinstance(depth, bool) or not isinstance(depth, int) or depth <= 0:
             raise ValueError("depth must be a positive integer")
-        payload = self._clob_get("/book", token_id=str(token_id))
+        token = str(token_id)
+        self._book_provider_timestamps.pop(token, None)
+        payload = self._clob_get("/book", token_id=token)
         if not isinstance(payload, Mapping):
             return None
         bids = self._levels(payload.get("bids"), reverse=True, depth=depth)
@@ -199,11 +224,14 @@ class PolymarketAdapter(PredictionMarketDataProvider):
             return None
         timestamp = parse_timestamp(
             payload.get("timestamp", payload.get("ts", payload.get("time")))
-        ) or utc_now()
+        )
+        timestamp_for_model = timestamp or utc_now()
         try:
-            return OrderBookSnapshot(timestamp=timestamp, bids=tuple(bids), asks=tuple(asks), token_id=str(token_id))
+            snapshot = OrderBookSnapshot(timestamp=timestamp_for_model, bids=tuple(bids), asks=tuple(asks), token_id=token)
         except ValueError:
             return None
+        self._book_provider_timestamps[token] = timestamp
+        return snapshot
 
     def order_book(self, market_id: str, depth: int = 20) -> OrderBookSnapshot | None:
         token_id = self._yes_token(market_id)
@@ -269,10 +297,14 @@ class PolymarketAdapter(PredictionMarketDataProvider):
         return levels[:depth]
 
     def metadata(self, market_id: str) -> InstrumentMetadata | None:
-        snapshot = self.market(market_id)
+        identifier = str(market_id)
+        raw = self._raw_cache.get(identifier)
+        # ``market`` already fetched and cached this exact Gamma payload in a
+        # collector pass.  Reusing it avoids a second metadata request.
+        snapshot = self._snapshot(raw) if raw is not None else self.market(identifier)
         if snapshot is None:
             return None
-        raw = self._raw_cache.get(str(market_id), {})
+        raw = self._raw_cache.get(identifier, {})
         return InstrumentMetadata(
             symbol=str(raw.get("slug") or snapshot.market_id),
             market_type=MarketType.PREDICTION,
@@ -327,6 +359,7 @@ class PolymarketAdapter(PredictionMarketDataProvider):
         if identifier is None:
             return None
         identifier = str(identifier)
+        self._provider_timestamps.pop(("market", identifier), None)
         self._remember(raw)
         outcomes = decode_jsonish(raw.get("outcomes", []))
         prices = decode_jsonish(raw.get("outcomePrices", raw.get("outcome_prices", [])))
@@ -355,9 +388,10 @@ class PolymarketAdapter(PredictionMarketDataProvider):
             no_ask = 1.0 - yes_bid
         if yes_bid is not None and yes_ask is not None and yes_bid > yes_ask:
             yes_bid = yes_ask = None
+        timestamp = parse_timestamp(raw.get("updatedAt", raw.get("updated_at")))
+        timestamp_for_model = timestamp or utc_now()
         if no_bid is not None and no_ask is not None and no_bid > no_ask:
             no_bid = no_ask = None
-        timestamp = parse_timestamp(raw.get("updatedAt", raw.get("updated_at"))) or utc_now()
         expiry = parse_timestamp(
             raw.get("endDate", raw.get("end_date", raw.get("endDateIso", raw.get("expirationDate"))))
         )
@@ -369,8 +403,8 @@ class PolymarketAdapter(PredictionMarketDataProvider):
             raw.get("resolution_criteria", raw.get("rules", raw.get("description", ""))),
         )
         tokens = self.token_ids(identifier)
-        return PredictionMarketSnapshot(
-            timestamp=timestamp,
+        snapshot = PredictionMarketSnapshot(
+            timestamp=timestamp_for_model,
             market_id=identifier,
             question=question,
             yes_bid=yes_bid,
@@ -390,6 +424,8 @@ class PolymarketAdapter(PredictionMarketDataProvider):
             yes_token_id=tokens.get("yes"),
             no_token_id=tokens.get("no"),
         )
+        self._provider_timestamps[("market", identifier)] = timestamp
+        return snapshot
 
 
 def _boolish(value: Any) -> bool:

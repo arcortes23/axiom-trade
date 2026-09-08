@@ -940,6 +940,28 @@ class PhaseTwoQualityTests(unittest.TestCase):
             self.assertEqual(stored_snapshot["payload"]["depth"]["yes"]["ask_levels"], 1)
             self.assertTrue(store.save_polymarket_market_metadata("m", {"rules": "changed"}, observed_at=T0))
             self.assertEqual(store.polymarket_health(now=T0 + timedelta(seconds=60))["metadata_records"], 2)
+            record = second.as_record()
+            for field in (
+                "candidate_bound_markets",
+                "candidate_bound_scheduled",
+                "candidate_bound_fresh",
+                "candidate_bound_stale",
+                "candidate_bound_missing",
+                "paper_forward_markets",
+                "paper_forward_scheduled",
+                "discovery_scheduled",
+                "discovery_deferred",
+                "candidate_references",
+                "tier_attempts",
+                "tier_successes",
+                "tier_failures",
+                "request_latency_summary",
+                "capacity_reason",
+            ):
+                self.assertIn(field, record)
+            self.assertEqual(record["capacity_reason"], None)
+            self.assertGreaterEqual(record["request_latency_summary"]["count"], 1)
+            self.assertEqual(record["tier_failures"], {"candidate": 0, "paper_forward": 0, "discovery": 0})
 
     def test_forward_registry_and_scanner_are_paper_only_and_frozen(self) -> None:
         config = {"nested": {"value": 1}}

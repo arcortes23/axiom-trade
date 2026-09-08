@@ -14,7 +14,7 @@ from itertools import islice, product
 from types import MappingProxyType
 from typing import Any, Mapping
 
-from .domain import MarketType
+from .domain import MarketType, parse_timestamp
 from .strategy import StrategyDefinition, load_strategy
 
 
@@ -984,10 +984,328 @@ class ExperimentPlan:
         return dict(self.model_document or {"field": "model_probability"})
 
 
+def normalize_forward_filters(
+    filters: Mapping[str, Any] | None,
+    regime_restrictions: Mapping[str, Any] | None = None,
+) -> Mapping[str, Any]:
+    """Return the small, immutable filter vocabulary used by forward authority.
+
+    This intentionally mirrors :meth:`AutonomousResearchProcessor._apply_plan_filters`.
+    The authority is a read-only consumer of a frozen plan, so unsupported keys
+    are rejected instead of being silently ignored.
+    """
+    source = dict(filters or {})
+    restrictions = dict(regime_restrictions or {})
+    supported = {
+        "entry_price",
+        "minimum_hours_to_resolution",
+        "maximum_hours_to_resolution",
+        "min_liquidity",
+        "max_spread",
+        "regime",
+        "regimes",
+        "category",
+    }
+    restriction_fields = {"regime", "regimes", "allowed_regimes", "allowed_states"}
+    unknown = sorted(set(source) - supported)
+    unknown_restrictions = sorted(set(restrictions) - restriction_fields)
+    if unknown or unknown_restrictions:
+        fields = unknown + unknown_restrictions
+        raise ExperimentPlanError("UNSUPPORTED_FEATURE", f"unsupported forward filters: {fields}")
+
+    numeric_keys = {
+        "entry_price",
+        "minimum_hours_to_resolution",
+        "maximum_hours_to_resolution",
+        "min_liquidity",
+        "max_spread",
+    }
+    result: dict[str, Any] = {}
+    for key in (
+        "entry_price",
+        "minimum_hours_to_resolution",
+        "maximum_hours_to_resolution",
+        "min_liquidity",
+        "max_spread",
+        "category",
+    ):
+        if key not in source:
+            continue
+        value = source[key]
+        if key == "category":
+            if isinstance(value, (list, tuple)):
+                values = tuple(str(item).strip().casefold() for item in value if str(item).strip())
+                if not values:
+                    raise ExperimentPlanError("UNSUPPORTED_FEATURE", "category filter must not be empty")
+                result[key] = list(dict.fromkeys(values))
+            elif isinstance(value, str) and value.strip():
+                result[key] = value.strip().casefold()
+            else:
+                raise ExperimentPlanError("UNSUPPORTED_FEATURE", "category filter must be text")
+        elif key in numeric_keys:
+            result[key] = _forward_numeric_bound(value, path=f"filters.{key}")
+        else:
+            raise AssertionError(f"unhandled forward filter {key}")
+    regime = source.get("regime", source.get("regimes"))
+    restricted = restrictions.get(
+        "allowed_regimes",
+        restrictions.get("allowed_states", restrictions.get("regime", restrictions.get("regimes"))),
+    )
+    if regime is not None and restricted is not None:
+        first = _forward_regime_values(regime)
+        second = _forward_regime_values(restricted)
+        values = sorted(first & second)
+    elif regime is not None:
+        values = sorted(_forward_regime_values(regime))
+    elif restricted is not None:
+        values = sorted(_forward_regime_values(restricted))
+    else:
+        values = []
+    if regime is not None or restricted is not None:
+        if not values:
+            raise ExperimentPlanError("UNSUPPORTED_FEATURE", "regime filter must not be empty")
+        result["regimes"] = values
+    return _freeze_json(result)
+
+
+def _forward_numeric(value: Any, *, path: str) -> float:
+    """Normalize one forward numeric value without coercing text or booleans."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ExperimentPlanError("UNSUPPORTED_FEATURE", f"{path} must be a finite number")
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        raise ExperimentPlanError("UNSUPPORTED_FEATURE", f"{path} must be a finite number")
+    if not math.isfinite(number):
+        raise ExperimentPlanError("UNSUPPORTED_FEATURE", f"{path} must be a finite number")
+    return number
+
+
+def _forward_numeric_bound(value: Any, *, path: str) -> float | list[float]:
+    if isinstance(value, (list, tuple)):
+        if not value or len(value) > 256:
+            raise ExperimentPlanError("UNSUPPORTED_FEATURE", f"{path} must be a bounded non-empty list")
+        return [_forward_numeric(item, path=f"{path}[]") for item in value]
+    if isinstance(value, Mapping):
+        raise ExperimentPlanError("UNSUPPORTED_FEATURE", f"{path} must be a finite scalar or bounded list")
+    return _forward_numeric(value, path=path)
+
+
+
+def _forward_regime_values(value: Any) -> set[str]:
+    if isinstance(value, str):
+        values = {value.strip()}
+    elif isinstance(value, (list, tuple)):
+        values = {str(item).strip() for item in value if str(item).strip()}
+    else:
+        raise ExperimentPlanError("UNSUPPORTED_FEATURE", "regime filter must be text or a bounded list")
+    if not values:
+        raise ExperimentPlanError("UNSUPPORTED_FEATURE", "regime filter must not be empty")
+    return values
+
+
+def _forward_market_value(market: Mapping[str, Any], key: str) -> Any:
+    if key in market:
+        return market[key]
+    for nested_name in ("payload", "snapshot", "metadata", "extra"):
+        nested = market.get(nested_name)
+        if isinstance(nested, Mapping):
+            value = _forward_market_value(nested, key)
+            if value is not None:
+                return value
+    return None
+
+
+def _forward_market_instrument(market: Mapping[str, Any]) -> Any:
+    """Return only persisted instrument identity fields, never market_id."""
+    value = market.get("instrument")
+    if value is not None:
+        return value
+    metadata = market.get("metadata")
+    if isinstance(metadata, Mapping):
+        value = metadata.get("symbol", metadata.get("instrument"))
+        if value is not None:
+            return value
+    payload = market.get("payload")
+    if isinstance(payload, Mapping):
+        value = payload.get("instrument")
+        if value is not None:
+            return value
+        metadata = payload.get("metadata")
+        if isinstance(metadata, Mapping):
+            return metadata.get("symbol", metadata.get("instrument"))
+    return None
+
+
+def _forward_identity(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().casefold()
+    return normalized or None
+
+
+def forward_market_matches(
+    market: Mapping[str, Any],
+    filters: Mapping[str, Any] | None,
+    *,
+    now: Any | None = None,
+    target_instrument: str | None = None,
+) -> bool:
+    """Match one current market against normalized forward filters.
+
+    The function is deliberately pure: it performs no catalog lookup and
+    treats malformed values as a non-match (fail closed).
+    """
+    if not isinstance(market, Mapping):
+        return False
+    if target_instrument is not None:
+        expected_instrument = _forward_identity(target_instrument)
+        actual_instrument = _forward_identity(_forward_market_instrument(market))
+        if expected_instrument is None or actual_instrument != expected_instrument:
+            return False
+    try:
+        normalized = normalize_forward_filters(filters)
+    except (ExperimentPlanError, TypeError, ValueError):
+        return False
+
+    def finite(value: Any) -> float:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return math.nan
+        try:
+            number = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return math.nan
+        return number if math.isfinite(number) else math.nan
+
+    def in_bound(value: float, bound: Any) -> bool:
+        if not math.isfinite(value):
+            return False
+        if isinstance(bound, (list, tuple)):
+            if len(bound) == 2:
+                low, high = finite(bound[0]), finite(bound[1])
+                return math.isfinite(low) and math.isfinite(high) and min(low, high) <= value <= max(low, high)
+            return any(abs(value - finite(item)) <= 1e-12 for item in bound if math.isfinite(finite(item)))
+        target = finite(bound)
+        return math.isfinite(target) and abs(value - target) <= 1e-12
+
+    if "entry_price" in normalized:
+        price = finite(_forward_market_value(market, "yes_mid"))
+        if not math.isfinite(price):
+            price = finite(_forward_market_value(market, "yes_ask"))
+        if not in_bound(price, normalized["entry_price"]):
+            return False
+    raw_expiry = _forward_market_value(market, "expiry")
+    if raw_expiry is None:
+        expiry_seconds = _forward_market_value(market, "time_to_expiry_seconds")
+    else:
+        expiry = parse_timestamp(raw_expiry)
+        reference = parse_timestamp(now)
+        if now is None:
+            # Keep the predicate deterministic when callers omit ``now`` by
+            # using the market's own observation timestamp as its reference.
+            reference = parse_timestamp(_forward_market_value(market, "timestamp"))
+        expiry_seconds = (expiry - reference).total_seconds() if expiry is not None and reference is not None else math.nan
+    expiry_seconds = finite(expiry_seconds)
+    if "minimum_hours_to_resolution" in normalized and (
+        not math.isfinite(expiry_seconds)
+        or expiry_seconds < finite(normalized["minimum_hours_to_resolution"]) * 3600.0
+    ):
+        return False
+    if "maximum_hours_to_resolution" in normalized and (
+        not math.isfinite(expiry_seconds)
+        or expiry_seconds > finite(normalized["maximum_hours_to_resolution"]) * 3600.0
+    ):
+        return False
+    if "min_liquidity" in normalized:
+        liquidity = finite(_forward_market_value(market, "liquidity"))
+        if not math.isfinite(liquidity) or liquidity < finite(normalized["min_liquidity"]):
+            return False
+    if "max_spread" in normalized:
+        spread_value = _forward_market_value(market, "spread")
+        if spread_value is None:
+            quotes = _forward_market_value(market, "quotes")
+            if isinstance(quotes, Mapping):
+                # Prefer the explicitly collected YES spread, then NO spread.
+                spread_value = quotes.get("yes_spread")
+                if spread_value is None:
+                    spread_value = quotes.get("no_spread")
+                if spread_value is None:
+                    yes_bid = finite(quotes.get("yes_bid"))
+                    yes_ask = finite(quotes.get("yes_ask"))
+                    if math.isfinite(yes_bid) and math.isfinite(yes_ask):
+                        spread_value = yes_ask - yes_bid
+        if spread_value is None:
+            yes_bid = finite(_forward_market_value(market, "yes_bid"))
+            yes_ask = finite(_forward_market_value(market, "yes_ask"))
+            if math.isfinite(yes_bid) and math.isfinite(yes_ask):
+                spread_value = yes_ask - yes_bid
+        spread = finite(spread_value)
+        if not math.isfinite(spread) or spread > finite(normalized["max_spread"]):
+            return False
+    if "category" in normalized:
+        actual = str(_forward_market_value(market, "category") or "").strip().casefold()
+        expected = normalized["category"]
+        allowed = expected if isinstance(expected, (list, tuple)) else (expected,)
+        if actual not in {str(item).casefold() for item in allowed}:
+            return False
+    if "regimes" in normalized:
+        actual = str(
+            _forward_market_value(market, "regime")
+            or _forward_market_value(market, "regime_state")
+            or ""
+        )
+        if actual not in set(str(item) for item in normalized["regimes"]):
+            return False
+    return True
+
+
+def historical_market_ids(value: Any) -> tuple[str, ...]:
+    """Extract explicitly provenance-bound historical constituent ids.
+
+    Only fields that describe dataset constituents are considered.  Arbitrary
+    target lists are never classified as historical merely because a dataset
+    is historical, which preserves genuine exact current targets.
+    """
+    found: list[str] = []
+    keys = {
+        "historical_market_ids",
+        "historical_constituent_market_ids",
+        "constituent_market_ids",
+        "market_versions",
+        "constituents",
+        "constituent_bindings",
+    }
+
+    def visit(item: Any, hinted: bool = False) -> None:
+        if isinstance(item, Mapping):
+            for key, child in item.items():
+                normalized = _normal_key(key)
+                child_hint = hinted or normalized in keys
+                if normalized in {"market_id", "marketid"} and (hinted or child_hint):
+                    text = str(child).strip()
+                    if text:
+                        found.append(text)
+                visit(child, child_hint)
+        elif hinted and isinstance(item, (list, tuple)):
+            for child in item:
+                if isinstance(child, str):
+                    text = child.strip()
+                    if text:
+                        found.append(text)
+                else:
+                    visit(child, True)
+
+    visit(value)
+    return tuple(dict.fromkeys(found))
+
+
 __all__ = [
     "AUTONOMOUS_BUDGET_ID",
     "ExperimentPlan",
     "ExperimentPlanError",
     "MAX_PLAN_VARIANTS",
     "PLAN_SCHEMA_VERSION",
+    "forward_market_matches",
+    "historical_market_ids",
+    "normalize_forward_filters",
 ]

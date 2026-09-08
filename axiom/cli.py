@@ -940,6 +940,7 @@ def _main_impl(argv: Sequence[str] | None = None) -> int:
                 service = CanaryService(
                     store,
                     allow_environment=getattr(args, "allow_environment", False),
+                    initialize=args.command != "canary-status",
                 )
                 if args.command == "canary-signal":
                     signal = service.generate_signal(args.candidate)
@@ -965,7 +966,7 @@ def _main_impl(argv: Sequence[str] | None = None) -> int:
                         allow_environment=args.allow_environment,
                     )
                 elif args.command == "canary-status":
-                    payload = service.status()
+                    payload = service.status_report()
                 elif args.command == "canary-disarm":
                     service.disarm()
                     payload = service.status()
@@ -1028,6 +1029,14 @@ def _main_impl(argv: Sequence[str] | None = None) -> int:
                             credentials_configured=credentials_configured,
                         )
             print(json.dumps(payload, sort_keys=True, indent=2, default=str))
+            if args.command == "canary-status":
+                readiness = payload.get("readiness")
+                ready = (
+                    isinstance(readiness, Mapping)
+                    and readiness.get("status") == "CURRENT"
+                    and not bool(readiness.get("stale"))
+                )
+                return 0 if ready else 1
             return 0 if payload.get("ready", True) else 1
         except CanaryBlocked as exc:
             print(

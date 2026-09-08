@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import math
 import sqlite3
 import tempfile
 import threading
@@ -10,7 +11,7 @@ import unittest
 from pathlib import Path
 from typing import Any
 
-from axiom.collector import CollectionCycle
+from axiom.collector import CollectionCycle, CollectorConfig, PolymarketCollector
 from axiom.dashboard import DashboardData
 from axiom.data import InMemoryPredictionProvider
 from axiom.forward import ForwardTestRegistry
@@ -21,6 +22,37 @@ from axiom.strategy import validate_strategy
 
 UTC = timezone.utc
 T0 = datetime(2026, 1, 1, tzinfo=UTC)
+
+
+class NodeConfigValidationTests(unittest.TestCase):
+    def test_direct_construction_rejects_non_positive_depth(self) -> None:
+        for depth in (0, -1, False):
+            with self.subTest(depth=depth):
+                with self.assertRaisesRegex(ValueError, "^depth must be a positive integer$"):
+                    NodeConfig(":memory:", depth=depth)
+
+    def test_direct_construction_rejects_invalid_failure_cooldown(self) -> None:
+        for cooldown in (-1.0, math.inf, -math.inf, math.nan):
+            with self.subTest(cooldown=cooldown):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "^failure_cooldown_seconds must be finite and non-negative$",
+                ):
+                    NodeConfig(":memory:", failure_cooldown_seconds=cooldown)
+
+    def test_direct_construction_accepts_positive_depth_and_zero_cooldown(self) -> None:
+        config = NodeConfig(
+            ":memory:",
+            depth=1,
+            failure_cooldown_seconds=0,
+            discovery_budget_per_cycle=4,
+            max_concurrency=2,
+        )
+
+        self.assertEqual(config.depth, 1)
+        self.assertEqual(config.failure_cooldown_seconds, 0)
+        self.assertEqual(config.discovery_budget_per_cycle, 4)
+        self.assertEqual(config.max_concurrency, 2)
 
 
 class SchedulerScaleTests(unittest.TestCase):
@@ -225,6 +257,7 @@ class SchedulerScaleTests(unittest.TestCase):
                 original_lock = store._lock
                 lock_probe = LockProbe()
                 store._lock = lock_probe  # type: ignore[assignment]
+                canary_selection_reads: list[bool] = []
 
                 def authorize_canary_selection(
                     _action: int,
@@ -233,11 +266,8 @@ class SchedulerScaleTests(unittest.TestCase):
                     _database: str | None,
                     _source: str | None,
                 ) -> int:
-                    if (
-                        _action == sqlite3.SQLITE_READ
-                        and table == "canary_selection"
-                        and not lock_probe.held_by_current_thread()
-                    ):
+                    if _action == sqlite3.SQLITE_READ and table == "canary_selection":
+                        canary_selection_reads.append(lock_probe.held_by_current_thread())
                         return sqlite3.SQLITE_DENY
                     return sqlite3.SQLITE_OK
 
@@ -246,13 +276,23 @@ class SchedulerScaleTests(unittest.TestCase):
                     locked_overview = DashboardData(store=store).overview_summary()
                     locked_canary = locked_overview["canary"]
                     self.assertIsNone(locked_canary["winner_id"])
+                    self.assertIsNone(locked_canary["winner_rank"])
                     self.assertIsNone(locked_canary["selected_candidate"])
-                    self.assertEqual(locked_canary["last_selected_candidate"], "persisted-candidate")
-                    self.assertEqual(locked_canary["selection_status"], "STALE")
+                    self.assertIsNone(locked_canary["last_selected_candidate"])
+                    self.assertEqual(locked_canary["selection_status"], "UNKNOWN")
+                    self.assertIsNone(locked_canary["selection_valid"])
+                    self.assertEqual(locked_canary["readiness_snapshot_status"], "STALE")
+                    self.assertTrue(locked_canary["readiness_snapshot_stale"])
                     self.assertEqual(
-                        locked_canary["selection_invalidation_reason"], "LIFECYCLE_REJECTED"
+                        locked_canary["readiness_snapshot_reason"],
+                        "READINESS_SNAPSHOT_MISSING",
                     )
-                    self.assertFalse(locked_canary["selection_valid"])
+                    self.assertIsNone(locked_canary["selection_reason"])
+                    self.assertIsNone(locked_canary["selection_invalidation_reason"])
+                    self.assertGreaterEqual(len(canary_selection_reads), 1)
+                    self.assertLessEqual(len(canary_selection_reads), 4)
+                    self.assertTrue(all(canary_selection_reads))
+                    canary_selection_reads.clear()
                 finally:
                     store.connection.set_authorizer(None)
                     store._lock = original_lock
@@ -294,20 +334,29 @@ class SchedulerScaleTests(unittest.TestCase):
                 self.assertLess(collection_span, paper_span)
                 self.assertEqual(store.get_collector_state("polymarket")["markets_seen"], 100)
 
-                overview = DashboardData(store=store).overview_summary()
+                store.connection.set_authorizer(authorize_canary_selection)
+                try:
+                    overview = DashboardData(store=store).overview_summary()
+                finally:
+                    store.connection.set_authorizer(None)
+                self.assertEqual(canary_selection_reads, [])
                 canary = overview["canary"]
                 self.assertIsNone(canary["winner_id"])
+                self.assertIsNone(canary["winner_rank"])
                 self.assertIsNone(canary["selected_candidate"])
                 self.assertEqual(canary["last_selected_candidate"], "persisted-candidate")
                 self.assertIsNone(canary["winner_score"])
-                self.assertEqual(canary["selection_reason"], "LIFECYCLE_REJECTED")
+                self.assertEqual(canary["selection_reason"], "SELECTED_WINNER")
+                self.assertIsNone(canary["selection_invalidation_reason"])
+                self.assertEqual(canary["selection_status"], "UNKNOWN")
+                self.assertIsNone(canary["selection_valid"])
+                self.assertEqual(canary["readiness_snapshot_status"], "STALE")
+                self.assertTrue(canary["readiness_snapshot_stale"])
                 self.assertEqual(
-                    canary["selection_invalidation_reason"], "LIFECYCLE_REJECTED"
+                    canary["readiness_snapshot_reason"], "READINESS_SNAPSHOT_INITIALIZING"
                 )
-                self.assertEqual(canary["selection_status"], "STALE")
-                self.assertFalse(canary["selection_valid"])
-                self.assertEqual(canary["eligible_count"], 0)
-                self.assertEqual(canary["rankable_count"], 0)
+                self.assertIsNone(canary["eligible_count"])
+                self.assertIsNone(canary["rankable_count"])
                 self.assertEqual(canary["execution_event_count"], 0)
                 components = {item["name"]: item for item in overview["components"]}
                 self.assertIn("POLYMARKET COLLECTOR", components)
@@ -352,6 +401,61 @@ class SchedulerScaleTests(unittest.TestCase):
                 collector_worker = next(row for row in store.list_worker_states(limit=64) if row["worker_name"] == "polymarket-collector")
                 self.assertEqual(collector_worker["payload"]["configured_interval_seconds"], 0.01)
                 self.assertIn("next_scheduled_collection_at", collector_worker["payload"])
+
+
+
+class CollectorConcurrencyTests(unittest.TestCase):
+    def test_max_two_requires_explicit_isolated_workers_and_unsafe_provider_is_serial(self) -> None:
+        class SharedActivity:
+            def __init__(self) -> None:
+                self.lock = threading.Lock()
+                self.active = 0
+                self.max_active = 0
+
+        class BlockingProvider(InMemoryPredictionProvider):
+            provider_name = "blocking-test"
+
+            def __init__(self, activity: SharedActivity, *, isolated: bool = False) -> None:
+                super().__init__([])
+                self.activity = activity
+                if isolated:
+                    self.isolated_worker_factory = lambda: BlockingProvider(activity)
+
+            def market(self, market_id: str):
+                del market_id
+                with self.activity.lock:
+                    self.activity.active += 1
+                    self.activity.max_active = max(self.activity.max_active, self.activity.active)
+                try:
+                    time.sleep(0.03)
+                    return None
+                finally:
+                    with self.activity.lock:
+                        self.activity.active -= 1
+
+        for isolated, expected_max_active in ((False, 1), (True, 2)):
+            with self.subTest(isolated=isolated), AxiomStore(":memory:") as store:
+                activity = SharedActivity()
+                provider = BlockingProvider(activity, isolated=isolated)
+                collector = PolymarketCollector(
+                    provider,
+                    store,
+                    CollectorConfig(
+                        interval_seconds=60,
+                        market_ids=("worker-a", "worker-b"),
+                        max_markets=2,
+                        max_attempts=1,
+                        max_concurrency=2,
+                        jitter_seconds=0,
+                    ),
+                    clock=lambda: T0,
+                    sleep=lambda _seconds: None,
+                )
+                cycle = collector.collect_once(now=T0)
+
+                self.assertEqual(activity.max_active, expected_max_active)
+                self.assertEqual(cycle.markets_attempted, 2)
+                self.assertLessEqual(activity.max_active, 2)
 
 
 if __name__ == "__main__":

@@ -1,16 +1,34 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
+import json
 from concurrent.futures import ThreadPoolExecutor
 import threading
 import time
 import unittest
 from typing import Any
 
+from axiom.data import PolymarketAdapter
 from axiom.data_quality import (
     PRICE_PROXY,
     TIMESTAMPED_DEPTH,
     evaluate_prediction_data_quality,
 )
+
+
+class _Response:
+    def __init__(self, payload: object = None, *, raw: bytes | None = None) -> None:
+        self.payload = payload
+        self.raw = raw
+        self.status = 200
+        self.headers: dict[str, str] = {}
+
+    def read(self) -> bytes:
+        return self.raw if self.raw is not None else json.dumps(self.payload).encode("utf-8")
+
+    def close(self) -> None:
+        return None
+
 
 
 DATASET_ID = "prediction:market-1"
@@ -140,6 +158,35 @@ class _QualityStore:
 
 
 
+
+class _AttestedQualityStore(_QualityStore):
+    """Store double exposing only bounded attestation metadata."""
+
+    def __init__(self, attestation: dict[str, Any]) -> None:
+        super().__init__()
+        self.attestation = dict(attestation)
+        self.attestation_load_calls = 0
+
+    def load_dataset_integrity_attestation(
+        self, dataset_id: str, dataset_version: str
+    ) -> dict[str, Any]:
+        self.attestation_load_calls += 1
+        return dict(self.attestation)
+class _SequencedAttestedQualityStore(_QualityStore):
+    """Store double that exposes a stale loser before the durable winner."""
+
+    def __init__(self, attestations: list[dict[str, Any]]) -> None:
+        super().__init__()
+        self._attestations = [dict(item) for item in attestations]
+        self.attestation_load_calls = 0
+
+    def load_dataset_integrity_attestation(
+        self, dataset_id: str, dataset_version: str
+    ) -> dict[str, Any]:
+        self.attestation_load_calls += 1
+        index = min(self.attestation_load_calls - 1, len(self._attestations) - 1)
+        return dict(self._attestations[index])
+
 def _payload(
     *,
     fidelity: str,
@@ -162,6 +209,72 @@ def _payload(
 
 
 class PredictionDataQualityCacheTests(unittest.TestCase):
+    def test_book_provider_timestamp_clears_after_unusable_response(self) -> None:
+        responses = [
+            _Response(
+                {
+                    "conditionId": "market-1",
+                    "question": "Will it happen?",
+                    "outcomes": ["Yes", "No"],
+                    "clobTokenIds": ["yes-token", "no-token"],
+                }
+            ),
+            _Response(
+                {
+                    "timestamp": "2025-01-01T00:00:00Z",
+                    "bids": [{"price": "0.40", "size": "2"}],
+                    "asks": [{"price": "0.60", "size": "2"}],
+                }
+            ),
+            _Response(None),
+            _Response(raw=b"not-json"),
+            _Response({"bids": [], "asks": []}),
+        ]
+
+        def opener(_request: object, timeout: float) -> _Response:
+            del timeout
+            return responses.pop(0)
+
+        adapter = PolymarketAdapter(opener=opener)
+        self.assertIsNotNone(adapter.market("market-1"))
+        self.assertIsNotNone(adapter.order_book_for_token("yes-token"))
+        self.assertEqual(
+            adapter.provider_timestamp_for("market-1", kind="yes_order_book"),
+            datetime(2025, 1, 1, tzinfo=timezone.utc),
+        )
+
+        for _ in range(3):
+            self.assertIsNone(adapter.order_book_for_token("yes-token"))
+            self.assertIsNone(adapter.provider_timestamp_for("market-1", kind="yes_order_book"))
+
+    def test_market_provider_timestamp_clears_after_unusable_response(self) -> None:
+        stamp = datetime(2025, 1, 1, tzinfo=timezone.utc)
+        valid = {
+            "conditionId": "market-1",
+            "question": "Will it happen?",
+            "outcomes": ["Yes", "No"],
+            "clobTokenIds": ["yes-token", "no-token"],
+            "updatedAt": stamp.isoformat(),
+        }
+        responses = [
+            _Response(valid),
+            _Response(None),
+            _Response(raw=b"not-json"),
+            _Response({"conditionId": "market-1", "question": ""}),
+        ]
+
+        def opener(_request: object, timeout: float) -> _Response:
+            del timeout
+            return responses.pop(0)
+
+        adapter = PolymarketAdapter(opener=opener)
+        self.assertIsNotNone(adapter.market("market-1"))
+        self.assertEqual(adapter.provider_timestamp_for("market-1"), stamp)
+
+        for _ in range(3):
+            self.assertIsNone(adapter.market("market-1"))
+            self.assertIsNone(adapter.provider_timestamp_for("market-1"))
+
     def test_repeated_evaluations_scan_once_but_reproject_each_payload(self) -> None:
         store = _QualityStore()
 
@@ -267,6 +380,96 @@ class PredictionDataQualityCacheTests(unittest.TestCase):
         self.assertEqual(recovered["historical_dataset_row_count"], 2)
         self.assertEqual(store.load_calls, 2)
         self.assertEqual(store.scan_calls, 1)
+
+    def test_stale_attestation_preserves_forward_contamination_reason_without_scan(self) -> None:
+        store = _AttestedQualityStore(
+            {
+                "dataset_id": DATASET_ID,
+                "dataset_version": DATASET_VERSION,
+                "source_type": "HISTORICAL",
+                "market_type": "prediction",
+                "row_count": 2,
+                "completeness": 1.0,
+                "execution_fidelity": PRICE_PROXY,
+                "contamination_result": "FAIL",
+                "reason": "FORWARD_CONTAMINATION",
+                "status": "STALE",
+            }
+        )
+
+        quality = evaluate_prediction_data_quality(store, _payload(fidelity=PRICE_PROXY))
+
+        self.assertFalse(quality["historical_data_integrity_passed"])
+        self.assertIn("HISTORICAL_FORWARD_CONTAMINATION", quality["reasons"])
+        self.assertNotIn("HISTORICAL_DATASET_ATTESTATION_STALE", quality["reasons"])
+        self.assertEqual(store.attestation_load_calls, 1)
+        self.assertEqual(store.scan_calls, 0)
+
+    def test_current_attestation_is_reused_without_materializing_rows(self) -> None:
+        store = _AttestedQualityStore(
+            {
+                "dataset_id": DATASET_ID,
+                "dataset_version": DATASET_VERSION,
+                "source_type": "HISTORICAL",
+                "market_type": "prediction",
+                "row_count": 2,
+                "completeness": 1.0,
+                "execution_fidelity": PRICE_PROXY,
+                "contamination_result": "PASS",
+                "status": "CURRENT",
+            }
+        )
+
+        first = evaluate_prediction_data_quality(store, _payload(fidelity=PRICE_PROXY))
+        second = evaluate_prediction_data_quality(store, _payload(fidelity=PRICE_PROXY))
+
+        self.assertTrue(first["historical_data_integrity_passed"])
+        self.assertEqual(first, second)
+        self.assertEqual(store.scan_calls, 0)
+
+    def test_quality_reloads_durable_winner_after_cas_loser(self) -> None:
+        store = _SequencedAttestedQualityStore(
+            [
+                {
+                    "dataset_id": DATASET_ID,
+                    "dataset_version": DATASET_VERSION,
+                    "status": "STALE",
+                    "reason": "ATTESTATION_CAS_LOST",
+                },
+                {
+                    "dataset_id": DATASET_ID,
+                    "dataset_version": DATASET_VERSION,
+                    "source_type": "HISTORICAL",
+                    "market_type": "prediction",
+                    "row_count": 2,
+                    "completeness": 1.0,
+                    "execution_fidelity": PRICE_PROXY,
+                    "contamination_result": "PASS",
+                    "policy_version": "prediction-integrity-v2",
+                    "attestation_hash": "sha256:winner",
+                    "status": "CURRENT",
+                },
+            ]
+        )
+
+        loser = evaluate_prediction_data_quality(store, _payload(fidelity=PRICE_PROXY))
+        winner = evaluate_prediction_data_quality(store, _payload(fidelity=PRICE_PROXY))
+
+        self.assertFalse(loser["historical_data_integrity_passed"])
+        self.assertEqual(loser["dataset_integrity_attestation_status"], "STALE")
+        self.assertTrue(winner["historical_data_integrity_passed"])
+        self.assertEqual(winner["dataset_integrity_attestation_status"], "CURRENT")
+        self.assertEqual(winner["dataset_integrity_attestation_hash"], "sha256:winner")
+        self.assertEqual(store.scan_calls, 0)
+
+    def test_unknown_stale_attestation_fails_closed_with_generic_reason(self) -> None:
+        store = _AttestedQualityStore({"status": "STALE"})
+
+        quality = evaluate_prediction_data_quality(store, _payload(fidelity=PRICE_PROXY))
+
+        self.assertFalse(quality["historical_data_integrity_passed"])
+        self.assertEqual(quality["reasons"], ["HISTORICAL_DATASET_ATTESTATION_STALE"])
+        self.assertEqual(store.scan_calls, 0)
 
 
 if __name__ == "__main__":

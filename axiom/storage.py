@@ -21,11 +21,12 @@ from dataclasses import asdict, is_dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Mapping, Sequence
+from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 _MAX_LATEST_SCAN_ROWS = 10_000
 _MAX_EVIDENCE_SCAN_ROWS = 100_000
 _QUEUE_RELEASE_BATCH = 256
 _QUEUE_LINEAGE_LIMIT = 256
+_DEFAULT_HERMES_JOB_ID = "f1d27bf8c27a"
 _PAGINATION_PAGE_SIZES = (10, 25, 50, 100)
 _DEFAULT_PAGE_SIZE = 25
 _POLYMARKET_SOURCE_TYPES = frozenset({"HISTORICAL", "FORWARD_COLLECTED"})
@@ -35,6 +36,9 @@ SQLITE_CONNECTION_TIMEOUT_SECONDS = 45.0
 SQLITE_BUSY_RETRY_ATTEMPTS = 4
 SQLITE_BUSY_RETRY_INITIAL_SECONDS = 0.05
 SQLITE_BUSY_RETRY_MAX_SECONDS = 0.5
+_MAX_DATASET_ATTESTATION_CONSTITUENTS = 1_000
+_DATASET_ATTESTATION_STATUS_CURRENT = "CURRENT"
+_DATASET_ATTESTATION_STATUS_STALE = "STALE"
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -167,6 +171,7 @@ class AxiomStore:
         self._conn.row_factory = sqlite3.Row
         self._lock = threading.RLock()
         self._transaction_depth = 0
+        self._after_commit_callbacks: list[list[Callable[[], Any]]] = []
         self._sqlite_timeout_seconds = timeout
         self._sqlite_busy_timeout_ms = max(1, int(round(timeout * 1000.0)))
         try:
@@ -178,11 +183,21 @@ class AxiomStore:
             raise
 
     def _database_filename(self) -> str:
-        rows = self._conn.execute("PRAGMA database_list").fetchall()
+        with self._lock:
+            rows = self._conn.execute("PRAGMA database_list").fetchall()
         for row in rows:
-            name = str(row[1] if not isinstance(row, Mapping) else row["name"])
+            if isinstance(row, Mapping):
+                name = row.get("name")
+                value = row.get("file")
+            else:
+                try:
+                    if len(row) < 3:
+                        continue
+                    name = row[1]
+                    value = row[2]
+                except (IndexError, KeyError, TypeError):
+                    continue
             if name == "main":
-                value = row[2] if not isinstance(row, Mapping) else row["file"]
                 return str(value or "")
         return ""
 
@@ -227,6 +242,7 @@ class AxiomStore:
     @contextmanager
     def transaction(self, *, immediate: bool = False) -> Iterator["AxiomStore"]:
         """Group several append-only writes into one rollback boundary."""
+        callbacks_to_run: list[Callable[[], Any]] = []
         with self._lock:
             if immediate and not self._transaction_depth:
                 sqlite_retry(
@@ -234,10 +250,15 @@ class AxiomStore:
                     operation_name="begin immediate SQLite transaction",
                 )
                 self._transaction_depth += 1
+                self._after_commit_callbacks.append([])
                 try:
                     yield self
                 except BaseException:
-                    self._conn.rollback()
+                    try:
+                        self._conn.rollback()
+                    finally:
+                        self._after_commit_callbacks.pop()
+                        self._transaction_depth -= 1
                     raise
                 else:
                     try:
@@ -246,24 +267,65 @@ class AxiomStore:
                             operation_name="commit SQLite transaction",
                         )
                     except BaseException:
-                        self._conn.rollback()
+                        try:
+                            self._conn.rollback()
+                        finally:
+                            self._after_commit_callbacks.pop()
+                            self._transaction_depth -= 1
                         raise
-                finally:
+                    callbacks_to_run = self._after_commit_callbacks.pop()
                     self._transaction_depth -= 1
-                return
-            self._transaction_depth += 1
-            savepoint = f"axiom_tx_{id(self):x}_{self._transaction_depth}"
-            self._conn.execute(f"SAVEPOINT {savepoint}")
-            try:
-                yield self
-            except BaseException:
-                self._conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
-                self._conn.execute(f"RELEASE SAVEPOINT {savepoint}")
-                raise
             else:
-                self._conn.execute(f"RELEASE SAVEPOINT {savepoint}")
-            finally:
-                self._transaction_depth -= 1
+                self._transaction_depth += 1
+                self._after_commit_callbacks.append([])
+                savepoint = f"axiom_tx_{id(self):x}_{self._transaction_depth}"
+                try:
+                    self._conn.execute(f"SAVEPOINT {savepoint}")
+                except BaseException:
+                    self._after_commit_callbacks.pop()
+                    self._transaction_depth -= 1
+                    raise
+                try:
+                    yield self
+                except BaseException:
+                    try:
+                        self._conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                        self._conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                    finally:
+                        self._after_commit_callbacks.pop()
+                        self._transaction_depth -= 1
+                    raise
+                else:
+                    try:
+                        self._conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                    except BaseException:
+                        self._after_commit_callbacks.pop()
+                        self._transaction_depth -= 1
+                        raise
+                    callbacks_to_run = self._after_commit_callbacks.pop()
+                    self._transaction_depth -= 1
+                    if self._after_commit_callbacks:
+                        self._after_commit_callbacks[-1].extend(callbacks_to_run)
+                        callbacks_to_run = []
+        self._run_after_commit_callbacks(callbacks_to_run)
+
+    def _run_after_commit_callbacks(self, callbacks: Sequence[Callable[[], Any]]) -> None:
+        """Run committed callbacks without allowing projection failures to undo writes."""
+        for callback in callbacks:
+            try:
+                callback()
+            except Exception:
+                _LOGGER.exception("after-commit callback failed")
+
+    def after_commit(self, callback: Callable[[], Any]) -> None:
+        """Run a callback after the outermost transaction durably commits."""
+        if not callable(callback):
+            raise TypeError("after_commit callback must be callable")
+        with self._lock:
+            if self._transaction_depth:
+                self._after_commit_callbacks[-1].append(callback)
+                return
+            self._run_after_commit_callbacks((callback,))
 
     @contextmanager
     def _write_context(self) -> Iterator[None]:
@@ -323,6 +385,28 @@ class AxiomStore:
                     metadata_json TEXT NOT NULL DEFAULT '{}',
                     PRIMARY KEY (dataset_id, dataset_version)
                 );
+                CREATE TABLE IF NOT EXISTS dataset_integrity_attestation (
+                    dataset_id TEXT NOT NULL,
+                    dataset_version TEXT NOT NULL,
+                    source_type TEXT NOT NULL,
+                    market_type TEXT NOT NULL,
+                    row_count INTEGER NOT NULL,
+                    completeness REAL NOT NULL,
+                    start_timestamp TEXT,
+                    end_timestamp TEXT,
+                    execution_fidelity TEXT NOT NULL,
+                    contamination_result TEXT NOT NULL,
+                    constituent_bindings_json TEXT NOT NULL DEFAULT '[]',
+                    provenance_version TEXT NOT NULL DEFAULT '',
+                    policy_version TEXT NOT NULL DEFAULT '',
+                    reason TEXT NOT NULL DEFAULT '',
+                    attestation_hash TEXT NOT NULL,
+                    verified_at TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    PRIMARY KEY (dataset_id, dataset_version)
+                );
+                CREATE INDEX IF NOT EXISTS idx_dataset_integrity_attestation_status
+                    ON dataset_integrity_attestation(status, dataset_id, dataset_version);
                 CREATE INDEX IF NOT EXISTS idx_dataset_catalog_source
                     ON dataset_catalog(source_type, updated_at);
                 CREATE INDEX IF NOT EXISTS idx_dataset_catalog_instrument
@@ -727,7 +811,16 @@ class AxiomStore:
             paper_state_columns = {str(row["name"]) for row in self._conn.execute("PRAGMA table_info(paper_state)").fetchall()}
             if "state_version" not in paper_state_columns:
                 self._conn.execute("ALTER TABLE paper_state ADD COLUMN state_version INTEGER NOT NULL DEFAULT 0")
+            attestation_columns = {
+                str(row["name"])
+                for row in self._conn.execute("PRAGMA table_info(dataset_integrity_attestation)").fetchall()
+            }
+            if "reason" not in attestation_columns:
+                self._conn.execute(
+                    "ALTER TABLE dataset_integrity_attestation ADD COLUMN reason TEXT NOT NULL DEFAULT ''"
+                )
             self._migrate_market_tables()
+            self._create_dataset_attestation_triggers()
     def _migrate_market_tables(self) -> None:
         """Upgrade pre-versioned market tables without discarding records."""
         for table, primary_key, index_name in (
@@ -1110,6 +1203,693 @@ class AxiomStore:
             rows = self._conn.execute(query, values).fetchall()
         return [_dataset_catalog_record(row) for row in rows]
 
+    # Dataset integrity attestations ---------------------------------
+    def load_dataset_integrity_attestation(
+        self, dataset_id: str, dataset_version: str | None = None
+    ) -> dict[str, Any] | None:
+        """Load the exact durable attestation without reconstructing history."""
+        clauses = ["dataset_id=?"]
+        values: list[Any] = [str(dataset_id)]
+        if dataset_version is not None:
+            clauses.append("dataset_version=?")
+            values.append(str(dataset_version))
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM dataset_integrity_attestation WHERE "
+                + " AND ".join(clauses)
+                + " ORDER BY verified_at DESC LIMIT 1",
+                values,
+            ).fetchone()
+        if row is None:
+            return None
+        bindings = _load(row["constituent_bindings_json"])
+        return {
+            "dataset_id": row["dataset_id"],
+            "dataset_version": row["dataset_version"],
+            "source_type": row["source_type"],
+            "market_type": row["market_type"],
+            "row_count": int(row["row_count"]),
+            "completeness": float(row["completeness"]),
+            "start_timestamp": _parse_datetime(row["start_timestamp"]),
+            "end_timestamp": _parse_datetime(row["end_timestamp"]),
+            "execution_fidelity": row["execution_fidelity"],
+            "historical_execution_fidelity": row["execution_fidelity"],
+            "contamination_result": row["contamination_result"],
+            "constituent_bindings": bindings if isinstance(bindings, list) else [],
+            "provenance_version": row["provenance_version"],
+            "policy_version": row["policy_version"],
+            "reason": row["reason"] if "reason" in row.keys() and row["reason"] else None,
+            "attestation_hash": row["attestation_hash"],
+            "verified_at": _parse_datetime(row["verified_at"]),
+            "status": row["status"],
+        }
+
+    get_dataset_integrity_attestation = load_dataset_integrity_attestation
+
+    def _prepare_dataset_integrity_attestation(
+        self,
+        dataset_id: str,
+        dataset_version: str,
+        attestation: Mapping[str, Any] | None = None,
+        **fields: Any,
+    ) -> tuple[Any, ...]:
+        """Normalize one attestation and return its durable column values."""
+        body = dict(attestation or {})
+        body.update(fields)
+        identifier = str(dataset_id).strip()
+        version = str(dataset_version).strip()
+        if not identifier or not version:
+            raise ValueError("attestation dataset identity is required")
+        status = str(body.get("status") or _DATASET_ATTESTATION_STATUS_STALE).upper()
+        if status not in {_DATASET_ATTESTATION_STATUS_CURRENT, _DATASET_ATTESTATION_STATUS_STALE}:
+            raise ValueError("attestation status must be CURRENT or STALE")
+        source_type = str(body.get("source_type") or "").strip().upper()
+        market_type = str(body.get("market_type") or "").strip().lower()
+        row_count = body.get("row_count", 0)
+        completeness = body.get("completeness", 0.0)
+        if isinstance(row_count, bool) or not isinstance(row_count, int) or row_count < 0:
+            raise ValueError("attestation row_count must be a non-negative integer")
+        completeness = float(completeness)
+        if not math.isfinite(completeness) or not 0.0 <= completeness <= 1.0:
+            raise ValueError("attestation completeness must be in [0, 1]")
+        bindings = body.get("constituent_bindings", body.get("constituents", []))
+        if not isinstance(bindings, list):
+            raise ValueError("attestation constituent_bindings must be a list")
+        if len(bindings) > _MAX_DATASET_ATTESTATION_CONSTITUENTS:
+            raise ValueError("attestation constituent_bindings exceeds 1000 entries")
+        verified_at = body.get("verified_at")
+        verified_iso = _iso(verified_at) if isinstance(verified_at, datetime) else str(verified_at or _now_iso())
+        start = body.get("start_timestamp")
+        end = body.get("end_timestamp")
+        start_iso = _iso(start) if isinstance(start, datetime) else (str(start) if start is not None else None)
+        end_iso = _iso(end) if isinstance(end, datetime) else (str(end) if end is not None else None)
+        reason = str(body.get("reason") or "").strip().upper()
+        canonical = {
+            "dataset_id": identifier,
+            "dataset_version": version,
+            "source_type": source_type,
+            "market_type": market_type,
+            "row_count": int(row_count),
+            "completeness": completeness,
+            "start_timestamp": start_iso,
+            "end_timestamp": end_iso,
+            "execution_fidelity": str(body.get("execution_fidelity") or body.get("historical_execution_fidelity") or "UNKNOWN").upper(),
+            "contamination_result": str(body.get("contamination_result") or "FAIL").upper(),
+            "constituent_bindings": bindings,
+            "provenance_version": str(body.get("provenance_version") or ""),
+            "policy_version": str(body.get("policy_version") or ""),
+        }
+        if reason:
+            canonical["reason"] = reason
+        expected_hash = "sha256:" + hashlib.sha256(_dump(canonical).encode("utf-8")).hexdigest()
+        attestation_hash = str(body.get("attestation_hash") or expected_hash)
+        if attestation_hash != expected_hash:
+            raise ValueError("attestation_hash does not match canonical attestation")
+        return (
+            identifier,
+            version,
+            source_type,
+            market_type,
+            int(row_count),
+            completeness,
+            start_iso,
+            end_iso,
+            canonical["execution_fidelity"],
+            canonical["contamination_result"],
+            _dump(bindings),
+            canonical["provenance_version"],
+            canonical["policy_version"],
+            reason,
+            attestation_hash,
+            verified_iso,
+            status,
+        )
+
+    def save_dataset_integrity_attestation(
+        self,
+        dataset_id: str,
+        dataset_version: str,
+        attestation: Mapping[str, Any] | None = None,
+        **fields: Any,
+    ) -> bool:
+        """Publish one attestation projection in a short writer transaction."""
+        values = self._prepare_dataset_integrity_attestation(
+            dataset_id,
+            dataset_version,
+            attestation,
+            **fields,
+        )
+        identifier, version = values[0], values[1]
+
+        def operation() -> bool:
+            with self._write_context():
+                self._conn.execute(
+                    "INSERT INTO dataset_integrity_attestation("
+                    "dataset_id,dataset_version,source_type,market_type,row_count,completeness,"
+                    "start_timestamp,end_timestamp,execution_fidelity,contamination_result,"
+                    "constituent_bindings_json,provenance_version,policy_version,reason,attestation_hash,verified_at,status"
+                    ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                    "ON CONFLICT(dataset_id,dataset_version) DO UPDATE SET "
+                    "source_type=excluded.source_type,market_type=excluded.market_type,row_count=excluded.row_count,"
+                    "completeness=excluded.completeness,start_timestamp=excluded.start_timestamp,"
+                    "end_timestamp=excluded.end_timestamp,execution_fidelity=excluded.execution_fidelity,"
+                    "contamination_result=excluded.contamination_result,constituent_bindings_json=excluded.constituent_bindings_json,"
+                    "provenance_version=excluded.provenance_version,policy_version=excluded.policy_version,"
+                    "reason=excluded.reason,attestation_hash=excluded.attestation_hash,verified_at=excluded.verified_at,"
+                    "status=excluded.status",
+                    values,
+                )
+            return True
+
+        return bool(sqlite_retry(operation, operation_name=f"save dataset attestation {identifier}/{version}"))
+
+    def invalidate_dataset_integrity_attestation(
+        self, dataset_id: str, dataset_version: str, *, reason: str | None = None
+    ) -> bool:
+        """Fence a prior attestation after immutable identity changes."""
+        identifier = str(dataset_id).strip()
+        version = str(dataset_version).strip()
+        reason_value = str(reason or "").strip().upper()
+
+        def operation() -> bool:
+            with self._write_context():
+                row = self._conn.execute(
+                    "SELECT * FROM dataset_integrity_attestation "
+                    "WHERE dataset_id=? AND dataset_version=?",
+                    (identifier, version),
+                ).fetchone()
+                if row is None or row["status"] == _DATASET_ATTESTATION_STATUS_STALE:
+                    return False
+                if reason_value:
+                    bindings = _load(row["constituent_bindings_json"])
+                    canonical = {
+                        "dataset_id": row["dataset_id"],
+                        "dataset_version": row["dataset_version"],
+                        "source_type": row["source_type"],
+                        "market_type": row["market_type"],
+                        "row_count": int(row["row_count"]),
+                        "completeness": float(row["completeness"]),
+                        "start_timestamp": row["start_timestamp"],
+                        "end_timestamp": row["end_timestamp"],
+                        "execution_fidelity": row["execution_fidelity"],
+                        "contamination_result": row["contamination_result"],
+                        "constituent_bindings": bindings if isinstance(bindings, list) else [],
+                        "provenance_version": row["provenance_version"],
+                        "policy_version": row["policy_version"],
+                        "reason": reason_value,
+                    }
+                    attestation_hash = "sha256:" + hashlib.sha256(_dump(canonical).encode("utf-8")).hexdigest()
+                    changed = self._conn.execute(
+                        "UPDATE dataset_integrity_attestation SET status=?,reason=?,attestation_hash=? "
+                        "WHERE dataset_id=? AND dataset_version=? AND status<>?",
+                        (
+                            _DATASET_ATTESTATION_STATUS_STALE,
+                            reason_value,
+                            attestation_hash,
+                            identifier,
+                            version,
+                            _DATASET_ATTESTATION_STATUS_STALE,
+                        ),
+                    ).rowcount
+                else:
+                    changed = self._conn.execute(
+                        "UPDATE dataset_integrity_attestation SET status=? "
+                        "WHERE dataset_id=? AND dataset_version=? AND status<>?",
+                        (
+                            _DATASET_ATTESTATION_STATUS_STALE,
+                            identifier,
+                            version,
+                            _DATASET_ATTESTATION_STATUS_STALE,
+                        ),
+                    ).rowcount
+            return bool(changed)
+
+        return bool(sqlite_retry(operation, operation_name=f"invalidate dataset attestation {identifier}/{version}"))
+
+    def _snapshot_read_connection(self) -> sqlite3.Connection:
+        """Open a dedicated read snapshot; never share the writer handle."""
+        filename = self._database_filename()
+        if filename and filename not in {":memory:", ""} and not filename.startswith("file::memory:"):
+            connection = sqlite3.connect(
+                self.path,
+                timeout=self._sqlite_timeout_seconds,
+                check_same_thread=False,
+                uri=self.path.startswith("file:"),
+            )
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA query_only=ON")
+            return connection
+        # ``:memory:`` has no independently addressable database.  Serialize
+        # while holding the lock, then release it before doing any historical
+        # scan.  ``Connection.backup`` waits forever when the source owns an
+        # active SAVEPOINT (the normal queue-processing transaction).
+        connection = sqlite3.connect(":memory:", check_same_thread=False)
+        connection.row_factory = sqlite3.Row
+        with self._lock:
+            connection.deserialize(self._conn.serialize())
+        connection.execute("PRAGMA query_only=ON")
+        return connection
+
+    @staticmethod
+    def _attestation_values(
+        connection: sqlite3.Connection,
+        dataset_id: str,
+        dataset_version: str,
+        market_id: str | None = None,
+    ) -> tuple[bool, int, datetime | None, datetime | None, str, bool]:
+        """Read exact immutable/legacy rows and return bounded integrity facts."""
+        dataset_row = connection.execute(
+            "SELECT payload_json,quality FROM datasets WHERE dataset_id=? AND version=?",
+            (dataset_id, dataset_version),
+        ).fetchone()
+        values: list[Mapping[str, Any]] = []
+        fidelity = "UNKNOWN"
+        if dataset_row is not None:
+            try:
+                loaded = _load(dataset_row["payload_json"])
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return False, 0, None, None, "UNKNOWN", False
+            if not isinstance(loaded, Sequence) or isinstance(loaded, (str, bytes, Mapping)):
+                return False, 0, None, None, "UNKNOWN", False
+            values = [item for item in loaded if isinstance(item, Mapping)]
+            if len(values) != len(loaded):
+                return False, len(values), None, None, "UNKNOWN", False
+            fidelity = str(dataset_row["quality"] or "UNKNOWN").upper()
+        elif market_id is not None:
+            rows = connection.execute(
+                "SELECT snapshot_id,source_timestamp,observed_at,payload_json,quality "
+                "FROM polymarket_snapshots WHERE market_id=? ORDER BY source_timestamp,snapshot_id",
+                (market_id,),
+            ).fetchall()
+            historical: list[Mapping[str, Any]] = []
+            identities: list[dict[str, Any]] = []
+            for row in rows:
+                try:
+                    payload = _load(row["payload_json"])
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    return False, 0, None, None, "UNKNOWN", False
+                if not isinstance(payload, Mapping):
+                    return False, 0, None, None, "UNKNOWN", False
+                if str(payload.get("source_type", "")).strip().upper() != "HISTORICAL":
+                    continue
+                timestamp = _parse_datetime(row["source_timestamp"])
+                if timestamp is None:
+                    return False, 0, None, None, "UNKNOWN", False
+                if payload.get("market_id") is not None and str(payload["market_id"]).strip() != market_id:
+                    return False, 0, None, None, "UNKNOWN", False
+                price = payload.get("price", payload.get("p", payload.get("yes_mid", payload.get("value"))))
+                try:
+                    price_value = float(price)
+                except (TypeError, ValueError):
+                    return False, 0, None, None, "UNKNOWN", False
+                if not math.isfinite(price_value) or not 0.0 <= price_value <= 1.0:
+                    return False, 0, None, None, "UNKNOWN", False
+                token_id = str(payload.get("token_id", payload.get("asset_id", market_id)) or market_id)
+                identity: dict[str, Any] = {"timestamp": timestamp, "price": price_value, "token_id": token_id}
+                order_book = payload.get("order_book", payload.get("book"))
+                if order_book is not None:
+                    identity["order_book"] = order_book
+                identities.append(identity)
+                historical.append(payload)
+                fidelity = str(row["quality"] or payload.get("quality") or payload.get("research_quality") or "UNKNOWN").upper()
+            if dataset_version.startswith("sha256:"):
+                expected = "sha256:" + hashlib.sha256(_dump(identities).encode("utf-8")).hexdigest()
+                if expected != dataset_version:
+                    return False, len(historical), None, None, fidelity, False
+            values = historical
+        else:
+            return False, 0, None, None, "UNKNOWN", False
+        timestamps: list[datetime] = []
+        contaminated = False
+        for value in values:
+            source_type = str(value.get("source_type", "HISTORICAL")).strip().upper()
+            if source_type != "HISTORICAL":
+                contaminated = True
+            stamp = _parse_datetime(value.get("source_timestamp", value.get("timestamp", value.get("time"))))
+            if stamp is None:
+                return False, len(values), None, None, fidelity, contaminated
+            timestamps.append(stamp)
+        return (
+            bool(values) and not contaminated,
+            len(values),
+            min(timestamps) if timestamps else None,
+            max(timestamps) if timestamps else None,
+            fidelity,
+            contaminated,
+        )
+
+    def _verify_dataset_integrity_snapshot(
+        self, connection: sqlite3.Connection, dataset_id: str, dataset_version: str
+    ) -> dict[str, Any]:
+        row = connection.execute(
+            "SELECT * FROM dataset_catalog WHERE dataset_id=? AND dataset_version=?",
+            (dataset_id, dataset_version),
+        ).fetchone()
+        now = _now_iso()
+        if row is None:
+            canonical = {
+                "dataset_id": dataset_id,
+                "dataset_version": dataset_version,
+                "source_type": "",
+                "market_type": "",
+                "row_count": 0,
+                "completeness": 0.0,
+                "start_timestamp": None,
+                "end_timestamp": None,
+                "execution_fidelity": "UNKNOWN",
+                "contamination_result": "FAIL",
+                "constituent_bindings": [],
+                "provenance_version": "",
+                "policy_version": "",
+                "reason": "DATASET_CATALOG_NOT_FOUND",
+            }
+            return {
+                **canonical,
+                "attestation_hash": "sha256:" + hashlib.sha256(_dump(canonical).encode("utf-8")).hexdigest(),
+                "verified_at": now,
+                "status": _DATASET_ATTESTATION_STATUS_STALE,
+                "reason": "DATASET_CATALOG_NOT_FOUND",
+            }
+        catalog = _dataset_catalog_record(row)
+        metadata = catalog.get("metadata") if isinstance(catalog.get("metadata"), Mapping) else {}
+        source_type = str(catalog.get("source_type") or "").upper()
+        market_type = str(catalog.get("market_type") or "").lower()
+        expected_count = catalog.get("row_count")
+        completeness = float(catalog.get("completeness") or 0.0)
+        fidelity = str(metadata.get("research_quality") or catalog.get("quality") or "UNKNOWN").upper()
+        if metadata.get("historical_order_book_available") is True:
+            fidelity = "TIMESTAMPED_DEPTH"
+        bindings: list[dict[str, Any]] = []
+        reasons: list[str] = []
+        observed_count = 0
+        observed_start: datetime | None = None
+        observed_end: datetime | None = None
+        contaminated = False
+        market_versions = metadata.get("market_versions")
+        if isinstance(market_versions, Sequence) and not isinstance(market_versions, (str, bytes)):
+            if len(market_versions) > _MAX_DATASET_ATTESTATION_CONSTITUENTS:
+                reasons.append("CONSTITUENT_LIMIT_EXCEEDED")
+            for item in market_versions[:_MAX_DATASET_ATTESTATION_CONSTITUENTS]:
+                if not isinstance(item, Mapping):
+                    reasons.append("CONSTITUENT_BINDING_INVALID")
+                    continue
+                market_id = str(item.get("market_id") or "").strip()
+                constituent_id = str(item.get("dataset_id") or (f"prediction:{market_id}" if market_id else "")).strip()
+                constituent_version = str(item.get("dataset_version") or item.get("version") or "").strip()
+                item_count = item.get("row_count", item.get("records"))
+                if not market_id or constituent_id != f"prediction:{market_id}" or not constituent_version:
+                    reasons.append("CONSTITUENT_BINDING_INVALID")
+                    continue
+                if isinstance(item_count, bool) or not isinstance(item_count, int) or item_count < 0:
+                    reasons.append("CONSTITUENT_ROW_COUNT_INVALID")
+                    continue
+                constituent_row = connection.execute(
+                    "SELECT * FROM dataset_catalog WHERE dataset_id=? AND dataset_version=?",
+                    (constituent_id, constituent_version),
+                ).fetchone()
+                if constituent_row is None:
+                    reasons.append("CONSTITUENT_CATALOG_NOT_FOUND")
+                    continue
+                constituent = _dataset_catalog_record(constituent_row)
+                if (
+                    str(constituent.get("source_type") or "").upper() != "HISTORICAL"
+                    or str(constituent.get("market_type") or "").lower() != "prediction"
+                    or int(constituent.get("row_count") or -1) != item_count
+                ):
+                    reasons.append("CONSTITUENT_CATALOG_MISMATCH")
+                    continue
+                ok, count, start, end, constituent_fidelity, is_contaminated = self._attestation_values(
+                    connection, constituent_id, constituent_version, market_id
+                )
+                if not ok or count != item_count:
+                    reasons.append("CONSTITUENT_ROWS_INVALID")
+                if is_contaminated:
+                    contaminated = True
+                if start is not None:
+                    observed_start = start if observed_start is None else min(observed_start, start)
+                    observed_end = end if observed_end is None else max(observed_end, end)
+                bindings.append(
+                    {
+                        "dataset_id": constituent_id,
+                        "dataset_version": constituent_version,
+                        "row_count": int(item_count),
+                    }
+                )
+                if constituent_fidelity == "TIMESTAMPED_DEPTH":
+                    fidelity = "TIMESTAMPED_DEPTH"
+                observed_count += count
+        else:
+            market_id = str(metadata.get("market_id") or "").strip() or None
+            ok, observed_count, observed_start, observed_end, observed_fidelity, is_contaminated = self._attestation_values(
+                connection, dataset_id, dataset_version, market_id
+            )
+            if not ok:
+                reasons.append("DATASET_ROWS_INVALID")
+            contaminated = contaminated or is_contaminated
+            if observed_fidelity != "UNKNOWN":
+                fidelity = observed_fidelity
+        start = _parse_datetime(catalog.get("start_timestamp"))
+        end = _parse_datetime(catalog.get("end_timestamp"))
+        if source_type != "HISTORICAL" or market_type != "prediction":
+            reasons.append("DATASET_PROVENANCE_INVALID")
+        if isinstance(expected_count, bool) or not isinstance(expected_count, int) or expected_count != observed_count:
+            reasons.append("ROW_COUNT_MISMATCH")
+        if completeness < 1.0:
+            reasons.append("INCOMPLETE_DATASET")
+        if expected_count and (start is None or end is None or observed_start != start or observed_end != end):
+            reasons.append("BOUNDS_MISMATCH")
+        if contaminated:
+            reasons.append("FORWARD_CONTAMINATION")
+        # Contamination is the strongest exact failure and must survive the
+        # bounded attestation projection even when row parsing also failed.
+        failure_reason = "FORWARD_CONTAMINATION" if contaminated else (reasons[0] if reasons else "")
+        canonical = {
+            "dataset_id": dataset_id,
+            "dataset_version": dataset_version,
+            "source_type": source_type,
+            "market_type": market_type,
+            "row_count": int(expected_count) if isinstance(expected_count, int) and not isinstance(expected_count, bool) else 0,
+            "completeness": completeness,
+            "start_timestamp": _iso(start) if start is not None else None,
+            "end_timestamp": _iso(end) if end is not None else None,
+            "execution_fidelity": fidelity,
+            "contamination_result": "FAIL" if contaminated or reasons else "PASS",
+            "constituent_bindings": bindings,
+            "provenance_version": str(metadata.get("provenance_version") or metadata.get("dataset_provenance_version") or "dataset-provenance-v1"),
+            "policy_version": str(metadata.get("policy_version") or "prediction-integrity-v1"),
+        }
+        if failure_reason:
+            canonical["reason"] = failure_reason
+        identity_payload = {
+            key: catalog.get(key)
+            for key in (
+                "dataset_id",
+                "dataset_version",
+                "provider",
+                "instrument",
+                "market_type",
+                "timeframe",
+                "start_timestamp",
+                "end_timestamp",
+                "row_count",
+                "completeness",
+                "missing_ranges",
+                "quality",
+                "source_type",
+                "snapshot_id",
+                "metadata",
+            )
+        }
+        return {
+            **canonical,
+            "attestation_hash": "sha256:" + hashlib.sha256(_dump(canonical).encode("utf-8")).hexdigest(),
+            "verified_at": now,
+            "status": _DATASET_ATTESTATION_STATUS_CURRENT if not reasons else _DATASET_ATTESTATION_STATUS_STALE,
+            "reason": failure_reason or None,
+            "_catalog_identity": hashlib.sha256(_dump(identity_payload).encode("utf-8")).hexdigest(),
+        }
+
+    def verify_dataset_integrity_attestation(
+        self, dataset_id: str, dataset_version: str, *, force: bool = False
+    ) -> dict[str, Any]:
+        """Verify legacy rows outside the writer lock, then publish with CAS."""
+        identifier, version = str(dataset_id).strip(), str(dataset_version).strip()
+        if not identifier or not version:
+            raise ValueError("dataset identity is required")
+
+        # This token is the publication fence.  The snapshot verifier may run
+        # for a long time, so every mutable row field used by the projection
+        # must still be the same before an update is allowed.
+        with self._lock:
+            existing_row = self._conn.execute(
+                "SELECT dataset_id,dataset_version,attestation_hash,verified_at,status,policy_version "
+                "FROM dataset_integrity_attestation WHERE dataset_id=? AND dataset_version=?",
+                (identifier, version),
+            ).fetchone()
+        existing_token = (
+            tuple(existing_row[column] for column in ("dataset_id", "dataset_version", "attestation_hash", "verified_at", "status", "policy_version"))
+            if existing_row is not None
+            else None
+        )
+        if not force and existing_row is not None and str(existing_row["status"]) == _DATASET_ATTESTATION_STATUS_CURRENT:
+            existing = self.load_dataset_integrity_attestation(identifier, version)
+            if isinstance(existing, Mapping):
+                return dict(existing)
+
+        filename = self._database_filename()
+        if (
+            (not filename or filename == ":memory:" or filename.startswith("file::memory:"))
+            and self._transaction_depth
+        ):
+            # SQLite cannot back up an in-memory connection while that same
+            # connection owns an open write transaction.  Tests and embedded
+            # callers may verify the transaction-local snapshot directly.
+            with self._lock:
+                result = self._verify_dataset_integrity_snapshot(
+                    self._conn,
+                    identifier,
+                    version,
+                )
+        else:
+            snapshot = self._snapshot_read_connection()
+            try:
+                result = self._verify_dataset_integrity_snapshot(
+                    snapshot,
+                    identifier,
+                    version,
+                )
+            finally:
+                snapshot.close()
+
+        snapshot_identity = result.get("_catalog_identity")
+        requested_policy = str(result.get("policy_version") or "")
+        body: dict[str, Any]
+        cas_lost = False
+        winner_exists = False
+        current_catalog_identity: str | None = None
+
+        with self.transaction(immediate=True):
+            current = self._conn.execute(
+                "SELECT * FROM dataset_catalog WHERE dataset_id=? AND dataset_version=?",
+                (identifier, version),
+            ).fetchone()
+            if current is None:
+                result["status"] = _DATASET_ATTESTATION_STATUS_STALE
+                result["reason"] = result.get("reason") or "DATASET_CATALOG_NOT_FOUND"
+            else:
+                current_identity = _dataset_catalog_record(current)
+                identity_payload = {
+                    key: current_identity.get(key)
+                    for key in (
+                        "dataset_id",
+                        "dataset_version",
+                        "provider",
+                        "instrument",
+                        "market_type",
+                        "timeframe",
+                        "start_timestamp",
+                        "end_timestamp",
+                        "row_count",
+                        "completeness",
+                        "missing_ranges",
+                        "quality",
+                        "source_type",
+                        "snapshot_id",
+                        "metadata",
+                    )
+                }
+                current_catalog_identity = hashlib.sha256(_dump(identity_payload).encode("utf-8")).hexdigest()
+                if snapshot_identity is not None and current_catalog_identity != snapshot_identity:
+                    result["status"] = _DATASET_ATTESTATION_STATUS_STALE
+                    result["reason"] = result.get("reason") or "DATASET_CATALOG_IDENTITY_CHANGED"
+
+            body = dict(result)
+            body.pop("_catalog_identity", None)
+            values = self._prepare_dataset_integrity_attestation(identifier, version, body)
+            if existing_token is None:
+                changed = self._conn.execute(
+                    "INSERT INTO dataset_integrity_attestation("
+                    "dataset_id,dataset_version,source_type,market_type,row_count,completeness,"
+                    "start_timestamp,end_timestamp,execution_fidelity,contamination_result,"
+                    "constituent_bindings_json,provenance_version,policy_version,reason,attestation_hash,verified_at,status"
+                    ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                    "ON CONFLICT(dataset_id,dataset_version) DO NOTHING",
+                    values,
+                ).rowcount
+            else:
+                changed = self._conn.execute(
+                    "UPDATE dataset_integrity_attestation SET "
+                    "source_type=?,market_type=?,row_count=?,completeness=?,start_timestamp=?,end_timestamp=?,"
+                    "execution_fidelity=?,contamination_result=?,constituent_bindings_json=?,provenance_version=?,"
+                    "policy_version=?,reason=?,attestation_hash=?,verified_at=?,status=? "
+                    "WHERE dataset_id=? AND dataset_version=? AND attestation_hash=? AND verified_at=? "
+                    "AND status=? AND policy_version=?",
+                    tuple(values[2:])
+                    + (
+                        existing_token[0],
+                        existing_token[1],
+                        existing_token[2],
+                        existing_token[3],
+                        existing_token[4],
+                        existing_token[5],
+                    ),
+                ).rowcount
+            if changed != 1:
+                cas_lost = True
+                winner_exists = (
+                    self._conn.execute(
+                        "SELECT 1 FROM dataset_integrity_attestation "
+                        "WHERE dataset_id=? AND dataset_version=?",
+                        (identifier, version),
+                    ).fetchone()
+                    is not None
+                )
+
+        winner = self.load_dataset_integrity_attestation(identifier, version) if winner_exists else None
+        if cas_lost:
+            winner_matches_request = (
+                isinstance(winner, Mapping)
+                and str(winner.get("status") or "").upper() == _DATASET_ATTESTATION_STATUS_CURRENT
+                and str(winner.get("policy_version") or "") == requested_policy
+                and snapshot_identity is not None
+                and current_catalog_identity == snapshot_identity
+            )
+            if winner_matches_request:
+                return dict(winner)
+            failed = dict(winner) if isinstance(winner, Mapping) else dict(body)
+            failed["status"] = _DATASET_ATTESTATION_STATUS_STALE
+            failed["reason"] = "ATTESTATION_CAS_LOST"
+            return failed
+        return winner or body
+
+    verify_dataset_integrity = verify_dataset_integrity_attestation
+    ensure_dataset_integrity = verify_dataset_integrity_attestation
+    load_dataset_attestation = load_dataset_integrity_attestation
+    save_dataset_attestation = save_dataset_integrity_attestation
+
+    def _create_dataset_attestation_triggers(self) -> None:
+        """Stale attestations when either catalog identity or payload identity changes."""
+        self._conn.executescript(
+            """
+            DROP TRIGGER IF EXISTS dataset_catalog_attestation_identity_update;
+            DROP TRIGGER IF EXISTS datasets_attestation_identity_update;
+            CREATE TRIGGER dataset_catalog_attestation_identity_update
+            AFTER UPDATE OF dataset_id,dataset_version,provider,instrument,market_type,timeframe,start_timestamp,end_timestamp,
+                row_count,completeness,missing_ranges_json,quality,source_type,snapshot_id,metadata_json
+            ON dataset_catalog BEGIN
+                UPDATE dataset_integrity_attestation SET status='STALE'
+                WHERE (dataset_id=OLD.dataset_id AND dataset_version=OLD.dataset_version)
+                   OR (dataset_id=NEW.dataset_id AND dataset_version=NEW.dataset_version);
+            END;
+            CREATE TRIGGER datasets_attestation_identity_update
+            AFTER UPDATE OF dataset_id,version,payload_json,metadata_json,quality
+            ON datasets BEGIN
+                UPDATE dataset_integrity_attestation SET status='STALE'
+                WHERE (dataset_id=OLD.dataset_id AND dataset_version=OLD.version)
+                   OR (dataset_id=NEW.dataset_id AND dataset_version=NEW.version);
+            END;
+            """
+        )
     def save_dataset_bootstrap_state(self, dataset_id: str, payload: Mapping[str, Any]) -> None:
         identifier = str(dataset_id).strip()
         if not identifier:
@@ -1387,6 +2167,8 @@ class AxiomStore:
             return []
         market_versions = aggregate_metadata.get("market_versions")
         if not isinstance(market_versions, Sequence) or isinstance(market_versions, (str, bytes)):
+            return []
+        if len(market_versions) > _MAX_DATASET_ATTESTATION_CONSTITUENTS:
             return []
         aggregate_count = catalog.get("row_count")
         if isinstance(aggregate_count, bool) or not isinstance(aggregate_count, int) or aggregate_count < 0:
@@ -2538,8 +3320,9 @@ class AxiomStore:
         """Report research-evidence maturity separately from collector health."""
         current = ensure_utc(now or utc_now())
         cutoff = current.isoformat()
-        with self._lock:
-            market_row = self._conn.execute(
+        snapshot = self._snapshot_read_connection()
+        try:
+            market_row = snapshot.execute(
                 "WITH market_ids AS ("
                 "SELECT market_id FROM polymarket_markets "
                 "WHERE rowid > COALESCE((SELECT MAX(rowid)-? FROM polymarket_markets),0) AND observed_at <= ? "
@@ -2548,7 +3331,7 @@ class AxiomStore:
                 ") SELECT COUNT(*) AS market_count FROM market_ids",
                 (_MAX_EVIDENCE_SCAN_ROWS, cutoff, _MAX_EVIDENCE_SCAN_ROWS, cutoff),
             ).fetchone()
-            snapshot_row = self._conn.execute(
+            snapshot_row = snapshot.execute(
                 "SELECT COUNT(*) AS snapshot_count, "
                 "COUNT(DISTINCT market_id) AS snapshot_markets, "
                 "SUM(CASE WHEN quality = 'ORDER_BOOK_SIMULATED' THEN 1 ELSE 0 END) AS book_snapshots, "
@@ -2567,7 +3350,7 @@ class AxiomStore:
                 "WHERE rowid > COALESCE((SELECT MAX(rowid)-? FROM polymarket_snapshots),0) AND observed_at <= ?",
                 (_MAX_EVIDENCE_SCAN_ROWS, cutoff),
             ).fetchone()
-            regime_row = self._conn.execute(
+            regime_row = snapshot.execute(
                 "SELECT COUNT(*) AS regime_count FROM ("
                 "SELECT DISTINCT CASE WHEN json_valid(payload_json) THEN "
                 "  CASE "
@@ -2583,7 +3366,7 @@ class AxiomStore:
                 ") WHERE regime IS NOT NULL",
                 (_MAX_EVIDENCE_SCAN_ROWS, cutoff),
             ).fetchone()
-            trade_row = self._conn.execute(
+            trade_row = snapshot.execute(
                 "WITH market_ids AS ("
                 "SELECT market_id FROM polymarket_markets "
                 "WHERE rowid > COALESCE((SELECT MAX(rowid)-? FROM polymarket_markets),0) AND observed_at <= ? "
@@ -2595,6 +3378,8 @@ class AxiomStore:
                 "WHERE trades.rowid > COALESCE((SELECT MAX(rowid)-? FROM polymarket_trades),0) AND trades.timestamp <= ?",
                 (_MAX_EVIDENCE_SCAN_ROWS, cutoff, _MAX_EVIDENCE_SCAN_ROWS, cutoff, _MAX_EVIDENCE_SCAN_ROWS, cutoff),
             ).fetchone()
+        finally:
+            snapshot.close()
         market_count = int((market_row["market_count"] if market_row else 0) or 0)
         snapshot_count = int((snapshot_row["snapshot_count"] if snapshot_row else 0) or 0)
         snapshot_markets = int((snapshot_row["snapshot_markets"] if snapshot_row else 0) or 0)
@@ -2745,33 +3530,34 @@ class AxiomStore:
             if isinstance(scheduled_values, (list, tuple, set, frozenset))
             else set()
         )
-        with self._lock:
-            latest_rows = self._conn.execute(
+        snapshot = self._snapshot_read_connection()
+        try:
+            latest_rows = snapshot.execute(
                 "SELECT market_id,observed_at,payload_json FROM ("
                 "SELECT market_id,observed_at,payload_json,"
                 "ROW_NUMBER() OVER (PARTITION BY market_id ORDER BY observed_at DESC,source_timestamp DESC,snapshot_id DESC) AS row_number "
                 "FROM polymarket_snapshots WHERE source_type='FORWARD_COLLECTED' AND observed_at>=? AND observed_at<=?) WHERE row_number=1",
                 (latest_window_iso, current_iso),
             ).fetchall()
-            recent_rows = self._conn.execute(
+            recent_rows = snapshot.execute(
                 "SELECT market_id,observed_at FROM polymarket_snapshots "
                 "WHERE source_type='FORWARD_COLLECTED' AND observed_at>=? AND observed_at<=? "
                 "ORDER BY market_id,observed_at,source_timestamp,snapshot_id",
                 (window_iso, current_iso),
             ).fetchall()
-            error_rows = self._conn.execute(
+            error_rows = snapshot.execute(
                 "SELECT error_id,market_id,observed_at,kind,detail,payload_json FROM collection_errors "
                 "WHERE source_type='FORWARD_COLLECTED' AND observed_at>=? AND observed_at<=? "
                 "AND rowid > COALESCE((SELECT MAX(rowid)-? FROM collection_errors WHERE source_type='FORWARD_COLLECTED'),0) "
                 "ORDER BY observed_at,error_id LIMIT 256",
                 (window_iso, current_iso, _MAX_LATEST_SCAN_ROWS),
             ).fetchall()
-            historical_error_count = int(self._conn.execute(
+            historical_error_count = int(snapshot.execute(
                 "SELECT COUNT(*) AS n FROM collection_errors WHERE source_type='HISTORICAL' "
                 "AND rowid > COALESCE((SELECT MAX(rowid)-? FROM collection_errors WHERE source_type='HISTORICAL'),0) AND observed_at<=?",
                 (_MAX_EVIDENCE_SCAN_ROWS, current_iso),
             ).fetchone()["n"])
-            trade_count = int(self._conn.execute(
+            trade_count = int(snapshot.execute(
                 "SELECT COUNT(*) AS n FROM ("
                 "SELECT trade_key FROM polymarket_trades "
                 "WHERE timestamp>=? AND timestamp<=? "
@@ -2779,11 +3565,13 @@ class AxiomStore:
                 ")",
                 (window_iso, current_iso, _MAX_LATEST_SCAN_ROWS),
             ).fetchone()["n"])
-            metadata_count = int(self._conn.execute(
+            metadata_count = int(snapshot.execute(
                 "SELECT COUNT(*) AS n FROM polymarket_markets "
                 "WHERE source_type='FORWARD_COLLECTED' AND observed_at>=? AND observed_at<=?",
                 (latest_window_iso, current_iso),
             ).fetchone()["n"])
+        finally:
+            snapshot.close()
         tracked = self.tracked_polymarket_markets(active_only=True, now=current, include_payload=True, limit=1000)
         active_markets = (
             set(scheduled_market_ids)
@@ -3680,6 +4468,307 @@ class AxiomStore:
         result = {str(row["status"]): int(row["n"]) for row in rows}
         result["total"] = sum(result.values())
         return result
+    def research_feed_status(
+        self,
+        *,
+        now: datetime | None = None,
+        hermes_job_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Return one bounded, read-only research-feed status projection.
+
+        The Hermes job is external to this process, so local scheduler state is
+        intentionally projected only as ``internal_queue`` evidence.  Every
+        aggregate below is computed in SQLite; this method never hydrates queue
+        or lifecycle rows and never performs qualification, network, or write
+        operations.
+        """
+        current = ensure_utc(now or utc_now())
+        current_iso = current.isoformat()
+        window_start = (current - timedelta(days=1)).isoformat()
+        accepted_sql = (
+            "(status='ACCEPTED' OR "
+            "(status='COMPLETED' AND json_valid(COALESCE(result_json,''))=1 "
+            "AND json_extract(result_json,'$.accepted')=1))"
+        )
+
+        with self._lock:
+            proposal_row = self._conn.execute(
+                "SELECT "
+                "MAX(CASE WHEN created_at<=? THEN created_at END) AS latest_submitted_at,"
+                "MAX(CASE WHEN " + accepted_sql + " AND updated_at<=? THEN updated_at END) AS latest_accepted_at,"
+                "COALESCE(SUM(CASE WHEN created_at>=? AND created_at<=? THEN 1 ELSE 0 END),0) AS submitted_24h,"
+                "COALESCE(SUM(CASE WHEN " + accepted_sql + " AND updated_at>=? AND updated_at<=? THEN 1 ELSE 0 END),0) AS accepted_24h,"
+                "COALESCE(SUM(CASE WHEN status='REJECTED' AND updated_at>=? AND updated_at<=? THEN 1 ELSE 0 END),0) AS rejected_24h,"
+                "COALESCE(SUM(CASE WHEN status='FAILED' AND updated_at>=? AND updated_at<=? THEN 1 ELSE 0 END),0) AS failed_24h,"
+                "COALESCE(SUM(CASE WHEN status='COMPLETED' THEN 1 ELSE 0 END),0) AS completed,"
+                "COALESCE(SUM(CASE WHEN status='PENDING' THEN 1 ELSE 0 END),0) AS pending,"
+                "COALESCE(SUM(CASE WHEN status='TESTING' AND lease_until IS NOT NULL AND lease_until>? THEN 1 ELSE 0 END),0) AS processing,"
+                "COALESCE(SUM(CASE WHEN status='REJECTED' THEN 1 ELSE 0 END),0) AS rejected,"
+                "COALESCE(SUM(CASE WHEN updated_at>=? AND updated_at<=? "
+                "AND status IN ('ACCEPTED','COMPLETED','REJECTED','FAILED') THEN 1 ELSE 0 END),0) AS terminal_24h "
+                "FROM research_queue WHERE lower(item_type)='hypothesis'",
+                (
+                    current_iso,
+                    current_iso,
+                    window_start,
+                    current_iso,
+                    window_start,
+                    current_iso,
+                    window_start,
+                    current_iso,
+                    window_start,
+                    current_iso,
+                    current_iso,
+                    window_start,
+                    current_iso,
+                ),
+            ).fetchone()
+            candidate_row = self._conn.execute(
+                "SELECT COUNT(*) AS total,"
+                "COALESCE(SUM(CASE WHEN stage='IDEA' THEN 1 ELSE 0 END),0) AS new,"
+                "COALESCE(SUM(CASE WHEN stage='REJECTED' THEN 1 ELSE 0 END),0) AS rejected "
+                "FROM candidate_lifecycle"
+            ).fetchone()
+            candidate_event_row = self._conn.execute(
+                "SELECT "
+                "MAX(CASE WHEN from_stage IS NULL AND to_stage='IDEA' AND created_at<=? THEN created_at END) AS latest_created_at,"
+                "COALESCE(SUM(CASE WHEN from_stage IS NULL AND to_stage='IDEA' THEN 1 ELSE 0 END),0) AS idea_events,"
+                "COALESCE(SUM(CASE WHEN from_stage IS NULL AND to_stage='IDEA' AND created_at>=? AND created_at<=? THEN 1 ELSE 0 END),0) AS created_24h,"
+                "COALESCE(SUM(CASE WHEN from_stage IS NULL AND to_stage='IDEA' AND created_at>=? AND created_at<=? "
+                "AND json_valid(COALESCE(payload_json,''))=1 "
+                "AND (NULLIF(TRIM(COALESCE(json_extract(payload_json,'$.parent_id'),'')),'') IS NOT NULL "
+                "OR NULLIF(TRIM(COALESCE(json_extract(payload_json,'$.lineage[0]'),'')),'') IS NOT NULL) "
+                "THEN 1 ELSE 0 END),0) AS mutations_24h "
+                "FROM candidate_lifecycle_events",
+                (current_iso, window_start, current_iso, window_start, current_iso),
+            ).fetchone()
+            # AxiomStore creates lifecycle events for normal writes.  This
+            # fallback keeps the aggregate useful for older/imported rows that
+            # predate that event table's creation.
+            candidate_fallback_row = None
+            if candidate_event_row is None or int(candidate_event_row["idea_events"] or 0) == 0:
+                candidate_fallback_row = self._conn.execute(
+                    "SELECT "
+                    "MAX(CASE WHEN updated_at<=? THEN updated_at END) AS latest_created_at,"
+                    "COALESCE(SUM(CASE WHEN updated_at>=? AND updated_at<=? THEN 1 ELSE 0 END),0) AS created_24h,"
+                    "COALESCE(SUM(CASE WHEN updated_at>=? AND updated_at<=? "
+                    "AND json_valid(COALESCE(payload_json,''))=1 "
+                    "AND (NULLIF(TRIM(COALESCE(json_extract(payload_json,'$.parent_id'),'')),'') IS NOT NULL "
+                    "OR NULLIF(TRIM(COALESCE(json_extract(payload_json,'$.lineage[0]'),'')),'') IS NOT NULL) "
+                    "THEN 1 ELSE 0 END),0) AS mutations_24h "
+                    "FROM candidate_lifecycle",
+                    (current_iso, window_start, current_iso, window_start, current_iso),
+                ).fetchone()
+            scheduler_row = self._conn.execute(
+                "SELECT state_json FROM scheduler_state WHERE scheduler_name='hermes-control'"
+            ).fetchone()
+            worker_row = self._conn.execute(
+                "SELECT status,payload_json,updated_at FROM worker_state "
+                "WHERE worker_name='research-queue' LIMIT 1"
+            ).fetchone()
+            budget_row = self._conn.execute(
+                "SELECT payload_json FROM experiment_budget WHERE budget_id='autonomous' LIMIT 1"
+            ).fetchone()
+            eligibility_table = self._conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='canary_eligibility' LIMIT 1"
+            ).fetchone()
+            eligible_count = 0
+            if eligibility_table is not None:
+                eligible_count = int(
+                    self._conn.execute(
+                        "SELECT COUNT(*) AS n "
+                        "FROM canary_eligibility AS e "
+                        "JOIN candidate_lifecycle AS c ON c.candidate_id=e.candidate_id "
+                        "WHERE c.stage IN ('FROZEN','PAPER_FORWARD','PAPER_PROMOTABLE') "
+                        "AND LENGTH(TRIM(COALESCE(e.frozen_hash,'')))>0 "
+                        "AND json_valid(COALESCE(c.payload_json,''))=1 "
+                        "AND LENGTH(TRIM(COALESCE(json_extract(c.payload_json,'$.frozen_hash'),'')))>0 "
+                        "AND json_type(c.payload_json,'$.frozen_hash')='text' "
+                        "AND json_extract(c.payload_json,'$.frozen_hash')=e.frozen_hash "
+                        "AND LENGTH(TRIM(COALESCE(json_extract(c.payload_json,'$.qualification_hash'),'')))>0 "
+                        "AND json_type(c.payload_json,'$.qualification_hash')='text' "
+                        "AND json_valid(COALESCE(e.evidence_json,''))=1 "
+                        "AND LENGTH(TRIM(COALESCE(json_extract(e.evidence_json,'$.qualification_hash'),'')))>0 "
+                        "AND json_type(e.evidence_json,'$.qualification_hash')='text' "
+                        "AND json_extract(c.payload_json,'$.qualification_hash')="
+                        "json_extract(e.evidence_json,'$.qualification_hash')"
+                    ).fetchone()["n"]
+                )
+
+        def _count(row: sqlite3.Row | None, name: str) -> int:
+            if row is None:
+                return 0
+            try:
+                value = row[name]
+                return max(0, int(value or 0))
+            except (KeyError, TypeError, ValueError, OverflowError):
+                return 0
+
+        def _timestamp(value: Any) -> str | None:
+            if value is None:
+                return None
+            if isinstance(value, datetime):
+                return ensure_utc(value).isoformat()
+            text = str(value).strip()
+            return text or None
+
+        proposal_submitted = _count(proposal_row, "submitted_24h")
+        proposal_accepted = _count(proposal_row, "accepted_24h")
+        proposal_rejected = _count(proposal_row, "rejected_24h")
+        proposal_failed = _count(proposal_row, "failed_24h")
+        proposal_pending = _count(proposal_row, "pending")
+        proposal_processing = _count(proposal_row, "processing")
+        candidate_created = _count(candidate_event_row, "created_24h")
+        candidate_mutations = _count(candidate_event_row, "mutations_24h")
+        if _count(candidate_event_row, "idea_events") == 0 and candidate_fallback_row is not None:
+            candidate_created = _count(candidate_fallback_row, "created_24h")
+            candidate_mutations = _count(candidate_fallback_row, "mutations_24h")
+        latest_created = (
+            _timestamp(candidate_event_row["latest_created_at"])
+            if candidate_event_row is not None and _count(candidate_event_row, "idea_events") > 0
+            else _timestamp(candidate_fallback_row["latest_created_at"])
+            if candidate_fallback_row is not None
+            else None
+        )
+
+        scheduler_state = _load(scheduler_row["state_json"]) if scheduler_row is not None else {}
+        scheduler_state = scheduler_state if isinstance(scheduler_state, Mapping) else {}
+
+        def _safe_job_id(value: Any) -> str | None:
+            text = str(value or "").strip()
+            if (
+                not text
+                or len(text) > 256
+                or not (text[0].isascii() and text[0].isalnum())
+                or any(not (char.isascii() and (char.isalnum() or char in "_.:-")) for char in text)
+            ):
+                return None
+            return text
+
+        if hermes_job_id is not None:
+            job_id = _safe_job_id(hermes_job_id) or _DEFAULT_HERMES_JOB_ID
+        else:
+            job_id = _safe_job_id(scheduler_state.get("job_id")) or _DEFAULT_HERMES_JOB_ID
+
+        queue_status = str(scheduler_state.get("status") or "ACTIVE").strip().upper()
+        if queue_status not in {"ACTIVE", "PAUSED"}:
+            queue_status = "ACTIVE"
+        trigger = scheduler_state.get("trigger", scheduler_state.get("schedule", "after_each_collection"))
+        trigger = str(trigger).strip() if trigger is not None else "after_each_collection"
+        if not trigger:
+            trigger = "after_each_collection"
+        worker_payload = (
+            _load(worker_row["payload_json"])
+            if worker_row is not None and worker_row["payload_json"]
+            else {}
+        )
+        worker_payload = worker_payload if isinstance(worker_payload, Mapping) else {}
+        last_cycle_at = (
+            worker_payload.get("last_cycle_at")
+            or worker_payload.get("cycle_at")
+            or scheduler_state.get("last_cycle_at")
+            or (worker_row["updated_at"] if worker_row is not None else None)
+            or scheduler_state.get("last_run_at")
+        )
+
+        budget_payload = _load(budget_row["payload_json"]) if budget_row is not None else {}
+        budget_payload = budget_payload if isinstance(budget_payload, Mapping) else {}
+
+        def _nonnegative_int(value: Any, default: int = 0) -> int:
+            if isinstance(value, bool):
+                return default
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError, OverflowError):
+                return default
+            return parsed if parsed >= 0 else default
+
+        total_limit = _nonnegative_int(budget_payload.get("total_limit"))
+        total_used = min(total_limit, _nonnegative_int(budget_payload.get("used_total")))
+        total_remaining = max(0, total_limit - total_used)
+        raw_total_limit = budget_payload.get("total_limit")
+        raw_total_used = budget_payload.get("used_total")
+        budget_exhausted = (
+            budget_row is not None
+            and isinstance(raw_total_limit, int)
+            and not isinstance(raw_total_limit, bool)
+            and isinstance(raw_total_used, int)
+            and not isinstance(raw_total_used, bool)
+            and raw_total_limit >= 0
+            and raw_total_used >= 0
+            and raw_total_used >= raw_total_limit
+        )
+
+        per_family_limit = _nonnegative_int(budget_payload.get("per_family_limit"))
+        raw_families = budget_payload.get("used_by_family", {})
+        raw_families = raw_families if isinstance(raw_families, Mapping) else {}
+        families: dict[str, dict[str, int]] = {}
+        for family, used in raw_families.items():
+            used_value = min(per_family_limit, _nonnegative_int(used))
+            family_name = str(family).strip()
+            if family_name:
+                families[family_name] = {
+                    "limit": per_family_limit,
+                    "used": used_value,
+                    "remaining": max(0, per_family_limit - used_value),
+                }
+
+        if proposal_submitted == 0:
+            no_new_reason = "NO_NEW_HERMES_PROPOSALS"
+        elif budget_exhausted:
+            no_new_reason = "RESEARCH_BUDGET_EXHAUSTED"
+        elif proposal_pending + proposal_processing > 0:
+            no_new_reason = "INTERNAL_QUEUE_HAS_WORK"
+        elif (
+            _count(proposal_row, "terminal_24h") > 0
+            and candidate_created == 0
+        ):
+            no_new_reason = "QUEUE_CONSUMED_WITHOUT_NEW_CANDIDATES"
+        elif candidate_created > 0:
+            no_new_reason = "CANDIDATE_FLOW_ACTIVE"
+        else:
+            no_new_reason = "NO_NEW_CANDIDATES_OBSERVED"
+
+        return {
+            "external_hermes": {
+                "job_id": job_id,
+                "status": "UNKNOWN",
+                "evidence": "No local verifier is available for the external Hermes job; scheduler state is internal-only.",
+            },
+            "internal_queue": {
+                "status": queue_status,
+                "trigger": trigger,
+                "last_cycle_at": _timestamp(last_cycle_at),
+            },
+            "proposals": {
+                "latest_submitted_at": _timestamp(proposal_row["latest_submitted_at"]) if proposal_row is not None else None,
+                "latest_accepted_at": _timestamp(proposal_row["latest_accepted_at"]) if proposal_row is not None else None,
+                "submitted_24h": proposal_submitted,
+                "accepted_24h": proposal_accepted,
+                "rejected_24h": proposal_rejected,
+                "failed_24h": proposal_failed,
+                "pending": proposal_pending,
+                "processing": proposal_processing,
+                "completed": _count(proposal_row, "completed"),
+                "rejected": _count(proposal_row, "rejected"),
+            },
+            "candidates": {
+                "latest_created_at": latest_created,
+                "created_24h": candidate_created,
+                "mutations_24h": candidate_mutations,
+                "total": _count(candidate_row, "total"),
+                "new": _count(candidate_row, "new"),
+                "eligible": eligible_count,
+                "rejected": _count(candidate_row, "rejected"),
+            },
+            "budgets": {
+                "total_limit": total_limit,
+                "total_used": total_used,
+                "total_remaining": total_remaining,
+                "families": families,
+            },
+            "no_new_candidates_reason": no_new_reason,
+        }
 
     def save_candidate_lifecycle(
         self,
@@ -4529,6 +5618,536 @@ class AxiomStore:
             for row in rows
         ]
 
+    def candidate_forward_requirements(
+        self,
+        candidate_ids: Sequence[str] | None = None,
+        now: datetime | None = None,
+        max_candidates: int = 100,
+        max_markets_per_candidate: int = 8,
+        max_total_markets: int = 100,
+    ) -> dict[str, Any]:
+        """Return the bounded, read-only current-market authority.
+
+        Historical dataset constituents are evidence for validation only.  They
+        are removed from executable authority when their provenance identifies
+        them as historical constituents; no empty authority is replaced by
+        discovery of all tracked markets.
+        """
+        for name, value in (
+            ("max_candidates", max_candidates),
+            ("max_markets_per_candidate", max_markets_per_candidate),
+            ("max_total_markets", max_total_markets),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+        current = ensure_utc(now or utc_now())
+        requested_ids = (
+            tuple(dict.fromkeys(str(value).strip() for value in candidate_ids if str(value).strip()))
+            if candidate_ids is not None
+            else None
+        )
+        if requested_ids is not None and len(requested_ids) > max_candidates:
+            requested_ids = requested_ids[:max_candidates]
+
+        if requested_ids is None:
+            rows = self.load_candidate_lifecycle(limit=max_candidates)
+            candidate_rows = [item for item in rows if isinstance(item, Mapping)]
+        else:
+            candidate_rows = []
+            for identifier in requested_ids:
+                record = self.load_candidate_lifecycle(identifier)
+                if isinstance(record, Mapping):
+                    candidate_rows.append(record)
+                else:
+                    candidate_rows.append({"candidate_id": identifier, "stage": "UNKNOWN", "payload": {}})
+
+        from .experiment_plan import (
+            ExperimentPlan,
+            ExperimentPlanError,
+            forward_market_matches,
+            historical_market_ids,
+            normalize_forward_filters,
+        )
+
+        def plain(value: Any) -> Any:
+            if isinstance(value, Mapping):
+                return {str(key): plain(child) for key, child in value.items()}
+            if isinstance(value, (list, tuple)):
+                return [plain(child) for child in value]
+            return value
+
+        def source_is_historical(value: Any) -> bool:
+            if not isinstance(value, Mapping):
+                return False
+            for key in ("source_type", "dataset_source_type", "historical_source_type"):
+                if str(value.get(key, "")).strip().upper() == "HISTORICAL":
+                    return True
+            for key in ("dataset_provenance", "provenance", "dataset_selector", "metadata"):
+                child = value.get(key)
+                if source_is_historical(child):
+                    return True
+            return False
+
+        def market_closed(record: Mapping[str, Any]) -> bool:
+            payload = record.get("payload", {})
+            payload = payload if isinstance(payload, Mapping) else {}
+            snapshot = payload.get("snapshot", {})
+            snapshot = snapshot if isinstance(snapshot, Mapping) else {}
+            metadata = payload.get("metadata", {})
+            if record.get("active") is False:
+                return True
+            settlement = str(
+                snapshot.get("settlement", payload.get("settlement", metadata.get("settlement", "")))
+                or ""
+            ).strip().lower()
+            if settlement in {"resolved_yes", "resolved_no", "void", "closed", "expired"}:
+                return True
+            closed = metadata.get("closed", payload.get("closed"))
+            if isinstance(closed, bool) and closed:
+                return True
+            if str(closed).strip().lower() in {"1", "true", "yes", "closed"}:
+                return True
+            expiry = _parse_datetime(
+                snapshot.get("expiry")
+                or metadata.get("expiry")
+                or payload.get("expiry")
+            )
+            return expiry is not None and expiry <= current
+
+        prepared: list[dict[str, Any]] = []
+        for row in candidate_rows[:max_candidates]:
+            candidate_id = str(row.get("candidate_id", "")).strip()
+            if not candidate_id:
+                continue
+            payload = row.get("payload", {})
+            payload = dict(payload) if isinstance(payload, Mapping) else {}
+            plan: ExperimentPlan | None = None
+            plan_record = None
+            plan_id = str(payload.get("plan_id", "")).strip()
+            if plan_id:
+                plan_record = self.load_experiment_plan(plan_id)
+            raw_plan = plan_record.get("plan") if isinstance(plan_record, Mapping) else None
+            if not isinstance(raw_plan, Mapping):
+                raw_plan = payload.get("experiment_plan")
+            try:
+                if isinstance(raw_plan, Mapping):
+                    plan = ExperimentPlan.from_mapping(
+                        raw_plan,
+                        hypothesis_id=str(payload.get("hypothesis_id", "")).strip() or None,
+                    )
+            except (ExperimentPlanError, TypeError, ValueError):
+                plan = None
+
+            declared_market_ids: tuple[str, ...] = ()
+            target_markets: tuple[str, ...] = ()
+            target_instrument: str | None = None
+            filters: Mapping[str, Any] = {}
+            restrictions: Mapping[str, Any] = {}
+            historical_ids: tuple[str, ...] = ()
+            if plan is not None:
+                # ExperimentPlan.target_markets is the normalized, deduped
+                # target list and enforces the plan's 1000-id bound.  Keep
+                # this declaration separate from executable resolution so
+                # omitted targets remain visible without broadening authority.
+                declared_market_ids = tuple(plan.target_markets)
+                target_markets = declared_market_ids
+                target_instrument = plan.target_instrument
+                filters = plan.filters
+                restrictions = plan.regime_restrictions
+                historical_source = source_is_historical(payload) or source_is_historical(plan.dataset_selector)
+                provenance = payload.get("dataset_provenance")
+                historical_ids = historical_market_ids(provenance)
+                if historical_source or historical_ids:
+                    historical_ids = tuple(dict.fromkeys((*historical_ids, *historical_market_ids(plan.as_dict()))))
+                    catalog = (
+                        self.load_dataset_catalog(plan.dataset_id, plan.dataset_version)
+                        if plan.dataset_id
+                        else None
+                    )
+                    if isinstance(catalog, Mapping):
+                        historical_ids = tuple(
+                            dict.fromkeys((*historical_ids, *historical_market_ids(catalog)))
+                        )
+            else:
+                target_value = payload.get("target_market_ids", payload.get("market_ids"))
+                if isinstance(target_value, (list, tuple)):
+                    # Legacy candidate payloads predate normalized plans. Keep
+                    # their declaration bounded to the same plan limit.
+                    declared_market_ids = tuple(
+                        dict.fromkeys(str(item).strip() for item in target_value if str(item).strip())
+                    )[:1000]
+                    target_markets = declared_market_ids
+                filters = payload.get("filters", payload.get("frozen_filters", {}))
+                filters = filters if isinstance(filters, Mapping) else {}
+                provenance = payload.get("dataset_provenance")
+                historical_ids = historical_market_ids(provenance)
+            historical_set = set(historical_ids)
+            executable_targets = tuple(item for item in target_markets if item not in historical_set)
+            ignored = tuple(item for item in target_markets if item in historical_set)
+            try:
+                normalized_filters = normalize_forward_filters(filters, restrictions)
+            except (ExperimentPlanError, TypeError, ValueError):
+                normalized_filters = {}
+                filter_error = True
+            else:
+                filter_error = False
+            prepared.append(
+                {
+                    "row": row,
+                    "candidate_id": candidate_id,
+                    "declared_market_ids": declared_market_ids,
+                    "target_instrument": target_instrument,
+                    "historical_set": historical_set,
+                    "executable_targets": executable_targets,
+                    "ignored": ignored,
+                    "normalized_filters": normalized_filters,
+                    "filter_error": filter_error,
+                }
+            )
+
+        # Keep the projection empty unless a candidate actually authorizes
+        # reusable filters.  Explicit targets are resolved in one bounded
+        # lookup per active/all projection and cached for every candidate.
+        active_by_id: dict[str, Mapping[str, Any]] = {}
+        all_by_id: dict[str, Mapping[str, Any]] = {}
+        needs_broad_inventory = any(
+            not item["filter_error"]
+            and not item["executable_targets"]
+            and item["normalized_filters"]
+            for item in prepared
+        )
+        if needs_broad_inventory:
+            active_records = self.tracked_polymarket_markets(
+                active_only=True,
+                now=current,
+                include_payload=True,
+                limit=1000,
+            )
+            for record in active_records:
+                if isinstance(record, Mapping):
+                    market_id = str(record.get("market_id", "")).strip()
+                    if market_id:
+                        active_by_id[market_id] = record
+
+        explicit_active_ids = tuple(
+            dict.fromkeys(
+                market_id
+                for item in prepared
+                if not item["filter_error"]
+                for market_id in item["executable_targets"]
+                if market_id not in active_by_id
+            )
+        )
+        explicit_all_ids = tuple(
+            dict.fromkeys(
+                market_id
+                for item in prepared
+                if not item["filter_error"]
+                for market_id in item["executable_targets"]
+                if market_id not in all_by_id
+            )
+        )
+        if explicit_active_ids:
+            explicit_active = self.tracked_polymarket_markets(
+                active_only=True,
+                now=current,
+                include_payload=True,
+                limit=len(explicit_active_ids),
+                market_ids=explicit_active_ids,
+            )
+            for record in explicit_active:
+                if isinstance(record, Mapping):
+                    market_id = str(record.get("market_id", "")).strip()
+                    if market_id:
+                        active_by_id[market_id] = record
+        if explicit_all_ids:
+            explicit_all = self.tracked_polymarket_markets(
+                active_only=False,
+                now=current,
+                include_payload=True,
+                limit=len(explicit_all_ids),
+                market_ids=explicit_all_ids,
+            )
+            for record in explicit_all:
+                if isinstance(record, Mapping):
+                    market_id = str(record.get("market_id", "")).strip()
+                    if market_id:
+                        all_by_id[market_id] = record
+
+        candidates: list[dict[str, Any]] = []
+        union_markets: list[str] = []
+        candidate_references: dict[str, list[str]] = {}
+        candidate_bound_markets: dict[str, list[str]] = {}
+        unresolved: list[str] = []
+        closed: list[str] = []
+        capacity_excluded_candidates: list[str] = []
+
+        for item in prepared:
+            row = item["row"]
+            candidate_id = item["candidate_id"]
+            declared_market_ids = item["declared_market_ids"]
+            target_instrument = item["target_instrument"]
+            historical_set = item["historical_set"]
+            executable_targets = item["executable_targets"]
+            ignored = item["ignored"]
+            normalized_filters = item["normalized_filters"]
+            filter_error = item["filter_error"]
+            permitted: list[str] = []
+            closed_targets: list[str] = []
+            if not filter_error:
+                if executable_targets:
+                    for market_id in executable_targets:
+                        record = active_by_id.get(market_id)
+                        if (
+                            record is not None
+                            and forward_market_matches(
+                                record,
+                                normalized_filters,
+                                now=current,
+                                target_instrument=target_instrument,
+                            )
+                        ):
+                            permitted.append(market_id)
+                        elif market_id in all_by_id and market_closed(all_by_id[market_id]):
+                            closed_targets.append(market_id)
+                elif normalized_filters:
+                    for market_id, record in active_by_id.items():
+                        if market_id in historical_set:
+                            continue
+                        if forward_market_matches(
+                            record,
+                            normalized_filters,
+                            now=current,
+                            target_instrument=target_instrument,
+                        ):
+                            permitted.append(market_id)
+
+            permitted = list(dict.fromkeys(permitted))[:max_markets_per_candidate]
+            # Apply the global cap only while admitting new unique markets.
+            # A market already admitted for another candidate remains
+            # authoritative for every candidate whose requirements authorize it.
+            candidate_markets: list[str] = []
+            capacity_excluded_markets: list[str] = []
+            for market_id in permitted:
+                if market_id in union_markets:
+                    candidate_markets.append(market_id)
+                    continue
+                if len(union_markets) >= max_total_markets:
+                    capacity_excluded_markets.append(market_id)
+                    continue
+                union_markets.append(market_id)
+                candidate_markets.append(market_id)
+            if candidate_markets:
+                resolution, reason_code = "RESOLVED", "CANDIDATE_FORWARD_MARKET_RESOLVED"
+            elif capacity_excluded_markets:
+                resolution, reason_code = "UNRESOLVED", "COLLECTOR_CAPACITY_INSUFFICIENT"
+                capacity_excluded_candidates.append(candidate_id)
+                unresolved.append(candidate_id)
+            elif closed_targets:
+                resolution, reason_code = "CLOSED", "CANDIDATE_MARKET_CLOSED"
+            else:
+                resolution, reason_code = "UNRESOLVED", "CANDIDATE_FORWARD_MARKET_UNRESOLVED"
+            if resolution == "UNRESOLVED" and candidate_id not in unresolved:
+                unresolved.append(candidate_id)
+            elif resolution == "CLOSED":
+                closed.append(candidate_id)
+            candidate_bound_markets[candidate_id] = list(candidate_markets)
+            for market_id in candidate_markets:
+                candidate_references.setdefault(market_id, []).append(candidate_id)
+            candidates.append(
+                {
+                    "candidate_id": candidate_id,
+                    "stage": str(row.get("stage", "")),
+                    "resolution": resolution,
+                    "reason_code": reason_code,
+                    "declared_market_ids": list(declared_market_ids),
+                    "market_ids": list(candidate_markets),
+                    "permitted_market_ids": list(candidate_markets),
+                    "capacity_excluded_market_ids": list(capacity_excluded_markets),
+                    "normalized_frozen_filters": plain(normalized_filters),
+                    "normalized_filters": plain(normalized_filters),
+                    "frozen_filters": plain(normalized_filters),
+                    "historical_market_ids_ignored": list(ignored),
+                }
+            )
+
+        return {
+            "candidates": candidates,
+            "market_ids": list(union_markets),
+            "candidate_references": candidate_references,
+            "candidate_bound_markets": candidate_bound_markets,
+            "unresolved_candidates": unresolved,
+            "closed_candidates": closed,
+            "capacity_excluded_candidates": capacity_excluded_candidates,
+            "capacity_excluded_candidate_count": len(capacity_excluded_candidates),
+            "as_of": current.isoformat(),
+        }
+
+    def polymarket_required_health(
+        self,
+        requirements: Mapping[str, Any] | None = None,
+        scheduled_market_ids: Sequence[str] | None = None,
+        now: datetime | None = None,
+        stale_after_seconds: float | None = None,
+        max_markets: int = 100,
+    ) -> dict[str, Any]:
+        """Aggregate fresh/stale/missing health for required authority only."""
+        if isinstance(max_markets, bool) or not isinstance(max_markets, int) or max_markets < 0:
+            raise ValueError("max_markets must be a non-negative integer")
+        bounded_max_markets = min(max_markets, _MAX_LATEST_SCAN_ROWS)
+        current = ensure_utc(now or utc_now())
+        stale_after = float(stale_after_seconds if stale_after_seconds is not None else 180.0)
+        if not math.isfinite(stale_after) or stale_after <= 0 or stale_after > _MAX_OPERATIONAL_WINDOW_SECONDS:
+            raise ValueError("stale_after_seconds must be finite, positive, and bounded")
+        authority = requirements if isinstance(requirements, Mapping) else self.candidate_forward_requirements(now=current)
+        raw_required = authority.get("market_ids")
+        if raw_required is None:
+            raw_bound = authority.get("candidate_bound_markets", ())
+            if isinstance(raw_bound, Mapping):
+                raw_required = [market for values in raw_bound.values() for market in values] if all(
+                    isinstance(values, (list, tuple, set, frozenset)) for values in raw_bound.values()
+                ) else ()
+            else:
+                raw_required = raw_bound
+        if not isinstance(raw_required, (list, tuple, set, frozenset)):
+            raw_required = ()
+        required = tuple(dict.fromkeys(str(item).strip() for item in raw_required if str(item).strip()))
+        assessed_required = required[:bounded_max_markets]
+        capacity_truncated = required[bounded_max_markets:]
+        refs = authority.get("candidate_references", {})
+        refs = refs if isinstance(refs, Mapping) else {}
+        normalized_refs = {
+            str(market_id): tuple(
+                dict.fromkeys(str(candidate).strip() for candidate in values if str(candidate).strip())
+            )
+            if isinstance(values, (list, tuple, set, frozenset))
+            else ()
+            for market_id, values in refs.items()
+        }
+        scheduled = (
+            tuple(dict.fromkeys(str(item).strip() for item in scheduled_market_ids if str(item).strip()))
+            if scheduled_market_ids is not None
+            else tuple(
+                dict.fromkeys(
+                    str(item).strip()
+                    for item in (
+                        (self.get_collector_state("polymarket") or {}).get("scheduled_market_ids", ())
+                        if isinstance(self.get_collector_state("polymarket") or {}, Mapping)
+                        else ()
+                    )
+                    if str(item).strip()
+                )
+            )
+        )
+        latest_rows = self.load_latest_polymarket_snapshots(
+            assessed_required,
+            source_type="FORWARD_COLLECTED",
+            limit=len(assessed_required),
+        ) if assessed_required else []
+        latest_by_market = {}
+        for row in latest_rows:
+            market_id = str(row.get("market_id", "")).strip() if isinstance(row, Mapping) else ""
+            observed = _parse_datetime(row.get("observed_at")) if isinstance(row, Mapping) else None
+            if market_id and (observed is None or observed <= current):
+                latest_by_market[market_id] = row
+        fresh: list[str] = []
+        stale: list[str] = []
+        missing: list[str] = []
+        diagnostics: list[dict[str, Any]] = []
+        required_snapshots: list[tuple[datetime, str]] = []
+        for market_id in assessed_required:
+            row = latest_by_market.get(market_id)
+            if row is None:
+                missing.append(market_id)
+                diagnostics.append(
+                    {
+                        "market_id": market_id,
+                        "candidate_bound": True,
+                        "candidate_references": list(normalized_refs.get(market_id, ())),
+                        "source_timestamp": None,
+                        "observed_at": None,
+                        "freshness_age_seconds": None,
+                        "collection_state": "missing",
+                        "reason_code": "REQUIRED_MARKET_SNAPSHOT_MISSING",
+                    }
+                )
+                continue
+            source_stamp = _parse_datetime(row.get("source_timestamp"))
+            observed_stamp = _parse_datetime(row.get("observed_at"))
+            if observed_stamp is None:
+                missing.append(market_id)
+                state, reason = "missing", "REQUIRED_MARKET_SNAPSHOT_MISSING"
+                age = None
+            else:
+                age = max(0.0, (current - observed_stamp).total_seconds())
+                if age <= stale_after:
+                    fresh.append(market_id)
+                    state, reason = "fresh", "REQUIRED_MARKET_SNAPSHOT_FRESH"
+                else:
+                    stale.append(market_id)
+                    state, reason = "stale", "REQUIRED_MARKET_SNAPSHOT_STALE"
+            if source_stamp is not None:
+                required_snapshots.append((source_stamp, market_id))
+            diagnostics.append(
+                {
+                    "market_id": market_id,
+                    "candidate_bound": True,
+                    "candidate_references": list(normalized_refs.get(market_id, ())),
+                    "source_timestamp": source_stamp.isoformat() if source_stamp is not None else None,
+                    "observed_at": observed_stamp.isoformat() if observed_stamp is not None else None,
+                    "freshness_age_seconds": age,
+                    "collection_state": state,
+                    "reason_code": reason,
+                }
+            )
+        if capacity_truncated:
+            missing.extend(capacity_truncated)
+
+        unresolved = authority.get("unresolved_candidates", ())
+        closed = authority.get("closed_candidates", ())
+        capacity_excluded = authority.get("capacity_excluded_candidates", ())
+        unresolved = list(unresolved) if isinstance(unresolved, (list, tuple)) else []
+        closed = list(closed) if isinstance(closed, (list, tuple)) else []
+        capacity_excluded = list(capacity_excluded) if isinstance(capacity_excluded, (list, tuple)) else []
+        if capacity_excluded or capacity_truncated:
+            grade, reason_code = "D", "COLLECTOR_CAPACITY_INSUFFICIENT"
+        elif unresolved:
+            grade, reason_code = "D", "CANDIDATE_FORWARD_MARKET_UNRESOLVED"
+        elif closed:
+            grade, reason_code = "D", "CANDIDATE_MARKET_CLOSED"
+        elif missing:
+            grade, reason_code = "D", "REQUIRED_MARKETS_MISSING"
+        elif stale:
+            grade, reason_code = "C", "REQUIRED_MARKETS_STALE"
+        elif required:
+            grade, reason_code = "A", "REQUIRED_MARKETS_FRESH"
+        else:
+            grade, reason_code = "D", "CANDIDATE_FORWARD_MARKET_UNRESOLVED"
+        ordered_snapshots = sorted(required_snapshots, key=lambda pair: (pair[0], pair[1]))
+        return {
+            "candidate_bound_markets": list(required),
+            "scheduled": list(scheduled),
+            "fresh": fresh,
+            "stale": stale,
+            "missing": missing,
+            "newest_required_snapshot": ordered_snapshots[-1][0].isoformat() if ordered_snapshots else None,
+            "oldest_required_snapshot": ordered_snapshots[0][0].isoformat() if ordered_snapshots else None,
+            "grade": grade,
+            "grade_scope": "required_forward_markets",
+            "reason_code": reason_code,
+            "candidate_references": {
+                market_id: list(normalized_refs.get(market_id, ())) for market_id in required
+            },
+            "market_diagnostics": diagnostics[:100],
+            "diagnostics": diagnostics[:100],
+            "required_market_count": len(required),
+            "unresolved_candidates": unresolved,
+            "closed_candidates": closed,
+            "capacity_excluded_candidates": capacity_excluded,
+            "capacity_excluded_candidate_count": len(capacity_excluded),
+            "as_of": current.isoformat(),
+        }
+
     def tracked_polymarket_markets(
         self,
         *,
@@ -4536,25 +6155,52 @@ class AxiomStore:
         now: datetime | None = None,
         include_payload: bool = False,
         limit: int = 1000,
+        market_ids: Sequence[str] | None = None,
     ) -> list[Any]:
         if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
             raise ValueError("limit must be a non-negative integer")
+        requested_ids = (
+            tuple(dict.fromkeys(str(item).strip() for item in market_ids if str(item).strip()))
+            if market_ids is not None
+            else ()
+        )
+        if market_ids is not None and not requested_ids:
+            return []
         current = ensure_utc(now or utc_now())
-        with self._lock:
-            metadata_rows = self._conn.execute(
-                "SELECT market_id,observed_at,metadata_hash,payload_json,source_type FROM ("
-                "SELECT market_id,observed_at,metadata_hash,payload_json,source_type,"
+        snapshot = self._snapshot_read_connection()
+        try:
+            metadata_where = "source_type='FORWARD_COLLECTED' AND observed_at<=?"
+            metadata_values: list[Any] = [current.isoformat()]
+            snapshot_where = "source_type='FORWARD_COLLECTED' AND observed_at<=?"
+            snapshot_values: list[Any] = [current.isoformat()]
+            if requested_ids:
+                placeholders = ",".join("?" for _ in requested_ids)
+                metadata_where += f" AND market_id IN ({placeholders})"
+                metadata_values.extend(requested_ids)
+                snapshot_where += f" AND market_id IN ({placeholders})"
+                snapshot_values.extend(requested_ids)
+            metadata_rows = snapshot.execute(
+                "WITH latest_keys AS ("
+                "SELECT rowid AS row_id,market_id,observed_at,metadata_hash,"
                 "ROW_NUMBER() OVER (PARTITION BY market_id ORDER BY observed_at DESC,metadata_hash DESC) AS row_number "
-                "FROM polymarket_markets WHERE source_type='FORWARD_COLLECTED' AND observed_at<=?) WHERE row_number=1 ORDER BY market_id LIMIT ?",
-                (current.isoformat(), int(limit)),
+                f"FROM polymarket_markets WHERE {metadata_where}) "
+                "SELECT p.market_id,p.observed_at,p.metadata_hash,p.payload_json,p.source_type "
+                "FROM polymarket_markets AS p JOIN latest_keys AS latest ON p.rowid=latest.row_id "
+                "WHERE latest.row_number=1 ORDER BY p.market_id LIMIT ?",
+                [*metadata_values, int(limit)],
             ).fetchall()
-            snapshot_rows = self._conn.execute(
-                "SELECT market_id,observed_at,source_timestamp,snapshot_id,payload_json,source_type FROM ("
-                "SELECT market_id,observed_at,source_timestamp,snapshot_id,payload_json,source_type,"
+            snapshot_rows = snapshot.execute(
+                "WITH latest_keys AS ("
+                "SELECT rowid AS row_id,market_id,observed_at,source_timestamp,snapshot_id,"
                 "ROW_NUMBER() OVER (PARTITION BY market_id ORDER BY observed_at DESC,source_timestamp DESC,snapshot_id DESC) AS row_number "
-                "FROM polymarket_snapshots WHERE source_type='FORWARD_COLLECTED' AND observed_at<=?) WHERE row_number=1 ORDER BY market_id LIMIT ?",
-                (current.isoformat(), int(limit)),
+                f"FROM polymarket_snapshots WHERE {snapshot_where}) "
+                "SELECT p.market_id,p.observed_at,p.source_timestamp,p.snapshot_id,p.payload_json,p.source_type "
+                "FROM polymarket_snapshots AS p JOIN latest_keys AS latest ON p.rowid=latest.row_id "
+                "WHERE latest.row_number=1 ORDER BY p.market_id LIMIT ?",
+                [*snapshot_values, int(limit)],
             ).fetchall()
+        finally:
+            snapshot.close()
         metadata_latest: dict[str, tuple[datetime | None, Any]] = {}
         snapshot_latest: dict[str, tuple[datetime | None, Any]] = {}
         for row in metadata_rows:
@@ -5758,7 +7404,6 @@ class AxiomStore:
             raise ValueError("activity_limit must be between 1 and 32")
         count_tables = (
             ("dataset_catalog", "dataset_catalog"),
-            ("bars", "bars"),
             ("polymarket_snapshots", "polymarket_snapshots"),
             ("polymarket_trades", "polymarket_trades"),
             ("collection_errors", "collection_errors"),
@@ -5782,47 +7427,47 @@ class AxiomStore:
                     json_object('dataset_id',dataset_id,'dataset_version',dataset_version,
                         'source_type',source_type,'timeframe',timeframe,'quality',quality),
                     source_type,source_type,NULL,NULL,NULL
-                FROM dataset_catalog
+                FROM (SELECT * FROM dataset_catalog ORDER BY updated_at DESC LIMIT 32)
                 UNION ALL
                 SELECT 'bootstrap',updated_at,'bootstrap:' || dataset_id,
                     dataset_id || ' bootstrap ' || lower(status),payload_json,
                     'bootstrap','bootstrap',status,NULL,NULL
-                FROM dataset_bootstrap_state
+                FROM (SELECT * FROM dataset_bootstrap_state ORDER BY updated_at DESC LIMIT 32)
                 UNION ALL
                 SELECT 'collection',COALESCE(ended_at,started_at),'collection:' || cycle_id,
                     'Polymarket collection cycle completed (' ||
                         COALESCE(json_extract(payload_json,'$.markets_seen'),0) || ' markets)',
                     payload_json,collector_name,'collection',NULL,NULL,NULL
-                FROM collection_cycles
+                FROM (SELECT * FROM collection_cycles ORDER BY COALESCE(ended_at,started_at) DESC LIMIT 32)
                 UNION ALL
                 SELECT 'lifecycle',created_at,'lifecycle:' || event_id,
                     'Candidate ' || candidate_id || ' moved to ' || to_stage,
                     json_object('from_stage',from_stage,'reason',reason),
                     'lifecycle','lifecycle',to_stage,NULL,NULL
-                FROM candidate_lifecycle_events
+                FROM (SELECT * FROM candidate_lifecycle_events ORDER BY created_at DESC LIMIT 32)
                 UNION ALL
                 SELECT 'research',updated_at,'research:item:' || item_id,
                     'Research item ' || item_type || ' is ' || lower(status),
                     json_object('item_id',item_id,'last_error',last_error),
                     source,'research',status,item_type,
                     json_extract(payload_json,'$.market_id')
-                FROM research_queue
+                FROM (SELECT * FROM research_queue ORDER BY updated_at DESC LIMIT 32)
                 UNION ALL
                 SELECT 'research',created_at,'research:event:' || event_id,
                     'Research queue item ' || item_id || ' moved to ' || to_status,
                     detail,'queue','research',to_status,NULL,NULL
-                FROM research_queue_events
+                FROM (SELECT * FROM research_queue_events ORDER BY created_at DESC LIMIT 32)
                 UNION ALL
                 SELECT 'report',created_at,'report:' || report_id,
                     'Research report ' || report_id || ' saved',
                     json_object('experiment_id',experiment_id),
                     'report','report',NULL,NULL,NULL
-                FROM reports
+                FROM (SELECT * FROM reports ORDER BY created_at DESC LIMIT 32)
                 UNION ALL
                 SELECT 'collection_error',observed_at,'collection_error:' || error_id,
                     'Collection error: ' || kind || ' (' || detail || ')',
                     payload_json,'collection','collection_error',kind,NULL,market_id
-                FROM collection_errors
+                FROM (SELECT * FROM collection_errors ORDER BY observed_at DESC LIMIT 32)
             )
         """
         with self._lock:
@@ -5830,6 +7475,11 @@ class AxiomStore:
                 label: int(self._conn.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()["n"])
                 for table, label in count_tables
             }
+            bars_row = self._conn.execute(
+                "SELECT COALESCE(SUM(row_count),0) AS n FROM dataset_catalog "
+                "WHERE lower(market_type)='crypto_spot'"
+            ).fetchone()
+            counts["bars"] = int(bars_row["n"] or 0)
             catalog_rows = self._conn.execute(
                 "SELECT lower(source_type) AS source_type,COUNT(*) AS dataset_count,"
                 "COALESCE(SUM(row_count),0) AS row_count "

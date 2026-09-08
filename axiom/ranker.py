@@ -1,6 +1,7 @@
 """Deterministic, persisted prediction-candidate canary selection."""
 from __future__ import annotations
 
+from datetime import datetime
 import hashlib
 import json
 import math
@@ -10,7 +11,10 @@ from .canary import (
     CanaryService,
     _canary_qualification_hash,
     _canary_qualification_projection,
+    _canary_lifecycle_snapshot_hashes,
     _canary_ranking_snapshot_hash,
+    _canary_prediction_market,
+    _CANARY_RANKING_EVIDENCE_ALIASES,
 )
 from .domain import ensure_utc, utc_now
 
@@ -18,6 +22,16 @@ from .storage import AxiomStore
 from .lifecycle import CandidateLifecycleManager, CandidateStage
 from .data_quality import evaluate_prediction_data_quality, persisted_quality_fields
 
+
+class _DatasetEvidenceChanged(RuntimeError):
+    """Raised when an attested dataset changes during ranking prevalidation."""
+
+    error_code = "DATASET_EVIDENCE_CHANGED"
+
+class _LifecycleEvidenceChanged(RuntimeError):
+    """Raised when a lifecycle snapshot changes during ranking prevalidation."""
+
+    error_code = "LIFECYCLE_SNAPSHOT_CHANGED"
 
 class CandidateCanaryRanker:
     """Continuously evaluate and rank frozen prediction candidates.
@@ -62,7 +76,7 @@ class CandidateCanaryRanker:
         clock=utc_now,
     ) -> None:
         self.store = store
-        self.service = service or CanaryService(store)
+        self.service = service or CanaryService(store, clock=clock)
         self.clock = clock
 
     @staticmethod
@@ -88,21 +102,11 @@ class CandidateCanaryRanker:
 
     @classmethod
     def _prediction_market(cls, payload: Mapping[str, Any]) -> str | None:
-        plan = payload.get("experiment_plan")
-        strategy = payload.get("strategy")
-        forward = payload.get("forward_config")
-        market = payload.get("market")
-        for source in (payload, plan, strategy, forward, market):
-            if isinstance(source, Mapping):
-                value = source.get("market_type", source.get("type"))
-                if value is not None:
-                    return str(value).strip().lower()
-        value = payload.get("market_type")
-        return str(value).strip().lower() if value is not None else None
+        return _canary_prediction_market(payload)
 
     @classmethod
     def _sample_count(cls, payload: Mapping[str, Any]) -> int | None:
-        value = cls._value(payload, "validation_sample_count", "sample_count")
+        value = cls._value(payload, *_CANARY_RANKING_EVIDENCE_ALIASES["sample_count"])
         if value is None:
             minimum = payload.get("minimum_sample_check")
             if isinstance(minimum, Mapping):
@@ -115,7 +119,7 @@ class CandidateCanaryRanker:
 
     @classmethod
     def _trade_count(cls, payload: Mapping[str, Any]) -> int | None:
-        value = cls._value(payload, "validation_trade_count", "validation_trades", "trade_count")
+        value = cls._value(payload, *_CANARY_RANKING_EVIDENCE_ALIASES["trade_count"])
         if value is None:
             minimum = payload.get("minimum_sample_check")
             if isinstance(minimum, Mapping):
@@ -193,7 +197,7 @@ class CandidateCanaryRanker:
         if not frozen_hash:
             return None, "FROZEN_HASH_MISSING", versions
         legacy_quality = cls._quality(
-            payload, "validation_data_quality", "data_quality", "quality", "data_quality_passed"
+            payload, *_CANARY_RANKING_EVIDENCE_ALIASES["quality"]
         )
         if isinstance(quality, Mapping) and quality.get("applicable"):
             integrity_score = (
@@ -202,18 +206,32 @@ class CandidateCanaryRanker:
             fidelity_score = cls._number(quality.get("historical_execution_fidelity_score"))
         else:
             integrity_score = legacy_quality
-            fidelity_score = cls._number(payload.get("execution_fidelity_score", legacy_quality))
+            fidelity_score = cls._number(
+                payload.get(
+                    _CANARY_RANKING_EVIDENCE_ALIASES["execution_fidelity_score"][0],
+                    legacy_quality,
+                )
+            )
         required = {
-            "expectancy": cls._number(cls._value(payload, "validation_expectancy", "expectancy")),
-            "confidence_lower_bound": cls._number(
-                cls._value(payload, "validation_confidence_lower_bound", "confidence_lower_bound")
+            "expectancy": cls._number(
+                cls._value(payload, *_CANARY_RANKING_EVIDENCE_ALIASES["expectancy"])
             ),
-            "robustness": cls._number(cls._value(payload, "validation_stability", "stability")),
-            "calibration": cls._number(cls._value(payload, "validation_calibration", "calibration")),
+            "confidence_lower_bound": cls._number(
+                cls._value(
+                    payload,
+                    *_CANARY_RANKING_EVIDENCE_ALIASES["confidence_lower_bound"],
+                )
+            ),
+            "robustness": cls._number(
+                cls._value(payload, *_CANARY_RANKING_EVIDENCE_ALIASES["stability"])
+            ),
+            "calibration": cls._number(
+                cls._value(payload, *_CANARY_RANKING_EVIDENCE_ALIASES["calibration"])
+            ),
             "sample_count": cls._sample_count(payload),
             "trade_count": cls._trade_count(payload),
             "execution_feasibility": cls._quality(
-                payload, "validation_execution_quality", "execution_quality"
+                payload, *_CANARY_RANKING_EVIDENCE_ALIASES["execution_quality"]
             ),
             "historical_data_integrity": integrity_score,
             "execution_fidelity_score": fidelity_score,
@@ -227,7 +245,9 @@ class CandidateCanaryRanker:
         if required["sample_count"] < min_samples or required["trade_count"] < min_trades:
             return None, "RANKING_EVIDENCE_BELOW_MINIMUM_SAMPLE", versions
         forward_evidence = payload.get("forward_evidence")
-        forward_expectancy = cls._number(payload.get("forward_expectancy"))
+        forward_expectancy = cls._number(
+            payload.get(_CANARY_RANKING_EVIDENCE_ALIASES["forward_expectancy"][0])
+        )
         if forward_expectancy is None and isinstance(forward_evidence, Mapping):
             forward_expectancy = cls._number(forward_evidence.get("forward_expectancy"))
         components: dict[str, float] = {
@@ -241,10 +261,14 @@ class CandidateCanaryRanker:
             "calibration": cls._clamp(float(required["calibration"])),
         }
         optional: dict[str, float] = {}
-        drawdown = cls._number(cls._value(payload, "validation_max_drawdown", "max_drawdown"))
+        drawdown = cls._number(
+            cls._value(payload, *_CANARY_RANKING_EVIDENCE_ALIASES["max_drawdown"])
+        )
         if drawdown is not None:
             optional["drawdown"] = cls._clamp(1.0 - drawdown)
-        liquidity = cls._number(cls._value(payload, "validation_liquidity", "liquidity"))
+        liquidity = cls._number(
+            cls._value(payload, *_CANARY_RANKING_EVIDENCE_ALIASES["liquidity"])
+        )
         if liquidity is not None:
             optional["liquidity"] = cls._clamp(liquidity)
         if forward_expectancy is not None:
@@ -285,34 +309,110 @@ class CandidateCanaryRanker:
     def _candidate_records(self) -> list[Mapping[str, Any]]:
         records = self.store.load_candidate_lifecycle(limit=10000)
         return [item for item in records if isinstance(item, Mapping)] if isinstance(records, list) else []
+    def _candidate_inventory_token(
+        self,
+        records: list[Mapping[str, Any]],
+    ) -> str:
+        """Hash the ranker-visible lifecycle evidence fence.
+
+        Mutable timestamps and full JSON payloads are deliberately excluded:
+        signal telemetry and harmless counters must not restart an in-progress
+        scan.  Stage, frozen binding, dataset attestation, and the canonical
+        qualification/ranking hashes remain fenced.
+        """
+        inventory: list[dict[str, Any]] = []
+        for record in records:
+            stage = str(record.get("stage") or "")
+            candidate_id = str(record.get("candidate_id") or "").strip()
+            if not candidate_id or stage not in self._STAGES:
+                continue
+            payload = self.service._merged_lifecycle_payload(record)
+            if not isinstance(payload, Mapping):
+                continue
+            _, qualification_hash, ranking_snapshot_hash = (
+                _canary_lifecycle_snapshot_hashes(self.store, record)
+            )
+            inventory.append(
+                {
+                    "candidate_id": candidate_id,
+                    "stage": stage,
+                    "frozen_hash": self.service._lifecycle_frozen_hash(record),
+                    "attestation": self._dataset_attestation_snapshot(payload),
+                    "qualification_hash": qualification_hash,
+                    "ranking_snapshot_hash": ranking_snapshot_hash,
+                }
+            )
+        inventory.sort(
+            key=lambda item: (
+                str(item["candidate_id"]),
+                str(item["stage"]),
+                str(item["frozen_hash"]),
+                str(item["qualification_hash"]),
+                str(item["ranking_snapshot_hash"]),
+                json.dumps(item["attestation"], sort_keys=True),
+            )
+        )
+        encoded = json.dumps(
+            inventory,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        return "sha256:" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+    def _dataset_attestation_snapshot(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        connection: Any | None = None,
+    ) -> dict[str, Any]:
+        """Read the exact durable attestation bound to a prediction dataset."""
+        dataset_id = str(payload.get("dataset_id") or "").strip()
+        dataset_version = str(payload.get("dataset_version") or "").strip()
+        snapshot: dict[str, Any] = {
+            "dataset_id": dataset_id,
+            "dataset_version": dataset_version,
+            "present": False,
+            "status": None,
+            "policy_version": None,
+            "attestation_hash": None,
+        }
+        if not dataset_id or not dataset_version:
+            return snapshot
+        if connection is None:
+            with self.store._lock:
+                row = self.store.connection.execute(
+                    "SELECT status,policy_version,attestation_hash "
+                    "FROM dataset_integrity_attestation "
+                    "WHERE dataset_id=? AND dataset_version=?",
+                    (dataset_id, dataset_version),
+                ).fetchone()
+        else:
+            row = connection.execute(
+                "SELECT status,policy_version,attestation_hash "
+                "FROM dataset_integrity_attestation "
+                "WHERE dataset_id=? AND dataset_version=?",
+                (dataset_id, dataset_version),
+            ).fetchone()
+        if row is not None:
+            snapshot.update(
+                {
+                    "present": True,
+                    "status": row["status"],
+                    "policy_version": row["policy_version"],
+                    "attestation_hash": row["attestation_hash"],
+                }
+            )
+        return snapshot
+
+
     def _persist_quality_projection(
         self,
         record: Mapping[str, Any],
         payload: Mapping[str, Any],
         quality: Mapping[str, Any],
     ) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
-        if not quality.get("applicable"):
-            return record, payload
-        evidence = persisted_quality_fields(quality)
-        if all(payload.get(key) == value for key, value in evidence.items()):
-            return record, payload
-        stage = str(record.get("stage") or "")
-        if stage not in self._STAGES:
-            return record, payload
-        try:
-            lifecycle = CandidateLifecycleManager(self.store)
-            lifecycle.record_evidence(
-                str(record.get("candidate_id") or ""),
-                evidence,
-                expected_stage=stage,
-                reason="data-quality policy re-evaluation",
-            )
-        except (KeyError, RuntimeError, ValueError):
-            return record, payload
-        refreshed = self.store.load_candidate_lifecycle(str(record.get("candidate_id") or ""))
-        if not isinstance(refreshed, Mapping) or not isinstance(refreshed.get("payload"), Mapping):
-            return record, payload
-        return refreshed, refreshed["payload"]
+        """Keep qualification reads side-effect free."""
+        return record, payload
 
 
     def _snapshot_hashes(
@@ -339,12 +439,132 @@ class CandidateCanaryRanker:
         if not qualification_hash or not ranking_snapshot_hash:
             return None
         return qualification, qualification_hash, ranking_snapshot_hash
+    def validate_persisted_ranking(
+        self,
+        row: Mapping[str, Any],
+        *,
+        ranking_run_id: str,
+        now: datetime,
+    ) -> bool:
+        """Reject ranking rows that are not part of the current fenced run."""
+        if not isinstance(row, Mapping):
+            return False
+        candidate_id = str(row.get("candidate_id") or "").strip()
+        if not candidate_id or str(row.get("ranking_run_id") or "") != str(ranking_run_id):
+            return False
+        try:
+            stamp = ensure_utc(datetime.fromisoformat(str(row.get("ranking_timestamp"))))
+            age = (ensure_utc(now) - stamp).total_seconds()
+            score = float(row.get("total_score"))
+            rank = int(row.get("rank"))
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if age < 0 or age > 60.0 or not math.isfinite(score) or rank < 0:
+            return False
+        cluster_key = str(row.get("cluster_key") or "").strip()
+        if not cluster_key:
+            return False
+        try:
+            representative = int(row.get("cluster_representative"))
+        except (TypeError, ValueError):
+            return False
+        if representative not in (0, 1):
+            return False
+        versions = row.get("evidence_versions")
+        if not isinstance(versions, Mapping):
+            raw_versions = row.get("evidence_versions_json")
+            try:
+                versions = json.loads(str(raw_versions or "{}"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                versions = None
+        if not isinstance(versions, Mapping) or not versions:
+            return False
+        components = row.get("component_scores")
+        if not isinstance(components, Mapping):
+            raw_components = row.get("component_scores_json")
+            try:
+                components = json.loads(str(raw_components or "{}"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                components = None
+        if not isinstance(components, Mapping):
+            return False
+        lifecycle = self.store.load_candidate_lifecycle(candidate_id)
+        if not isinstance(lifecycle, Mapping) or str(lifecycle.get("stage") or "") not in self._STAGES:
+            return False
+        payload = self.service._merged_lifecycle_payload(lifecycle)
+        if not isinstance(payload, Mapping):
+            return False
+        eligibility = self.store.connection.execute(
+            "SELECT candidate_id,frozen_hash,evidence_json "
+            "FROM canary_eligibility WHERE candidate_id=?",
+            (candidate_id,),
+        ).fetchone()
+        binding = self.service._eligibility_binding_result(
+            candidate_id,
+            eligibility,
+            record=lifecycle,
+            verify_attestation=False,
+        )
+        if not binding.get("bound") or binding.get("reevaluation_required"):
+            return False
+        if not self.service.validate_eligibility(
+            candidate_id,
+            _record=lifecycle,
+            _verify_attestation=False,
+        ).get("eligible"):
+            return False
+        quality = evaluate_prediction_data_quality(
+            self.store,
+            payload,
+            verify_attestation=False,
+        )
+        expected_hash = _canary_ranking_snapshot_hash(
+            candidate_id,
+            str(lifecycle.get("stage") or ""),
+            payload,
+            qualification_hash=str(binding.get("qualification_hash") or ""),
+            quality=quality,
+        )
+        return bool(
+            row.get("qualification_hash")
+            and row.get("qualification_hash") == binding.get("qualification_hash")
+            and row.get("ranking_snapshot_hash")
+            and row.get("ranking_snapshot_hash") == expected_hash
+            and str(versions.get("frozen_hash") or "")
+            == str(self.service._lifecycle_frozen_hash(lifecycle) or "")
+        )
 
     def evaluate_and_select(self, now: datetime | None = None) -> dict[str, Any]:
+        expected_projection_version = self.service._readiness_projection_version()
+        try:
+            return self._evaluate_and_select(now)
+        except Exception as exc:
+            error_code = getattr(exc, "error_code", None)
+            if not isinstance(error_code, str) or not error_code:
+                error_code = str(type(exc).__name__).upper()[:64] or "UNKNOWN"
+            self.service._persist_evaluation_failure(
+                error_code=error_code,
+                expected_projection_version=expected_projection_version,
+            )
+            raise
+
+    def _evaluate_and_select(self, now: datetime | None = None) -> dict[str, Any]:
         timestamp = ensure_utc(now or self.clock())
         candidates: list[dict[str, Any]] = []
         invalidated_reasons: dict[str, str] = {}
-        for original_record in self._candidate_records():
+        prevalidated: list[dict[str, Any]] = []
+        inventory = self._candidate_records()
+        # Keep the initial membership fence separate from the mutable
+        # evidence token.  Projection/eligibility preparation may intentionally
+        # rewrite lifecycle evidence, but an externally added or removed
+        # candidate must still fail closed.
+        inventory_candidate_ids = frozenset(
+            str(record.get("candidate_id") or "").strip()
+            for record in inventory
+            if str(record.get("candidate_id") or "").strip()
+        )
+        verified_datasets: set[tuple[str, str]] = set()
+        for original_record in inventory:
             candidate_id = str(original_record.get("candidate_id") or "").strip()
             if not candidate_id:
                 continue
@@ -359,9 +579,47 @@ class CandidateCanaryRanker:
                 self.service.invalidate_eligibility(
                     candidate_id,
                     invalidated_reasons[candidate_id],
+                    publish_readiness=False,
                 )
                 continue
+            attestation = self._dataset_attestation_snapshot(payload)
+            dataset_identity = (
+                str(attestation.get("dataset_id") or ""),
+                str(attestation.get("dataset_version") or ""),
+            )
+            if (
+                attestation.get("status") != "CURRENT"
+                and all(dataset_identity)
+                and dataset_identity not in verified_datasets
+            ):
+                verified_datasets.add(dataset_identity)
+                try:
+                    self.store.verify_dataset_integrity_attestation(*dataset_identity)
+                except Exception:
+                    pass
+                attestation = self._dataset_attestation_snapshot(payload)
             quality = evaluate_prediction_data_quality(self.store, payload)
+            quality_status = (
+                quality.get("dataset_integrity_attestation_status")
+                if isinstance(quality, Mapping)
+                else None
+            )
+            quality_hash = (
+                quality.get("dataset_integrity_attestation_hash")
+                if isinstance(quality, Mapping)
+                else None
+            )
+            if (
+                attestation["status"] != quality_status
+                or attestation["attestation_hash"] != quality_hash
+            ):
+                invalidated_reasons[candidate_id] = "DATASET_EVIDENCE_CHANGED"
+                self.service.invalidate_eligibility(
+                    candidate_id,
+                    invalidated_reasons[candidate_id],
+                    publish_readiness=False,
+                )
+                continue
             record, payload = self._persist_quality_projection(
                 original_record,
                 payload,
@@ -376,18 +634,26 @@ class CandidateCanaryRanker:
                 self.service.invalidate_eligibility(
                     candidate_id,
                     invalidated_reasons[candidate_id],
+                    publish_readiness=False,
                 )
                 continue
             validation = self.service.validate_eligibility(
                 candidate_id,
                 _record=record,
             )
-            if not validation.get("eligible"):
-                binding_reason = (
-                    validation.get("binding", {}).get("reason_code")
-                    if isinstance(validation.get("binding"), Mapping)
-                    else None
-                )
+            binding = validation.get("binding")
+            binding_reason = (
+                binding.get("reason_code")
+                if isinstance(binding, Mapping)
+                else None
+            )
+            binding_missing = binding_reason == "ELIGIBILITY_MISSING"
+            binding_bound = (
+                isinstance(binding, Mapping) and bool(binding.get("bound"))
+            )
+            if not validation.get("eligible") or (
+                not binding_bound and not binding_missing
+            ):
                 invalidated_reasons[candidate_id] = (
                     str(binding_reason)
                     if binding_reason in {
@@ -400,31 +666,40 @@ class CandidateCanaryRanker:
                 self.service.invalidate_eligibility(
                     candidate_id,
                     invalidated_reasons[candidate_id],
+                    publish_readiness=False,
                 )
                 continue
-            try:
-                self.service.mark_eligible(candidate_id)
-            except Exception:
-                invalidated_reasons[candidate_id] = "ELIGIBILITY_INVALID"
-                self.service.invalidate_eligibility(
-                    candidate_id,
-                    invalidated_reasons[candidate_id],
-                )
-                continue
-            record = self.store.load_candidate_lifecycle(candidate_id)
-            payload = (
-                self.service._merged_lifecycle_payload(record)
-                if isinstance(record, Mapping)
-                else None
+            prevalidated.append(
+                {
+                    "candidate_id": candidate_id,
+                    "record": record,
+                    "payload": payload,
+                    "quality": quality,
+                    "validation": validation,
+                    "attestation": attestation,
+                }
             )
+
+        candidates: list[dict[str, Any]] = []
+        for prepared in prevalidated:
+            candidate_id = str(prepared["candidate_id"])
+            # Keep the original prevalidation record as the ranking baseline.
+            # Re-reading here could absorb an A/B lifecycle mutation that
+            # happened while ranking evidence was being prepared, defeating
+            # the fenced commit's change detection.
+            record = prepared["record"]
+            payload = prepared["payload"]
             if not isinstance(record, Mapping) or not isinstance(payload, Mapping):
                 invalidated_reasons[candidate_id] = "ELIGIBILITY_INVALID"
                 self.service.invalidate_eligibility(
                     candidate_id,
                     invalidated_reasons[candidate_id],
+                    publish_readiness=False,
                 )
                 continue
-            quality = evaluate_prediction_data_quality(self.store, payload)
+            quality = prepared["quality"]
+            validation = prepared["validation"]
+            attestation = prepared["attestation"]
             frozen_hash = str(validation.get("frozen_hash") or "")
             hashes = self._snapshot_hashes(
                 record,
@@ -437,9 +712,50 @@ class CandidateCanaryRanker:
                 self.service.invalidate_eligibility(
                     candidate_id,
                     invalidated_reasons[candidate_id],
+                    publish_readiness=False,
                 )
                 continue
             _, qualification_hash, ranking_snapshot_hash = hashes
+            validation_qualification = validation.get("qualification")
+            validation_hash = validation.get("qualification_hash")
+            eligibility_frozen_hash = str(validation.get("frozen_hash") or "")
+            if (
+                not isinstance(validation_qualification, Mapping)
+                or not isinstance(validation_hash, str)
+                or not validation_hash
+                or validation_hash != qualification_hash
+                or not eligibility_frozen_hash
+            ):
+                invalidated_reasons[candidate_id] = "ELIGIBILITY_INVALID"
+                self.service.invalidate_eligibility(
+                    candidate_id,
+                    invalidated_reasons[candidate_id],
+                    publish_readiness=False,
+                )
+                continue
+            try:
+                # Always stage canonical qualification evidence derived from
+                # the current lifecycle. A legacy full-payload binding is
+                # accepted only after re-evaluation and is rewritten before
+                # the ranking commit, so the final fence observes the same
+                # evidence it will persist.
+                eligibility_evidence_json = json.dumps(
+                    {
+                        **dict(validation_qualification),
+                        "qualification_hash": validation_hash,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                )
+            except (TypeError, ValueError):
+                invalidated_reasons[candidate_id] = "ELIGIBILITY_INVALID"
+                self.service.invalidate_eligibility(
+                    candidate_id,
+                    invalidated_reasons[candidate_id],
+                    publish_readiness=False,
+                )
+                continue
             evidence, reason, versions = self._rank_evidence(
                 payload,
                 frozen_hash,
@@ -449,6 +765,13 @@ class CandidateCanaryRanker:
                 {
                     "qualification_hash": qualification_hash,
                     "ranking_snapshot_hash": ranking_snapshot_hash,
+                    "dataset_integrity_attestation_status": attestation["status"],
+                    "dataset_integrity_attestation_policy_version": attestation[
+                        "policy_version"
+                    ],
+                    "dataset_integrity_attestation_hash": attestation[
+                        "attestation_hash"
+                    ],
                 }
             )
             item: dict[str, Any] = {
@@ -461,6 +784,9 @@ class CandidateCanaryRanker:
                 "versions": versions,
                 "qualification_hash": qualification_hash,
                 "ranking_snapshot_hash": ranking_snapshot_hash,
+                "eligibility_frozen_hash": eligibility_frozen_hash,
+                "eligibility_evidence_json": eligibility_evidence_json,
+                "attestation": attestation,
             }
             if evidence is not None:
                 item["reason"] = ""
@@ -471,46 +797,113 @@ class CandidateCanaryRanker:
                 )
             candidates.append(item)
 
+        # Persist ranker's eligibility attestations only after the evidence
+        # preparation fence.  A concurrent C/D telemetry update can then
+        # leave the prior CURRENT readiness reason untouched until release;
+        # A/B changes remain fenced by the final lifecycle hash checks.
+        self.service._batch_mark_eligible_prevalidated(prevalidated)
+
         changed_ids: set[str] = set()
         stable: list[dict[str, Any]] = []
         with self.store._lock:
             connection = self.store.connection
             if connection.in_transaction:
                 raise RuntimeError("ranking transaction already active")
+            # Capture the mutable evidence baseline only after all intentional
+            # projection, eligibility, and candidate preparation writes have
+            # completed.  The transaction re-reads the same persisted records
+            # so external A/B changes between these fences still abort.
+            inventory_token = self._candidate_inventory_token(self._candidate_records())
             connection.execute("BEGIN IMMEDIATE")
             try:
+                current_inventory = self._candidate_records()
+                current_candidate_ids = frozenset(
+                    str(record.get("candidate_id") or "").strip()
+                    for record in current_inventory
+                    if str(record.get("candidate_id") or "").strip()
+                )
+                if (
+                    current_candidate_ids != inventory_candidate_ids
+                    or self._candidate_inventory_token(current_inventory)
+                    != inventory_token
+                ):
+                    raise _LifecycleEvidenceChanged(
+                        "candidate inventory changed during ranking"
+                    )
                 for item in candidates:
                     candidate_id = str(item["candidate_id"])
                     current = self.store.load_candidate_lifecycle(candidate_id)
                     if not isinstance(current, Mapping):
-                        changed_ids.add(candidate_id)
-                        continue
+                        raise _LifecycleEvidenceChanged(
+                            f"lifecycle snapshot disappeared for {candidate_id}"
+                        )
                     current_payload = self.service._merged_lifecycle_payload(current)
                     if not isinstance(current_payload, Mapping):
-                        changed_ids.add(candidate_id)
-                        continue
-                    current_quality = evaluate_prediction_data_quality(
-                        self.store,
+                        raise _LifecycleEvidenceChanged(
+                            f"lifecycle payload disappeared for {candidate_id}"
+                        )
+                    current_frozen_hash = self.service._lifecycle_frozen_hash(current)
+                    expected_frozen_hash = str(
+                        item["versions"].get("frozen_hash") or ""
+                    )
+                    quality = item.get("quality")
+                    expected_attestation = item.get("attestation")
+                    attestation = self._dataset_attestation_snapshot(
                         current_payload,
+                        connection=connection,
                     )
-                    current_validation = self.service.validate_eligibility(
-                        candidate_id,
-                        _record=current,
+                    attestation_changed = (
+                        not isinstance(expected_attestation, Mapping)
+                        or attestation != expected_attestation
                     )
-                    current_frozen_hash = str(
-                        current_validation.get("frozen_hash") or ""
+                    stage_changed = (
+                        str(current.get("stage") or "")
+                        != str(item["record"].get("stage") or "")
                     )
+                    frozen_changed = current_frozen_hash != expected_frozen_hash
+                    if attestation_changed:
+                        raise _DatasetEvidenceChanged(
+                            f"dataset attestation changed for {candidate_id}"
+                        )
+                    if stage_changed or frozen_changed:
+                        raise _LifecycleEvidenceChanged(
+                            f"lifecycle binding changed for {candidate_id}"
+                        )
+                    # Historical evidence and eligibility were fully computed
+                    # before BEGIN IMMEDIATE.  The fenced section only checks
+                    # lifecycle, attestation, and ranking hashes before writing.
                     current_hashes = self._snapshot_hashes(
                         current,
                         current_payload,
-                        current_quality,
+                        quality,
                         current_frozen_hash,
                     )
+                    if current_hashes is None:
+                        changed_ids.add(candidate_id)
+                        continue
+                    # A ranking-input mutation (for example, forward
+                    # expectancy or duration) invalidates the entire fenced
+                    # run.  It is not safe to publish a mixed-time ranking.
+                    # C/D telemetry and harmless metadata are intentionally
+                    # absent from this hash and therefore continue normally.
+                    if current_hashes[2] != item["ranking_snapshot_hash"]:
+                        raise _LifecycleEvidenceChanged(
+                            f"ranking snapshot changed for {candidate_id}"
+                        )
+                    eligibility_attestation = connection.execute(
+                        "SELECT candidate_id,frozen_hash,evidence_json "
+                        "FROM canary_eligibility WHERE candidate_id=?",
+                        (candidate_id,),
+                    ).fetchone()
                     if (
-                        not current_validation.get("eligible")
-                        or current_hashes is None
+                        eligibility_attestation is None
+                        or str(eligibility_attestation["candidate_id"] or "").strip()
+                        != candidate_id
+                        or eligibility_attestation["frozen_hash"]
+                        != item["eligibility_frozen_hash"]
+                        or eligibility_attestation["evidence_json"]
+                        != item["eligibility_evidence_json"]
                         or current_hashes[1] != item["qualification_hash"]
-                        or current_hashes[2] != item["ranking_snapshot_hash"]
                     ):
                         changed_ids.add(candidate_id)
                         continue
@@ -554,23 +947,63 @@ class CandidateCanaryRanker:
                     if selected_representatives
                     else None
                 )
-                evidence_seed = [
-                    (
-                        str(item["candidate_id"]),
-                        item["versions"],
-                        float(item["evidence"]["total_score"]),
+                persisted: list[dict[str, Any]] = []
+                fingerprint_rows: list[dict[str, Any]] = []
+                for item in stable:
+                    evidence = item["evidence"]
+                    candidate_id = str(item["candidate_id"])
+                    representative = bool(
+                        evidence is not None
+                        and representatives.get(str(item.get("cluster_key"))) is item
                     )
-                    for item in selected_representatives
-                ]
+                    rank = int(rank_by_id.get(candidate_id, 0))
+                    reason = (
+                        "DIVERSITY_CLUSTER_NON_REPRESENTATIVE"
+                        if evidence is not None and not representative
+                        else str(item["reason"])
+                    )
+                    fingerprint_rows.append(
+                        {
+                            "candidate_id": candidate_id,
+                            "rank": rank,
+                            "total_score": (
+                                float(evidence["total_score"])
+                                if evidence is not None
+                                else None
+                            ),
+                            "component_scores": evidence or {},
+                            "evidence_versions": item["versions"],
+                            "cluster_key": str(item.get("cluster_key") or ""),
+                            "cluster_representative": int(representative),
+                            "selected": int(candidate_id == selected_id and representative),
+                            "reason": reason,
+                            "qualification_hash": item["qualification_hash"],
+                            "ranking_snapshot_hash": item["ranking_snapshot_hash"],
+                        }
+                    )
+                fingerprint_rows.sort(
+                    key=lambda row: (
+                        1 if int(row["rank"]) == 0 else 0,
+                        int(row["rank"]),
+                        (
+                            -float(row["total_score"])
+                            if row["total_score"] is not None
+                            else float("inf")
+                        ),
+                        str(row["candidate_id"]),
+                    )
+                )
                 run_id = "rank-" + hashlib.sha256(
                     json.dumps(
-                        evidence_seed,
+                        {
+                            "formula_version": self.FORMULA_VERSION,
+                            "ordered_rows": fingerprint_rows,
+                        },
                         sort_keys=True,
                         separators=(",", ":"),
                         allow_nan=False,
                     ).encode("utf-8")
                 ).hexdigest()[:24]
-                persisted: list[dict[str, Any]] = []
                 for item in stable:
                     evidence = item["evidence"]
                     candidate_id = str(item["candidate_id"])
@@ -705,9 +1138,24 @@ class CandidateCanaryRanker:
                     connection.rollback()
                 raise
         with self.store._lock:
-            self.service.bind_autonomous_selection(selected_id)
-            public_status = self.service.status()
-            selected_snapshot = self.current_selection()
+            self.service.bind_autonomous_selection(
+                selected_id,
+                publish_readiness=False,
+            )
+            public_status = self.service.publish_readiness_snapshot(
+                reason="RANKING_EVALUATED"
+            )
+            # The committed ranking already validated selection hashes; avoid
+            # re-running the expensive selection validation for this result.
+            selection_record = self.service._selection_record()
+            selected_snapshot = (
+                selection_record
+                if selected_id
+                and isinstance(selection_record, Mapping)
+                and str(selection_record.get("candidate_id") or "").strip()
+                == selected_id
+                else None
+            )
             rankings_snapshot = self.rankings()
         return {
             "ranking_run_id": run_id,
@@ -737,8 +1185,10 @@ class CandidateCanaryRanker:
     def rank(self, now: datetime | None = None) -> dict[str, Any]:
         return self.evaluate_and_select(now)
 
+    MAX_RANKINGS = 10_000
+
     def rankings(self, *, limit: int = 100) -> list[dict[str, Any]]:
-        bounded = max(1, min(int(limit), 1000))
+        bounded = max(1, min(int(limit), self.MAX_RANKINGS))
         with self.store._lock:
             rows = self.store.connection.execute(
                 "SELECT * FROM canary_rankings ORDER BY CASE WHEN rank=0 THEN 1 ELSE 0 END,rank,total_score DESC,candidate_id LIMIT ?",
@@ -771,7 +1221,7 @@ class CandidateCanaryRanker:
         return self.current_selection()
 
     def eligible_count(self) -> int:
-        return int(self.service.status().get("eligible_count") or 0)
+        return int(self.service.authoritative_status().get("eligible_count") or 0)
 
 
 __all__ = ["CandidateCanaryRanker"]

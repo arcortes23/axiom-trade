@@ -19,8 +19,13 @@ import time
 from typing import Any, Callable, Mapping
 
 from .autonomous import AutonomousResearchProcessor
-from .bootstrap import BTC_HISTORY_START, HistoricalBootstrapper
-from .canary import CanaryBlocked, CanaryService, CredentialStore, PolymarketClobV2Venue
+from .canary import (
+    AUTONOMOUS_CANARY_LIMITS,
+    CanaryBlocked,
+    CanaryService,
+    CredentialStore,
+    PolymarketClobV2Venue,
+)
 from .crypto_universe import load_crypto_universe
 from .data import BinanceAdapter
 from .domain import utc_now
@@ -31,6 +36,15 @@ from .storage import AxiomStore
 DEFAULT_HERMES_JOB_ID = "f1d27bf8c27a"
 BOOTSTRAP_JOB_NAME = "crypto-universe-bootstrap"
 HERMES_STATE_NAME = "hermes-control"
+# The configured Hermes job is an external reference only.  The operator has
+# no local verifier for that process, so scheduler state must never be exposed
+# as the external job's status.
+HERMES_CONTROL_SCOPE = "INTERNAL_RESEARCH_QUEUE_PROCESSOR"
+HERMES_EXTERNAL_STATUS = "UNKNOWN"
+HERMES_EXTERNAL_EVIDENCE = (
+    "No local verifier is available for the external Hermes job; "
+    "scheduler state is internal-only."
+)
 _SAFE_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$")
 _SECRET_KEY = re.compile(r"(?:secret|private|password|token|api[_-]?key|credential|mnemonic)", re.I)
 _ALLOWED_ACTIONS = frozenset(
@@ -662,6 +676,136 @@ def _safe_value(value: Any, *, depth: int = 0) -> Any:
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value if not isinstance(value, str) or len(value) <= 1024 else value[:1021] + "..."
     return str(value)[:1024]
+def _operator_value_missing(value: Any) -> bool:
+    return value is None or (isinstance(value, str) and not value.strip())
+def _operator_signal_projection(value: Any) -> dict[str, Any] | None:
+    """Return a non-empty signal mapping, or the explicit missing value."""
+    if not isinstance(value, Mapping) or not value:
+        return None
+    projected = dict(value)
+    return projected or None
+
+
+def _operator_canonical_blocker(*sources: Mapping[str, Any] | None) -> Any:
+    """Return the first non-missing blocker from bounded report sections."""
+    for source in sources:
+        if not isinstance(source, Mapping):
+            continue
+        value = source.get("blocker")
+        if not _operator_value_missing(value):
+            return value
+    return None
+def _operator_control_state(*sources: Mapping[str, Any] | None) -> str:
+    """Return the bounded control state represented by an authoritative report."""
+    states: list[str] = []
+    for source in sources:
+        if not isinstance(source, Mapping):
+            continue
+        for key in ("state", "control_state", "micro_live_canary"):
+            value = source.get(key)
+            if _operator_value_missing(value):
+                continue
+            state = str(value).strip().upper()
+            if state:
+                states.append(state)
+    if "KILLED" in states:
+        return "KILLED"
+    for state in states:
+        if state in {"DISABLED", "DISARMED"}:
+            return state
+    for state in states:
+        if state != "UNKNOWN":
+            return state
+    return "UNKNOWN"
+
+
+def _operator_normalized_canary_blocker(
+    blocker: Any,
+    *control_sources: Mapping[str, Any] | None,
+) -> Any:
+    """Fill only absent blockers from the authoritative control state."""
+    if not _operator_value_missing(blocker):
+        return blocker
+    control_state = _operator_control_state(*control_sources)
+    if control_state in {"DISABLED", "DISARMED"}:
+        return "AUTONOMOUS_CANARY_DISABLED"
+    if control_state == "UNKNOWN":
+        return "AUTONOMOUS_CONTROL_UNKNOWN"
+    return blocker
+
+
+
+
+
+
+def _operator_merge_persisted(
+    persisted: Mapping[str, Any] | None,
+    *sections: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Keep non-missing readiness singleton values while filling report gaps."""
+    merged = dict(persisted) if isinstance(persisted, Mapping) else {}
+    for section in sections:
+        if not isinstance(section, Mapping):
+            continue
+        for key, value in section.items():
+            if key not in merged or _operator_value_missing(merged[key]):
+                merged[key] = value
+    return merged
+
+
+def _operator_patch_non_missing(
+    target: Mapping[str, Any] | None,
+    *sections: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    merged = dict(target) if isinstance(target, Mapping) else {}
+    for section in sections:
+        if not isinstance(section, Mapping):
+            continue
+        for key, value in section.items():
+            if not _operator_value_missing(value):
+                merged[key] = value
+    return merged
+
+_OPERATOR_PRESERVE_KEYS = (
+    "eligibility_raw_count",
+    "eligible_count",
+    "rankable_raw_count",
+    "rankable_count",
+    "ranking_run_id",
+    "ranking_timestamp",
+    "selection_status",
+    "selection_valid",
+    "selection_invalidation_reason",
+    "selection_reason",
+    "selected_candidate",
+    "last_selected_candidate",
+    "readiness_snapshot_status",
+    "readiness_snapshot_stale",
+    "readiness_snapshot_reason",
+    "readiness_snapshot_updated_at",
+    "latest_signal",
+    "rank",
+    "score",
+    "next_decision",
+    "blocker",
+    "winner_rank",
+    "winner_score",
+    "autonomous",
+    "candidate_status",
+)
+
+
+def _operator_safe_mapping(value: Any) -> dict[str, Any]:
+    projected = _safe_value(value)
+    result = dict(projected) if isinstance(projected, Mapping) else {}
+    if isinstance(value, Mapping):
+        for key in _OPERATOR_PRESERVE_KEYS:
+            if key in value:
+                result[key] = _safe_value(value[key])
+    return result
+
+
+
 
 
 def _safe_identifier(value: Any, field: str) -> str:
@@ -715,7 +859,6 @@ def _operator_job_payload(job: Mapping[str, Any] | None) -> dict[str, Any]:
 
 class HermesOperatorAdapter:
     """Fixed in-process Hermes adapter; it accepts no executable or argv."""
-
     def __init__(self, store: AxiomStore, job_id: str) -> None:
         self.store = store
         self.job_id = _safe_identifier(job_id, "Hermes job ID")
@@ -723,17 +866,38 @@ class HermesOperatorAdapter:
     def state(self) -> dict[str, Any]:
         raw = self.store.get_scheduler_state(HERMES_STATE_NAME) or {}
         state = dict(raw) if isinstance(raw, Mapping) else {}
+        # This is the control state of Axiom's in-process queue processor.
+        # It is deliberately kept separate from the external Hermes status,
+        # which cannot be verified by this adapter.
         status = str(state.get("status") or "ACTIVE").upper()
         if status not in {"ACTIVE", "PAUSED"}:
             status = "ACTIVE"
+        schedule = state.get("schedule") or "after_each_collection"
+        last_cycle_at = state.get("last_cycle_at")
+        if last_cycle_at is None:
+            last_cycle_at = state.get("last_run_at")
+        trigger = state.get("trigger") or schedule
         return {
+            # Legacy scheduler fields remain available for the node and
+            # existing callers; status is explicitly the local queue status.
             "job_id": self.job_id,
             "status": status,
-            "schedule": state.get("schedule") or "after_each_collection",
+            "schedule": schedule,
             "last_run_at": state.get("last_run_at"),
             "next_run_at": state.get("next_run_at"),
             "last_result": _safe_value(state.get("last_result")),
             "run_requested_at": state.get("run_requested_at"),
+            "control_scope": HERMES_CONTROL_SCOPE,
+            "external_hermes": {
+                "job_id": self.job_id,
+                "status": HERMES_EXTERNAL_STATUS,
+                "evidence": HERMES_EXTERNAL_EVIDENCE,
+            },
+            "internal_queue": {
+                "status": status,
+                "trigger": trigger,
+                "last_cycle_at": last_cycle_at,
+            },
         }
 
     def set_status(self, status: str) -> dict[str, Any]:
@@ -792,11 +956,37 @@ class OperatorControlPlane:
         self._lock = threading.RLock()
         self._connectivity_lock = threading.RLock()
         self._bootstrap_threads: dict[str, threading.Thread] = {}
+        # Windows identity checks can invoke CIM and are disproportionately
+        # expensive on a dashboard refresh.  Keep a tiny, short-lived cache so
+        # repeated status reads cannot fan out into an unbounded process scan.
+        self._pid_identity_cache: dict[tuple[int, str], tuple[float, bool]] = {}
+        self._pid_identity_cache_ttl = 1.0
+        self._pid_identity_cache_limit = 32
         configured = self.store.get_operator_config("hermes_research_job_id", None)
         selected = hermes_job_id or configured or DEFAULT_HERMES_JOB_ID
         self.hermes_job_id = _safe_identifier(selected, "Hermes job ID")
         if hermes_job_id is not None:
             self.configure_hermes_job_id(hermes_job_id)
+
+    def _cached_pid_matches_node(self, pid: int) -> bool:
+        """Bound the Windows CIM/process identity work used by status reads."""
+        try:
+            pid_value = int(pid)
+        except (TypeError, ValueError):
+            return False
+        if pid_value <= 0:
+            return False
+        now = time.monotonic()
+        key = (pid_value, self.db_path)
+        cached = self._pid_identity_cache.get(key)
+        if cached is not None and now - cached[0] <= self._pid_identity_cache_ttl:
+            return cached[1]
+        result = bool(_pid_matches_node(pid_value, self.db_path))
+        self._pid_identity_cache[key] = (now, result)
+        if len(self._pid_identity_cache) > self._pid_identity_cache_limit:
+            oldest = min(self._pid_identity_cache, key=self._pid_identity_cache.__getitem__)
+            self._pid_identity_cache.pop(oldest, None)
+        return result
 
     def configure_hermes_job_id(self, job_id: str) -> str:
         value = _safe_identifier(job_id, "Hermes job ID")
@@ -816,7 +1006,7 @@ class OperatorControlPlane:
             lock_pid = int(lock_text.splitlines()[0].strip())
         except (FileNotFoundError, OSError, ValueError):
             pass
-        workers = self.store.list_worker_states(limit=2048)
+        workers = self.store.list_worker_states(limit=32)
         root = next((item for item in workers if str(item.get("worker_name")) == "axiom-node"), {})
         worker_payload = root.get("payload") if isinstance(root.get("payload"), Mapping) else {}
         persisted_pid = worker_payload.get("pid")
@@ -824,7 +1014,7 @@ class OperatorControlPlane:
             pid = int(lock_pid or persisted_pid or 0)
         except (TypeError, ValueError):
             pid = 0
-        identity_valid = bool(pid and _pid_matches_node(pid, self.db_path))
+        identity_valid = bool(pid and self._cached_pid_matches_node(pid))
         alive = bool(pid and _pid_alive(pid))
         persisted_status = str(root.get("status") or "").lower()
         if alive and identity_valid:
@@ -852,7 +1042,7 @@ class OperatorControlPlane:
             pid = int(text.splitlines()[0].strip())
         except (FileNotFoundError, OSError, ValueError):
             return
-        if _pid_alive(pid) and _pid_matches_node(pid, self.db_path):
+        if _pid_alive(pid) and self._cached_pid_matches_node(pid):
             raise OperatorControlError("NODE_ALREADY_RUNNING")
         try:
             if path.read_text(encoding="ascii") == text:
@@ -921,28 +1111,75 @@ class OperatorControlPlane:
             return self.ensure_node()
 
     def _bootstrap_status(self) -> dict[str, Any]:
+        """Project persisted bootstrap progress using bounded aggregate reads."""
         job = self.store.get_operator_job(BOOTSTRAP_JOB_NAME)
         result = _operator_job_payload(job)
-        try:
-            snapshot = load_crypto_universe(self.store)
-            selected = list(snapshot.selected_symbols) if snapshot is not None else []
-        except (AttributeError, TypeError, ValueError):
-            selected = []
-        states = self.store.list_dataset_bootstrap_states(limit=10_000)
-        running = [item for item in states if str(item.get("status", "")).upper() == "RUNNING"]
-        complete = [item for item in states if str(item.get("status", "")).upper() in {"COMPLETE", "EMPTY"}]
+        aggregate: Mapping[str, Any] = {}
+        aggregate_method = getattr(self.store, "dashboard_overview_summary", None)
+        if callable(aggregate_method):
+            try:
+                candidate = aggregate_method(activity_limit=1)
+                if isinstance(candidate, Mapping):
+                    aggregate = candidate
+            except (AttributeError, TypeError, ValueError, OSError):
+                aggregate = {}
+        statuses = aggregate.get("bootstrap_statuses", {})
+        statuses = statuses if isinstance(statuses, Mapping) else {}
+        normalized_statuses = {
+            str(key).upper(): max(0, int(value or 0))
+            for key, value in statuses.items()
+            if str(key).strip()
+        }
+        complete_count = sum(
+            normalized_statuses.get(key, 0) for key in ("COMPLETE", "EMPTY")
+        )
+        running_row: Mapping[str, Any] | None = None
+        states_method = getattr(self.store, "list_dataset_bootstrap_states", None)
+        if callable(states_method):
+            try:
+                latest = states_method(limit=1)
+                if isinstance(latest, (list, tuple)) and latest:
+                    row = latest[0]
+                    if isinstance(row, Mapping) and str(row.get("status", "")).upper() == "RUNNING":
+                        running_row = row
+            except (AttributeError, TypeError, ValueError, OSError):
+                running_row = None
+        total_datasets = max(
+            int(result.get("total_datasets", 0) or 0),
+            sum(normalized_statuses.values()),
+        )
+        total_symbols = int(result.get("total_symbols", 0) or 0)
+        if not total_symbols and total_datasets:
+            total_symbols = (total_datasets + 3) // 4
         result.update(
             {
-                "current_symbol": (running[0].get("instrument") if running else result.get("current_symbol")),
-                "current_timeframe": (running[0].get("timeframe") if running else result.get("current_timeframe")),
-                "completed_datasets": len(complete),
-                "total_datasets": len(selected) * 4,
-                "total_symbols": len(selected),
+                "current_symbol": (
+                    running_row.get("instrument")
+                    if running_row is not None
+                    else result.get("current_symbol")
+                ),
+                "current_timeframe": (
+                    running_row.get("timeframe")
+                    if running_row is not None
+                    else result.get("current_timeframe")
+                ),
+                "completed_datasets": complete_count,
+                "total_datasets": total_datasets,
+                "total_symbols": total_symbols,
             }
         )
-        if result["status"] == "RUNNING" and not running and complete and result["completed_datasets"] >= result["total_datasets"]:
+        if (
+            result["status"] == "RUNNING"
+            and running_row is None
+            and complete_count
+            and total_datasets
+            and complete_count >= total_datasets
+        ):
             result["status"] = "COMPLETE"
-        elif result["status"] == "NOT_STARTED" and 0 < result["completed_datasets"] < result["total_datasets"]:
+        elif (
+            result["status"] == "NOT_STARTED"
+            and 0 < complete_count < total_datasets
+        ):
             result["status"] = "PARTIAL"
             result["resumable"] = True
         return result
@@ -1024,7 +1261,6 @@ class OperatorControlPlane:
             self._bootstrap_threads[BOOTSTRAP_JOB_NAME] = thread
             thread.start()
             return self._bootstrap_status()
-
     def _hermes(self) -> HermesOperatorAdapter:
         configured = self.store.get_operator_config("hermes_research_job_id", self.hermes_job_id)
         selected = configured if isinstance(configured, str) and configured else self.hermes_job_id
@@ -1032,8 +1268,9 @@ class OperatorControlPlane:
 
     def status(self) -> dict[str, Any]:
         hermes = self._hermes()
-        workers = self.store.list_worker_states(limit=2048)
+        workers = self.store.list_worker_states(limit=32)
         worker_map = {str(item.get("worker_name")): item for item in workers if isinstance(item, Mapping)}
+
         def worker(name: str) -> dict[str, Any]:
             row = worker_map.get(name, {})
             payload = row.get("payload") if isinstance(row.get("payload"), Mapping) else {}
@@ -1043,35 +1280,237 @@ class OperatorControlPlane:
                 "heartbeat_at": row.get("heartbeat_at"),
                 "started_at": row.get("started_at"),
             }
-        try:
-            projected_credentials = CredentialStore().safe_projection(
-                allow_environment=False
-            )
-            if isinstance(projected_credentials, Mapping):
-                configured = bool(projected_credentials.get("configured"))
-            else:
-                configured = False
-        except BaseException:
-            configured = False
-        credentials = {
-            "configured": configured,
-            "status": "CONFIGURED" if configured else "NOT CONFIGURED",
-            "secret_values_exposed": False,
-        }
+
+
         canary = CanaryService(self.store, initialize=False)
+        report: Mapping[str, Any] = {}
+        legacy_readiness: Mapping[str, Any] = {}
         try:
-            canary_status = _safe_value(canary.status())
-            latest_signal = _safe_value(canary.latest_signal())
+            readiness_method = getattr(canary, "status", None)
+            if not callable(readiness_method):
+                readiness_method = getattr(canary, "readiness_snapshot", None)
+            if callable(readiness_method):
+                raw_readiness = readiness_method()
+                candidate_readiness = _operator_safe_mapping(raw_readiness)
+                if isinstance(candidate_readiness, Mapping):
+                    legacy_readiness = candidate_readiness
+            report_method = getattr(canary, "status_report", None)
+            if callable(report_method):
+                raw_report = report_method()
+                candidate_report = _safe_value(raw_report)
+                if isinstance(raw_report, Mapping) and isinstance(candidate_report, Mapping):
+                    candidate_report = dict(candidate_report)
+                    for section_name in (
+                        "latest_signal",
+                        "control",
+                        "authoritative_control",
+                        "readiness",
+                        "authoritative_readiness",
+                        "worker",
+                        "execution",
+                    ):
+                        if section_name in raw_report:
+                            candidate_report[section_name] = _safe_value(
+                                raw_report[section_name]
+                            )
+                if isinstance(candidate_report, Mapping):
+                    report = dict(candidate_report)
+            if not report:
+                report = {"readiness": dict(legacy_readiness)}
         except Exception:
-            canary_status, latest_signal = {"micro_live_canary": "DISABLED"}, None
+            report = {"readiness": dict(legacy_readiness)}
+        control_report = report.get("control") or report.get("authoritative_control") or {}
+        raw_readiness_report = report.get("readiness") or {}
+        readiness_report = _operator_merge_persisted(
+            legacy_readiness if isinstance(legacy_readiness, Mapping) else {},
+            raw_readiness_report
+            if isinstance(raw_readiness_report, Mapping)
+            else None,
+        )
+        worker_report = report.get("worker") or {}
+        execution_report = report.get("execution") or {}
+        report = dict(report)
+        report["readiness"] = dict(readiness_report)
+        control_report = control_report if isinstance(control_report, Mapping) else {}
+        readiness_report = readiness_report if isinstance(readiness_report, Mapping) else {}
+        worker_report = worker_report if isinstance(worker_report, Mapping) else {}
+        execution_report = execution_report if isinstance(execution_report, Mapping) else {}
+        canary_status = dict(readiness_report)
+        # Fill only absent legacy aliases from bounded report sections.  The
+        # readiness singleton remains authoritative for non-missing display data.
+        for section in (control_report, worker_report, execution_report):
+            canary_status = _operator_merge_persisted(canary_status, section)
+        latest_signal = None
+        for source in (
+            report,
+            execution_report,
+            worker_report,
+            canary_status,
+        ):
+            for alias in ("latest_signal", "signal"):
+                candidate = _operator_signal_projection(source.get(alias))
+                if candidate is not None:
+                    latest_signal = candidate
+                    break
+            if latest_signal is not None:
+                break
+        latest_signal_method = getattr(canary, "latest_signal", None)
+        if callable(latest_signal_method):
+            try:
+                candidate_signal = _operator_signal_projection(
+                    _safe_value(latest_signal_method())
+                )
+            except Exception:
+                candidate_signal = None
+            if candidate_signal is not None:
+                latest_signal = candidate_signal
+        canary_status["latest_signal"] = latest_signal
+        autonomous_state = _operator_merge_persisted(
+            readiness_report.get("autonomous")
+            if isinstance(readiness_report.get("autonomous"), Mapping)
+            else {},
+            canary_status.get("autonomous")
+            if isinstance(canary_status.get("autonomous"), Mapping)
+            else None,
+        )
+        if isinstance(worker_report, Mapping):
+            autonomous_state = _operator_patch_non_missing(
+                autonomous_state,
+                worker_report.get("autonomous"),
+            )
+            worker_fields = {
+                key: worker_report.get(key)
+                for key in (
+                    "last_tick_at",
+                    "last_tick_started_at",
+                    "last_tick_completed_at",
+                    "last_successful_tick",
+                    "last_error_code",
+                    "consecutive_failures",
+                    "next_retry_at",
+                    "candidates_evaluated",
+                    "signals_generated",
+                    "orders_attempted",
+                    "next_decision",
+                    "blocker",
+                    "last_signal_id",
+                    "worker_status",
+                )
+                if key in worker_report
+            }
+            autonomous_state = _operator_patch_non_missing(
+                autonomous_state,
+                worker_fields,
+            )
+        rank_value = canary_status.get("rank")
+        if _operator_value_missing(rank_value):
+            rank_value = canary_status.get("winner_rank")
+        score_value = canary_status.get("score")
+        if _operator_value_missing(score_value):
+            score_value = canary_status.get("winner_score")
+        autonomous_state = _operator_patch_non_missing(
+            autonomous_state,
+            {
+                "rank": rank_value,
+                "score": score_value,
+                "selection_reason": canary_status.get("selection_reason"),
+                "next_decision": canary_status.get("next_decision"),
+                "blocker": canary_status.get("blocker"),
+            },
+        )
+        blocker = _operator_normalized_canary_blocker(
+            _operator_canonical_blocker(
+                worker_report,
+                report,
+                control_report,
+                execution_report,
+                autonomous_state,
+                canary_status,
+                readiness_report,
+            ),
+            control_report,
+            report.get("authoritative_control"),
+            readiness_report,
+            report,
+            canary_status,
+        )
+        canary_status["blocker"] = blocker
+        autonomous_state["blocker"] = blocker
+        report["latest_signal"] = latest_signal
+        report["readiness"] = {
+            **readiness_report,
+            "latest_signal": latest_signal,
+            "blocker": blocker,
+        }
+        autonomous_state.setdefault(
+            "enabled",
+            str(canary_status.get("micro_live_canary") or "").upper()
+            in {"AUTONOMOUS_MICRO_LIVE", "ENABLED"},
+        )
+        canary_status.setdefault(
+            "risk_envelope",
+            readiness_report.get("risk_envelope")
+            or control_report.get("risk_envelope")
+            or dict(AUTONOMOUS_CANARY_LIMITS),
+        )
+        canary_status.setdefault(
+            "risk_limits",
+            readiness_report.get("risk_limits")
+            or control_report.get("risk_limits")
+            or canary_status.get("risk_envelope", {}),
+        )
+        canary_status.setdefault("trades", execution_report.get("trades", []))
+        canary_status.setdefault(
+            "execution_event_count",
+            execution_report.get("event_count", execution_report.get("real_execution_events", 0)),
+        )
+        canary_status.setdefault(
+            "real_execution_events",
+            execution_report.get("real_execution_events", execution_report.get("event_count", 0)),
+        )
         worker_status = worker("autonomous-canary")
-        autonomous_state = canary_status.get("autonomous") if isinstance(canary_status, Mapping) else {}
-        if not isinstance(autonomous_state, Mapping):
-            autonomous_state = {}
         latest_connectivity = _stored_connectivity_projection(
             self.store.get_operator_config(CANARY_CONNECTIVITY_CONFIG_KEY, None)
         )
+        credential_type = CredentialStore
+        try:
+            projected_credentials = credential_type.cached_projection(
+                allow_environment=False,
+                persisted={
+                    "canary": canary_status,
+                    "status_report": report,
+                    "readiness": readiness_report,
+                    "connectivity": latest_connectivity,
+                },
+            )
+        except BaseException:
+            projected_credentials = None
+        if not isinstance(projected_credentials, Mapping):
+            try:
+                credential_store = credential_type()
+                projected_credentials = credential_store.cached_projection(
+                    allow_environment=False,
+                    persisted={
+                        "canary": canary_status,
+                        "status_report": report,
+                        "readiness": readiness_report,
+                        "connectivity": latest_connectivity,
+                    },
+                )
+            except BaseException:
+                projected_credentials = None
+        credentials = (
+            dict(projected_credentials)
+            if isinstance(projected_credentials, Mapping)
+            else {
+                "configured": None,
+                "status": "NOT CHECKED",
+                "secret_values_exposed": False,
+            }
+        )
+        credentials["secret_values_exposed"] = False
         return {
+            "canary_status_report": dict(report),
             "connectivity": latest_connectivity,
             "node": self._node_status(),
             "bootstrap": self._bootstrap_status(),
@@ -1083,6 +1522,11 @@ class OperatorControlPlane:
             "credentials": credentials,
             "canary": {
                 "status": canary_status,
+                "status_report": dict(report),
+                "control": dict(control_report),
+                "readiness": dict(readiness_report),
+                "worker": dict(worker_report),
+                "execution": dict(execution_report),
                 "latest_signal": latest_signal,
                 "autonomous": autonomous_state,
                 "connectivity": latest_connectivity,
@@ -1207,7 +1651,17 @@ class OperatorControlPlane:
             else:
                 public = _safe_value(result)
             self._audit(action_value, target_value, success=True, result=public)
-            return {"ok": True, "action": action_value, "target": target_value, "result": public, "paper_only": True, "live_execution": False}
+            response = {
+                "ok": True,
+                "action": action_value,
+                "target": target_value,
+                "result": public,
+                "paper_only": True,
+                "live_execution": False,
+            }
+            if action_value.startswith("hermes."):
+                response["control_scope"] = HERMES_CONTROL_SCOPE
+            return response
         except OperatorControlError as exc:
             reason = exc.code
         except CanaryBlocked as exc:
@@ -1216,13 +1670,30 @@ class OperatorControlPlane:
             reason = type(exc).__name__.upper()
         except Exception as exc:
             reason = type(exc).__name__.upper()
-        self._audit(action_value or "invalid", target_value, success=False, reason=reason, result={"ok": False, "reason": reason})
-        return {"ok": False, "action": action_value, "target": target_value, "reason": reason, "paper_only": True, "live_execution": False}
+        failure = {
+            "ok": False,
+            "action": action_value,
+            "target": target_value,
+            "reason": reason,
+            "paper_only": True,
+            "live_execution": False,
+        }
+        if action_value.startswith("hermes."):
+            failure["control_scope"] = HERMES_CONTROL_SCOPE
+        self._audit(
+            action_value or "invalid",
+            target_value,
+            success=False,
+            reason=reason,
+            result={"ok": False, "reason": reason},
+        )
+        return failure
 
 
 __all__ = [
     "DEFAULT_HERMES_JOB_ID",
     "BOOTSTRAP_JOB_NAME",
+    "HERMES_CONTROL_SCOPE",
     "CANARY_CONNECTIVITY_CONFIG_KEY",
     "HermesOperatorAdapter",
     "OperatorControlError",

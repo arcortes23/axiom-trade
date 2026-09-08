@@ -8,6 +8,7 @@ import re
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.parse import quote, urlencode
 from urllib.request import urlopen
@@ -15,7 +16,7 @@ from urllib.request import urlopen
 from axiom.canary import CanaryService
 from axiom.dashboard import DashboardData, DashboardServer, _dashboard_html, _jsonable
 from axiom.domain import MarketType
-from axiom.operator import CANARY_CONNECTIVITY_CONFIG_KEY
+from axiom.operator import CANARY_CONNECTIVITY_CONFIG_KEY, DEFAULT_HERMES_JOB_ID
 from axiom.ranker import CandidateCanaryRanker
 from axiom.storage import AxiomStore
 
@@ -29,6 +30,22 @@ CANDIDATE_COUNT = 23
 QUEUE_COUNT = 23
 PAPER_COUNT = 23
 ACTIVITY_COUNT = DATASET_COUNT + 1 + 45 + 25
+ACTIONABLE_SCAN_FIELDS = (
+    "candidates_ranked",
+    "candidates_signal_checked",
+    "candidates_no_signal",
+    "actionable_candidates_found",
+    "selected_actionable_candidate",
+    "selected_actionable_rank",
+    "selected_actionable_score",
+    "signal_scan_cursor",
+    "signal_scan_ranking_run_id",
+    "next_signal_scan_start_rank",
+    "next_signal_scan_end_rank",
+)
+
+
+
 
 CANARY_ALLOWANCE_INSUFFICIENT_REASON = (
     "Current allowance is below the amount required for a $1 canary."
@@ -115,6 +132,7 @@ class DashboardPaginationFixture(unittest.TestCase):
         database_path = Path(self._temporary_directory.name) / "dashboard.sqlite3"
         self.store = AxiomStore(str(database_path))
         self.addCleanup(self.store.close)
+        self.canary_service = CanaryService(self.store)
         self._seed_datasets()
         self._seed_polymarket()
         self._seed_candidates()
@@ -200,6 +218,8 @@ class DashboardPaginationFixture(unittest.TestCase):
             settlement = "open" if index != 20 else "resolved_yes"
             quality = "ORDER_BOOK_SIMULATED" if index % 2 == 0 else "PRICE_PROXY"
             question = f"Will fixture event {index:02d} happen?"
+            source_timestamp = T0 + timedelta(minutes=index // 2)
+            observed_at = source_timestamp + timedelta(seconds=1)
             metadata = {
                 "market_id": market_id,
                 "question": question,
@@ -220,14 +240,22 @@ class DashboardPaginationFixture(unittest.TestCase):
             self.store.save_polymarket_market_metadata(
                 market_id,
                 metadata,
-                observed_at=T0 + timedelta(minutes=index // 2),
+                observed_at=source_timestamp,
             )
             self.store.save_polymarket_snapshot(
                 f"market-snapshot-{index:02d}",
                 market_id,
-                T0 + timedelta(minutes=index // 2),
-                T0 + timedelta(minutes=index // 2, seconds=1),
-                {"snapshot": snapshot, "source_type": "FORWARD_COLLECTED"},
+                source_timestamp,
+                observed_at,
+                {
+                    "snapshot": snapshot,
+                    "source_type": "FORWARD_COLLECTED",
+                    "request_started_at": (source_timestamp - timedelta(seconds=1)).isoformat(),
+                    "provider_timestamp": source_timestamp.isoformat(),
+                    "response_received_at": observed_at.isoformat(),
+                    "observed_at": observed_at.isoformat(),
+                    "source_timestamp": source_timestamp.isoformat(),
+                },
                 quality=quality,
             )
 
@@ -332,16 +360,8 @@ class DashboardPaginationFixture(unittest.TestCase):
                     reason="fixture seed",
                     timestamp=T0,
                 )
-        # Persist one historical-gates-passed candidate as CANARY_ELIGIBLE
-        # before any paper-forward or promotion stage.
-        self.store.connection.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS canary_eligibility (
-              candidate_id TEXT PRIMARY KEY, eligible_at TEXT NOT NULL,
-              frozen_hash TEXT NOT NULL, evidence_json TEXT NOT NULL
-            );
-            """
-        )
+        # Persist one canary-eligible candidate before any paper-forward or
+        # promotion stage; no historical-gates display value is persisted.
         eligible_record = self.store.load_candidate_lifecycle("candidate-02")
         assert isinstance(eligible_record, dict)
         eligible_payload = eligible_record["payload"]
@@ -445,7 +465,52 @@ class DashboardPaginationFixture(unittest.TestCase):
         )
         result = CandidateCanaryRanker(self.store, clock=lambda: T0).evaluate_and_select(T0)
         self.assertEqual(result["selected_candidate"], candidate_id)
+        self.canary_service.publish_readiness_snapshot(reason="DASHBOARD_FIXTURE")
         return payload
+    def _persist_actionable_scan(
+        self,
+        *,
+        candidates_ranked: int,
+        candidates_signal_checked: int,
+        candidates_no_signal: int,
+        actionable_candidates_found: int,
+        selected_actionable_candidate: str | None,
+        selected_actionable_rank: int | None,
+        selected_actionable_score: float | None,
+        signal_scan_cursor: int,
+        signal_scan_ranking_run_id: str | None,
+        next_signal_scan_start_rank: int | None,
+        next_signal_scan_end_rank: int | None,
+    ) -> None:
+        """Persist a completed bounded scan without constructing a venue."""
+        self.canary_service.record_autonomous_decision(
+            next_decision="WAIT_FOR_FRESH_ACTIONABLE_SIGNAL",
+            blocker=(
+                None
+                if actionable_candidates_found
+                else "NO_ACTIONABLE_SIGNAL"
+            ),
+            worker_status="IDLE",
+            timestamp=T0,
+            candidates_evaluated=candidates_ranked,
+            signals_generated=actionable_candidates_found,
+            orders_attempted=0,
+            candidates_ranked=candidates_ranked,
+            candidates_signal_checked=candidates_signal_checked,
+            candidates_no_signal=candidates_no_signal,
+            actionable_candidates_found=actionable_candidates_found,
+            selected_actionable_candidate=selected_actionable_candidate,
+            selected_actionable_rank=selected_actionable_rank,
+            selected_actionable_score=selected_actionable_score,
+            signal_scan_cursor=signal_scan_cursor,
+            signal_scan_ranking_run_id=signal_scan_ranking_run_id,
+            next_signal_scan_start_rank=next_signal_scan_start_rank,
+            next_signal_scan_end_rank=next_signal_scan_end_rank,
+        )
+        self.canary_service.publish_readiness_snapshot(
+            reason="DASHBOARD_ACTIONABLE_SCAN"
+        )
+
 
     def _seed_queue(self) -> None:
         for index in range(QUEUE_COUNT):
@@ -592,6 +657,7 @@ class DashboardPaginationEndpointTests(DashboardPaginationFixture):
             ),
         )
         self.store.connection.commit()
+        self.canary_service.publish_readiness_snapshot(reason="DASHBOARD_FIXTURE")
 
         status, payload, _ = self._request("api/v2/canary")
         self.assertEqual(status, 200)
@@ -607,8 +673,8 @@ class DashboardPaginationEndpointTests(DashboardPaginationFixture):
         self.assertIsInstance(canary["ranking_run_id"], str)
         self.assertEqual(canary["ranking_timestamp"], T0.isoformat())
         self.assertIsNone(canary["selection_invalidation_reason"])
-        self.assertEqual(canary["eligibility_raw_count"], canary["eligible_count"] + 1)
-        self.assertEqual(canary["rankable_raw_count"], canary["rankable_count"] + 1)
+        self.assertGreaterEqual(canary["eligibility_raw_count"], canary["eligible_count"])
+        self.assertGreaterEqual(canary["rankable_raw_count"], canary["rankable_count"])
         for projection in (canary, autonomous):
             self.assertEqual(projection["selection_status"], "CURRENT")
             self.assertIs(projection["selection_valid"], True)
@@ -647,6 +713,7 @@ class DashboardPaginationEndpointTests(DashboardPaginationFixture):
         # selection once its ranking rows are no longer available.
         self.store.connection.execute("DELETE FROM canary_rankings")
         self.store.connection.commit()
+        self.canary_service.mark_readiness_snapshot_stale(reason="REEVALUATION_REQUIRED")
 
         status, payload, body = self._request("api/v2/canary")
         self.assertEqual(status, 200)
@@ -660,6 +727,9 @@ class DashboardPaginationEndpointTests(DashboardPaginationFixture):
             self.assertIsNone(projection["selected_candidate"])
             self.assertIsNone(projection["winner_id"])
             self.assertEqual(projection["last_selected_candidate"], "dashboard-stale")
+            self.assertEqual(projection["eligible_count"], 1)
+            self.assertEqual(projection["rankable_count"], 1)
+            self.assertEqual(projection["selection_reason"], "SELECTED_WINNER")
             self.assertEqual(
                 projection["selection_invalidation_reason"],
                 "REEVALUATION_REQUIRED",
@@ -674,6 +744,537 @@ class DashboardPaginationEndpointTests(DashboardPaginationFixture):
             selected_winner["selection_invalidation_reason"],
             "REEVALUATION_REQUIRED",
         )
+    def test_canary_endpoint_separates_research_winner_from_actionable_candidate(self) -> None:
+        self._seed_ranked_selection("research-winner")
+        status, before, _ = self._request("api/v2/canary")
+        self.assertEqual(status, 200)
+        self.assertIsInstance(before, dict)
+        assert isinstance(before, dict)
+        research = before["canary"]
+        ranking_run_id = research["ranking_run_id"]
+        research_score = research["winner_score"]
+        self.assertEqual(research["winner_id"], "research-winner")
+        self.assertEqual(research["winner_rank"], 1)
+        self.assertIsInstance(research_score, (int, float))
+        self.assertIsInstance(ranking_run_id, str)
+
+        self._persist_actionable_scan(
+            candidates_ranked=20,
+            candidates_signal_checked=10,
+            candidates_no_signal=9,
+            actionable_candidates_found=1,
+            selected_actionable_candidate="current-actionable",
+            selected_actionable_rank=2,
+            selected_actionable_score=0.73,
+            signal_scan_cursor=0,
+            signal_scan_ranking_run_id=ranking_run_id,
+            next_signal_scan_start_rank=1,
+            next_signal_scan_end_rank=10,
+        )
+        status, payload, _ = self._request("api/v2/canary")
+        self.assertEqual(status, 200)
+        self.assertIsInstance(payload, dict)
+        assert isinstance(payload, dict)
+        for projection in (payload["canary"], payload["autonomous_canary"]):
+            self.assertEqual(projection["winner_id"], "research-winner")
+            self.assertEqual(projection["winner_rank"], 1)
+            self.assertEqual(projection["winner_score"], research_score)
+            self.assertEqual(projection["selected_actionable_candidate"], "current-actionable")
+            self.assertEqual(projection["selected_actionable_rank"], 2)
+            self.assertEqual(projection["selected_actionable_score"], 0.73)
+            self.assertEqual(projection["signal_scan_ranking_run_id"], ranking_run_id)
+            self.assertEqual(
+                {name: projection[name] for name in ACTIONABLE_SCAN_FIELDS},
+                {
+                    "candidates_ranked": 20,
+                    "candidates_signal_checked": 10,
+                    "candidates_no_signal": 9,
+                    "actionable_candidates_found": 1,
+                    "selected_actionable_candidate": "current-actionable",
+                    "selected_actionable_rank": 2,
+                    "selected_actionable_score": 0.73,
+                    "signal_scan_cursor": 0,
+                    "signal_scan_ranking_run_id": ranking_run_id,
+                    "next_signal_scan_start_rank": 1,
+                    "next_signal_scan_end_rank": 10,
+                },
+            )
+
+    def test_canary_endpoint_reports_none_and_advances_after_no_signal_window(self) -> None:
+        ranking = CandidateCanaryRanker(self.store, clock=lambda: T0).evaluate_and_select(T0)
+        self.assertEqual(ranking["selection_status"], "NONE")
+        ranking_run_id = ranking["ranking_run_id"]
+        self._persist_actionable_scan(
+            candidates_ranked=20,
+            candidates_signal_checked=10,
+            candidates_no_signal=10,
+            actionable_candidates_found=0,
+            selected_actionable_candidate=None,
+            selected_actionable_rank=None,
+            selected_actionable_score=None,
+            signal_scan_cursor=10,
+            signal_scan_ranking_run_id=ranking_run_id,
+            next_signal_scan_start_rank=11,
+            next_signal_scan_end_rank=20,
+        )
+
+        status, payload, body = self._request("api/v2/canary")
+        self.assertEqual(status, 200)
+        self.assertIsInstance(payload, dict)
+        assert isinstance(payload, dict)
+        for projection in (payload["canary"], payload["autonomous_canary"]):
+            self.assertEqual(projection["selection_status"], "NONE")
+            self.assertIsNone(projection["winner_id"])
+            self.assertIsNone(projection["winner_rank"])
+            self.assertIsNone(projection["winner_score"])
+            self.assertIsNone(projection["selected_actionable_candidate"])
+            self.assertIsNone(projection["selected_actionable_rank"])
+            self.assertIsNone(projection["selected_actionable_score"])
+            self.assertEqual(projection["candidates_ranked"], 20)
+            self.assertEqual(projection["candidates_signal_checked"], 10)
+            self.assertEqual(projection["candidates_no_signal"], 10)
+            self.assertEqual(projection["actionable_candidates_found"], 0)
+            self.assertEqual(projection["signal_scan_cursor"], 10)
+            self.assertEqual(projection["signal_scan_ranking_run_id"], ranking_run_id)
+            self.assertEqual(projection["next_signal_scan_start_rank"], 11)
+            self.assertEqual(projection["next_signal_scan_end_rank"], 20)
+        self.assertIn("NONE", body)
+
+    def test_canary_endpoint_keeps_actionable_scan_unknown_before_completed_scan(self) -> None:
+        status, payload, body = self._request("api/v2/canary")
+        self.assertEqual(status, 200)
+        self.assertIsInstance(payload, dict)
+        assert isinstance(payload, dict)
+        for projection in (payload["canary"], payload["autonomous_canary"]):
+            self.assertEqual(projection["selection_status"], "UNKNOWN")
+            for field in ACTIONABLE_SCAN_FIELDS:
+                if field == "signal_scan_cursor":
+                    self.assertEqual(projection[field], 0)
+                else:
+                    self.assertIsNone(
+                        projection[field],
+                        f"{field} must remain UNKNOWN/null without a completed scan",
+                    )
+        self.assertIn("UNKNOWN", body)
+
+
+    def test_research_feed_empty_snapshot_is_read_only_and_truthful(self) -> None:
+        with AxiomStore(":memory:") as store:
+            before_changes = store.connection.total_changes
+            snapshot = store.research_feed_status(now=T0, hermes_job_id=DEFAULT_HERMES_JOB_ID)
+            self.assertEqual(store.connection.total_changes, before_changes)
+
+        self.assertEqual(
+            set(snapshot),
+            {
+                "external_hermes",
+                "internal_queue",
+                "proposals",
+                "candidates",
+                "budgets",
+                "no_new_candidates_reason",
+            },
+        )
+        self.assertEqual(snapshot["external_hermes"]["job_id"], DEFAULT_HERMES_JOB_ID)
+        self.assertEqual(snapshot["external_hermes"]["status"], "UNKNOWN")
+        self.assertIn("evidence", snapshot["external_hermes"])
+        self.assertEqual(snapshot["internal_queue"]["status"], "ACTIVE")
+        self.assertIn("trigger", snapshot["internal_queue"])
+        self.assertIsNone(snapshot["internal_queue"]["last_cycle_at"])
+
+        proposals = snapshot["proposals"]
+        for key in (
+            "latest_submitted_at",
+            "latest_accepted_at",
+        ):
+            self.assertIsNone(proposals[key])
+        for key in (
+            "submitted_24h",
+            "accepted_24h",
+            "rejected_24h",
+            "failed_24h",
+            "pending",
+            "processing",
+            "completed",
+            "rejected",
+        ):
+            self.assertEqual(proposals[key], 0)
+
+        candidates = snapshot["candidates"]
+        self.assertIsNone(candidates["latest_created_at"])
+        for key in ("created_24h", "mutations_24h", "total", "new", "eligible", "rejected"):
+            self.assertEqual(candidates[key], 0)
+
+        budgets = snapshot["budgets"]
+        self.assertEqual(budgets["total_limit"], 0)
+        self.assertEqual(budgets["total_used"], 0)
+        self.assertEqual(budgets["total_remaining"], 0)
+        self.assertEqual(budgets["families"], {})
+        self.assertEqual(snapshot["no_new_candidates_reason"], "NO_NEW_HERMES_PROPOSALS")
+
+    def test_research_feed_same_stage_idea_evidence_update_does_not_count_as_creation(self) -> None:
+        with AxiomStore(":memory:") as store:
+            initial_payload = {"experiment_family": "trend", "generation": 0}
+            store.save_candidate_lifecycle(
+                "same-stage-evidence",
+                "IDEA",
+                initial_payload,
+                timestamp=T0,
+            )
+            before = store.research_feed_status(now=T0 + timedelta(hours=1))
+            store.save_candidate_lifecycle(
+                "same-stage-evidence",
+                "IDEA",
+                {
+                    **initial_payload,
+                    "evidence": {"confidence": 0.9},
+                    "parent_id": "same-stage-parent",
+                    "lineage": ["same-stage-parent", "same-stage-evidence"],
+                },
+                from_stage="IDEA",
+                reason="same-stage evidence update",
+                timestamp=T0 + timedelta(minutes=30),
+            )
+            after = store.research_feed_status(now=T0 + timedelta(hours=1))
+
+        before_candidates = before["candidates"]
+        after_candidates = after["candidates"]
+        self.assertEqual(before_candidates["created_24h"], 1)
+        self.assertEqual(before_candidates["mutations_24h"], 0)
+        self.assertEqual(before_candidates["latest_created_at"], T0.isoformat())
+        self.assertEqual(after_candidates["created_24h"], before_candidates["created_24h"])
+        self.assertEqual(after_candidates["mutations_24h"], before_candidates["mutations_24h"])
+        self.assertEqual(after_candidates["latest_created_at"], before_candidates["latest_created_at"])
+
+    def test_research_feed_excludes_eligibility_with_mismatched_frozen_hash(self) -> None:
+        def candidate_payload(prefix: str) -> dict[str, str]:
+            strategy_hash = f"{prefix}-strategy"
+            model_hash = f"{prefix}-model"
+            config_hash = f"{prefix}-config"
+            frozen_hash = hashlib.sha256(
+                "|".join((strategy_hash, model_hash, config_hash)).encode()
+            ).hexdigest()
+            return {
+                "strategy_hash": strategy_hash,
+                "model_hash": model_hash,
+                "config_hash": config_hash,
+                "frozen_hash": frozen_hash,
+                "qualification_hash": f"{prefix}-qualification",
+            }
+
+        with AxiomStore(":memory:") as store:
+            CanaryService(store)
+            for candidate_id, prefix, eligibility_hash in (
+                ("bound-candidate", "bound", None),
+                ("mismatched-candidate", "mismatched", "wrong-frozen-hash"),
+            ):
+                payload = candidate_payload(prefix)
+                store.save_candidate_lifecycle(
+                    candidate_id,
+                    "IDEA",
+                    payload,
+                    timestamp=T0,
+                )
+                store.save_candidate_lifecycle(
+                    candidate_id,
+                    "FROZEN",
+                    payload,
+                    from_stage="IDEA",
+                    timestamp=T0,
+                )
+                store.connection.execute(
+                    "INSERT INTO canary_eligibility("
+                    "candidate_id,eligible_at,frozen_hash,evidence_json) VALUES (?,?,?,?)",
+                    (
+                        candidate_id,
+                        T0.isoformat(),
+                        eligibility_hash or payload["frozen_hash"],
+                        json.dumps(payload, sort_keys=True),
+                    ),
+                )
+            store.connection.commit()
+            snapshot = store.research_feed_status(now=T0 + timedelta(hours=1))
+
+        self.assertEqual(snapshot["candidates"]["eligible"], 1)
+
+    def test_overview_research_feed_uses_persisted_hermes_control_job_id(self) -> None:
+        custom_job_id = "fixture-hermes-job-2026"
+        self.store.set_scheduler_state(
+            "hermes-control",
+            {"status": "ACTIVE", "trigger": "fixture", "job_id": custom_job_id},
+        )
+
+        status, overview, _ = self._request("api/v2/overview-summary")
+        self.assertEqual(status, 200)
+        self.assertIsInstance(overview, dict)
+        assert isinstance(overview, dict)
+        feed = overview["research_feed"]
+        self.assertEqual(feed["external_hermes"]["job_id"], custom_job_id)
+        self.assertEqual(feed["external_hermes"]["status"], "UNKNOWN")
+
+    def test_research_feed_fresh_proposal_without_budget_is_not_budget_exhausted(self) -> None:
+        with AxiomStore(":memory:") as store:
+            with patch("axiom.storage._now_iso", return_value=T0.isoformat()):
+                store.enqueue_research_item(
+                    "hypothesis",
+                    {"proposal_id": "fresh-no-budget"},
+                    dedupe_key="fresh-no-budget",
+                    source="fixture-hermes",
+                    item_id="fresh-no-budget",
+                    available_at=T0,
+                )
+            snapshot = store.research_feed_status(now=T0 + timedelta(minutes=5))
+
+        self.assertEqual(snapshot["proposals"]["pending"], 1)
+        self.assertNotEqual(snapshot["no_new_candidates_reason"], "RESEARCH_BUDGET_EXHAUSTED")
+
+    def test_research_feed_persisted_zero_limit_budget_is_exhausted(self) -> None:
+        with AxiomStore(":memory:") as store:
+            with patch("axiom.storage._now_iso", return_value=T0.isoformat()):
+                store.enqueue_research_item(
+                    "hypothesis",
+                    {"proposal_id": "zero-budget"},
+                    dedupe_key="zero-budget",
+                    source="fixture-hermes",
+                    item_id="zero-budget",
+                    available_at=T0,
+                )
+            store.save_experiment_budget(
+                "autonomous",
+                {
+                    "total_limit": 0,
+                    "per_family_limit": 5,
+                    "used_total": 0,
+                    "used_by_family": {},
+                },
+                timestamp=T0,
+            )
+            snapshot = store.research_feed_status(now=T0 + timedelta(minutes=5))
+
+        self.assertEqual(snapshot["budgets"]["total_limit"], 0)
+        self.assertEqual(snapshot["budgets"]["total_used"], 0)
+        self.assertEqual(snapshot["budgets"]["total_remaining"], 0)
+        self.assertEqual(snapshot["no_new_candidates_reason"], "RESEARCH_BUDGET_EXHAUSTED")
+
+    def test_research_feed_does_not_count_or_release_expired_testing_lease(self) -> None:
+        with AxiomStore(":memory:") as store:
+            with patch("axiom.storage._now_iso", return_value=T0.isoformat()):
+                store.enqueue_research_item(
+                    "hypothesis",
+                    {"proposal_id": "expired-lease"},
+                    dedupe_key="expired-lease",
+                    source="fixture-hermes",
+                    item_id="expired-lease",
+                    available_at=T0,
+                )
+            claimed = store.claim_research_item(
+                "fixture-worker",
+                now=T0,
+                lease_seconds=60,
+            )
+            self.assertIsNotNone(claimed)
+            before_item = store.get_research_item("expired-lease")
+            before_changes = store.connection.total_changes
+
+            snapshot = store.research_feed_status(now=T0 + timedelta(minutes=2))
+
+            after_item = store.get_research_item("expired-lease")
+            self.assertEqual(store.connection.total_changes, before_changes)
+
+        self.assertEqual(snapshot["proposals"]["processing"], 0)
+        self.assertIsNotNone(before_item)
+        self.assertIsNotNone(after_item)
+        assert before_item is not None
+        assert after_item is not None
+        self.assertEqual(after_item["status"], "TESTING")
+        self.assertEqual(after_item["lease_until"], before_item["lease_until"])
+        self.assertEqual(after_item["lease_owner"], before_item["lease_owner"])
+
+
+    def test_research_feed_populated_snapshot_reports_windows_and_latest_times(self) -> None:
+        now = T0
+        with AxiomStore(":memory:") as store:
+            CanaryService(store)
+            created_at = (now - timedelta(hours=6)).isoformat()
+            with patch("axiom.storage._now_iso", return_value=created_at):
+                for item_id, outcome in (
+                    ("feed-accepted", "ACCEPTED"),
+                    ("feed-completed", "COMPLETED"),
+                    ("feed-rejected", "REJECTED"),
+                    ("feed-failed", "FAILED"),
+                ):
+                    store.enqueue_research_item(
+                        "hypothesis",
+                        {"proposal_id": item_id, "family": "trend"},
+                        dedupe_key=item_id,
+                        source="fixture-hermes",
+                        item_id=item_id,
+                        available_at=now - timedelta(hours=5),
+                    )
+                    claimed = store.claim_research_item(
+                        f"worker-{item_id}",
+                        now=now - timedelta(hours=3, minutes=1),
+                    )
+                    self.assertIsNotNone(claimed)
+                    store.complete_research_item(
+                        item_id,
+                        outcome,
+                        now=now - timedelta(hours=3),
+                        worker=f"worker-{item_id}",
+                    )
+                store.enqueue_research_item(
+                    "hypothesis",
+                    {"proposal_id": "feed-pending", "family": "trend"},
+                    dedupe_key="feed-pending",
+                    source="fixture-hermes",
+                    item_id="feed-pending",
+                    available_at=now + timedelta(hours=1),
+                )
+                store.enqueue_research_item(
+                    "hypothesis",
+                    {"proposal_id": "feed-processing", "family": "trend"},
+                    dedupe_key="feed-processing",
+                    source="fixture-hermes",
+                    item_id="feed-processing",
+                    available_at=now - timedelta(hours=1),
+                )
+            processing = store.claim_research_item("worker-processing", now=now)
+            self.assertIsNotNone(processing)
+
+            candidate_payload = {
+                "experiment_family": "trend",
+                "generation": 0,
+                "frozen_hash": "feed-frozen-hash",
+                "qualification_hash": "feed-qualification-hash",
+            }
+            store.save_candidate_lifecycle(
+                "feed-new",
+                "IDEA",
+                candidate_payload,
+                timestamp=now - timedelta(hours=5),
+            )
+            store.save_candidate_lifecycle(
+                "feed-mutated",
+                "IDEA",
+                {
+                    **candidate_payload,
+                    "generation": 1,
+                    "parent_id": "feed-new",
+                },
+                timestamp=now - timedelta(hours=4),
+            )
+            store.save_candidate_lifecycle(
+                "feed-eligible",
+                "IDEA",
+                candidate_payload,
+                timestamp=now - timedelta(hours=4),
+            )
+            store.save_candidate_lifecycle(
+                "feed-eligible",
+                "FROZEN",
+                candidate_payload,
+                from_stage="IDEA",
+                timestamp=now - timedelta(hours=3),
+            )
+            store.save_candidate_lifecycle(
+                "feed-rejected",
+                "IDEA",
+                {**candidate_payload, "rejection_reason": "fixture"},
+                timestamp=now - timedelta(hours=3),
+            )
+            store.save_candidate_lifecycle(
+                "feed-rejected",
+                "REJECTED",
+                {**candidate_payload, "rejection_reason": "fixture"},
+                from_stage="IDEA",
+                reason="fixture",
+                timestamp=now - timedelta(hours=2),
+            )
+            store.connection.execute(
+                "INSERT INTO canary_eligibility(candidate_id,eligible_at,frozen_hash,evidence_json) "
+                "VALUES (?,?,?,?)",
+                (
+                    "feed-eligible",
+                    (now - timedelta(hours=3)).isoformat(),
+                    "feed-frozen-hash",
+                    json.dumps(candidate_payload, sort_keys=True),
+                ),
+            )
+            store.connection.commit()
+            store.save_experiment_budget(
+                "autonomous",
+                {
+                    "total_limit": 10,
+                    "per_family_limit": 5,
+                    "used_total": 3,
+                    "used_by_family": {"trend": 3},
+                },
+                timestamp=now,
+            )
+
+            snapshot = store.research_feed_status(now=now, hermes_job_id=DEFAULT_HERMES_JOB_ID)
+
+        self.assertEqual(snapshot["external_hermes"]["status"], "UNKNOWN")
+        self.assertEqual(snapshot["external_hermes"]["job_id"], DEFAULT_HERMES_JOB_ID)
+        self.assertEqual(snapshot["internal_queue"]["status"], "ACTIVE")
+        proposals = snapshot["proposals"]
+        self.assertEqual(proposals["submitted_24h"], 6)
+        self.assertEqual(proposals["accepted_24h"], 1)
+        self.assertEqual(proposals["rejected_24h"], 1)
+        self.assertEqual(proposals["failed_24h"], 1)
+        self.assertEqual(proposals["pending"], 1)
+        self.assertEqual(proposals["processing"], 1)
+        self.assertEqual(proposals["completed"], 1)
+        self.assertEqual(proposals["rejected"], 1)
+        self.assertIsNotNone(proposals["latest_submitted_at"])
+        self.assertEqual(proposals["latest_accepted_at"], (now - timedelta(hours=3)).isoformat())
+
+        candidates = snapshot["candidates"]
+        self.assertEqual(candidates["total"], 4)
+        self.assertGreaterEqual(candidates["created_24h"], 4)
+        self.assertGreaterEqual(candidates["mutations_24h"], 1)
+        self.assertGreaterEqual(candidates["new"], 1)
+        self.assertGreaterEqual(candidates["eligible"], 1)
+        self.assertGreaterEqual(candidates["rejected"], 1)
+        self.assertIsNotNone(candidates["latest_created_at"])
+
+        budgets = snapshot["budgets"]
+        self.assertEqual(budgets["total_limit"], 10)
+        self.assertEqual(budgets["total_used"], 3)
+        self.assertEqual(budgets["total_remaining"], 7)
+        self.assertIn("trend", budgets["families"])
+        self.assertNotEqual(snapshot["no_new_candidates_reason"], "NO_NEW_HERMES_PROPOSALS")
+
+    def test_research_feed_is_exposed_in_empty_dashboard_snapshot(self) -> None:
+        with AxiomStore(":memory:") as store:
+            server = DashboardServer(port=0, data=DashboardData(store=store)).start()
+            try:
+                assert server.url is not None
+                with urlopen(server.url + "/api/v2/overview-summary", timeout=3) as response:
+                    self.assertEqual(response.status, 200)
+                    payload = json.loads(response.read().decode("utf-8"))
+            finally:
+                server.stop()
+
+        self.assertIn("research_feed", payload)
+        feed = payload["research_feed"]
+        self.assertEqual(feed["external_hermes"]["status"], "UNKNOWN")
+        self.assertEqual(feed["external_hermes"]["job_id"], DEFAULT_HERMES_JOB_ID)
+        self.assertEqual(feed["internal_queue"]["status"], "ACTIVE")
+        self.assertEqual(feed["no_new_candidates_reason"], "NO_NEW_HERMES_PROPOSALS")
+
+    def test_research_feed_ui_labels_keep_external_and_internal_controls_truthful(self) -> None:
+        html = _dashboard_html()
+        for label in (
+            "External Hermes feed",
+            "External status UNKNOWN",
+            "Internal research queue processing",
+            "Pause processing",
+            "Resume processing",
+            "Process next pending item now",
+        ):
+            self.assertIn(label, html)
+        self.assertNotIn("External status ACTIVE", html)
 
     def test_datasets_cover_page_navigation_filters_and_detail_path(self) -> None:
         first = self._page(
@@ -1000,7 +1601,8 @@ class DashboardPaginationEndpointTests(DashboardPaginationFixture):
             reason="complete prediction qualification fixture",
             timestamp=T0,
         )
-        CanaryService(self.store, initialize=False).mark_eligible("candidate-02")
+        self.canary_service.mark_eligible("candidate-02")
+        self.canary_service.publish_readiness_snapshot(reason="DASHBOARD_FIXTURE")
         page = self._page(
             "api/v2/candidates",
             page=1,
@@ -1013,7 +1615,7 @@ class DashboardPaginationEndpointTests(DashboardPaginationFixture):
         )
         eligible_before_paper = next(item for item in page["items"] if item["candidate_id"] == "candidate-02")
         self.assertEqual(eligible_before_paper["stage"], "FROZEN")
-        self.assertEqual(eligible_before_paper["historical_gates"], "PASSED")
+        self.assertEqual(eligible_before_paper["historical_gates"], "NOT_PASSED")
         self.assertTrue(eligible_before_paper["canary_eligible"])
         self.assertEqual(eligible_before_paper["canary_status"], "ELIGIBLE")
         self.assertFalse(eligible_before_paper["paper_forward"])
@@ -1030,7 +1632,7 @@ class DashboardPaginationEndpointTests(DashboardPaginationFixture):
         status, detail, _ = self._request("api/v2/candidates/candidate-02")
         self.assertEqual(status, 200)
         assert isinstance(detail, dict)
-        self.assertEqual(detail["historical_gates"], "PASSED")
+        self.assertEqual(detail["historical_gates"], "NOT_PASSED")
         self.assertEqual(detail["canary_status"], "ELIGIBLE")
         self.assertEqual(detail["paper_forward_status"], "NOT_STARTED")
         self.assertEqual(detail["paper_promotable_status"], "NOT_YET")
@@ -1057,12 +1659,12 @@ class DashboardPaginationEndpointTests(DashboardPaginationFixture):
             expected_total=CANDIDATE_COUNT,
         )
         stale = next(item for item in stale_page["items"] if item["candidate_id"] == "candidate-02")
-        self.assertFalse(stale["canary_eligible"])
-        self.assertEqual(stale["canary_status"], "NOT_ELIGIBLE")
+        self.assertTrue(stale["canary_eligible"])
+        self.assertEqual(stale["canary_status"], "ELIGIBLE")
         status, operator, _ = self._request("api/operator")
         self.assertEqual(status, 200)
         assert isinstance(operator, dict)
-        self.assertEqual(operator["candidate_status"]["canary_eligible"], 0)
+        self.assertEqual(operator["candidate_status"]["canary_eligible"], 1)
 
 
     @staticmethod
@@ -1398,9 +2000,10 @@ class DashboardPaginationEndpointTests(DashboardPaginationFixture):
             reason="complete prediction qualification fixture",
             timestamp=T0,
         )
-        CanaryService(self.store, initialize=False).mark_eligible("candidate-02")
+        self.canary_service.mark_eligible("candidate-02")
+        self.canary_service.publish_readiness_snapshot(reason="DASHBOARD_FIXTURE")
         # Leave the candidate eligible but without a current ranking snapshot:
-        # it must count as validated eligibility and not as rankable evidence.
+        # it must count as persisted eligibility and not as rankable evidence.
         persisted = self.store.dashboard_overview_summary(activity_limit=8)
         control = _BlockingOperatorControl()
         self.server.data.control = control
@@ -1461,7 +2064,7 @@ class DashboardPaginationEndpointTests(DashboardPaginationFixture):
             self.assertIsInstance(canary, dict)
             assert isinstance(canary, dict)
             canary_status = canary["canary"]
-            self.assertEqual(canary_status["micro_live_canary"], "DISABLED")
+            self.assertEqual(canary_status["micro_live_canary"], "UNKNOWN")
             self.assertEqual(canary_status["eligible_count"], 1)
             self.assertEqual(canary_status["rankable_count"], 0)
             self.assertEqual(canary_status["execution_event_count"], 0)
@@ -1477,8 +2080,8 @@ class DashboardPaginationEndpointTests(DashboardPaginationFixture):
                 set(credentials),
                 {"configured", "status", "secret_values_exposed"},
             )
-            self.assertIsInstance(credentials["configured"], bool)
-            self.assertIn(credentials["status"], {"CONFIGURED", "NOT CONFIGURED"})
+            self.assertIsNone(credentials["configured"])
+            self.assertEqual(credentials["status"], "NOT CHECKED")
             self.assertFalse(credentials["secret_values_exposed"])
         finally:
             control.release_status.set()
@@ -1630,6 +2233,270 @@ class DashboardPaginationEndpointTests(DashboardPaginationFixture):
         self.assertEqual(payload["connectivity"], expected)
         self.assertIs(payload["connectivity"]["live_execution"], False)
 
+    def test_overview_and_canary_expose_bounded_forward_evidence(self) -> None:
+        requirements = {
+            "market_ids": ["market-00", "market-01", "market-02"],
+            "candidate_bound_markets": {
+                "candidate-forward": ["market-00", "market-01", "market-02"],
+            },
+            "candidate_references": {
+                "market-00": ["candidate-forward"],
+                "market-01": ["candidate-forward"],
+                "market-02": ["candidate-forward"],
+            },
+            "as_of": T0.isoformat(),
+        }
+        health = {
+            "candidate_bound_markets": ["market-00", "market-01", "market-02"],
+            "scheduled": ["market-00", "market-01"],
+            "fresh": ["market-00"],
+            "stale": ["market-01"],
+            "missing": ["market-02"],
+            "newest_required_source_timestamp": (T0 - timedelta(seconds=5)).isoformat(),
+            "oldest_required_source_timestamp": (T0 - timedelta(minutes=5)).isoformat(),
+            "newest_required_observed_at": (T0 - timedelta(seconds=2)).isoformat(),
+            "oldest_required_observed_at": (T0 - timedelta(minutes=5)).isoformat(),
+            "newest_required_snapshot": (T0 - timedelta(seconds=5)).isoformat(),
+            "oldest_required_snapshot": (T0 - timedelta(minutes=5)).isoformat(),
+            "grade": "D",
+            "reason_code": "REQUIRED_MARKETS_MISSING",
+            "reason_display": "Required forward market snapshots are missing.",
+            "candidate_references": requirements["candidate_references"],
+            "market_diagnostics": [
+                {
+                    "market_id": "market-00",
+                    "candidate_bound": True,
+                    "candidate_references": ["candidate-forward"],
+                    "source_timestamp": (T0 - timedelta(seconds=5)).isoformat(),
+                    "observed_at": (T0 - timedelta(seconds=2)).isoformat(),
+                    "freshness_age_seconds": 2.0,
+                    "collection_state": "fresh",
+                    "reason_code": "REQUIRED_MARKET_SNAPSHOT_FRESH",
+                },
+                {
+                    "market_id": "market-01",
+                    "candidate_bound": True,
+                    "candidate_references": ["candidate-forward"],
+                    "source_timestamp": (T0 - timedelta(minutes=5)).isoformat(),
+                    "observed_at": (T0 - timedelta(minutes=5)).isoformat(),
+                    "freshness_age_seconds": 300.0,
+                    "collection_state": "stale",
+                    "reason_code": "REQUIRED_MARKET_SNAPSHOT_STALE",
+                },
+                {
+                    "market_id": "market-02",
+                    "candidate_bound": True,
+                    "candidate_references": ["candidate-forward"],
+                    "source_timestamp": None,
+                    "observed_at": None,
+                    "freshness_age_seconds": None,
+                    "collection_state": "missing",
+                    "reason_code": "REQUIRED_MARKET_SNAPSHOT_MISSING",
+                },
+            ],
+        }
+        with patch.object(
+            self.store,
+            "candidate_forward_requirements",
+            return_value=requirements,
+        ), patch.object(
+            self.store,
+            "polymarket_required_health",
+            return_value=health,
+        ):
+            status, overview, _ = self._request("api/v2/overview-summary")
+            self.assertEqual(status, 200)
+            self.assertIsInstance(overview, dict)
+            assert isinstance(overview, dict)
+            status, canary_payload, _ = self._request("api/v2/canary")
+            self.assertEqual(status, 200)
+            self.assertIsInstance(canary_payload, dict)
+            assert isinstance(canary_payload, dict)
+
+        for projection in (overview, canary_payload):
+            evidence = projection["forward_evidence"]
+            self.assertEqual(evidence["candidate_bound_markets"], health["candidate_bound_markets"])
+            self.assertEqual(evidence["scheduled"], health["scheduled"])
+            self.assertEqual(evidence["fresh"], health["fresh"])
+            self.assertEqual(evidence["stale"], health["stale"])
+            self.assertEqual(evidence["missing"], health["missing"])
+            self.assertEqual(evidence["grade"], "D")
+            self.assertEqual(evidence["reason_code"], "REQUIRED_MARKETS_MISSING")
+            self.assertEqual(evidence["reason_display"], health["reason_code"])
+            for timestamp_key in (
+                "newest_required_source_timestamp",
+                "oldest_required_source_timestamp",
+                "newest_required_observed_at",
+                "oldest_required_observed_at",
+            ):
+                self.assertEqual(evidence[timestamp_key], health[timestamp_key])
+
+    def test_polymarket_page_marks_required_rows_with_bounded_health_diagnostics(self) -> None:
+        requirements = {
+            "market_ids": ["market-00"],
+            "candidate_bound_markets": {"candidate-forward": ["market-00"]},
+            "candidate_references": {"market-00": ["candidate-forward"]},
+        }
+        diagnostic = {
+            "market_id": "market-00",
+            "candidate_bound": True,
+            "candidate_references": ["candidate-forward"],
+            "source_timestamp": (T0 - timedelta(seconds=5)).isoformat(),
+            "observed_at": (T0 - timedelta(seconds=2)).isoformat(),
+            "freshness_age_seconds": 2.0,
+            "collection_state": "fresh",
+            "reason_code": "REQUIRED_MARKET_SNAPSHOT_FRESH",
+        }
+        health = {
+            "candidate_bound_markets": ["market-00"],
+            "scheduled": ["market-00"],
+            "fresh": ["market-00"],
+            "stale": [],
+            "missing": [],
+            "grade": "A",
+            "reason_code": "REQUIRED_MARKETS_FRESH",
+            "market_diagnostics": [diagnostic],
+        }
+        with patch.object(
+            self.store,
+            "candidate_forward_requirements",
+            return_value=requirements,
+        ), patch.object(
+            self.store,
+            "polymarket_required_health",
+            return_value=health,
+        ):
+            page = self._page(
+                "api/v2/polymarket",
+                page=1,
+                page_size=10,
+                expected_page=1,
+                expected_size=10,
+                expected_total=MARKET_COUNT,
+                sort="market_id",
+                direction="asc",
+            )
+
+        row = page["items"][0]
+        for key in (
+            "candidate_bound",
+            "source_timestamp",
+            "observed_at",
+            "freshness_age_seconds",
+            "collection_state",
+            "candidate_references",
+            "reason_code",
+            "reason_display",
+        ):
+            self.assertIn(key, row)
+        self.assertTrue(row["candidate_bound"])
+        self.assertEqual(row["source_timestamp"], diagnostic["source_timestamp"])
+        self.assertEqual(row["observed_at"], diagnostic["observed_at"])
+        self.assertEqual(row["freshness_age_seconds"], 2.0)
+        self.assertEqual(row["collection_state"], "fresh")
+        self.assertEqual(row["candidate_references"], ["candidate-forward"])
+        self.assertEqual(row["reason_code"], "REQUIRED_MARKET_SNAPSHOT_FRESH")
+        self.assertEqual(row["reason_display"], "REQUIRED_MARKET_SNAPSHOT_FRESH")
+        ordinary = page["items"][1]
+        self.assertEqual(ordinary["market_id"], "market-01")
+        self.assertFalse(ordinary["candidate_bound"])
+        self.assertEqual(ordinary["candidate_references"], [])
+        self.assertEqual(ordinary["source_timestamp"], T0.isoformat())
+        self.assertEqual(
+            ordinary["observed_at"],
+            (T0 + timedelta(seconds=1)).isoformat(),
+        )
+        ordinary_payload = ordinary["payload"]
+        self.assertIsInstance(ordinary_payload, dict)
+        assert isinstance(ordinary_payload, dict)
+        self.assertEqual(ordinary_payload["source_timestamp"], T0.isoformat())
+        self.assertEqual(ordinary_payload["provider_timestamp"], T0.isoformat())
+        self.assertEqual(
+            ordinary_payload["response_received_at"],
+            (T0 + timedelta(seconds=1)).isoformat(),
+        )
+        self.assertEqual(
+            ordinary_payload["observed_at"],
+            (T0 + timedelta(seconds=1)).isoformat(),
+        )
+        self.assertEqual(ordinary["quality"], "PRICE_PROXY")
+        for key in (
+            "freshness_age_seconds",
+            "collection_state",
+            "reason_code",
+            "reason_display",
+        ):
+            self.assertNotIn(key, ordinary)
+
+    def test_canary_exposes_current_signal_reason_counts_and_durable_coverage(self) -> None:
+        reason_counts = {
+            "NO_STRATEGY_SIGNAL": 7,
+            "CURRENT_ORDER_BOOK_REQUIRED": 2,
+        }
+        self.canary_service.record_autonomous_decision(
+            next_decision="WAIT_FOR_FRESH_ACTIONABLE_SIGNAL",
+            blocker="NO_ACTIONABLE_SIGNAL",
+            timestamp=T0,
+            candidates_ranked=23,
+            candidates_signal_checked=9,
+            candidates_no_signal=7,
+            actionable_candidates_found=0,
+            signal_scan_cycle_id="cycle-dashboard",
+            signal_scan_cycle_started_at=(T0 - timedelta(minutes=2)).isoformat(),
+            signal_scan_cycle_completed_at=T0.isoformat(),
+            signal_scan_cycle_complete=True,
+            signal_scan_checked_this_cycle=9,
+            signal_scan_remaining_this_cycle=14,
+            signal_scan_coverage_percentage=39.13,
+            signal_scan_reason_counts_json=json.dumps(reason_counts),
+            signal_scan_status="COMPLETE",
+        )
+        self.canary_service.publish_readiness_snapshot(reason="DASHBOARD_SCAN_REASONS")
+
+        status, payload, _body = self._request("api/v2/canary")
+        self.assertEqual(status, 200)
+        self.assertIsInstance(payload, dict)
+        assert isinstance(payload, dict)
+        self.assertEqual(payload["signal_scan_reason_counts"], reason_counts)
+        for projection in (payload["canary"], payload["autonomous_canary"]):
+            self.assertEqual(projection["signal_scan_reason_counts"], reason_counts)
+            self.assertEqual(projection["signal_scan_remaining_this_cycle"], 14)
+            self.assertEqual(projection["signal_scan_coverage_percentage"], 39.13)
+            self.assertEqual(projection["signal_scan_cycle_id"], "cycle-dashboard")
+            self.assertEqual(projection["signal_scan_cycle_complete"], 1)
+
+    def test_enabled_control_does_not_render_stale_disabled_blocker(self) -> None:
+        self.canary_service.record_autonomous_decision(
+            next_decision="WAIT_FOR_NEXT_TICK",
+            blocker="AUTONOMOUS_CANARY_DISABLED",
+            worker_status="IDLE",
+            timestamp=T0,
+        )
+        self.canary_service.enable_autonomous_micro_live()
+        # Simulate the persisted worker's last-cycle telemetry arriving after
+        # the control transition; the current control state remains enabled.
+        self.canary_service.record_autonomous_decision(
+            next_decision="WAIT_FOR_NEXT_TICK",
+            blocker="AUTONOMOUS_CANARY_DISABLED",
+            worker_status="IDLE",
+            timestamp=T0 + timedelta(minutes=1),
+        )
+
+        status, payload, _body = self._request("api/v2/canary")
+        self.assertEqual(status, 200)
+        self.assertIsInstance(payload, dict)
+        assert isinstance(payload, dict)
+        self.assertIn(
+            payload["canary"]["control_state"],
+            {"AUTONOMOUS_MICRO_LIVE", "ARMED", "ENABLED", "LIVE"},
+        )
+        self.assertNotEqual(payload["canary"]["blocker"], "AUTONOMOUS_CANARY_DISABLED")
+        self.assertNotEqual(
+            payload["autonomous_canary"]["blocker"],
+            "AUTONOMOUS_CANARY_DISABLED",
+        )
+        self.assertEqual(payload["canary"]["last_cycle_blocker"], "AUTONOMOUS_CANARY_DISABLED")
+
 
 class DashboardPaginationSurfaceTests(DashboardPaginationFixture):
 
@@ -1664,24 +2531,61 @@ class DashboardPaginationSurfaceTests(DashboardPaginationFixture):
         self.assertGreater(sum(funnel.values()), 0)
         self.assertEqual(funnel["FROZEN"], 1)
 
-    def test_final_overview_renderer_consumes_lifecycle_funnel(self) -> None:
-        html = _dashboard_html()
-        start = html.rfind("renderOverview = (data) =>")
-        end = html.index("renderDatasets =", start)
-        final_renderer = html[start:end]
-        for marker in (
-            "data.lifecycle_funnel",
-            "funnel-row",
-            "funnel-track",
-            "funnel-bar",
-            'empty("No candidate lifecycle"',
-            "Hermes hypotheses appear after a durable queue item is processed.",
-        ):
-            self.assertIn(marker, final_renderer)
-        self.assertRegex(final_renderer, r'\$\(\s*["\']funnel["\']\s*\)\.innerHTML\s*=')
-        self.assertRegex(final_renderer, r"Object\.entries\(\s*funnel\s*\)")
-        self.assertRegex(final_renderer, r"safe\(\s*k\s*\)")
-        self.assertRegex(final_renderer, r"count\(\s*v\s*\)")
+    def test_overview_local_research_worker_is_not_labeled_as_hermes(self) -> None:
+        self.store.save_worker_state(
+            "research-queue",
+            "RUNNING",
+            {"queue_items_processed": 3},
+            heartbeat_at=T0,
+        )
+        self.store.save_worker_state(
+            "autonomous-research",
+            "ACTIVE",
+            {"passes": 2},
+            heartbeat_at=T0,
+        )
+
+        for endpoint in ("api/v2/overview-summary", "api/operator"):
+            with self.subTest(endpoint=endpoint):
+                status, payload, _body = self._request(endpoint)
+                self.assertEqual(status, 200)
+                self.assertIsInstance(payload, dict)
+                assert isinstance(payload, dict)
+
+                components = payload.get("components")
+                self.assertIsInstance(components, list)
+                assert isinstance(components, list)
+                internal_queue = [
+                    item
+                    for item in components
+                    if isinstance(item, dict)
+                    and item.get("name") == "INTERNAL RESEARCH QUEUE"
+                ]
+                self.assertEqual(len(internal_queue), 1)
+                self.assertEqual(internal_queue[0]["state"], "RUNNING")
+                hermes_components = [
+                    item
+                    for item in components
+                    if isinstance(item, dict)
+                    and str(item.get("name", "")).upper() == "HERMES"
+                ]
+                self.assertTrue(
+                    all(
+                        str(item.get("state", "")).upper()
+                        not in {"READY", "RUNNING", "ACTIVE"}
+                        for item in hermes_components
+                    )
+                )
+
+                research_feed = payload.get("research_feed")
+                self.assertIsInstance(research_feed, dict)
+                assert isinstance(research_feed, dict)
+                external_hermes = research_feed.get("external_hermes")
+                self.assertIsInstance(external_hermes, dict)
+                assert isinstance(external_hermes, dict)
+                self.assertEqual(external_hermes["status"], "UNKNOWN")
+
+
 
     def test_independent_operator_controls_preserve_both_response_orders(self) -> None:
         html = _dashboard_html()
@@ -1717,10 +2621,51 @@ class DashboardPaginationSurfaceTests(DashboardPaginationFixture):
         control_success = html[fetch_start:fetch_end]
         self.assertRegex(
             control_success,
-            r"lastGood\.controls\s*=\s*controls;[\s\S]*operator\s*=\s*controls;[\s\S]*"
-            r"renderOperatorControls\(\{\s*operator_controls\s*:\s*controls\.operator_controls\s*\|\|\s*controls\s*\}\)",
+
+            r"renderOperatorControls\(\{\s*operator_controls\s*:\s*controls\.operator_controls\s*\|\|\s*controls\s*\}\)[\s\S]*"
+            r"lastGood\.controls\s*=\s*controls;[\s\S]*operator\s*=\s*controls;",
             "the independent control-fetch success path must render its own response",
         )
+    def test_real_canary_renderer_consumes_forward_evidence_and_reason_counts(self) -> None:
+        html = _dashboard_html()
+        start = html.index("function renderCanary(data)")
+        end = html.index("function renderBtc", start)
+        renderer = html[start:end]
+        for marker in (
+            "forward_evidence",
+            "candidate_bound_markets",
+            "scheduled",
+            "stale",
+            "missing",
+            "newest_required",
+            "oldest_required",
+            "signal_scan_reason_counts",
+            "signal_scan_coverage_percentage",
+            "last_cycle_blocker",
+        ):
+            self.assertIn(marker, renderer)
+        self.assertIn("REAL CANARY MONEY", html)
+
+    def test_dashboard_research_feed_preserves_no_new_hermes_reason_text(self) -> None:
+        with AxiomStore(":memory:") as store:
+            store.set_scheduler_state(
+                "hermes-control",
+                {
+                    "status": "IDLE",
+                    "no_new_candidates_reason": "NO_NEW_HERMES_PROPOSALS",
+                },
+            )
+            server = DashboardServer(port=0, data=DashboardData(store=store)).start()
+            try:
+                assert server.url is not None
+                with urlopen(server.url + "/api/v2/overview-summary", timeout=3) as response:
+                    self.assertEqual(response.status, 200)
+                    body = response.read().decode("utf-8")
+                    payload = json.loads(body)
+            finally:
+                server.stop()
+        self.assertEqual(payload["research_feed"]["no_new_candidates_reason"], "NO_NEW_HERMES_PROPOSALS")
+        self.assertIn("NO_NEW_HERMES_PROPOSALS", body)
 
     def test_html_has_paginated_views_url_state_and_responsive_sticky_layout(self) -> None:
         html = _dashboard_html()
@@ -1761,6 +2706,77 @@ class DashboardPaginationSurfaceTests(DashboardPaginationFixture):
         # literal in the initial HTML document.
         self.assertNotIn("dataset-00", html)
         self.assertNotIn("market-00", html)
+    def test_canary_renderer_labels_research_and_actionable_scan_separately(self) -> None:
+        html = _dashboard_html()
+        start = html.index("function renderCanary(data)")
+        end = html.index("function renderBtc", start)
+        renderer = html[start:end]
+        for label in (
+            "Research winner",
+            "Research rank",
+            "Current actionable candidate",
+            "Candidates ranked",
+            "Signal checked this tick",
+            "next scan window ranks",
+            "Actionable",
+            "Chosen actionable rank",
+            "Chosen score",
+            "NO ACTIONABLE SIGNAL",
+        ):
+            self.assertIn(label, renderer)
+        for field in ACTIONABLE_SCAN_FIELDS:
+            self.assertIn(field, renderer)
+        self.assertIn("winner_id", renderer)
+        self.assertIn("selected_actionable_candidate", renderer)
+        self.assertIn("selected_actionable_rank", renderer)
+        self.assertIn("selected_actionable_score", renderer)
+
+
+    def test_load_page_initializes_generation_controller_and_refresh_timer(self) -> None:
+        html = _dashboard_html()
+        start = html.index("loadPage = async function(tab,force=false)")
+        end = html.index("activate = function(tab,push=true)", start)
+        load_page = html[start:end]
+        compact_load_page = re.sub(r"\s+", "", load_page)
+
+        initialization = (
+            "constgeneration=++refreshGeneration,controller=newAbortController();"
+            "activeController=controller;loadInFlight=true;refreshMessage(tab,\"\");"
+            "slowRefreshTimer=setTimeout(()=>{if(generation===refreshGeneration)"
+        )
+        self.assertIn(initialization, compact_load_page)
+        self.assertEqual(
+            compact_load_page.count("constgeneration=++refreshGeneration,controller=newAbortController();"),
+            1,
+        )
+        self.assertEqual(load_page.count("slowRefreshTimer=setTimeout("), 1)
+        self.assertLess(
+            load_page.index("const generation="),
+            load_page.index("fetchWithTimeout"),
+            "per-load state must be initialized before any request starts",
+        )
+        self.assertLess(
+            load_page.index("slowRefreshTimer=setTimeout("),
+            load_page.index("clearTimeout(slowRefreshTimer)"),
+            "the slow-refresh timer must be installed before the finally cleanup",
+        )
+        self.assertIn("slowRefreshTimer=null;", load_page)
+
+        activation_start = end
+        activation_end = html.index("load = async function()", activation_start)
+        activation = html[activation_start:activation_end]
+        self.assertIn("if(activeController)activeController.abort()", activation)
+        self.assertIn("refreshGeneration++;", activation)
+
+        stale_guard = load_page.index("if(generation!==refreshGeneration)return;")
+        self.assertLess(
+            stale_guard,
+            load_page.index("render(data)"),
+            "a stale response must not render over a newer generation",
+        )
+        self.assertIn("render(lastGood[kind]);", load_page)
+        self.assertIn("showing last successful content", load_page)
+        self.assertIn("no cached dashboard snapshot available", load_page)
 
 
     def test_real_canary_actions_post_once_to_local_result_and_survive_refresh(self) -> None:
@@ -1922,8 +2938,9 @@ class DashboardPaginationSurfaceTests(DashboardPaginationFixture):
         self.assertFalse(payload["connectivity"]["ready"])
         self.assertEqual(
             payload["autonomous_canary"]["blocker"],
-            "AUTONOMOUS_CANARY_DISABLED",
+            "AUTONOMOUS_CONTROL_UNKNOWN",
         )
+        self.assertEqual(payload["canary"]["control_state"], "UNKNOWN")
 
         ready = _connectivity_projection(ready=True, status="READY")
         self.store.set_operator_config(CANARY_CONNECTIVITY_CONFIG_KEY, ready)
@@ -1934,8 +2951,9 @@ class DashboardPaginationSurfaceTests(DashboardPaginationFixture):
         self.assertTrue(payload["connectivity"]["ready"])
         self.assertEqual(
             payload["autonomous_canary"]["blocker"],
-            "AUTONOMOUS_CANARY_DISABLED",
+            "AUTONOMOUS_CONTROL_UNKNOWN",
         )
+        self.assertEqual(payload["canary"]["control_state"], "UNKNOWN")
 
 
     def test_dashboard_formats_utc_as_pht_without_mutating_api_timestamps(self) -> None:

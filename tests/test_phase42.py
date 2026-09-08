@@ -392,7 +392,11 @@ class Phase42DashboardTests(unittest.TestCase):
             self.assertEqual(operator["coverage"]["historical_count"], 1)
             self.assertEqual(operator["coverage"]["forward_count"], 1)
             self.assertEqual(operator["components"][2]["state"], "READY")
-            self.assertEqual(operator["components"][1]["state"], "READY")
+            self.assertEqual(operator["components"][1]["state"], "DEGRADED")
+            self.assertEqual(
+                operator["components"][1]["detail"]["reason_code"],
+                "HEALTH_UNAVAILABLE",
+            )
             self.assertEqual(operator["candidates"][0]["strategy_id"], "btc-trend")
             detail = data.strategy_detail("candidate-1")
             self.assertTrue(detail["available"])

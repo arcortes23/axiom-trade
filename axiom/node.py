@@ -33,6 +33,7 @@ from .research_bus import DurableResearchBus
 from .lifecycle import PromotionCriteria
 from .strategy import evaluate_signal_record, load_strategy
 from .auto_canary import AutonomousCanaryWorker
+from .canary import CanaryService
 
 
 def _pid_alive(pid: int) -> bool:
@@ -151,6 +152,9 @@ class NodeConfig:
     interval_seconds: float = 60.0
     depth: int = 20
     max_markets: int = 100
+    discovery_budget_per_cycle: int = 20
+    max_concurrency: int = 1
+    freshness_sla_seconds: float | None = None
     max_attempts: int = 3
     max_provider_clock_skew_seconds: float = 5.0
     failure_cooldown_seconds: float = 30.0
@@ -217,12 +221,20 @@ class NodeConfig:
             raise ValueError("interval_seconds must be finite and positive")
         if isinstance(self.depth, bool) or not isinstance(self.depth, int) or self.depth <= 0:
             raise ValueError("depth must be a positive integer")
-        if isinstance(self.max_markets, bool) or not isinstance(self.max_markets, int) or self.max_markets <= 0:
-            raise ValueError("max_markets must be a positive integer")
-        if isinstance(self.max_attempts, bool) or not isinstance(self.max_attempts, int) or self.max_attempts <= 0:
-            raise ValueError("max_attempts must be a positive integer")
         if not math.isfinite(cooldown) or cooldown < 0:
             raise ValueError("failure_cooldown_seconds must be finite and non-negative")
+        if isinstance(self.max_markets, bool) or not isinstance(self.max_markets, int) or self.max_markets <= 0:
+            raise ValueError("max_markets must be a positive integer")
+        if isinstance(self.discovery_budget_per_cycle, bool) or not isinstance(self.discovery_budget_per_cycle, int) or self.discovery_budget_per_cycle < 0:
+            raise ValueError("discovery_budget_per_cycle must be a non-negative integer")
+        if isinstance(self.max_concurrency, bool) or not isinstance(self.max_concurrency, int) or self.max_concurrency not in {1, 2}:
+            raise ValueError("max_concurrency must be one or two")
+        if self.freshness_sla_seconds is not None:
+            freshness = float(self.freshness_sla_seconds)
+            if not math.isfinite(freshness) or freshness <= 0:
+                raise ValueError("freshness_sla_seconds must be finite and positive")
+        if isinstance(self.max_attempts, bool) or not isinstance(self.max_attempts, int) or self.max_attempts <= 0:
+            raise ValueError("max_attempts must be a positive integer")
         provider_clock_skew = float(self.max_provider_clock_skew_seconds)
         if not math.isfinite(provider_clock_skew) or provider_clock_skew < 0:
             raise ValueError("max_provider_clock_skew_seconds must be finite and non-negative")
@@ -367,6 +379,9 @@ class ResearchNode:
         self._run_cycle_base = 0
         self._research_passes = 0
         self._cycles: list[CollectionCycle] = []
+        self._auto_canary_restart_count = 0
+        self._auto_canary_restart_limit = 3
+        self._auto_canary_fatal = False
         self._restart_count = 0
         self._last_status: dict[str, Any] | None = None
         self._paper_store: AxiomStore | None = None
@@ -377,6 +392,9 @@ class ResearchNode:
                 interval_seconds=config.interval_seconds,
                 depth=config.depth,
                 max_markets=config.max_markets,
+                discovery_budget_per_cycle=config.discovery_budget_per_cycle,
+                max_concurrency=config.max_concurrency,
+                freshness_sla_seconds=config.freshness_sla_seconds,
                 max_attempts=config.max_attempts,
                 failure_cooldown_seconds=config.failure_cooldown_seconds,
                 max_provider_clock_skew_seconds=config.max_provider_clock_skew_seconds,
@@ -451,6 +469,110 @@ class ResearchNode:
                 return False
         self.stop_event.set()
         return True
+    def _publish_autonomous_initializing(self, timestamp: datetime) -> None:
+        """Publish a minimal startup state before the first autonomous tick."""
+        try:
+            service = CanaryService(self.store, clock=self.clock)
+            service.upsert_initializing_readiness_snapshot(timestamp=timestamp)
+            service.record_autonomous_decision(
+                next_decision="INITIALIZING",
+                blocker=None,
+                signal_id=None,
+                worker_status="INITIALIZING",
+                timestamp=timestamp,
+                publish=False,
+            )
+        except Exception as exc:
+            self._log(logging.WARNING, "autonomous canary initialization state failed: %s", exc)
+
+    def _save_autonomous_worker_state(
+        self,
+        status: str,
+        *,
+        decision: str | None = None,
+        blocker: str | None = None,
+        error_type: str | None = None,
+        candidate_id: str | None = None,
+        signal_id: str | None = None,
+    ) -> None:
+        """Persist node-owned autonomous liveness without touching control."""
+        heartbeat = ensure_utc(self.clock())
+        payload: dict[str, Any] = {
+            "pid": os.getpid(),
+            "configured_interval_seconds": float(self.config.auto_canary_interval_seconds),
+            "autonomous": True,
+            "production_live_execution": False,
+        }
+        if decision is not None:
+            payload["decision"] = decision
+        if blocker is not None:
+            payload["blocker"] = blocker
+        if error_type is not None:
+            payload["error_type"] = error_type
+        if candidate_id is not None:
+            payload["candidate_id"] = candidate_id
+        if signal_id is not None:
+            payload["signal_id"] = signal_id
+        if status.lower() == "fatal":
+            payload.update({"fatal": True, "requires_attention": True})
+        try:
+            self.store.save_worker_state(
+                "autonomous-canary",
+                status,
+                payload,
+                started_at=self.started_at or heartbeat,
+                heartbeat_at=heartbeat,
+            )
+        except Exception:
+            return
+
+    def _persist_autonomous_fatal(self, reason: str) -> None:
+        self._auto_canary_fatal = True
+        self._save_autonomous_worker_state(
+            "fatal",
+            decision="AUTONOMOUS_WORKER_FATAL_REVIEW_REQUIRED",
+            blocker=reason,
+            error_type="AUTONOMOUS_THREAD_EXITED",
+        )
+        try:
+            service = CanaryService(self.store, clock=self.clock)
+            service.record_autonomous_decision(
+                next_decision="AUTONOMOUS_WORKER_FATAL_REVIEW_REQUIRED",
+                blocker=reason,
+                worker_status="FATAL",
+                timestamp=ensure_utc(self.clock()),
+                last_error_code="AUTONOMOUS_THREAD_EXITED",
+            )
+        except Exception as exc:
+            self._log(logging.WARNING, "autonomous fatal state publication failed: %s", exc)
+
+    def _supervise_autonomous_thread(self) -> bool:
+        """Restart a dead autonomous thread a bounded number of times."""
+        thread = self._auto_canary_thread
+        if self.stop_event.is_set() or thread is None or thread.is_alive():
+            return True
+        if self._auto_canary_restart_count >= self._auto_canary_restart_limit:
+            self._persist_autonomous_fatal("AUTONOMOUS_THREAD_EXITED")
+            return False
+        self._auto_canary_restart_count += 1
+        self._restart_count += 1
+        delay = min(2.0, max(0.1, 2.0 ** (self._auto_canary_restart_count - 1) * 0.1))
+        self._save_autonomous_worker_state(
+            "degraded",
+            decision="AUTONOMOUS_THREAD_RESTARTING",
+            blocker="AUTONOMOUS_THREAD_EXITED",
+        )
+        if self.stop_event.wait(delay):
+            return True
+        replacement = threading.Thread(
+            target=self._auto_canary_worker_loop,
+            name=f"{self.config.worker_name}-autonomous-canary",
+            daemon=True,
+        )
+        self._auto_canary_thread = replacement
+        replacement.start()
+        return True
+
 
     def run(self, *, max_cycles: int | None = None) -> list[CollectionCycle]:
         if max_cycles is not None and (isinstance(max_cycles, bool) or max_cycles < 0):
@@ -470,7 +592,10 @@ class ResearchNode:
         self._cycles.clear()
         self._run_cycle_base = 0
         self._research_passes = 0
+        self._auto_canary_restart_count = 0
+        self._auto_canary_fatal = False
         cycle_failure = False
+        status = "degraded"
         try:
             self.store.save_worker_state(
                 self.config.worker_name,
@@ -484,6 +609,7 @@ class ResearchNode:
                 started_at=self.started_at,
                 heartbeat_at=self.started_at,
             )
+            self._publish_autonomous_initializing(self.started_at)
             worker_start_states = {
                 "polymarket-collector": {
                     "pid": os.getpid(),
@@ -516,7 +642,7 @@ class ResearchNode:
             for worker_name, payload in worker_start_states.items():
                 self.store.save_worker_state(
                     worker_name,
-                    "running",
+                    "idle" if max_cycles == 0 else "running",
                     payload,
                     started_at=self.started_at,
                     heartbeat_at=self.started_at,
@@ -525,19 +651,49 @@ class ResearchNode:
             if max_cycles != 0:
                 self._start_worker_threads(max_cycles)
                 while not self.stop_event.is_set():
+                    auto_dead = False
                     with self._worker_condition:
                         cycle_count = len(self._cycles) - self._run_cycle_base
                         research_passes = self._research_passes
                         collector = self._collector_thread
+                        auto_thread = self._auto_canary_thread
+                        if auto_thread is not None and not auto_thread.is_alive():
+                            auto_dead = True
                         if max_cycles is not None and cycle_count >= max_cycles and research_passes >= 1:
-                            break
+                            if auto_dead:
+                                cycle_failure = True
+                            else:
+                                break
                         if collector is not None and not collector.is_alive() and (
                             max_cycles is None or cycle_count < max_cycles
                         ):
                             cycle_failure = True
                             break
-                        self._worker_condition.wait(timeout=0.5)
-            cycle_failure = cycle_failure or bool(self._collector_error or self._research_error)
+                        if auto_dead:
+                            self._worker_condition.wait(timeout=0.01)
+                        else:
+                            self._worker_condition.wait(timeout=0.5)
+                    if auto_dead:
+                        if not self._supervise_autonomous_thread():
+                            cycle_failure = True
+                            break
+            elif max_cycles == 0:
+                # No child was launched; immediately settle the startup
+                # marker so direct bounded invocations cannot leave RUNNING.
+                try:
+                    service = CanaryService(self.store, clock=self.clock)
+                    service.record_autonomous_decision(
+                        next_decision="WAIT_FOR_NEXT_DECISION",
+                        blocker=None,
+                        worker_status="IDLE",
+                        timestamp=ensure_utc(self.clock()),
+                        publish=False,
+                    )
+                except Exception:
+                    pass
+            cycle_failure = cycle_failure or self._auto_canary_fatal or bool(
+                self._collector_error or self._research_error
+            )
             status = (
                 "degraded"
                 if cycle_failure
@@ -559,21 +715,6 @@ class ResearchNode:
                 if worker is not None:
                     worker.join()
             self._stop_heartbeat_watchdog()
-            if max_cycles is not None:
-                try:
-                    self.store.save_worker_state(
-                        "autonomous-canary",
-                        "idle",
-                        {
-                            "pid": os.getpid(),
-                            "autonomous": True,
-                            "production_live_execution": False,
-                        },
-                        started_at=self.started_at,
-                        heartbeat_at=ensure_utc(self.clock()),
-                    )
-                except Exception:
-                    pass
             self._collector_thread = None
             self._research_thread = None
             self._health_thread = None
@@ -643,64 +784,75 @@ class ResearchNode:
         self._health_thread.start()
         self._auto_canary_thread.start()
     def _auto_canary_worker_loop(self) -> None:
-        status = "running"
+        """Run isolated ticks and leave a truthful heartbeat at each boundary."""
+        status = "idle"
+        retry_attempts = 0
         try:
             while not self.stop_event.is_set():
-                result = self._auto_canary_worker.tick()
-                payload = {
-                    "pid": os.getpid(),
-                    "configured_interval_seconds": float(self.config.auto_canary_interval_seconds),
-                    "autonomous": True,
-                    "production_live_execution": False,
-                    "decision": result.get("decision"),
-                    "blocker": result.get("blocker"),
-                    "candidate_id": result.get("candidate_id"),
-                    "signal_id": result.get("signal_id"),
-                }
-                status = "degraded" if result.get("status") == "ERROR" else "running"
-                self.store.save_worker_state(
-                    "autonomous-canary",
-                    status,
-                    payload,
-                    started_at=ensure_utc(self.clock()),
-                    heartbeat_at=ensure_utc(self.clock()),
+                self._save_autonomous_worker_state(
+                    "running",
+                    decision="EVALUATING_CANDIDATES",
                 )
-                if self.stop_event.wait(self.config.auto_canary_interval_seconds):
-                    break
-        except Exception as exc:
-            status = "degraded"
-            try:
-                self.store.save_worker_state(
-                    "autonomous-canary",
-                    status,
-                    {
-                        "pid": os.getpid(),
-                        "autonomous": True,
-                        "production_live_execution": False,
+                try:
+                    result = self._auto_canary_worker.tick()
+                except BaseException as exc:
+                    # A tick failure is local to this iteration.  Do not let
+                    # it silently terminate the supervised autonomous thread.
+                    result = {
+                        "status": "ERROR",
                         "decision": "AUTONOMOUS_WORKER_EXCEPTION",
                         "blocker": "AUTONOMOUS_WORKER_EXCEPTION",
                         "error_type": type(exc).__name__,
-                    },
-                    started_at=ensure_utc(self.clock()),
-                    heartbeat_at=ensure_utc(self.clock()),
+                    }
+                    self._log(logging.ERROR, "autonomous worker tick failed: %s", exc)
+                status = "degraded" if result.get("status") == "ERROR" else "idle"
+                self._save_autonomous_worker_state(
+                    status,
+                    decision=str(result.get("decision") or ""),
+                    blocker=result.get("blocker"),
+                    error_type=result.get("error_type"),
+                    candidate_id=result.get("candidate_id"),
+                    signal_id=result.get("signal_id"),
                 )
-            except Exception:
-                pass
+                if status == "degraded" and retry_attempts < 1:
+                    retry_attempts += 1
+                    if self.stop_event.wait(
+                        min(
+                            float(self.config.auto_canary_interval_seconds),
+                            max(0.1, 2.0 ** retry_attempts * 0.1),
+                        )
+                    ):
+                        break
+                    continue
+                retry_attempts = 0
+                if self.stop_event.wait(self.config.auto_canary_interval_seconds):
+                    break
+        except BaseException as exc:
+            # Unexpected loop-level failures are persisted as degraded.  The
+            # node main loop can then restart this thread or fence FATAL.
+            status = "degraded"
+            self._log(logging.ERROR, "autonomous worker loop failed: %s", exc)
+            self._save_autonomous_worker_state(
+                status,
+                decision="AUTONOMOUS_WORKER_EXCEPTION",
+                blocker="AUTONOMOUS_WORKER_EXCEPTION",
+                error_type=type(exc).__name__,
+            )
         finally:
-            try:
-                self.store.save_worker_state(
-                    "autonomous-canary",
-                    "stopped" if self.stop_event.is_set() else status,
-                    {
-                        "pid": os.getpid(),
-                        "autonomous": True,
-                        "production_live_execution": False,
-                    },
-                    started_at=ensure_utc(self.clock()),
-                    heartbeat_at=ensure_utc(self.clock()),
+            if not self._auto_canary_fatal:
+                self._save_autonomous_worker_state(
+                    "degraded" if status == "degraded" else "idle",
+                    decision=(
+                        "AUTONOMOUS_WORKER_EXCEPTION"
+                        if status == "degraded"
+                        else "WAIT_FOR_NEXT_DECISION"
+                    ),
+                    blocker=(
+                        "AUTONOMOUS_WORKER_EXCEPTION"
+                        if status == "degraded"
+                        else None
+                    ),
                 )
-            except Exception:
-                pass
 
     def _collector_for_worker(self) -> tuple[PolymarketCollector, AxiomStore | None]:
         """Run collection on the node store while preserving independent cadence."""
@@ -1002,7 +1154,6 @@ class ResearchNode:
                             "pid": os.getpid(),
                             "parent_worker": self.config.worker_name,
                             "lock_path": str(self.lock_path),
-                            "paper_only": True,
                             "live_execution": False,
                         },
                         started_at=self.started_at,
@@ -1139,7 +1290,7 @@ class ResearchNode:
                 "heartbeat_at": worker_state.get("heartbeat_at"),
                 "payload": child_payload,
             }
-            child_degraded = child_degraded or child_status in {"degraded", "stale"}
+            child_degraded = child_degraded or child_status in {"degraded", "stale", "fatal"}
             child_running = child_running or child_status == "running"
         persisted_crypto = worker_payload.get("crypto_paper") if isinstance(worker_payload, Mapping) else None
         crypto_error = bool(

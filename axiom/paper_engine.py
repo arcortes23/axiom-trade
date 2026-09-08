@@ -32,6 +32,7 @@ from .paper import PaperTrader, PaperTradingConfig
 from .portfolio import Portfolio
 from .risk import RiskEngine, RiskLimits
 from .storage import AxiomStore
+from .strategy.signals import evaluate_model_document_probability
 
 _MAX_RUN_OBSERVATIONS = 100_000
 
@@ -1150,36 +1151,27 @@ def _observation_sort_key(value: Any, tzinfo: Any) -> tuple[datetime, str, str]:
         market = getattr(value, "market_id", "")
     return stamp, str(market), _canonical_json(value)
 
-
 def _model_probability(model: Any | None, observation: Mapping[str, Any]) -> float | None:
     if model is None:
         return None
-    value: Any = None
     if isinstance(model, Mapping):
-        if "probability" in model:
-            value = model["probability"]
-        elif "yes_probability" in model:
-            value = model["yes_probability"]
-        else:
-            field = model.get("field")
-            if isinstance(field, str) and field.strip():
-                value = observation.get(field)
-    else:
-        methods = ("predict_probability", "probability", "predict", "estimate")
-        for name in methods:
-            method = getattr(model, name, None)
-            if not callable(method):
-                continue
-            try:
-                value = method(observation)
-            except (TypeError, AttributeError):
-                continue
-            break
-        if value is None and callable(model):
-            try:
-                value = model(observation)
-            except (TypeError, AttributeError):
-                return None
+        return evaluate_model_document_probability(model, observation)
+    value: Any = None
+    methods = ("predict_probability", "probability", "predict", "estimate")
+    for name in methods:
+        method = getattr(model, name, None)
+        if not callable(method):
+            continue
+        try:
+            value = method(observation)
+        except (TypeError, AttributeError):
+            continue
+        break
+    if value is None and callable(model):
+        try:
+            value = model(observation)
+        except (TypeError, AttributeError):
+            return None
     if isinstance(value, Mapping):
         value = value.get("probability", value.get("yes_probability", value.get("prediction")))
     try:
@@ -1187,8 +1179,6 @@ def _model_probability(model: Any | None, observation: Mapping[str, Any]) -> flo
     except (TypeError, ValueError):
         return None
     return probability if math.isfinite(probability) and 0 <= probability <= 1 else None
-
-
 def _finite_number(value: Any) -> float | None:
     try:
         number = float(value)
