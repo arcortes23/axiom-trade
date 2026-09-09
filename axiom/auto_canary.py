@@ -19,6 +19,7 @@ from .canary import (
 )
 from .domain import ensure_utc, utc_now
 from .ranker import CandidateCanaryRanker
+from .lifecycle import _canonical_scope_gate_error
 from .storage import AxiomStore
 
 class AutonomousCanaryWorker:
@@ -51,10 +52,24 @@ class AutonomousCanaryWorker:
     _SIGNAL_REASON_CODES = (
         "READY_SIGNAL",
         "NO_STRATEGY_SIGNAL",
+        "STRATEGY_EVALUATED_DECLINED",
+        "SIGNAL_PRODUCED",
+        "MODEL_INPUT_MISSING",
+        "WARMING_UP",
+        "INSUFFICIENT_LOOKBACK",
         "NO_FORWARD_SNAPSHOT",
         "STALE_FORWARD_EVIDENCE",
         "MARKET_CLOSED",
         "MARKET_FILTER_MISMATCH",
+        "RESEARCH_ONLY",
+        "INVALID_POLICY",
+        "DEFERRED_MARKETS",
+        "SCOPE_RESOLUTION_MISSING",
+        "SCOPE_RESOLUTION_SCOPE_MISMATCH",
+        "SCOPE_RESOLUTION_STALE",
+        "LEGACY_SCOPE_SUCCESSOR_REQUIRED",
+        "SCOPE_RESOLUTION_ZERO_MATCHES",
+        "SCOPE_RESOLUTION_TOKEN_MISMATCH",
         "CANDIDATE_FORWARD_MARKET_UNRESOLVED",
         "COLLECTOR_CANDIDATE_HEALTH_BLOCKED",
     )
@@ -179,6 +194,7 @@ class AutonomousCanaryWorker:
         "QUALIFICATION_INVALID",
         "DUPLICATE_CLUSTER_DEFERRED",
         "CYCLE_REMAINDER",
+        "LEGACY_SCOPE_SUCCESSOR_REQUIRED",
     )
 
     @staticmethod
@@ -315,6 +331,24 @@ class AutonomousCanaryWorker:
             if not candidate_id:
                 self._last_scan_skip_reasons["INVALID_RANKING_BINDING"] += 1
                 continue
+            lifecycle = self.store.load_candidate_lifecycle(candidate_id)
+            payload = (
+                ranker.service._merged_lifecycle_payload(lifecycle)
+                if isinstance(lifecycle, Mapping)
+                else None
+            )
+            scope_error = _canonical_scope_gate_error(
+                str(lifecycle.get("stage") or "") if isinstance(lifecycle, Mapping) else "",
+                payload if isinstance(payload, Mapping) else {},
+            )
+            if scope_error is not None:
+                skip_reason = (
+                    scope_error
+                    if scope_error in self._SCAN_SKIP_REASONS
+                    else "INVALID_RANKING_BINDING"
+                )
+                self._last_scan_skip_reasons[skip_reason] += 1
+                continue
             with self.store._lock:
                 eligibility = self.store.connection.execute(
                     "SELECT candidate_id,frozen_hash,evidence_json "
@@ -361,8 +395,11 @@ class AutonomousCanaryWorker:
             if persisted_rank == 0:
                 rankless_reason = (
                     reason.startswith("RANKING_EVIDENCE_MISSING")
-                    or reason == "RANKING_EVIDENCE_BELOW_MINIMUM_SAMPLE"
-                    or reason == "FROZEN_HASH_MISSING"
+                    or reason in {
+                        "RANKING_EVIDENCE_BELOW_MINIMUM_SAMPLE",
+                        "RANKING_EVIDENCE_ZERO_TRADES",
+                        "FROZEN_HASH_MISSING",
+                    }
                 )
                 if representative_marker != 0 or not (
                     reason == "DIVERSITY_CLUSTER_NON_REPRESENTATIVE"
@@ -394,6 +431,24 @@ class AutonomousCanaryWorker:
                 or candidate_id in accepted_ids
             ):
                 continue
+            lifecycle = self.store.load_candidate_lifecycle(candidate_id)
+            payload = (
+                ranker.service._merged_lifecycle_payload(lifecycle)
+                if isinstance(lifecycle, Mapping)
+                else None
+            )
+            scope_error = _canonical_scope_gate_error(
+                str(lifecycle.get("stage") or "") if isinstance(lifecycle, Mapping) else "",
+                payload if isinstance(payload, Mapping) else {},
+            )
+            if scope_error is not None:
+                skip_reason = (
+                    scope_error
+                    if scope_error in self._SCAN_SKIP_REASONS
+                    else "INVALID_RANKING_BINDING"
+                )
+                self._last_scan_skip_reasons[skip_reason] += 1
+                continue
             qualification_hash = str(row.get("qualification_hash") or "").strip()
             if not qualification_hash:
                 self._last_scan_skip_reasons["QUALIFICATION_INVALID"] += 1
@@ -406,6 +461,7 @@ class AutonomousCanaryWorker:
             return reason.startswith("RANKING_EVIDENCE_MISSING") or reason in {
                 "FROZEN_HASH_MISSING",
                 "RANKING_EVIDENCE_BELOW_MINIMUM_SAMPLE",
+                "RANKING_EVIDENCE_ZERO_TRADES",
             }
 
         ordered_rows = [

@@ -5,15 +5,25 @@ bounded score in ``[-1, 1]`` (positive means YES/buy, negative means NO/sell).
 No evaluator accepts or executes user-provided code.
 """
 from __future__ import annotations
+from dataclasses import dataclass, field
 
-from dataclasses import dataclass
-from datetime import datetime
+from collections.abc import Mapping as MappingABC
+from datetime import datetime, timezone
 import math
 from statistics import mean, pstdev
 from typing import Any, Iterable, Mapping, Sequence
 
 from axiom.domain import MarketType, OHLCVBar, PredictionMarketSnapshot, SettlementState, parse_timestamp
 from .dsl import StrategyDefinition, validate_strategy
+
+
+MODEL_INPUT_MISSING = "MODEL_INPUT_MISSING"
+WARMING_UP = "WARMING_UP"
+INSUFFICIENT_LOOKBACK = "INSUFFICIENT_LOOKBACK"
+STRATEGY_EVALUATED_DECLINED = "STRATEGY_EVALUATED_DECLINED"
+SIGNAL_PRODUCED = "SIGNAL_PRODUCED"
+MODEL_INPUT_PRESENT = "MODEL_INPUT_PRESENT"
+CONSTANT_BASELINE = "CONSTANT_BASELINE"
 
 
 def _number(value: Any, default: float = 0.0) -> float:
@@ -96,6 +106,8 @@ def _crypto_signal(family: str, items: Sequence[Any], params: Mapping[str, Any])
         return _clip(((_sma(closes, fast) / baseline) - 1.0) / max(threshold, 1e-12)) if baseline else 0.0
     if family == "mean_reversion":
         window = max(2, lookback)
+        if len(closes) < window:
+            return 0.0
         sample = closes[-window:]
         centre, deviation = mean(sample), pstdev(sample)
         if deviation <= 1e-12:
@@ -150,6 +162,14 @@ def _snapshot_value(item: Any, key: str, default: Any = None) -> Any:
     return getattr(item, key, default)
 
 
+def _snapshot_time(item: Any) -> datetime:
+    for key in ("source_timestamp", "as_of_timestamp", "asof_timestamp", "as_of", "timestamp", "observed_at"):
+        stamp = parse_timestamp(_snapshot_value(item, key))
+        if stamp is not None:
+            return stamp
+    return datetime.min.replace(tzinfo=timezone.utc)
+
+
 def _snapshots(data: Any) -> list[Any]:
     if isinstance(data, Mapping):
         for key in ("snapshots", "markets", "history", "observations"):
@@ -158,13 +178,40 @@ def _snapshots(data: Any) -> list[Any]:
                 break
     return list(data) if isinstance(data, Iterable) and not isinstance(data, (str, bytes, Mapping)) else []
 
+def _ordered_prediction_snapshots(data: Any) -> list[Any]:
+    snapshots = _snapshots(data)
+    if not snapshots:
+        return []
+    ordered = sorted(
+        snapshots,
+        key=lambda item: (
+            _snapshot_time(item),
+            str(_snapshot_value(item, "source_snapshot_id", "")),
+            str(_snapshot_value(item, "market_id", "")),
+        ),
+    )
+    # Signal histories are per market.  When a caller supplies a mixed batch,
+    # retain only the current market rather than stitching unrelated events.
+    current_market = _snapshot_value(ordered[-1], "market_id", None)
+    if isinstance(data, Mapping):
+        current_market = data.get("market_id", current_market)
+    current_market = str(current_market or "").strip()
+    if current_market:
+        same_market = [
+            item for item in ordered
+            if str(_snapshot_value(item, "market_id", "")).strip() == current_market
+        ]
+        if same_market:
+            ordered = same_market
+    return ordered
+
 
 def _market_probability(item: Any) -> float | None:
     value = _snapshot_value(item, "yes_mid")
     if value is None:
         value = _snapshot_value(item, "yes_ask")
     result = _number(value, math.nan)
-    return result if math.isfinite(result) else None
+    return result if math.isfinite(result) and 0.0 <= result <= 1.0 else None
 
 
 def _model_probability(data: Any, item: Any, index: int = -1) -> float | None:
@@ -174,6 +221,11 @@ def _model_probability(data: Any, item: Any, index: int = -1) -> float | None:
             result = _number(value, math.nan)
             return result if math.isfinite(result) and 0.0 <= result <= 1.0 else None
     if isinstance(data, Mapping):
+        model_document = data.get("model_document", data.get("model"))
+        if isinstance(model_document, Mapping):
+            probability = evaluate_model_document_probability(model_document, item)
+            if probability is not None:
+                return probability
         values = data.get("probabilities", data.get("model_probabilities"))
         if isinstance(values, Mapping):
             market_id = _snapshot_value(item, "market_id")
@@ -188,38 +240,166 @@ def _model_probability(data: Any, item: Any, index: int = -1) -> float | None:
         result = _number(value, math.nan)
         if math.isfinite(result) and 0.0 <= result <= 1.0:
             return result
-    return None
-def evaluate_model_document_probability(
+
+
+@dataclass(frozen=True, slots=True)
+class ModelProbabilityEvaluation(MappingABC[str, Any]):
+    """Canonical probability result shared by backtest and paper consumers."""
+
+    probability: float | None
+    reason_code: str
+    evidence: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        probability = self.probability
+        if probability is not None:
+            try:
+                probability = float(probability)
+            except (TypeError, ValueError):
+                probability = None
+            if probability is None or not math.isfinite(probability) or not 0.0 <= probability <= 1.0:
+                probability = None
+        object.__setattr__(self, "probability", probability)
+        object.__setattr__(self, "reason_code", str(self.reason_code).strip().upper() or MODEL_INPUT_MISSING)
+        object.__setattr__(self, "evidence", dict(self.evidence) if isinstance(self.evidence, Mapping) else {})
+
+    @property
+    def available(self) -> bool:
+        return self.probability is not None
+
+    @property
+    def reason(self) -> str:
+        return self.reason_code
+
+    def as_record(self) -> dict[str, Any]:
+        return {
+            "probability": self.probability,
+            "reason_code": self.reason_code,
+            "evidence": dict(self.evidence),
+        }
+
+    def __getitem__(self, key: str) -> Any:
+        return self.as_record()[key]
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return self.as_record().get(key, default)
+    def __iter__(self):
+        return iter(self.as_record())
+
+    def __len__(self) -> int:
+        return 3
+
+def evaluate_model_document(
     model_document: Mapping[str, Any] | None,
     observation: Mapping[str, Any] | Any,
-) -> float | None:
-    """Evaluate a declarative model document without mutating its inputs.
+) -> ModelProbabilityEvaluation:
+    """Evaluate one persisted model document and retain provenance.
 
-    Forward and canary execution persist model documents rather than executable
-    model objects.  Keep this evaluator deliberately small and pure so both
-    paths apply the exact same probability semantics to persisted observations.
+    A constant document is executable, but is explicitly marked as a baseline
+    rather than being mistaken for an observation-derived model.
     """
     if not isinstance(model_document, Mapping):
-        return None
+        return ModelProbabilityEvaluation(None, MODEL_INPUT_MISSING, {"model_source": "MISSING"})
     value: Any = None
+    constant_key: str | None = None
+    evidence: dict[str, Any] = {"model_source": "FIELD"}
     if "probability" in model_document:
         value = model_document["probability"]
+        constant_key = "probability"
     elif "yes_probability" in model_document:
         value = model_document["yes_probability"]
+        constant_key = "yes_probability"
     else:
-        field = model_document.get("field")
-        if isinstance(field, str) and field.strip():
-            if isinstance(observation, Mapping):
-                value = observation.get(field)
-            else:
-                value = getattr(observation, field, None)
+        field_name = model_document.get("field")
+        if isinstance(field_name, str) and field_name.strip():
+            field_name = field_name.strip()
+            value = (
+                observation.get(field_name)
+                if isinstance(observation, Mapping)
+                else getattr(observation, field_name, None)
+            )
+            if value is None:
+                return ModelProbabilityEvaluation(
+                    None,
+                    MODEL_INPUT_MISSING,
+                    {"model_source": "FIELD", "field": field_name},
+                )
+            evidence = {"model_source": "FIELD", "field": field_name}
+        else:
+            return ModelProbabilityEvaluation(None, MODEL_INPUT_MISSING, {"model_source": "MISSING"})
     if isinstance(value, Mapping):
         value = value.get("probability", value.get("yes_probability", value.get("prediction")))
     try:
         probability = float(value)
     except (TypeError, ValueError):
-        return None
-    return probability if math.isfinite(probability) and 0.0 <= probability <= 1.0 else None
+        return ModelProbabilityEvaluation(
+            None,
+            MODEL_INPUT_MISSING,
+            {"model_source": "CONSTANT_BASELINE" if constant_key else "FIELD", "field": constant_key},
+        )
+    if not math.isfinite(probability) or not 0.0 <= probability <= 1.0:
+        return ModelProbabilityEvaluation(
+            None,
+            MODEL_INPUT_MISSING,
+            {"model_source": "CONSTANT_BASELINE" if constant_key else "FIELD", "field": constant_key},
+        )
+    if constant_key is not None:
+        evidence = {
+            "model_source": CONSTANT_BASELINE,
+            "model_document_type": CONSTANT_BASELINE,
+            "field": constant_key,
+        }
+    return ModelProbabilityEvaluation(probability, MODEL_INPUT_PRESENT, evidence)
+
+
+def evaluate_model_probability_evidence(
+    model: Any | None,
+    observation: Mapping[str, Any] | Any,
+) -> ModelProbabilityEvaluation:
+    """Evaluate a model object using the same semantics as persisted documents."""
+    if isinstance(model, Mapping):
+        return evaluate_model_document(model, observation)
+    if model is None:
+        return ModelProbabilityEvaluation(None, MODEL_INPUT_MISSING, {"model_source": "MISSING"})
+    value: Any = None
+    method_name: str | None = None
+    for name in ("predict_probability", "probability", "predict", "estimate"):
+        method = getattr(model, name, None)
+        if not callable(method):
+            continue
+        try:
+            value = method(observation)
+        except (TypeError, AttributeError):
+            continue
+        method_name = name
+        break
+    if value is None and callable(model):
+        try:
+            value = model(observation)
+            method_name = "__call__"
+        except (TypeError, AttributeError):
+            value = None
+    if value is None:
+        document = getattr(model, "document", None)
+        if isinstance(document, Mapping):
+            return evaluate_model_document(document, observation)
+    if isinstance(value, Mapping):
+        value = value.get("probability", value.get("yes_probability", value.get("prediction")))
+    try:
+        probability = float(value)
+    except (TypeError, ValueError):
+        return ModelProbabilityEvaluation(None, MODEL_INPUT_MISSING, {"model_source": method_name or "MISSING"})
+    if not math.isfinite(probability) or not 0.0 <= probability <= 1.0:
+        return ModelProbabilityEvaluation(None, MODEL_INPUT_MISSING, {"model_source": method_name or "MISSING"})
+    return ModelProbabilityEvaluation(probability, MODEL_INPUT_PRESENT, {"model_source": method_name or "MODEL"})
+
+
+def evaluate_model_document_probability(
+    model_document: Mapping[str, Any] | None,
+    observation: Mapping[str, Any] | Any,
+) -> float | None:
+    """Numeric compatibility API for persisted model documents."""
+    return evaluate_model_document(model_document, observation).probability
 
 
 evaluate_model_probability = evaluate_model_document_probability
@@ -237,10 +417,28 @@ def _time_to_expiry(item: Any) -> float | None:
     if timestamp is not None and expiry is not None:
         return (expiry - timestamp).total_seconds()
     return None
+def _declared_lookback(params: Mapping[str, Any], default: int = 1) -> int:
+    raw = params.get("lookback", params.get("window", default))
+    try:
+        value = int(raw)
+    except (TypeError, ValueError, OverflowError):
+        return max(1, default)
+    return max(1, value)
+
+
+def _prediction_requires_model(family: str) -> bool:
+    return family in {
+        "probability_mispricing",
+        "tails",
+        "lottery_ticket",
+        "time_decay",
+        "consistency",
+        "correlation_aware",
+    }
 
 
 def _prediction_signal(family: str, data: Any, params: Mapping[str, Any]) -> float:
-    snapshots = _snapshots(data)
+    snapshots = _ordered_prediction_snapshots(data)
     if not snapshots:
         return 0.0
     current = snapshots[-1]
@@ -279,15 +477,17 @@ def _prediction_signal(family: str, data: Any, params: Mapping[str, Any]) -> flo
             paired.append((model, market))
     history_model = [model for model, _ in paired]
     history_market_paired = [market for _, market in paired]
+    lookback = _declared_lookback(params)
     if family == "mean_reversion":
-        if len(history_market) < 2:
+        if len(history_market) < lookback + 1:
             return 0.0
-        centre = mean(history_market[:-1]) if len(history_market) > 1 else history_market[-1]
+        prior = history_market[:-1]
+        centre = mean(prior[-lookback:])
         return _clip((centre - history_market[-1]) / max(threshold, 0.05))
     if family == "momentum":
-        if len(history_market) < 2:
+        if len(history_market) < lookback + 1:
             return 0.0
-        return _clip((history_market[-1] - history_market[0]) / max(threshold, 0.05))
+        return _clip((history_market[-1] - history_market[-lookback - 1]) / max(threshold, 0.05))
     if family == "time_decay":
         seconds = _time_to_expiry(current)
         horizon = max(_number(params.get("horizon", 86400.0), 86400.0), 1.0)
@@ -358,20 +558,54 @@ def _operation_value(operation: Mapping[str, Any], values: Sequence[float]) -> f
 
 
 @dataclass(frozen=True, slots=True)
-class Signal:
+class Signal(MappingABC[str, Any]):
     family: str
     score: float
     side: str
     market_type: str
+    reason_code: str = STRATEGY_EVALUATED_DECLINED
+    evidence: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "score", _clip(float(self.score)))
+        object.__setattr__(self, "reason_code", str(self.reason_code).strip().upper() or STRATEGY_EVALUATED_DECLINED)
+        object.__setattr__(self, "evidence", dict(self.evidence) if isinstance(self.evidence, Mapping) else {})
 
     @property
     def actionable(self) -> bool:
         return abs(self.score) > 1e-12
+    @property
+    def reason(self) -> str:
+        return self.reason_code
+
+    @property
+    def evaluation_reason(self) -> str:
+        return self.reason_code
+
+    def as_record(self) -> dict[str, Any]:
+        return {
+            "family": self.family,
+            "score": self.score,
+            "side": self.side,
+            "market_type": self.market_type,
+            "reason_code": self.reason_code,
+            "reason": self.reason_code,
+            "evidence": dict(self.evidence),
+        }
+
+    def __getitem__(self, key: str) -> Any:
+        return self.as_record()[key]
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return self.as_record().get(key, default)
+    def __iter__(self):
+        return iter(self.as_record())
+
+    def __len__(self) -> int:
+        return 7
 
 
-def evaluate_signal(strategy: StrategyDefinition | Mapping[str, Any] | str, data: Any) -> float:
-    """Evaluate a validated strategy and return a deterministic score in ``[-1, 1]``."""
-    definition = validate_strategy(strategy) if not isinstance(strategy, StrategyDefinition) else strategy
+def _score_for_definition(definition: StrategyDefinition, data: Any) -> float:
     if definition.market_type is MarketType.CRYPTO_SPOT:
         score = _crypto_signal(definition.family, _bars(data), definition.parameters)
     else:
@@ -384,11 +618,140 @@ def evaluate_signal(strategy: StrategyDefinition | Mapping[str, Any] | str, data
     return _clip(score)
 
 
-def evaluate_signal_record(strategy: StrategyDefinition | Mapping[str, Any] | str, data: Any) -> Signal:
+def _model_evidence(data: Any, current: Any, index: int) -> ModelProbabilityEvaluation:
+    prior_evidence = _snapshot_value(current, "model_evaluation")
+    if isinstance(prior_evidence, Mapping) and prior_evidence.get("probability") is not None:
+        return ModelProbabilityEvaluation(
+            prior_evidence.get("probability"),
+            str(prior_evidence.get("reason_code") or MODEL_INPUT_PRESENT),
+            prior_evidence.get("evidence", {}),
+        )
+    if isinstance(data, Mapping):
+        top_evidence = data.get("model_evaluation")
+        if isinstance(top_evidence, Mapping) and top_evidence.get("probability") is not None:
+            return ModelProbabilityEvaluation(
+                top_evidence.get("probability"),
+                str(top_evidence.get("reason_code") or MODEL_INPUT_PRESENT),
+                top_evidence.get("evidence", {}),
+            )
+    for key in ("model_probability", "probability", "predicted_probability", "p"):
+        value = _snapshot_value(current, key)
+        if value is not None:
+            try:
+                probability = float(value)
+            except (TypeError, ValueError):
+                probability = None
+            if probability is not None and math.isfinite(probability) and 0.0 <= probability <= 1.0:
+                return ModelProbabilityEvaluation(
+                    probability,
+                    MODEL_INPUT_PRESENT,
+                    {"model_source": "OBSERVATION", "field": key},
+                )
+            return ModelProbabilityEvaluation(
+                None,
+                MODEL_INPUT_MISSING,
+                {"model_source": "OBSERVATION", "field": key},
+            )
+    if isinstance(data, Mapping):
+        model = data.get("model_document", data.get("model"))
+        if model is not None:
+            return evaluate_model_probability_evidence(model, current)
+        values = data.get("probabilities", data.get("model_probabilities"))
+        if isinstance(values, Mapping):
+            value = values.get(_snapshot_value(current, "market_id"), values.get(str(index)))
+        elif isinstance(values, Sequence) and not isinstance(values, (str, bytes)):
+            try:
+                value = values[index]
+            except IndexError:
+                value = None
+        else:
+            value = None
+        if value is not None:
+            try:
+                probability = float(value)
+            except (TypeError, ValueError):
+                probability = None
+            if probability is not None and math.isfinite(probability) and 0.0 <= probability <= 1.0:
+                return ModelProbabilityEvaluation(
+                    probability,
+                    MODEL_INPUT_PRESENT,
+                    {"model_source": "INPUT_SEQUENCE"},
+                )
+    return ModelProbabilityEvaluation(None, MODEL_INPUT_MISSING, {"model_source": "MISSING"})
+
+
+def evaluate_signal_evaluation(
+    strategy: StrategyDefinition | Mapping[str, Any] | str,
+    data: Any,
+) -> Signal:
+    """Evaluate a strategy and expose the state a consumer must act on."""
     definition = validate_strategy(strategy) if not isinstance(strategy, StrategyDefinition) else strategy
-    score = evaluate_signal(definition, data)
+    evidence: dict[str, Any] = {}
+    if definition.market_type is MarketType.CRYPTO_SPOT:
+        bars = _bars(data)
+        if not bars:
+            return Signal(definition.family, 0.0, "flat", definition.market_type.value, WARMING_UP, {"history_count": 0})
+        lookback = _declared_lookback(definition.parameters, 14)
+        if definition.family == "mean_reversion":
+            required = max(2, lookback)
+        elif definition.family in {"dip", "momentum", "breakout", "volatility", "volume_filter"}:
+            required = lookback + 1
+        elif definition.family == "trend":
+            try:
+                fast = max(1, int(definition.parameters.get("fast", min(lookback, 10))))
+                slow = max(fast + 1, int(definition.parameters.get("slow", max(lookback, 30))))
+            except (TypeError, ValueError, OverflowError):
+                fast, slow = min(lookback, 10), max(lookback, 30)
+            required = slow
+        elif definition.family == "rsi":
+            required = max(2, _declared_lookback(definition.parameters, 14)) + 1
+        else:
+            required = 0
+        if required:
+            evidence.update({"lookback": lookback, "history_count": len(bars), "required": required})
+            if len(bars) < required:
+                return Signal(
+                    definition.family, 0.0, "flat", definition.market_type.value,
+                    INSUFFICIENT_LOOKBACK, evidence,
+                )
+    else:
+        snapshots = _ordered_prediction_snapshots(data)
+        if not snapshots:
+            return Signal(definition.family, 0.0, "flat", definition.market_type.value, WARMING_UP, {"history_count": 0})
+        lookback = _declared_lookback(definition.parameters)
+        if definition.family in {"momentum", "mean_reversion"}:
+            required = lookback + 1
+            evidence.update({"lookback": lookback, "history_count": len(snapshots), "required": required})
+            if len(snapshots) < required:
+                return Signal(
+                    definition.family, 0.0, "flat", definition.market_type.value,
+                    INSUFFICIENT_LOOKBACK, evidence,
+                )
+        current = snapshots[-1]
+        model_evaluation = _model_evidence(data, current, len(snapshots) - 1)
+        evidence["model"] = model_evaluation.as_record()
+        if _prediction_requires_model(definition.family) and not model_evaluation.available:
+            return Signal(
+                definition.family, 0.0, "flat", definition.market_type.value,
+                MODEL_INPUT_MISSING, evidence,
+            )
+    score = _score_for_definition(definition, data)
+    reason = SIGNAL_PRODUCED if abs(score) > 1e-12 else STRATEGY_EVALUATED_DECLINED
     side = "buy" if score > 0 else "sell" if score < 0 else "flat"
-    return Signal(definition.family, score, side, definition.market_type.value)
+    return Signal(definition.family, score, side, definition.market_type.value, reason, evidence)
+
+
+evaluate_signal_with_reason = evaluate_signal_evaluation
+evaluate_signal_evidence = evaluate_signal_evaluation
+
+
+def evaluate_signal(strategy: StrategyDefinition | Mapping[str, Any] | str, data: Any) -> float:
+    """Numeric compatibility API returning a deterministic score in ``[-1, 1]``."""
+    return evaluate_signal_evaluation(strategy, data).score
+
+
+def evaluate_signal_record(strategy: StrategyDefinition | Mapping[str, Any] | str, data: Any) -> Signal:
+    return evaluate_signal_evaluation(strategy, data)
 
 
 def evaluate_crypto_family(family: str, bars: Sequence[OHLCVBar | Mapping[str, Any]], **parameters: Any) -> float:
@@ -405,11 +768,21 @@ class BuiltinSignalEvaluator:
     def evaluate(self, strategy: StrategyDefinition | Mapping[str, Any] | str, data: Any) -> float:
         return evaluate_signal(strategy, data)
 
+    def evaluate_record(self, strategy: StrategyDefinition | Mapping[str, Any] | str, data: Any) -> Signal:
+        return evaluate_signal_evaluation(strategy, data)
+
     __call__ = evaluate
+
+
 SignalEvaluator = BuiltinSignalEvaluator
 
+
 __all__ = [
-    "BuiltinSignalEvaluator", "Signal", "SignalEvaluator", "evaluate_crypto_family",
-    "evaluate_model_document_probability", "evaluate_prediction_family",
-    "evaluate_signal", "evaluate_signal_record",
+    "BuiltinSignalEvaluator", "CONSTANT_BASELINE", "INSUFFICIENT_LOOKBACK",
+    "MODEL_INPUT_MISSING", "MODEL_INPUT_PRESENT", "ModelProbabilityEvaluation",
+    "SIGNAL_PRODUCED", "STRATEGY_EVALUATED_DECLINED", "Signal", "SignalEvaluator",
+    "WARMING_UP", "evaluate_crypto_family", "evaluate_model_document",
+    "evaluate_model_document_probability", "evaluate_model_probability_evidence",
+    "evaluate_prediction_family", "evaluate_signal", "evaluate_signal_evaluation",
+    "evaluate_signal_evidence", "evaluate_signal_record", "evaluate_signal_with_reason",
 ]

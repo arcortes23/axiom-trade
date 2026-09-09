@@ -226,24 +226,67 @@ class PolymarketCollector:
     ) -> CollectionCycle:
         started = ensure_utc(now or self.clock())
         monotonic_started = time.monotonic()
-        counters = self._new_counters()
         root_state = self.store.get_collector_state(self.config.collector_name) or {}
         requested = tuple(dict.fromkeys(str(item).strip() for item in (market_ids or ()) if str(item).strip()))
         configured = requested or self.config.market_ids
-
+        counters = self._new_counters()
         primary_candidate_ids = self._active_primary_candidate_ids()
+        paper_ids = self._active_paper_forward_ids()
+        scope_candidate_ids, scope_candidate_markets, scope_discovered, scope_cursor = (
+            self._resolve_market_scopes(
+                started,
+                tuple(dict.fromkeys([*(primary_candidate_ids or ()), *paper_ids])),
+                root_state,
+                counters,
+            )
+        )
+        scope_candidate_set = set(scope_candidate_ids)
+        legacy_primary_ids = [
+            identifier for identifier in (primary_candidate_ids or ())
+            if identifier not in scope_candidate_set
+        ]
         candidate_requirements = self._candidate_requirements(
-            started, candidate_ids=primary_candidate_ids
+            started, candidate_ids=legacy_primary_ids
         )
         candidate_bound = self._requirement_markets(candidate_requirements)
         candidate_references = self._requirement_references(candidate_requirements)
+        # Scope resolution is the sole authority for candidates carrying a
+        # frozen market policy.  The older requirements projection is retained
+        # only for candidates without one, preserving collection priority for
+        # legacy stores while preventing a second scope authority.
+        for candidate_id in scope_candidate_ids:
+            for market_id in scope_candidate_markets.get(candidate_id, ()):
+                if market_id not in candidate_bound:
+                    candidate_bound.append(market_id)
+                candidate_references.setdefault(market_id, [])
+                if candidate_id not in candidate_references[market_id]:
+                    candidate_references[market_id].append(candidate_id)
         if configured:
-            candidate_bound = list(dict.fromkeys([*configured, *candidate_bound]))
-            for identifier in configured:
+            allowed_scope_ids = {
+                market_id
+                for values in scope_candidate_markets.values()
+                for market_id in values
+            }
+            configured_values = (
+                configured
+                if not scope_candidate_set
+                else tuple(item for item in configured if item in allowed_scope_ids)
+            )
+            candidate_bound = list(dict.fromkeys([*configured_values, *candidate_bound]))
+            for identifier in configured_values:
                 candidate_references.setdefault(identifier, [])
 
-        # A market is due for the required tier when its last persisted
-        candidate_health = self._required_health(candidate_requirements, started, candidate_bound)
+        # The storage health projection consumes the legacy authority shape.
+        # Project resolved scope ids into that shape without asking storage to
+        # rediscover or reinterpret the canonical policy.
+        health_requirements: Mapping[str, Any] = candidate_requirements
+        if scope_candidate_set:
+            health_requirements = {
+                **dict(candidate_requirements),
+                "market_ids": list(candidate_bound),
+                "candidate_references": candidate_references,
+            }
+        candidate_health = self._required_health(health_requirements, started, candidate_bound)
         candidate_fresh = list(candidate_health.get("fresh", ()))
         candidate_stale = list(candidate_health.get("stale", ()))
         candidate_missing = list(candidate_health.get("missing", ()))
@@ -260,15 +303,18 @@ class PolymarketCollector:
             due_candidates = list(dict.fromkeys([*configured, *due_candidates]))
             known_candidate.update(configured)
 
-        paper_ids = [
-            identifier for identifier in self._active_paper_forward_ids()
-            if identifier not in set(primary_candidate_ids or ())
-        ]
-        paper_requirements = self._candidate_requirements(started, candidate_ids=paper_ids)
+        legacy_paper_ids = [identifier for identifier in paper_ids if identifier not in scope_candidate_set]
+        paper_requirements = self._candidate_requirements(started, candidate_ids=legacy_paper_ids)
         paper_markets = [
             market_id for market_id in self._requirement_markets(paper_requirements)
             if market_id not in known_candidate
         ]
+        for candidate_id in paper_ids:
+            if candidate_id not in scope_candidate_set:
+                continue
+            for market_id in scope_candidate_markets.get(candidate_id, ()):
+                if market_id not in known_candidate and market_id not in paper_markets:
+                    paper_markets.append(market_id)
 
         capacity = self.config.max_markets
         candidate_scheduled = due_candidates[:capacity]
@@ -276,15 +322,24 @@ class PolymarketCollector:
         paper_scheduled = paper_markets[:remaining]
         remaining = max(0, remaining - len(paper_scheduled))
 
-        discovered: dict[str, PredictionMarketSnapshot] = {}
+        discovery_cursor = scope_cursor if scope_candidate_set else root_state.get("discovery_carry_cursor", 0)
         discovery_scheduled: list[str] = []
+        discovered: dict[str, PredictionMarketSnapshot] = {}
         discovery_deferred: list[str] = []
-        discovery_cursor = root_state.get("discovery_carry_cursor", 0)
         try:
             discovery_cursor = max(0, int(discovery_cursor))
         except (TypeError, ValueError):
             discovery_cursor = 0
-        if not configured and remaining > 0 and self.config.discovery_budget_per_cycle > 0:
+        # A scope-bearing candidate has already consumed the one shared public
+        # inventory pass above.  Never append unqualified inventory to its
+        # schedule; this is what prevents research-only/invalid scopes from
+        # widening into live collection authority.
+        if (
+            not configured
+            and not scope_candidate_set
+            and remaining > 0
+            and self.config.discovery_budget_per_cycle > 0
+        ):
             try:
                 discovered_values, next_cursor, deferred = self._discover_markets(
                     started,
@@ -310,7 +365,7 @@ class PolymarketCollector:
             except Exception as exc:
                 counters["errors"] += 1
                 self.store.save_collection_error(None, started, "discovery", str(exc))
-        if not configured and remaining > len(discovery_scheduled):
+        if not configured and not scope_candidate_set and remaining > len(discovery_scheduled):
             try:
                 tracked = self.store.tracked_polymarket_markets(
                     active_only=self.config.active,
@@ -416,11 +471,10 @@ class PolymarketCollector:
                     tier_successes[tier] += 1
                 else:
                     tier_failures[tier] += 1
-
         ended = ensure_utc(now or self.clock())
         if ended < started:
             ended = started
-        final_health = self._required_health(candidate_requirements, ended, candidate_bound)
+        final_health = self._required_health(health_requirements, ended, candidate_bound)
         candidate_fresh = list(final_health.get("fresh", candidate_fresh))
         candidate_stale = list(final_health.get("stale", candidate_stale))
         candidate_missing = list(final_health.get("missing", candidate_missing))
@@ -526,6 +580,7 @@ class PolymarketCollector:
                 "markets_seen": len(planned_ids),
                 "stale_after_seconds": self.config.stale_after_seconds,
                 "discovery_carry_cursor": discovery_cursor,
+                "scope_discovery_carry_cursor": scope_cursor,
                 "candidate_bound_markets": list(candidate_bound),
                 "candidate_bound_scheduled": list(candidate_scheduled),
                 "candidate_bound_fresh": list(candidate_fresh),
@@ -756,6 +811,343 @@ class PolymarketCollector:
         except Exception:
             return []
         return providers if len(providers) >= 2 else []
+    def _resolve_market_scopes(
+        self,
+        observed_at: datetime,
+        candidate_ids: Sequence[str],
+        root_state: Mapping[str, Any],
+        counters: dict[str, Any],
+    ) -> tuple[list[str], dict[str, list[str]], dict[str, PredictionMarketSnapshot], int]:
+        """Resolve all frozen market policies against one shared inventory.
+
+        Scope resolution deliberately happens before the normal candidate and
+        paper tiers.  The resolver owns policy parsing, exclusion/defer
+        taxonomy, exact token identity, and provenance persistence; this
+        method only supplies bounded current records and projects matched
+        market ids into the existing fair scheduler.
+        """
+        try:
+            from .market_scope import resolve_market_scope
+        except (ImportError, AttributeError):
+            resolve_market_scope = None
+        saver = getattr(self.store, "save_market_scope_resolution", None)
+        loader = getattr(self.store, "load_candidate_lifecycle", None)
+        if not callable(resolve_market_scope) or not callable(loader):
+            return [], {}, {}, self._scope_cursor(root_state)
+
+        documents: list[tuple[str, Mapping[str, Any]]] = []
+        for candidate_id in dict.fromkeys(str(item).strip() for item in candidate_ids if str(item).strip()):
+            try:
+                record = loader(candidate_id)
+            except (AttributeError, KeyError, TypeError, ValueError):
+                continue
+            if not isinstance(record, Mapping):
+                continue
+            stage = str(record.get("stage", "")).strip().upper()
+            if stage not in {"FROZEN", "PAPER_FORWARD", "PAPER_PROMOTABLE"}:
+                continue
+            payload = record.get("payload")
+            if not isinstance(payload, Mapping):
+                continue
+            if self._has_scope_material(payload):
+                documents.append((candidate_id, self._scope_document(payload)))
+        if not documents:
+            return [], {}, {}, self._scope_cursor(root_state)
+        carry_cursor = self._scope_cursor(root_state)
+        needs_inventory = any(
+            self._scope_document_needs_inventory(document)
+            for _, document in documents
+        )
+        if needs_inventory:
+            current_records, snapshots, next_cursor = self._discover_scope_inventory(
+                observed_at,
+                counters,
+                carry_cursor=carry_cursor,
+            )
+        else:
+            current_records, snapshots, next_cursor = [], {}, carry_cursor
+        # Resolver limits are independently bounded from the scheduler's
+        # global market cap.  A candidate may have up to the canonical 100
+        # matches, while this cycle still schedules at most max_markets.
+        max_scope_markets = min(1000, max(0, len(current_records)))
+        candidate_markets: dict[str, list[str]] = {}
+        scope_candidates = [candidate_id for candidate_id, _ in documents]
+        for candidate_id, document in documents:
+            try:
+                result = resolve_market_scope(
+                    candidate_id,
+                    document,
+                    current_records,
+                    resolved_at=observed_at,
+                    max_matches=100,
+                    max_markets=max_scope_markets,
+                )
+            except Exception as exc:
+                counters["errors"] += 1
+                self.store.save_collection_error(candidate_id, observed_at, "market_scope", str(exc))
+                continue
+            try:
+                parameters = inspect.signature(saver).parameters
+                accepts_if_absent = (
+                    "if_absent" in parameters
+                    or any(
+                        parameter.kind is inspect.Parameter.VAR_KEYWORD
+                        for parameter in parameters.values()
+                    )
+                )
+            except (TypeError, ValueError):
+                accepts_if_absent = True
+            try:
+                if accepts_if_absent:
+                    saver(result, if_absent=True)
+                else:
+                    saver(result)
+            except Exception as exc:
+                counters["errors"] += 1
+                self.store.save_collection_error(
+                    candidate_id, observed_at, "market_scope_persistence", str(exc)
+                )
+                continue
+            matched = self._scope_result_market_ids(result)
+            candidate_markets[candidate_id] = matched
+        return scope_candidates, candidate_markets, snapshots, next_cursor
+
+    @staticmethod
+    def _scope_cursor(root_state: Mapping[str, Any]) -> int:
+        value = root_state.get("scope_discovery_carry_cursor", root_state.get("discovery_carry_cursor", 0))
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def _has_scope_material(payload: Mapping[str, Any]) -> bool:
+        """Recognize an explicitly bound canonical scope.
+
+        Bare ``market_ids``/filter fields are the pre-scope candidate
+        contract.  They must continue through ``candidate_forward_requirements``
+        so existing frozen candidates retain their legacy authority.  A
+        canonical policy (or its immutable hash/version binding), including
+        one nested in a frozen plan/document, is instead owned exclusively by
+        persisted scope resolution.
+        """
+        bindings = {"market_scope", "market_scope_hash", "market_scope_version", "scope_hash", "scope_version"}
+
+        def declared(document: Mapping[str, Any], depth: int = 0) -> bool:
+            if "market_scope" in document and document.get("market_scope") is not None:
+                return True
+            if any(
+                key in document
+                and document.get(key) is not None
+                and bool(str(document.get(key)).strip())
+                for key in bindings - {"market_scope"}
+            ):
+                return True
+            if depth >= 3:
+                return False
+            return any(
+                isinstance(nested := document.get(key), Mapping)
+                and declared(nested, depth + 1)
+                for key in ("experiment_plan", "frozen_document", "frozen_documents")
+            )
+
+        return declared(payload)
+
+    @staticmethod
+    def _scope_document(payload: Mapping[str, Any]) -> Mapping[str, Any]:
+        """Copy the immutable lifecycle payload without changing authority."""
+        document = dict(payload)
+        frozen = payload.get("frozen_document")
+        if isinstance(frozen, Mapping):
+            document = {**document, **dict(frozen)}
+        frozen_documents = payload.get("frozen_documents")
+        if isinstance(frozen_documents, Mapping):
+            document = {**document, **dict(frozen_documents)}
+        return document
+    @staticmethod
+    def _scope_document_needs_inventory(document: Mapping[str, Any]) -> bool:
+        source = document.get("experiment_plan")
+        source = source if isinstance(source, Mapping) else document
+        policy = source.get("market_scope")
+        if isinstance(policy, Mapping):
+            mode = str(policy.get("mode", "")).strip().upper()
+            return mode in {"EXACT_MARKETS", "RULE_BASED_MARKETS"}
+        # Hash/version-only or malformed bindings cannot authorize current
+        # markets, so resolving them against an inventory is unnecessary.
+        return False
+
+
+
+    def _discover_scope_inventory(
+        self,
+        observed_at: datetime,
+        counters: dict[str, Any],
+        *,
+        carry_cursor: int,
+        provider: Any | None = None,
+    ) -> tuple[list[Mapping[str, Any]], dict[str, PredictionMarketSnapshot], int]:
+        """Fetch one bounded current inventory shared by every candidate."""
+        provider = provider or self.provider
+        method = getattr(provider, "markets", None)
+        if not callable(method):
+            return [], {}, carry_cursor
+        # Scope inventory must be the adapter's current/open view.  Passing
+        # ``active=False`` asks PolymarketAdapter for closed inventory.
+        kwargs: dict[str, Any] = {"active": True}
+        try:
+            parameters = inspect.signature(method).parameters
+        except (TypeError, ValueError):
+            parameters = {}
+        accepts_kwargs = any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        )
+        scan_budget = min(
+            100,
+            max(1, self.config.max_markets, self.config.discovery_budget_per_cycle),
+        )
+        if "limit" in parameters or accepts_kwargs or not parameters:
+            # One bounded page is shared by every policy and never multiplied
+            # by candidate count.
+            kwargs["limit"] = scan_budget
+        try:
+            values = self._call_provider(
+                "scope_discovery",
+                lambda: method(**kwargs),
+                observed_at,
+                counters,
+                provider=provider,
+            ) or ()
+        except Exception as exc:
+            counters["errors"] += 1
+            self.store.save_collection_error(None, observed_at, "scope_discovery", str(exc))
+            return [], {}, carry_cursor
+        snapshots: list[PredictionMarketSnapshot] = []
+        seen_ids: set[str] = set()
+        for item in values:
+            if not isinstance(item, PredictionMarketSnapshot):
+                continue
+            market_id = str(item.market_id).strip()
+            if not market_id or market_id in seen_ids:
+                continue
+            seen_ids.add(market_id)
+            snapshots.append(item)
+            if len(snapshots) >= 100:
+                break
+        if not snapshots:
+            return [], {}, carry_cursor
+        offset = carry_cursor % len(snapshots)
+        rotated = snapshots[offset:] + snapshots[:offset]
+        page = rotated[:scan_budget]
+        records = [self._scope_market_record(item, observed_at, provider) for item in page]
+        record_by_id = {
+            str(item.market_id).strip(): item
+            for item in page
+            if str(item.market_id).strip()
+        }
+        # Advance the durable cursor by the bounded page, rather than by each
+        # candidate resolution.  Repeated policies therefore see identical
+        # inventory and cannot multiply network work.
+        next_cursor = (offset + len(page)) % len(snapshots)
+        return records, record_by_id, next_cursor
+
+    @staticmethod
+    def _scope_market_record(
+        snapshot: PredictionMarketSnapshot,
+        observed_at: datetime,
+        provider: Any,
+    ) -> Mapping[str, Any]:
+        settlement = getattr(snapshot.settlement, "value", snapshot.settlement)
+        # Gamma lifecycle fields are authoritative only when explicitly
+        # present.  Keep missing values unknown so the resolver can defer
+        # rather than infer lifecycle or order-book state from unrelated
+        # fields such as settlement or an attached book.
+        active = snapshot.active
+        closed = snapshot.closed
+        book_available = snapshot.enable_order_book
+        provider_name = getattr(provider, "provider_name", type(provider).__name__)
+        return {
+            "market_id": snapshot.market_id,
+            "condition_id": snapshot.condition_id or "",
+            "yes_token_id": snapshot.yes_token_id or "",
+            "no_token_id": snapshot.no_token_id or "",
+            "instrument": "POLYMARKET",
+            "instrument_type": "POLYMARKET",
+            "market_type": "prediction",
+            "venue": "POLYMARKET",
+            "category": snapshot.category,
+            "categories": [snapshot.category] if snapshot.category else [],
+            "tag": list(snapshot.tags),
+            "tags": list(snapshot.tags),
+            "question": snapshot.question,
+            "yes_bid": snapshot.yes_bid,
+            "yes_ask": snapshot.yes_ask,
+            "yes_mid": snapshot.yes_mid,
+            "price": snapshot.yes_mid,
+            "expiry": snapshot.expiry.isoformat() if snapshot.expiry is not None else None,
+            "liquidity": snapshot.liquidity,
+            "volume": snapshot.volume,
+            "spread": snapshot.yes_spread,
+            "yes_spread": snapshot.yes_spread,
+            "no_spread": snapshot.no_spread,
+            "source": provider_name,
+            "provider": "POLYMARKET",
+            "provider_name": provider_name,
+            "active": active,
+            "open": active,
+            "closed": closed,
+            "archived": snapshot.archived,
+            "settlement": settlement,
+            "outcome": settlement,
+            "accepting_orders": snapshot.accepting_orders,
+            "acceptingOrders": snapshot.accepting_orders,
+            "accepting-orders": snapshot.accepting_orders,
+            "enable_order_book": snapshot.enable_order_book,
+            "enableOrderBook": snapshot.enable_order_book,
+            "book": book_available,
+            "book_available": book_available,
+            "order_book_available": book_available,
+            "source_type": "CURRENT",
+            "observed_at": observed_at.isoformat(),
+            "provider_timestamp": (
+                snapshot.provider_timestamp.isoformat()
+                if snapshot.provider_timestamp is not None
+                else None
+            ),
+            "metadata_provenance": {
+                "source_type": "CURRENT",
+                "provider": provider_name,
+                "instrument": "POLYMARKET",
+                "venue": "POLYMARKET",
+                "observed_at": observed_at.isoformat(),
+            },
+        }
+    @staticmethod
+    def _scope_result_market_ids(result: Any) -> list[str]:
+        raw = getattr(result, "matched_markets", _UNSET)
+        if raw is _UNSET and isinstance(result, Mapping):
+            raw = result.get("matched_markets", result.get("matched", ()))
+        if raw is _UNSET or raw is None:
+            return []
+        if isinstance(raw, Mapping):
+            raw = raw.values()
+        if isinstance(raw, (str, bytes)):
+            raw = (raw,)
+        try:
+            values = list(raw)
+        except TypeError:
+            values = [raw]
+        result_ids: list[str] = []
+        for item in values:
+            if isinstance(item, str):
+                identifier = item.strip()
+            elif isinstance(item, Mapping):
+                identifier = str(item.get("market_id", item.get("id", ""))).strip()
+            else:
+                identifier = str(getattr(item, "market_id", "")).strip()
+            if identifier and identifier not in result_ids:
+                result_ids.append(identifier)
+        return result_ids
 
     def run_forever(
         self,

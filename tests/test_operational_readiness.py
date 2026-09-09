@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+import hashlib
 import json
 import sys
 import unittest
@@ -12,7 +13,13 @@ from axiom.cli import _load_cli_universe, _run_cli_crypto_research, build_parser
 from axiom.crypto_universe import TOP_50_MARKET_CAP_BINANCE_USDT, UniverseSnapshot, load_crypto_universe
 from axiom.data import InMemoryCryptoProvider
 from axiom.domain import MarketType, OHLCVBar
-from axiom.experiment_plan import ExperimentPlan, ExperimentPlanError, forward_market_matches
+from axiom.experiment_plan import (
+    ExperimentPlan,
+    ExperimentPlanError,
+    forward_market_matches,
+    normalize_market_scope,
+)
+from axiom.market_scope import resolve_market_scope
 from axiom.research import run_crypto_research, run_multi_symbol_crypto_research
 from axiom.storage import AxiomStore
 from axiom.dashboard import DashboardData
@@ -1019,8 +1026,283 @@ class CanaryReadinessTests(unittest.TestCase):
             rendered = json.dumps(result, sort_keys=True).lower()
             self.assertNotIn("wallet", rendered)
             self.assertNotIn("signer", rendered)
+    def _seed_official_submission_fixture(self, store: AxiomStore, service: CanaryService) -> str:
+        """Seed the canonical prediction candidate required by official submit."""
+        dataset_id = "prediction-history"
+        dataset_version = "v1"
+        market_id = "market-1"
+        source_timestamp = T0
+        strategy_document = {
+            "version": 1,
+            "market_type": "prediction",
+            "family": "probability_mispricing",
+            "parameters": {"threshold": 0.05},
+            "operations": [],
+            "probability_model": "fixed",
+            "resolution_aware": True,
+            "resolution_inputs": ["expiry", "settlement"],
+            "strategy_id": "candidate-1",
+        }
+        model_document = {"probability": 0.80}
+        market_scope = normalize_market_scope(
+            {
+                "schema_version": "1",
+                "mode": "EXACT_MARKETS",
+                "instrument": "POLYMARKET",
+                "categories": [],
+                "market_ids": [market_id],
+                "filters": {},
+                "provenance": "canonical",
+            }
+        )
+        experiment_plan = ExperimentPlan.from_mapping(
+            {
+                "plan_id": "official-submit-plan",
+                "hypothesis_id": "official-submit-hypothesis",
+                "market_type": "prediction",
+                "template": "probability_mispricing",
+                "market_scope": market_scope.as_dict(),
+                "dataset_selector": {
+                    "dataset_id": dataset_id,
+                    "dataset_version": dataset_version,
+                    "source_type": "HISTORICAL",
+                },
+                "strategy_document": strategy_document,
+                "model_document": model_document,
+                "paper_only": True,
+                "min_samples": 30,
+                "min_trades": 10,
+                "max_variants": 1,
+            }
+        )
+        experiment_plan_payload = experiment_plan.as_dict()
+        strategy_document = dict(experiment_plan_payload["strategy_document"])
+        model_document = dict(experiment_plan_payload["model_document"])
+        strategy_hash = service._document_hash(strategy_document)
+        model_hash = service._document_hash(model_document)
+        self.assertIsNotNone(strategy_hash)
+        self.assertIsNotNone(model_hash)
+        config_hash = "sha256:official-submit-config"
+        frozen_hash = hashlib.sha256(
+            f"{strategy_hash}|{model_hash}|{config_hash}".encode("utf-8")
+        ).hexdigest()
+        rows = [{"timestamp": T0.isoformat(), "price": 0.5, "source_type": "HISTORICAL"}]
+        store.save_dataset(
+            dataset_id,
+            dataset_version,
+            rows,
+            metadata={
+                "provider": "polymarket-fixture",
+                "source_type": "HISTORICAL",
+                "research_quality": "PRICE_PROXY",
+                "historical_order_book_available": False,
+            },
+            quality="PRICE_PROXY",
+        )
+        store.save_dataset_catalog(
+            dataset_id,
+            dataset_version,
+            provider="polymarket-fixture",
+            instrument="POLYMARKET",
+            market_type=MarketType.PREDICTION,
+            timeframe="event",
+            start_timestamp=T0,
+            end_timestamp=T0,
+            row_count=len(rows),
+            completeness=1.0,
+            quality="PRICE_PROXY",
+            source_type="HISTORICAL",
+            snapshot_id=f"{dataset_id}:{dataset_version}",
+            metadata={
+                "provider": "polymarket-fixture",
+                "source_type": "HISTORICAL",
+                "research_quality": "PRICE_PROXY",
+                "historical_order_book_available": False,
+            },
+            created_at=T0,
+            updated_at=T0,
+        )
+        dataset_attestation = store.verify_dataset_integrity_attestation(
+            dataset_id,
+            dataset_version,
+            force=True,
+        )
+        payload = {
+            "candidate_id": "candidate-1",
+            "strategy_id": "candidate-1",
+            "experiment_family": "official-submit",
+            "market_type": "prediction",
+            "instrument": "POLYMARKET",
+            "dataset_id": dataset_id,
+            "dataset_version": dataset_version,
+            "dataset_selector": {
+                "dataset_id": dataset_id,
+                "dataset_version": dataset_version,
+                "source_type": "HISTORICAL",
+            },
+            "dataset_provenance": {
+                "dataset_id": dataset_id,
+                "dataset_version": dataset_version,
+                "source_type": "HISTORICAL",
+                "time_split": "train-validation-holdout",
+            },
+            "dataset_attestation": dataset_attestation,
+            "experiment_plan": experiment_plan_payload,
+            "plan_hash": experiment_plan.plan_hash,
+            "market_scope": market_scope.as_dict(),
+            "market_scope_hash": market_scope.scope_hash,
+            "market_scope_version": market_scope.scope_version,
+            "market_ids": [market_id],
+            "target_market_ids": [market_id],
+            "schema_validated": True,
+            "historical_backtest_passed": True,
+            "validation_passed": True,
+            "robustness_passed": True,
+            "data_quality_passed": True,
+            "frozen": True,
+            "holdout_used": False,
+            "data_quality": "PRICE_PROXY",
+            "validation_expectancy": 0.10,
+            "validation_confidence_lower_bound": 0.05,
+            "validation_stability": 0.90,
+            "validation_calibration": 0.90,
+            "sample_count": 100,
+            "trade_count": 50,
+            "validation_execution_quality": 0.90,
+            "minimum_sample_check": {
+                "passed": True,
+                "count": 100,
+                "trades": 50,
+                "min_observations": 30,
+                "min_trades": 10,
+                "checks": {"sample_count": True, "trade_count": True},
+            },
+            "strategy_document": strategy_document,
+            "model_document": model_document,
+            "strategy_hash": strategy_hash,
+            "model_hash": model_hash,
+            "config_hash": config_hash,
+            "frozen_hash": frozen_hash,
+        }
+        store.save_candidate_lifecycle("candidate-1", "IDEA", payload, timestamp=T0)
+        store.save_candidate_lifecycle("candidate-1", "FROZEN", payload, timestamp=T0)
+        market_expiry = (T0 + timedelta(days=1)).isoformat()
+        store.save_polymarket_market_metadata(
+            market_id,
+            {
+                "source_type": "FORWARD_COLLECTED",
+                "instrument": "POLYMARKET",
+                "venue": "POLYMARKET",
+                "market_type": "prediction",
+                "active": True,
+                "closed": False,
+                "metadata": {
+                    "instrument": "POLYMARKET",
+                    "category": "politics",
+                    "active": True,
+                    "closed": False,
+                },
+                "snapshot": {
+                    "market_id": market_id,
+                    "condition_id": "condition-1",
+                    "yes_token_id": "yes",
+                    "no_token_id": "no",
+                    "token_ids": {"yes": "yes", "no": "no"},
+                    "category": "politics",
+                    "settlement": "open",
+                    "expiry": market_expiry,
+                    "active": True,
+                    "closed": False,
+                    "accepting_orders": True,
+                    "enable_order_book": True,
+                },
+            },
+            observed_at=T0,
+            source_type="FORWARD_COLLECTED",
+        )
+        book_timestamp = source_timestamp.isoformat()
+        current_snapshot = {
+            "source_type": "FORWARD_COLLECTED",
+            "snapshot": {
+                "market_id": market_id,
+                "condition_id": "condition-1",
+                "timestamp": book_timestamp,
+                "yes_mid": "0.50",
+                "yes_ask": "0.50",
+                "no_mid": "0.50",
+                "no_ask": "0.50",
+                "yes_token_id": "yes",
+                "no_token_id": "no",
+                "token_ids": {"yes": "yes", "no": "no"},
+                "yes_order_book": {
+                    "asks": [{"price": "0.50", "size": "100"}],
+                    "bids": [{"price": "0.49", "size": "100"}],
+                    "timestamp": book_timestamp,
+                    "token_id": "yes",
+                },
+                "no_order_book": {
+                    "asks": [{"price": "0.50", "size": "100"}],
+                    "bids": [{"price": "0.49", "size": "100"}],
+                    "timestamp": book_timestamp,
+                    "token_id": "no",
+                },
+                "settlement": "open",
+                "expiry": market_expiry,
+                "active": True,
+                "closed": False,
+                "accepting_orders": True,
+                "enable_order_book": True,
+            },
+            "active": True,
+            "closed": False,
+            "settlement": "open",
+        }
+        store.save_polymarket_snapshot(
+            "official-submit-snapshot",
+            market_id,
+            source_timestamp,
+            T0,
+            current_snapshot,
+            quality="ORDER_BOOK_SIMULATED",
+            source_type="FORWARD_COLLECTED",
+        )
+        resolution = resolve_market_scope(
+            "candidate-1",
+            {"market_scope": market_scope.as_dict()},
+            [
+                {
+                    "market_id": market_id,
+                    "condition_id": "condition-1",
+                    "yes_token_id": "yes",
+                    "no_token_id": "no",
+                    "instrument": "POLYMARKET",
+                    "venue": "POLYMARKET",
+                    "source_type": "CURRENT",
+                    "active": True,
+                    "open": True,
+                    "closed": False,
+                    "settlement": "open",
+                    "accepting_orders": True,
+                    "enable_order_book": True,
+                    "metadata": {"category": "politics"},
+                    "metadata_provenance": {
+                        "source_type": "CURRENT",
+                        "metadata_hash": "sha256:market-1",
+                    },
+                }
+            ],
+            resolved_at=T0,
+        )
+        store.save_market_scope_resolution(resolution)
+        service.mark_eligible("candidate-1")
+        with patch.object(store, "polymarket_health", return_value={"grade": "A"}):
+            signal = service.generate_signal("candidate-1")
+        self.assertIsInstance(signal, dict)
+        self.assertEqual(signal.get("status"), "READY")
+        return str(signal["signal_id"])
 
-    def _submit_official_fixture(self, client: _SDKClient, signal_id: str) -> None:
+
+    def _submit_official_fixture(self, client: _SDKClient) -> None:
         secure_factory = MagicMock(spec=["_create"])
         secure_factory._create.return_value = client
         credentials = _CredentialStore(True)
@@ -1070,6 +1352,7 @@ class CanaryReadinessTests(unittest.TestCase):
             return_value={"blocked": False, "close_only": False},
         ), AxiomStore(":memory:") as store:
             service = CanaryService(store, credentials=credentials, clock=lambda: T0)
+            signal_id = self._seed_official_submission_fixture(store, service)
             expiry = (T0 + timedelta(hours=1)).isoformat()
             store.connection.execute(
                 "INSERT INTO canary_control("
@@ -1125,10 +1408,7 @@ class CanaryReadinessTests(unittest.TestCase):
                 CanaryBlocked,
                 "CANARY_ALLOWANCE_INSUFFICIENT",
             ):
-                self._submit_official_fixture(
-                    client,
-                    f"insufficient-allowance-{len(allowances)}",
-                )
+                self._submit_official_fixture(client)
 
             self.assertEqual(len(client.create_calls), 1)
             self.assertEqual(client.post_calls, [])
@@ -1222,6 +1502,7 @@ class CanaryReadinessTests(unittest.TestCase):
             self.assertFalse(hasattr(CanaryService, "_submit_official_order"))
             with AxiomStore(":memory:") as store:
                 service = CanaryService(store, credentials=credentials, clock=lambda: T0)
+                signal_id = self._seed_official_submission_fixture(store, service)
                 snapshot = {
                     "micro_live_canary": "ARMED",
                     "candidate": "candidate-1",
@@ -1284,7 +1565,7 @@ class CanaryReadinessTests(unittest.TestCase):
                     return_value={"blocked": False, "close_only": False},
                 ), patch.object(PolymarketClobV2Venue, "market_context", return_value=context):
                     service.submit(
-                        signal_id="service-gated",
+                        signal_id=signal_id,
                         candidate_id="candidate-1",
                         market_id="market-1",
                         token_id="yes",
@@ -1851,11 +2132,6 @@ class DashboardAndCliShapeTests(unittest.TestCase):
             self.assertEqual(progress[0]["errors"], ["one retry"])
 
     def test_dashboard_projection_exposes_required_health_without_provider_access(self) -> None:
-        requirements = {
-            "market_ids": ["required-market"],
-            "candidate_bound_markets": {"candidate-dashboard": ["required-market"]},
-            "candidate_references": {"required-market": ["candidate-dashboard"]},
-        }
         health = {
             "candidate_bound_markets": ["required-market"],
             "scheduled": ["required-market"],
@@ -1894,22 +2170,20 @@ class DashboardAndCliShapeTests(unittest.TestCase):
                 raise AssertionError("dashboard projection called provider")
 
         with AxiomStore(":memory:") as store:
-            with patch.object(
-                store,
-                "candidate_forward_requirements",
-                return_value=requirements,
-            ), patch.object(
-                store,
-                "polymarket_required_health",
-                return_value=health,
-            ):
-                data = DashboardData(
-                    store=store,
-                    prediction_provider=ExplodingProvider(),
-                    crypto_provider=ExplodingProvider(),
-                )
-                overview = data.overview_summary()
-                canary = data.canary_data()
+            store.save_worker_state(
+                "health-monitor",
+                "idle",
+                health,
+                started_at=T0,
+                heartbeat_at=T0,
+            )
+            data = DashboardData(
+                store=store,
+                prediction_provider=ExplodingProvider(),
+                crypto_provider=ExplodingProvider(),
+            )
+            overview = data.overview_summary()
+            canary = data.canary_data()
 
         for payload in (overview, canary):
             evidence = payload["forward_evidence"]

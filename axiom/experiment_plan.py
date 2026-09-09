@@ -6,13 +6,14 @@ variants; it never accepts Python, callbacks, credentials, or live controls.
 """
 from __future__ import annotations
 from dataclasses import dataclass
+from enum import Enum
 import hashlib
 import json
 import math
 import re
 from itertools import islice, product
 from types import MappingProxyType
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from .domain import MarketType, parse_timestamp
 from .strategy import StrategyDefinition, load_strategy
@@ -36,6 +37,412 @@ class ExperimentPlanError(ValueError):
         self.code = self.reason
         self.detail = str(detail).strip() or self.reason
         super().__init__(f"{self.reason}: {self.detail}")
+MARKET_SCOPE_SCHEMA_VERSION = "1"
+MARKET_SCOPE_VERSION = MARKET_SCOPE_SCHEMA_VERSION
+
+
+class MarketScopeMode(str, Enum):
+    """The only supported market-scope policies."""
+
+    RESEARCH_ONLY = "RESEARCH_ONLY"
+    EXACT_MARKETS = "EXACT_MARKETS"
+    RULE_BASED_MARKETS = "RULE_BASED_MARKETS"
+
+
+_MARKET_SCOPE_FIELDS = frozenset(
+    {
+        "schema_version",
+        "version",
+        "mode",
+        "instrument",
+        "instrument_constraint",
+        "target_instrument",
+        "category",
+        "categories",
+        "category_constraints",
+        "market_ids",
+        "exact_market_ids",
+        "markets",
+        "filters",
+        "regime_restrictions",
+        "provenance",
+        "source",
+        "policy_hash",
+        "scope_hash",
+        "hash",
+    }
+)
+_MARKET_SCOPE_PROVENANCE = frozenset({"canonical", "legacy-derived"})
+
+
+def _scope_values(value: Any, *, name: str, limit: int, casefold: bool = False) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    values = (value,) if isinstance(value, str) else value
+    if not isinstance(values, (list, tuple, set, frozenset)) or len(values) > limit:
+        raise ExperimentPlanError("MALFORMED_MARKET_SCOPE", f"{name} must be a bounded list")
+    result: list[str] = []
+    for item in values:
+        if not isinstance(item, str) or not item.strip():
+            raise ExperimentPlanError("MALFORMED_MARKET_SCOPE", f"{name} must contain non-empty strings")
+        text = item.strip().casefold() if casefold else item.strip()
+        if text not in result:
+            result.append(text)
+    if isinstance(values, (set, frozenset)):
+        result.sort()
+    return tuple(result)
+
+
+def _scope_alias(source: Mapping[str, Any], names: Sequence[str], *, name: str) -> Any:
+    values = [(key, source[key]) for key in names if key in source]
+    if not values:
+        return None
+    first = values[0][1]
+    for key, value in values[1:]:
+        if _canonical(value) != _canonical(first):
+            raise ExperimentPlanError("CONFLICTING_MARKET_SCOPE", f"conflicting {name} values: {names[0]} and {key}")
+    return first
+
+
+def _scope_restrictions(value: Any) -> Mapping[str, Any]:
+    if value is None:
+        return MappingProxyType({})
+    if not isinstance(value, Mapping):
+        raise ExperimentPlanError("MALFORMED_MARKET_SCOPE", "market_scope.regime_restrictions must be an object")
+    allowed = {"regime", "regimes", "allowed_regimes", "allowed_states"}
+    unknown = sorted(set(str(key) for key in value) - allowed)
+    if unknown:
+        raise ExperimentPlanError("UNSUPPORTED_MARKET_SCOPE", f"unsupported market scope regime fields: {unknown}")
+    supplied = _scope_alias(value, tuple(allowed), name="regime restrictions")
+    if supplied is None:
+        return MappingProxyType({})
+    regimes = _scope_values(supplied, name="market_scope.regime_restrictions", limit=64, casefold=False)
+    if not regimes:
+        raise ExperimentPlanError("MALFORMED_MARKET_SCOPE", "market_scope.regime_restrictions must not be empty")
+    return MappingProxyType({"regimes": tuple(regimes)})
+
+
+def _scope_filter_values(value: Any, restrictions: Mapping[str, Any]) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
+    if value is None:
+        source: Mapping[str, Any] = {}
+    elif isinstance(value, Mapping):
+        source = dict(value)
+        if isinstance(source.get("category"), (set, frozenset)):
+            source["category"] = sorted(source["category"])
+    else:
+        raise ExperimentPlanError("MALFORMED_MARKET_SCOPE", "market_scope.filters must be an object")
+    try:
+        normalized = normalize_forward_filters(source, restrictions)
+    except ExperimentPlanError as exc:
+        reason = "UNSUPPORTED_MARKET_SCOPE" if "unsupported" in exc.detail.lower() else "MALFORMED_MARKET_SCOPE"
+        raise ExperimentPlanError(reason, exc.detail) from exc
+    filters = dict(normalized)
+    filter_category = filters.get("category")
+    if filter_category is not None:
+        categories = _scope_values(filter_category, name="market_scope.filters.category", limit=64, casefold=True)
+        filters["category"] = categories[0] if isinstance(filter_category, str) else list(categories)
+    regimes = filters.pop("regimes", None)
+    normalized_restrictions = dict(restrictions)
+    if regimes is not None:
+        normalized_restrictions = {"regimes": tuple(sorted(str(item) for item in regimes))}
+    return _freeze_json(filters), _freeze_json(normalized_restrictions)
+def _scope_material(policy: "MarketScopePolicy") -> dict[str, Any]:
+    material = policy.as_dict()
+    material.pop("policy_hash", None)
+    material.pop("scope_hash", None)
+    material.pop("hash", None)
+    material.pop("provenance", None)
+    material["categories"] = sorted(material.get("categories", ()))
+    material["market_ids"] = sorted(material.get("market_ids", ()))
+    filters = dict(material.get("filters") or {})
+    for key in ("category", "regimes"):
+        value = filters.get(key)
+        if isinstance(value, list):
+            filters[key] = sorted(value)
+    material["filters"] = filters
+    restrictions = dict(material.get("regime_restrictions") or {})
+    if isinstance(restrictions.get("regimes"), list):
+        restrictions["regimes"] = sorted(restrictions["regimes"])
+    material["regime_restrictions"] = restrictions
+    return material
+
+
+def _scope_equivalent(left: "MarketScopePolicy", right: "MarketScopePolicy") -> bool:
+    """Compare authorities while ignoring provenance added by compatibility aliases."""
+    left_material = _scope_material(left)
+    right_material = _scope_material(right)
+    left_material.pop("provenance", None)
+    right_material.pop("provenance", None)
+    return _canonical(left_material) == _canonical(right_material)
+@dataclass(frozen=True, slots=True)
+class MarketScopePolicy:
+    """Immutable authority describing which prediction markets may be researched."""
+
+    schema_version: str
+    mode: str
+    instrument: str | None = None
+    categories: tuple[str, ...] = ()
+    market_ids: tuple[str, ...] = ()
+    filters: Mapping[str, Any] = MappingProxyType({})
+    regime_restrictions: Mapping[str, Any] = MappingProxyType({})
+    provenance: str = "canonical"
+
+    def __post_init__(self) -> None:
+        version = str(self.schema_version).strip()
+        if version != MARKET_SCOPE_SCHEMA_VERSION:
+            raise ValueError(f"unsupported market scope schema {version!r}")
+        mode = self.mode.value if isinstance(self.mode, MarketScopeMode) else str(self.mode).strip().upper()
+        if mode not in {item.value for item in MarketScopeMode}:
+            raise ValueError(f"unsupported market scope mode {mode!r}")
+        instrument = self.instrument
+        if instrument is not None:
+            if not isinstance(instrument, str) or not instrument.strip():
+                raise ValueError("market scope instrument must be non-empty text")
+            instrument = instrument.strip()
+        categories = tuple(str(item).strip().casefold() for item in self.categories if str(item).strip())
+        market_ids = tuple(str(item).strip() for item in self.market_ids if str(item).strip())
+        if len(set(categories)) != len(categories) or len(set(market_ids)) != len(market_ids):
+            raise ValueError("market scope values must not contain duplicates")
+        filters = _freeze_json(dict(self.filters) if isinstance(self.filters, Mapping) else self.filters)
+        restrictions = _freeze_json(
+            dict(self.regime_restrictions) if isinstance(self.regime_restrictions, Mapping) else self.regime_restrictions
+        )
+        provenance = str(self.provenance).strip().lower()
+        if provenance not in _MARKET_SCOPE_PROVENANCE:
+            raise ValueError(f"unsupported market scope provenance {provenance!r}")
+        if mode == MarketScopeMode.RESEARCH_ONLY.value and (instrument or categories or market_ids or filters or restrictions):
+            raise ValueError("RESEARCH_ONLY market scope cannot contain market ids or rules")
+        if mode == MarketScopeMode.EXACT_MARKETS.value and not market_ids:
+            raise ValueError("EXACT_MARKETS market scope requires market ids")
+        if mode == MarketScopeMode.RULE_BASED_MARKETS.value and market_ids:
+            raise ValueError("RULE_BASED_MARKETS market scope cannot contain exact market ids")
+        if mode == MarketScopeMode.RULE_BASED_MARKETS.value and not (instrument or categories or filters or restrictions):
+            raise ValueError("RULE_BASED_MARKETS market scope requires at least one rule")
+        object.__setattr__(self, "schema_version", version)
+        object.__setattr__(self, "mode", mode)
+        object.__setattr__(self, "instrument", instrument)
+        object.__setattr__(self, "categories", categories)
+        object.__setattr__(self, "market_ids", market_ids)
+        object.__setattr__(self, "filters", filters)
+        object.__setattr__(self, "regime_restrictions", restrictions)
+        object.__setattr__(self, "provenance", provenance)
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> "MarketScopePolicy":
+        if not isinstance(value, Mapping):
+            raise ExperimentPlanError("MALFORMED_MARKET_SCOPE", "market_scope must be an object")
+        unknown = sorted(set(str(key) for key in value) - _MARKET_SCOPE_FIELDS)
+        if unknown:
+            raise ExperimentPlanError("UNSUPPORTED_MARKET_SCOPE", f"unsupported market scope fields: {unknown}")
+        try:
+            clean = _clean_json(value, path="market_scope")
+        except ExperimentPlanError as exc:
+            reason = "UNSUPPORTED_MARKET_SCOPE" if exc.reason == "UNSAFE_PLAN_FIELD" else "MALFORMED_MARKET_SCOPE"
+            raise ExperimentPlanError(reason, exc.detail) from exc
+        schema_version = _scope_alias(clean, ("schema_version", "version"), name="schema version")
+        schema_version = MARKET_SCOPE_SCHEMA_VERSION if schema_version is None else str(schema_version).strip()
+        if schema_version != MARKET_SCOPE_SCHEMA_VERSION:
+            raise ExperimentPlanError("UNSUPPORTED_MARKET_SCOPE", f"unsupported market scope schema {schema_version!r}")
+        mode_value = clean.get("mode")
+        if not isinstance(mode_value, str) or not mode_value.strip():
+            raise ExperimentPlanError("MALFORMED_MARKET_SCOPE", "market_scope.mode is required")
+        mode = mode_value.strip().upper()
+        if mode not in {item.value for item in MarketScopeMode}:
+            raise ExperimentPlanError("UNSUPPORTED_MARKET_SCOPE", f"unsupported market scope mode {mode_value!r}")
+        provenance = str(clean.get("provenance", "canonical")).strip().lower()
+        if provenance not in _MARKET_SCOPE_PROVENANCE:
+            raise ExperimentPlanError("MALFORMED_MARKET_SCOPE", "market_scope.provenance is invalid")
+        instrument_value = _scope_alias(
+            clean,
+            ("instrument", "instrument_constraint", "target_instrument"),
+            name="instrument",
+        )
+        if instrument_value is not None and (not isinstance(instrument_value, str) or not instrument_value.strip()):
+            raise ExperimentPlanError("MALFORMED_MARKET_SCOPE", "market_scope.instrument must be non-empty text")
+        categories_value = _scope_alias(
+            clean,
+            ("categories", "category", "category_constraints"),
+            name="categories",
+        )
+        categories = _scope_values(categories_value, name="market_scope.categories", limit=64, casefold=True)
+        ids_value = _scope_alias(clean, ("market_ids", "exact_market_ids", "markets"), name="market ids")
+        market_ids = _scope_values(ids_value, name="market_scope.market_ids", limit=1000)
+        restrictions = _scope_restrictions(clean.get("regime_restrictions"))
+        filters, restrictions = _scope_filter_values(clean.get("filters"), restrictions)
+        filter_category = filters.get("category")
+        if filter_category is not None:
+            filter_categories = _scope_values(filter_category, name="market_scope.filters.category", limit=64, casefold=True)
+            if categories and set(categories) != set(filter_categories):
+                raise ExperimentPlanError("CONFLICTING_MARKET_SCOPE", "market scope category constraints differ")
+            categories = categories or filter_categories
+        if categories and "category" not in filters:
+            filters = _freeze_json({**dict(filters), "category": list(categories)})
+        if mode == MarketScopeMode.RESEARCH_ONLY.value and (instrument_value or categories or market_ids or filters or restrictions):
+            raise ExperimentPlanError("MALFORMED_MARKET_SCOPE", "RESEARCH_ONLY market scope cannot contain market ids or rules")
+        if mode == MarketScopeMode.EXACT_MARKETS.value and not market_ids:
+            raise ExperimentPlanError("MALFORMED_MARKET_SCOPE", "EXACT_MARKETS market scope requires market ids")
+        if mode == MarketScopeMode.RULE_BASED_MARKETS.value and market_ids:
+            raise ExperimentPlanError("CONFLICTING_MARKET_SCOPE", "RULE_BASED_MARKETS market scope conflicts with exact market ids")
+        if mode == MarketScopeMode.RULE_BASED_MARKETS.value and not (instrument_value or categories or filters or restrictions):
+            raise ExperimentPlanError("MALFORMED_MARKET_SCOPE", "RULE_BASED_MARKETS market scope requires at least one rule")
+        supplied_hash = _scope_alias(clean, ("policy_hash", "scope_hash", "hash"), name="policy hash")
+        policy = cls(
+            schema_version,
+            mode,
+            instrument_value.strip() if isinstance(instrument_value, str) else None,
+            categories,
+            market_ids,
+            filters,
+            restrictions,
+            provenance,
+        )
+        if supplied_hash is not None and str(supplied_hash).strip() != policy.policy_hash:
+            raise ExperimentPlanError("CONFLICTING_MARKET_SCOPE", "market scope policy hash does not match canonical material")
+        return policy
+
+
+    @property
+    def version(self) -> str:
+        return self.schema_version
+
+    @property
+    def scope_version(self) -> str:
+        return self.schema_version
+
+    @property
+    def policy_hash(self) -> str:
+        return "sha256:" + hashlib.sha256(_canonical(_scope_material(self)).encode("utf-8")).hexdigest()
+
+    @property
+    def scope_hash(self) -> str:
+        return self.policy_hash
+
+    @property
+    def hash(self) -> str:
+        return self.policy_hash
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "mode": self.mode,
+            "instrument": self.instrument,
+            "categories": list(self.categories),
+            "market_ids": list(self.market_ids),
+            "filters": _plain_json(self.filters),
+            "regime_restrictions": _plain_json(self.regime_restrictions),
+            "provenance": self.provenance,
+        }
+
+    to_dict = as_dict
+    as_record = as_dict
+
+
+def normalize_market_scope(
+    value: Mapping[str, Any] | None = None,
+    *,
+    target: Any = None,
+    market_ids: Any = None,
+    target_market_ids: Any = None,
+    target_instrument: Any = None,
+    instrument: Any = None,
+    categories: Any = None,
+    filters: Any = None,
+    regime_restrictions: Any = None,
+) -> MarketScopePolicy:
+    """Normalize one explicit policy or legacy target/filter sources."""
+    if value is not None:
+        explicit = MarketScopePolicy.from_mapping(value)
+        legacy_present = any(
+            item is not None
+            for item in (target, market_ids, target_market_ids, target_instrument, instrument, categories, filters, regime_restrictions)
+        )
+        if not legacy_present:
+            return explicit
+        legacy = normalize_market_scope(
+            None,
+            target=target,
+            market_ids=market_ids,
+            target_market_ids=target_market_ids,
+            target_instrument=target_instrument,
+            instrument=instrument,
+            categories=categories,
+            filters=filters,
+            regime_restrictions=regime_restrictions,
+        )
+        if not _scope_equivalent(explicit, legacy):
+            raise ExperimentPlanError("CONFLICTING_MARKET_SCOPE", "explicit market_scope conflicts with legacy target/filter sources")
+        return explicit
+
+    target_instrument_value = instrument if instrument is not None else target_instrument
+    target_ids = market_ids
+    target_filter: Any = filters
+    target_restrictions: Any = regime_restrictions
+    target_categories = categories
+    if target is not None:
+        if isinstance(target, str):
+            if target_instrument_value is not None and str(target_instrument_value).strip() != target.strip():
+                raise ExperimentPlanError("CONFLICTING_MARKET_SCOPE", "target and target_instrument differ")
+            target_instrument_value = target
+        elif isinstance(target, Mapping):
+            unknown_target = sorted(
+                set(str(key) for key in target)
+                - {"instrument", "symbol", "market_ids", "exact_market_ids", "markets", "category", "categories", "dataset_id"}
+            )
+            if unknown_target:
+                raise ExperimentPlanError("UNSUPPORTED_MARKET_SCOPE", f"unsupported legacy target fields: {unknown_target}")
+            target_instrument_value = _scope_alias(target, ("instrument", "symbol"), name="target instrument") or target_instrument_value
+            target_ids = _scope_alias(target, ("market_ids", "exact_market_ids", "markets"), name="target market ids") or target_ids
+            target_categories = _scope_alias(target, ("categories", "category"), name="target categories") or target_categories
+        else:
+            raise ExperimentPlanError("MALFORMED_MARKET_SCOPE", "legacy target must be text or an object")
+    if target_market_ids is not None:
+        if target_ids is not None and _canonical(target_ids) != _canonical(target_market_ids):
+            raise ExperimentPlanError("CONFLICTING_MARKET_SCOPE", "market_ids and target_market_ids differ")
+        target_ids = target_market_ids
+    if target_categories is not None:
+        if target_filter is None:
+            target_filter = {"category": target_categories}
+        elif isinstance(target_filter, Mapping) and "category" not in target_filter:
+            target_filter = {**target_filter, "category": target_categories}
+    supplied_any = any(
+        item is not None
+        for item in (target, market_ids, target_market_ids, target_instrument, instrument, categories, filters, regime_restrictions)
+    )
+    normalized_ids = _scope_values(target_ids, name="market_ids", limit=1000)
+    normalized_categories = _scope_values(target_categories, name="categories", limit=64, casefold=True)
+    normalized_restrictions = _scope_restrictions(target_restrictions)
+    normalized_filters, normalized_restrictions = _scope_filter_values(target_filter, normalized_restrictions)
+    filter_category = normalized_filters.get("category")
+    if filter_category is not None:
+        filter_categories = _scope_values(filter_category, name="filters.category", limit=64, casefold=True)
+        if normalized_categories and set(normalized_categories) != set(filter_categories):
+            raise ExperimentPlanError("CONFLICTING_MARKET_SCOPE", "legacy category constraints differ")
+        normalized_categories = normalized_categories or filter_categories
+    if normalized_categories and "category" not in normalized_filters:
+        normalized_filters = _freeze_json({**dict(normalized_filters), "category": list(normalized_categories)})
+    instrument_text = None
+    if target_instrument_value is not None:
+        if not isinstance(target_instrument_value, str) or not target_instrument_value.strip():
+            raise ExperimentPlanError("MALFORMED_MARKET_SCOPE", "target_instrument must be non-empty text")
+        instrument_text = target_instrument_value.strip()
+    if normalized_ids:
+        if not normalized_filters and normalized_restrictions:
+            raise ExperimentPlanError("CONFLICTING_MARKET_SCOPE", "exact market ids conflict with regime restrictions")
+        mode = MarketScopeMode.EXACT_MARKETS.value
+    elif instrument_text or normalized_categories or normalized_filters or normalized_restrictions:
+        mode = MarketScopeMode.RULE_BASED_MARKETS.value
+    else:
+        mode = MarketScopeMode.RESEARCH_ONLY.value
+    return MarketScopePolicy(
+        MARKET_SCOPE_SCHEMA_VERSION,
+        mode,
+        instrument_text,
+        normalized_categories,
+        normalized_ids,
+        normalized_filters,
+        normalized_restrictions,
+        "legacy-derived" if supplied_any else "canonical",
+    )
 
 
 _TEMPLATE_FAMILIES = {
@@ -125,12 +532,22 @@ _ALLOWED_FIELDS = frozenset(
         "target",
         "target_instrument",
         "market_ids",
+        "target_market_ids",
+        "instrument",
+        "categories",
+        "market_scope",
+        "market_scope_hash",
+        "market_scope_version",
         "dataset_selector",
         "dataset_id",
         "dataset_version",
         "dataset_timeframe",
         "dataset_source",
         "dataset_source_type",
+        "dataset_constituent_ids",
+        "constituent_market_ids",
+        "constituents",
+        "market_versions",
         "survivorship_bias",
         "universe",
         "universe_provenance",
@@ -296,6 +713,26 @@ def _as_mapping(value: Any, *, name: str) -> dict[str, Any]:
     clean = _clean_json(value, path=name)
     assert isinstance(clean, dict)
     return clean
+
+def _normalize_dataset_selector(value: Any) -> dict[str, Any]:
+    selector = _as_mapping(value, name="dataset_selector")
+    for key in ("dataset_id", "dataset_version", "timeframe", "interval", "source", "provider", "source_type"):
+        if key in selector and selector[key] is not None:
+            if not isinstance(selector[key], str) or not selector[key].strip():
+                raise ExperimentPlanError("MALFORMED_DATASET_SELECTOR", f"dataset_selector.{key} must be non-empty text")
+            selector[key] = selector[key].strip()
+    if "source_type" in selector:
+        selector["source_type"] = selector["source_type"].upper()
+    for key in ("constituent_market_ids", "constituent_ids"):
+        if key in selector:
+            selector[key] = list(_scope_values(selector[key], name=f"dataset_selector.{key}", limit=1000))
+    if "constituents" in selector and isinstance(selector["constituents"], (list, tuple, set, frozenset)):
+        values = selector["constituents"]
+        if all(isinstance(item, str) for item in values):
+            selector["constituents"] = list(
+                _scope_values(values, name="dataset_selector.constituents", limit=1000)
+            )
+    return selector
 
 
 def _string_list(value: Any, *, name: str, limit: int) -> tuple[str, ...]:
@@ -489,9 +926,7 @@ class ExperimentPlan:
     template: str
     allowed_features: tuple[str, ...]
     parameters: Mapping[str, tuple[Any, ...]]
-    filters: Mapping[str, Any]
-    regime_restrictions: Mapping[str, Any]
-    target: Mapping[str, Any]
+    market_scope: MarketScopePolicy
     dataset_selector: Mapping[str, Any]
     methodology: Mapping[str, Any]
     metrics: tuple[str, ...]
@@ -589,34 +1024,70 @@ class ExperimentPlan:
             possible_variants *= len(values)
             if possible_variants > MAX_PLAN_VARIANTS * MAX_PARAMETER_VALUES:
                 raise ExperimentPlanError("EXPERIMENT_BUDGET_EXCEEDED", "parameter search space is too large")
-
-        filters = _as_mapping(raw.get("filters"), name="filters")
-        regime_restrictions = _as_mapping(raw.get("regime_restrictions"), name="regime_restrictions")
-        target = _target(raw.get("target"), target_instrument=raw.get("target_instrument"), market_ids=raw.get("market_ids"))
-        selector = _as_mapping(raw.get("dataset_selector"), name="dataset_selector")
-        if raw.get("dataset_id") is not None:
-            selector["dataset_id"] = str(raw["dataset_id"]).strip()
-        if raw.get("dataset_version") is not None:
-            selector["dataset_version"] = str(raw["dataset_version"]).strip()
+        market_scope = normalize_market_scope(
+            raw.get("market_scope"),
+            target=raw.get("target"),
+            market_ids=raw.get("market_ids"),
+            target_market_ids=raw.get("target_market_ids"),
+            target_instrument=raw.get("target_instrument"),
+            instrument=raw.get("instrument"),
+            categories=raw.get("categories"),
+            filters=raw.get("filters"),
+            regime_restrictions=raw.get("regime_restrictions"),
+        )
+        provided_scope_hash = raw.get("market_scope_hash")
+        if provided_scope_hash is not None and str(provided_scope_hash).strip() != market_scope.policy_hash:
+            raise ExperimentPlanError("CONFLICTING_MARKET_SCOPE", "market_scope_hash does not match canonical market scope")
+        provided_scope_version = raw.get("market_scope_version")
+        if provided_scope_version is not None and str(provided_scope_version).strip() != market_scope.version:
+            raise ExperimentPlanError("CONFLICTING_MARKET_SCOPE", "market_scope_version does not match canonical market scope")
+        target = {
+            **({"instrument": market_scope.instrument} if market_scope.instrument else {}),
+            **({"market_ids": list(market_scope.market_ids)} if market_scope.market_ids else {}),
+            **({"categories": list(market_scope.categories)} if market_scope.categories else {}),
+        }
+        legacy_target = raw.get("target")
+        legacy_target_dataset_id = (
+            legacy_target.get("dataset_id")
+            if isinstance(legacy_target, Mapping)
+            else None
+        )
+        selector = _normalize_dataset_selector(raw.get("dataset_selector"))
         for raw_name, selector_name in (
+            ("dataset_id", "dataset_id"),
+            ("dataset_version", "dataset_version"),
             ("dataset_timeframe", "timeframe"),
             ("dataset_source", "source"),
             ("dataset_source_type", "source_type"),
+            ("dataset_constituent_ids", "constituent_market_ids"),
+            ("constituent_market_ids", "constituent_market_ids"),
+            ("constituents", "constituents"),
+            ("market_versions", "market_versions"),
             ("survivorship_bias", "survivorship_bias"),
         ):
-            if raw.get(raw_name) is not None:
-                selector.setdefault(selector_name, str(raw[raw_name]).strip())
+            supplied = raw.get(raw_name)
+            if supplied is None:
+                continue
+            if selector_name in selector and _canonical(selector[selector_name]) != _canonical(supplied):
+                raise ExperimentPlanError(
+                    "CONFLICTING_DATASET_SELECTOR",
+                    f"dataset selector {selector_name} conflicts with top-level {raw_name}",
+                )
+            selector[selector_name] = supplied
         if selector.get("dataset_version") is None and selector.get("version") is not None:
             selector["dataset_version"] = str(selector["version"]).strip()
         if selector.get("source") is None and selector.get("provider") is not None:
             selector["source"] = str(selector["provider"]).strip()
         if selector.get("survivorship_bias") is None and selector.get("survivorship") is not None:
             selector["survivorship_bias"] = str(selector["survivorship"]).strip()
+        selector = _normalize_dataset_selector(selector)
         if not str(selector.get("dataset_version", "")).strip():
             raise ExperimentPlanError("INSUFFICIENT_DATA", "dataset_version is required")
         selector["dataset_version"] = str(selector["dataset_version"]).strip()
-        if not selector.get("dataset_id") and target.get("dataset_id"):
-            selector["dataset_id"] = str(target["dataset_id"])
+        if not selector.get("dataset_id") and legacy_target_dataset_id is not None:
+            if not isinstance(legacy_target_dataset_id, str) or not legacy_target_dataset_id.strip():
+                raise ExperimentPlanError("MALFORMED_DATASET_SELECTOR", "target.dataset_id must be non-empty text")
+            selector["dataset_id"] = legacy_target_dataset_id.strip()
         if market_type is MarketType.CRYPTO_SPOT:
             if not selector.get("dataset_id"):
                 raise ExperimentPlanError("INSUFFICIENT_DATA", "crypto_spot plans require an explicit dataset_id")
@@ -698,8 +1169,11 @@ class ExperimentPlan:
             "template": template_key,
             "allowed_features": list(features),
             "parameters": {key: list(values) for key, values in sorted(parameters.items())},
-            "filters": filters,
-            "regime_restrictions": regime_restrictions,
+            "market_scope": market_scope.as_dict(),
+            "market_scope_hash": market_scope.policy_hash,
+            "market_scope_version": market_scope.version,
+            "filters": dict(market_scope.filters),
+            "regime_restrictions": dict(market_scope.regime_restrictions),
             "target": target,
             "dataset_selector": selector,
             "methodology": methodology,
@@ -729,28 +1203,26 @@ class ExperimentPlan:
         if len(_canonical(normalized).encode("utf-8")) > MAX_PLAN_BYTES:
             raise ExperimentPlanError("PLAN_TOO_LARGE", "experiment plan exceeds bounded size")
         return cls(
-            schema_version,
-            plan_id,
-            resolved_hypothesis,
-            market_type,
-            template_key,
-            features,
-            MappingProxyType({key: tuple(values) for key, values in sorted(parameters.items())}),
-            _freeze_json(filters),
-            _freeze_json(regime_restrictions),
-            _freeze_json(target),
-            _freeze_json(selector),
-            _freeze_json(methodology),
-            metrics,
-            normalized["experiment_family"],
-            _freeze_json(family_budget),
-            max_variants,
-            min_samples,
-            min_trades,
-            True,
-            _freeze_json(strategy_document) if strategy_document is not None else None,
-            _freeze_json(model_document) if model_document is not None else None,
-            _freeze_json(universe) if universe is not None else None,
+            schema_version=schema_version,
+            plan_id=plan_id,
+            hypothesis_id=resolved_hypothesis,
+            market_type=market_type,
+            template=template_key,
+            allowed_features=features,
+            parameters=MappingProxyType({key: tuple(values) for key, values in sorted(parameters.items())}),
+            market_scope=market_scope,
+            dataset_selector=_freeze_json(selector),
+            methodology=_freeze_json(methodology),
+            metrics=metrics,
+            experiment_family=normalized["experiment_family"],
+            family_budget=_freeze_json(family_budget),
+            max_variants=max_variants,
+            min_samples=min_samples,
+            min_trades=min_trades,
+            paper_only=True,
+            strategy_document=_freeze_json(strategy_document) if strategy_document is not None else None,
+            model_document=_freeze_json(model_document) if model_document is not None else None,
+            universe=_freeze_json(universe) if universe is not None else None,
         )
 
     @classmethod
@@ -802,6 +1274,49 @@ class ExperimentPlan:
         if not isinstance(raw_plan, Mapping):
             raise ExperimentPlanError("INVALID_PLAN", "experiment_plan must be an object")
         plan_document = dict(raw_plan)
+        # Preserve proposal-level compatibility aliases when an embedded plan
+        # is supplied.  The plan parser remains the single conflict checker.
+        for alias in (
+            "market_scope",
+            "market_scope_hash",
+            "market_scope_version",
+            "filters",
+            "regime_restrictions",
+            "target",
+            "target_instrument",
+            "market_ids",
+            "target_market_ids",
+            "instrument",
+            "categories",
+            "dataset_selector",
+            "dataset_timeframe",
+            "dataset_source",
+            "dataset_source_type",
+            "dataset_constituent_ids",
+            "constituent_market_ids",
+            "constituents",
+            "market_versions",
+            "survivorship_bias",
+        ):
+            if alias not in proposal:
+                continue
+            supplied = proposal[alias]
+            if alias in plan_document and _canonical(plan_document[alias]) != _canonical(supplied):
+                reason = "CONFLICTING_MARKET_SCOPE" if alias in {
+                    "market_scope",
+                    "market_scope_hash",
+                    "market_scope_version",
+                    "filters",
+                    "regime_restrictions",
+                    "target",
+                    "target_instrument",
+                    "market_ids",
+                    "target_market_ids",
+                    "instrument",
+                    "categories",
+                } else "CONFLICTING_DATASET_SELECTOR"
+                raise ExperimentPlanError(reason, f"proposal and experiment plan {alias} values differ")
+            plan_document.setdefault(alias, supplied)
         if proposal.get("dataset_id") is not None:
             proposal_dataset_id = str(proposal["dataset_id"]).strip()
             plan_selector = plan_document.get("dataset_selector")
@@ -831,7 +1346,6 @@ class ExperimentPlan:
     @property
     def dataset_version(self) -> str:
         return str(self.dataset_selector.get("dataset_version", ""))
-
     @property
     def dataset_id(self) -> str | None:
         value = self.dataset_selector.get("dataset_id")
@@ -860,6 +1374,36 @@ class ExperimentPlan:
     @property
     def dataset_survivorship(self) -> str | None:
         return self._selector_text(self.dataset_selector, "survivorship_bias", "survivorship")
+    @property
+    def filters(self) -> Mapping[str, Any]:
+        """Compatibility view derived from the canonical market scope."""
+        return self.market_scope.filters
+
+    @property
+    def regime_restrictions(self) -> Mapping[str, Any]:
+        """Compatibility view derived from the canonical market scope."""
+        return self.market_scope.regime_restrictions
+
+    @property
+    def target(self) -> Mapping[str, Any]:
+        """Compatibility target view derived from the canonical market scope."""
+        result: dict[str, Any] = {}
+        if self.market_scope.instrument is not None:
+            result["instrument"] = self.market_scope.instrument
+        if self.market_scope.market_ids:
+            result["market_ids"] = list(self.market_scope.market_ids)
+        if self.market_scope.categories:
+            result["categories"] = list(self.market_scope.categories)
+        return result
+
+    @property
+    def market_scope_hash(self) -> str:
+        return self.market_scope.policy_hash
+
+    @property
+    def market_scope_version(self) -> str:
+        return self.market_scope.version
+
 
     @property
     def universe_id(self) -> str | None:
@@ -907,6 +1451,9 @@ class ExperimentPlan:
             "template": self.template,
             "allowed_features": list(self.allowed_features),
             "parameters": {key: list(values) for key, values in sorted(self.parameters.items())},
+            "market_scope": self.market_scope.as_dict(),
+            "market_scope_hash": self.market_scope_hash,
+            "market_scope_version": self.market_scope_version,
             "filters": _plain_json(self.filters),
             "regime_restrictions": _plain_json(self.regime_restrictions),
             "target": _plain_json(self.target),
@@ -1303,9 +1850,14 @@ __all__ = [
     "AUTONOMOUS_BUDGET_ID",
     "ExperimentPlan",
     "ExperimentPlanError",
+    "MARKET_SCOPE_SCHEMA_VERSION",
+    "MARKET_SCOPE_VERSION",
+    "MarketScopeMode",
+    "MarketScopePolicy",
     "MAX_PLAN_VARIANTS",
     "PLAN_SCHEMA_VERSION",
     "forward_market_matches",
     "historical_market_ids",
     "normalize_forward_filters",
+    "normalize_market_scope",
 ]

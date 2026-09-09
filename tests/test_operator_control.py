@@ -24,6 +24,8 @@ from axiom.operator import (
     _loopback_host,
 )
 from axiom.ranker import CandidateCanaryRanker
+from axiom.experiment_plan import normalize_market_scope
+from axiom.market_scope import resolve_market_scope
 from axiom.storage import AxiomStore
 
 
@@ -1081,6 +1083,17 @@ class OperatorControlTests(unittest.TestCase):
         model_hash = "model-hash"
         config_hash = "config-hash"
         frozen_hash = hashlib.sha256(f"{strategy_hash}|{model_hash}|{config_hash}".encode()).hexdigest()
+        attestation = target.verify_dataset_integrity_attestation(
+            "dataset-1",
+            "dataset-v1",
+            force=True,
+        )
+        policy = normalize_market_scope(
+            {
+                **normalize_market_scope(market_ids=["MARKET-1"]).as_dict(),
+                "provenance": "canonical",
+            }
+        )
         payload = {
             "candidate_id": candidate_id,
             "strategy_id": "strategy-1",
@@ -1089,6 +1102,12 @@ class OperatorControlTests(unittest.TestCase):
             "instrument": "MARKET-1",
             "dataset_id": "dataset-1",
             "dataset_version": "dataset-v1",
+            "dataset_selector": {
+                "dataset_id": "dataset-1",
+                "dataset_version": "dataset-v1",
+                "source_type": "HISTORICAL",
+            },
+            "dataset_attestation": attestation,
             "dataset_provenance": {
                 "dataset_id": "dataset-1",
                 "dataset_version": "dataset-v1",
@@ -1097,6 +1116,20 @@ class OperatorControlTests(unittest.TestCase):
             },
             "source_type": "HISTORICAL",
             "timeframe": "event",
+            "market_scope": policy.as_dict(),
+            "market_scope_hash": policy.scope_hash,
+            "market_scope_version": policy.scope_version,
+            "plan_hash": "sha256:operator-plan-v1",
+            "experiment_plan": {
+                "dataset_selector": {
+                    "dataset_id": "dataset-1",
+                    "dataset_version": "dataset-v1",
+                    "source_type": "HISTORICAL",
+                },
+                "market_scope": policy.as_dict(),
+                "min_independent_samples": 30,
+                "min_trades": 0,
+            },
             "strategy_hash": strategy_hash,
             "model_hash": model_hash,
             "config_hash": config_hash,
@@ -1119,7 +1152,42 @@ class OperatorControlTests(unittest.TestCase):
             "critical_error": None,
         }
         target.save_candidate_lifecycle(candidate_id, "IDEA", payload, timestamp=timestamp)
-        target.save_candidate_lifecycle(candidate_id, "FROZEN", payload, from_stage="IDEA", timestamp=timestamp)
+        target.save_candidate_lifecycle(
+            candidate_id,
+            "FROZEN",
+            payload,
+            from_stage="IDEA",
+            timestamp=timestamp,
+        )
+        resolved_at = timestamp or datetime.now(timezone.utc)
+        target.save_market_scope_resolution(
+            resolve_market_scope(
+                candidate_id,
+                {"market_scope": payload["market_scope"]},
+                [
+                    {
+                        "market_id": "MARKET-1",
+                        "condition_id": "MARKET-1-CONDITION",
+                        "yes_token_id": "MARKET-1-YES",
+                        "no_token_id": "MARKET-1-NO",
+                        "instrument": "POLYMARKET",
+                        "venue": "POLYMARKET",
+                        "source_type": "CURRENT",
+                        "active": True,
+                        "open": True,
+                        "closed": False,
+                        "settlement": "open",
+                        "accepting_orders": True,
+                        "enable_order_book": True,
+                        "metadata_provenance": {
+                            "source_type": "CURRENT",
+                            "metadata_hash": "sha256:MARKET-1",
+                        },
+                    }
+                ],
+                resolved_at=resolved_at,
+            )
+        )
     def test_dashboard_restart_hydrates_persisted_overview_and_canary(self) -> None:
         restart_db = str(Path(self.tempdir.name) / "restart.sqlite")
         timestamp = datetime(2026, 1, 2, 12, tzinfo=timezone.utc)
@@ -1175,6 +1243,25 @@ class OperatorControlTests(unittest.TestCase):
                     runner_payload,
                     from_stage="IDEA",
                     timestamp=timestamp,
+                )
+                original_store.save_market_scope_resolution(
+                    resolve_market_scope(
+                        "runner",
+                        {"market_scope": runner_payload["market_scope"]},
+                        [
+                            {
+                                "market_id": "MARKET-1",
+                                "condition_id": "MARKET-1-CONDITION",
+                                "yes_token_id": "MARKET-1-YES",
+                                "no_token_id": "MARKET-1-NO",
+                                "metadata_provenance": {
+                                    "source_type": "CURRENT",
+                                    "metadata_hash": "sha256:MARKET-1",
+                                },
+                            }
+                        ],
+                        resolved_at=timestamp,
+                    )
                 )
 
                 canary_service = CanaryService(original_store, clock=lambda: timestamp)
@@ -1417,6 +1504,25 @@ class OperatorControlTests(unittest.TestCase):
             candidate_b,
             from_stage="IDEA",
             timestamp=timestamp,
+        )
+        self.store.save_market_scope_resolution(
+            resolve_market_scope(
+                "B",
+                {"market_scope": candidate_b["market_scope"]},
+                [
+                    {
+                        "market_id": "MARKET-1",
+                        "condition_id": "MARKET-1-CONDITION",
+                        "yes_token_id": "MARKET-1-YES",
+                        "no_token_id": "MARKET-1-NO",
+                        "metadata_provenance": {
+                            "source_type": "CURRENT",
+                            "metadata_hash": "sha256:MARKET-1",
+                        },
+                    }
+                ],
+                resolved_at=timestamp,
+            )
         )
         credentials = Mock()
         credentials.configured.return_value = True

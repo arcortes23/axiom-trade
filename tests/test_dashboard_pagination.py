@@ -18,6 +18,8 @@ from axiom.dashboard import DashboardData, DashboardServer, _dashboard_html, _js
 from axiom.domain import MarketType
 from axiom.operator import CANARY_CONNECTIVITY_CONFIG_KEY, DEFAULT_HERMES_JOB_ID
 from axiom.ranker import CandidateCanaryRanker
+from axiom.experiment_plan import normalize_market_scope
+from axiom.market_scope import resolve_market_scope
 from axiom.storage import AxiomStore
 
 
@@ -404,16 +406,46 @@ class DashboardPaginationFixture(unittest.TestCase):
                 "historical_order_book_available": False,
             },
         )
+        policy = normalize_market_scope(
+            {
+                **normalize_market_scope(market_ids=["dashboard-market"]).as_dict(),
+                "provenance": "canonical",
+            }
+        )
         payload: dict[str, object] = {
             "market_type": "prediction",
             "dataset_id": dataset_id,
             "dataset_version": "v1",
+            "dataset_selector": {
+                "dataset_id": dataset_id,
+                "dataset_version": "v1",
+                "source_type": "HISTORICAL",
+            },
             "dataset_provenance": {
                 "dataset_id": dataset_id,
                 "dataset_version": "v1",
                 "source_type": "HISTORICAL",
                 "time_split": "train-validation-holdout",
             },
+            "dataset_attestation": self.store.verify_dataset_integrity_attestation(
+                dataset_id,
+                "v1",
+                force=True,
+            ),
+            "experiment_plan": {
+                "dataset_selector": {
+                    "dataset_id": dataset_id,
+                    "dataset_version": "v1",
+                    "source_type": "HISTORICAL",
+                },
+                "market_scope": policy.as_dict(),
+                "min_independent_samples": 30,
+                "min_trades": 10,
+            },
+            "market_scope": policy.as_dict(),
+            "market_scope_hash": policy.scope_hash,
+            "market_scope_version": policy.scope_version,
+            "plan_hash": "sha256:dashboard-plan-v1",
             "lineage": [candidate_id],
             "mutation_cluster": candidate_id,
             "experiment_family": "dashboard-regression",
@@ -462,6 +494,34 @@ class DashboardPaginationFixture(unittest.TestCase):
             from_stage="IDEA",
             reason="dashboard regression",
             timestamp=T0,
+        )
+        self.store.save_market_scope_resolution(
+            resolve_market_scope(
+                candidate_id,
+                {"market_scope": payload["market_scope"]},
+                [
+                    {
+                        "market_id": "dashboard-market",
+                        "condition_id": "dashboard-condition",
+                        "yes_token_id": "dashboard-market-yes",
+                        "no_token_id": "dashboard-market-no",
+                        "instrument": "POLYMARKET",
+                        "venue": "POLYMARKET",
+                        "source_type": "CURRENT",
+                        "active": True,
+                        "open": True,
+                        "closed": False,
+                        "settlement": "open",
+                        "accepting_orders": True,
+                        "enable_order_book": True,
+                        "metadata_provenance": {
+                            "source_type": "CURRENT",
+                            "metadata_hash": "sha256:dashboard-market",
+                        },
+                    }
+                ],
+                resolved_at=T0,
+            )
         )
         result = CandidateCanaryRanker(self.store, clock=lambda: T0).evaluate_and_select(T0)
         self.assertEqual(result["selected_candidate"], candidate_id)
@@ -2233,110 +2293,82 @@ class DashboardPaginationEndpointTests(DashboardPaginationFixture):
         self.assertEqual(payload["connectivity"], expected)
         self.assertIs(payload["connectivity"]["live_execution"], False)
 
-    def test_overview_and_canary_expose_bounded_forward_evidence(self) -> None:
-        requirements = {
-            "market_ids": ["market-00", "market-01", "market-02"],
-            "candidate_bound_markets": {
-                "candidate-forward": ["market-00", "market-01", "market-02"],
+    def test_overview_and_canary_expose_persisted_market_scope_funnel(self) -> None:
+        funnel = {
+            "available": True,
+            "total": 1,
+            "stage_counts": {
+                "historically_qualified": 1,
+                "valid_frozen_scope": 1,
+                "matching_current_markets": 1,
+                "fresh_complete_inputs": 0,
+                "strategy_evaluated": 0,
+                "ready_signal": 0,
+                "execution_feasible": 0,
+                "submitted": 0,
+                "filled": 0,
             },
-            "candidate_references": {
-                "market-00": ["candidate-forward"],
-                "market-01": ["candidate-forward"],
-                "market-02": ["candidate-forward"],
+            "stages": {
+                "historically_qualified": {
+                    "count": 1,
+                    "blocker_counts": {},
+                    "timestamps": {"latest": T0.isoformat(), "earliest": T0.isoformat()},
+                },
+                "valid_frozen_scope": {
+                    "count": 1,
+                    "blocker_counts": {},
+                    "timestamps": {"latest": T0.isoformat(), "earliest": T0.isoformat()},
+                },
+                "matching_current_markets": {
+                    "count": 1,
+                    "blocker_counts": {},
+                    "timestamps": {"latest": T0.isoformat(), "earliest": T0.isoformat()},
+                },
+                "fresh_complete_inputs": {
+                    "count": 0,
+                    "blocker_counts": {"STALE_INPUT": 1},
+                    "timestamps": {"latest": None, "earliest": None},
+                },
+                "strategy_evaluated": {"count": 0, "blocker_counts": {"INPUTS_NOT_READY": 1}, "timestamps": {"latest": None, "earliest": None}},
+                "ready_signal": {"count": 0, "blocker_counts": {"NO_READY_SIGNAL": 1}, "timestamps": {"latest": None, "earliest": None}},
+                "execution_feasible": {"count": 0, "blocker_counts": {"NOT_READY": 1}, "timestamps": {"latest": None, "earliest": None}},
+                "submitted": {"count": 0, "blocker_counts": {"NOT_FEASIBLE": 1}, "timestamps": {"latest": None, "earliest": None}},
+                "filled": {"count": 0, "blocker_counts": {"NOT_SUBMITTED": 1}, "timestamps": {"latest": None, "earliest": None}},
             },
-            "as_of": T0.isoformat(),
-        }
-        health = {
-            "candidate_bound_markets": ["market-00", "market-01", "market-02"],
-            "scheduled": ["market-00", "market-01"],
-            "fresh": ["market-00"],
-            "stale": ["market-01"],
-            "missing": ["market-02"],
-            "newest_required_source_timestamp": (T0 - timedelta(seconds=5)).isoformat(),
-            "oldest_required_source_timestamp": (T0 - timedelta(minutes=5)).isoformat(),
-            "newest_required_observed_at": (T0 - timedelta(seconds=2)).isoformat(),
-            "oldest_required_observed_at": (T0 - timedelta(minutes=5)).isoformat(),
-            "newest_required_snapshot": (T0 - timedelta(seconds=5)).isoformat(),
-            "oldest_required_snapshot": (T0 - timedelta(minutes=5)).isoformat(),
-            "grade": "D",
-            "reason_code": "REQUIRED_MARKETS_MISSING",
-            "reason_display": "Required forward market snapshots are missing.",
-            "candidate_references": requirements["candidate_references"],
-            "market_diagnostics": [
-                {
-                    "market_id": "market-00",
-                    "candidate_bound": True,
-                    "candidate_references": ["candidate-forward"],
-                    "source_timestamp": (T0 - timedelta(seconds=5)).isoformat(),
-                    "observed_at": (T0 - timedelta(seconds=2)).isoformat(),
-                    "freshness_age_seconds": 2.0,
-                    "collection_state": "fresh",
-                    "reason_code": "REQUIRED_MARKET_SNAPSHOT_FRESH",
-                },
-                {
-                    "market_id": "market-01",
-                    "candidate_bound": True,
-                    "candidate_references": ["candidate-forward"],
-                    "source_timestamp": (T0 - timedelta(minutes=5)).isoformat(),
-                    "observed_at": (T0 - timedelta(minutes=5)).isoformat(),
-                    "freshness_age_seconds": 300.0,
-                    "collection_state": "stale",
-                    "reason_code": "REQUIRED_MARKET_SNAPSHOT_STALE",
-                },
-                {
-                    "market_id": "market-02",
-                    "candidate_bound": True,
-                    "candidate_references": ["candidate-forward"],
-                    "source_timestamp": None,
-                    "observed_at": None,
-                    "freshness_age_seconds": None,
-                    "collection_state": "missing",
-                    "reason_code": "REQUIRED_MARKET_SNAPSHOT_MISSING",
-                },
-            ],
+            "blockers": [{"reason": "STALE_INPUT", "count": 1}],
+            "latest_resolved_at": T0.isoformat(),
+            "items": [{"candidate_id": "candidate-forward", "status": "MATCHED", "reason": "MATCHED", "resolved_at": T0.isoformat()}],
         }
         with patch.object(
             self.store,
-            "candidate_forward_requirements",
-            return_value=requirements,
-        ), patch.object(
-            self.store,
-            "polymarket_required_health",
-            return_value=health,
-        ):
+            "market_scope_resolution_funnel",
+            return_value=funnel,
+        ) as persisted_funnel:
             status, overview, _ = self._request("api/v2/overview-summary")
             self.assertEqual(status, 200)
-            self.assertIsInstance(overview, dict)
-            assert isinstance(overview, dict)
             status, canary_payload, _ = self._request("api/v2/canary")
             self.assertEqual(status, 200)
-            self.assertIsInstance(canary_payload, dict)
-            assert isinstance(canary_payload, dict)
 
+        self.assertGreaterEqual(persisted_funnel.call_count, 2)
         for projection in (overview, canary_payload):
-            evidence = projection["forward_evidence"]
-            self.assertEqual(evidence["candidate_bound_markets"], health["candidate_bound_markets"])
-            self.assertEqual(evidence["scheduled"], health["scheduled"])
-            self.assertEqual(evidence["fresh"], health["fresh"])
-            self.assertEqual(evidence["stale"], health["stale"])
-            self.assertEqual(evidence["missing"], health["missing"])
-            self.assertEqual(evidence["grade"], "D")
-            self.assertEqual(evidence["reason_code"], "REQUIRED_MARKETS_MISSING")
-            self.assertEqual(evidence["reason_display"], health["reason_code"])
-            for timestamp_key in (
-                "newest_required_source_timestamp",
-                "oldest_required_source_timestamp",
-                "newest_required_observed_at",
-                "oldest_required_observed_at",
-            ):
-                self.assertEqual(evidence[timestamp_key], health[timestamp_key])
+            self.assertEqual(
+                projection["market_scope_funnel"]["stages"]["historically_qualified"]["count"],
+                1,
+            )
+            self.assertEqual(
+                projection["market_scope_funnel"]["stages"]["fresh_complete_inputs"]["blocker_counts"],
+                {"STALE_INPUT": 1},
+            )
+            self.assertEqual(
+                projection["market_scope_funnel"]["timestamps"]["latest"],
+                T0.isoformat(),
+            )
+            self.assertEqual(
+                projection["forward_evidence"]["market_scope_funnel"]["stage_counts"]["ready_signal"],
+                0,
+            )
 
     def test_polymarket_page_marks_required_rows_with_bounded_health_diagnostics(self) -> None:
-        requirements = {
-            "market_ids": ["market-00"],
-            "candidate_bound_markets": {"candidate-forward": ["market-00"]},
-            "candidate_references": {"market-00": ["candidate-forward"]},
-        }
         diagnostic = {
             "market_id": "market-00",
             "candidate_bound": True,
@@ -2357,25 +2389,23 @@ class DashboardPaginationEndpointTests(DashboardPaginationFixture):
             "reason_code": "REQUIRED_MARKETS_FRESH",
             "market_diagnostics": [diagnostic],
         }
-        with patch.object(
-            self.store,
-            "candidate_forward_requirements",
-            return_value=requirements,
-        ), patch.object(
-            self.store,
-            "polymarket_required_health",
-            return_value=health,
-        ):
-            page = self._page(
-                "api/v2/polymarket",
-                page=1,
-                page_size=10,
-                expected_page=1,
-                expected_size=10,
-                expected_total=MARKET_COUNT,
-                sort="market_id",
-                direction="asc",
-            )
+        self.store.save_worker_state(
+            "health-monitor",
+            "idle",
+            health,
+            started_at=T0,
+            heartbeat_at=T0,
+        )
+        page = self._page(
+            "api/v2/polymarket",
+            page=1,
+            page_size=10,
+            expected_page=1,
+            expected_size=10,
+            expected_total=MARKET_COUNT,
+            sort="market_id",
+            direction="asc",
+        )
 
         row = page["items"][0]
         for key in (

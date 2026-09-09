@@ -176,6 +176,37 @@ _MAX_PAGE_SIZE = 100
 _CANARY_ELIGIBLE_STAGES = frozenset({"FROZEN", "PAPER_FORWARD", "PAPER_PROMOTABLE"})
 _PAPER_FORWARD_STAGES = frozenset({"PAPER_FORWARD", "PAPER_PROMOTABLE"})
 _BINANCE_HTTP_FORBIDDEN_ACTIONS = frozenset({"EXECUTION_PROBE", "RECONCILE_PROBE"})
+_MARKET_SCOPE_FUNNEL_STAGES = (
+    "historically_qualified",
+    "valid_frozen_scope",
+    "matching_current_markets",
+    "fresh_complete_inputs",
+    "strategy_evaluated",
+    "ready_signal",
+    "execution_feasible",
+    "submitted",
+    "filled",
+)
+
+
+def _empty_market_scope_funnel() -> dict[str, Any]:
+    stages = {
+        name: {
+            "count": 0,
+            "blocker_counts": {},
+            "timestamps": {"latest": None, "earliest": None},
+        }
+        for name in _MARKET_SCOPE_FUNNEL_STAGES
+    }
+    return {
+        "available": False,
+        "stages": stages,
+        "stage_counts": {name: 0 for name in _MARKET_SCOPE_FUNNEL_STAGES},
+        "blocker_counts": {},
+        "timestamps": {"as_of": None, "latest": None, "earliest": None},
+        "as_of": None,
+        "live_execution": False,
+    }
 
 
 def _pagination_error(query: Mapping[str, Any]) -> str | None:
@@ -203,6 +234,8 @@ def _pagination_error(query: Mapping[str, Any]) -> str | None:
             return "page_size must be one of 10, 25, 50, or 100"
     return None
 _MAX_SIZE_FALLBACK = 1000
+_LATEST_CANDIDATE_LIMIT = 50
+
 
 
 def _pagination_params(query: Mapping[str, Any] | None = None) -> dict[str, Any]:
@@ -1430,12 +1463,23 @@ class DashboardData:
             for item in diagnostics
             if isinstance(item, Mapping) and item.get("market_id")
         }
+        required_markets = {
+            str(value).strip()
+            for value in evidence.get("candidate_bound_markets", ())
+            if str(value).strip()
+        }
+        references = evidence.get("candidate_references", {})
+        references = references if isinstance(references, Mapping) else {}
         for item in result.get("items", []):
             if not isinstance(item, Mapping):
                 continue
             market_id = str(item.get("market_id") or "").strip()
             diagnostic = by_market.get(market_id)
-            candidate_bound = bool(diagnostic and diagnostic.get("candidate_bound", False))
+            diagnostic_bound = (
+                diagnostic is not None
+                and diagnostic.get("candidate_bound") is True
+            )
+            candidate_bound = market_id in required_markets or diagnostic_bound
             item["candidate_bound"] = candidate_bound
             item["candidate_bound_priority"] = candidate_bound
             item["required_priority"] = "CANDIDATE_BOUND" if candidate_bound else None
@@ -1443,12 +1487,25 @@ class DashboardData:
             item["candidate_references"] = (
                 list(diagnostic.get("candidate_references", ()))[:32]
                 if diagnostic is not None
+                else list(references.get(market_id, ()))[:32]
+                if isinstance(references.get(market_id), (list, tuple, set, frozenset))
                 else []
             )
-            # Health diagnostics describe only candidate-bound requirements.
-            # Ordinary discovery rows must retain their persisted provenance
-            # and collection fields rather than receiving diagnostic nulls.
-            if diagnostic is not None:
+            # Health diagnostics are only authoritative when persisted by a
+            # worker/evaluation.  Never recompute them from provider state.
+            if candidate_bound:
+                if diagnostic is None:
+                    diagnostic = {
+                        "source_timestamp": item.get("source_timestamp"),
+                        "observed_at": item.get("observed_at"),
+                        "freshness_age_seconds": None,
+                        "collection_state": "unknown",
+                        "reason_code": "NO_PERSISTED_MARKET_HEALTH",
+                        "reason_display": "NO_PERSISTED_MARKET_HEALTH",
+                    }
+                else:
+                    diagnostic = dict(diagnostic)
+                    diagnostic.setdefault("reason_display", diagnostic.get("reason_code"))
                 for key in (
                     "source_timestamp",
                     "observed_at",
@@ -2425,6 +2482,7 @@ class DashboardData:
             "grade",
             "grade_scope",
             "reason_code",
+            "reason_display",
             "reasons",
             "window_start",
             "window_end",
@@ -2458,6 +2516,28 @@ class DashboardData:
             "stale_markets",
             "gap_count",
             "gaps",
+            # Candidate-bound health is persisted alongside collector health.
+            "candidate_bound_markets",
+            "scheduled",
+            "fresh",
+            "stale",
+            "missing",
+            "newest_required_source_timestamp",
+            "oldest_required_source_timestamp",
+            "newest_required_observed_at",
+            "oldest_required_observed_at",
+            "newest_required_snapshot",
+            "oldest_required_snapshot",
+            "newest_required_source",
+            "oldest_required_source",
+            "newest_required_observed",
+            "oldest_required_observed",
+            "candidate_references",
+            "market_diagnostics",
+            "diagnostics",
+            "required_market_count",
+            "unresolved_candidates",
+            "closed_candidates",
         )
         return {
             key: _bounded_value(value[key])
@@ -2600,12 +2680,111 @@ class DashboardData:
             "live_execution": False,
         }
 
-    def _candidate_rows(self) -> list[dict[str, Any]]:
+    def _bounded_candidate_lifecycle(self, *, limit: int = _LATEST_CANDIDATE_LIMIT) -> list[Mapping[str, Any]]:
+        """Read only the bounded candidate history needed by legacy cards."""
         if self.store is None:
             return []
-        records = self.store.load_candidate_lifecycle(limit=_MAX_SIZE_FALLBACK)
-        records = records if isinstance(records, list) else []
-        return [self._candidate_row(item) for item in records if isinstance(item, Mapping)]
+        loader = getattr(self.store, "load_candidate_lifecycle", None)
+        if not callable(loader):
+            return []
+        try:
+            records = loader(limit=max(0, min(int(limit), _LATEST_CANDIDATE_LIMIT)))
+        except (AttributeError, TypeError, ValueError, sqlite3.Error):
+            return []
+        return [
+            item
+            for item in (records if isinstance(records, (list, tuple)) else ())
+            if isinstance(item, Mapping)
+        ][:_LATEST_CANDIDATE_LIMIT]
+
+    def _candidate_rows(self) -> list[dict[str, Any]]:
+        """Return the bounded legacy candidate table without authority scans."""
+        return [
+            self._candidate_row(item)
+            for item in self._bounded_candidate_lifecycle()
+        ]
+
+    @staticmethod
+    def _latest_candidate_projection(item: Mapping[str, Any]) -> dict[str, Any]:
+        payload = item.get("payload")
+        payload = payload if isinstance(payload, Mapping) else {}
+        candidate_id = str(item.get("candidate_id") or "").strip()
+        persisted_provenance = payload.get("dataset_provenance", payload.get("provenance"))
+        provenance = (
+            _bounded_value(persisted_provenance)
+            if isinstance(persisted_provenance, Mapping)
+            else {}
+        )
+        return {
+            "candidate_id": candidate_id,
+            "strategy_id": payload.get("strategy_id", payload.get("experiment_id", candidate_id)),
+            "family": payload.get("experiment_family", payload.get("family", "unknown")),
+            "market": payload.get("market_type", payload.get("market")),
+            "market_type": payload.get("market_type", payload.get("market")),
+            "stage": item.get("stage"),
+            "updated_at": item.get("updated_at"),
+            "provenance": provenance,
+        }
+
+    def _persisted_forward_health(
+        self,
+        *sources: Mapping[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Return one bounded persisted required-market health projection."""
+        health_keys = {
+            "candidate_bound_markets",
+            "scheduled",
+            "fresh",
+            "stale",
+            "missing",
+            "market_diagnostics",
+            "diagnostics",
+            "required_market_count",
+        }
+        for source in sources:
+            if isinstance(source, Mapping) and health_keys.intersection(source):
+                return dict(source)
+        if self.store is None:
+            return {}
+        workers = getattr(self.store, "list_worker_states", None)
+        if callable(workers):
+            try:
+                rows = workers(limit=32)
+            except (AttributeError, TypeError, ValueError, sqlite3.Error):
+                rows = []
+            for row in rows if isinstance(rows, (list, tuple)) else ():
+                if not isinstance(row, Mapping):
+                    continue
+                payload = row.get("payload")
+                if not isinstance(payload, Mapping):
+                    continue
+                for candidate in (
+                    payload,
+                    payload.get("required_health"),
+                    payload.get("market_health"),
+                    payload.get("forward_health"),
+                ):
+                    if isinstance(candidate, Mapping) and health_keys.intersection(candidate):
+                        return dict(candidate)
+        evaluations = getattr(self.store, "list_signal_evaluations", None)
+        if not callable(evaluations):
+            try:
+                evaluations = CanaryService(self.store, initialize=False).list_signal_evaluations
+            except (AttributeError, TypeError, ValueError, sqlite3.Error):
+                evaluations = None
+        if callable(evaluations):
+            try:
+                rows = evaluations(limit=64)
+            except (AttributeError, TypeError, ValueError, sqlite3.Error):
+                rows = []
+            for row in rows if isinstance(rows, (list, tuple)) else ():
+                if not isinstance(row, Mapping):
+                    continue
+                candidate = row.get("required_health")
+                if isinstance(candidate, Mapping) and health_keys.intersection(candidate):
+                    return dict(candidate)
+        return {}
+
 
     def _candidate_canary_eligibility(self, candidate_id: str) -> Mapping[str, Any] | None:
         """Read and verify the persisted eligibility binding."""
@@ -3308,181 +3487,465 @@ class DashboardData:
             "live_execution": False,
         }
 
-    def _required_forward_evidence(self) -> dict[str, Any]:
-        """Read bounded candidate-bound market health without provider calls."""
-        empty: dict[str, Any] = {
-            "candidate_bound_markets": [],
-            "scheduled": [],
-            "fresh": [],
-            "stale": [],
-            "missing": [],
-            "newest_required_source_timestamp": None,
-            "oldest_required_source_timestamp": None,
-            "newest_required_observed_at": None,
-            "oldest_required_observed_at": None,
-            "newest_required_source": None,
-            "oldest_required_source": None,
-            "newest_required_observed": None,
-            "oldest_required_observed": None,
-            "newest_required_snapshot": None,
-            "oldest_required_snapshot": None,
-            "grade": "D",
-            "grade_scope": "required_forward_markets",
-            "reason_code": "CANDIDATE_FORWARD_MARKET_UNRESOLVED",
-            "reason_display": "UNRESOLVED_MARKET",
-            "candidate_references": {},
-            "market_diagnostics": [],
-            "diagnostics": [],
-            "required_market_count": 0,
-            "unresolved_candidates": [],
-            "closed_candidates": [],
-        }
+    def market_scope_funnel_data(self) -> dict[str, Any]:
+        """Project the persisted market-scope handoff without recomputation.
+
+        The aggregate is written by the qualification/resolution workers.  A
+        dashboard GET may only read that bounded aggregate; it must not scan
+        candidate lifecycle rows or resolve current markets itself.
+        """
+        empty = _empty_market_scope_funnel()
         if self.store is None:
             return empty
-        requirements_method = getattr(self.store, "candidate_forward_requirements", None)
-        if not callable(requirements_method):
+        method = getattr(self.store, "market_scope_resolution_funnel", None)
+        if not callable(method):
             return empty
         try:
-            requirements = requirements_method(
-                max_candidates=100,
-                max_markets_per_candidate=8,
-                max_total_markets=100,
-            )
+            raw = method(limit=1000)
         except TypeError:
             try:
-                requirements = requirements_method()
+                raw = method()
             except (AttributeError, TypeError, ValueError, sqlite3.Error):
                 return empty
         except (AttributeError, TypeError, ValueError, sqlite3.Error):
             return empty
-        requirements = requirements if isinstance(requirements, Mapping) else {}
-        health_method = getattr(self.store, "polymarket_required_health", None)
-        if not callable(health_method):
+        if not isinstance(raw, Mapping):
             return empty
-        try:
-            health = health_method(requirements=requirements)
-        except TypeError:
-            try:
-                health = health_method(requirements)
-            except (AttributeError, TypeError, ValueError, sqlite3.Error):
-                health = {}
-        except (AttributeError, TypeError, ValueError, sqlite3.Error):
-            health = {}
-        health = health if isinstance(health, Mapping) else {}
+        def scope_bound(value: Any, depth: int = 0) -> Any:
+            if depth >= 8:
+                return "<truncated>"
+            if isinstance(value, Mapping):
+                return {
+                    str(key): scope_bound(child, depth + 1)
+                    for key, child in list(value.items())[:128]
+                }
+            if isinstance(value, (list, tuple, set, frozenset)):
+                return [scope_bound(child, depth + 1) for child in list(value)[:1000]]
+            return _jsonable(value)
 
-        def bounded_ids(value: Any, limit: int = 100) -> list[str]:
+        bounded = scope_bound(raw)
+        bounded = bounded if isinstance(bounded, Mapping) else {}
+        result = dict(bounded)
+        raw_stage_values = bounded.get("stages", bounded.get("funnel", {}))
+        raw_stages = raw_stage_values if isinstance(raw_stage_values, Mapping) else {}
+        raw_counts = bounded.get("stage_counts", {})
+        raw_counts = raw_counts if isinstance(raw_counts, Mapping) else {}
+        raw_blockers = bounded.get("blocker_counts", {})
+        raw_blockers = raw_blockers if isinstance(raw_blockers, Mapping) else {}
+        raw_timestamps = bounded.get("timestamps", {})
+        raw_timestamps = raw_timestamps if isinstance(raw_timestamps, Mapping) else {}
+        exact_blockers: dict[str, int] = {}
+        raw_blocker_values = bounded.get("blockers", [])
+        if isinstance(raw_blocker_values, (list, tuple)):
+            result["resolution_blockers"] = list(raw_blocker_values)[:1000]
+            for item in raw_blocker_values[:1000]:
+                if not isinstance(item, Mapping):
+                    continue
+                reason = str(item.get("reason") or "").strip()
+                if reason:
+                    try:
+                        exact_blockers[reason] = max(0, int(item.get("count", 0) or 0))
+                    except (TypeError, ValueError):
+                        exact_blockers[reason] = 0
+        if isinstance(raw_stage_values, (list, tuple)):
+            result["resolution_stages"] = list(raw_stage_values)[:1000]
+        if isinstance(bounded.get("items"), (list, tuple)):
+            result["resolution_items"] = list(bounded["items"])[:1000]
+        result["resolution_status_counts"] = dict(
+            bounded.get("status_counts", bounded.get("statuses", {}))
+            if isinstance(bounded.get("status_counts", bounded.get("statuses", {})), Mapping)
+            else {}
+        )
+        result["resolution_reason_counts"] = dict(
+            bounded.get("reason_counts", bounded.get("reasons", {}))
+            if isinstance(bounded.get("reason_counts", bounded.get("reasons", {})), Mapping)
+            else {}
+        )
+
+        def aliases(stage: str) -> tuple[str, ...]:
+            return (stage, stage.upper(), stage.replace("_", "-"), stage.replace("_", " "))
+
+        def lookup(source: Mapping[str, Any], stage: str) -> Any:
+            for key in aliases(stage):
+                if key in source:
+                    return source[key]
+            return None
+
+        def count_value(value: Any) -> int:
+            try:
+                return max(0, int(value or 0))
+            except (TypeError, ValueError):
+                return 0
+
+        stages: dict[str, dict[str, Any]] = {}
+        stage_counts: dict[str, int] = {}
+        for stage in _MARKET_SCOPE_FUNNEL_STAGES:
+            entry = lookup(raw_stages, stage)
+            if isinstance(entry, Mapping):
+                count = count_value(entry.get("count", entry.get("total", lookup(raw_counts, stage))))
+                blockers = entry.get("blocker_counts", entry.get("blockers", {}))
+                blockers = blockers if isinstance(blockers, Mapping) else {}
+                timestamps = entry.get("timestamps", {})
+                timestamps = timestamps if isinstance(timestamps, Mapping) else {}
+                latest = entry.get("latest_at", entry.get("updated_at", timestamps.get("latest")))
+                earliest = entry.get("earliest_at", timestamps.get("earliest"))
+            else:
+                count = count_value(entry if entry is not None else lookup(raw_counts, stage))
+                blockers = lookup(raw_blockers, stage)
+                blockers = blockers if isinstance(blockers, Mapping) else {}
+                latest = None
+                earliest = None
+            stage_counts[stage] = count
+            stages[stage] = {
+                "count": count,
+                "blocker_counts": dict(blockers),
+                "timestamps": {"latest": latest, "earliest": earliest},
+            }
+        result["stages"] = stages
+        result["stage_counts"] = stage_counts
+        result["blocker_counts"] = dict(raw_blockers or exact_blockers)
+        result["timestamps"] = {
+            **dict(raw_timestamps),
+            "latest": raw_timestamps.get("latest") or bounded.get("latest_resolved_at"),
+            "as_of": raw_timestamps.get("as_of") or bounded.get("latest_resolved_at"),
+        }
+        result.setdefault("as_of", bounded.get("latest_resolved_at"))
+        result["available"] = bool(
+            bounded.get("available", False)
+            or bounded.get("total", 0)
+            or bounded.get("resolution_count", 0)
+            or any(stage_counts.values())
+        )
+        result["live_execution"] = False
+        result["storage_backed"] = True
+        return result
+    def _research_order_funnel(
+        self,
+        scope_funnel: Mapping[str, Any],
+        aggregate: Mapping[str, Any] | None,
+        canary_status: Mapping[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Join bounded persisted evidence into the nine-stage handoff.
+
+        This only joins already-persisted summaries.  It never turns a
+        missing readiness, order, or fill record into a successful stage.
+        """
+        result = dict(scope_funnel)
+        stage_values = scope_funnel.get("stage_counts", {})
+        stage_values = stage_values if isinstance(stage_values, Mapping) else {}
+        direct_stages = scope_funnel.get("stages", {})
+        direct_stages = direct_stages if isinstance(direct_stages, Mapping) else {}
+        if any(stage_values.get(name, 0) for name in _MARKET_SCOPE_FUNNEL_STAGES):
+            return result
+        aggregate = aggregate if isinstance(aggregate, Mapping) else {}
+        candidate_stages = aggregate.get("candidate_stages", {})
+        candidate_stages = candidate_stages if isinstance(candidate_stages, Mapping) else {}
+        def count_value(value: Any) -> int:
+            try:
+                return max(0, int(value or 0))
+            except (TypeError, ValueError):
+                return 0
+
+        normalized_candidates = {
+            str(key).upper(): count_value(value)
+            for key, value in candidate_stages.items()
+            if str(key).strip()
+        }
+        historical = sum(
+            normalized_candidates.get(key, 0)
+            for key in ("FROZEN", "PAPER_FORWARD", "PAPER_PROMOTABLE")
+        )
+        evaluated = sum(
+            normalized_candidates.get(key, 0)
+            for key in ("BACKTESTED", "VALIDATED", "ROBUSTNESS_CHECKED", "FROZEN", "PAPER_FORWARD", "PAPER_PROMOTABLE")
+        )
+        resolution_statuses = scope_funnel.get("resolution_status_counts", {})
+        resolution_statuses = resolution_statuses if isinstance(resolution_statuses, Mapping) else {}
+        statuses = {
+            str(key).upper(): count_value(value)
+            for key, value in resolution_statuses.items()
+        }
+        resolution_reasons = scope_funnel.get("resolution_reason_counts", {})
+        resolution_reasons = resolution_reasons if isinstance(resolution_reasons, Mapping) else {}
+        valid_scope = min(historical, sum(value for key, value in statuses.items() if key != "INVALID_POLICY"))
+        matching = min(historical, statuses.get("MATCHED", 0) + statuses.get("PARTIAL", 0))
+        prior_scope = min(historical, valid_scope)
+        reason_counts = {
+            str(key): count_value(value)
+            for key, value in resolution_reasons.items()
+        }
+        canary_status = canary_status if isinstance(canary_status, Mapping) else {}
+        fresh_source = next(
+            (
+                source.get(key)
+                for source in (canary_status, aggregate)
+                for key in ("fresh_complete_inputs_count", "complete_inputs_count", "fresh_inputs")
+                if source.get(key) is not None
+            ),
+            None,
+        )
+        fresh = min(matching, count_value(fresh_source)) if fresh_source is not None else 0
+        evaluated_source = next(
+            (
+                aggregate.get(key)
+                for key in ("strategy_evaluated", "strategies_evaluated", "evaluated")
+                if aggregate.get(key) is not None
+            ),
+            None,
+        )
+        if evaluated_source is not None:
+            evaluated = count_value(evaluated_source)
+        strategy = min(fresh, evaluated)
+        autonomous = canary_status.get("autonomous", {})
+        autonomous = autonomous if isinstance(autonomous, Mapping) else {}
+        ready_signal = min(
+            strategy,
+            count_value(autonomous.get("signals_generated", canary_status.get("signals_generated", 0))),
+        )
+        readiness_status = str(
+            canary_status.get("readiness_snapshot_status")
+            or canary_status.get("readiness_status")
+            or ""
+        ).upper()
+        execution_feasible = ready_signal if readiness_status == "CURRENT" else 0
+        aggregate_counts = aggregate.get("counts", {})
+        aggregate_counts = aggregate_counts if isinstance(aggregate_counts, Mapping) else {}
+
+        def aggregate_value(keys: tuple[str, ...]) -> Any:
+            for source in (aggregate, aggregate_counts):
+                for key in keys:
+                    if source.get(key) is not None:
+                        return source.get(key)
+            return 0
+
+        submitted_source = aggregate_value(("orders_submitted", "submitted", "paper_submitted", "paper_execution_events"))
+        filled_source = aggregate_value(("orders_filled", "filled", "paper_filled", "fills", "paper_bet_ledger"))
+        submitted = min(execution_feasible, count_value(submitted_source))
+        filled = min(submitted, count_value(filled_source))
+        timestamps = scope_funnel.get("timestamps", {})
+        timestamps = dict(timestamps) if isinstance(timestamps, Mapping) else {}
+        latest_scope = scope_funnel.get("latest_resolved_at") or timestamps.get("latest")
+
+        def stage(name: str, count: int, blockers: Mapping[str, Any], latest: Any = None) -> dict[str, Any]:
+            existing = direct_stages.get(name)
+            if isinstance(existing, Mapping) and existing.get("blocker_counts"):
+                blockers = existing["blocker_counts"]
+            return {
+                "count": max(0, int(count)),
+                "blocker_counts": {
+                    str(key): max(0, int(value or 0))
+                    for key, value in blockers.items()
+                },
+                "timestamps": {"latest": latest, "earliest": latest},
+            }
+
+        stage_rows = {
+            "historically_qualified": stage(
+                "historically_qualified",
+                historical,
+                {} if historical else {"NO_PERSISTED_HISTORICAL_QUALIFICATION": 0},
+            ),
+            "valid_frozen_scope": stage(
+                "valid_frozen_scope",
+                prior_scope,
+                {**({"INVALID_POLICY": statuses.get("INVALID_POLICY", 0)} if statuses.get("INVALID_POLICY") else {}),
+                 "NO_PERSISTED_FROZEN_SCOPE": historical - prior_scope},
+                latest_scope,
+            ),
+            "matching_current_markets": stage(
+                "matching_current_markets",
+                matching,
+                {**{key: value for key, value in reason_counts.items()},
+                 "NO_MATCHING_CURRENT_MARKETS": prior_scope - matching},
+                latest_scope,
+            ),
+            "fresh_complete_inputs": stage(
+                "fresh_complete_inputs",
+                fresh,
+                {"NO_PERSISTED_FRESH_COMPLETE_INPUTS": matching - fresh},
+            ),
+            "strategy_evaluated": stage(
+                "strategy_evaluated",
+                strategy,
+                {"NO_PERSISTED_STRATEGY_EVALUATION": historical - strategy},
+            ),
+            "ready_signal": stage(
+                "ready_signal",
+                ready_signal,
+                {"NO_PERSISTED_READY_SIGNAL": strategy - ready_signal},
+                canary_status.get("ranking_timestamp"),
+            ),
+            "execution_feasible": stage(
+                "execution_feasible",
+                execution_feasible,
+                {"READINESS_SNAPSHOT_NOT_CURRENT": ready_signal - execution_feasible},
+                canary_status.get("readiness_snapshot_updated_at"),
+            ),
+            "submitted": stage(
+                "submitted",
+                submitted,
+                {"NO_PERSISTED_SUBMISSION": execution_feasible - submitted},
+            ),
+            "filled": stage(
+                "filled",
+                filled,
+                {"NO_PERSISTED_FILL": submitted - filled},
+            ),
+        }
+        result["stages"] = stage_rows
+        result["stage_counts"] = {name: row["count"] for name, row in stage_rows.items()}
+        result["timestamps"] = {
+            **timestamps,
+            "latest": timestamps.get("latest") or latest_scope,
+            "as_of": timestamps.get("as_of") or scope_funnel.get("as_of") or latest_scope,
+        }
+        result["available"] = bool(
+            scope_funnel.get("available")
+            or any(row["count"] for row in stage_rows.values())
+        )
+        result["storage_backed"] = True
+        return result
+
+    def _required_forward_evidence(
+        self,
+        market_scope_funnel: Mapping[str, Any] | None = None,
+        *,
+        health_sources: tuple[Mapping[str, Any] | None, ...] = (),
+        candidate_ids: list[str] | tuple[str, ...] | None = None,
+    ) -> dict[str, Any]:
+        """Expose persisted scope/health state without authority work."""
+        funnel = (
+            dict(market_scope_funnel)
+            if isinstance(market_scope_funnel, Mapping)
+            else self.market_scope_funnel_data()
+        )
+        health = self._persisted_forward_health(*health_sources)
+        stage_counts = funnel.get("stage_counts", {})
+        stage_counts = stage_counts if isinstance(stage_counts, Mapping) else {}
+        funnel_blockers = funnel.get("blocker_counts", {})
+        funnel_blockers = funnel_blockers if isinstance(funnel_blockers, Mapping) else {}
+        timestamps = funnel.get("timestamps", {})
+        timestamps = timestamps if isinstance(timestamps, Mapping) else {}
+
+        def bounded_list(value: Any, *, limit: int = 1000) -> list[Any]:
             if not isinstance(value, (list, tuple, set, frozenset)):
                 return []
-            return list(dict.fromkeys(str(item).strip() for item in list(value)[:limit] if str(item).strip()))
+            return list(value)[:limit]
 
-        raw_diagnostics = health.get("market_diagnostics", health.get("diagnostics", []))
-        diagnostics: list[dict[str, Any]] = []
-        if isinstance(raw_diagnostics, (list, tuple)):
-            for raw in list(raw_diagnostics)[:100]:
-                if not isinstance(raw, Mapping):
-                    continue
-                market_id = str(raw.get("market_id") or "").strip()
-                if not market_id:
-                    continue
-                reason_code = str(raw.get("reason_code") or "").strip() or None
-                refs = bounded_ids(raw.get("candidate_references"), 32)
-                diagnostics.append(
-                    {
-                        "market_id": market_id,
-                        "candidate_bound": bool(raw.get("candidate_bound", True)),
-                        "candidate_references": refs,
-                        "source_timestamp": raw.get("source_timestamp"),
-                        "observed_at": raw.get("observed_at"),
-                        "freshness_age_seconds": raw.get("freshness_age_seconds"),
-                        "collection_state": raw.get("collection_state"),
-                        "reason_code": reason_code,
-                        "reason_display": (
-                            "UNRESOLVED_MARKET"
-                            if reason_code == "CANDIDATE_FORWARD_MARKET_UNRESOLVED"
-                            else reason_code
-                        ),
-                    }
-                )
-        diagnostic_by_market = {item["market_id"]: item for item in diagnostics}
-        source_stamps = [
-            (parse_timestamp(item.get("source_timestamp")), item.get("source_timestamp"))
+        def health_list(name: str) -> list[Any]:
+            return bounded_list(health.get(name))
+
+        candidate_bound_markets = health_list("candidate_bound_markets")
+        scheduled = health_list("scheduled")
+        fresh = health_list("fresh")
+        stale = health_list("stale")
+        missing = health_list("missing")
+        diagnostics = health.get("market_diagnostics", health.get("diagnostics", []))
+        diagnostics = bounded_list(diagnostics, limit=100)
+        diagnostics = [
+            dict(_bounded_value(item))
             for item in diagnostics
-            if parse_timestamp(item.get("source_timestamp")) is not None
+            if isinstance(item, Mapping) and str(item.get("market_id") or "").strip()
         ]
-        observed_stamps = [
-            (parse_timestamp(item.get("observed_at")), item.get("observed_at"))
-            for item in diagnostics
-            if parse_timestamp(item.get("observed_at")) is not None
-        ]
-        source_stamps.sort(key=lambda item: item[0])
-        observed_stamps.sort(key=lambda item: item[0])
-        references = health.get("candidate_references", requirements.get("candidate_references", {}))
+        references = health.get("candidate_references", {})
         references = references if isinstance(references, Mapping) else {}
-        bounded_references = {
-            str(market_id): bounded_ids(values, 32)
-            for market_id, values in list(references.items())[:100]
+        candidate_references = {
+            str(market_id): bounded_list(values, limit=32)
+            for market_id, values in list(references.items())[:1000]
+            if isinstance(values, (list, tuple, set, frozenset))
         }
-        reason_code = str(
-            health.get("reason_code")
-            or requirements.get("reason_code")
-            or empty["reason_code"]
-        ).strip()
-        return {
-            "candidate_bound_markets": bounded_ids(
-                health.get("candidate_bound_markets", requirements.get("market_ids", []))
-            ),
-            "scheduled": bounded_ids(health.get("scheduled", [])),
-            "fresh": bounded_ids(health.get("fresh", [])),
-            "stale": bounded_ids(health.get("stale", [])),
-            "missing": bounded_ids(health.get("missing", [])),
-            "newest_required_source_timestamp": (
-                source_stamps[-1][1]
-                if source_stamps
-                else health.get("newest_required_source_timestamp", health.get("newest_required_snapshot"))
-            ),
-            "oldest_required_source_timestamp": (
-                source_stamps[0][1]
-                if source_stamps
-                else health.get("oldest_required_source_timestamp", health.get("oldest_required_snapshot"))
-            ),
-            "newest_required_observed_at": (
-                observed_stamps[-1][1] if observed_stamps else health.get("newest_required_observed_at")
-            ),
-            "oldest_required_observed_at": (
-                observed_stamps[0][1] if observed_stamps else health.get("oldest_required_observed_at")
-            ),
-            "newest_required_source": (
-                source_stamps[-1][1]
-                if source_stamps
-                else health.get("newest_required_source_timestamp", health.get("newest_required_snapshot"))
-            ),
-            "oldest_required_source": (
-                source_stamps[0][1]
-                if source_stamps
-                else health.get("oldest_required_source_timestamp", health.get("oldest_required_snapshot"))
-            ),
-            "newest_required_observed": (
-                observed_stamps[-1][1] if observed_stamps else health.get("newest_required_observed_at")
-            ),
-            "oldest_required_observed": (
-                observed_stamps[0][1] if observed_stamps else health.get("oldest_required_observed_at")
-            ),
-            "grade": health.get("grade"),
-            "grade_scope": health.get("grade_scope", "required_forward_markets"),
+        for diagnostic in diagnostics:
+            market_id = str(diagnostic["market_id"])
+            refs = diagnostic.get("candidate_references")
+            if market_id not in candidate_references and isinstance(
+                refs, (list, tuple, set, frozenset)
+            ):
+                candidate_references[market_id] = bounded_list(refs, limit=32)
+            if diagnostic.get("candidate_bound") and market_id not in candidate_bound_markets:
+                candidate_bound_markets.append(market_id)
+
+        def first_health(*names: str) -> Any:
+            for name in names:
+                value = health.get(name)
+                if value is not None and value != "":
+                    return value
+            return None
+
+        required_count = first_health("required_market_count")
+        if required_count is None:
+            required_count = len(candidate_bound_markets)
+        try:
+            required_market_count = max(0, int(required_count or 0))
+        except (TypeError, ValueError):
+            required_market_count = len(candidate_bound_markets)
+        latest_source = first_health("newest_required_source_timestamp", "newest_required_source")
+        earliest_source = first_health("oldest_required_source_timestamp", "oldest_required_source")
+        latest_observed = first_health("newest_required_observed_at", "newest_required_observed")
+        earliest_observed = first_health("oldest_required_observed_at", "oldest_required_observed")
+        latest_source = latest_source or timestamps.get("latest")
+        earliest_source = earliest_source or timestamps.get("earliest")
+        latest_observed = latest_observed or timestamps.get("latest")
+        earliest_observed = earliest_observed or timestamps.get("earliest")
+        unresolved = bounded_list(health.get("unresolved_candidates"))
+        if "unresolved_candidates" not in health:
+            unresolved = bounded_list(funnel.get("unresolved_candidates"))
+        closed = bounded_list(health.get("closed_candidates"))
+        if "closed_candidates" not in health:
+            closed = bounded_list(funnel.get("closed_candidates"))
+        if not unresolved and not health and not funnel.get("resolution_items"):
+            ids = candidate_ids
+            if ids is None:
+                ids = [
+                    str(item.get("candidate_id") or "").strip()
+                    for item in self._bounded_candidate_lifecycle()
+                ]
+            unresolved = list(dict.fromkeys(str(item).strip() for item in ids if str(item).strip()))[
+                :_LATEST_CANDIDATE_LIMIT
+            ]
+        reason_code = first_health("reason_code")
+        if reason_code is None:
+            reason_code = (
+                "CANDIDATE_FORWARD_MARKET_UNRESOLVED"
+                if unresolved
+                else None if funnel.get("available") else "NO_PERSISTED_SCOPE_RESOLUTION"
+            )
+        reason_display = reason_code or first_health("reason_display")
+        grade = first_health("grade")
+        if grade is None:
+            grade = "CURRENT" if funnel.get("available") else "UNKNOWN"
+        blocker_counts = health.get("blocker_counts", funnel_blockers)
+        if not isinstance(blocker_counts, Mapping):
+            blocker_counts = funnel_blockers
+        blocker_counts = dict(blocker_counts or {})
+        result = {
+            "candidate_bound_markets": candidate_bound_markets,
+            "scheduled": scheduled,
+            "fresh": fresh,
+            "stale": stale,
+            "missing": missing,
+            "newest_required_source_timestamp": latest_source,
+            "oldest_required_source_timestamp": earliest_source,
+            "newest_required_observed_at": latest_observed,
+            "oldest_required_observed_at": earliest_observed,
+            "newest_required_source": latest_source,
+            "oldest_required_source": earliest_source,
+            "newest_required_observed": latest_observed,
+            "oldest_required_observed": earliest_observed,
+            "grade": grade,
+            "grade_scope": first_health("grade_scope") or "persisted_market_scope_resolution",
             "reason_code": reason_code,
-            "reason_display": (
-                "UNRESOLVED_MARKET"
-                if reason_code == "CANDIDATE_FORWARD_MARKET_UNRESOLVED"
-                else reason_code
-            ),
-            "candidate_references": bounded_references,
+            "reason_display": reason_display,
+            "candidate_references": candidate_references,
             "market_diagnostics": diagnostics,
             "diagnostics": diagnostics,
-            "required_market_count": health.get("required_market_count", len(diagnostics)),
-            "unresolved_candidates": bounded_ids(health.get("unresolved_candidates", [])),
-            "closed_candidates": bounded_ids(health.get("closed_candidates", [])),
-            "as_of": health.get("as_of") or requirements.get("as_of"),
+            "required_market_count": required_market_count,
+            "unresolved_candidates": unresolved,
+            "closed_candidates": closed,
+            "as_of": first_health("as_of") or funnel.get("as_of") or timestamps.get("as_of"),
+            "market_scope_funnel": funnel,
+            "blocker_counts": blocker_counts,
         }
+        return result
 
     def overview_summary(
         self,
@@ -3493,14 +3956,36 @@ class DashboardData:
         configured = self._configured("overview-summary")
         if configured is not None:
             return dict(configured) if isinstance(configured, Mapping) else {"value": configured}
+        market_scope_funnel = self.market_scope_funnel_data()
         if self.store is None or not callable(getattr(self.store, "dashboard_overview_summary", None)):
+            candidate_records = self._bounded_candidate_lifecycle()
+            candidate_ids = [
+                str(item.get("candidate_id") or "").strip()
+                for item in candidate_records
+                if str(item.get("candidate_id") or "").strip()
+            ]
+            market_scope_funnel = self._research_order_funnel(
+                market_scope_funnel,
+                {},
+                {},
+            )
+            latest_candidates = [
+                self._latest_candidate_projection(item)
+                for item in candidate_records[:_LATEST_CANDIDATE_LIMIT]
+            ]
             return {
                 "available": False,
                 "components": [],
                 "research_cards": {},
                 "coverage": {},
                 "latest_activity": [],
-                "forward_evidence": self._required_forward_evidence(),
+                "latest_candidates": latest_candidates,
+                "candidates": latest_candidates,
+                "forward_evidence": self._required_forward_evidence(
+                    market_scope_funnel,
+                    candidate_ids=candidate_ids,
+                ),
+                "market_scope_funnel": market_scope_funnel,
                 "signal_scan_reason_counts": {},
                 "live_execution": False,
             }
@@ -3727,7 +4212,27 @@ class DashboardData:
         canary_status["autonomous"] = autonomous
         latest_signal = _signal_projection(canary_status.get("latest_signal"))
         canary_status["latest_signal"] = latest_signal
-        forward_evidence = self._required_forward_evidence()
+        candidate_records = self._bounded_candidate_lifecycle()
+        candidate_ids = [
+            str(item.get("candidate_id") or "").strip()
+            for item in candidate_records
+            if str(item.get("candidate_id") or "").strip()
+        ]
+        market_scope_funnel = self._research_order_funnel(
+            market_scope_funnel,
+            aggregate,
+            canary_status,
+        )
+        forward_evidence = self._required_forward_evidence(
+            market_scope_funnel,
+            health_sources=(
+                health,
+                health_payload,
+                collector_worker_payload,
+                collector_state,
+            ),
+            candidate_ids=candidate_ids,
+        )
         def worker_state(name: str, default: str = "NOT INITIALIZED") -> str:
             item = worker_map.get(name, {})
             status = str(item.get("status") or "").upper()
@@ -3751,6 +4256,23 @@ class DashboardData:
                 "dataset_version": outcome.get("dataset_version"),
                 "family": outcome.get("family"),
             }
+
+        aggregate_candidates = (
+            aggregate.get("latest_candidates")
+            if isinstance(aggregate, Mapping)
+            else None
+        )
+        if isinstance(aggregate_candidates, (list, tuple)) and aggregate_candidates:
+            latest_candidates = [
+                _bounded_value(item)
+                for item in aggregate_candidates[:_LATEST_CANDIDATE_LIMIT]
+                if isinstance(item, Mapping)
+            ]
+        else:
+            latest_candidates = [
+                self._latest_candidate_projection(item)
+                for item in candidate_records[:_LATEST_CANDIDATE_LIMIT]
+            ]
         historical = catalog.get("historical", {}) if isinstance(catalog, Mapping) else {}
         forward = catalog.get("forward_collected", {}) if isinstance(catalog, Mapping) else {}
         bootstrap_progress = self._operator_bootstrap_progress()
@@ -3759,18 +4281,6 @@ class DashboardData:
             if isinstance(canary_status, Mapping)
             else None
         )
-        latest_candidates: list[dict[str, Any]] = []
-        try:
-            candidate_page = self.paginate_candidate_lifecycle(
-                {"page": 1, "page_size": 10, "sort": "updated_at", "direction": "desc"}
-            )
-            latest_candidates = [
-                self._compact_candidate_display_row(item)
-                for item in candidate_page.get("items", [])
-                if isinstance(item, Mapping)
-            ][:10]
-        except (AttributeError, TypeError, ValueError, sqlite3.Error):
-            latest_candidates = []
         paper_detail = dict(paper_worker_payload)
         paper_detail["paper_forward_candidates"] = stages.get("PAPER_FORWARD", 0) + stages.get("PAPER_PROMOTABLE", 0)
         paper_detail["status"] = (
@@ -3886,6 +4396,7 @@ class DashboardData:
             "canary": canary_status,
             "canary_signal": latest_signal,
             "forward_evidence": forward_evidence,
+            "market_scope_funnel": market_scope_funnel,
             "signal_scan_reason_counts": signal_scan_reason_counts,
             "candidate_status": {
                 "canary_eligible": candidate_canary_count,
@@ -4061,7 +4572,8 @@ class DashboardData:
             worker_section if isinstance(worker_section, Mapping) else None,
             canary_report,
         )
-        forward_evidence = self._required_forward_evidence()
+        market_scope_funnel = self.market_scope_funnel_data()
+        forward_evidence = self._required_forward_evidence(market_scope_funnel)
         canary["blocker"] = blocker
         canary["last_cycle_blocker"] = raw_blocker
         canary["signal_scan_reason_counts"] = signal_scan_reason_counts
@@ -4192,6 +4704,7 @@ class DashboardData:
             "real_execution_events": execution_events,
             "live_execution": False,
             "forward_evidence": forward_evidence,
+            "market_scope_funnel": market_scope_funnel,
             "signal_scan_reason_counts": signal_scan_reason_counts,
         }
         projection.update({name: canary[name] for name in _CANARY_STATUS_FIELDS})
@@ -4330,7 +4843,7 @@ class DashboardData:
             if isinstance(item, Mapping)
         ]
         candidate_status = {
-            "canary_eligible": self._candidate_canary_eligibility_count(),
+            "canary_eligible": None,
             # Paper status is lifecycle-derived and intentionally remains
             # separate from the persisted canary eligibility binding.
             "paper_forward": stages["PAPER_FORWARD"] + stages["PAPER_PROMOTABLE"],
@@ -4717,6 +5230,7 @@ def _dashboard_html(
       <article class="panel"><div class="section-title"><h2>SYSTEM CONTROL</h2><span class="badge good">localhost + token</span></div><div id="operator-controls" class="three-col"></div><div id="control-result" class="page-note"></div></article>
       <div class="two-col"><div><article class="panel"><div class="section-title"><h2>Historical / forward coverage</h2><a class="link" href="#datasets" data-link="datasets">View all</a></div><div id="coverage"></div></article>
         <article class="panel"><div class="section-title"><h2>Candidate lifecycle funnel</h2><a class="link" href="#candidates" data-link="candidates">View all</a></div><div id="funnel" class="funnel"></div></article>
+        <article class="panel"><div class="section-title"><h2>Research → order funnel</h2><span class="badge">persisted handoff</span></div><div id="market-scope-funnel" class="funnel"></div><p class="page-note">Qualification is historical evidence only. Readiness and execution feasibility are persisted separately.</p></article>
         <article class="panel"><div class="section-title"><h2>Latest candidates</h2><a class="link" href="#candidates" data-link="candidates">View all</a></div><div id="overview-candidates" class="scroll"></div></article></div>
         <div><article class="panel"><div class="section-title"><h2>Latest activity</h2><a class="link" href="#activity" data-link="activity">View all</a></div><div id="overview-activity" class="timeline"></div></article>
         <article class="panel"><div class="section-title"><h2>Selected detail</h2><span class="muted">preserved on refresh</span></div><div id="detail" class="empty"><strong>Select an item</strong>Dataset and candidate evidence appears here.</div></article></div></div>
@@ -5064,11 +5578,24 @@ def _dashboard_html(
         <section class="panel"><h3>Candidate admission</h3>${researchFeedField("no_new_candidates_reason","No new candidates reason",feed.no_new_candidates_reason)}</section>
       </div>`;
     }
+    function renderMarketScopeFunnel(data) {
+      const funnel=data.market_scope_funnel||{}, stages=funnel.stages||{}, counts=funnel.stage_counts||{};
+      const names=["historically_qualified","valid_frozen_scope","matching_current_markets","fresh_complete_inputs","strategy_evaluated","ready_signal","execution_feasible","submitted","filled"];
+      const max=Math.max(1,...names.map(name=>Number(stages[name]?.count??counts[name]??0)));
+      const rows=names.map(name=>{
+        const stage=stages[name]||{}, value=Number(stage.count??counts[name]??0)||0, blockers=stage.blocker_counts||stage.blockers||{}, ts=stage.timestamps||{};
+        const blockerText=Object.entries(blockers).map(([key,count])=>`${safe(key)}=${safe(count)}`).join(", ");
+        const when=ts.latest||stage.latest_at||"";
+        return `<div class="funnel-row" title="${safe(blockerText)}"><span>${safe(name.replaceAll("_"," "))}</span><span class="funnel-track"><span class="funnel-bar" style="width:${Math.min(100,Math.round(value/max*100))}%"></span></span><strong>${count(value)}</strong></div><p class="page-note">${blockerText?`Blockers: ${blockerText} · `:""}${when?`latest ${safe(dateText(when))}`:"No persisted timestamp"}</p>`;
+      }).join("");
+      $("market-scope-funnel").innerHTML=rows||empty("No persisted market-scope handoff","Resolution workers have not persisted a bounded funnel yet.");
+    }
     renderOverview = (data) => { renderComponents(data); renderOutcomeCards(data); const c=data.coverage||{},h=data.collector_health||{}; $("coverage").innerHTML=`<div class="three-col"><div class="key-value"><span class="key">Historical datasets</span><strong>${count(c.historical_count)}</strong></div><div class="key-value"><span class="key">Historical rows</span><strong>${count(c.historical_rows)}</strong></div><div class="key-value"><span class="key">Forward datasets</span><strong>${count(c.forward_count)}</strong></div><div class="key-value"><span class="key">Forward rows</span><strong>${count(c.forward_rows)}</strong></div><div class="key-value"><span class="key">Logical observations</span><strong>${count((c.logical_rows||{}).bars)}</strong></div><div class="key-value"><span class="key">Collector errors</span><strong>${count(h.collection_errors)}</strong></div><div class="key-value"><span class="key">Last cycle duration</span><strong>${h.last_cycle_duration_seconds==null?"—":`${Number(h.last_cycle_duration_seconds).toFixed(1)}s`}</strong></div><div class="key-value"><span class="key">Effective cadence</span><strong>${h.effective_collection_cadence_seconds==null?"—":`${Number(h.effective_collection_cadence_seconds).toFixed(1)}s`}</strong></div><div class="key-value"><span class="key">Markets A / S / F</span><strong>${count(h.last_cycle_markets_attempted)} / ${count(h.last_cycle_markets_successful)} / ${count(h.last_cycle_markets_failed)}</strong></div></div><p class="page-note">Configured interval ${safe(h.configured_interval_seconds??"—")}s · stale threshold ${safe(h.stale_after_seconds??"—")}s · last successful cycle ${safe(dateText(h.last_successful_cycle))}</p>`; $("overview-activity").innerHTML=activityMarkup(arr(data.latest_activity||data.activity)); $("overview-candidates").innerHTML=empty("Candidate list is lazy","Open Candidates to load the bounded lifecycle page."); $("raw-overview").textContent=json({counts:data.counts,collector_health:h,latest_outcome:data.hermes_latest_outcome}); };
     const _renderOverviewScheduling = renderOverview;
     renderOverview = (data) => {
       _renderOverviewScheduling(data);
       renderResearchFeed(data);
+      renderMarketScopeFunnel(data);
       $("overview-readiness-snapshot").innerHTML=readinessSnapshotMarkup(data);
       if(Object.prototype.hasOwnProperty.call(data,"operator_controls")||!operatorControlsRendered)renderOperatorControls(data);
       const h = data.collector_health || {};

@@ -11,11 +11,12 @@ from pathlib import Path
 import tempfile
 import unittest
 from urllib.request import Request
-
 from axiom.collector import CollectorConfig, PolymarketCollector
 from axiom.data import InMemoryPredictionProvider, PolymarketAdapter
 from axiom.data._http import HTTPFetchError, fetch_json_strict
 from axiom.canary import CanaryService
+from axiom.experiment_plan import normalize_market_scope
+from axiom.market_scope import resolve_market_scope
 from axiom.director import research_summary, validate_hermes_proposal
 from axiom.domain import (
     CryptoTicker,
@@ -44,9 +45,9 @@ from axiom.strategy import validate_strategy
 
 T0 = datetime(2025, 1, 1, tzinfo=timezone.utc)
 
-
 def market(market_id: str = "m", *, settlement: SettlementState = SettlementState.OPEN, expiry: datetime | None = None, yes_mid: float = 0.5) -> PredictionMarketSnapshot:
     book = OrderBookSnapshot(T0, (OrderBookLevel(yes_mid - 0.01, 10.0),), (OrderBookLevel(yes_mid + 0.01, 10.0),), "yes")
+    resolved = settlement is not SettlementState.OPEN
     return PredictionMarketSnapshot(
         timestamp=T0,
         market_id=market_id,
@@ -63,6 +64,14 @@ def market(market_id: str = "m", *, settlement: SettlementState = SettlementStat
         settlement=settlement,
         resolution_criteria="public result",
         order_book=book,
+        source="POLYMARKET",
+        yes_token_id=f"yes-{market_id}",
+        no_token_id=f"no-{market_id}",
+        condition_id=f"condition-{market_id}",
+        active=not resolved,
+        closed=resolved,
+        accepting_orders=not resolved,
+        enable_order_book=True,
     )
 
 
@@ -123,9 +132,113 @@ class _RecordingPredictionProvider(InMemoryPredictionProvider):
         return super().trades(market_id, start=start, end=end)
 
 
-def _seed_frozen_candidate(store: AxiomStore, candidate_id: str, market_ids: tuple[str, ...]) -> None:
+def _canonical_prediction_scope(
+    *,
+    market_ids: tuple[str, ...] = (),
+    filters: dict[str, object] | None = None,
+    research_only: bool = False,
+) -> tuple[dict[str, object], str, str]:
+    if research_only:
+        policy = normalize_market_scope(
+            {
+                "schema_version": "1",
+                "mode": "RESEARCH_ONLY",
+                "instrument": None,
+                "categories": [],
+                "market_ids": [],
+                "filters": {},
+                "regime_restrictions": {},
+                "provenance": "canonical",
+            }
+        )
+    else:
+        policy = normalize_market_scope(
+            market_ids=list(market_ids),
+            filters=filters or {},
+            target_instrument="POLYMARKET",
+        )
+        policy = normalize_market_scope({**policy.as_dict(), "provenance": "canonical"})
+    return policy.as_dict(), policy.scope_hash, policy.scope_version
+def _scope_market_record(
+    market_id: str,
+    *,
+    category: str | None = None,
+    closed: bool = False,
+) -> dict[str, object]:
+    return {
+        "market_id": market_id,
+        "condition_id": f"condition-{market_id}",
+        "yes_token_id": f"yes-{market_id}",
+        "no_token_id": f"no-{market_id}",
+        "instrument": "POLYMARKET",
+        "instrument_type": "POLYMARKET",
+        "market_type": "prediction",
+        "venue": "POLYMARKET",
+        "provider": "recording-memory",
+        "source": "recording-memory",
+        "source_type": "CURRENT",
+        "category": category,
+        "categories": [category] if category else [],
+        "active": not closed,
+        "open": not closed,
+        "closed": closed,
+        "accepting_orders": not closed,
+        "order_book_available": not closed,
+        "settlement": "resolved_yes" if closed else "open",
+        "expiry": None,
+        "metadata_provenance": {
+            "source_type": "CURRENT",
+            "provider": "recording-memory",
+            "instrument": "POLYMARKET",
+            "venue": "POLYMARKET",
+            "observed_at": T0.isoformat(),
+        },
+    }
+def _persist_scope_resolution(
+    store: AxiomStore,
+    candidate_id: str,
+    scope: dict[str, object],
+    records: list[dict[str, object]],
+) -> None:
+    resolution = resolve_market_scope(
+        candidate_id,
+        {"market_scope": scope},
+        records,
+        resolved_at=T0,
+    )
+    store.save_market_scope_resolution(resolution)
+def _seed_frozen_candidate(
+    store: AxiomStore,
+    candidate_id: str,
+    market_ids: tuple[str, ...],
+    *,
+    persist_resolution: bool = True,
+) -> None:
+
+    scope, scope_hash, scope_version = _canonical_prediction_scope(market_ids=market_ids)
+    payload = {
+        "candidate_id": candidate_id,
+        "market_type": "prediction",
+        "market_ids": list(market_ids),
+        "market_scope": scope,
+        "market_scope_hash": scope_hash,
+        "market_scope_version": scope_version,
+        "plan_hash": f"sha256:plan-{candidate_id}",
+        "dataset_selector": {
+            "dataset_id": "prediction-history",
+            "dataset_version": "v1",
+            "source_type": "HISTORICAL",
+        },
+        "dataset_attestation": {
+            "dataset_id": "prediction-history",
+            "dataset_version": "v1",
+            "status": "CURRENT",
+            "policy_version": "prediction-integrity-v1",
+            "attestation_hash": "sha256:fixture-attestation",
+        },
+    }
     lifecycle = CandidateLifecycleManager(store)
-    lifecycle.register_idea(candidate_id, {"candidate_id": candidate_id, "market_ids": list(market_ids)})
+    lifecycle.register_idea(candidate_id, payload)
     lifecycle.advance(candidate_id, CandidateStage.SCHEMA_VALIDATED, {"schema_valid": True})
     lifecycle.advance(candidate_id, CandidateStage.BACKTESTED, {"backtest_complete": True})
     lifecycle.advance(candidate_id, CandidateStage.VALIDATED, {"validation_complete": True, "holdout_used": False})
@@ -143,6 +256,43 @@ def _seed_frozen_candidate(store: AxiomStore, candidate_id: str, market_ids: tup
             "risk_snapshot": {"max_position_fraction": 0.05},
         },
     )
+    if persist_resolution:
+        _persist_scope_resolution(
+            store,
+            candidate_id,
+            scope,
+            [_scope_market_record(market_id) for market_id in market_ids],
+        )
+def _current_records_from_store(store: AxiomStore) -> list[dict[str, object]]:
+    records: list[dict[str, object]] = []
+    rows = store.tracked_polymarket_markets(
+        active_only=False,
+        now=T0,
+        include_payload=True,
+        limit=1000,
+    )
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        market_id = str(row.get("market_id") or "").strip()
+        if not market_id:
+            continue
+        payload = row.get("payload")
+        payload = payload if isinstance(payload, dict) else {}
+        metadata = payload.get("metadata")
+        metadata = metadata if isinstance(metadata, dict) else {}
+        snapshot = payload.get("snapshot")
+        snapshot = snapshot if isinstance(snapshot, dict) else {}
+        closed = bool(row.get("active") is False or metadata.get("closed") is True)
+        record = _scope_market_record(
+            market_id,
+            category=str(metadata.get("category")) if metadata.get("category") is not None else None,
+            closed=closed,
+        )
+        if snapshot.get("expiry") is not None:
+            record["expiry"] = snapshot["expiry"]
+        records.append(record)
+    return records
 
 
 def _seed_candidate_authority(store: AxiomStore, candidate_id: str, rank: int) -> None:
@@ -222,8 +372,9 @@ class Phase3CollectionTests(unittest.TestCase):
         self.assertEqual(raised.exception.retry_after, 4.0)
         self.assertTrue(raised.exception.retryable)
 
-    def test_condition_id_payload_is_cached_for_token_and_metadata_calls(self) -> None:
+    def test_market_id_payload_is_cached_for_token_and_metadata_calls(self) -> None:
         raw = {
+            "id": "market-1",
             "conditionId": "condition-1",
             "question": "Will it happen?",
             "outcomes": ["Yes", "No"],
@@ -231,19 +382,31 @@ class Phase3CollectionTests(unittest.TestCase):
             "outcomePrices": ["0.4", "0.6"],
             "updatedAt": "2025-01-01T00:00:00Z",
         }
+        calls: list[str] = []
 
-        def opener(request: Request, timeout: float) -> _Response:
+        def opener(request: Request, *, timeout: float) -> _Response:
+            del timeout
+            calls.append(request.full_url)
             return _Response(raw)
 
         adapter = PolymarketAdapter(opener=opener)
-        snapshot = adapter.market("condition-1")
+        snapshot = adapter.market("market-1")
         self.assertIsNotNone(snapshot)
-        self.assertEqual(snapshot.market_id, "condition-1")
-        self.assertEqual(adapter.token_ids("condition-1"), {"yes": "yes-token", "no": "no-token"})
-        self.assertEqual(adapter.metadata("condition-1").market_id, "condition-1")
+        assert snapshot is not None
+        self.assertEqual(snapshot.market_id, "market-1")
+        self.assertEqual(snapshot.condition_id, "condition-1")
+        self.assertEqual(adapter.token_ids("market-1"), {"yes": "yes-token", "no": "no-token"})
+        metadata = adapter.metadata("market-1")
+        self.assertIsNotNone(metadata)
+        assert metadata is not None
+        self.assertEqual(metadata.market_id, "market-1")
+        self.assertEqual(metadata.condition_id, "condition-1")
+        self.assertEqual(metadata.extra["condition_id"], "condition-1")
+        self.assertEqual(len(calls), 1)
     def test_crossed_yes_quote_is_sanitized_before_snapshot_construction(self) -> None:
         raw = {
-            "conditionId": "crossed",
+            "id": "crossed",
+            "conditionId": "condition-crossed",
             "question": "Will it happen?",
             "outcomes": ["Yes", "No"],
             "clobTokenIds": ["yes-token", "no-token"],
@@ -253,7 +416,9 @@ class Phase3CollectionTests(unittest.TestCase):
             "updatedAt": "2025-01-01T00:00:00Z",
         }
 
-        adapter = PolymarketAdapter(opener=lambda _request, timeout: _Response(raw))
+        adapter = PolymarketAdapter(
+            opener=lambda _request, *, timeout: _Response(raw)
+        )
         snapshot = adapter.market("crossed")
 
         self.assertIsNotNone(snapshot)
@@ -338,9 +503,19 @@ class Phase3CollectionTests(unittest.TestCase):
         provider = _RecordingPredictionProvider(snapshots)
         with AxiomStore(":memory:") as store:
             _seed_forward_metadata(store, ids)
-            _seed_frozen_candidate(store, "candidate-priority", ("candidate-a", "candidate-b"))
+            _seed_frozen_candidate(
+                store,
+                "candidate-priority",
+                ("candidate-a", "candidate-b"),
+                persist_resolution=False,
+            )
             _seed_candidate_authority(store, "candidate-priority", 1)
-            _seed_frozen_candidate(store, "paper-priority", ("paper-a",))
+            _seed_frozen_candidate(
+                store,
+                "paper-priority",
+                ("paper-a",),
+                persist_resolution=False,
+            )
             CandidateLifecycleManager(store).advance(
                 "paper-priority",
                 CandidateStage.PAPER_FORWARD,
@@ -361,26 +536,35 @@ class Phase3CollectionTests(unittest.TestCase):
             )
             cycle = collector.collect_once(now=T0)
 
-            self.assertEqual(list(cycle.candidate_bound_markets), ["candidate-a", "candidate-b"])
-            self.assertEqual(list(cycle.candidate_bound_scheduled), ["candidate-a", "candidate-b"])
-            self.assertEqual(list(cycle.candidate_bound_fresh), ["candidate-a", "candidate-b"])
+            self.assertEqual(
+                list(cycle.candidate_bound_markets),
+                ["candidate-a", "candidate-b", "paper-a"],
+            )
+            self.assertEqual(
+                list(cycle.candidate_bound_scheduled),
+                ["candidate-a", "candidate-b", "paper-a"],
+            )
+            self.assertEqual(
+                list(cycle.candidate_bound_fresh),
+                ["candidate-a", "candidate-b", "paper-a"],
+            )
             self.assertEqual(list(cycle.candidate_bound_stale), [])
             self.assertEqual(list(cycle.candidate_bound_missing), [])
-            self.assertEqual(list(cycle.paper_forward_markets), ["paper-a"])
-            self.assertEqual(list(cycle.paper_forward_scheduled), ["paper-a"])
-            self.assertEqual(list(cycle.discovery_scheduled), ["discovery-a"])
-            self.assertEqual(list(cycle.discovery_deferred), ["discovery-b"])
-            self.assertEqual(cycle.tier_attempts["candidate"], 2)  # type: ignore[index]
-            self.assertEqual(cycle.tier_successes["candidate"], 2)  # type: ignore[index]
-            self.assertEqual(cycle.tier_attempts["paper_forward"], 1)  # type: ignore[index]
-            self.assertEqual(cycle.tier_successes["paper_forward"], 1)  # type: ignore[index]
-            self.assertEqual(cycle.tier_attempts["discovery"], 1)  # type: ignore[index]
-            self.assertEqual(cycle.tier_successes["discovery"], 1)  # type: ignore[index]
-            self.assertEqual(cycle.markets_seen, 4)
-            self.assertEqual(cycle.markets_attempted, 4)
+            self.assertEqual(list(cycle.paper_forward_markets), [])
+            self.assertEqual(list(cycle.paper_forward_scheduled), [])
+            self.assertEqual(list(cycle.discovery_scheduled), [])
+            self.assertEqual(list(cycle.discovery_deferred), [])
+            self.assertEqual(cycle.tier_attempts["candidate"], 3)  # type: ignore[index]
+            self.assertEqual(cycle.tier_successes["candidate"], 3)  # type: ignore[index]
+            self.assertEqual(cycle.tier_attempts["paper_forward"], 0)  # type: ignore[index]
+            self.assertEqual(cycle.tier_successes["paper_forward"], 0)  # type: ignore[index]
+            self.assertEqual(cycle.tier_attempts["discovery"], 0)  # type: ignore[index]
+            self.assertEqual(cycle.tier_successes["discovery"], 0)  # type: ignore[index]
+            self.assertEqual(cycle.markets_seen, 3)
+            self.assertEqual(cycle.markets_attempted, 3)
             self.assertEqual(
                 list(dict.fromkeys(item[1] for item in provider.calls if item[0] == "market")),
-                ["candidate-a", "candidate-b", "paper-a", "discovery-a"],
+                ["candidate-a", "candidate-b", "paper-a"],
             )
             self.assertLessEqual(
                 len([item for item in provider.calls if item[0] == "market"]),
@@ -419,7 +603,12 @@ class Phase3CollectionTests(unittest.TestCase):
         provider = _RecordingPredictionProvider(tuple(market(identifier) for identifier in identifiers))
         with AxiomStore(":memory:") as store:
             _seed_forward_metadata(store, identifiers)
-            _seed_frozen_candidate(store, "capacity-candidate", identifiers)
+            _seed_frozen_candidate(
+                store,
+                "capacity-candidate",
+                identifiers,
+                persist_resolution=False,
+            )
             _seed_candidate_authority(store, "capacity-candidate", 1)
             collector = PolymarketCollector(
                 provider,
@@ -427,7 +616,7 @@ class Phase3CollectionTests(unittest.TestCase):
                 CollectorConfig(
                     interval_seconds=60,
                     max_markets=1,
-                    discovery_budget_per_cycle=0,
+                    discovery_budget_per_cycle=2,
                     stale_after_seconds=30,
                     max_attempts=1,
                     jitter_seconds=0,
@@ -451,7 +640,12 @@ class Phase3CollectionTests(unittest.TestCase):
             _seed_forward_metadata(store, market_ids)
             for index, candidate_id in enumerate(candidate_ids):
                 start = index * 8
-                _seed_frozen_candidate(store, candidate_id, market_ids[start : start + 8])
+                _seed_frozen_candidate(
+                    store,
+                    candidate_id,
+                    market_ids[start : start + 8],
+                    persist_resolution=False,
+                )
                 _seed_candidate_authority(store, candidate_id, index + 1)
             collector = PolymarketCollector(
                 provider,
@@ -468,9 +662,9 @@ class Phase3CollectionTests(unittest.TestCase):
             )
             cycle = collector.collect_once(now=T0)
 
-        self.assertEqual(len(cycle.candidate_bound_markets), 150)
-        self.assertEqual(len(cycle.candidate_bound_scheduled), 150)
-        self.assertEqual(len(cycle.candidate_bound_fresh), 150)
+        self.assertEqual(len(cycle.candidate_bound_markets), 100)
+        self.assertEqual(len(cycle.candidate_bound_scheduled), 100)
+        self.assertEqual(len(cycle.candidate_bound_fresh), 100)
         self.assertEqual(list(cycle.candidate_bound_stale), [])
         self.assertEqual(list(cycle.candidate_bound_missing), [])
         self.assertIsNone(cycle.capacity_reason)
@@ -1532,8 +1726,60 @@ class CandidateForwardAuthorityTests(unittest.TestCase):
         candidate_id: str,
         payload: dict[str, object],
     ) -> None:
+        source = dict(payload)
+        raw_scope = source.get("market_scope")
+        if isinstance(raw_scope, dict):
+            scope = normalize_market_scope({**raw_scope, "provenance": "canonical"})
+            scope_document = scope.as_dict()
+            scope_hash = scope.scope_hash
+            scope_version = scope.scope_version
+        else:
+            raw_ids = source.get("market_ids")
+            market_ids = (
+                tuple(str(item).strip() for item in raw_ids if str(item).strip())
+                if isinstance(raw_ids, (list, tuple))
+                else ()
+            )
+            raw_filters = source.get("frozen_filters")
+            if market_ids:
+                scope_document, scope_hash, scope_version = _canonical_prediction_scope(
+                    market_ids=market_ids
+                )
+            elif isinstance(raw_filters, dict):
+                scope_document, scope_hash, scope_version = _canonical_prediction_scope(
+                    filters=dict(raw_filters)
+                )
+            else:
+                scope_document, scope_hash, scope_version = _canonical_prediction_scope(
+                    research_only=True
+                )
+        provenance = source.get("dataset_provenance")
+        provenance = provenance if isinstance(provenance, dict) else {}
+        dataset_id = str(provenance.get("dataset_id") or "prediction-history")
+        dataset_version = str(provenance.get("dataset_version") or "v1")
+        candidate_payload = {
+            "candidate_id": candidate_id,
+            "market_type": "prediction",
+            **source,
+            "market_scope": scope_document,
+            "market_scope_hash": scope_hash,
+            "market_scope_version": scope_version,
+            "plan_hash": str(source.get("plan_hash") or f"sha256:plan-{candidate_id}"),
+            "dataset_selector": {
+                "dataset_id": dataset_id,
+                "dataset_version": dataset_version,
+                "source_type": "HISTORICAL",
+            },
+            "dataset_attestation": {
+                "dataset_id": dataset_id,
+                "dataset_version": dataset_version,
+                "status": "CURRENT",
+                "policy_version": "prediction-integrity-v1",
+                "attestation_hash": "sha256:fixture-attestation",
+            },
+        }
         lifecycle = CandidateLifecycleManager(store)
-        lifecycle.register_idea(candidate_id, {"candidate_id": candidate_id, **payload})
+        lifecycle.register_idea(candidate_id, candidate_payload)
         lifecycle.advance(candidate_id, CandidateStage.SCHEMA_VALIDATED, {"schema_valid": True})
         lifecycle.advance(candidate_id, CandidateStage.BACKTESTED, {"backtest_complete": True})
         lifecycle.advance(
@@ -1551,11 +1797,18 @@ class CandidateForwardAuthorityTests(unittest.TestCase):
             CandidateStage.FROZEN,
             {
                 "frozen": True,
+                "frozen_hash": f"frozen-{candidate_id}",
                 "strategy_hash": "strategy-hash",
                 "model_hash": "model-hash",
                 "config_hash": "config-hash",
                 "risk_snapshot": {"max_position_fraction": 0.05},
             },
+        )
+        _persist_scope_resolution(
+            store,
+            candidate_id,
+            scope_document,
+            _current_records_from_store(store),
         )
 
     def test_historical_constituents_are_not_executable_and_exact_current_target_survives(self) -> None:
@@ -1631,11 +1884,69 @@ class CandidateForwardAuthorityTests(unittest.TestCase):
         with AxiomStore(":memory:") as store:
             self._metadata(store, "tracked-but-unbound")
             self._freeze_candidate(store, "candidate-empty", {})
-            self._freeze_candidate(
-                store,
+
+            malformed = {
+                "candidate_id": "candidate-unsupported",
+                "market_type": "prediction",
+                "market_scope": {
+                    "schema_version": "1",
+                    "mode": "EXACT_MARKETS",
+                    "instrument": "POLYMARKET",
+                    "categories": [],
+                    "market_ids": [],
+                    "filters": {},
+                    "regime_restrictions": {},
+                    "provenance": "canonical",
+                },
+                "market_scope_hash": "sha256:malformed-scope",
+                "market_scope_version": "1",
+                "plan_hash": "sha256:malformed-plan",
+                "dataset_selector": {
+                    "dataset_id": "prediction-history",
+                    "dataset_version": "v1",
+                    "source_type": "HISTORICAL",
+                },
+                "dataset_attestation": {
+                    "dataset_id": "prediction-history",
+                    "dataset_version": "v1",
+                    "status": "CURRENT",
+                    "attestation_hash": "sha256:fixture-attestation",
+                },
+            }
+            lifecycle = CandidateLifecycleManager(store)
+            lifecycle.register_idea("candidate-unsupported", malformed)
+            lifecycle.advance(
                 "candidate-unsupported",
-                {"frozen_filters": {"unsupported_selector": "value"}},
+                CandidateStage.SCHEMA_VALIDATED,
+                {"schema_valid": True},
             )
+            lifecycle.advance(
+                "candidate-unsupported",
+                CandidateStage.BACKTESTED,
+                {"backtest_complete": True},
+            )
+            lifecycle.advance(
+                "candidate-unsupported",
+                CandidateStage.VALIDATED,
+                {"validation_complete": True, "holdout_used": False},
+            )
+            lifecycle.advance(
+                "candidate-unsupported",
+                CandidateStage.ROBUSTNESS_CHECKED,
+                {"robustness_passed": True},
+            )
+            with self.assertRaisesRegex(ValueError, "LEGACY_SCOPE_SUCCESSOR_REQUIRED"):
+                lifecycle.advance(
+                    "candidate-unsupported",
+                    CandidateStage.FROZEN,
+                    {
+                        "frozen": True,
+                        "strategy_hash": "strategy-hash",
+                        "model_hash": "model-hash",
+                        "config_hash": "config-hash",
+                        "risk_snapshot": {"max_position_fraction": 0.05},
+                    },
+                )
 
             requirements = store.candidate_forward_requirements(
                 candidate_ids=["candidate-empty", "candidate-unsupported"],

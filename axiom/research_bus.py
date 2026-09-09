@@ -151,6 +151,18 @@ _SAFE_IDENTIFIER_FIELDS = frozenset(
         "no_token_id",
         "clob_token_id",
         "clob_token_ids",
+        # A frozen hash is normally an execution binding and remains blocked.
+        # These narrowly named fields are audit-only predecessor references
+        # emitted by legacy-scope successors; they carry no executable state.
+        "predecessor_candidate_id",
+        "predecessor_frozen_hash",
+        "successor_candidate_id",
+        "successor_scope_hash",
+        "successor_scope_version",
+        "legacy_scope_hash",
+        "legacy_scope_version",
+        "canonical_scope_hash",
+        "canonical_scope_version",
     }
 )
 
@@ -289,6 +301,20 @@ class DurableResearchBus:
 
     def submit_hypothesis(self, payload: Mapping[str, Any], **kwargs: Any) -> ResearchQueueItem:
         return self.submit("hypothesis", payload, **kwargs)
+    def submit_proposal(self, payload: Mapping[str, Any], **kwargs: Any) -> ResearchQueueItem:
+        """Validate and enqueue one ordinary hypothesis proposal.
+
+        The bus remains the durable/audited boundary.  Importing the director
+        lazily avoids a module cycle while ensuring callers cannot bypass the
+        same proposal validation used by the queue processor.
+        """
+        from .director import validate_hermes_proposal
+
+        validation = validate_hermes_proposal(payload, store=self._store)
+        if not validation.accepted:
+            detail = "; ".join(validation.reasons) or "proposal rejected"
+            raise ResearchBusPermissionError(f"INVALID_RESEARCH_PROPOSAL: {detail}")
+        return self.submit_hypothesis(validation.normalized or payload, **kwargs)
 
     def submit_candidate(self, payload: Mapping[str, Any], **kwargs: Any) -> ResearchQueueItem:
         return self.submit("candidate", payload, **kwargs)

@@ -130,6 +130,31 @@ def candidate_payload(
         "market_type": market_type,
         "dataset_id": dataset_id,
         "dataset_version": dataset_version,
+        "dataset_selector": {
+            "dataset_id": dataset_id,
+            "dataset_version": dataset_version,
+            "source_type": "HISTORICAL",
+        },
+        "dataset_attestation": {
+            "dataset_id": dataset_id,
+            "dataset_version": dataset_version,
+            "status": "CURRENT",
+            "policy_version": "v1",
+            "attestation_hash": "fixture-attestation",
+        },
+        "market_scope": {
+            "schema_version": "1",
+            "mode": "EXACT_MARKETS",
+            "instrument": "POLYMARKET",
+            "categories": [],
+            "market_ids": ["market-1"],
+            "filters": {},
+            "regime_restrictions": {},
+            "provenance": "canonical",
+        },
+        "market_scope_hash": "sha256:fixture-market-scope",
+        "market_scope_version": "market-scope-v1",
+        "plan_hash": "sha256:fixture-plan",
         "dataset_provenance": {
             "dataset_id": dataset_id,
             "dataset_version": dataset_version,
@@ -233,7 +258,51 @@ class AutonomousWorkflowTests(unittest.TestCase):
         payload = candidate_payload(candidate_id, **kwargs)
         self.store.save_candidate_lifecycle(candidate_id, "IDEA", payload, timestamp=T0)
         self.store.save_candidate_lifecycle(candidate_id, "FROZEN", payload, timestamp=T0)
+        self.store.save_market_scope_resolution(
+            {
+                "candidate_id": candidate_id,
+                "scope_hash": payload["market_scope_hash"],
+                "scope_version": payload["market_scope_version"],
+                "resolved_at": T0,
+                "status": "MATCHED",
+                "reason": "MATCHED",
+                "policy": payload["market_scope"],
+                "matched_markets": [
+                    {
+                        "market_id": "market-1",
+                        "condition_id": "condition-1",
+                        "yes_token_id": "yes",
+                        "no_token_id": "no",
+                        "metadata_provenance": {"source": "fixture"},
+                    }
+                ],
+                "provenance": {"source": "fixture"},
+            }
+        )
         return payload
+
+    def bind_fixture_scope(self, candidate_id: str, payload: Mapping[str, object]) -> None:
+        self.store.save_market_scope_resolution(
+            {
+                "candidate_id": candidate_id,
+                "scope_hash": payload["market_scope_hash"],
+                "scope_version": payload["market_scope_version"],
+                "resolved_at": T0,
+                "status": "MATCHED",
+                "reason": "MATCHED",
+                "policy": payload["market_scope"],
+                "matched_markets": [
+                    {
+                        "market_id": "market-1",
+                        "condition_id": "condition-1",
+                        "yes_token_id": "yes",
+                        "no_token_id": "no",
+                        "metadata_provenance": {"source": "fixture"},
+                    }
+                ],
+                "provenance": {"source": "fixture"},
+            }
+        )
     def save_quality_dataset(
         self,
         dataset_id: str,
@@ -955,6 +1024,7 @@ class AutonomousWorkflowTests(unittest.TestCase):
                 payload,
                 timestamp=T0,
             )
+            self.bind_fixture_scope(candidate_id, payload)
         self.save_forward_canary_snapshot()
         self.service.enable_autonomous_micro_live()
         venue = TestVenue()
@@ -1131,27 +1201,37 @@ class AutonomousWorkflowTests(unittest.TestCase):
         ), patch.object(CanaryService, "status", return_value=dashboard_projection):
             result = worker.tick(now=T0)
 
-        self.assertEqual(result["status"], "NO_SIGNAL")
+        self.assertEqual(result["status"], "BLOCKED")
+        self.assertEqual(result["blocker"], "CANDIDATE_EXECUTABLE_DOCUMENTS_UNAVAILABLE")
         self.assertEqual(result["candidate_id"], "durable-winner")
         authoritative = self.service.authoritative_status()
         self.assertEqual(authoritative["micro_live_canary"], AUTONOMOUS_MICRO_LIVE)
         self.assertEqual(authoritative["candidate"], "durable-winner")
 
-    def test_ranker_re_evaluates_legacy_full_payload_into_qualification_binding(self):
-        payload = self.seed_candidate("legacy")
-        legacy_evidence = {
-            **payload,
-            "forward_duration_seconds": 999_999,
-            "forward_observations": 100_000,
-            "forward_fills": 100_000,
-            "forward_trades": 100_000,
-            "forward_order_attempts": 100_000,
-            "forward_liquidity": 100_000,
-            "forward_max_drawdown": 0.01,
-            "forward_spread": 0.01,
-            "forward_requested_quantity": 100_000,
-            "forward_filled_quantity": 100_000,
-        }
+    def test_ranker_requires_canonical_scope_successor_for_legacy_payload(self):
+        payload = candidate_payload("legacy")
+        source_payload = dict(payload)
+        for field in (
+            "market_scope",
+            "market_scope_hash",
+            "market_scope_version",
+            "plan_hash",
+            "dataset_selector",
+            "dataset_attestation",
+        ):
+            source_payload.pop(field, None)
+        self.store.save_candidate_lifecycle(
+            "legacy",
+            "IDEA",
+            source_payload,
+            timestamp=T0,
+        )
+        self.store.save_candidate_lifecycle(
+            "legacy",
+            "FROZEN",
+            source_payload,
+            timestamp=T0,
+        )
         with self.store.connection:
             self.store.connection.execute(
                 "INSERT INTO canary_eligibility(candidate_id,eligible_at,frozen_hash,evidence_json) "
@@ -1159,39 +1239,25 @@ class AutonomousWorkflowTests(unittest.TestCase):
                 (
                     "legacy",
                     T0.isoformat(),
-                    payload["frozen_hash"],
-                    json.dumps(legacy_evidence, sort_keys=True),
+                    source_payload["frozen_hash"],
+                    json.dumps(source_payload, sort_keys=True),
                 ),
             )
-        before = self.store.connection.execute(
-            "SELECT evidence_json FROM canary_eligibility WHERE candidate_id=?",
-            ("legacy",),
-        ).fetchone()
-        self.assertNotEqual(json.loads(before["evidence_json"]).get("schema"), "canary-qualification-v1")
-
+        before = self.store.load_candidate_lifecycle("legacy")
         result = CandidateCanaryRanker(self.store, clock=lambda: T0).evaluate_and_select(T0)
-        evidence_row = self.store.connection.execute(
-            "SELECT evidence_json FROM canary_eligibility WHERE candidate_id=?",
+        after = self.store.load_candidate_lifecycle("legacy")
+        self.assertEqual(after["payload"], before["payload"])
+        self.assertIsNone(result["selected_candidate"])
+        self.assertEqual(result["eligible_count"], 0)
+        self.assertEqual(result["rankable_count"], 0)
+        self.assertEqual(self.store.connection.execute(
+            "SELECT COUNT(*) FROM canary_eligibility WHERE candidate_id=?",
             ("legacy",),
-        ).fetchone()
-        evidence = json.loads(evidence_row["evidence_json"])
-        self.assertEqual(evidence["schema"], "canary-qualification-v1")
-        self.assertEqual(evidence["candidate_id"], "legacy")
-        self.assertEqual(evidence["frozen_hash"], payload["frozen_hash"])
-        self.assertNotIn("forward_duration_seconds", evidence)
-        self.assertNotIn("forward_observations", evidence)
-
-        ranking_row = self.store.connection.execute(
-            "SELECT qualification_hash,ranking_snapshot_hash FROM canary_rankings "
-            "WHERE candidate_id=?",
-            ("legacy",),
-        ).fetchone()
-        self.assertTrue(ranking_row["qualification_hash"])
-        self.assertTrue(ranking_row["ranking_snapshot_hash"])
-        self.assertEqual(result["eligibility_raw_count"], 1)
-        self.assertEqual(result["eligible_count"], 1)
-        self.assertEqual(result["rankable_raw_count"], 1)
-        self.assertEqual(result["rankable_count"], 1)
+        ).fetchone()[0], 0)
+        self.assertEqual(
+            CandidateCanaryRanker(self.store, clock=lambda: T0).rankings(),
+            [],
+        )
 
     def test_rejected_candidate_is_not_executable_after_ranker_tick(self):
         payload = self.seed_candidate("rejected", executable=True, score=0.90)
@@ -2454,7 +2520,14 @@ class AutonomousWorkflowTests(unittest.TestCase):
     def _normalized_reason_counts(value):
         if isinstance(value, str):
             value = json.loads(value or "{}")
-        return dict(value) if isinstance(value, Mapping) else {}
+        if not isinstance(value, Mapping):
+            return {}
+        # Production persists the additive reason taxonomy. Legacy tests
+        # intentionally assert only the stable compatibility projection.
+        return {
+            reason: int(value.get(reason, 0) or 0)
+            for reason in AutonomousWorkflowTests._SIGNAL_REASON_CODES
+        }
 
     def _assert_reason_counts(
         self,
@@ -2823,7 +2896,10 @@ class AutonomousWorkflowTests(unittest.TestCase):
 
         active_cycle = "active-current"
         active_time = T0 + timedelta(minutes=10)
-        active_reason_counts = {"NO_STRATEGY_SIGNAL": 1}
+        active_reason_counts = {
+            reason: (1 if reason == "NO_STRATEGY_SIGNAL" else 0)
+            for reason in self._SIGNAL_REASON_CODES
+        }
         self.service.record_autonomous_decision(
             next_decision="EVALUATING_CANDIDATES",
             worker_status="RUNNING",
@@ -3178,6 +3254,7 @@ class AutonomousWorkflowTests(unittest.TestCase):
                 "QUALIFICATION_INVALID",
                 "DUPLICATE_CLUSTER_DEFERRED",
                 "CYCLE_REMAINDER",
+                "LEGACY_SCOPE_SUCCESSOR_REQUIRED",
             },
         )
         self.assertTrue(
@@ -4069,6 +4146,7 @@ class AutonomousWorkflowTests(unittest.TestCase):
                 payload,
                 timestamp=T0,
             )
+            self.bind_fixture_scope(candidate_id, payload)
         self._enable_worker()
         checked: list[str] = []
         worker = AutonomousCanaryWorker(

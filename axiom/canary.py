@@ -1045,12 +1045,22 @@ _CANARY_QUALIFICATION_KEYS = frozenset(
         "candidate_id",
         "market_type",
         "market",
+        "market_scope",
+        "market_scope_hash",
+        "market_scope_version",
+        "scope_hash",
+        "scope_version",
+        "plan_hash",
         "strategy_id",
         "timeframe",
         "source_type",
         "dataset_id",
         "dataset_version",
+        "dataset_selector",
         "dataset_provenance",
+        "dataset_attestation",
+        "dataset_integrity_attestation",
+        "historical_dataset_attestation",
         "strategy_hash",
         "model_hash",
         "config_hash",
@@ -1189,6 +1199,317 @@ def _canary_prediction_market_inputs(payload: Mapping[str, Any]) -> dict[str, An
         "sources": sources,
         "effective": _canary_prediction_market(body),
     }
+def _canary_mapping_value(source: Any, name: str, default: Any = None) -> Any:
+    if isinstance(source, Mapping):
+        return source.get(name, default)
+    return getattr(source, name, default)
+
+
+def _canary_scope_binding(payload: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Extract the frozen plan/scope and historical selector binding.
+
+    The lifecycle payload is the compatibility boundary: current candidates
+    persist the canonical fields at top level, while normalized plans keep
+    them nested under ``experiment_plan``/``market_scope``.  This helper does
+    not infer a broad market universe and never turns a research-only scope
+    into forward authority.
+    """
+    body = payload if isinstance(payload, Mapping) else {}
+    plan = body.get("experiment_plan")
+    plan = plan if isinstance(plan, Mapping) else {}
+    scope = body.get("market_scope")
+    if not isinstance(scope, Mapping):
+        scope = plan.get("market_scope")
+    scope = scope if isinstance(scope, Mapping) else {}
+    selector = body.get("dataset_selector")
+    if not isinstance(selector, Mapping):
+        selector = plan.get("dataset_selector")
+    selector = dict(selector) if isinstance(selector, Mapping) else {}
+    plan_hash = (
+        body.get("plan_hash")
+        or plan.get("plan_hash")
+        or plan.get("policy_hash")
+    )
+    scope_hash = (
+        body.get("market_scope_hash")
+        or body.get("scope_hash")
+        or scope.get("scope_hash")
+        or scope.get("policy_hash")
+        or scope.get("hash")
+        or plan.get("market_scope_hash")
+    )
+    scope_version = (
+        body.get("market_scope_version")
+        or body.get("scope_version")
+        or scope.get("scope_version")
+        or scope.get("schema_version")
+        or scope.get("version")
+        or plan.get("market_scope_version")
+    )
+    dataset_id = body.get("dataset_id") or plan.get("dataset_id") or selector.get("dataset_id")
+    dataset_version = (
+        body.get("dataset_version")
+        or plan.get("dataset_version")
+        or selector.get("dataset_version")
+        or selector.get("version")
+    )
+    attestation = (
+        body.get("dataset_attestation")
+        or body.get("dataset_integrity_attestation")
+        or body.get("historical_dataset_attestation")
+    )
+    if not isinstance(attestation, Mapping):
+        attestation = {}
+    return {
+        "plan_hash": str(plan_hash).strip() if plan_hash is not None else None,
+        "scope_hash": str(scope_hash).strip() if scope_hash is not None else None,
+        "scope_version": str(scope_version).strip() if scope_version is not None else None,
+        "market_scope": dict(scope),
+        "dataset_selector": selector,
+        "dataset_id": str(dataset_id).strip() if dataset_id is not None else None,
+        "dataset_version": str(dataset_version).strip() if dataset_version is not None else None,
+        "dataset_attestation": dict(attestation),
+        "scope_declared": bool(scope or scope_hash or scope_version),
+    }
+
+
+def _canary_resolution_attr(resolution: Any, name: str, default: Any = None) -> Any:
+    value = _canary_mapping_value(resolution, name, default)
+    if value is not default:
+        return value
+    as_dict = getattr(resolution, "as_dict", None)
+    if callable(as_dict):
+        try:
+            encoded = as_dict()
+        except Exception:
+            encoded = None
+        if isinstance(encoded, Mapping):
+            return encoded.get(name, default)
+    return default
+
+
+def _canary_resolution_market(item: Any) -> dict[str, Any]:
+    """Normalize one typed ``CurrentMarket`` without widening its fields."""
+    if isinstance(item, Mapping):
+        source = dict(item)
+    else:
+        source = {}
+        as_dict = getattr(item, "as_dict", None)
+        if callable(as_dict):
+            try:
+                encoded = as_dict()
+            except Exception:
+                encoded = None
+            if isinstance(encoded, Mapping):
+                source.update(encoded)
+        for name in (
+            "market_id",
+            "yes_token_id",
+            "no_token_id",
+            "token_ids",
+            "category",
+            "instrument",
+            "metadata",
+        ):
+            value = getattr(item, name, None)
+            if value is not None:
+                source.setdefault(name, value)
+    market_id = source.get("market_id", source.get("id"))
+    token_ids = source.get("token_ids")
+    if isinstance(token_ids, Mapping):
+        yes_token_id = source.get("yes_token_id") or token_ids.get("yes") or token_ids.get("YES")
+        no_token_id = source.get("no_token_id") or token_ids.get("no") or token_ids.get("NO")
+    elif isinstance(token_ids, (list, tuple)) and len(token_ids) >= 2:
+        # Polymarket's canonical mapping is explicitly YES/NO in the
+        # resolution object; do not guess from an unordered collection.
+        yes_token_id = source.get("yes_token_id")
+        no_token_id = source.get("no_token_id")
+    else:
+        yes_token_id = source.get("yes_token_id")
+        no_token_id = source.get("no_token_id")
+    result = dict(source)
+    result["market_id"] = str(market_id).strip() if market_id is not None else ""
+    result["yes_token_id"] = str(yes_token_id).strip() if yes_token_id is not None else ""
+    result["no_token_id"] = str(no_token_id).strip() if no_token_id is not None else ""
+    return result
+def _canary_resolution_disposition(item: Any) -> dict[str, Any]:
+    """Normalize one persisted scope disposition for diagnostic evidence."""
+    if isinstance(item, Mapping):
+        source = dict(item)
+    else:
+        source = {}
+        as_dict = getattr(item, "as_dict", None)
+        if callable(as_dict):
+            try:
+                encoded = as_dict()
+            except Exception:
+                encoded = None
+            if isinstance(encoded, Mapping):
+                source.update(encoded)
+        for name in ("market_id", "reason", "detail", "metadata"):
+            value = getattr(item, name, None)
+            if value is not None:
+                source.setdefault(name, value)
+    source["market_id"] = str(source.get("market_id") or "").strip()
+    source["reason"] = str(source.get("reason") or "UNKNOWN").strip().upper()
+    source["detail"] = str(source.get("detail") or "").strip()
+    metadata = source.get("metadata")
+    source["metadata"] = dict(metadata) if isinstance(metadata, Mapping) else {}
+    return source
+
+
+def _canary_scope_disposition_failure(item: Mapping[str, Any]) -> str:
+    """Map resolver dispositions to non-authorizing canary diagnostics."""
+    reason = str(item.get("reason") or "").strip().upper()
+    if reason in {
+        "MARKET_CLOSED",
+        "INACTIVE_MARKET",
+        "RESOLVED_MARKET",
+        "MARKET_EXPIRED",
+    }:
+        return "MARKET_CLOSED"
+    if reason in {
+        "RULE_MISMATCH",
+        "CATEGORY_MISMATCH",
+        "INSTRUMENT_MISMATCH",
+        "VENUE_MISMATCH",
+        "NON_CURRENT_MARKET",
+    }:
+        return "MARKET_FILTER_MISMATCH"
+    if reason in {"NOT_OBSERVED", "FORWARD_SNAPSHOT_MISSING"}:
+        return "NO_FORWARD_SNAPSHOT"
+    return "DEFERRED_MARKETS"
+
+
+_CANARY_SCOPE_DISPOSITION_FAILURE_PRECEDENCE = {
+    "MARKET_CLOSED": 60,
+    "MARKET_FILTER_MISMATCH": 50,
+    "NO_FORWARD_SNAPSHOT": 40,
+    "DEFERRED_MARKETS": 20,
+}
+
+
+
+def _canary_current_scope_resolution(
+    store: AxiomStore,
+    candidate_id: str,
+    payload: Mapping[str, Any] | None,
+    *,
+    now: datetime,
+) -> dict[str, Any]:
+    """Load and validate the immutable persisted current market resolution."""
+    binding = _canary_scope_binding(payload)
+    result: dict[str, Any] = {
+        "candidate_id": str(candidate_id).strip(),
+        "bound": False,
+        "reason_code": "CANDIDATE_FORWARD_MARKET_UNRESOLVED",
+        "scope_hash": binding["scope_hash"],
+        "scope_version": binding["scope_version"],
+        "plan_hash": binding["plan_hash"],
+        "dataset_selector": binding["dataset_selector"],
+        "dataset_attestation": binding["dataset_attestation"],
+        "matched_markets": [],
+        "excluded_markets": [],
+        "deferred_markets": [],
+        "resolution": None,
+    }
+    scope_hash = binding["scope_hash"]
+    scope_version = binding["scope_version"]
+    if not binding.get("scope_declared"):
+        # Legacy frozen documents are diagnostic/migration inputs only.  They
+        # do not carry a canonical scope identity and therefore cannot become
+        # current execution authority by inference at this boundary.
+        result["legacy"] = True
+        result["reason_code"] = "LEGACY_SCOPE_SUCCESSOR_REQUIRED"
+        return result
+    if not scope_hash or not scope_version:
+        result["reason_code"] = "SCOPE_RESOLUTION_MISSING"
+        return result
+    loader = getattr(store, "load_market_scope_resolution", None)
+    if not callable(loader):
+        result["reason_code"] = "SCOPE_RESOLUTION_MISSING"
+        return result
+    try:
+        resolution = loader(
+            str(candidate_id).strip(),
+            scope_hash=scope_hash,
+            scope_version=scope_version,
+        )
+    except Exception:
+        resolution = None
+    if resolution is None:
+        try:
+            unbound = loader(str(candidate_id).strip())
+        except Exception:
+            unbound = None
+        result["reason_code"] = (
+            "SCOPE_RESOLUTION_SCOPE_MISMATCH"
+            if unbound is not None
+            else "SCOPE_RESOLUTION_MISSING"
+        )
+        return result
+    result["resolution"] = resolution
+    resolved_hash = _canary_resolution_attr(resolution, "scope_hash")
+    resolved_version = _canary_resolution_attr(resolution, "scope_version")
+    if (
+        str(resolved_hash or "").strip() != scope_hash
+        or str(resolved_version or "").strip() != scope_version
+    ):
+        result["reason_code"] = "SCOPE_RESOLUTION_SCOPE_MISMATCH"
+        return result
+    status = str(_canary_resolution_attr(resolution, "status", "") or "").strip().upper()
+    reason = str(_canary_resolution_attr(resolution, "reason", "") or "").strip().upper()
+    resolved_at = parse_timestamp(_canary_resolution_attr(resolution, "resolved_at"))
+    if (
+        resolved_at is None
+        or resolved_at > ensure_utc(now)
+        or (ensure_utc(now) - resolved_at).total_seconds() > CANARY_SIGNAL_MAX_AGE_SECONDS
+    ):
+        result["reason_code"] = "SCOPE_RESOLUTION_STALE"
+        return result
+    matched = _canary_resolution_attr(resolution, "matched_markets", ())
+    excluded = _canary_resolution_attr(resolution, "excluded_markets", ())
+    deferred = _canary_resolution_attr(resolution, "deferred_markets", ())
+    matched_values = list(matched) if isinstance(matched, (list, tuple, set, frozenset)) else []
+    excluded_values = list(excluded) if isinstance(excluded, (list, tuple, set, frozenset)) else []
+    deferred_values = list(deferred) if isinstance(deferred, (list, tuple, set, frozenset)) else []
+    markets = [_canary_resolution_market(item) for item in matched_values]
+    result["matched_markets"] = markets
+    result["excluded_markets"] = [
+        _canary_resolution_disposition(item) for item in excluded_values
+    ]
+    result["deferred_markets"] = [
+        _canary_resolution_disposition(item) for item in deferred_values
+    ]
+    if status not in {"MATCHED", "PARTIAL", "RESOLVED", "CURRENT"}:
+        if status == "RESEARCH_ONLY" or reason == "RESEARCH_ONLY":
+            result["reason_code"] = "RESEARCH_ONLY"
+        elif status == "INVALID_POLICY" or reason == "INVALID_POLICY":
+            result["reason_code"] = "INVALID_POLICY"
+        elif status == "DEFERRED" or "DEFERRED" in reason:
+            result["reason_code"] = "DEFERRED_MARKETS"
+        else:
+            result["reason_code"] = (
+                "SCOPE_RESOLUTION_ZERO_MATCHES"
+                if not markets or "ZERO" in reason
+                else "CANDIDATE_FORWARD_MARKET_UNRESOLVED"
+            )
+        return result
+    if not markets:
+        result["reason_code"] = "SCOPE_RESOLUTION_ZERO_MATCHES"
+        return result
+    if any(
+        not item.get("market_id")
+        or not item.get("yes_token_id")
+        or not item.get("no_token_id")
+        for item in markets
+    ):
+        result["reason_code"] = "SCOPE_RESOLUTION_TOKEN_MISMATCH"
+        return result
+    result["bound"] = True
+    result["reason_code"] = None
+    result["resolved_at"] = resolved_at.isoformat()
+    return result
 
 
 def _canary_qualification_projection(
@@ -1229,6 +1550,19 @@ def _canary_qualification_projection(
                 "market",
             },
         )
+    scope_binding = _canary_scope_binding(body)
+    for scope_name, scope_value in (
+        ("plan_hash", scope_binding.get("plan_hash")),
+        ("market_scope_hash", scope_binding.get("scope_hash")),
+        ("market_scope_version", scope_binding.get("scope_version")),
+        ("dataset_selector", scope_binding.get("dataset_selector")),
+        ("dataset_attestation", scope_binding.get("dataset_attestation")),
+    ):
+        if scope_value not in (None, "", {}, []):
+            result.setdefault(
+                scope_name,
+                _canary_qualification_value(scope_value, key=scope_name),
+            )
     if isinstance(quality, Mapping):
         derived_quality = _canary_qualification_value(
             persisted_quality_fields(quality)
@@ -2523,6 +2857,18 @@ class CanaryService:
             return None
         if value is None or isinstance(value, (str, bool, int)):
             if isinstance(value, str):
+                if lowered.endswith("reason_counts_json"):
+                    try:
+                        parsed = json.loads(value or "{}")
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        return "{}"
+                    if isinstance(parsed, Mapping):
+                        return json.dumps(
+                            parsed,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                            allow_nan=False,
+                        )
                 return value[:512]
             return value
         if isinstance(value, float):
@@ -4640,6 +4986,20 @@ class CanaryService:
             raise CanaryBlocked("CANDIDATE_RESEARCH_GATES_INCOMPLETE")
         if not quality.get("canary_data_quality_acceptable"):
             raise CanaryBlocked("CANDIDATE_RESEARCH_GATES_INCOMPLETE")
+        scope_binding = _canary_scope_binding(payload)
+        scope_resolution = _canary_current_scope_resolution(
+            self.store,
+            identifier,
+            payload,
+            now=ensure_utc(self.clock()),
+        )
+        if not scope_resolution.get("bound"):
+            raise CanaryBlocked(
+                str(
+                    scope_resolution.get("reason_code")
+                    or "SCOPE_RESOLUTION_MISSING"
+                )
+            )
 
         forward_test: Mapping[str, Any] | None = None
         forward_config: Mapping[str, Any] = {}
@@ -4704,10 +5064,13 @@ class CanaryService:
             or self._document_hash(model_document) != expected_model_hash
         ):
             raise CanaryBlocked("CANDIDATE_FROZEN_BINDING_INVALID")
+        scope_binding = _canary_scope_binding(payload)
         return {
             "candidate_id": identifier,
             "lifecycle": lifecycle,
             "payload": payload,
+            "qualification_hash": binding.get("qualification_hash"),
+            "plan_hash": scope_binding.get("plan_hash"),
             "frozen_hash": frozen_hash,
             "strategy_hash": expected_strategy_hash,
             "model_hash": expected_model_hash,
@@ -4718,6 +5081,9 @@ class CanaryService:
             "forward_config": forward_config,
             "data_quality": quality,
             "risk_limits": risk_limits,
+            "scope_resolution": scope_resolution,
+            "scope_hash": scope_resolution.get("scope_hash"),
+            "scope_version": scope_resolution.get("scope_version"),
         }
     @staticmethod
     def _signal_observation(row: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -5033,6 +5399,8 @@ class CanaryService:
             "paper_expected_price": str(expected_price),
             "score": score,
             "current_order_book_hash": _canary_document_hash(current_book),
+            "scope_hash": binding.get("scope_hash"),
+            "scope_version": binding.get("scope_version"),
         }
         base_signal_id = "canary-signal-" + hashlib.sha256(
             json.dumps(identity, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
@@ -5114,6 +5482,30 @@ class CanaryService:
                     source_observed_at = current_row.get("observed_at")
                     if isinstance(source_observed_at, datetime):
                         source_observed_at = ensure_utc(source_observed_at).isoformat()
+                    scope_market = next(
+                        (
+                            item
+                            for item in binding.get("scope_resolution", {}).get(
+                                "matched_markets", ()
+                            )
+                            if isinstance(item, Mapping)
+                            and str(item.get("market_id") or "").strip() == str(market_id)
+                        ),
+                        {},
+                    )
+                    scope_provenance = (
+                        scope_market.get("metadata_provenance")
+                        if isinstance(scope_market.get("metadata_provenance"), Mapping)
+                        else scope_market.get("metadata")
+                        if isinstance(scope_market.get("metadata"), Mapping)
+                        else {}
+                    )
+                    scope_resolution = binding.get("scope_resolution")
+                    scope_resolution_row = (
+                        scope_resolution.get("resolution")
+                        if isinstance(scope_resolution, Mapping)
+                        else scope_resolution
+                    )
                     evidence = {
                         "score": score,
                         "model_probability": current_observation.get("model_probability"),
@@ -5126,6 +5518,13 @@ class CanaryService:
                         "source_observed_at": source_observed_at,
                         "source_snapshot_id": source_snapshot_id,
                         "source_timestamp": source_timestamp.isoformat(),
+                        "plan_hash": _canary_scope_binding(binding.get("payload")).get("plan_hash"),
+                        "market_scope_hash": binding.get("scope_hash"),
+                        "market_scope_version": binding.get("scope_version"),
+                        "scope_resolution_id": _canary_resolution_attr(
+                            scope_resolution_row, "resolution_id"
+                        ),
+                        "market_metadata_provenance": dict(scope_provenance),
                     }
                     self.store.connection.execute(
                         "INSERT INTO canary_signals("
@@ -5198,61 +5597,116 @@ class CanaryService:
             }
             return self._persist_signal_evaluation(result)
 
-        authority: Mapping[str, Any] = {}
-        try:
-            loaded = self.store.candidate_forward_requirements(
-                candidate_ids=(identifier,),
-                now=now,
-                max_candidates=1,
-                max_markets_per_candidate=8,
-                max_total_markets=8,
-            )
-            if isinstance(loaded, Mapping):
-                authority = loaded
-        except Exception as exc:
-            return finish(
-                "CANDIDATE_FORWARD_MARKET_UNRESOLVED",
-                evidence={"authority_error": type(exc).__name__},
-            )
-
-        candidate_entry: Mapping[str, Any] = {}
-        candidates = authority.get("candidates")
-        if isinstance(candidates, (list, tuple)):
-            candidate_entry = next(
-                (
-                    item
-                    for item in candidates
-                    if isinstance(item, Mapping)
-                    and str(item.get("candidate_id") or "").strip() == identifier
-                ),
-                {},
-            )
-        raw_markets = candidate_entry.get("market_ids", candidate_entry.get("permitted_market_ids", ()))
-        market_ids = tuple(
-            dict.fromkeys(
-                str(value).strip()
-                for value in (raw_markets if isinstance(raw_markets, (list, tuple, set, frozenset)) else ())
-                if str(value).strip()
-            )
-        )[:8]
-        authority_reason = str(
-            candidate_entry.get("reason_code", authority.get("reason_code", ""))
-        ).strip().upper()
-        raw_declared_markets = candidate_entry.get("declared_market_ids", ())
-        declared_market_ids = tuple(
-            dict.fromkeys(
-                str(value).strip()
-                for value in (
-                    raw_declared_markets
-                    if isinstance(
-                        raw_declared_markets,
-                        (list, tuple, set, frozenset),
+        lifecycle = self.store.load_candidate_lifecycle(identifier)
+        lifecycle_payload = self._merged_lifecycle_payload(lifecycle)
+        scope_binding = _canary_scope_binding(lifecycle_payload)
+        scope_resolution = _canary_current_scope_resolution(
+            self.store,
+            identifier,
+            lifecycle_payload,
+            now=now,
+        )
+        if not scope_resolution.get("bound"):
+            evidence = {
+                "scope_hash": scope_resolution.get("scope_hash"),
+                "scope_version": scope_resolution.get("scope_version"),
+                "plan_hash": scope_binding.get("plan_hash"),
+                "scope_resolution_reason": scope_resolution.get("reason_code"),
+                "excluded_markets": scope_resolution.get("excluded_markets", []),
+                "deferred_markets": scope_resolution.get("deferred_markets", []),
+            }
+            # Persisted exclusions/deferred entries are diagnostic evidence
+            # only.  Project them to a precise non-actionable reason without
+            # treating any excluded market as executable authority.
+            disposition_failures: list[dict[str, Any]] = []
+            for field in ("excluded_markets", "deferred_markets"):
+                values = scope_resolution.get(field, ())
+                if not isinstance(values, (list, tuple)):
+                    continue
+                for disposition in values:
+                    if not isinstance(disposition, Mapping):
+                        continue
+                    market_id = str(disposition.get("market_id") or "").strip()
+                    if not market_id:
+                        continue
+                    failure_reason = _canary_scope_disposition_failure(disposition)
+                    disposition_failures.append(
+                        {
+                            "market_id": market_id,
+                            "reason_code": failure_reason,
+                            "disposition_reason": str(
+                                disposition.get("reason") or ""
+                            ).strip().upper(),
+                            "detail": str(disposition.get("detail") or "").strip(),
+                        }
                     )
-                    else ()
+            if disposition_failures:
+                selected = min(
+                    enumerate(disposition_failures),
+                    key=lambda item: (
+                        -_CANARY_SCOPE_DISPOSITION_FAILURE_PRECEDENCE.get(
+                            item[1]["reason_code"], 0
+                        ),
+                        item[0],
+                    ),
+                )[1]
+                evidence["market_failures"] = [
+                    {
+                        "market_id": item["market_id"],
+                        "reason_code": item["reason_code"],
+                    }
+                    for item in disposition_failures
+                ]
+                evidence["scope_disposition_reason"] = selected[
+                    "disposition_reason"
+                ]
+                if selected["detail"]:
+                    evidence["scope_disposition_detail"] = selected["detail"]
+                return finish(
+                    selected["reason_code"],
+                    market_id=selected["market_id"],
+                    evidence=evidence,
                 )
-                if str(value).strip()
+            return finish(
+                str(
+                    scope_resolution.get("reason_code")
+                    or "SCOPE_RESOLUTION_MISSING"
+                ),
+                evidence=evidence,
             )
+        resolved_markets = scope_resolution.get("matched_markets", [])
+        market_ids = tuple(
+            str(item.get("market_id") or "").strip()
+            for item in resolved_markets
+            if isinstance(item, Mapping) and str(item.get("market_id") or "").strip()
         )[:8]
+        scope = scope_binding.get("market_scope", {})
+        declared_values = (
+            scope.get("market_ids", scope.get("exact_market_ids", ()))
+            if isinstance(scope, Mapping)
+            else ()
+        )
+        declared_market_ids = tuple(
+            str(value).strip()
+            for value in declared_values
+            if str(value).strip()
+        )[:8]
+        authority_reason = "CANDIDATE_FORWARD_MARKET_RESOLVED"
+        authority: Mapping[str, Any] = {
+            "candidates": [
+                {
+                    "candidate_id": identifier,
+                    "resolution": "RESOLVED",
+                    "reason_code": authority_reason,
+                    "market_ids": list(market_ids),
+                    "permitted_market_ids": list(market_ids),
+                    "declared_market_ids": list(declared_market_ids),
+                }
+            ],
+            "market_ids": list(market_ids),
+            "as_of": scope_resolution.get("resolved_at"),
+        }
+        candidate_entry: Mapping[str, Any] = authority["candidates"][0]
         required_health: Mapping[str, Any] = {}
         try:
             health = self.store.polymarket_required_health(
@@ -5268,6 +5722,14 @@ class CanaryService:
                 required_health={},
                 evidence={"health_error": type(exc).__name__},
             )
+        resolved_token_bindings = {
+            str(item.get("market_id") or "").strip(): {
+                "yes_token_id": str(item.get("yes_token_id") or "").strip(),
+                "no_token_id": str(item.get("no_token_id") or "").strip(),
+            }
+            for item in scope_resolution.get("matched_markets", ())
+            if isinstance(item, Mapping) and str(item.get("market_id") or "").strip()
+        }
 
         evidence: dict[str, Any] = {
             "authority": {
@@ -5278,6 +5740,33 @@ class CanaryService:
             "required_health_reason_code": required_health.get("reason_code"),
             "required_market_count": required_health.get("required_market_count"),
         }
+        evidence.update(
+            {
+                "plan_hash": scope_binding.get("plan_hash"),
+                "scope_hash": scope_binding.get("scope_hash"),
+                "scope_version": scope_binding.get("scope_version"),
+                "scope_resolution_status": _canary_resolution_attr(
+                    scope_resolution.get("resolution"), "status"
+                )
+                if scope_resolution.get("resolution") is not None
+                else None,
+                "scope_resolution_resolved_at": scope_resolution.get("resolved_at"),
+                "resolved_market_ids": list(market_ids),
+                "excluded_markets": scope_resolution.get("excluded_markets", []),
+                "deferred_markets": scope_resolution.get("deferred_markets", []),
+                "resolved_market_metadata_provenance": {
+                    str(item.get("market_id") or "").strip(): dict(
+                        item.get("metadata_provenance")
+                        if isinstance(item.get("metadata_provenance"), Mapping)
+                        else item.get("metadata")
+                        if isinstance(item.get("metadata"), Mapping)
+                        else {}
+                    )
+                    for item in scope_resolution.get("matched_markets", ())
+                    if isinstance(item, Mapping) and str(item.get("market_id") or "").strip()
+                },
+            }
+        )
         for key in ("fresh", "stale", "missing", "closed_candidates", "unresolved_candidates"):
             value = required_health.get(key, authority.get(key, ()))
             if isinstance(value, (list, tuple)):
@@ -5395,6 +5884,28 @@ class CanaryService:
             except (TypeError, ValueError, KeyError):
                 filter_mismatch_ids = set()
 
+        # The resolver's immutable exclusions are authoritative diagnostics.
+        # They are never appended to ``market_ids`` or sent through model
+        # evaluation, but must remain visible when current inventory shape
+        # cannot independently classify an omitted declared target.
+        for field in ("excluded_markets", "deferred_markets"):
+            values = scope_resolution.get(field, ())
+            if not isinstance(values, (list, tuple)):
+                continue
+            for disposition in values:
+                if not isinstance(disposition, Mapping):
+                    continue
+                market_id = str(disposition.get("market_id") or "").strip()
+                if not market_id:
+                    continue
+                failure_reason = _canary_scope_disposition_failure(disposition)
+                if failure_reason == "MARKET_CLOSED":
+                    closed_market_ids.add(market_id)
+                elif failure_reason == "MARKET_FILTER_MISMATCH":
+                    filter_mismatch_ids.add(market_id)
+                elif failure_reason == "NO_FORWARD_SNAPSHOT":
+                    missing_market_ids.add(market_id)
+
         if authority_reason == "COLLECTOR_CAPACITY_INSUFFICIENT":
             return finish(
                 "COLLECTOR_CANDIDATE_HEALTH_BLOCKED",
@@ -5487,9 +5998,14 @@ class CanaryService:
         failure_precedence = {
             "MARKET_CLOSED": 60,
             "MARKET_FILTER_MISMATCH": 50,
+            "SCOPE_RESOLUTION_TOKEN_MISMATCH": 50,
             "NO_FORWARD_SNAPSHOT": 40,
             "STALE_FORWARD_EVIDENCE": 30,
             "COLLECTOR_CANDIDATE_HEALTH_BLOCKED": 20,
+            "MODEL_INPUT_MISSING": 15,
+            "WARMING_UP": 12,
+            "INSUFFICIENT_LOOKBACK": 12,
+            "STRATEGY_EVALUATED_DECLINED": 10,
             "NO_STRATEGY_SIGNAL": 10,
         }
         failures: list[dict[str, Any]] = []
@@ -5631,13 +6147,18 @@ class CanaryService:
                 stamp = parse_timestamp(row.get("source_timestamp"))
                 if observation is not None and stamp is not None and stamp <= now:
                     observations.append(observation)
-            if not observations or not self._apply_signal_model(
-                observations, binding["model_document"]
-            ):
+            if not observations:
                 record_failure(
-                    "NO_STRATEGY_SIGNAL",
+                    "WARMING_UP",
                     market_id,
-                    details={"signal_blocker": "STRATEGY_NOT_ACTIONABLE"},
+                    details={"signal_blocker": "INSUFFICIENT_FORWARD_INPUT"},
+                )
+                continue
+            if not self._apply_signal_model(observations, binding["model_document"]):
+                record_failure(
+                    "MODEL_INPUT_MISSING",
+                    market_id,
+                    details={"signal_blocker": "MODEL_INPUT_MISSING"},
                 )
                 continue
             current_observation["model_probability"] = observations[-1].get(
@@ -5650,14 +6171,34 @@ class CanaryService:
                     binding["strategy"], {"snapshots": tuple(observations)}
                 )
                 score = float(evaluated.score)
+                evaluation_reason = str(
+                    getattr(evaluated, "reason_code", "")
+                    or "STRATEGY_EVALUATED_DECLINED"
+                ).strip().upper()
             except (TypeError, ValueError, OverflowError):
                 score = 0.0
                 evaluated = None
-            if not math.isfinite(score) or evaluated is None or not evaluated.actionable:
+                evaluation_reason = "STRATEGY_EVALUATED_DECLINED"
+            if (
+                not math.isfinite(score)
+                or evaluated is None
+                or not evaluated.actionable
+            ):
+                compatibility_reason = (
+                    "NO_STRATEGY_SIGNAL"
+                    if (
+                        not scope_binding.get("scope_declared")
+                        and evaluation_reason == "STRATEGY_EVALUATED_DECLINED"
+                    )
+                    else evaluation_reason
+                )
                 record_failure(
-                    "NO_STRATEGY_SIGNAL",
+                    compatibility_reason,
                     market_id,
-                    details={"signal_blocker": "STRATEGY_NOT_ACTIONABLE"},
+                    details={
+                        "signal_blocker": "STRATEGY_NOT_ACTIONABLE",
+                        "evaluation_reason": evaluation_reason,
+                    },
                 )
                 continue
             outcome = "yes" if score > 0 else "no"
@@ -5666,6 +6207,22 @@ class CanaryService:
             if isinstance(token_ids, Mapping):
                 token_id = token_id or token_ids.get(outcome)
             token_id = str(token_id or "").strip()
+            expected_token = (
+                resolved_token_bindings.get(market_id, {}).get(f"{outcome}_token_id")
+                if resolved_token_bindings
+                else None
+            )
+            if expected_token and token_id != expected_token:
+                record_failure(
+                    "SCOPE_RESOLUTION_TOKEN_MISMATCH",
+                    market_id,
+                    details={
+                        "signal_blocker": "FROZEN_TOKEN_MAPPING_CHANGED",
+                        "expected_token_id": expected_token,
+                        "observed_token_id": token_id,
+                    },
+                )
+                continue
             current_book = self._current_order_book(
                 current_observation,
                 outcome,
@@ -5909,6 +6466,44 @@ class CanaryService:
         ):
             self._invalidate_signal(signal_id, "CANDIDATE_FROZEN_BINDING_CHANGED")
             raise CanaryBlocked("CANARY_SIGNAL_NO_LONGER_VALID")
+        scope_resolution = _canary_current_scope_resolution(
+            self.store,
+            str(signal.get("candidate_id") or ""),
+            binding.get("payload"),
+            now=now,
+        )
+        if not scope_resolution.get("bound"):
+            reason = str(
+                scope_resolution.get("reason_code")
+                or "SCOPE_RESOLUTION_STALE"
+            )
+            self._invalidate_signal(signal_id, reason)
+            raise CanaryBlocked(reason)
+        selected_scope_market = next(
+            (
+                item
+                for item in scope_resolution.get("matched_markets", ())
+                if isinstance(item, Mapping)
+                and str(item.get("market_id") or "").strip()
+                == str(signal.get("market_id") or "").strip()
+            ),
+            None,
+        )
+        expected_scope_token = (
+            selected_scope_market.get(
+                f"{str(signal.get('outcome') or '').strip().lower()}_token_id"
+            )
+            if isinstance(selected_scope_market, Mapping)
+            else None
+        )
+        if (
+            not isinstance(selected_scope_market, Mapping)
+            or not expected_scope_token
+            or str(expected_scope_token).strip()
+            != str(signal.get("token_id") or "").strip()
+        ):
+            self._invalidate_signal(signal_id, "SCOPE_RESOLUTION_TOKEN_MISMATCH")
+            raise CanaryBlocked("SCOPE_RESOLUTION_TOKEN_MISMATCH")
         control_snapshot = self.authoritative_status()
         if control_snapshot.get("micro_live_canary") == AUTONOMOUS_MICRO_LIVE:
             control_candidate = str(
@@ -5918,14 +6513,25 @@ class CanaryService:
             if not control_candidate or not signal_candidate or control_candidate != signal_candidate:
                 self._invalidate_signal(signal_id, "AUTO_CANARY_CANDIDATE_NOT_SELECTED")
                 raise CanaryBlocked("AUTO_CANARY_CANDIDATE_NOT_SELECTED")
+        resolved_ids = [
+            str(item.get("market_id") or "").strip()
+            for item in scope_resolution.get("matched_markets", ())
+            if isinstance(item, Mapping) and str(item.get("market_id") or "").strip()
+        ][:8]
+        requirements: Mapping[str, Any] = {
+            "candidates": [
+                {
+                    "candidate_id": str(signal["candidate_id"]),
+                    "resolution": "RESOLVED",
+                    "reason_code": "CANDIDATE_FORWARD_MARKET_RESOLVED",
+                    "market_ids": resolved_ids,
+                    "permitted_market_ids": resolved_ids,
+                }
+            ],
+            "market_ids": resolved_ids,
+            "as_of": scope_resolution.get("resolved_at"),
+        }
         try:
-            requirements = self.store.candidate_forward_requirements(
-                candidate_ids=(str(signal["candidate_id"]),),
-                now=now,
-                max_candidates=1,
-                max_markets_per_candidate=8,
-                max_total_markets=8,
-            )
             required_health = self.store.polymarket_required_health(
                 requirements=requirements,
                 now=now,
@@ -5995,6 +6601,65 @@ class CanaryService:
         ):
             self._invalidate_signal(signal_id, "MARKET_BINDING_CHANGED")
             raise CanaryBlocked("CANARY_SIGNAL_NO_LONGER_VALID")
+        try:
+            final_binding = self._candidate_signal_binding(
+                str(signal.get("candidate_id") or "")
+            )
+        except CanaryBlocked as exc:
+            self._invalidate_signal(signal_id, str(exc))
+            raise
+        if any(
+            final_binding.get(name) != binding.get(name)
+            for name in (
+                "frozen_hash",
+                "qualification_hash",
+                "plan_hash",
+                "strategy_hash",
+                "model_hash",
+                "config_hash",
+                "scope_hash",
+                "scope_version",
+            )
+        ):
+            self._invalidate_signal(signal_id, "CANDIDATE_LIFECYCLE_CHANGED")
+            raise CanaryBlocked("CANDIDATE_LIFECYCLE_CHANGED")
+        binding = final_binding
+        # Last scope/token/lifecycle fence immediately before the only
+        # submission route. Earlier checks intentionally do not substitute
+        # for this point-in-time recheck.
+        final_scope = _canary_current_scope_resolution(
+            self.store,
+            str(signal.get("candidate_id") or ""),
+            binding.get("payload"),
+            now=ensure_utc(self.clock()),
+        )
+        final_market = next(
+            (
+                item
+                for item in final_scope.get("matched_markets", ())
+                if isinstance(item, Mapping)
+                and str(item.get("market_id") or "").strip()
+                == str(signal.get("market_id") or "").strip()
+            ),
+            None,
+        )
+        final_expected_token = (
+            final_market.get(f"{outcome}_token_id")
+            if isinstance(final_market, Mapping)
+            else None
+        )
+        if (
+            not final_scope.get("bound")
+            or not isinstance(final_market, Mapping)
+            or str(final_expected_token or "").strip()
+            != str(signal.get("token_id") or "").strip()
+        ):
+            reason = str(
+                final_scope.get("reason_code")
+                or "SCOPE_RESOLUTION_TOKEN_MISMATCH"
+            )
+            self._invalidate_signal(signal_id, reason)
+            raise CanaryBlocked(reason)
         return self.submit(
             signal_id=str(signal["signal_id"]),
             candidate_id=str(signal["candidate_id"]),
@@ -6758,7 +7423,10 @@ class CanaryService:
                     _verify_attestation=False,
                 )
                 if not validation.get("eligible"):
-                    reason = "ELIGIBILITY_INVALID"
+                    reason = str(
+                        validation.get("reason_code")
+                        or "ELIGIBILITY_INVALID"
+                    ).strip().upper()
                 else:
                     try:
                         row = self.store.connection.execute(
@@ -7870,6 +8538,10 @@ class CanaryService:
             else bool(allow_environment)
         )
         is_official_venue = type(venue) is PolymarketClobV2Venue
+        reservation_control_state: str | None = None
+        reservation_control_candidate: str | None = None
+        reservation_control_expiry: str | None = None
+        reservation_control_generation: int | None = None
 
         def block(reason: str) -> None:
             raise CanaryBlocked(reason)
@@ -7944,6 +8616,165 @@ class CanaryService:
                 block("BALANCE_CHECK_FAILED")
             if balance < required:
                 block("INSUFFICIENT_BALANCE")
+        def enforce_submission_fence(
+            *,
+            required_status: str,
+        ) -> Mapping[str, Any]:
+            """Require the persisted, current signal immediately before posting."""
+            signal = self.get_signal(signal_id)
+            if not isinstance(signal, Mapping):
+                block("CANARY_SIGNAL_NOT_FOUND")
+            if str(signal.get("status") or "").upper() != required_status.upper():
+                if (
+                    required_status.upper() == "READY"
+                    and str(signal.get("status") or "").upper()
+                    in {"SUBMITTED", "SUBMITTING", "UNKNOWN", "REJECTED"}
+                ):
+                    block("DUPLICATE_SIGNAL")
+                block(
+                    "CANARY_SIGNAL_NOT_READY"
+                    if required_status.upper() == "READY"
+                    else "CANARY_SIGNAL_STATE_CHANGED"
+                )
+            if any(
+                str(signal.get(name) or "").strip() != str(expected).strip()
+                for name, expected in (
+                    ("candidate_id", candidate_id),
+                    ("market_id", market_id),
+                    ("token_id", token_id),
+                    ("side", side),
+                )
+            ):
+                block("CANARY_SIGNAL_BINDING_MISMATCH")
+            try:
+                signal_price = Decimal(str(signal.get("paper_expected_price")))
+                expected_price = Decimal(str(paper_expected_price))
+            except (TypeError, ValueError, ArithmeticError):
+                block("CANARY_SIGNAL_BINDING_MISMATCH")
+            if (
+                not signal_price.is_finite()
+                or not expected_price.is_finite()
+                or signal_price != expected_price
+            ):
+                block("CANARY_SIGNAL_BINDING_MISMATCH")
+            signal_evidence = signal.get("evidence")
+            if (
+                not isinstance(signal_evidence, Mapping)
+                or signal_evidence.get("current_execution_evidence")
+                != CURRENT_ORDER_BOOK
+            ):
+                block("CURRENT_ORDER_BOOK_REQUIRED")
+            fence_now = ensure_utc(self.clock())
+            if required_status.upper() == "SUBMITTING":
+                book_timestamp = parse_timestamp(
+                    signal_evidence.get("current_order_book_timestamp")
+                )
+                source_timestamp = parse_timestamp(
+                    signal_evidence.get("source_timestamp")
+                    or signal.get("source_timestamp")
+                )
+                if (
+                    book_timestamp is None
+                    or source_timestamp is None
+                    or book_timestamp > fence_now
+                    or source_timestamp > fence_now
+                    or (fence_now - book_timestamp).total_seconds()
+                    > CANARY_SIGNAL_MAX_AGE_SECONDS
+                    or (fence_now - source_timestamp).total_seconds()
+                    > CANARY_SIGNAL_MAX_AGE_SECONDS
+                ):
+                    block("CANARY_SIGNAL_STALE")
+            if required_status.upper() == "READY":
+                return signal
+            lifecycle = self.store.load_candidate_lifecycle(
+                str(signal.get("candidate_id") or "")
+            )
+            payload = self._merged_lifecycle_payload(lifecycle)
+            if not isinstance(payload, Mapping):
+                block("CANDIDATE_FROZEN_BINDING_INVALID")
+            validation = self.validate_eligibility(
+                str(signal.get("candidate_id") or ""),
+                _record=lifecycle,
+            )
+            if not validation.get("eligible"):
+                block(
+                    str(
+                        validation.get("reason_code")
+                        or "CANDIDATE_RESEARCH_GATES_INCOMPLETE"
+                    )
+                )
+            if any(
+                str(payload.get(name) or "").strip()
+                != str(signal.get(name) or "").strip()
+                for name in (
+                    "frozen_hash",
+                    "strategy_hash",
+                    "model_hash",
+                    "config_hash",
+                )
+            ):
+                block("CANDIDATE_LIFECYCLE_CHANGED")
+            validation_binding = validation.get("binding")
+            if (
+                not isinstance(validation_binding, Mapping)
+                or not validation_binding.get("bound")
+            ):
+                block("CANDIDATE_FROZEN_BINDING_INVALID")
+            scope = _canary_current_scope_resolution(
+                self.store,
+                str(signal.get("candidate_id") or ""),
+                payload,
+                now=fence_now,
+            )
+            if required_status.upper() == "SUBMITTING" and (
+                str(
+                    signal_evidence.get("scope_hash")
+                    or signal_evidence.get("market_scope_hash")
+                    or ""
+                ).strip()
+                != str(scope.get("scope_hash") or "").strip()
+                or str(
+                    signal_evidence.get("scope_version")
+                    or signal_evidence.get("market_scope_version")
+                    or ""
+                ).strip()
+                != str(scope.get("scope_version") or "").strip()
+            ):
+                block("SCOPE_RESOLUTION_SCOPE_MISMATCH")
+            matched = (
+                scope.get("matched_markets", ())
+                if isinstance(scope, Mapping)
+                else ()
+            )
+            selected = next(
+                (
+                    item
+                    for item in matched
+                    if isinstance(item, Mapping)
+                    and str(item.get("market_id") or "").strip()
+                    == str(market_id).strip()
+                ),
+                None,
+            )
+            expected_token = (
+                selected.get(
+                    f"{str(signal.get('outcome') or '').strip().lower()}_token_id"
+                )
+                if isinstance(selected, Mapping)
+                else None
+            )
+            if required_status.upper() == "SUBMITTING" and (
+                not isinstance(selected, Mapping)
+                or not scope.get("bound")
+                or str(expected_token or "").strip() != str(token_id).strip()
+            ):
+                block("SCOPE_RESOLUTION_TOKEN_MISMATCH")
+            return signal
+
+        # Direct callers are not allowed to manufacture a submission from
+        # candidate arguments; a current persisted READY signal is mandatory.
+        enforce_submission_fence(required_status="READY")
+
 
 
         def submit_official_order(
@@ -8043,6 +8874,8 @@ class CanaryService:
                     raise CanaryBlocked("INSUFFICIENT_BALANCE")
                 if allowance < required:
                     raise CanaryBlocked("CANARY_ALLOWANCE_INSUFFICIENT")
+                enforce_submission_fence(required_status="SUBMITTING")
+                final_submission_fence()
                 response = client.post_order(signed)
                 accepted = bool(_sdk_value(response, "ok", False))
                 if accepted:
@@ -8250,6 +9083,37 @@ class CanaryService:
             connection.execute("BEGIN IMMEDIATE")
             try:
                 locked_snapshot = self.authoritative_status()
+                reservation_control_row = connection.execute(
+                    "SELECT state,candidate_id,expires_at,control_generation "
+                    "FROM canary_control WHERE singleton=1"
+                ).fetchone()
+                if reservation_control_row is None:
+                    block("CANARY_NOT_ARMED")
+                try:
+                    reservation_control_state = str(
+                        reservation_control_row["state"] or ""
+                    ).upper()
+                    reservation_control_candidate = (
+                        str(reservation_control_row["candidate_id"]).strip()
+                        if reservation_control_row["candidate_id"] is not None
+                        else None
+                    )
+                    reservation_control_expiry = (
+                        str(reservation_control_row["expires_at"])
+                        if reservation_control_row["expires_at"] is not None
+                        else None
+                    )
+                    reservation_control_generation = int(
+                        reservation_control_row["control_generation"] or 0
+                    )
+                except (TypeError, ValueError):
+                    block("CANARY_CONTROL_CORRUPT")
+                if reservation_control_generation <= 0:
+                    block("CANARY_CONTROL_CORRUPT")
+                if reservation_control_state != str(
+                    locked_snapshot.get("micro_live_canary") or ""
+                ).upper():
+                    block("CANARY_CONTROL_CHANGED")
                 if locked_snapshot["micro_live_canary"] == "KILLED":
                     block("CANARY_KILLED")
                 if locked_snapshot["micro_live_canary"] not in {"ARMED", AUTONOMOUS_MICRO_LIVE}:
@@ -8312,6 +9176,9 @@ class CanaryService:
                 event_time = ensure_utc(self.clock())
                 evidence_record = dict(evidence)
                 evidence_record["control_generation"] = control_generation
+                evidence_record["control_state"] = reservation_control_state
+                evidence_record["control_candidate"] = reservation_control_candidate
+                evidence_record["control_expiry"] = reservation_control_expiry
                 connection.execute(
                     "INSERT INTO canary_ledger("
                     "event_id,signal_id,timestamp,candidate_id,venue,market_id,"
@@ -8403,6 +9270,24 @@ class CanaryService:
                     if not isinstance(control_limits, Mapping):
                         block("CANARY_CONTROL_CORRUPT")
                     control_generation = int(control["control_generation"] or 0)
+                    if (
+                        reservation_control_generation is None
+                        or control_generation != reservation_control_generation
+                    ):
+                        block("CANARY_CONTROL_CHANGED")
+                    if control_state != reservation_control_state:
+                        block("CANARY_CONTROL_CHANGED")
+                    if (
+                        str(control["candidate_id"] or "").strip()
+                        != (reservation_control_candidate or "")
+                    ):
+                        block(
+                            "AUTO_CANARY_CANDIDATE_NOT_SELECTED"
+                            if control_state == AUTONOMOUS_MICRO_LIVE
+                            else "CANDIDATE_MISMATCH"
+                        )
+                    if control_expiry != (reservation_control_expiry or ""):
+                        block("CANARY_CONTROL_CHANGED")
                 except (TypeError, ValueError, json.JSONDecodeError):
                     block("CANARY_CONTROL_CORRUPT")
                 expected_integrity = self._integrity(
@@ -8457,6 +9342,104 @@ class CanaryService:
 
         submitted_at = ensure_utc(self.clock())
 
+        def final_submission_fence() -> None:
+            """Re-read the reservation control immediately before posting."""
+            with self.store._lock:
+                if connection.in_transaction:
+                    raise CanaryBlocked("CANARY_TRANSACTION_ACTIVE")
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    control = connection.execute(
+                        "SELECT state,candidate_id,expires_at,limits_json,"
+                        "integrity_hash,control_generation "
+                        "FROM canary_control WHERE singleton=1"
+                    ).fetchone()
+                    if control is None:
+                        block("CANARY_NOT_ARMED")
+                    control_state = str(control["state"] or "").upper()
+                    if control_state == "KILLED":
+                        block("CANARY_KILLED")
+                    if control_state not in {"ARMED", AUTONOMOUS_MICRO_LIVE}:
+                        block("CANARY_NOT_ARMED")
+                    try:
+                        control_generation = int(
+                            control["control_generation"] or 0
+                        )
+                        control_candidate = str(
+                            control["candidate_id"] or ""
+                        ).strip()
+                        control_expiry = str(control["expires_at"] or "")
+                        control_limits = json.loads(control["limits_json"] or "{}")
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        block("CANARY_CONTROL_CORRUPT")
+                    if (
+                        reservation_control_generation is None
+                        or control_generation != reservation_control_generation
+                    ):
+                        block("CANARY_CONTROL_CHANGED")
+                    if control_state != reservation_control_state:
+                        block("CANARY_CONTROL_CHANGED")
+                    if (
+                        control_candidate != (reservation_control_candidate or "")
+                        or control_candidate != str(candidate_id).strip()
+                    ):
+                        block(
+                            "AUTO_CANARY_CANDIDATE_NOT_SELECTED"
+                            if control_state == AUTONOMOUS_MICRO_LIVE
+                            else "CANDIDATE_MISMATCH"
+                        )
+                    if control_expiry != (reservation_control_expiry or ""):
+                        block("CANARY_CONTROL_CHANGED")
+                    try:
+                        if control_state == "ARMED" and (
+                            not control_expiry
+                            or ensure_utc(datetime.fromisoformat(control_expiry))
+                            <= ensure_utc(self.clock())
+                        ):
+                            block("CANARY_NOT_ARMED")
+                        if control_state == AUTONOMOUS_MICRO_LIVE and control_expiry:
+                            block("CANARY_CONTROL_CORRUPT")
+                        if not isinstance(control_limits, Mapping):
+                            block("CANARY_CONTROL_CORRUPT")
+                    except (TypeError, ValueError):
+                        block("CANARY_CONTROL_CORRUPT")
+                    expected_integrity = self._integrity(
+                        ""
+                        if control_state == AUTONOMOUS_MICRO_LIVE
+                        else str(candidate_id),
+                        AUTONOMOUS_CANARY_VENUE
+                        if control_state == AUTONOMOUS_MICRO_LIVE
+                        else "polymarket",
+                        ""
+                        if control_state == AUTONOMOUS_MICRO_LIVE
+                        else control_expiry,
+                        control_limits,
+                    )
+                    if expected_integrity != control["integrity_hash"]:
+                        block("CANARY_CONTROL_CORRUPT")
+                    if control_state == AUTONOMOUS_MICRO_LIVE:
+                        if control_limits != self.autonomous_limits():
+                            block("AUTONOMOUS_RISK_ENVELOPE_CORRUPT")
+                    elif control_limits != limits:
+                        block("CANARY_CONTROL_CORRUPT")
+                    reservation = connection.execute(
+                        "SELECT status,control_generation FROM canary_ledger "
+                        "WHERE event_id=?",
+                        (event_id,),
+                    ).fetchone()
+                    if (
+                        reservation is None
+                        or str(reservation["status"]).upper() != "SUBMITTING"
+                        or int(reservation["control_generation"] or 0)
+                        != reservation_control_generation
+                    ):
+                        block("CANARY_RESERVATION_FAILED")
+                    connection.commit()
+                except BaseException:
+                    if connection.in_transaction:
+                        connection.rollback()
+                    raise
+
         def external_submission() -> Mapping[str, Any]:
             if is_official_venue:
                 return submit_official_order(
@@ -8467,6 +9450,8 @@ class CanaryService:
                     price=max_price,
                     size=quantity,
                 )
+            enforce_submission_fence(required_status="SUBMITTING")
+            final_submission_fence()
             return venue.submit_limit_order(
                 token_id=resolved_asset_id,
                 side=side.upper(),
@@ -8641,6 +9626,14 @@ class CanaryService:
                 "OFFICIAL_POLYMARKET_SDK_NOT_INSTALLED",
                 "OFFICIAL_POLYMARKET_SDK_NOT_READONLY_COMPATIBLE",
                 "UNSUPPORTED_POLYMARKET_SDK",
+                "CANARY_CONTROL_CHANGED",
+                "CANARY_CONTROL_CORRUPT",
+                "CANARY_KILLED",
+                "CANARY_NOT_ARMED",
+                "AUTO_CANARY_CANDIDATE_NOT_SELECTED",
+                "CANDIDATE_MISMATCH",
+                "AUTONOMOUS_RISK_ENVELOPE_CORRUPT",
+                "CANARY_RESERVATION_FAILED",
             }
             if pre_submission_rejection:
                 control_state = persist_outcome(

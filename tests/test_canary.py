@@ -16,6 +16,8 @@ from unittest.mock import patch
 import axiom.canary as canary_module
 
 from axiom.lifecycle import CandidateLifecycleManager, CandidateStage
+from axiom.experiment_plan import normalize_market_scope
+from axiom.market_scope import resolve_market_scope
 from axiom.auto_canary import AutonomousCanaryWorker
 from axiom.ranker import CandidateCanaryRanker
 from axiom.canary import (
@@ -34,6 +36,95 @@ from axiom.dashboard import DashboardData, _dashboard_html
 from axiom.storage import AxiomStore, SQLiteBusyTimeout
 
 T0=datetime(2026,1,2,12,tzinfo=timezone.utc)
+
+def _persist_test_scope(
+    store,
+    candidate_id,
+    payload,
+    market_ids=("m",),
+    *,
+    now=T0,
+    market_records=None,
+):
+    """Bind a fixture to one immutable current-market scope resolution.
+
+    ``market_records`` lets diagnostic fixtures model the resolver's exact
+    matched/excluded/deferred universe without allowing the canary to infer
+    authority from snapshots or market metadata.
+    """
+    ids = [str(item).strip() for item in market_ids if str(item).strip()]
+    source = payload.get("experiment_plan")
+    source = source if isinstance(source, dict) else payload
+    filters = source.get("filters", payload.get("frozen_filters", {}))
+    target = source.get("target") if isinstance(source, dict) else None
+    target_ids = None
+    if isinstance(target, dict):
+        target_ids = target.get("market_ids", target.get("exact_market_ids"))
+    policy = normalize_market_scope(
+        market_ids=target_ids if target_ids is not None else ids,
+        filters=filters if isinstance(filters, dict) else {},
+    )
+    policy = normalize_market_scope(
+        {**policy.as_dict(), "provenance": "canonical"}
+    )
+    payload["market_scope"] = policy.as_dict()
+    payload["market_scope_hash"] = policy.scope_hash
+    payload["market_scope_version"] = policy.scope_version
+    payload.setdefault("plan_hash", "sha256:test-plan")
+    payload.setdefault(
+        "dataset_selector",
+        {
+            "dataset_id": payload.get("dataset_id", "prediction-history"),
+            "dataset_version": payload.get("dataset_version", "v1"),
+            "source_type": "HISTORICAL",
+        },
+    )
+    payload.setdefault(
+        "dataset_attestation",
+        {
+            "status": "CURRENT",
+            "hash": "sha256:test-dataset",
+        },
+    )
+
+    supplied = market_records if isinstance(market_records, dict) else {}
+    records = []
+    for market_id in ids:
+        record = supplied.get(market_id, {})
+        if record is None:
+            continue
+        record = dict(record) if isinstance(record, dict) else {}
+        records.append(
+            {
+                "market_id": market_id,
+                "condition_id": f"condition-{market_id}",
+                "yes_token_id": "yes",
+                "no_token_id": "no",
+                "instrument": "POLYMARKET",
+                "venue": "POLYMARKET",
+                "source_type": "CURRENT",
+                "active": True,
+                "open": True,
+                "closed": False,
+                "settlement": "open",
+                "accepting_orders": True,
+                "enable_order_book": True,
+                "metadata": {"category": "politics"},
+                "metadata_provenance": {
+                    "source_type": "CURRENT",
+                    "metadata_hash": f"sha256:{market_id}",
+                },
+                **record,
+            }
+        )
+    resolution = resolve_market_scope(
+        str(candidate_id),
+        {"market_scope": payload["market_scope"]},
+        records,
+        resolved_at=now,
+    )
+    store.save_market_scope_resolution(resolution)
+    return resolution
 
 class HealthyStore(AxiomStore):
     def polymarket_health(self, **kwargs):
@@ -206,10 +297,57 @@ class CanaryTests(unittest.TestCase):
                 "forward_regime_count":3,
             },
         }
+        _persist_test_scope(self.store, "C123", payload, ("m",))
         self.store.save_candidate_lifecycle("C123","IDEA",payload,timestamp=T0)
         for stage in ("SCHEMA_VALIDATED","BACKTESTED","VALIDATED","ROBUSTNESS_CHECKED","FROZEN","PAPER_FORWARD","PAPER_PROMOTABLE"):
             self.store.save_candidate_lifecycle("C123",stage,payload,timestamp=T0)
         self.service.mark_eligible("C123")
+    def _ensure_direct_signal(self, signal_id, candidate_id="C123"):
+        if candidate_id != "C123":
+            return
+        existing = self.store.connection.execute(
+            "SELECT 1 FROM canary_signals WHERE signal_id=?", (signal_id,)
+        ).fetchone()
+        if existing is not None:
+            return
+        lifecycle = self.store.load_candidate_lifecycle(candidate_id)
+        payload = lifecycle["payload"]
+        evidence = {
+            "current_execution_evidence": "CURRENT_ORDER_BOOK",
+            "current_order_book_timestamp": T0.isoformat(),
+            "scope_hash": payload["market_scope_hash"],
+            "scope_version": payload["market_scope_version"],
+        }
+        self.store.connection.execute(
+            "INSERT INTO canary_signals("
+            "signal_id,candidate_id,frozen_hash,strategy_hash,model_hash,config_hash,"
+            "market_id,token_id,outcome,side,paper_expected_price,source_snapshot_id,"
+            "source_timestamp,generated_at,expires_at,status,reason,evidence_json,updated_at)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                signal_id,
+                candidate_id,
+                payload["frozen_hash"],
+                payload["strategy_hash"],
+                payload["model_hash"],
+                payload["config_hash"],
+                "m",
+                "yes",
+                "yes",
+                "BUY",
+                "0.50",
+                "direct-test",
+                T0.isoformat(),
+                T0.isoformat(),
+                (T0 + timedelta(seconds=60)).isoformat(),
+                "READY",
+                None,
+                json.dumps(evidence, sort_keys=True),
+                T0.isoformat(),
+            ),
+        )
+        self.store.connection.commit()
+
     def test_initial_readiness_keeps_qualification_and_selection_unknown(self):
         store = AxiomStore(":memory:")
         self.addCleanup(store.close)
@@ -232,11 +370,29 @@ class CanaryTests(unittest.TestCase):
     def arm(self, **kwargs): return self.service.arm("C123",venue=kwargs.pop("venue",self.venue),credentials_configured=True,**kwargs)
     def submit(self, signal="s1", **kwargs):
         candidate_id = kwargs.pop("candidate_id", "C123")
+        self._ensure_direct_signal(signal, candidate_id)
         return self.service.submit(signal_id=signal,candidate_id=candidate_id,market_id="m",token_id="yes",side="BUY",paper_expected_price=Decimal("0.50"),venue=kwargs.pop("venue",self.venue),allow_test_venue=kwargs.pop("allow_test_venue",True),**kwargs)
     def assertBlocked(self, code, fn):
         with self.assertRaisesRegex(CanaryBlocked,code): fn()
 
     def test_default_startup_cannot_trade(self): self.assertBlocked("CANARY_NOT_ARMED",self.submit)
+    def test_direct_submit_requires_persisted_ready_signal(self):
+        self.arm()
+        with self.assertRaisesRegex(CanaryBlocked, "CANARY_SIGNAL_NOT_FOUND"):
+            self.service.submit(
+                signal_id="not-persisted",
+                candidate_id="C123",
+                market_id="m",
+                token_id="yes",
+                side="BUY",
+                paper_expected_price=Decimal("0.50"),
+                venue=self.venue,
+                allow_test_venue=True,
+            )
+        self.assertEqual(
+            self.store.connection.execute("SELECT COUNT(*) FROM canary_ledger").fetchone()[0],
+            0,
+        )
 
     def test_limits_reject_nonfinite_values(self):
         for field in ("target_notional_usd", "max_exposure_usd", "max_daily_loss_usd"):
@@ -1694,8 +1850,149 @@ class CanaryTests(unittest.TestCase):
             "DUPLICATE_SIGNAL",
             lambda: self.submit("crash-gap"),
         )
+    def test_control_kill_after_submitting_transition_blocks_sink(self):
+        self.arm()
+        venue = FakeVenue()
+        original_publish = self.service.publish_readiness_snapshot
+
+        def kill_before_final_fence(*, reason):
+            if reason == "CANARY_SUBMITTING":
+                self.service.kill()
+            return original_publish(reason=reason)
+
+        with patch.object(
+            self.service,
+            "publish_readiness_snapshot",
+            side_effect=kill_before_final_fence,
+        ):
+            with self.assertRaisesRegex(CanaryBlocked, "CANARY_KILLED"):
+                self.submit("killed-before-sink", venue=venue)
+        self.assertFalse(venue.submissions)
+
+    def test_disarm_after_reservation_blocks_sink(self):
+        self.arm()
+        venue = FakeVenue()
+        original_publish = self.service.publish_readiness_snapshot
+
+        def disarm_before_final_fence(*, reason):
+            if reason == "CANARY_SUBMITTING":
+                self.service.disarm()
+            return original_publish(reason=reason)
+
+        with patch.object(
+            self.service,
+            "publish_readiness_snapshot",
+            side_effect=disarm_before_final_fence,
+        ):
+            with self.assertRaisesRegex(CanaryBlocked, "CANARY_NOT_ARMED"):
+                self.submit("disarmed-before-sink", venue=venue)
+        self.assertFalse(venue.submissions)
+
+    def test_generation_change_after_reservation_blocks_sink(self):
+        self.arm()
+        venue = FakeVenue()
+        original_publish = self.service.publish_readiness_snapshot
+
+        def change_generation_before_final_fence(*, reason):
+            if reason == "CANARY_SUBMITTING":
+                with self.store._lock:
+                    self.store.connection.execute(
+                        "UPDATE canary_control SET control_generation="
+                        "control_generation+1 WHERE singleton=1"
+                    )
+                    self.store.connection.commit()
+            return original_publish(reason=reason)
+
+        with patch.object(
+            self.service,
+            "publish_readiness_snapshot",
+            side_effect=change_generation_before_final_fence,
+        ):
+            with self.assertRaisesRegex(CanaryBlocked, "CANARY_CONTROL_CHANGED"):
+                self.submit("generation-changed-before-sink", venue=venue)
+        self.assertFalse(venue.submissions)
+
+    def test_kill_during_official_allowance_blocks_post_order(self):
+        self.arm()
+        signal_id = "official-killed-before-sink"
+        self._ensure_direct_signal(signal_id)
+
+        class SDKClient:
+            def __init__(self):
+                self.post_calls = []
+                self.closed = False
+                self._ctx = {
+                    "environment_config": {
+                        "exchange_v3": "0xexchange-v3",
+                    }
+                }
+
+            def create_limit_order(self, **kwargs):
+                return {"maker_amount": "1000000"}
+
+            def get_balance_allowance(self, **kwargs):
+                self.service.kill()
+                return {
+                    "balance": "2500000",
+                    "allowances": {"0xexchange-v3": "1000000"},
+                }
+
+            def post_order(self, signed):
+                self.post_calls.append(signed)
+                return {"ok": True, "order_id": "unexpected"}
+
+            def close(self):
+                self.closed = True
+
+        client = SDKClient()
+        client.service = self.service
+
+        class SecureClient:
+            @staticmethod
+            def _create(**kwargs):
+                return client
+
+        context = {
+            "asset_id": "position-yes",
+            "market_version": "v2",
+            "neg_risk": False,
+            "accepting_orders": True,
+            "min_order_size": "1",
+            "tick_size": "0.01",
+            "bids": [{"price": "0.49", "size": "100"}],
+            "asks": [{"price": "0.50", "size": "100"}],
+            "fee_bps": "10",
+        }
+        sdk = SimpleNamespace(SecureClient=SecureClient)
+        with patch.dict(sys.modules, {"polymarket": sdk}), patch.object(
+            PolymarketClobV2Venue,
+            "installed_sdk_version",
+            return_value="0.9.2",
+        ), patch.object(
+            PolymarketClobV2Venue,
+            "geoblock",
+            return_value={"blocked": False, "close_only": False},
+        ), patch.object(
+            PolymarketClobV2Venue,
+            "market_context",
+            return_value=context,
+        ):
+            with self.assertRaisesRegex(CanaryBlocked, "CANARY_KILLED"):
+                self.service.submit(
+                    signal_id=signal_id,
+                    candidate_id="C123",
+                    market_id="m",
+                    token_id="yes",
+                    side="BUY",
+                    paper_expected_price=Decimal("0.50"),
+                    venue=PolymarketClobV2Venue(),
+                )
+        self.assertFalse(client.post_calls)
+        self.assertTrue(client.closed)
+
     def test_cross_process_kill_does_not_wait_for_blocked_submission(self):
         self.arm()
+        self._ensure_direct_signal("cross-process")
         with tempfile.TemporaryDirectory() as directory:
             database_path = f"{directory}\\canary.sqlite3"
             target = sqlite3.connect(database_path)
@@ -1824,7 +2121,7 @@ class CanaryTests(unittest.TestCase):
     def test_different_candidate_cannot_trade_or_write_ledger(self):
         self.arm()
         venue = FakeVenue()
-        self.assertBlocked("CANDIDATE_MISMATCH", lambda: self.submit(candidate_id="C999", venue=venue))
+        self.assertBlocked("CANARY_SIGNAL_NOT_FOUND", lambda: self.submit(candidate_id="C999", venue=venue))
         self.assertFalse(venue.submissions)
         self.assertEqual(self.store.connection.execute("SELECT COUNT(*) FROM canary_ledger").fetchone()[0], 0)
     def test_invalid_frozen_binding_cannot_trade(self):
@@ -2257,6 +2554,7 @@ class CanarySignalTests(unittest.TestCase):
         model=None,
         dataset_market_ids=(),
         experiment_plan=None,
+        scope_records=None,
     ):
         strategy = {**(strategy or self.strategy), "strategy_id": candidate_id}
         model = dict(model or self.model)
@@ -2313,6 +2611,18 @@ class CanarySignalTests(unittest.TestCase):
             payload["frozen_filters"] = dict(frozen_filters)
         if experiment_plan is not None:
             payload["experiment_plan"] = dict(experiment_plan)
+        scope_market_ids = tuple(str(item) for item in market_ids)
+        if isinstance(experiment_plan, dict):
+            target = experiment_plan.get("target")
+            if isinstance(target, dict) and target.get("market_ids"):
+                scope_market_ids = tuple(str(item) for item in target["market_ids"])
+        _persist_test_scope(
+            self.store,
+            candidate_id,
+            payload,
+            scope_market_ids,
+            market_records=scope_records,
+        )
         self.store.save_candidate_lifecycle(
             candidate_id, "IDEA", payload, timestamp=T0
         )
@@ -2499,7 +2809,7 @@ class CanarySignalTests(unittest.TestCase):
         )
         self._assert_evaluation(
             "no-strategy",
-            "NO_STRATEGY_SIGNAL",
+            "STRATEGY_EVALUATED_DECLINED",
             market_id="no-strategy-market",
             assert_market_id=True,
         )
@@ -2592,6 +2902,9 @@ class CanarySignalTests(unittest.TestCase):
             "filter-mismatch",
             market_ids=("sports-market",),
             frozen_filters={"category": "politics"},
+            scope_records={
+                "sports-market": {"metadata": {"category": "sports"}},
+            },
         )
         self._save_metadata("sports-market", category="sports")
         self._assert_evaluation(
@@ -2605,6 +2918,7 @@ class CanarySignalTests(unittest.TestCase):
         self._add_candidate(
             "unresolved-forward",
             market_ids=(missing_market,),
+            scope_records={missing_market: None},
         )
         result = self._assert_evaluation(
             "unresolved-forward",
@@ -2623,6 +2937,10 @@ class CanarySignalTests(unittest.TestCase):
             candidate_id,
             market_ids=(missing_market, authorized_market),
             model={"probability": 0.50},
+            scope_records={
+                missing_market: None,
+                authorized_market: {},
+            },
         )
         self._save_snapshot(
             "authorized-no-signal-for-missing",
@@ -2650,7 +2968,7 @@ class CanarySignalTests(unittest.TestCase):
             [
                 {
                     "market_id": authorized_market,
-                    "reason_code": "NO_STRATEGY_SIGNAL",
+                    "reason_code": "STRATEGY_EVALUATED_DECLINED",
                 },
                 {
                     "market_id": missing_market,
@@ -2739,6 +3057,10 @@ class CanarySignalTests(unittest.TestCase):
             market_ids=(authorized_market, excluded_market),
             frozen_filters={"category": "politics"},
             model={"probability": 0.50},
+            scope_records={
+                authorized_market: {"metadata": {"category": "politics"}},
+                excluded_market: {"metadata": {"category": "sports"}},
+            },
         )
         self._save_snapshot(
             "authorized-no-signal-snapshot",
@@ -2775,7 +3097,7 @@ class CanarySignalTests(unittest.TestCase):
         self.assertEqual(result["evidence"]["market_failures"], [
             {
                 "market_id": authorized_market,
-                "reason_code": "NO_STRATEGY_SIGNAL",
+                "reason_code": "STRATEGY_EVALUATED_DECLINED",
             },
             {
                 "market_id": excluded_market,
@@ -2876,6 +3198,10 @@ class CanarySignalTests(unittest.TestCase):
                 "min_trades": 0,
                 "paper_only": True,
             },
+            scope_records={
+                authorized_market: {"metadata": {"category": "politics"}},
+                excluded_market: {"metadata": {"category": "sports"}},
+            },
         )
         self._save_metadata(authorized_market, category="politics")
         self._save_metadata(excluded_market, category="sports")
@@ -2926,7 +3252,7 @@ class CanarySignalTests(unittest.TestCase):
             [
                 {
                     "market_id": authorized_market,
-                    "reason_code": "NO_STRATEGY_SIGNAL",
+                    "reason_code": "STRATEGY_EVALUATED_DECLINED",
                 },
                 {
                     "market_id": excluded_market,
@@ -2960,6 +3286,16 @@ class CanarySignalTests(unittest.TestCase):
                 "min_samples": 30,
                 "min_trades": 0,
                 "paper_only": True,
+            },
+            scope_records={
+                closed_market: {
+                    "active": False,
+                    "open": False,
+                    "closed": True,
+                    "settlement": "closed",
+                    "metadata": {"category": "politics"},
+                },
+                excluded_market: {"metadata": {"category": "sports"}},
             },
         )
         for index in range(1001):
@@ -3069,7 +3405,7 @@ class CanarySignalTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["reason_code"], "READY_SIGNAL")
 
-    def test_all_market_failures_use_deterministic_severity_and_market_evidence(self):
+    def test_all_market_failures_apply_severity_and_preserve_resolver_order(self):
         candidate_id = "multi-market-failure"
         closed_market = "multi-market-closed"
         stale_market = "multi-market-stale"
@@ -3077,6 +3413,16 @@ class CanarySignalTests(unittest.TestCase):
         self._add_candidate(
             candidate_id,
             market_ids=(closed_market, stale_market, missing_market),
+            scope_records={
+                closed_market: {
+                    "active": False,
+                    "open": False,
+                    "closed": True,
+                    "settlement": "closed",
+                },
+                stale_market: {},
+                missing_market: None,
+            },
         )
         self._save_metadata(closed_market)
         self._save_snapshot(
@@ -3100,12 +3446,15 @@ class CanarySignalTests(unittest.TestCase):
         self.assertEqual(result["reason_code"], "MARKET_CLOSED")
         self.assertEqual(result["market_id"], closed_market)
         self.assertEqual(result["evidence"]["market_id"], closed_market)
+        # Matched markets are evaluated first; immutable excluded/deferred
+        # diagnostics are appended afterward. Selection still uses the
+        # explicit safety precedence, so MARKET_CLOSED wins over stale/missing.
         self.assertEqual(
             result["evidence"]["market_failures"],
             [
                 {"market_id": stale_market, "reason_code": "STALE_FORWARD_EVIDENCE"},
-                {"market_id": missing_market, "reason_code": "NO_FORWARD_SNAPSHOT"},
                 {"market_id": closed_market, "reason_code": "MARKET_CLOSED"},
+                {"market_id": missing_market, "reason_code": "NO_FORWARD_SNAPSHOT"},
             ],
         )
         rows = self.service.list_signal_evaluations(
@@ -3733,8 +4082,35 @@ class CanaryForwardAuthorityContractTests(unittest.TestCase):
 
     @staticmethod
     def _freeze_candidate(store: AxiomStore, candidate_id: str, payload: dict[str, object]) -> None:
+        canonical = dict(payload)
+        if canonical.get("market_ids"):
+            policy = normalize_market_scope(market_ids=canonical["market_ids"])
+        else:
+            policy = normalize_market_scope(
+                filters=canonical.get("frozen_filters") or {"category": "politics"}
+            )
+        policy = normalize_market_scope(
+            {**policy.as_dict(), "provenance": "canonical"}
+        )
+        canonical.update(
+            {
+                "market_scope": policy.as_dict(),
+                "market_scope_hash": policy.scope_hash,
+                "market_scope_version": policy.scope_version,
+                "plan_hash": "sha256:test-plan",
+                "dataset_selector": {
+                    "dataset_id": "test-history",
+                    "dataset_version": "v1",
+                    "source_type": "HISTORICAL",
+                },
+                "dataset_attestation": {
+                    "status": "CURRENT",
+                    "hash": "sha256:test-dataset",
+                },
+            }
+        )
         lifecycle = CandidateLifecycleManager(store)
-        lifecycle.register_idea(candidate_id, {"candidate_id": candidate_id, **payload})
+        lifecycle.register_idea(candidate_id, {"candidate_id": candidate_id, **canonical})
         lifecycle.advance(candidate_id, CandidateStage.SCHEMA_VALIDATED, {"schema_valid": True})
         lifecycle.advance(candidate_id, CandidateStage.BACKTESTED, {"backtest_complete": True})
         lifecycle.advance(
@@ -3752,10 +4128,17 @@ class CanaryForwardAuthorityContractTests(unittest.TestCase):
             CandidateStage.FROZEN,
             {
                 "frozen": True,
+                "holdout_used": False,
                 "strategy_hash": "strategy-hash",
                 "model_hash": "model-hash",
                 "config_hash": "config-hash",
                 "risk_snapshot": {"max_position_fraction": 0.05},
+                "plan_hash": canonical["plan_hash"],
+                "market_scope": canonical["market_scope"],
+                "market_scope_hash": canonical["market_scope_hash"],
+                "market_scope_version": canonical["market_scope_version"],
+                "dataset_selector": canonical["dataset_selector"],
+                "dataset_attestation": canonical["dataset_attestation"],
             },
         )
 

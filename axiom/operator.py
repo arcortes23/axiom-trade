@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import sqlite3
 import sys
 import threading
 import time
@@ -1271,6 +1272,22 @@ class OperatorControlPlane:
         hermes = self._hermes()
         workers = self.store.list_worker_states(limit=32)
         worker_map = {str(item.get("worker_name")): item for item in workers if isinstance(item, Mapping)}
+        scope_funnel_method = getattr(self.store, "market_scope_resolution_funnel", None)
+        market_scope_funnel: dict[str, Any] = {}
+        if callable(scope_funnel_method):
+            try:
+                persisted_funnel = scope_funnel_method(limit=1000)
+            except TypeError:
+                try:
+                    persisted_funnel = scope_funnel_method()
+                except (AttributeError, TypeError, ValueError, sqlite3.Error):
+                    persisted_funnel = {}
+            except (AttributeError, TypeError, ValueError, sqlite3.Error):
+                persisted_funnel = {}
+            if isinstance(persisted_funnel, Mapping):
+                market_scope_funnel = _safe_value(persisted_funnel)
+                if not isinstance(market_scope_funnel, dict):
+                    market_scope_funnel = {}
 
         def worker(name: str) -> dict[str, Any]:
             row = worker_map.get(name, {})
@@ -1520,6 +1537,7 @@ class OperatorControlPlane:
             "paper": {**worker("paper-engine"), "read_only": True, "live_execution": False},
             "research": worker("research-engine"),
             "autonomous_canary_worker": worker_status,
+            "market_scope_funnel": market_scope_funnel,
             "credentials": credentials,
             "canary": {
                 "status": canary_status,

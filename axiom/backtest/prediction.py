@@ -22,6 +22,7 @@ from axiom.domain import (
 from axiom.metrics import calculate_prediction_metrics
 from axiom.portfolio import OrderRequest, Portfolio
 from axiom.strategy import StrategyDefinition, evaluate_signal, validate_strategy
+from axiom.strategy.signals import evaluate_model_probability_evidence, evaluate_signal_evaluation
 from .types import BacktestResult
 
 
@@ -30,8 +31,27 @@ def _value(item: Any, name: str, default: Any = None) -> Any:
 
 
 def _time(item: Any) -> datetime:
-    stamp = _value(item, "timestamp", datetime.min.replace(tzinfo=timezone.utc))
-    return parse_timestamp(stamp) or datetime.min.replace(tzinfo=timezone.utc)
+    stamp = parse_timestamp(_value(item, "timestamp"))
+    return stamp or _source_time(item)
+
+def _source_time(item: Any) -> datetime:
+    candidates = [item]
+    if isinstance(item, Mapping) and isinstance(item.get("snapshot"), Mapping):
+        candidates.insert(0, item["snapshot"])
+    for candidate in candidates:
+        for name in ("source_timestamp", "as_of_timestamp", "asof_timestamp", "as_of", "timestamp", "observed_at"):
+            stamp = parse_timestamp(_value(candidate, name))
+            if stamp is not None:
+                return stamp
+    return datetime.min.replace(tzinfo=timezone.utc)
+
+def _sort_key(item: Any) -> tuple[datetime, str, str]:
+    nested = item.get("snapshot") if isinstance(item, Mapping) and isinstance(item.get("snapshot"), Mapping) else item
+    return (
+        _source_time(item),
+        str(_value(nested, "market_id", _value(item, "market_id", ""))),
+        str(_value(nested, "source_snapshot_id", _value(nested, "snapshot_id", _value(item, "source_snapshot_id", _value(item, "snapshot_id", ""))))),
+    )
 
 
 def _number(item: Any, name: str, default: float = 0.0) -> float:
@@ -138,11 +158,16 @@ class PredictionMarketBacktester:
         *, resolutions: Mapping[str, ResolvedContract] | Sequence[ResolvedContract] | None = None,
         initial_cash: float | None = None,
         research_quality: ResearchQuality | str | None = None,
+        model: Any | None = None,
+        model_document: Any | None = None,
     ) -> BacktestResult:
         definition = validate_strategy(strategy)
         if definition.market_type is not MarketType.PREDICTION:
             raise ValueError("PredictionMarketBacktester requires a prediction strategy")
-        rows = sorted(list(snapshots), key=_time)
+        rows = sorted(list(snapshots), key=_sort_key)
+        model_source = model if model is not None else model_document
+        if model_source is None and isinstance(strategy, Mapping):
+            model_source = strategy.get("model_document", strategy.get("model"))
         contracts: dict[str, ResolvedContract] = {}
         if isinstance(resolutions, Mapping):
             contracts.update(resolutions)
@@ -152,9 +177,37 @@ class PredictionMarketBacktester:
         observed_outcomes: dict[str, str] = {}
         curve: list[dict[str, Any]] = []
         labels: list[SimulationQuality] = []
+        history_by_market: dict[str, list[Any]] = {}
         for index, snapshot in enumerate(rows):
             timestamp = _time(snapshot)
             market_id = str(_value(snapshot, "market_id", ""))
+            active_snapshot = dict(snapshot) if isinstance(snapshot, Mapping) else snapshot
+            model_evaluation = evaluate_model_probability_evidence(model_source, active_snapshot) if model_source is not None else None
+            if model_evaluation is not None and isinstance(active_snapshot, dict):
+                active_snapshot["model_evaluation"] = model_evaluation.as_record()
+                if model_evaluation.probability is not None and _value(active_snapshot, "model_probability") is None:
+                    active_snapshot["model_probability"] = model_evaluation.probability
+            market_history = history_by_market.setdefault(market_id, [])
+            context = {
+                "snapshots": tuple(market_history + [active_snapshot]),
+                "observations": tuple(market_history + [active_snapshot]),
+                "history": tuple(market_history + [active_snapshot]),
+                "market_id": market_id,
+            }
+            if isinstance(active_snapshot, Mapping):
+                context.update(active_snapshot)
+                context["snapshots"] = tuple(market_history + [active_snapshot])
+                context["observations"] = tuple(market_history + [active_snapshot])
+                context["history"] = tuple(market_history + [active_snapshot])
+            if model_evaluation is not None:
+                context["model_evaluation"] = model_evaluation.as_record()
+                if model_evaluation.probability is not None:
+                    context["model_probability"] = model_evaluation.probability
+            if model_source is not None:
+                context["model_document"] = model_source
+            evaluation = evaluate_signal_evaluation(definition, context)
+            score = evaluation.score
+            history_by_market[market_id].append(active_snapshot)
             # Explicit resolutions and snapshot settlement become observable
             # only at their timestamp; a resolved market cannot be re-entered.
             contract = contracts.get(market_id)
@@ -190,15 +243,12 @@ class PredictionMarketBacktester:
                 if contract is not None and ensure_utc(contract.resolved_at) > timestamp
                 else state
             )
-            # Current quote is observable; model history is strictly rows[:index+1].
-            context = {"snapshots": rows[: index + 1]}
-            if isinstance(snapshot, Mapping):
-                context.update(snapshot)
-            score = evaluate_signal(definition, context)
             outcome = "yes" if score > 0 else "no"
             current = portfolio.get_position(market_id, outcome=outcome)
             current_quantity = current.quantity if current else 0.0
-            model_probability = _value(snapshot, "model_probability")
+            model_probability = _value(active_snapshot, "model_probability")
+            if model_probability is None and model_evaluation is not None:
+                model_probability = model_evaluation.probability
             try:
                 model_probability = float(model_probability)
                 trade_probability = model_probability if outcome == "yes" else 1.0 - model_probability
@@ -237,10 +287,10 @@ class PredictionMarketBacktester:
                 if delta > 1e-12:
                     portfolio.execute_order(
                         OrderRequest(
-                            market_id,
-                            Side.BUY,
-                            delta,
-                            MarketType.PREDICTION,
+                            symbol=market_id,
+                            side=Side.BUY,
+                            quantity=delta,
+                            market_type=MarketType.PREDICTION,
                             strategy_id=definition.id,
                             market_id=market_id,
                             outcome=outcome,
@@ -251,6 +301,10 @@ class PredictionMarketBacktester:
                         order_book=order_book,
                         fee_bps=self.fee_bps,
                         slippage_bps=self.slippage_bps,
+                        metadata={
+                            "evaluation_reason": evaluation.reason_code,
+                            "evaluation_evidence": dict(evaluation.evidence),
+                        },
                     )
             yes_mid = _probability(snapshot, "yes_mid", _probability(snapshot, "yes_ask", 0.0))
             no_mid = _probability(snapshot, "no_mid", _probability(snapshot, "no_ask", 0.0))
@@ -263,7 +317,18 @@ class PredictionMarketBacktester:
                 or (_probability(snapshot, "no_bid", 0.0) > 0 and _probability(snapshot, "no_ask", 0.0) > 0)
             ) else SimulationQuality.MEDIUM
             labels.append(quality)
-            curve.append({"timestamp": timestamp, "equity": equity, "cash": portfolio.cash, "market_id": market_id, "quality": quality.value})
+            curve.append(
+                {
+                    "timestamp": timestamp,
+                    "equity": equity,
+                    "cash": portfolio.cash,
+                    "market_id": market_id,
+                    "quality": quality.value,
+                    "reason_code": evaluation.reason_code,
+                    "evaluation_reason": evaluation.reason_code,
+                    "evaluation_evidence": dict(evaluation.evidence),
+                }
+            )
         outcomes = dict(observed_outcomes)
         probability_records: list[dict[str, float | None]] = []
         for fill in portfolio.fills:

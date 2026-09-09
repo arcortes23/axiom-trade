@@ -14,12 +14,18 @@ from .canary import (
     _canary_lifecycle_snapshot_hashes,
     _canary_ranking_snapshot_hash,
     _canary_prediction_market,
+    _canary_scope_binding,
+    _canary_current_scope_resolution,
     _CANARY_RANKING_EVIDENCE_ALIASES,
 )
 from .domain import ensure_utc, utc_now
 
 from .storage import AxiomStore
-from .lifecycle import CandidateLifecycleManager, CandidateStage
+from .lifecycle import (
+    CandidateLifecycleManager,
+    CandidateStage,
+    _canonical_scope_gate_error,
+)
 from .data_quality import evaluate_prediction_data_quality, persisted_quality_fields
 
 
@@ -164,6 +170,9 @@ class CandidateCanaryRanker:
             "family": family,
             "dataset_id": versions.get("dataset_id"),
             "dataset_version": versions.get("dataset_version"),
+            "plan_hash": versions.get("plan_hash"),
+            "market_scope_hash": versions.get("market_scope_hash"),
+            "market_scope_version": versions.get("market_scope_version"),
             "strategy_hash": versions.get("strategy_hash"),
             "model_hash": versions.get("model_hash"),
             "config_hash": versions.get("config_hash"),
@@ -174,13 +183,19 @@ class CandidateCanaryRanker:
     @classmethod
     def _versions(cls, payload: Mapping[str, Any], frozen_hash: str) -> dict[str, Any]:
         plan = payload.get("experiment_plan") if isinstance(payload.get("experiment_plan"), Mapping) else {}
+        scope = _canary_scope_binding(payload)
         return {
             "frozen_hash": frozen_hash,
+            "plan_hash": scope.get("plan_hash") or str(payload.get("plan_hash") or ""),
+            "market_scope_hash": scope.get("scope_hash") or "",
+            "market_scope_version": scope.get("scope_version") or "",
             "strategy_hash": str(payload.get("strategy_hash") or ""),
             "model_hash": str(payload.get("model_hash") or ""),
             "config_hash": str(payload.get("config_hash") or ""),
             "dataset_id": str(payload.get("dataset_id") or plan.get("dataset_id") or ""),
             "dataset_version": str(payload.get("dataset_version") or plan.get("dataset_version") or ""),
+            "dataset_selector": dict(scope.get("dataset_selector") or {}),
+            "dataset_attestation": dict(scope.get("dataset_attestation") or {}),
             "forward_test_id": str(payload.get("forward_test_id") or ""),
             "locked_holdout_used": False,
             "formula_version": cls.FORMULA_VERSION,
@@ -239,6 +254,8 @@ class CandidateCanaryRanker:
         missing = [name for name, value in required.items() if value is None]
         if missing:
             return None, "RANKING_EVIDENCE_MISSING:" + ",".join(missing), versions
+        if required["trade_count"] <= 0:
+            return None, "RANKING_EVIDENCE_ZERO_TRADES", versions
         plan = payload.get("experiment_plan") if isinstance(payload.get("experiment_plan"), Mapping) else {}
         min_samples = cls._number(plan.get("min_independent_samples", plan.get("min_samples", 30))) or 30.0
         min_trades = cls._number(plan.get("min_trades", 0)) or 0.0
@@ -333,6 +350,11 @@ class CandidateCanaryRanker:
                 continue
             payload = self.service._merged_lifecycle_payload(record)
             if not isinstance(payload, Mapping):
+                continue
+            if _canonical_scope_gate_error(
+                str(record.get("stage") or ""),
+                payload,
+            ) is not None:
                 continue
             if self._prediction_market(payload) not in {
                 "prediction",
@@ -526,6 +548,14 @@ class CandidateCanaryRanker:
         quality: Mapping[str, Any],
         frozen_hash: str,
     ) -> tuple[dict[str, Any], str, str] | None:
+        # The lifecycle row may retain forward metrics both nested under
+        # ``forward_evidence`` and at the top level.  Hash the same merged
+        # projection used by the final commit fence so duplicate placement is
+        # representation-only, while conflicting values remain material.
+        canonical_payload = self.service._merged_lifecycle_payload(record)
+        if not isinstance(canonical_payload, Mapping):
+            return None
+        payload = canonical_payload
         qualification = _canary_qualification_projection(
             str(record.get("candidate_id") or ""),
             payload,
@@ -563,8 +593,11 @@ class CandidateCanaryRanker:
         reason = str(row.get("reason") or "").strip().upper()
         return (
             reason.startswith("RANKING_EVIDENCE_MISSING")
-            or reason == "RANKING_EVIDENCE_BELOW_MINIMUM_SAMPLE"
-            or reason == "FROZEN_HASH_MISSING"
+            or reason in {
+                "RANKING_EVIDENCE_BELOW_MINIMUM_SAMPLE",
+                "RANKING_EVIDENCE_ZERO_TRADES",
+                "FROZEN_HASH_MISSING",
+            }
         )
 
     def validate_persisted_ranking(
@@ -637,6 +670,27 @@ class CandidateCanaryRanker:
         payload = self.service._merged_lifecycle_payload(lifecycle)
         if not isinstance(payload, Mapping):
             return False
+        if self._prediction_market(payload) not in {
+            "prediction",
+            "polymarket",
+            "prediction_market",
+        }:
+            return False
+        scope_error = _canonical_scope_gate_error(
+            str(lifecycle.get("stage") or ""),
+            payload,
+        )
+        if scope_error is not None:
+            return False
+        scope_binding = _canary_scope_binding(payload)
+        scope_resolution = _canary_current_scope_resolution(
+            self.store,
+            candidate_id,
+            payload,
+            now=ensure_utc(now),
+        )
+        if not scope_resolution.get("bound"):
+            return False
         eligibility = self.store.connection.execute(
             "SELECT candidate_id,frozen_hash,evidence_json "
             "FROM canary_eligibility WHERE candidate_id=?",
@@ -668,6 +722,10 @@ class CandidateCanaryRanker:
             qualification_hash=str(binding.get("qualification_hash") or ""),
             quality=quality,
         )
+        expected_versions = self._versions(
+            payload,
+            str(self.service._lifecycle_frozen_hash(lifecycle) or ""),
+        )
         return bool(
             row.get("qualification_hash")
             and row.get("qualification_hash") == binding.get("qualification_hash")
@@ -675,8 +733,13 @@ class CandidateCanaryRanker:
             and row.get("ranking_snapshot_hash") == expected_hash
             and str(versions.get("frozen_hash") or "")
             == str(self.service._lifecycle_frozen_hash(lifecycle) or "")
+            and str(versions.get("plan_hash") or "")
+            == str(expected_versions.get("plan_hash") or "")
+            and str(versions.get("market_scope_hash") or "")
+            == str(expected_versions.get("market_scope_hash") or "")
+            and str(versions.get("market_scope_version") or "")
+            == str(expected_versions.get("market_scope_version") or "")
         )
-
     def evaluate_and_select(self, now: datetime | None = None) -> dict[str, Any]:
         expected_projection_version = self.service._readiness_projection_version()
         try:
@@ -712,16 +775,29 @@ class CandidateCanaryRanker:
             if not candidate_id:
                 continue
             stage = str(original_record.get("stage") or "")
-            payload = original_record.get("payload")
-            if stage not in self._STAGES or not isinstance(payload, Mapping):
-                invalidated_reasons[candidate_id] = (
-                    "LIFECYCLE_REJECTED"
-                    if stage == "REJECTED"
-                    else "ELIGIBILITY_INVALID"
-                )
+            if stage == CandidateStage.REJECTED.value:
+                invalidated_reasons[candidate_id] = "LIFECYCLE_REJECTED"
                 self.service.invalidate_eligibility(
                     candidate_id,
                     invalidated_reasons[candidate_id],
+                    publish_readiness=False,
+                )
+                continue
+            payload = self.service._merged_lifecycle_payload(original_record)
+            if not isinstance(payload, Mapping):
+                invalidated_reasons[candidate_id] = "ELIGIBILITY_INVALID"
+                self.service.invalidate_eligibility(
+                    candidate_id,
+                    invalidated_reasons[candidate_id],
+                    publish_readiness=False,
+                )
+                continue
+            scope_error = _canonical_scope_gate_error(stage, payload)
+            if scope_error is not None:
+                invalidated_reasons[candidate_id] = scope_error
+                self.service.invalidate_eligibility(
+                    candidate_id,
+                    scope_error,
                     publish_readiness=False,
                 )
                 continue
@@ -1375,6 +1451,39 @@ class CandidateCanaryRanker:
         with self.store._lock:
             selection = self.service._selection_record()
             if not isinstance(selection, Mapping):
+                return None
+            candidate_id = str(selection.get("candidate_id") or "").strip()
+            lifecycle = (
+                self.store.load_candidate_lifecycle(candidate_id)
+                if candidate_id
+                else None
+            )
+            if (
+                not isinstance(lifecycle, Mapping)
+                or str(lifecycle.get("stage") or "") not in self._STAGES
+            ):
+                return None
+            payload = self.service._merged_lifecycle_payload(lifecycle)
+            if not isinstance(payload, Mapping):
+                return None
+            if self._prediction_market(payload) not in {
+                "prediction",
+                "polymarket",
+                "prediction_market",
+            }:
+                return None
+            if _canonical_scope_gate_error(
+                str(lifecycle.get("stage") or ""),
+                payload,
+            ) is not None:
+                return None
+            scope_resolution = _canary_current_scope_resolution(
+                self.store,
+                candidate_id,
+                payload,
+                now=ensure_utc(self.clock()),
+            )
+            if not scope_resolution.get("bound"):
                 return None
             state = self.service._selection_validation(selection)
             return selection if state.get("selection_valid") else None

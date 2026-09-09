@@ -213,7 +213,8 @@ class PredictionDataQualityCacheTests(unittest.TestCase):
         responses = [
             _Response(
                 {
-                    "conditionId": "market-1",
+                    "id": "market-1",
+                    "conditionId": "condition-1",
                     "question": "Will it happen?",
                     "outcomes": ["Yes", "No"],
                     "clobTokenIds": ["yes-token", "no-token"],
@@ -228,7 +229,7 @@ class PredictionDataQualityCacheTests(unittest.TestCase):
             ),
             _Response(None),
             _Response(raw=b"not-json"),
-            _Response({"bids": [], "asks": []}),
+            _Response({}),
         ]
 
         def opener(_request: object, timeout: float) -> _Response:
@@ -250,7 +251,8 @@ class PredictionDataQualityCacheTests(unittest.TestCase):
     def test_market_provider_timestamp_clears_after_unusable_response(self) -> None:
         stamp = datetime(2025, 1, 1, tzinfo=timezone.utc)
         valid = {
-            "conditionId": "market-1",
+            "id": "market-1",
+            "conditionId": "condition-1",
             "question": "Will it happen?",
             "outcomes": ["Yes", "No"],
             "clobTokenIds": ["yes-token", "no-token"],

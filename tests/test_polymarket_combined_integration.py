@@ -11,6 +11,8 @@ from unittest.mock import patch
 from axiom.auto_canary import AutonomousCanaryWorker
 from axiom.canary import CanaryService
 from axiom.dashboard import DashboardData
+from axiom.experiment_plan import normalize_market_scope
+from axiom.market_scope import resolve_market_scope
 from axiom.storage import AxiomStore
 
 
@@ -102,6 +104,19 @@ def _candidate_payload(
         "market_type": "prediction",
         "dataset_id": "prediction-history",
         "dataset_version": "v1",
+        "plan_hash": "sha256:fixture-plan",
+        "dataset_selector": {
+            "dataset_id": "prediction-history",
+            "dataset_version": "v1",
+            "source_type": "HISTORICAL",
+        },
+        "dataset_attestation": {
+            "dataset_id": "prediction-history",
+            "dataset_version": "v1",
+            "status": "CURRENT",
+            "policy_version": "v1",
+            "attestation_hash": "fixture-attestation",
+        },
         "dataset_provenance": {
             "dataset_id": "prediction-history",
             "dataset_version": "v1",
@@ -137,7 +152,22 @@ def _candidate_payload(
         },
     }
     if target_market_id:
+        policy = normalize_market_scope(
+            {
+                "schema_version": "1",
+                "mode": "EXACT_MARKETS",
+                "instrument": "POLYMARKET",
+                "categories": [],
+                "market_ids": [target_market_id],
+                "filters": {},
+                "regime_restrictions": {},
+                "provenance": "canonical",
+            }
+        )
         payload["target_market_ids"] = [target_market_id]
+        payload["market_scope"] = policy.as_dict()
+        payload["market_scope_hash"] = policy.scope_hash
+        payload["market_scope_version"] = policy.scope_version
     if executable:
         strategy = {
             "version": 1,
@@ -196,6 +226,31 @@ def _seed_candidate(
         timestamp=T0,
     )
     service.mark_eligible(candidate_id, publish_readiness=False)
+    if executable and target_market_id:
+        resolution = resolve_market_scope(
+            candidate_id,
+            payload,
+            [
+                {
+                    "market_id": target_market_id,
+                    "condition_id": f"{target_market_id}-condition",
+                    "yes_token_id": f"{target_market_id}-yes-token",
+                    "no_token_id": f"{target_market_id}-no-token",
+                    "source_type": "CURRENT",
+                    "provider": "polymarket",
+                    "instrument": "POLYMARKET",
+                    "active": True,
+                    "open": True,
+                    "closed": False,
+                    "settlement": "open",
+                    "accepting_orders": True,
+                    "order_book_available": True,
+                    "expiry": (T0 + timedelta(hours=2)).isoformat(),
+                }
+            ],
+            resolved_at=T0,
+        )
+        store.save_market_scope_resolution(resolution)
     return payload
 
 

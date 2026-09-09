@@ -106,6 +106,58 @@ hermes gateway stop
 Do not add `--accept-hooks` unless an operator explicitly approves that
 policy. Do not execute the gateway commands from an Axiom research worker.
 
+## Market-scope contract
+
+Every proposal contains exactly one bounded, falsifiable hypothesis. A
+prediction proposal has two independent bindings:
+
+* `experiment_plan.dataset_selector` selects the exact immutable historical
+  dataset (`dataset_id` and `dataset_version`) from
+  `researchable_datasets`. It is evidence provenance only.
+* `experiment_plan.market_scope` is the canonical market policy for the
+  hypothesis. Its normalized material is hashed deterministically by Axiom;
+  Axiom attaches `market_scope_hash` and `market_scope_version` to the
+  normalized plan/lifecycle record. Hermes MUST NOT supply, select, or trust a
+  caller-provided policy hash as a second authority.
+
+Never put market-policy authority in `dataset_selector`. In particular,
+historical constituent lists, aggregate constituent metadata, dataset row
+membership, or a dataset's `market_versions` are not an authority to widen a
+scope. A historical dataset may contain markets outside the scope; workers
+must ignore those rows. An exact event or market id must never be widened into
+related events, a category, or a rule.
+
+`market_scope` uses schema version `"1"` and exactly one mode:
+
+* `RESEARCH_ONLY` means historical analysis only. It has no market ids or
+  forward matching rules and never permits forward markets.
+* `EXACT_MARKETS` means the non-empty, explicit `market_ids` list is the
+  complete scope. Do not add, infer, or widen ids.
+* `RULE_BASED_MARKETS` means bounded matching rules. It has no exact ids and
+  uses only the supported prediction `instrument`, `categories`, normalized
+  `filters`, and normalized `regime_restrictions`. Backend code owns matching,
+  caps, and capacity; Hermes cannot request a cap, reserve capacity, or
+  override a backend limit.
+
+The scope's `provenance` is `"canonical"` for this prompt. Compatibility
+`target`, `market_ids`, `filters`, and regime properties may be emitted only
+when the backend derives them from this one canonical scope; they are not a
+second authority. Legacy target/filter documents must be explicitly marked
+`"provenance": "legacy-derived"` and are accepted only through backend
+normalization. Missing, malformed, contradictory, or unsupported scope is
+fail-closed: stop and report the validation reason rather than guessing a
+scope or falling back to a legacy target.
+
+Scope successors are new immutable scope policies. Revalidation is required
+when a scope, its version/hash, dataset binding, or relevant market metadata
+changes; a successor does not silently inherit prior authorization or results.
+Historical liquidity and spread may be unavailable or only a price proxy.
+Do not invent those measurements: record the limitation and fail the
+liquidity/spread-bound hypothesis when the required metric is absent.
+Label a constant model probability as a constant-model baseline, not as a
+fitted or independently validated model. Zero trades or missing required
+metrics is a failed/inconclusive result, never evidence for the hypothesis.
+
 ## Director prompt
 
 At each invocation, whether manually started or optionally scheduled:
@@ -121,18 +173,23 @@ At each invocation, whether manually started or optionally scheduled:
    closes an evidence gap over a broad idea list or cosmetic parameter search.
    Submit no more than one proposal JSON object for this run.
 
-3. The hypothesis must identify its public source and select an exact
-   `dataset_id` plus exact `dataset_version` from the summary's
-   `researchable_datasets` section. The selected pair is the only permitted
-   dataset binding; do not use a public observation timestamp as a version.
-   When applicable, also reference a persisted research result by exact
-   version. It must contain one bounded declarative `experiment_plan` with:
+3. The hypothesis must identify its public source and copy one exact
+   historical `dataset_id` plus exact immutable `dataset_version` from the
+   summary's `researchable_datasets` section into
+   `experiment_plan.dataset_selector`. That selector is separate from
+   `market_scope` and is the only dataset binding; do not use a public
+   observation timestamp as a version. When applicable, also reference a
+   persisted research result by exact version. It must contain one bounded
+   declarative `experiment_plan` with:
 
    - `schema_version: "1"`;
    - `market_type` equal to exactly `prediction` or `crypto_spot`;
    - one supported family from the list above;
    - an explicit allowed-feature list and finite scalar parameter ranges;
-   - filters, regime restrictions, target, metrics, and a dataset selector;
+   - a canonical schema-version-1 `market_scope`;
+   - the separate exact historical `dataset_selector`;
+   - scope-normalized filters and regime restrictions; compatibility target or
+     filter properties only when derived from that scope;
    - chronological `train-validation-holdout` methodology;
    - family budget, `max_variants`, and minimum samples;
    - `paper_only: true`.
@@ -140,7 +197,8 @@ At each invocation, whether manually started or optionally scheduled:
    For both market types, the dataset selector MUST copy the exact
    `dataset_id` and immutable `dataset_version` from `researchable_datasets`.
    For `prediction`, prefer `Polymarket-historical` or a listed exact
-   `prediction:<market-id>` constituent; never invent that identifier. For
+   `prediction:<market-id>` constituent; never invent that identifier.
+   Historical constituent membership never changes `market_scope`. For
    `crypto_spot`, use only a listed historical dataset with exact versioned
    universe provenance and methodology for its bounded instrument set.
 
@@ -150,20 +208,89 @@ At each invocation, whether manually started or optionally scheduled:
    unsupported families, unbounded search spaces, missing data versions, and
    live fields with an explicit reason code.
 
+   This complete prediction example is a reusable
+   `RULE_BASED_MARKETS` policy. Its category/instrument, price, expiry,
+   liquidity, and spread constraints are the only rule constraints; the
+   backend owns capacity and matching:
+
+   ```json
+   {
+     "proposal_id": "proposal-polymarket-politics-price-band",
+     "statement": "Historical politics markets priced between 0.40 and 0.60 with 24-168 hours to expiry and adequate liquidity have lower Brier loss than the constant-model baseline.",
+     "source": "Axiom persisted Polymarket-historical history",
+     "tests": [
+       "chronological train-validation-holdout with non-empty required metrics and at least one paper trade"
+     ],
+     "dataset_version": "sha256:polymarket-historical-v1",
+     "time_split": "train-validation-holdout",
+     "paper_only": true,
+     "experiment_plan": {
+       "schema_version": "1",
+       "hypothesis_id": "proposal-polymarket-politics-price-band",
+       "market_type": "prediction",
+       "template": "probability_mispricing",
+       "experiment_family": "probability_mispricing",
+       "allowed_features": [
+         "timestamp",
+         "market_id",
+         "yes_mid",
+         "model_probability",
+         "expiry",
+         "settlement",
+         "liquidity",
+         "spread"
+       ],
+       "parameters": {
+         "threshold": [0.05]
+       },
+       "market_scope": {
+         "schema_version": "1",
+         "mode": "RULE_BASED_MARKETS",
+         "instrument": "POLYMARKET",
+         "categories": ["politics"],
+         "market_ids": [],
+         "filters": {
+           "entry_price": [0.40, 0.60],
+           "minimum_hours_to_resolution": 24,
+           "maximum_hours_to_resolution": 168,
+           "min_liquidity": 1000,
+           "max_spread": 0.05
+         },
+         "regime_restrictions": {},
+         "provenance": "canonical"
+       },
+       "dataset_selector": {
+         "dataset_id": "Polymarket-historical",
+         "dataset_version": "sha256:polymarket-historical-v1",
+         "source_type": "HISTORICAL",
+         "timeframe": "event"
+       },
+       "methodology": {
+         "time_split": "train-validation-holdout",
+         "model_baseline": "constant-model baseline; not fitted"
+       },
+       "metrics": ["brier", "log_loss", "sample_count", "trade_count"],
+       "family_budget": {
+         "total_limit": 1000,
+         "per_family_limit": 250
+       },
+       "max_variants": 1,
+       "min_samples": 30,
+       "min_trades": 1,
+       "paper_only": true
+     }
+   }
+   ```
+
 4. If no suitable entry is listed, output `NO_RESEARCHABLE_DATASET` and stop.
    Do not submit a proposal with a guessed, timestamp-derived, forward, or
    otherwise deliberately invalid binding. If a listed pair is rejected with
    `DATASET_NOT_FOUND`, stop and report that code; do not substitute another
-   dataset without rereading the summary.
-   Submit only the bounded hypothesis JSON object. The command validates size,
-   required fields, forbidden fields, plan schema, exact dataset binding, and
-   durable deduplication before enqueue. This is one prediction example; a
-   crypto proposal must replace its market type/family and include the exact
-   crypto selector required above:
-
-   ```powershell
-   python -m axiom.cli submit-proposal --db "<repo>\runtime-data\axiom.sqlite" --proposal '{"proposal_id":"proposal-<stable-id>","statement":"<one falsifiable statement>","source":"<public prediction source or exact Axiom dataset/result id>","tests":["<bounded chronological test>"],"dataset_version":"<immutable version>","time_split":"train-validation-holdout","paper_only":true,"experiment_plan":{"schema_version":"1","market_type":"prediction","template":"probability_mispricing","allowed_features":["timestamp","market_id","yes_mid","model_probability","expiry","settlement"],"parameters":{"threshold":[0.05]},"filters":{},"regime_restrictions":{},"target":{"market_ids":["<market-id>"]},"metrics":["brier","log_loss","sample_count"],"dataset_selector":{"dataset_id":"prediction:<market-id>","dataset_version":"<immutable version>"},"methodology":{"time_split":"train-validation-holdout"},"family_budget":{"budget_id":"autonomous","total_limit":1000,"per_family_limit":250},"max_variants":1,"min_samples":30,"paper_only":true}}'
-   ```
+   dataset without rereading the summary. A zero-trade or missing-metric
+   result is a failed/inconclusive experiment and cannot support a claim.
+   Submit only the bounded hypothesis JSON object. A crypto proposal must
+   replace its market type/family and include the exact crypto selector and
+   appropriate scope required above.
 
 5. Treat `accepted: false` as a hard stop. Do not retry with a larger
    payload, hidden state, locked data, execution instruction, Binance access,
@@ -173,7 +300,8 @@ At each invocation, whether manually started or optionally scheduled:
    result that is not persisted by Axiom. Multiple testing reports the number
    of variants tested and selected; it does not inflate confidence across
    siblings. Mutations may use validation evidence only, remain bounded by
-   family/generation budgets, and never read the locked partition.
+   family/generation budgets, and never read the locked partition. A scope
+   successor or changed dataset requires backend revalidation before reuse.
 
    The autonomous processor intentionally does not consume the locked holdout
    at all. It is an immutable partition reserved for a separately controlled

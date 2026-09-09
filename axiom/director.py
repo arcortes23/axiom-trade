@@ -17,6 +17,7 @@ _DATASET_VERSION_ALIASES = frozenset({"latest", "current", "default", "unversion
 _MAX_RESEARCHABLE_DATASET_SCAN = 256
 _MAX_RESEARCHABLE_PREDICTION_CONSTITUENTS = 8
 _MAX_RESEARCHABLE_CRYPTO_DATASETS = 32
+_MAX_LEGACY_SCOPE_SUMMARY = 32
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,6 +112,17 @@ def validate_hermes_proposal(
             reasons.extend((exc.reason, exc.detail))
     if not reasons and store is not None and plan is not None:
         reasons.extend(_persisted_binding_reasons(store, plan))
+    if not reasons and plan is not None:
+        # Keep caller-level aliases intact while publishing a canonical,
+        # self-authenticating plan for downstream queue/lifecycle consumers.
+        normalized = dict(normalized)
+        original_plan = normalized.get("experiment_plan")
+        if isinstance(original_plan, Mapping):
+            canonical_plan = dict(original_plan)
+            canonical_plan.update(plan.as_dict())
+        else:
+            canonical_plan = plan.as_dict()
+        normalized["experiment_plan"] = canonical_plan
     proposal_id = str(normalized.get("proposal_id", "")).strip() or None
     if proposal_id is None and not reasons:
         proposal_id = "proposal-" + hashlib.sha256(_canonical(normalized).encode("utf-8")).hexdigest()[:24]
@@ -445,6 +457,78 @@ def _persisted_binding_reasons(store: AxiomStore, plan: Any) -> tuple[str, ...]:
         ):
             return ("DATASET_NOT_FOUND", "crypto dataset and universe provenance do not match the exact catalog")
     return ()
+def _legacy_scope_summary(
+    candidates: list[Any],
+    queue_items: list[Any],
+) -> dict[str, Any]:
+    """Return bounded, read-only scope classification and lineage evidence."""
+    from .legacy_scope import classify_legacy_scope
+
+    scope_names = {
+        "market_scope",
+        "target",
+        "market_ids",
+        "target_market_ids",
+        "target_instrument",
+        "instrument",
+        "categories",
+        "filters",
+        "frozen_filters",
+        "regime_restrictions",
+    }
+    counts: dict[str, int] = {}
+    relations: list[dict[str, Any]] = []
+    inspected_candidates = 0
+    for item in candidates[:_MAX_LEGACY_SCOPE_SUMMARY]:
+        if not isinstance(item, Mapping):
+            continue
+        payload = item.get("payload")
+        payload = payload if isinstance(payload, Mapping) else item
+        plan = payload.get("experiment_plan")
+        scope_source = plan if isinstance(plan, Mapping) else payload
+        if not any(name in scope_source for name in scope_names):
+            continue
+        inspected_candidates += 1
+        assessment = classify_legacy_scope(item)
+        counts[assessment.classification] = counts.get(assessment.classification, 0) + 1
+        if assessment.classification == "LEGACY_UNAMBIGUOUS":
+            relations.append(
+                {
+                    "predecessor_candidate_id": assessment.candidate_id,
+                    "predecessor_frozen_hash": assessment.frozen_hash,
+                    "classification": assessment.classification,
+                    "scope_hash": assessment.scope_hash,
+                    "scope_version": assessment.scope_version,
+                }
+            )
+    inspected_queue = 0
+    for item in queue_items[:_MAX_LEGACY_SCOPE_SUMMARY]:
+        if not isinstance(item, Mapping):
+            continue
+        payload = item.get("payload")
+        if not isinstance(payload, Mapping) or payload.get("successor_relation") != "LEGACY_SCOPE_SUCCESSOR":
+            continue
+        inspected_queue += 1
+        relations.append(
+            {
+                "queue_item_id": item.get("item_id"),
+                "queue_status": item.get("status"),
+                "successor_id": payload.get("successor_candidate_id", payload.get("proposal_id")),
+                "predecessor_candidate_id": payload.get("predecessor_candidate_id"),
+                "predecessor_frozen_hash": payload.get("predecessor_frozen_hash"),
+                "classification": payload.get("legacy_scope_classification", "LEGACY_UNAMBIGUOUS"),
+                "successor_scope_hash": payload.get("successor_scope_hash"),
+                "successor_scope_version": payload.get("successor_scope_version"),
+            }
+        )
+    return {
+        "classification_counts": dict(sorted(counts.items())),
+        "successor_relations": relations[:_MAX_LEGACY_SCOPE_SUMMARY],
+        "bounded_candidates": inspected_candidates,
+        "bounded_queue_items": inspected_queue,
+    }
+
+
 
 
 def research_summary(store: AxiomStore, *, now: datetime | None = None, limit: int = 20) -> dict[str, Any]:
@@ -639,6 +723,7 @@ def research_summary(store: AxiomStore, *, now: datetime | None = None, limit: i
         gaps.append("no persisted candidate lifecycle")
     if not reports:
         gaps.append("no persisted research reports")
+    legacy_scope = _legacy_scope_summary(all_candidates, all_queue_items)
     return {
         "as_of": (now.isoformat() if now is not None else (health.get("evidence_maturity") or {}).get("as_of")),
         "live_execution": False,
@@ -688,6 +773,7 @@ def research_summary(store: AxiomStore, *, now: datetime | None = None, limit: i
         },
         "researchable_datasets": _researchable_datasets(store),
         "gaps": gaps,
+        "legacy_scope": legacy_scope,
     }
 
 

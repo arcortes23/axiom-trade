@@ -46,6 +46,28 @@ def _binding_value(value: Any) -> str | None:
     return text or None
 
 
+def _scope_binding(plan: ExperimentPlan) -> dict[str, Any]:
+    """Return the canonical, recomputed authority carried by every worker artifact."""
+    return {
+        "market_scope": plan.market_scope.as_dict(),
+        "market_scope_hash": plan.market_scope_hash,
+        "market_scope_version": plan.market_scope_version,
+        "scope_hash": plan.market_scope_hash,
+        "scope_version": plan.market_scope_version,
+        "dataset_selector": dict(plan.as_dict()["dataset_selector"]),
+    }
+
+
+def _canonical_binding(value: Any) -> str:
+    def plain(item: Any) -> Any:
+        if isinstance(item, Mapping):
+            return {str(key): plain(child) for key, child in item.items()}
+        if isinstance(item, (list, tuple)):
+            return [plain(child) for child in item]
+        if isinstance(item, (set, frozenset)):
+            return [plain(child) for child in sorted(item, key=str)]
+        return item
+    return json.dumps(plain(value), sort_keys=True, separators=(",", ":"), allow_nan=False, default=str)
 class AutonomousResearchError(ValueError):
     """A deterministic, auditable queue rejection or unsupported operation."""
 
@@ -412,6 +434,7 @@ class AutonomousResearchProcessor:
                     "hypothesis_id": plan.hypothesis_id,
                     "plan_id": plan.plan_id,
                     "plan_hash": plan.plan_hash,
+                    **_scope_binding(plan),
                     "dataset_id": plan.dataset_id,
                     "dataset_version": plan.dataset_version,
                     "variant": candidate["parameters"],
@@ -625,6 +648,7 @@ class AutonomousResearchProcessor:
                 "candidate_id": candidate_id,
                 "plan_id": plan.plan_id,
                 "plan_hash": plan.plan_hash,
+                **_scope_binding(plan),
                 "holdout_used": False,
             }
             if crypto_binding is not None:
@@ -666,7 +690,7 @@ class AutonomousResearchProcessor:
             )
             if mutation_ids:
                 result = {**dict(result), "mutation_candidates": list(mutation_ids)}
-        return result
+        return {**dict(result), **_scope_binding(plan)}
 
     def _validate_worker_candidate_binding(
         self,
@@ -689,6 +713,15 @@ class AutonomousResearchProcessor:
             supplied = _binding_value(payload.get(field))
             persisted = _binding_value(run_record.get(field))
             if supplied != expected or persisted != expected:
+                raise AutonomousResearchError(
+                    "CANDIDATE_BINDING_MISMATCH",
+                    f"candidate {field} does not match the persisted experiment plan",
+                )
+        expected_scope = _scope_binding(plan)
+        for field, expected in expected_scope.items():
+            supplied = payload.get(field)
+            persisted = run_record.get(field)
+            if _canonical_binding(supplied) != _canonical_binding(expected) or _canonical_binding(persisted) != _canonical_binding(expected):
                 raise AutonomousResearchError(
                     "CANDIDATE_BINDING_MISMATCH",
                     f"candidate {field} does not match the persisted experiment plan",
@@ -891,6 +924,14 @@ class AutonomousResearchProcessor:
             raise AutonomousResearchError("RESULT_BINDING_MISMATCH", "experiment plan identity is not exact")
         if _binding_value(plan.dataset_id) != dataset_id or plan.dataset_version != dataset_version:
             raise AutonomousResearchError("RESULT_BINDING_MISMATCH", "experiment plan dataset binding is not exact")
+        expected_scope = _scope_binding(plan)
+        for field, expected in expected_scope.items():
+            if _canonical_binding(candidate_payload.get(field)) != _canonical_binding(expected):
+                raise AutonomousResearchError("RESULT_BINDING_MISMATCH", f"candidate {field} is not canonical")
+            if field in result_payload and _canonical_binding(result_payload.get(field)) != _canonical_binding(expected):
+                raise AutonomousResearchError("RESULT_BINDING_MISMATCH", f"experiment_result {field} does not match the candidate scope")
+            if _canonical_binding(experiment.get(field)) != _canonical_binding(expected):
+                raise AutonomousResearchError("RESULT_BINDING_MISMATCH", f"persisted worker run {field} does not match the candidate scope")
 
     @staticmethod
     def _validate_forward_result_binding(candidate_payload: Mapping[str, Any], spec: Any) -> None:
@@ -906,6 +947,13 @@ class AutonomousResearchProcessor:
                 raise AutonomousResearchError(
                     "RESULT_BINDING_MISMATCH",
                     f"forward-test {field} does not match the candidate binding",
+                )
+        for field in ("market_scope_hash", "market_scope_version", "scope_hash", "scope_version", "market_scope", "dataset_selector"):
+            expected = candidate_payload.get(field)
+            if _canonical_binding(config.get(field)) != _canonical_binding(expected):
+                raise AutonomousResearchError(
+                    "RESULT_BINDING_MISMATCH",
+                    f"forward-test {field} does not match the candidate scope",
                 )
 
     def _crypto_binding(self, plan: ExperimentPlan) -> dict[str, Any] | None:
@@ -1093,6 +1141,33 @@ class AutonomousResearchProcessor:
             },
             "selected_symbol": selected[target_key],
         }
+    def _dataset_attestation(self, plan: ExperimentPlan) -> Mapping[str, Any]:
+        """Load the immutable dataset attestation used by frozen scope evidence."""
+        dataset_id = plan.dataset_id
+        dataset_version = plan.dataset_version
+        if not dataset_id and dataset_version:
+            finder = getattr(self.store, "load_dataset_by_version", None)
+            resolved = finder(dataset_version) if callable(finder) else None
+            if isinstance(resolved, Mapping):
+                candidate_id = resolved.get("dataset_id")
+                if candidate_id is not None and str(candidate_id).strip():
+                    dataset_id = str(candidate_id).strip()
+        if not dataset_id or not dataset_version:
+            raise AutonomousResearchError(
+                "DATASET_ATTESTATION_MISSING",
+                "frozen scope evidence requires an exact dataset selector",
+            )
+        loader = getattr(self.store, "load_dataset_integrity_attestation", None)
+        verifier = getattr(self.store, "verify_dataset_integrity_attestation", None)
+        attestation = loader(dataset_id, dataset_version) if callable(loader) else None
+        if not isinstance(attestation, Mapping) and callable(verifier):
+            attestation = verifier(dataset_id, dataset_version)
+        if not isinstance(attestation, Mapping):
+            raise AutonomousResearchError(
+                "DATASET_ATTESTATION_MISSING",
+                f"no immutable dataset attestation for {dataset_id}/{dataset_version}",
+            )
+        return dict(attestation)
 
     def _load_prediction_dataset_by_version(self, version: str) -> Any | None:
         """Load a datasetless prediction plan only when its version is unambiguous."""
@@ -1262,14 +1337,30 @@ class AutonomousResearchProcessor:
             allowed_regimes = _as_regime_set(allowed_regimes, "regime filter")
         target_markets = set(plan.target_markets)
         target_instrument = plan.target_instrument
+        target_instrument_key = _normal_symbol(target_instrument) if target_instrument else ""
+        historical_polymarket_scope = (
+            plan.market_type is MarketType.PREDICTION and target_instrument_key == "POLYMARKET"
+        )
         result: list[Mapping[str, Any]] = []
         for row in rows:
             market_id = str(_value(row, "market_id", "")).strip()
             if target_markets and market_id not in target_markets:
                 continue
-            symbol = str(_value(row, "symbol", _value(row, "instrument", ""))).strip()
-            if target_instrument and target_instrument not in {market_id, symbol}:
-                continue
+            if historical_polymarket_scope:
+                # Historical price-history rows may omit venue identity.  The
+                # exact dataset selector and its immutable attestation bind
+                # those rows; an explicitly supplied identity still has to
+                # agree with the canonical Polymarket scope.
+                row_symbol = _binding_value(_value(row, "symbol"))
+                row_instrument = _binding_value(_value(row, "instrument"))
+                if row_symbol is not None and _normal_symbol(row_symbol) != target_instrument_key:
+                    continue
+                if row_instrument is not None and _normal_symbol(row_instrument) != target_instrument_key:
+                    continue
+            elif target_instrument:
+                symbol = str(_value(row, "symbol", _value(row, "instrument", ""))).strip()
+                if target_instrument not in {market_id, symbol}:
+                    continue
             if "category" in filters:
                 actual_category = str(_value(row, "category", "") or "").strip().casefold()
                 expected_category = filters["category"]
@@ -1429,6 +1520,7 @@ class AutonomousResearchProcessor:
             "candidate_id": candidate_id,
             "hypothesis_id": plan.hypothesis_id,
             "plan_id": plan.plan_id,
+            **_scope_binding(plan),
             "plan_hash": plan.plan_hash,
             "dataset_id": plan.dataset_id,
             "dataset_version": plan.dataset_version,
@@ -1582,6 +1674,7 @@ class AutonomousResearchProcessor:
             )
         if candidate.stage is CandidateStage.ROBUSTNESS_CHECKED:
             model_document = plan.model_for() or {"type": "deterministic"}
+            dataset_attestation = self._dataset_attestation(plan)
             if plan.market_type is MarketType.CRYPTO_SPOT:
                 # Crypto autonomous candidates are historical research only.
                 # They are deliberately never registered with ForwardTestRegistry.
@@ -1606,6 +1699,7 @@ class AutonomousResearchProcessor:
                     "strategy_document": strategy.to_dict(),
                     "model_document": dict(model_document),
                 }
+            forward_config.update(_scope_binding(plan))
             config_hash = _hash_document({"config": forward_config, "risk_limits": risk_snapshot})
             strategy_hash = _content_hash(strategy.to_dict())
             model_hash = _content_hash(model_document)
@@ -1628,6 +1722,7 @@ class AutonomousResearchProcessor:
                         "time_split": plan.methodology.get("time_split"),
                         "universe": dict(plan.universe or {}),
                     },
+                    "dataset_attestation": dict(dataset_attestation),
                     "experiment_budget_lineage": {
                         "budget_id": AUTONOMOUS_BUDGET_ID,
                         "family": plan.experiment_family,
@@ -1799,6 +1894,10 @@ class AutonomousResearchProcessor:
                     "plan_id": plan.plan_id,
                     "hypothesis_id": plan.hypothesis_id,
                     "validation_only": True,
+                    "market_scope_hash": plan.market_scope_hash,
+                    "market_scope": plan.market_scope.as_dict(),
+                    "market_scope_version": plan.market_scope_version,
+                    "dataset_selector": dict(plan.as_dict()["dataset_selector"]),
                     "locked_partition_used": False,
                     "crypto_provenance": dict(self._crypto_binding(plan) or {}),
                 },
@@ -1820,6 +1919,7 @@ class AutonomousResearchProcessor:
                 "hypothesis_id": plan.hypothesis_id,
                 "plan_id": plan.plan_id,
                 "plan_hash": plan.plan_hash,
+                **_scope_binding(plan),
                 "experiment_plan": plan.as_dict(),
                 "strategy": child_strategy.to_dict(),
                 "parameters": dict(child_strategy.parameters),
@@ -1846,6 +1946,7 @@ class AutonomousResearchProcessor:
                     "hypothesis_id": plan.hypothesis_id,
                     "plan_id": plan.plan_id,
                     "plan_hash": plan.plan_hash,
+                    **_scope_binding(plan),
                     "dataset_id": plan.dataset_id,
                     "dataset_version": plan.dataset_version,
                     "generation": child.generation,
@@ -1908,6 +2009,7 @@ class AutonomousResearchProcessor:
             "hypothesis_id": plan.hypothesis_id,
             "plan_id": plan.plan_id,
             "experiment_plan": plan.as_dict(),
+            **_scope_binding(plan),
             "strategy": strategy.to_dict(),
             "parameters": dict(parameters),
             "variant_id": variant_id,
@@ -1943,6 +2045,7 @@ class AutonomousResearchProcessor:
             "hypothesis_id": plan.hypothesis_id,
             "plan_id": plan.plan_id,
             "plan_hash": plan.plan_hash,
+            **_scope_binding(plan),
             "status": (
                 "accepted_research_only"
                 if plan.market_type is MarketType.CRYPTO_SPOT and selected

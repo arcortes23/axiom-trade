@@ -22,6 +22,8 @@ from axiom.canary import (
 )
 from axiom.dashboard import DashboardData, DashboardServer
 from axiom.operator import CANARY_CONNECTIVITY_CONFIG_KEY, OperatorControlPlane
+from axiom.experiment_plan import normalize_market_scope
+from axiom.market_scope import resolve_market_scope
 from axiom.ranker import CandidateCanaryRanker
 from axiom.storage import AxiomStore
 
@@ -206,6 +208,11 @@ class DashboardReadLatencyFixture(unittest.TestCase):
             created_at=T0,
             updated_at=T0,
         )
+        self.store.verify_dataset_integrity_attestation(
+            "Polymarket-historical",
+            "v1",
+            force=True,
+        )
 
     def _candidate_payload(self, candidate_id: str, index: int) -> dict[str, object]:
         strategy_document = {
@@ -227,6 +234,13 @@ class DashboardReadLatencyFixture(unittest.TestCase):
             json.dumps(model_document, sort_keys=True, separators=(",", ":")).encode("utf-8")
         ).hexdigest()
         config_hash = f"config-hash-{index:02d}"
+        market_id = f"market-{index:02d}"
+        policy = normalize_market_scope(
+            {
+                **normalize_market_scope(market_ids=[market_id]).as_dict(),
+                "provenance": "canonical",
+            }
+        )
         return {
             "candidate_id": candidate_id,
             "strategy_id": f"strategy-{index:02d}",
@@ -237,12 +251,28 @@ class DashboardReadLatencyFixture(unittest.TestCase):
             "source_type": "HISTORICAL",
             "dataset_id": "Polymarket-historical",
             "dataset_version": "v1",
+            "dataset_selector": {
+                "dataset_id": "Polymarket-historical",
+                "dataset_version": "v1",
+                "source_type": "HISTORICAL",
+            },
+            "dataset_attestation": dict(
+                self.store.load_dataset_integrity_attestation(
+                    "Polymarket-historical",
+                    "v1",
+                )
+                or {}
+            ),
             "dataset_provenance": {
                 "dataset_id": "Polymarket-historical",
                 "dataset_version": "v1",
                 "source_type": "HISTORICAL",
                 "time_split": "train-validation-holdout",
             },
+            "market_scope": policy.as_dict(),
+            "market_scope_hash": policy.scope_hash,
+            "market_scope_version": policy.scope_version,
+            "plan_hash": "sha256:latency-plan-v1",
             "lineage": [candidate_id],
             "mutation_cluster": f"latency-cluster-{index:02d}",
             "schema_validated": True,
@@ -275,10 +305,53 @@ class DashboardReadLatencyFixture(unittest.TestCase):
                 "checks": {"observations": True, "trades": True},
             },
             "experiment_plan": {
+                "dataset_selector": {
+                    "dataset_id": "Polymarket-historical",
+                    "dataset_version": "v1",
+                    "source_type": "HISTORICAL",
+                },
+                "market_scope": policy.as_dict(),
                 "min_independent_samples": 30,
                 "min_trades": 10,
             },
         }
+
+    def _persist_current_scope(self, candidate_id: str, index: int) -> None:
+        market_id = f"market-{index:02d}"
+        policy = normalize_market_scope(
+            {
+                **normalize_market_scope(market_ids=[market_id]).as_dict(),
+                "provenance": "canonical",
+            }
+        )
+        self.store.save_market_scope_resolution(
+            resolve_market_scope(
+                candidate_id,
+                {"market_scope": policy.as_dict()},
+                [
+                    {
+                        "market_id": market_id,
+                        "condition_id": f"{market_id}-condition",
+                        "yes_token_id": f"{market_id}-yes",
+                        "no_token_id": f"{market_id}-no",
+                        "instrument": "POLYMARKET",
+                        "venue": "POLYMARKET",
+                        "source_type": "CURRENT",
+                        "active": True,
+                        "open": True,
+                        "closed": False,
+                        "settlement": "open",
+                        "accepting_orders": True,
+                        "enable_order_book": True,
+                        "metadata_provenance": {
+                            "source_type": "CURRENT",
+                            "metadata_hash": f"sha256:{market_id}",
+                        },
+                    }
+                ],
+                resolved_at=T0,
+            )
+        )
 
     def _seed_candidates(self) -> None:
         # CanaryService.mark_eligible is intentionally used here so every row
@@ -296,6 +369,7 @@ class DashboardReadLatencyFixture(unittest.TestCase):
                 reason="latency fixture",
                 timestamp=T0,
             )
+            self._persist_current_scope(candidate_id, index)
             service.mark_eligible(candidate_id)
 
     def _request(
@@ -646,7 +720,15 @@ class DashboardReadLatencyFixture(unittest.TestCase):
                 (T0 + timedelta(minutes=5)).isoformat(),
                 "READY",
                 None,
-                json.dumps({"current_execution_evidence": "CURRENT_ORDER_BOOK"}),
+                json.dumps(
+                    {
+                        "current_execution_evidence": "CURRENT_ORDER_BOOK",
+                        "scope_hash": payload["market_scope_hash"],
+                        "scope_version": payload["market_scope_version"],
+                        "current_order_book_timestamp": T0.isoformat(),
+                        "source_timestamp": T0.isoformat(),
+                    }
+                ),
                 T0.isoformat(),
             ),
         )

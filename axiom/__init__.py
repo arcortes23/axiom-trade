@@ -86,7 +86,20 @@ from .hermes import CandidateMessage, Hermes, HermesPermissions, HermesValidatio
 from .paper import CryptoPaperTrader, LiveExecutionDisabled, PAPER_EXECUTION_STATUSES, PaperTradingConfig, PredictionPaperTrader
 from .node import NodeConfig, ResearchNode
 from .paper_engine import ForwardPaperEngine, PaperEngineCycle, build_resolved_bet, historical_replay_id, run_forward_paper, run_historical_replay
-from .experiment_plan import ExperimentPlan, ExperimentPlanError, PLAN_SCHEMA_VERSION
+from .experiment_plan import (
+    AUTONOMOUS_BUDGET_ID,
+    ExperimentPlan,
+    ExperimentPlanError,
+    MARKET_SCOPE_SCHEMA_VERSION,
+    MARKET_SCOPE_VERSION,
+    MarketScopeMode,
+    MarketScopePolicy,
+    PLAN_SCHEMA_VERSION,
+    forward_market_matches,
+    historical_market_ids,
+    normalize_forward_filters,
+    normalize_market_scope,
+)
 from .autonomous import (
     AutonomousQueueCycle,
     AutonomousResearchConfig,
@@ -99,6 +112,20 @@ from .research_bus import DurableResearchBus, ResearchBusPermissionError, Resear
 from .ranker import CandidateCanaryRanker
 from .auto_canary import AutonomousCanaryWorker
 from .director import ProposalValidation, compact_report, research_summary, validate_hermes_proposal
+from .legacy_scope import (
+    CANONICAL_VALID,
+    INVALID,
+    LEGACY_AMBIGUOUS,
+    LEGACY_UNAMBIGUOUS,
+    LegacyScopeAssessment,
+    LegacyScopeClassification,
+    LegacyScopeError,
+    LegacyScopeSuccessor,
+    classify_legacy_scope,
+    create_legacy_successor,
+    enqueue_legacy_successor,
+    propose_legacy_successor,
+)
 from .bootstrap import (
     BTC_DATASET_IDS,
     BTC_HISTORY_START,
@@ -152,6 +179,18 @@ __all__ = [
     "DeterministicMutationEngine",
     "ExperimentBudget",
     "MutationCandidate",
+    "CANONICAL_VALID",
+    "LEGACY_UNAMBIGUOUS",
+    "LEGACY_AMBIGUOUS",
+    "INVALID",
+    "LegacyScopeAssessment",
+    "LegacyScopeClassification",
+    "LegacyScopeError",
+    "LegacyScopeSuccessor",
+    "classify_legacy_scope",
+    "create_legacy_successor",
+    "enqueue_legacy_successor",
+    "propose_legacy_successor",
     "ForwardPaperEngine",
     "build_resolved_bet",
     "PaperEngineCycle",
@@ -262,6 +301,15 @@ __all__ = [
     "ExperimentPlan",
     "ExperimentPlanError",
     "PLAN_SCHEMA_VERSION",
+    "AUTONOMOUS_BUDGET_ID",
+    "MARKET_SCOPE_SCHEMA_VERSION",
+    "MARKET_SCOPE_VERSION",
+    "MarketScopeMode",
+    "MarketScopePolicy",
+    "normalize_market_scope",
+    "normalize_forward_filters",
+    "forward_market_matches",
+    "historical_market_ids",
     "AutonomousQueueCycle",
     "AutonomousResearchConfig",
     "AutonomousResearchError",

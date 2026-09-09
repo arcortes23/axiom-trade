@@ -772,6 +772,28 @@ class AxiomStore:
                     heartbeat_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS market_scope_resolutions (
+                    resolution_id TEXT PRIMARY KEY,
+                    candidate_id TEXT NOT NULL,
+                    scope_hash TEXT NOT NULL,
+                    scope_version TEXT NOT NULL,
+                    resolved_at TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    policy_json TEXT NOT NULL,
+                    matched_markets_json TEXT NOT NULL,
+                    excluded_markets_json TEXT NOT NULL,
+                    deferred_markets_json TEXT NOT NULL,
+                    provenance_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(candidate_id, scope_hash, scope_version, resolved_at)
+                );
+                CREATE INDEX IF NOT EXISTS idx_market_scope_resolutions_candidate
+                    ON market_scope_resolutions(candidate_id, resolved_at DESC, resolution_id);
+                CREATE INDEX IF NOT EXISTS idx_market_scope_resolutions_status
+                    ON market_scope_resolutions(status, resolved_at DESC, candidate_id);
+                CREATE INDEX IF NOT EXISTS idx_market_scope_resolutions_scope
+                    ON market_scope_resolutions(scope_hash, scope_version, resolved_at DESC);
                 """
             )
             queue_columns = {str(row["name"]) for row in self._conn.execute("PRAGMA table_info(research_queue)").fetchall()}
@@ -4748,6 +4770,7 @@ class AxiomStore:
                 "rejected_24h": proposal_rejected,
                 "failed_24h": proposal_failed,
                 "pending": proposal_pending,
+
                 "processing": proposal_processing,
                 "completed": _count(proposal_row, "completed"),
                 "rejected": _count(proposal_row, "rejected"),
@@ -4769,6 +4792,294 @@ class AxiomStore:
             },
             "no_new_candidates_reason": no_new_reason,
         }
+    # Current-market scope resolutions ---------------------------------
+    def save_market_scope_resolution(
+        self,
+        result: Any,
+        *,
+        if_absent: bool = True,
+    ) -> str:
+        """Persist one immutable current-market scope resolution.
+
+        ``resolution_id`` is derived by the typed result from candidate id,
+        frozen scope hash/version and resolution timestamp.  Repeating the
+        exact write is idempotent; a write with the same identity but a
+        different payload is rejected rather than silently replacing authority.
+        """
+        from .market_scope import MarketScopeResolution
+
+        resolution = (
+            result
+            if isinstance(result, MarketScopeResolution)
+            else MarketScopeResolution.from_mapping(result)
+        )
+        payload = resolution.as_dict()
+        values = (
+            resolution.resolution_id,
+            resolution.candidate_id,
+            resolution.scope_hash,
+            resolution.scope_version,
+            resolution.resolved_at.isoformat(),
+            resolution.status,
+            resolution.reason,
+            _dump(payload["policy"]),
+            _dump(payload["matched_markets"]),
+            _dump(payload["excluded_markets"]),
+            _dump(payload["deferred_markets"]),
+            _dump(payload["provenance"]),
+            _now_iso(),
+        )
+        with self._write_context():
+            existing = self._conn.execute(
+                "SELECT * FROM market_scope_resolutions WHERE resolution_id=?",
+                (resolution.resolution_id,),
+            ).fetchone()
+            if existing is not None:
+                existing_values = (
+                    str(existing["candidate_id"]),
+                    str(existing["scope_hash"]),
+                    str(existing["scope_version"]),
+                    str(existing["resolved_at"]),
+                    str(existing["status"]),
+                    str(existing["reason"]),
+                    str(existing["policy_json"]),
+                    str(existing["matched_markets_json"]),
+                    str(existing["excluded_markets_json"]),
+                    str(existing["deferred_markets_json"]),
+                    str(existing["provenance_json"]),
+                )
+                current_values = values[1:12]
+                if existing_values != current_values:
+                    raise ValueError(f"market scope resolution identity conflicts with stored payload: {resolution.resolution_id}")
+                if not if_absent:
+                    raise ValueError(f"market scope resolution already exists: {resolution.resolution_id}")
+                return resolution.resolution_id
+            try:
+                self._conn.execute(
+                    "INSERT INTO market_scope_resolutions("
+                    "resolution_id,candidate_id,scope_hash,scope_version,resolved_at,status,reason,"
+                    "policy_json,matched_markets_json,excluded_markets_json,deferred_markets_json,"
+                    "provenance_json,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    values,
+                )
+            except sqlite3.IntegrityError as exc:
+                # The unique natural key protects against two deterministic
+                # writers racing with distinct resolution ids.
+                duplicate = self._conn.execute(
+                    "SELECT resolution_id FROM market_scope_resolutions "
+                    "WHERE candidate_id=? AND scope_hash=? AND scope_version=? AND resolved_at=?",
+                    values[1:5],
+                ).fetchone()
+                if duplicate is not None:
+                    if str(duplicate["resolution_id"]) == resolution.resolution_id and if_absent:
+                        return resolution.resolution_id
+                    raise ValueError("market scope resolution identity already exists") from exc
+                raise
+        return resolution.resolution_id
+
+    def load_market_scope_resolution(
+        self,
+        candidate_id: str,
+        *,
+        scope_hash: str | None = None,
+        scope_version: str | None = None,
+        resolved_at: datetime | None = None,
+    ) -> Any | None:
+        """Load the newest immutable resolution matching one candidate binding."""
+        from .market_scope import MarketScopeResolution
+
+        identifier = str(candidate_id).strip()
+        if not identifier:
+            raise ValueError("candidate_id is required")
+        clauses = ["candidate_id=?"]
+        values: list[Any] = [identifier]
+        if scope_hash is not None:
+            clauses.append("scope_hash=?")
+            values.append(str(scope_hash).strip())
+        if scope_version is not None:
+            clauses.append("scope_version=?")
+            values.append(str(scope_version).strip())
+        if resolved_at is not None:
+            stamp = _parse_datetime(resolved_at)
+            if stamp is None:
+                raise ValueError("resolved_at must be a datetime or timestamp")
+            clauses.append("resolved_at=?")
+            values.append(stamp.isoformat())
+        query = (
+            "SELECT * FROM market_scope_resolutions WHERE "
+            + " AND ".join(clauses)
+            + " ORDER BY resolved_at DESC,resolution_id DESC LIMIT 1"
+        )
+        with self._lock:
+            row = self._conn.execute(query, values).fetchone()
+        return self._market_scope_resolution_from_row(row) if row is not None else None
+
+    def latest_market_scope_resolution(
+        self,
+        candidate_id: str,
+        *,
+        scope_hash: str | None = None,
+        scope_version: str | None = None,
+    ) -> Any | None:
+        """Alias for the bounded newest-resolution read."""
+        return self.load_market_scope_resolution(
+            candidate_id,
+            scope_hash=scope_hash,
+            scope_version=scope_version,
+        )
+
+    def list_market_scope_resolutions(
+        self,
+        *,
+        candidate_id: str | None = None,
+        status: str | None = None,
+        scope_hash: str | None = None,
+        scope_version: str | None = None,
+        limit: int = 100,
+    ) -> list[Any]:
+        """List immutable resolutions in newest-first bounded order."""
+        from .market_scope import MarketScopeResolutionStatus
+
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0 or limit > 1000:
+            raise ValueError("limit must be an integer in [0,1000]")
+        clauses: list[str] = []
+        values: list[Any] = []
+        for column, value in (
+            ("candidate_id", candidate_id),
+            ("scope_hash", scope_hash),
+            ("scope_version", scope_version),
+        ):
+            if value is not None:
+                text = str(value).strip()
+                if column == "candidate_id" and not text:
+                    raise ValueError("candidate_id must not be empty")
+                clauses.append(column + "=?")
+                values.append(text)
+        if status is not None:
+            normalized = status.value if isinstance(status, MarketScopeResolutionStatus) else str(status).strip().upper()
+            if not normalized:
+                raise ValueError("status must not be empty")
+            clauses.append("status=?")
+            values.append(normalized)
+        query = "SELECT * FROM market_scope_resolutions"
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY resolved_at DESC,resolution_id DESC LIMIT ?"
+        values.append(int(limit))
+        with self._lock:
+            rows = self._conn.execute(query, values).fetchall()
+        return [self._market_scope_resolution_from_row(row) for row in rows]
+
+    def list_market_scope_resolution_markets(
+        self,
+        candidate_id: str,
+        *,
+        scope_hash: str | None = None,
+        scope_version: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Return matched current markets from one bounded latest resolution."""
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0 or limit > 1000:
+            raise ValueError("limit must be an integer in [0,1000]")
+        resolution = self.load_market_scope_resolution(
+            candidate_id,
+            scope_hash=scope_hash,
+            scope_version=scope_version,
+        )
+        if resolution is None:
+            return []
+        return [item.as_dict() for item in resolution.matched_markets[:limit]]
+
+    def market_scope_resolution_funnel(
+        self,
+        *,
+        candidate_id: str | None = None,
+        limit: int = 1000,
+    ) -> dict[str, Any]:
+        """Aggregate latest resolution statuses/reasons for dashboard reads."""
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0 or limit > 1000:
+            raise ValueError("limit must be an integer in [0,1000]")
+        clauses = ""
+        values: list[Any] = []
+        if candidate_id is not None:
+            identifier = str(candidate_id).strip()
+            if not identifier:
+                raise ValueError("candidate_id must not be empty")
+            clauses = "WHERE candidate_id=?"
+            values.append(identifier)
+        # One current row per candidate makes the funnel represent current
+        # authority, not every historical reevaluation.
+        query = (
+            "WITH ranked AS ("
+            "SELECT r.*,ROW_NUMBER() OVER (PARTITION BY candidate_id "
+            "ORDER BY resolved_at DESC,resolution_id DESC) AS row_number "
+            "FROM market_scope_resolutions AS r "
+            + clauses
+            + ") SELECT * FROM ranked WHERE row_number=1 "
+            "ORDER BY resolved_at DESC,resolution_id DESC LIMIT ?"
+        )
+        values.append(int(limit))
+        with self._lock:
+            rows = self._conn.execute(query, values).fetchall()
+        status_counts: dict[str, int] = {}
+        reason_counts: dict[str, int] = {}
+        latest: list[dict[str, Any]] = []
+        for row in rows:
+            status_value = str(row["status"])
+            reason_value = str(row["reason"])
+            status_counts[status_value] = status_counts.get(status_value, 0) + 1
+            reason_counts[reason_value] = reason_counts.get(reason_value, 0) + 1
+            latest.append(
+                {
+                    "candidate_id": str(row["candidate_id"]),
+                    "status": status_value,
+                    "reason": reason_value,
+                    "scope_hash": str(row["scope_hash"]),
+                    "scope_version": str(row["scope_version"]),
+                    "resolved_at": str(row["resolved_at"]),
+                    "resolution_id": str(row["resolution_id"]),
+                }
+            )
+        stages = [{"status": key, "count": value} for key, value in sorted(status_counts.items())]
+        blockers = [{"reason": key, "count": value} for key, value in sorted(reason_counts.items())]
+        return {
+            "total": len(rows),
+            "status_counts": dict(status_counts),
+            "reason_counts": dict(reason_counts),
+            "statuses": dict(status_counts),
+            "reasons": dict(reason_counts),
+            "stages": stages,
+            "blockers": blockers,
+            "latest_resolved_at": latest[0]["resolved_at"] if latest else None,
+            "items": latest,
+            "resolutions": latest,
+        }
+
+    def _market_scope_resolution_from_row(self, row: sqlite3.Row) -> Any:
+        from .market_scope import MarketScopeResolution
+
+        return MarketScopeResolution(
+            candidate_id=row["candidate_id"],
+            scope_hash=row["scope_hash"],
+            scope_version=row["scope_version"],
+            resolved_at=row["resolved_at"],
+            status=row["status"],
+            reason=row["reason"],
+            policy=_load(row["policy_json"]),
+            matched_markets=_load(row["matched_markets_json"]),
+            excluded_markets=_load(row["excluded_markets_json"]),
+            deferred_markets=_load(row["deferred_markets_json"]),
+            provenance=_load(row["provenance_json"]),
+            schema_version="1",
+            resolution_id=row["resolution_id"],
+        )
+    # Alternate names retained for consumers that call the authority
+    # ``current_market_resolution`` rather than ``market_scope_resolution``.
+    save_current_market_resolution = save_market_scope_resolution
+    load_current_market_resolution = load_market_scope_resolution
+    list_current_market_resolutions = list_market_scope_resolutions
+    current_market_scope_funnel = market_scope_resolution_funnel
+
 
     def save_candidate_lifecycle(
         self,

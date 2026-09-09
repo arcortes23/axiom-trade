@@ -16,8 +16,24 @@ from axiom.canary import (
 from axiom.lifecycle import CandidateLifecycleManager, CandidateStage
 from axiom.ranker import CandidateCanaryRanker
 from axiom.storage import AxiomStore
+from axiom.experiment_plan import normalize_market_scope
+from axiom.market_scope import resolve_market_scope
 
 
+def _canonical_unresolved_scope() -> tuple[dict[str, object], str, str]:
+    policy = normalize_market_scope(
+        {
+            "schema_version": "1",
+            "mode": "RULE_BASED_MARKETS",
+            "instrument": "POLYMARKET",
+            "categories": ["no-such-forward-market"],
+            "market_ids": [],
+            "filters": {"category": "no-such-forward-market"},
+            "regime_restrictions": {},
+            "provenance": "canonical",
+        }
+    )
+    return policy.as_dict(), policy.scope_hash, policy.scope_version
 
 T0 = datetime(2026, 1, 2, 12, tzinfo=timezone.utc)
 
@@ -34,9 +50,28 @@ class PolymarketTruthfulnessRegressionTests(unittest.TestCase):
         store = self.make_store()
         lifecycle = CandidateLifecycleManager(store)
         candidate_id = "authority-unresolved"
+        scope, scope_hash, scope_version = _canonical_unresolved_scope()
         lifecycle.register_idea(
             candidate_id,
-            {"filters": {"category": "no-such-forward-market"}},
+            {
+                "market_type": "prediction",
+                "market_scope": scope,
+                "market_scope_hash": scope_hash,
+                "market_scope_version": scope_version,
+                "plan_hash": "sha256:truthfulness-plan",
+                "dataset_selector": {
+                    "dataset_id": "prediction-history",
+                    "dataset_version": "v1",
+                    "source_type": "HISTORICAL",
+                },
+                "dataset_attestation": {
+                    "dataset_id": "prediction-history",
+                    "dataset_version": "v1",
+                    "status": "CURRENT",
+                    "policy_version": "prediction-integrity-v1",
+                    "attestation_hash": "sha256:truthfulness-attestation",
+                },
+            },
         )
         lifecycle.advance(
             candidate_id,
@@ -70,26 +105,34 @@ class PolymarketTruthfulnessRegressionTests(unittest.TestCase):
                 "risk_snapshot": {"max_loss": 1},
             },
         )
+        store.save_market_scope_resolution(
+            resolve_market_scope(
+                candidate_id,
+                {"market_scope": scope},
+                [],
+                resolved_at=T0,
+            )
+        )
 
         service = CanaryService(store, clock=lambda: T0)
         result = service.evaluate_signal(candidate_id)
 
         self.assertEqual(
-            result["reason_code"], "CANDIDATE_FORWARD_MARKET_UNRESOLVED"
+            result["reason_code"], "SCOPE_RESOLUTION_ZERO_MATCHES"
         )
         self.assertIsNone(result["market_id"])
         self.assertEqual(
-            result["evidence"]["authority_reason_code"],
-            "CANDIDATE_FORWARD_MARKET_UNRESOLVED",
+            result["evidence"]["scope_resolution_reason"],
+            "SCOPE_RESOLUTION_ZERO_MATCHES",
         )
         persisted = service.list_signal_evaluations("authority-unresolved")
         self.assertEqual(len(persisted), 1)
         self.assertEqual(
-            persisted[0]["reason_code"], "CANDIDATE_FORWARD_MARKET_UNRESOLVED"
+            persisted[0]["reason_code"], "SCOPE_RESOLUTION_ZERO_MATCHES"
         )
         self.assertEqual(
-            persisted[0]["evidence"]["authority_reason_code"],
-            "CANDIDATE_FORWARD_MARKET_UNRESOLVED",
+            persisted[0]["evidence"]["scope_resolution_reason"],
+            "SCOPE_RESOLUTION_ZERO_MATCHES",
         )
 
     def test_unknown_submission_is_not_successful_and_is_not_resubmitted(self) -> None:

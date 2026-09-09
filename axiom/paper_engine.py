@@ -32,7 +32,10 @@ from .paper import PaperTrader, PaperTradingConfig
 from .portfolio import Portfolio
 from .risk import RiskEngine, RiskLimits
 from .storage import AxiomStore
-from .strategy.signals import evaluate_model_document_probability
+from .strategy.signals import (
+    evaluate_model_probability_evidence,
+    evaluate_signal_evaluation,
+)
 
 _MAX_RUN_OBSERVATIONS = 100_000
 
@@ -169,6 +172,7 @@ class ForwardPaperEngine:
             self.risk = risk
         self._restore_risk_status()
         strategy_document = _normalized_strategy_document(getattr(strategy, "definition", strategy))
+        self._strategy_document = strategy_document
         model_document = getattr(model, "document", model)
         if _content_hash(strategy_document) != spec.strategy_hash:
             raise ValueError("strategy does not match the frozen forward-test hash")
@@ -256,7 +260,12 @@ class ForwardPaperEngine:
             rows = self.store.list_latest_paper_observations(self._run_id, per_market_limit=512)
         except Exception:
             return
-        rows.sort(key=lambda item: (_observation_timestamp(item.get("payload")) or datetime.fromtimestamp(0, tz=self.spec.registration_timestamp.tzinfo), str(item.get("market_id", ""))))
+        rows.sort(
+            key=lambda item: _observation_sort_key(
+                item.get("payload"),
+                self.spec.registration_timestamp.tzinfo,
+            )
+        )
         rebuilt: dict[str, list[Any]] = {}
         for item in rows:
             payload = item.get("payload")
@@ -267,15 +276,12 @@ class ForwardPaperEngine:
                 continue
             observation = dict(payload)
             if not self._model_state_restored:
-                model_state_before = _snapshot_object_state(self.model)
-                try:
-                    model_probability = _model_probability(self.model, observation)
-                except Exception:
-                    _restore_object_state(self.model, model_state_before)
-                    model_probability = None
-                if model_probability is not None:
-                    observation["model_probability"] = model_probability
+                model_evaluation = _model_probability_evaluation(self.model, observation)
+                if model_evaluation.probability is not None:
+                    observation["model_probability"] = model_evaluation.probability
+                observation["model_evaluation"] = model_evaluation.as_record()
             history = rebuilt.setdefault(market_id, [])
+            observation.setdefault("source_type", str(item.get("source_type", "FORWARD_COLLECTED")).upper())
             warm_context = {
                 "market_type": MarketType.PREDICTION.value,
                 "symbol": market_id,
@@ -361,6 +367,11 @@ class ForwardPaperEngine:
                 errors.append("malformed prediction observation")
                 continue
             market_id, observation, yes_book, no_book = normalized
+            source_type = str(observation.get("source_type", "FORWARD_COLLECTED")).strip().upper()
+            if self._execution_mode != "historical_replay" and source_type != "FORWARD_COLLECTED":
+                skipped += 1
+                errors.append(f"stored fallback requires FORWARD_COLLECTED for {market_id}")
+                continue
             if self.spec.allowed_markets and market_id not in self.spec.allowed_markets:
                 skipped += 1
                 continue
@@ -402,17 +413,46 @@ class ForwardPaperEngine:
                 skipped += 1
                 continue
             model_state_before = _snapshot_object_state(self.model)
-            model_probability = None
+            model_evaluation = None
             if not terminal:
                 try:
-                    model_probability = _model_probability(self.model, observation)
+                    model_evaluation = _model_probability_evaluation(self.model, observation)
                 except Exception as exc:
                     _restore_object_state(self.model, model_state_before)
                     skipped += 1
                     errors.append(f"model error for {market_id}: {exc}")
                     continue
+            model_probability = model_evaluation.probability if model_evaluation is not None else None
             if model_probability is not None:
                 observation["model_probability"] = model_probability
+            if model_evaluation is not None:
+                observation["model_evaluation"] = model_evaluation.as_record()
+            strategy_evaluation = None
+            if not terminal and isinstance(self._strategy_document, Mapping):
+                signal_inputs = tuple(self._signal_history.get(market_id, ())) + (observation,)
+                evaluation_data: dict[str, Any] = {
+                    "observations": signal_inputs,
+                    "snapshots": signal_inputs,
+                    "history": signal_inputs,
+                    "market_id": market_id,
+                }
+                model_document = getattr(self.model, "document", self.model)
+                if model_document is not None:
+                    evaluation_data["model_document"] = model_document
+                try:
+                    strategy_evaluation = evaluate_signal_evaluation(self._strategy_document, evaluation_data)
+                except (TypeError, ValueError):
+                    strategy_evaluation = None
+            if (
+                model_evaluation is not None
+                and model_evaluation.probability is None
+                and model_evaluation.reason_code == "MODEL_INPUT_MISSING"
+            ):
+                # Keep the distinction in persisted evidence; no default 0.50
+                # probability is ever synthesized.
+                observation["model_probability"] = None
+            if model_evaluation is not None and model_evaluation.probability is None:
+                observation["model_evaluation"]["reason_code"] = model_evaluation.reason_code
             price = _reference_price(observation, yes_book, no_book)
             if price is None and not terminal:
                 _restore_object_state(self.model, model_state_before)
@@ -466,6 +506,18 @@ class ForwardPaperEngine:
                         execution_event["observation_id"] = observation_id
                         execution_event["experiment_id"] = self._run_id
                         execution_event["paper_only"] = True
+                        if strategy_evaluation is not None:
+                            execution_event["reason_code"] = strategy_evaluation.reason_code
+                            execution_event["evaluation_reason"] = strategy_evaluation.reason_code
+                            execution_event["evaluation_evidence"] = dict(strategy_evaluation.evidence)
+                        elif fill is not None:
+                            execution_event["reason_code"] = "SIGNAL_PRODUCED"
+                        elif str(execution_event.get("status", "")).upper() == "RESOLUTION":
+                            execution_event["reason_code"] = "RESOLUTION"
+                        else:
+                            execution_event["reason_code"] = "STRATEGY_EVALUATED_DECLINED"
+                        if model_evaluation is not None:
+                            execution_event["model_evaluation"] = model_evaluation.as_record()
                         event_status = str(execution_event.get("status", "NO_SIGNAL")).strip().upper() or "NO_SIGNAL"
                         if self.store.save_paper_execution_event(
                             "paper-execution-" + self._run_id + "-" + observation_id,
@@ -631,6 +683,7 @@ class ForwardPaperEngine:
                         market_id=market_id,
                         source_start=self.spec.registration_timestamp,
                         source_after=source_after,
+                        source_type="FORWARD_COLLECTED",
                         limit=512,
                     )
                 )
@@ -1003,6 +1056,10 @@ def _normalize_observation(raw: Any) -> tuple[str, dict[str, Any], OrderBookSnap
         "predicted_probability",
         "source_snapshot_id",
         "source_timestamp",
+        "as_of_timestamp",
+        "asof_timestamp",
+        "as_of",
+        "source_type",
         "available_at",
     ):
         if key not in observation and key in raw:
@@ -1140,45 +1197,47 @@ def _observation_timestamp(value: Any) -> datetime | None:
         return value.timestamp
     if isinstance(value, Mapping):
         nested = value.get("snapshot") if isinstance(value.get("snapshot"), Mapping) else value
-        return parse_timestamp(nested.get("timestamp", value.get("observed_at")))
+        if isinstance(nested, Mapping):
+            return (
+                parse_timestamp(nested.get("timestamp"))
+                or parse_timestamp(value.get("timestamp"))
+                or parse_timestamp(value.get("observed_at"))
+            )
     return parse_timestamp(getattr(value, "timestamp", None))
+
+
 def _observation_sort_key(value: Any, tzinfo: Any) -> tuple[datetime, str, str]:
-    stamp = _observation_timestamp(value) or datetime.fromtimestamp(0, tz=tzinfo)
     if isinstance(value, Mapping):
         nested = value.get("snapshot") if isinstance(value.get("snapshot"), Mapping) else value
-        market = nested.get("market_id", value.get("market_id", "")) if isinstance(nested, Mapping) else ""
+        if isinstance(nested, Mapping):
+            source_stamp = (
+                parse_timestamp(nested.get("source_timestamp"))
+                or parse_timestamp(nested.get("as_of_timestamp"))
+                or parse_timestamp(nested.get("asof_timestamp"))
+                or parse_timestamp(nested.get("as_of"))
+                or parse_timestamp(value.get("source_timestamp"))
+                or parse_timestamp(value.get("as_of_timestamp"))
+                or parse_timestamp(value.get("asof_timestamp"))
+                or parse_timestamp(value.get("as_of"))
+                or _observation_timestamp(value)
+            )
+            market = nested.get("market_id", value.get("market_id", ""))
+        else:
+            source_stamp = _observation_timestamp(value)
+            market = value.get("market_id", "")
     else:
+        source_stamp = parse_timestamp(getattr(value, "source_timestamp", None)) or _observation_timestamp(value)
         market = getattr(value, "market_id", "")
+    stamp = source_stamp or datetime.fromtimestamp(0, tz=tzinfo)
     return stamp, str(market), _canonical_json(value)
 
+def _model_probability_evaluation(model: Any | None, observation: Mapping[str, Any]):
+    return evaluate_model_probability_evidence(model, observation)
+
+
 def _model_probability(model: Any | None, observation: Mapping[str, Any]) -> float | None:
-    if model is None:
-        return None
-    if isinstance(model, Mapping):
-        return evaluate_model_document_probability(model, observation)
-    value: Any = None
-    methods = ("predict_probability", "probability", "predict", "estimate")
-    for name in methods:
-        method = getattr(model, name, None)
-        if not callable(method):
-            continue
-        try:
-            value = method(observation)
-        except (TypeError, AttributeError):
-            continue
-        break
-    if value is None and callable(model):
-        try:
-            value = model(observation)
-        except (TypeError, AttributeError):
-            return None
-    if isinstance(value, Mapping):
-        value = value.get("probability", value.get("yes_probability", value.get("prediction")))
-    try:
-        probability = float(value)
-    except (TypeError, ValueError):
-        return None
-    return probability if math.isfinite(probability) and 0 <= probability <= 1 else None
+    """Numeric compatibility wrapper around the canonical model evaluator."""
+    return _model_probability_evaluation(model, observation).probability
 def _finite_number(value: Any) -> float | None:
     try:
         number = float(value)

@@ -6,6 +6,7 @@ from enum import Enum
 import math
 from typing import Any, Mapping
 
+from .experiment_plan import MarketScopePolicy
 from .storage import AxiomStore
 
 
@@ -244,6 +245,132 @@ class CandidateLifecycle:
             "updated_at": self.updated_at,
             "rejection_reason": self.rejection_reason,
         }
+
+LEGACY_SCOPE_SUCCESSOR_REQUIRED = "LEGACY_SCOPE_SUCCESSOR_REQUIRED"
+
+
+def _is_prediction_candidate(evidence: Mapping[str, Any]) -> bool:
+    """Return whether canonical market scope is an applicable lifecycle gate.
+
+    Market scope is execution authority for prediction/Polymarket candidates
+    only.  Crypto candidates retain their instrument, symbol, and immutable
+    dataset controls and must not be forced through the prediction scope
+    successor path.  Keep the market-type source precedence aligned with the
+    canary/ranker payload contract: the top-level payload wins, followed by
+    the nested plan, strategy, forward config, and market documents.
+
+    Documents predating the typed market field are treated as prediction
+    candidates for compatibility.  That preserves the fail-closed successor
+    requirement for legacy prediction sources while explicitly typed crypto
+    research bypasses this gate.
+    """
+    body = evidence if isinstance(evidence, Mapping) else {}
+    for source_name in (
+        "payload",
+        "experiment_plan",
+        "strategy",
+        "forward_config",
+        "market",
+    ):
+        source = body if source_name == "payload" else body.get(source_name)
+        if not isinstance(source, Mapping):
+            continue
+        value = source.get("market_type", source.get("type"))
+        if value is None:
+            continue
+        market_type = str(getattr(value, "value", value)).strip().lower().replace("-", "_")
+        if market_type.startswith("markettype."):
+            market_type = market_type.removeprefix("markettype.")
+        return market_type not in {
+            "crypto",
+            "crypto_spot",
+            "spot",
+            "binance",
+        }
+    return True
+
+
+def _canonical_scope_gate_error(
+    stage: CandidateStage | str,
+    evidence: Mapping[str, Any],
+) -> str | None:
+    """Require an explicit canonical scope before forward lifecycle use.
+
+    Older frozen documents deliberately remain readable for research and
+    migration, but their historical aliases cannot become execution
+    authority by being inferred at this boundary.
+    """
+    stage_value = stage.value if isinstance(stage, CandidateStage) else str(stage)
+    if stage_value not in {
+        CandidateStage.FROZEN.value,
+        CandidateStage.PAPER_FORWARD.value,
+        CandidateStage.PAPER_PROMOTABLE.value,
+    }:
+        return None
+    body = evidence if isinstance(evidence, Mapping) else {}
+    if not _is_prediction_candidate(body):
+        return None
+    plan = body.get("experiment_plan")
+    plan = plan if isinstance(plan, Mapping) else {}
+    scope = body.get("market_scope")
+    if not isinstance(scope, Mapping):
+        scope = plan.get("market_scope")
+    scope = scope if isinstance(scope, Mapping) else None
+    scope_hash = (
+        body.get("market_scope_hash")
+        or body.get("scope_hash")
+        or (scope or {}).get("market_scope_hash")
+        or (scope or {}).get("scope_hash")
+        or (scope or {}).get("policy_hash")
+        or (scope or {}).get("hash")
+        or plan.get("market_scope_hash")
+    )
+    scope_version = (
+        body.get("market_scope_version")
+        or body.get("scope_version")
+        or (scope or {}).get("market_scope_version")
+        or (scope or {}).get("scope_version")
+        or (scope or {}).get("schema_version")
+        or (scope or {}).get("version")
+        or plan.get("market_scope_version")
+    )
+    if scope is None:
+        return LEGACY_SCOPE_SUCCESSOR_REQUIRED
+    try:
+        policy = MarketScopePolicy.from_mapping(scope)
+    except (TypeError, ValueError):
+        return LEGACY_SCOPE_SUCCESSOR_REQUIRED
+    if policy.provenance != "canonical":
+        return LEGACY_SCOPE_SUCCESSOR_REQUIRED
+    required_scope = {
+        "plan_hash": body.get("plan_hash") or plan.get("plan_hash"),
+        "market_scope_hash": scope_hash,
+        "market_scope_version": scope_version,
+        "dataset_selector": body.get("dataset_selector") or plan.get("dataset_selector"),
+    }
+    for name, value in required_scope.items():
+        if value in (None, "", {}, []):
+            return f"missing frozen scope evidence: {name}"
+    if not any(
+        body.get(name) not in (None, "", {}, [])
+        or plan.get(name) not in (None, "", {}, [])
+        for name in (
+            "dataset_attestation",
+            "dataset_integrity_attestation",
+            "historical_dataset_attestation",
+        )
+    ):
+        return "missing frozen scope evidence: dataset_attestation"
+    return None
+
+
+def is_canonical_scope_evidence(
+    stage: CandidateStage | str,
+    evidence: Mapping[str, Any],
+) -> bool:
+    """Return whether a candidate has forward-safe canonical scope evidence."""
+    return _canonical_scope_gate_error(stage, evidence) is None
+
 
 
 class CandidateLifecycleManager:
@@ -504,7 +631,16 @@ def _stage_gate(stage: CandidateStage, evidence: Mapping[str, Any]) -> str | Non
             value = evidence.get(name)
             if value is None or value == "" or value == {}:
                 return f"missing frozen evidence: {name}"
+    scope_error = _canonical_scope_gate_error(stage, evidence)
+    if scope_error is not None:
+        return scope_error
     return None
 
-
-__all__ = ["CandidateLifecycle", "CandidateLifecycleManager", "CandidateStage", "PromotionCriteria"]
+__all__ = [
+    "CandidateLifecycle",
+    "CandidateLifecycleManager",
+    "CandidateStage",
+    "PromotionCriteria",
+    "LEGACY_SCOPE_SUCCESSOR_REQUIRED",
+    "is_canonical_scope_evidence",
+]

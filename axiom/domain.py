@@ -62,7 +62,17 @@ class InstrumentMetadata:
     tags: tuple[str, ...] = ()
     expiry: datetime | None = None
     extra: Mapping[str, Any] = field(default_factory=dict)
-
+    condition_id: str | None = None
+    slug: str | None = None
+    provider_timestamp: datetime | None = None
+    active: bool | None = None
+    closed: bool | None = None
+    archived: bool | None = None
+    accepting_orders: bool | None = None
+    enable_order_book: bool | None = None
+    min_order_size: float | None = None
+    neg_risk: bool | None = None
+    order_book_available: bool | None = None
     def __post_init__(self) -> None:
         if not str(self.symbol).strip() or not str(self.provider).strip():
             raise ValueError("instrument symbol and provider are required")
@@ -72,10 +82,29 @@ class InstrumentMetadata:
             value = getattr(self, name)
             if value is not None and (not math.isfinite(float(value)) or float(value) <= 0):
                 raise ValueError(f"{name} must be finite and positive")
+        for name in ("active", "closed", "archived", "accepting_orders", "enable_order_book", "order_book_available"):
+            value = getattr(self, name)
+            if value is not None and not isinstance(value, bool):
+                raise TypeError(f"{name} must be a bool when provided")
+        if self.min_order_size is not None:
+            min_order_size = float(self.min_order_size)
+            if not math.isfinite(min_order_size) or min_order_size <= 0:
+                raise ValueError("min_order_size must be finite and positive")
+            object.__setattr__(self, "min_order_size", min_order_size)
+        if self.neg_risk is not None and not isinstance(self.neg_risk, bool):
+            raise TypeError("neg_risk must be a bool when provided")
         if not math.isfinite(float(self.contract_size)) or self.contract_size <= 0:
             raise ValueError("contract_size must be finite and positive")
-        if self.expiry is not None:
-            object.__setattr__(self, "expiry", ensure_utc(self.expiry))
+        if self.provider_timestamp is not None:
+            object.__setattr__(self, "provider_timestamp", ensure_utc(self.provider_timestamp))
+        for name in ("condition_id", "slug"):
+            value = getattr(self, name)
+            if value is not None:
+                normalized = str(value).strip()
+                if not normalized:
+                    raise ValueError(f"{name} must be non-empty when provided")
+                object.__setattr__(self, name, normalized)
+        object.__setattr__(self, "extra", dict(self.extra) if isinstance(self.extra, Mapping) else {})
         object.__setattr__(self, "tags", tuple(str(tag) for tag in self.tags))
 
 
@@ -163,22 +192,49 @@ class OrderBookSnapshot:
     bids: tuple[OrderBookLevel, ...]
     asks: tuple[OrderBookLevel, ...]
     token_id: str | None = None
+    condition_id: str | None = None
+    provider_timestamp: datetime | None = None
+    book_hash: str | None = None
+    min_order_size: float | None = None
+    tick_size: float | None = None
+    neg_risk: bool | None = None
+    available: bool = True
+    source: str = ""
     def __post_init__(self) -> None:
         bids, asks = tuple(self.bids), tuple(self.asks)
         if not all(isinstance(level, OrderBookLevel) for level in (*bids, *asks)):
             raise TypeError("order-book sides must contain OrderBookLevel values")
         object.__setattr__(self, "timestamp", ensure_utc(self.timestamp))
+        if self.provider_timestamp is not None:
+            object.__setattr__(self, "provider_timestamp", ensure_utc(self.provider_timestamp))
         bids = tuple(sorted(bids, key=lambda level: level.price, reverse=True))
         asks = tuple(sorted(asks, key=lambda level: level.price))
         if bids and asks and bids[0].price > asks[0].price:
             raise ValueError("order-book bid cannot exceed ask")
-        if self.token_id is not None:
-            token_id = str(self.token_id).strip()
-            if not token_id:
-                raise ValueError("token_id must be non-empty when provided")
-            object.__setattr__(self, "token_id", token_id)
+        for name in ("token_id", "condition_id", "book_hash"):
+            value = getattr(self, name)
+            if value is not None:
+                normalized = str(value).strip()
+                if not normalized:
+                    raise ValueError(f"{name} must be non-empty when provided")
+                object.__setattr__(self, name, normalized)
+        for name in ("min_order_size", "tick_size"):
+            value = getattr(self, name)
+            if value is not None:
+                if isinstance(value, bool):
+                    raise TypeError(f"{name} must be numeric when provided")
+                number = float(value)
+                if not math.isfinite(number) or number <= 0:
+                    raise ValueError(f"{name} must be finite and positive")
+                object.__setattr__(self, name, number)
+        if not isinstance(self.available, bool):
+            raise TypeError("order-book available must be a bool")
+        if self.neg_risk is not None and not isinstance(self.neg_risk, bool):
+            raise TypeError("order-book neg_risk must be a bool when provided")
+        object.__setattr__(self, "source", str(self.source))
         object.__setattr__(self, "bids", bids)
         object.__setattr__(self, "asks", asks)
+
 
 
     @property
@@ -298,11 +354,32 @@ class PredictionMarketSnapshot:
     source: str = ""
     yes_token_id: str | None = None
     no_token_id: str | None = None
+    condition_id: str | None = None
+    slug: str | None = None
+    provider_timestamp: datetime | None = None
+    active: bool | None = None
+    closed: bool | None = None
+    archived: bool | None = None
+    accepting_orders: bool | None = None
+    enable_order_book: bool | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "timestamp", ensure_utc(self.timestamp))
+        if self.provider_timestamp is not None:
+            object.__setattr__(self, "provider_timestamp", ensure_utc(self.provider_timestamp))
         if not str(self.market_id).strip() or not str(self.question).strip():
             raise ValueError("prediction market id and question are required")
+        for name in ("condition_id", "slug"):
+            value = getattr(self, name)
+            if value is not None:
+                normalized = str(value).strip()
+                if not normalized:
+                    raise ValueError(f"{name} must be non-empty when provided")
+                object.__setattr__(self, name, normalized)
+        for name in ("active", "closed", "archived", "accepting_orders", "enable_order_book"):
+            value = getattr(self, name)
+            if value is not None and not isinstance(value, bool):
+                raise TypeError(f"{name} must be a bool when provided")
         for name in ("yes_bid", "yes_ask", "yes_mid", "no_bid", "no_ask", "no_mid"):
             value = getattr(self, name)
             if value is not None:

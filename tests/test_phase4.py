@@ -65,13 +65,24 @@ def experiment_plan(
     max_variants: int = 1,
     target_market_ids: tuple[str, ...] = (),
 ) -> dict[str, object]:
+    target_ids = list(target_market_ids)
+    market_scope = {
+        "schema_version": "1",
+        "mode": "EXACT_MARKETS" if target_ids else "RULE_BASED_MARKETS",
+        "categories": ["politics"],
+        "market_ids": target_ids,
+        "filters": {"category": "politics"},
+        "regime_restrictions": {},
+        "provenance": "canonical",
+    }
     return {
         "market_type": "prediction",
         "template": "probability_mispricing",
         "dataset_id": dataset_id,
         "dataset_version": dataset_version,
-        "target": {"market_ids": list(target_market_ids)},
+        "target": {"market_ids": target_ids},
         "filters": {"category": "politics"},
+        "market_scope": market_scope,
         "parameters": {"threshold": [0.03, 0.05][:max_variants]},
         "min_samples": 1,
         "min_trades": 0,
@@ -393,9 +404,20 @@ class Phase4AutonomousLoopTests(unittest.TestCase):
                 regime="calm",
             ),
         ]
+        canonical_plan = experiment_plan(
+            target_market_ids=(
+                "target-good",
+                "target-price-fail",
+                "target-category-fail",
+            )
+        )
+        canonical_plan["market_scope"] = {
+            **canonical_plan["market_scope"],
+            "filters": filters,
+        }
         plan = ExperimentPlan.from_mapping(
             {
-                **experiment_plan(target_market_ids=("target-good", "target-price-fail", "target-category-fail")),
+                **canonical_plan,
                 "hypothesis_id": "target-filtering",
                 "filters": filters,
             }
