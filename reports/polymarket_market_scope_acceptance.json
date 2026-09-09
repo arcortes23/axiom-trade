@@ -1,0 +1,1659 @@
+{
+  "bounded_samples": {
+    "evaluations": [
+      {
+        "canonical_first_failure": "yes_price",
+        "conditions": {
+          "category_tags": "pass",
+          "expiry": "pass",
+          "instrument": "pass",
+          "lifecycle": "pass",
+          "liquidity": "pass",
+          "regime_restrictions": "pass",
+          "scope": "pass",
+          "spread": "pass",
+          "yes_price": "fail"
+        },
+        "market_id": "811719",
+        "observed_at": "2026-09-09T18:34:07.413513+00:00",
+        "policy_match": false
+      },
+      {
+        "canonical_first_failure": "yes_price",
+        "conditions": {
+          "category_tags": "pass",
+          "expiry": "pass",
+          "instrument": "pass",
+          "lifecycle": "pass",
+          "liquidity": "pass",
+          "regime_restrictions": "pass",
+          "scope": "pass",
+          "spread": "pass",
+          "yes_price": "fail"
+        },
+        "market_id": "811720",
+        "observed_at": "2026-09-09T18:34:07.413513+00:00",
+        "policy_match": false
+      },
+      {
+        "canonical_first_failure": "yes_price",
+        "conditions": {
+          "category_tags": "pass",
+          "expiry": "pass",
+          "instrument": "pass",
+          "lifecycle": "pass",
+          "liquidity": "pass",
+          "regime_restrictions": "pass",
+          "scope": "pass",
+          "spread": "pass",
+          "yes_price": "fail"
+        },
+        "market_id": "811721",
+        "observed_at": "2026-09-09T18:34:07.413513+00:00",
+        "policy_match": false
+      },
+      {
+        "canonical_first_failure": "yes_price",
+        "conditions": {
+          "category_tags": "pass",
+          "expiry": "pass",
+          "instrument": "pass",
+          "lifecycle": "pass",
+          "liquidity": "pass",
+          "regime_restrictions": "pass",
+          "scope": "pass",
+          "spread": "missing",
+          "yes_price": "fail"
+        },
+        "market_id": "811722",
+        "observed_at": "2026-09-09T18:34:07.413513+00:00",
+        "policy_match": false
+      },
+      {
+        "canonical_first_failure": "yes_price",
+        "conditions": {
+          "category_tags": "pass",
+          "expiry": "pass",
+          "instrument": "pass",
+          "lifecycle": "pass",
+          "liquidity": "pass",
+          "regime_restrictions": "pass",
+          "scope": "pass",
+          "spread": "missing",
+          "yes_price": "fail"
+        },
+        "market_id": "811723",
+        "observed_at": "2026-09-09T18:34:07.413513+00:00",
+        "policy_match": false
+      },
+      {
+        "canonical_first_failure": "yes_price",
+        "conditions": {
+          "category_tags": "pass",
+          "expiry": "pass",
+          "instrument": "pass",
+          "lifecycle": "pass",
+          "liquidity": "pass",
+          "regime_restrictions": "pass",
+          "scope": "pass",
+          "spread": "missing",
+          "yes_price": "fail"
+        },
+        "market_id": "811724",
+        "observed_at": "2026-09-09T18:34:07.413513+00:00",
+        "policy_match": false
+      },
+      {
+        "canonical_first_failure": "yes_price",
+        "conditions": {
+          "category_tags": "pass",
+          "expiry": "pass",
+          "instrument": "pass",
+          "lifecycle": "pass",
+          "liquidity": "pass",
+          "regime_restrictions": "pass",
+          "scope": "pass",
+          "spread": "missing",
+          "yes_price": "fail"
+        },
+        "market_id": "811725",
+        "observed_at": "2026-09-09T18:34:07.413513+00:00",
+        "policy_match": false
+      },
+      {
+        "canonical_first_failure": "yes_price",
+        "conditions": {
+          "category_tags": "pass",
+          "expiry": "pass",
+          "instrument": "pass",
+          "lifecycle": "pass",
+          "liquidity": "pass",
+          "regime_restrictions": "pass",
+          "scope": "pass",
+          "spread": "missing",
+          "yes_price": "fail"
+        },
+        "market_id": "811726",
+        "observed_at": "2026-09-09T18:34:07.413513+00:00",
+        "policy_match": false
+      },
+      {
+        "canonical_first_failure": "yes_price",
+        "conditions": {
+          "category_tags": "pass",
+          "expiry": "pass",
+          "instrument": "pass",
+          "lifecycle": "pass",
+          "liquidity": "pass",
+          "regime_restrictions": "pass",
+          "scope": "pass",
+          "spread": "missing",
+          "yes_price": "fail"
+        },
+        "market_id": "811727",
+        "observed_at": "2026-09-09T18:34:07.413513+00:00",
+        "policy_match": false
+      },
+      {
+        "canonical_first_failure": "yes_price",
+        "conditions": {
+          "category_tags": "pass",
+          "expiry": "pass",
+          "instrument": "pass",
+          "lifecycle": "pass",
+          "liquidity": "pass",
+          "regime_restrictions": "pass",
+          "scope": "pass",
+          "spread": "pass",
+          "yes_price": "fail"
+        },
+        "market_id": "918248",
+        "observed_at": "2026-09-09T18:34:07.413513+00:00",
+        "policy_match": false
+      }
+    ],
+    "explicit_open_ids": [
+      "811719",
+      "811720",
+      "811721",
+      "811722",
+      "811723",
+      "811724",
+      "811725",
+      "811726",
+      "811727",
+      "918248"
+    ]
+  },
+  "candidate_outcome": {
+    "authority_flags": {
+      "execution": false,
+      "lifecycle": false,
+      "qualification": false,
+      "ranking": false,
+      "scope": true
+    },
+    "book_count": 2,
+    "book_depth": 5,
+    "book_hashes": {
+      "no": "sha256:d8819a350f4e082d4ef1f2cda71c04626aa20f6e3e351dda4e120352c7371b59",
+      "yes": "sha256:c16c79ea195375d57a32c70862ecfbd66e66ab2b0896c7d0cb501554b65dc238"
+    },
+    "books": [
+      {
+        "book": {
+          "asks": [
+            {
+              "price": 0.45,
+              "size": 8904.34
+            },
+            {
+              "price": 0.46,
+              "size": 79689.7
+            },
+            {
+              "price": 0.47,
+              "size": 113756.78
+            },
+            {
+              "price": 0.48,
+              "size": 169959.74
+            },
+            {
+              "price": 0.49,
+              "size": 78830.05
+            }
+          ],
+          "available": true,
+          "bids": [
+            {
+              "price": 0.44,
+              "size": 9961.03
+            },
+            {
+              "price": 0.43,
+              "size": 24579.1
+            },
+            {
+              "price": 0.42,
+              "size": 35159.8
+            },
+            {
+              "price": 0.41,
+              "size": 112520.29
+            },
+            {
+              "price": 0.4,
+              "size": 13380.17
+            }
+          ],
+          "book_hash": "0301fbb1c486eaec93ffacb30793bc0435a1e59d",
+          "condition_id": "0xa3b36b2d6104d34af4e6c6215fc818e43352e78a748fbfb0b85e3a35f71dec9a",
+          "min_order_size": 5.0,
+          "neg_risk": true,
+          "provider_timestamp": "2026-09-09T18:35:22.495000+00:00",
+          "source": "polymarket",
+          "tick_size": 0.01,
+          "timestamp": "2026-09-09T18:35:22.495000+00:00",
+          "token_id": "5615282760875985231868508008056959876238536896643315063916840237042205273721"
+        },
+        "book_hash": "sha256:c16c79ea195375d57a32c70862ecfbd66e66ab2b0896c7d0cb501554b65dc238",
+        "outcome": "yes",
+        "token_id": "5615282760875985231868508008056959876238536896643315063916840237042205273721"
+      },
+      {
+        "book": {
+          "asks": [
+            {
+              "price": 0.56,
+              "size": 9961.03
+            },
+            {
+              "price": 0.57,
+              "size": 24579.1
+            },
+            {
+              "price": 0.58,
+              "size": 35159.8
+            },
+            {
+              "price": 0.59,
+              "size": 112520.29
+            },
+            {
+              "price": 0.6,
+              "size": 13380.17
+            }
+          ],
+          "available": true,
+          "bids": [
+            {
+              "price": 0.55,
+              "size": 8904.34
+            },
+            {
+              "price": 0.54,
+              "size": 79689.7
+            },
+            {
+              "price": 0.53,
+              "size": 113756.78
+            },
+            {
+              "price": 0.52,
+              "size": 169959.74
+            },
+            {
+              "price": 0.51,
+              "size": 78830.05
+            }
+          ],
+          "book_hash": "5ec27a367821d4f789e82dc71972ddb0ec8f6023",
+          "condition_id": "0xa3b36b2d6104d34af4e6c6215fc818e43352e78a748fbfb0b85e3a35f71dec9a",
+          "min_order_size": 5.0,
+          "neg_risk": true,
+          "provider_timestamp": "2026-09-09T18:35:22.495000+00:00",
+          "source": "polymarket",
+          "tick_size": 0.01,
+          "timestamp": "2026-09-09T18:35:22.495000+00:00",
+          "token_id": "97050921740416192996389806693742575608111328819185493163189880975611314813724"
+        },
+        "book_hash": "sha256:d8819a350f4e082d4ef1f2cda71c04626aa20f6e3e351dda4e120352c7371b59",
+        "outcome": "no",
+        "token_id": "97050921740416192996389806693742575608111328819185493163189880975611314813724"
+      }
+    ],
+    "execution_flags": {
+      "authentication": false,
+      "credentials": false,
+      "live_execution": false,
+      "orders": false
+    },
+    "identity": {
+      "accepting_orders": true,
+      "active": true,
+      "archived": false,
+      "category": null,
+      "closed": false,
+      "condition_id": "0xa3b36b2d6104d34af4e6c6215fc818e43352e78a748fbfb0b85e3a35f71dec9a",
+      "enable_order_book": true,
+      "expiry": "2026-09-16T00:00:00+00:00",
+      "liquidity": 419154.578,
+      "market_id": "2252244",
+      "no_ask": null,
+      "no_bid": null,
+      "no_mid": 0.555,
+      "no_token_id": "97050921740416192996389806693742575608111328819185493163189880975611314813724",
+      "order_book": null,
+      "provider_timestamp": "2026-09-09T18:30:06.441195+00:00",
+      "question": "Will there be no change in Fed interest rates after the September 2026 meeting?",
+      "resolution_criteria": "The FED interest rates are defined in this market by the upper bound of the target federal funds range. The decisions on the target federal funds range are made by the Federal Open Market Committee (FOMC) meetings.\n\nThis market will resolve to the amount of basis points the upper bound of the target federal funds rate is changed by versus the level it was prior to the Federal Reserve's September 2026 meeting.\n\nIf the target federal funds rate is changed to a level not expressed in the displayed options, the change will be rounded up to the nearest 25 and will resolve to the relevant bracket. (e.g. if there's a cut/increase of 12.5 bps it will be considered to be 25 bps)\n\nThe resolution source for this market is the FOMC\u2019s statement after its meeting scheduled for September 15-16, 2026 according to the official calendar: https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm.\n\nThe level and change of the target federal funds rate is also published at the official website of the Federal Reserve at https://www.federalreserve.gov/monetarypolicy/openmarket.htm.\n\nThis market may resolve as soon as the FOMC\u2019s statement for their September meeting with relevant data is issued. If no statement is released by the end date of the next scheduled meeting, this market will resolve to the \"No change\" bracket.",
+      "settlement": "open",
+      "slug": "will-there-be-no-change-in-fed-interest-rates-after-the-september-2026-meeting-615",
+      "source": "polymarket",
+      "tags": [],
+      "timestamp": "2026-09-09T18:30:06.441195+00:00",
+      "volume": 25414577.211184155,
+      "yes_ask": 0.45,
+      "yes_bid": 0.44,
+      "yes_mid": 0.445,
+      "yes_token_id": "5615282760875985231868508008056959876238536896643315063916840237042205273721"
+    },
+    "identity_hash": "sha256:31ea1d90b118bf570a85d371f90dc4c9fb8789dd7eecce8c05dfe8fb2abb24d1",
+    "market_id": "2252244",
+    "original_policy_matches": [
+      "2252244",
+      "2252245"
+    ],
+    "probe": false,
+    "queue_attempt": {
+      "authority_flags": {
+        "execution": false,
+        "lifecycle": false,
+        "qualification": false,
+        "ranking": false,
+        "scope": false
+      },
+      "book_hashes": {
+        "no": "sha256:d8819a350f4e082d4ef1f2cda71c04626aa20f6e3e351dda4e120352c7371b59",
+        "yes": "sha256:c16c79ea195375d57a32c70862ecfbd66e66ab2b0896c7d0cb501554b65dc238"
+      },
+      "dataset_attestation": {
+        "computed": false,
+        "error_type": null
+      },
+      "dataset_metadata": {
+        "dataset_id": "public-polymarket:81d4d17eb2ca56f41697c224",
+        "dataset_version": "observed-10917b10198925dac2cc0ef6",
+        "immutable_prerequisite_present": false,
+        "metadata_hash": "sha256:247e25107a7f8c7f211e0bc0a4bd77a27e1285b9167492b59add2c7fec78b027",
+        "source_type": "FORWARD_COLLECTED"
+      },
+      "error_type": null,
+      "evidence_class": "PUBLIC_MATCH_ORDINARY_PROCESSOR",
+      "exact_reason": "no immutable dataset public-polymarket:81d4d17eb2ca56f41697c224 at version observed-10917b10198925dac2cc0ef6",
+      "execution_flags": {
+        "authentication": false,
+        "credentials": false,
+        "live_execution": false,
+        "orders": false
+      },
+      "identity_hash": "sha256:31ea1d90b118bf570a85d371f90dc4c9fb8789dd7eecce8c05dfe8fb2abb24d1",
+      "lifecycle_stage": null,
+      "lineage": [
+        "2252244",
+        "sha256:31ea1d90b118bf570a85d371f90dc4c9fb8789dd7eecce8c05dfe8fb2abb24d1",
+        "sha256:c16c79ea195375d57a32c70862ecfbd66e66ab2b0896c7d0cb501554b65dc238",
+        "sha256:d8819a350f4e082d4ef1f2cda71c04626aa20f6e3e351dda4e120352c7371b59"
+      ],
+      "market_id": "2252244",
+      "market_scope": {
+        "categories": [
+          "politics"
+        ],
+        "filters": {
+          "category": [
+            "politics"
+          ],
+          "entry_price": [
+            0.4,
+            0.6
+          ],
+          "max_spread": 0.05,
+          "maximum_hours_to_resolution": 168.0,
+          "min_liquidity": 1000.0,
+          "minimum_hours_to_resolution": 24.0
+        },
+        "instrument": "POLYMARKET",
+        "market_ids": [],
+        "mode": "RULE_BASED_MARKETS",
+        "provenance": "canonical",
+        "regime_restrictions": {},
+        "schema_version": "1"
+      },
+      "market_scope_hash": "sha256:337e266dd67dde78f634df9fe0e09b87faf7b2ae0913b84435199a99c1cd350a",
+      "market_scope_version": "1",
+      "missing_prerequisite": {
+        "dataset_id": "public-polymarket:81d4d17eb2ca56f41697c224",
+        "dataset_version": "observed-10917b10198925dac2cc0ef6",
+        "name": "immutable_dataset",
+        "observed_reason": "no immutable dataset public-polymarket:81d4d17eb2ca56f41697c224 at version observed-10917b10198925dac2cc0ef6",
+        "present": false,
+        "source_type": "HISTORICAL"
+      },
+      "processor_reason": "no immutable dataset public-polymarket:81d4d17eb2ca56f41697c224 at version observed-10917b10198925dac2cc0ef6",
+      "promotable": false,
+      "public_provenance": {
+        "book_hashes": {
+          "no": "sha256:d8819a350f4e082d4ef1f2cda71c04626aa20f6e3e351dda4e120352c7371b59",
+          "yes": "sha256:c16c79ea195375d57a32c70862ecfbd66e66ab2b0896c7d0cb501554b65dc238"
+        },
+        "identity_hash": "sha256:31ea1d90b118bf570a85d371f90dc4c9fb8789dd7eecce8c05dfe8fb2abb24d1",
+        "market_id": "2252244",
+        "market_token_ids": "[REDACTED]",
+        "source_type": "FORWARD_COLLECTED"
+      },
+      "queue_cycle": {
+        "claimed": 1,
+        "completed": 0,
+        "failed": 0,
+        "paper_only": true,
+        "rejected": 1,
+        "released": 0,
+        "results": [
+          {
+            "accepted": false,
+            "item_id": "queue-c5858068fa96a5e24d49b4027030b9bfe43ff0fd77eeecdaa5f2c72f4bc26e55",
+            "item_type": "hypothesis",
+            "paper_only": true,
+            "reason": "no immutable dataset public-polymarket:81d4d17eb2ca56f41697c224 at version observed-10917b10198925dac2cc0ef6",
+            "reason_code": "INSUFFICIENT_DATA"
+          }
+        ]
+      },
+      "queue_item_id": "queue-c5858068fa96a5e24d49b4027030b9bfe43ff0fd77eeecdaa5f2c72f4bc26e55",
+      "queue_status": "REJECTED",
+      "reason": "no immutable dataset public-polymarket:81d4d17eb2ca56f41697c224 at version observed-10917b10198925dac2cc0ef6",
+      "reason_code": "INSUFFICIENT_DATA",
+      "resulting_stage": null,
+      "runtime_criteria": {
+        "max_drawdown": 0.2,
+        "min_calibration": 0.8,
+        "min_confidence_lower_bound": 0.0,
+        "min_expectancy": 0.0,
+        "min_forward_duration_seconds": 604800.0,
+        "min_forward_duration_seconds_for_performance_rejection": 0.0,
+        "min_independent_samples": 30,
+        "min_liquidity": 0.0,
+        "min_order_attempts_for_execution_rejection": 5,
+        "min_regimes": 3,
+        "min_resolved_bets_for_performance_rejection": 5,
+        "min_stability": 0.6,
+        "min_trades": 20
+      },
+      "scope_match": true,
+      "selection_rule": "smallest numeric market ID from observed policy matches",
+      "synthetic_offline": false,
+      "token_ids": {
+        "no": "97050921740416192996389806693742575608111328819185493163189880975611314813724",
+        "yes": "5615282760875985231868508008056959876238536896643315063916840237042205273721"
+      },
+      "workflow": "enqueue_public_market_attempt"
+    },
+    "reasons": [],
+    "scope_match": true,
+    "selection_rule": "smallest numeric market ID from observed policy matches",
+    "status": "ORIGINAL_POLICY_MATCH",
+    "token_ids": {
+      "no": "97050921740416192996389806693742575608111328819185493163189880975611314813724",
+      "yes": "5615282760875985231868508008056959876238536896643315063916840237042205273721"
+    }
+  },
+  "code_hash": "sha256:555ab1fba09deb8851604ca94e6efb48373de252a1c22d32e5d762f365c3c93a",
+  "config": {
+    "book_depth": 5,
+    "max_books": 2,
+    "max_pages": 4,
+    "max_seconds": 60.0,
+    "mode": "public",
+    "page_limit": 100,
+    "sample_limit": 10
+  },
+  "config_differences": {
+    "discovery_pushdown": {
+      "end_date_max_hours": 168.0,
+      "end_date_min_hours": 24.0,
+      "liquidity_num_min": 1000.0,
+      "price_local_only": true,
+      "spread_local_only": true,
+      "tag_id": 2,
+      "tag_slug": "politics",
+      "unsupported_or_custom_local_only": []
+    },
+    "max_books": 2,
+    "metadata_budget_independent_from_book_budget": true,
+    "metadata_page_budget": 4,
+    "probe_limits": {
+      "authority": "all_false",
+      "book_depth": 5,
+      "max_books": 2
+    },
+    "promotion_criteria": {
+      "relaxed": {
+        "max_drawdown": 1.0,
+        "min_calibration": 0.0,
+        "min_confidence_lower_bound": -1.0,
+        "min_expectancy": -1.0,
+        "min_forward_duration_seconds": 0.0,
+        "min_forward_duration_seconds_for_performance_rejection": 0.0,
+        "min_independent_samples": 0,
+        "min_liquidity": 0.0,
+        "min_order_attempts_for_execution_rejection": 5,
+        "min_regimes": 0,
+        "min_resolved_bets_for_performance_rejection": 5,
+        "min_stability": 0.0,
+        "min_trades": 0
+      },
+      "relaxed_vs_runtime": {
+        "max_drawdown": {
+          "changed": true,
+          "relaxed": 1.0,
+          "runtime": 0.2
+        },
+        "min_calibration": {
+          "changed": true,
+          "relaxed": 0.0,
+          "runtime": 0.8
+        },
+        "min_confidence_lower_bound": {
+          "changed": true,
+          "relaxed": -1.0,
+          "runtime": 0.0
+        },
+        "min_expectancy": {
+          "changed": true,
+          "relaxed": -1.0,
+          "runtime": 0.0
+        },
+        "min_forward_duration_seconds": {
+          "changed": true,
+          "relaxed": 0.0,
+          "runtime": 604800.0
+        },
+        "min_forward_duration_seconds_for_performance_rejection": {
+          "changed": false,
+          "relaxed": 0.0,
+          "runtime": 0.0
+        },
+        "min_independent_samples": {
+          "changed": true,
+          "relaxed": 0,
+          "runtime": 30
+        },
+        "min_liquidity": {
+          "changed": false,
+          "relaxed": 0.0,
+          "runtime": 0.0
+        },
+        "min_order_attempts_for_execution_rejection": {
+          "changed": false,
+          "relaxed": 5,
+          "runtime": 5
+        },
+        "min_regimes": {
+          "changed": true,
+          "relaxed": 0,
+          "runtime": 3
+        },
+        "min_resolved_bets_for_performance_rejection": {
+          "changed": false,
+          "relaxed": 5,
+          "runtime": 5
+        },
+        "min_stability": {
+          "changed": true,
+          "relaxed": 0.0,
+          "runtime": 0.6
+        },
+        "min_trades": {
+          "changed": true,
+          "relaxed": 0,
+          "runtime": 20
+        }
+      },
+      "runtime": {
+        "max_drawdown": 0.2,
+        "min_calibration": 0.8,
+        "min_confidence_lower_bound": 0.0,
+        "min_expectancy": 0.0,
+        "min_forward_duration_seconds": 604800.0,
+        "min_forward_duration_seconds_for_performance_rejection": 0.0,
+        "min_independent_samples": 30,
+        "min_liquidity": 0.0,
+        "min_order_attempts_for_execution_rejection": 5,
+        "min_regimes": 3,
+        "min_resolved_bets_for_performance_rejection": 5,
+        "min_stability": 0.6,
+        "min_trades": 20
+      }
+    },
+    "runtime_qualification_uses_default_criteria": true,
+    "scope_policy_is_not_runtime_promotion": true
+  },
+  "config_hash": "sha256:f95b14b066c35f56af83db3cebf7e7be7d45987a54350826eef048ef6f2851fb",
+  "counts": {
+    "canonical_first_failure": {
+      "PASS": 2,
+      "category_tags": 189,
+      "expiry": 0,
+      "expiry_malformed": 0,
+      "expiry_missing": 0,
+      "instrument": 0,
+      "instrument_malformed": 0,
+      "instrument_missing": 0,
+      "lifecycle": 0,
+      "liquidity": 0,
+      "liquidity_malformed": 0,
+      "liquidity_missing": 0,
+      "regime_restrictions": 0,
+      "regime_restrictions_malformed": 0,
+      "regime_restrictions_missing": 0,
+      "scope": 0,
+      "spread": 0,
+      "spread_malformed": 0,
+      "spread_missing": 0,
+      "yes_price": 113,
+      "yes_price_malformed": 0,
+      "yes_price_missing": 0
+    },
+    "canonical_first_failure_distribution": {
+      "PASS": 2,
+      "category_tags": 189,
+      "expiry": 0,
+      "expiry_malformed": 0,
+      "expiry_missing": 0,
+      "instrument": 0,
+      "instrument_malformed": 0,
+      "instrument_missing": 0,
+      "lifecycle": 0,
+      "liquidity": 0,
+      "liquidity_malformed": 0,
+      "liquidity_missing": 0,
+      "regime_restrictions": 0,
+      "regime_restrictions_malformed": 0,
+      "regime_restrictions_missing": 0,
+      "scope": 0,
+      "spread": 0,
+      "spread_malformed": 0,
+      "spread_missing": 0,
+      "yes_price": 113,
+      "yes_price_malformed": 0,
+      "yes_price_missing": 0
+    },
+    "independent": {
+      "category_tags": {
+        "fail": 189,
+        "malformed": 0,
+        "missing": 0,
+        "pass": 115
+      },
+      "expiry": {
+        "fail": 0,
+        "malformed": 0,
+        "missing": 0,
+        "pass": 304
+      },
+      "instrument": {
+        "fail": 0,
+        "malformed": 0,
+        "missing": 0,
+        "pass": 304
+      },
+      "lifecycle": {
+        "fail": 0,
+        "malformed": 0,
+        "missing": 0,
+        "pass": 304
+      },
+      "liquidity": {
+        "fail": 0,
+        "malformed": 0,
+        "missing": 0,
+        "pass": 304
+      },
+      "regime_restrictions": {
+        "fail": 0,
+        "malformed": 0,
+        "missing": 0,
+        "pass": 304
+      },
+      "scope": {
+        "fail": 0,
+        "malformed": 0,
+        "missing": 0,
+        "pass": 304
+      },
+      "spread": {
+        "fail": 6,
+        "malformed": 0,
+        "missing": 83,
+        "pass": 215
+      },
+      "yes_price": {
+        "fail": 286,
+        "malformed": 0,
+        "missing": 0,
+        "pass": 18
+      }
+    },
+    "independent_pass_counts": {
+      "category_tags": 115,
+      "expiry": 304,
+      "instrument": 304,
+      "lifecycle": 304,
+      "liquidity": 304,
+      "regime_restrictions": 304,
+      "scope": 304,
+      "spread": 215,
+      "yes_price": 18
+    },
+    "observed_unique_markets": 304,
+    "original_policy_matches": 2
+  },
+  "coverage": {
+    "bounded": true,
+    "cross_page_duplicate_rows": 0,
+    "duplicate_rows": 0,
+    "identity_reconciliation": {
+      "duplicate": 0,
+      "malformed": 96,
+      "raw": 400,
+      "reconciles": true,
+      "unique": 304
+    },
+    "malformed_rows": 96,
+    "observed_cross_page_duplicate_rows": 0,
+    "observed_malformed_rows": 0,
+    "observed_within_page_duplicate_rows": 0,
+    "page_error_reasons": [],
+    "page_statuses": [
+      "PARTIAL",
+      "PARTIAL",
+      "PARTIAL",
+      "PARTIAL"
+    ],
+    "provider_cross_page_duplicate_rows": 0,
+    "provider_duplicate_rows": 0,
+    "provider_malformed_rows": 96,
+    "provider_within_page_duplicate_rows": 0,
+    "raw_rows": 400,
+    "reasons": [
+      "metadata_page_budget_exhausted"
+    ],
+    "status": "BUDGET_EXHAUSTED",
+    "unattributed_duplicate_rows": 0,
+    "unique_rows": 304,
+    "within_page_duplicate_rows": 0
+  },
+  "generated_at": "2026-09-09T18:35:24.183180+00:00",
+  "later_public_workflow": {
+    "command": "python tools/polymarket_market_scope_acceptance.py --mode public --max-pages 4 --max-seconds 60 --max-books 2 --book-depth 5 --output reports/polymarket_market_scope_acceptance.public.json",
+    "executed_in_this_report": true,
+    "public_match_outcome": {
+      "authority_flags": {
+        "execution": false,
+        "lifecycle": false,
+        "qualification": false,
+        "ranking": false,
+        "scope": false
+      },
+      "book_hashes": {
+        "no": "sha256:d8819a350f4e082d4ef1f2cda71c04626aa20f6e3e351dda4e120352c7371b59",
+        "yes": "sha256:c16c79ea195375d57a32c70862ecfbd66e66ab2b0896c7d0cb501554b65dc238"
+      },
+      "dataset_attestation": {
+        "computed": false,
+        "error_type": null
+      },
+      "dataset_metadata": {
+        "dataset_id": "public-polymarket:81d4d17eb2ca56f41697c224",
+        "dataset_version": "observed-10917b10198925dac2cc0ef6",
+        "immutable_prerequisite_present": false,
+        "metadata_hash": "sha256:247e25107a7f8c7f211e0bc0a4bd77a27e1285b9167492b59add2c7fec78b027",
+        "source_type": "FORWARD_COLLECTED"
+      },
+      "error_type": null,
+      "evidence_class": "PUBLIC_MATCH_ORDINARY_PROCESSOR",
+      "exact_reason": "no immutable dataset public-polymarket:81d4d17eb2ca56f41697c224 at version observed-10917b10198925dac2cc0ef6",
+      "execution_flags": {
+        "authentication": false,
+        "credentials": false,
+        "live_execution": false,
+        "orders": false
+      },
+      "identity_hash": "sha256:31ea1d90b118bf570a85d371f90dc4c9fb8789dd7eecce8c05dfe8fb2abb24d1",
+      "lifecycle_stage": null,
+      "lineage": [
+        "2252244",
+        "sha256:31ea1d90b118bf570a85d371f90dc4c9fb8789dd7eecce8c05dfe8fb2abb24d1",
+        "sha256:c16c79ea195375d57a32c70862ecfbd66e66ab2b0896c7d0cb501554b65dc238",
+        "sha256:d8819a350f4e082d4ef1f2cda71c04626aa20f6e3e351dda4e120352c7371b59"
+      ],
+      "market_id": "2252244",
+      "market_scope": {
+        "categories": [
+          "politics"
+        ],
+        "filters": {
+          "category": [
+            "politics"
+          ],
+          "entry_price": [
+            0.4,
+            0.6
+          ],
+          "max_spread": 0.05,
+          "maximum_hours_to_resolution": 168.0,
+          "min_liquidity": 1000.0,
+          "minimum_hours_to_resolution": 24.0
+        },
+        "instrument": "POLYMARKET",
+        "market_ids": [],
+        "mode": "RULE_BASED_MARKETS",
+        "provenance": "canonical",
+        "regime_restrictions": {},
+        "schema_version": "1"
+      },
+      "market_scope_hash": "sha256:337e266dd67dde78f634df9fe0e09b87faf7b2ae0913b84435199a99c1cd350a",
+      "market_scope_version": "1",
+      "missing_prerequisite": {
+        "dataset_id": "public-polymarket:81d4d17eb2ca56f41697c224",
+        "dataset_version": "observed-10917b10198925dac2cc0ef6",
+        "name": "immutable_dataset",
+        "observed_reason": "no immutable dataset public-polymarket:81d4d17eb2ca56f41697c224 at version observed-10917b10198925dac2cc0ef6",
+        "present": false,
+        "source_type": "HISTORICAL"
+      },
+      "processor_reason": "no immutable dataset public-polymarket:81d4d17eb2ca56f41697c224 at version observed-10917b10198925dac2cc0ef6",
+      "promotable": false,
+      "public_provenance": {
+        "book_hashes": {
+          "no": "sha256:d8819a350f4e082d4ef1f2cda71c04626aa20f6e3e351dda4e120352c7371b59",
+          "yes": "sha256:c16c79ea195375d57a32c70862ecfbd66e66ab2b0896c7d0cb501554b65dc238"
+        },
+        "identity_hash": "sha256:31ea1d90b118bf570a85d371f90dc4c9fb8789dd7eecce8c05dfe8fb2abb24d1",
+        "market_id": "2252244",
+        "market_token_ids": "[REDACTED]",
+        "source_type": "FORWARD_COLLECTED"
+      },
+      "queue_cycle": {
+        "claimed": 1,
+        "completed": 0,
+        "failed": 0,
+        "paper_only": true,
+        "rejected": 1,
+        "released": 0,
+        "results": [
+          {
+            "accepted": false,
+            "item_id": "queue-c5858068fa96a5e24d49b4027030b9bfe43ff0fd77eeecdaa5f2c72f4bc26e55",
+            "item_type": "hypothesis",
+            "paper_only": true,
+            "reason": "no immutable dataset public-polymarket:81d4d17eb2ca56f41697c224 at version observed-10917b10198925dac2cc0ef6",
+            "reason_code": "INSUFFICIENT_DATA"
+          }
+        ]
+      },
+      "queue_item_id": "queue-c5858068fa96a5e24d49b4027030b9bfe43ff0fd77eeecdaa5f2c72f4bc26e55",
+      "queue_status": "REJECTED",
+      "reason": "no immutable dataset public-polymarket:81d4d17eb2ca56f41697c224 at version observed-10917b10198925dac2cc0ef6",
+      "reason_code": "INSUFFICIENT_DATA",
+      "resulting_stage": null,
+      "runtime_criteria": {
+        "max_drawdown": 0.2,
+        "min_calibration": 0.8,
+        "min_confidence_lower_bound": 0.0,
+        "min_expectancy": 0.0,
+        "min_forward_duration_seconds": 604800.0,
+        "min_forward_duration_seconds_for_performance_rejection": 0.0,
+        "min_independent_samples": 30,
+        "min_liquidity": 0.0,
+        "min_order_attempts_for_execution_rejection": 5,
+        "min_regimes": 3,
+        "min_resolved_bets_for_performance_rejection": 5,
+        "min_stability": 0.6,
+        "min_trades": 20
+      },
+      "scope_match": true,
+      "selection_rule": "smallest numeric market ID from observed policy matches",
+      "synthetic_offline": false,
+      "token_ids": {
+        "no": "97050921740416192996389806693742575608111328819185493163189880975611314813724",
+        "yes": "5615282760875985231868508008056959876238536896643315063916840237042205273721"
+      },
+      "workflow": "enqueue_public_market_attempt"
+    },
+    "steps": [
+      "Run from an isolated, read-only environment with network egress limited to the public Gamma and CLOB origins.",
+      "Use the exact CLI budgets and write to a new output path; do not point the runner at a live database.",
+      "Review allowlisted GET requests, coverage, hashes, and probe authority flags before any separate operator action.",
+      "Treat DATA_PIPELINE_PROBE as observation-only and do not use it as lifecycle, scope, ranking, qualification, or execution authority."
+    ],
+    "successor_outcome": {
+      "authority_flags": {
+        "execution": false,
+        "lifecycle": false,
+        "qualification": false,
+        "ranking": false,
+        "scope": false
+      },
+      "authority_market_cap": 30,
+      "dataset_attestation": {
+        "attestation_hash": "sha256:c81c3561f8f5386e5266482b9722645a27dc3461da5f41193c5f63a3bbc6fce0",
+        "computed": true,
+        "contamination_result": "PASS",
+        "execution_fidelity": "PRICE_PROXY",
+        "reason": null,
+        "row_count": 180,
+        "status": "CURRENT"
+      },
+      "dataset_metadata": {
+        "catalog_dataset_id": "prediction:offline-market-scope-fixture",
+        "dataset_id": "offline-market-scope-fixture",
+        "dataset_version": "fixture-v1",
+        "metadata_hash": "sha256:5ce78b684d67af2674393627a1ebc503bfe469f2564bac6365cae6b1071a8a92"
+      },
+      "error_type": null,
+      "evidence_class": "SYNTHETIC_OFFLINE",
+      "exact_reason": "CANDIDATE_FORWARD_MARKET_UNRESOLVED",
+      "execution_flags": {
+        "authentication": false,
+        "credentials": false,
+        "live_execution": false,
+        "orders": false
+      },
+      "isolated": true,
+      "lifecycle_stage": "FROZEN",
+      "lineage": [
+        "synthetic-predecessor-v1",
+        "sha256:7748e2d6763109e8fb10cdff8bf34e54347ffa10153f629b3162e1d54fef7725"
+      ],
+      "live_state_accessed": false,
+      "predecessor_frozen_hash": "sha256:7748e2d6763109e8fb10cdff8bf34e54347ffa10153f629b3162e1d54fef7725",
+      "predecessor_id": "synthetic-predecessor-v1",
+      "predecessor_provenance": {
+        "candidate_id": "synthetic-predecessor-v1",
+        "frozen_hash": "sha256:7748e2d6763109e8fb10cdff8bf34e54347ffa10153f629b3162e1d54fef7725",
+        "lineage_preserved": true
+      },
+      "processor_reason": "unsupported_by_validation",
+      "promotable": false,
+      "queue_item_id": "queue-3f397a3b3d6c80151aa44cd261de063156090971e988c20413c6597b35a2b0ba",
+      "queue_status": "REJECTED",
+      "reason": "CANDIDATE_FORWARD_MARKET_UNRESOLVED",
+      "reason_code": null,
+      "resulting_stage": "FROZEN",
+      "runtime_criteria": {
+        "max_drawdown": 0.2,
+        "min_calibration": 0.8,
+        "min_confidence_lower_bound": 0.0,
+        "min_expectancy": 0.0,
+        "min_forward_duration_seconds": 604800.0,
+        "min_forward_duration_seconds_for_performance_rejection": 0.0,
+        "min_independent_samples": 30,
+        "min_liquidity": 0.0,
+        "min_order_attempts_for_execution_rejection": 5,
+        "min_regimes": 3,
+        "min_resolved_bets_for_performance_rejection": 5,
+        "min_stability": 0.6,
+        "min_trades": 20
+      },
+      "runtime_reasons": [
+        "insufficient_independent_resolved_bets",
+        "insufficient_successful_order_attempts",
+        "drawdown_limit",
+        "forward_expectancy_floor",
+        "forward_confidence_lower_bound",
+        "forward_stability_floor",
+        "forward_calibration_floor",
+        "forward_liquidity_floor",
+        "insufficient_paper_forward_duration",
+        "insufficient_forward_regime_diversity"
+      ],
+      "successor_id": "synthetic-predecessor-v1:legacy-successor",
+      "synthetic_offline": true,
+      "workflow": "enqueue_legacy_successor"
+    },
+    "successor_outcome_evidence_class": "SYNTHETIC_OFFLINE",
+    "supported_public_paths": [
+      "/markets/keyset",
+      "/markets/{market_id}",
+      "/tags/slug/{slug}",
+      "/book"
+    ]
+  },
+  "mode": "public",
+  "order": {
+    "cross_page_duplicate_count": 0,
+    "cross_page_duplicate_ids": [],
+    "duplicate_count": 0,
+    "duplicate_ids": [],
+    "lexicographically_sorted": false,
+    "observed_ids": [
+      "811719",
+      "811720",
+      "811721",
+      "811722",
+      "811723",
+      "811724",
+      "811725",
+      "811726",
+      "811727",
+      "918248"
+    ],
+    "provider_duplicate_count": 0,
+    "stable_first_observation_order": [
+      "811719",
+      "811720",
+      "811721",
+      "811722",
+      "811723",
+      "811724",
+      "811725",
+      "811726",
+      "811727",
+      "918248"
+    ],
+    "unattributed_duplicate_count": 0,
+    "unique_ids": 304,
+    "within_page_duplicate_count": 0
+  },
+  "pagination": {
+    "coverage_status": "BUDGET_EXHAUSTED",
+    "cursor_chain": [
+      null,
+      "FGLhPvo-zO-Qc7wmLkFQpqumzXe1rbyp0Pp9AqPi7sB7InYiOjEsImsiOiJtYXJrZXRzIiwib2giOiI0ZjUzY2RhMThjMmJhYTBjMDM1NGJiNWY5YTNlY2JlNWVkMTJhYjRkOGUxMWJhODczYzJmMTExNjEyMDJiOTQ1Iiwia2V5cyI6W3sidCI6InN0cmluZyIsInYiOiIyNzEyNDA5In1dfQ",
+      "FbRFAO6PbbnEKqIhlToim1R7xBkPuMRF8ya-8nSLRCB7InYiOjEsImsiOiJtYXJrZXRzIiwib2giOiI0ZjUzY2RhMThjMmJhYTBjMDM1NGJiNWY5YTNlY2JlNWVkMTJhYjRkOGUxMWJhODczYzJmMTExNjEyMDJiOTQ1Iiwia2V5cyI6W3sidCI6InN0cmluZyIsInYiOiIyODY1NzM4In1dfQ",
+      "l4TwA6hPJT0U9Yi12bc4_BEwKxd0evHT5Cg30_uRJGF7InYiOjEsImsiOiJtYXJrZXRzIiwib2giOiI0ZjUzY2RhMThjMmJhYTBjMDM1NGJiNWY5YTNlY2JlNWVkMTJhYjRkOGUxMWJhODczYzJmMTExNjEyMDJiOTQ1Iiwia2V5cyI6W3sidCI6InN0cmluZyIsInYiOiIzMDkzMTk4In1dfQ"
+    ],
+    "cursor_reuse_detected": false,
+    "metadata_page_budget": 4,
+    "opaque_cursor_only": true,
+    "pages_observed": 4,
+    "returned_cursor_count": 4
+  },
+  "public_queue_attempt": {
+    "authority_flags": {
+      "execution": false,
+      "lifecycle": false,
+      "qualification": false,
+      "ranking": false,
+      "scope": false
+    },
+    "book_hashes": {
+      "no": "sha256:d8819a350f4e082d4ef1f2cda71c04626aa20f6e3e351dda4e120352c7371b59",
+      "yes": "sha256:c16c79ea195375d57a32c70862ecfbd66e66ab2b0896c7d0cb501554b65dc238"
+    },
+    "dataset_attestation": {
+      "computed": false,
+      "error_type": null
+    },
+    "dataset_metadata": {
+      "dataset_id": "public-polymarket:81d4d17eb2ca56f41697c224",
+      "dataset_version": "observed-10917b10198925dac2cc0ef6",
+      "immutable_prerequisite_present": false,
+      "metadata_hash": "sha256:247e25107a7f8c7f211e0bc0a4bd77a27e1285b9167492b59add2c7fec78b027",
+      "source_type": "FORWARD_COLLECTED"
+    },
+    "error_type": null,
+    "evidence_class": "PUBLIC_MATCH_ORDINARY_PROCESSOR",
+    "exact_reason": "no immutable dataset public-polymarket:81d4d17eb2ca56f41697c224 at version observed-10917b10198925dac2cc0ef6",
+    "execution_flags": {
+      "authentication": false,
+      "credentials": false,
+      "live_execution": false,
+      "orders": false
+    },
+    "identity_hash": "sha256:31ea1d90b118bf570a85d371f90dc4c9fb8789dd7eecce8c05dfe8fb2abb24d1",
+    "lifecycle_stage": null,
+    "lineage": [
+      "2252244",
+      "sha256:31ea1d90b118bf570a85d371f90dc4c9fb8789dd7eecce8c05dfe8fb2abb24d1",
+      "sha256:c16c79ea195375d57a32c70862ecfbd66e66ab2b0896c7d0cb501554b65dc238",
+      "sha256:d8819a350f4e082d4ef1f2cda71c04626aa20f6e3e351dda4e120352c7371b59"
+    ],
+    "market_id": "2252244",
+    "market_scope": {
+      "categories": [
+        "politics"
+      ],
+      "filters": {
+        "category": [
+          "politics"
+        ],
+        "entry_price": [
+          0.4,
+          0.6
+        ],
+        "max_spread": 0.05,
+        "maximum_hours_to_resolution": 168.0,
+        "min_liquidity": 1000.0,
+        "minimum_hours_to_resolution": 24.0
+      },
+      "instrument": "POLYMARKET",
+      "market_ids": [],
+      "mode": "RULE_BASED_MARKETS",
+      "provenance": "canonical",
+      "regime_restrictions": {},
+      "schema_version": "1"
+    },
+    "market_scope_hash": "sha256:337e266dd67dde78f634df9fe0e09b87faf7b2ae0913b84435199a99c1cd350a",
+    "market_scope_version": "1",
+    "missing_prerequisite": {
+      "dataset_id": "public-polymarket:81d4d17eb2ca56f41697c224",
+      "dataset_version": "observed-10917b10198925dac2cc0ef6",
+      "name": "immutable_dataset",
+      "observed_reason": "no immutable dataset public-polymarket:81d4d17eb2ca56f41697c224 at version observed-10917b10198925dac2cc0ef6",
+      "present": false,
+      "source_type": "HISTORICAL"
+    },
+    "processor_reason": "no immutable dataset public-polymarket:81d4d17eb2ca56f41697c224 at version observed-10917b10198925dac2cc0ef6",
+    "promotable": false,
+    "public_provenance": {
+      "book_hashes": {
+        "no": "sha256:d8819a350f4e082d4ef1f2cda71c04626aa20f6e3e351dda4e120352c7371b59",
+        "yes": "sha256:c16c79ea195375d57a32c70862ecfbd66e66ab2b0896c7d0cb501554b65dc238"
+      },
+      "identity_hash": "sha256:31ea1d90b118bf570a85d371f90dc4c9fb8789dd7eecce8c05dfe8fb2abb24d1",
+      "market_id": "2252244",
+      "market_token_ids": "[REDACTED]",
+      "source_type": "FORWARD_COLLECTED"
+    },
+    "queue_cycle": {
+      "claimed": 1,
+      "completed": 0,
+      "failed": 0,
+      "paper_only": true,
+      "rejected": 1,
+      "released": 0,
+      "results": [
+        {
+          "accepted": false,
+          "item_id": "queue-c5858068fa96a5e24d49b4027030b9bfe43ff0fd77eeecdaa5f2c72f4bc26e55",
+          "item_type": "hypothesis",
+          "paper_only": true,
+          "reason": "no immutable dataset public-polymarket:81d4d17eb2ca56f41697c224 at version observed-10917b10198925dac2cc0ef6",
+          "reason_code": "INSUFFICIENT_DATA"
+        }
+      ]
+    },
+    "queue_item_id": "queue-c5858068fa96a5e24d49b4027030b9bfe43ff0fd77eeecdaa5f2c72f4bc26e55",
+    "queue_status": "REJECTED",
+    "reason": "no immutable dataset public-polymarket:81d4d17eb2ca56f41697c224 at version observed-10917b10198925dac2cc0ef6",
+    "reason_code": "INSUFFICIENT_DATA",
+    "resulting_stage": null,
+    "runtime_criteria": {
+      "max_drawdown": 0.2,
+      "min_calibration": 0.8,
+      "min_confidence_lower_bound": 0.0,
+      "min_expectancy": 0.0,
+      "min_forward_duration_seconds": 604800.0,
+      "min_forward_duration_seconds_for_performance_rejection": 0.0,
+      "min_independent_samples": 30,
+      "min_liquidity": 0.0,
+      "min_order_attempts_for_execution_rejection": 5,
+      "min_regimes": 3,
+      "min_resolved_bets_for_performance_rejection": 5,
+      "min_stability": 0.6,
+      "min_trades": 20
+    },
+    "scope_match": true,
+    "selection_rule": "smallest numeric market ID from observed policy matches",
+    "synthetic_offline": false,
+    "token_ids": {
+      "no": "97050921740416192996389806693742575608111328819185493163189880975611314813724",
+      "yes": "5615282760875985231868508008056959876238536896643315063916840237042205273721"
+    },
+    "workflow": "enqueue_public_market_attempt"
+  },
+  "queue_demo": {
+    "authority_flags": {
+      "execution": false,
+      "lifecycle": false,
+      "qualification": false,
+      "ranking": false,
+      "scope": false
+    },
+    "authority_market_cap": 30,
+    "dataset_attestation": {
+      "attestation_hash": "sha256:c81c3561f8f5386e5266482b9722645a27dc3461da5f41193c5f63a3bbc6fce0",
+      "computed": true,
+      "contamination_result": "PASS",
+      "execution_fidelity": "PRICE_PROXY",
+      "reason": null,
+      "row_count": 180,
+      "status": "CURRENT"
+    },
+    "dataset_metadata": {
+      "catalog_dataset_id": "prediction:offline-market-scope-fixture",
+      "dataset_id": "offline-market-scope-fixture",
+      "dataset_version": "fixture-v1",
+      "metadata_hash": "sha256:5ce78b684d67af2674393627a1ebc503bfe469f2564bac6365cae6b1071a8a92"
+    },
+    "error_type": null,
+    "evidence_class": "SYNTHETIC_OFFLINE",
+    "exact_reason": "CANDIDATE_FORWARD_MARKET_UNRESOLVED",
+    "execution_flags": {
+      "authentication": false,
+      "credentials": false,
+      "live_execution": false,
+      "orders": false
+    },
+    "isolated": true,
+    "lifecycle_stage": "FROZEN",
+    "lineage": [
+      "synthetic-predecessor-v1",
+      "sha256:7748e2d6763109e8fb10cdff8bf34e54347ffa10153f629b3162e1d54fef7725"
+    ],
+    "live_state_accessed": false,
+    "predecessor_frozen_hash": "sha256:7748e2d6763109e8fb10cdff8bf34e54347ffa10153f629b3162e1d54fef7725",
+    "predecessor_id": "synthetic-predecessor-v1",
+    "predecessor_provenance": {
+      "candidate_id": "synthetic-predecessor-v1",
+      "frozen_hash": "sha256:7748e2d6763109e8fb10cdff8bf34e54347ffa10153f629b3162e1d54fef7725",
+      "lineage_preserved": true
+    },
+    "processor_reason": "unsupported_by_validation",
+    "promotable": false,
+    "queue_item_id": "queue-3f397a3b3d6c80151aa44cd261de063156090971e988c20413c6597b35a2b0ba",
+    "queue_status": "REJECTED",
+    "reason": "CANDIDATE_FORWARD_MARKET_UNRESOLVED",
+    "reason_code": null,
+    "resulting_stage": "FROZEN",
+    "runtime_criteria": {
+      "max_drawdown": 0.2,
+      "min_calibration": 0.8,
+      "min_confidence_lower_bound": 0.0,
+      "min_expectancy": 0.0,
+      "min_forward_duration_seconds": 604800.0,
+      "min_forward_duration_seconds_for_performance_rejection": 0.0,
+      "min_independent_samples": 30,
+      "min_liquidity": 0.0,
+      "min_order_attempts_for_execution_rejection": 5,
+      "min_regimes": 3,
+      "min_resolved_bets_for_performance_rejection": 5,
+      "min_stability": 0.6,
+      "min_trades": 20
+    },
+    "runtime_reasons": [
+      "insufficient_independent_resolved_bets",
+      "insufficient_successful_order_attempts",
+      "drawdown_limit",
+      "forward_expectancy_floor",
+      "forward_confidence_lower_bound",
+      "forward_stability_floor",
+      "forward_calibration_floor",
+      "forward_liquidity_floor",
+      "insufficient_paper_forward_duration",
+      "insufficient_forward_regime_diversity"
+    ],
+    "successor_id": "synthetic-predecessor-v1:legacy-successor",
+    "synthetic_offline": true,
+    "workflow": "enqueue_legacy_successor"
+  },
+  "reasons": {
+    "blockers": [],
+    "candidate": [],
+    "coverage": [
+      "metadata_page_budget_exhausted"
+    ]
+  },
+  "requests": {
+    "allowlist": [
+      "/markets/keyset",
+      "/markets/{market_id}",
+      "/tags/slug/{slug}",
+      "/book"
+    ],
+    "identity_and_book_requests": [
+      {
+        "market_id": "2252244",
+        "method": "GET",
+        "path": "/markets/2252244",
+        "requested_at": "2026-09-09T18:35:24.183180+00:00"
+      },
+      {
+        "depth": 5,
+        "method": "GET",
+        "path": "/book",
+        "requested_at": "2026-09-09T18:35:24.183180+00:00",
+        "token_id": "5615282760875985231868508008056959876238536896643315063916840237042205273721"
+      },
+      {
+        "depth": 5,
+        "method": "GET",
+        "path": "/book",
+        "requested_at": "2026-09-09T18:35:24.183180+00:00",
+        "token_id": "97050921740416192996389806693742575608111328819185493163189880975611314813724"
+      }
+    ],
+    "methods": [
+      "GET"
+    ],
+    "samples": [
+      {
+        "coverage_status": "PARTIAL",
+        "cross_page_duplicate_count": 0,
+        "duplicate_count": 0,
+        "error_reason": null,
+        "malformed_count": 1,
+        "method": "GET",
+        "observed_malformed_count": 0,
+        "page": 0,
+        "path": "/markets/keyset",
+        "provider_requested_at": null,
+        "query": {
+          "after_cursor": null,
+          "closed": false,
+          "end_date_max": "2026-09-16T18:35:24.183180+00:00",
+          "end_date_min": "2026-09-10T18:35:24.183180+00:00",
+          "include_tag": true,
+          "limit": 100,
+          "liquidity_num_min": 1000.0,
+          "tag_ids": [
+            2
+          ]
+        },
+        "query_fingerprint": "18a03b1998c66cbcacba26a99cad7f2b9627d551da058f3bf3e4840937944051",
+        "raw_count": 100,
+        "requested_at": "2026-09-09T18:35:24.183180+00:00",
+        "unique_count": 99,
+        "within_page_duplicate_count": 0
+      },
+      {
+        "coverage_status": "PARTIAL",
+        "cross_page_duplicate_count": 0,
+        "duplicate_count": 0,
+        "error_reason": null,
+        "malformed_count": 32,
+        "method": "GET",
+        "observed_malformed_count": 0,
+        "page": 1,
+        "path": "/markets/keyset",
+        "provider_requested_at": null,
+        "query": {
+          "after_cursor": "FGLhPvo-zO-Qc7wmLkFQpqumzXe1rbyp0Pp9AqPi7sB7InYiOjEsImsiOiJtYXJrZXRzIiwib2giOiI0ZjUzY2RhMThjMmJhYTBjMDM1NGJiNWY5YTNlY2JlNWVkMTJhYjRkOGUxMWJhODczYzJmMTExNjEyMDJiOTQ1Iiwia2V5cyI6W3sidCI6InN0cmluZyIsInYiOiIyNzEyNDA5In1dfQ",
+          "closed": false,
+          "end_date_max": "2026-09-16T18:35:24.183180+00:00",
+          "end_date_min": "2026-09-10T18:35:24.183180+00:00",
+          "include_tag": true,
+          "limit": 100,
+          "liquidity_num_min": 1000.0,
+          "tag_ids": [
+            2
+          ]
+        },
+        "query_fingerprint": "18a03b1998c66cbcacba26a99cad7f2b9627d551da058f3bf3e4840937944051",
+        "raw_count": 100,
+        "requested_at": "2026-09-09T18:35:24.183180+00:00",
+        "unique_count": 68,
+        "within_page_duplicate_count": 0
+      },
+      {
+        "coverage_status": "PARTIAL",
+        "cross_page_duplicate_count": 0,
+        "duplicate_count": 0,
+        "error_reason": null,
+        "malformed_count": 0,
+        "method": "GET",
+        "observed_malformed_count": 0,
+        "page": 2,
+        "path": "/markets/keyset",
+        "provider_requested_at": null,
+        "query": {
+          "after_cursor": "FbRFAO6PbbnEKqIhlToim1R7xBkPuMRF8ya-8nSLRCB7InYiOjEsImsiOiJtYXJrZXRzIiwib2giOiI0ZjUzY2RhMThjMmJhYTBjMDM1NGJiNWY5YTNlY2JlNWVkMTJhYjRkOGUxMWJhODczYzJmMTExNjEyMDJiOTQ1Iiwia2V5cyI6W3sidCI6InN0cmluZyIsInYiOiIyODY1NzM4In1dfQ",
+          "closed": false,
+          "end_date_max": "2026-09-16T18:35:24.183180+00:00",
+          "end_date_min": "2026-09-10T18:35:24.183180+00:00",
+          "include_tag": true,
+          "limit": 100,
+          "liquidity_num_min": 1000.0,
+          "tag_ids": [
+            2
+          ]
+        },
+        "query_fingerprint": "18a03b1998c66cbcacba26a99cad7f2b9627d551da058f3bf3e4840937944051",
+        "raw_count": 100,
+        "requested_at": "2026-09-09T18:35:24.183180+00:00",
+        "unique_count": 100,
+        "within_page_duplicate_count": 0
+      },
+      {
+        "coverage_status": "PARTIAL",
+        "cross_page_duplicate_count": 0,
+        "duplicate_count": 0,
+        "error_reason": null,
+        "malformed_count": 63,
+        "method": "GET",
+        "observed_malformed_count": 0,
+        "page": 3,
+        "path": "/markets/keyset",
+        "provider_requested_at": null,
+        "query": {
+          "after_cursor": "l4TwA6hPJT0U9Yi12bc4_BEwKxd0evHT5Cg30_uRJGF7InYiOjEsImsiOiJtYXJrZXRzIiwib2giOiI0ZjUzY2RhMThjMmJhYTBjMDM1NGJiNWY5YTNlY2JlNWVkMTJhYjRkOGUxMWJhODczYzJmMTExNjEyMDJiOTQ1Iiwia2V5cyI6W3sidCI6InN0cmluZyIsInYiOiIzMDkzMTk4In1dfQ",
+          "closed": false,
+          "end_date_max": "2026-09-16T18:35:24.183180+00:00",
+          "end_date_min": "2026-09-10T18:35:24.183180+00:00",
+          "include_tag": true,
+          "limit": 100,
+          "liquidity_num_min": 1000.0,
+          "tag_ids": [
+            2
+          ]
+        },
+        "query_fingerprint": "18a03b1998c66cbcacba26a99cad7f2b9627d551da058f3bf3e4840937944051",
+        "raw_count": 100,
+        "requested_at": "2026-09-09T18:35:24.183180+00:00",
+        "unique_count": 37,
+        "within_page_duplicate_count": 0
+      }
+    ],
+    "tag_lookup": {
+      "method": "GET",
+      "path": "/tags/slug/politics",
+      "query": {},
+      "requested_at": "2026-09-09T18:35:24.183180+00:00",
+      "slug": "politics",
+      "status": "resolved",
+      "tag_id": 2
+    },
+    "total_discovery_requests": 4
+  },
+  "runtime_qualification": {
+    "authority": "not assigned by DATA_PIPELINE_PROBE or ORIGINAL_POLICY_MATCH",
+    "criteria": {
+      "max_drawdown": 0.2,
+      "min_calibration": 0.8,
+      "min_confidence_lower_bound": 0.0,
+      "min_expectancy": 0.0,
+      "min_forward_duration_seconds": 604800.0,
+      "min_forward_duration_seconds_for_performance_rejection": 0.0,
+      "min_independent_samples": 30,
+      "min_liquidity": 0.0,
+      "min_order_attempts_for_execution_rejection": 5,
+      "min_regimes": 3,
+      "min_resolved_bets_for_performance_rejection": 5,
+      "min_stability": 0.6,
+      "min_trades": 20
+    },
+    "evidence_class": "SYNTHETIC_OFFLINE",
+    "synthetic_offline": true,
+    "unmodified_defaults": true
+  },
+  "schema_version": "polymarket-market-scope-acceptance-v1",
+  "scope": {
+    "first_failure_order": [
+      "scope",
+      "instrument",
+      "lifecycle",
+      "category_tags",
+      "regime_restrictions",
+      "yes_price",
+      "expiry",
+      "liquidity",
+      "spread"
+    ],
+    "policy": {
+      "categories": [
+        "politics"
+      ],
+      "filters": {
+        "category": [
+          "politics"
+        ],
+        "entry_price": [
+          0.4,
+          0.6
+        ],
+        "max_spread": 0.05,
+        "maximum_hours_to_resolution": 168.0,
+        "min_liquidity": 1000.0,
+        "minimum_hours_to_resolution": 24.0
+      },
+      "instrument": "POLYMARKET",
+      "market_ids": [],
+      "mode": "RULE_BASED_MARKETS",
+      "provenance": "canonical",
+      "regime_restrictions": {},
+      "schema_version": "1"
+    },
+    "policy_authority": "canonical local MarketScopePolicy when available"
+  },
+  "scope_hash": "sha256:337e266dd67dde78f634df9fe0e09b87faf7b2ae0913b84435199a99c1cd350a",
+  "security": {
+    "authentication_used": false,
+    "credentials_used": false,
+    "forbidden_paths_observed": [],
+    "observed_methods": [
+      "GET"
+    ],
+    "order_transport_called": false,
+    "private_or_authenticated_state_accessed": false,
+    "public_get_allowlist": [
+      "/markets/keyset",
+      "/markets/{market_id}",
+      "/tags/slug/{slug}",
+      "/book"
+    ],
+    "secret_scrubbed": true
+  },
+  "status_categories": {
+    "candidate": "ORIGINAL_POLICY_MATCH",
+    "coverage": "BUDGET_EXHAUSTED",
+    "probe_authority": "NOT_APPLICABLE",
+    "public_queue": "REJECTED",
+    "queue": "REJECTED",
+    "synthetic_queue_demo": "REJECTED"
+  },
+  "synthetic_offline_queue_demo": {
+    "authority_flags": {
+      "execution": false,
+      "lifecycle": false,
+      "qualification": false,
+      "ranking": false,
+      "scope": false
+    },
+    "authority_market_cap": 30,
+    "dataset_attestation": {
+      "attestation_hash": "sha256:c81c3561f8f5386e5266482b9722645a27dc3461da5f41193c5f63a3bbc6fce0",
+      "computed": true,
+      "contamination_result": "PASS",
+      "execution_fidelity": "PRICE_PROXY",
+      "reason": null,
+      "row_count": 180,
+      "status": "CURRENT"
+    },
+    "dataset_metadata": {
+      "catalog_dataset_id": "prediction:offline-market-scope-fixture",
+      "dataset_id": "offline-market-scope-fixture",
+      "dataset_version": "fixture-v1",
+      "metadata_hash": "sha256:5ce78b684d67af2674393627a1ebc503bfe469f2564bac6365cae6b1071a8a92"
+    },
+    "error_type": null,
+    "evidence_class": "SYNTHETIC_OFFLINE",
+    "exact_reason": "CANDIDATE_FORWARD_MARKET_UNRESOLVED",
+    "execution_flags": {
+      "authentication": false,
+      "credentials": false,
+      "live_execution": false,
+      "orders": false
+    },
+    "isolated": true,
+    "lifecycle_stage": "FROZEN",
+    "lineage": [
+      "synthetic-predecessor-v1",
+      "sha256:7748e2d6763109e8fb10cdff8bf34e54347ffa10153f629b3162e1d54fef7725"
+    ],
+    "live_state_accessed": false,
+    "predecessor_frozen_hash": "sha256:7748e2d6763109e8fb10cdff8bf34e54347ffa10153f629b3162e1d54fef7725",
+    "predecessor_id": "synthetic-predecessor-v1",
+    "predecessor_provenance": {
+      "candidate_id": "synthetic-predecessor-v1",
+      "frozen_hash": "sha256:7748e2d6763109e8fb10cdff8bf34e54347ffa10153f629b3162e1d54fef7725",
+      "lineage_preserved": true
+    },
+    "processor_reason": "unsupported_by_validation",
+    "promotable": false,
+    "queue_item_id": "queue-3f397a3b3d6c80151aa44cd261de063156090971e988c20413c6597b35a2b0ba",
+    "queue_status": "REJECTED",
+    "reason": "CANDIDATE_FORWARD_MARKET_UNRESOLVED",
+    "reason_code": null,
+    "resulting_stage": "FROZEN",
+    "runtime_criteria": {
+      "max_drawdown": 0.2,
+      "min_calibration": 0.8,
+      "min_confidence_lower_bound": 0.0,
+      "min_expectancy": 0.0,
+      "min_forward_duration_seconds": 604800.0,
+      "min_forward_duration_seconds_for_performance_rejection": 0.0,
+      "min_independent_samples": 30,
+      "min_liquidity": 0.0,
+      "min_order_attempts_for_execution_rejection": 5,
+      "min_regimes": 3,
+      "min_resolved_bets_for_performance_rejection": 5,
+      "min_stability": 0.6,
+      "min_trades": 20
+    },
+    "runtime_reasons": [
+      "insufficient_independent_resolved_bets",
+      "insufficient_successful_order_attempts",
+      "drawdown_limit",
+      "forward_expectancy_floor",
+      "forward_confidence_lower_bound",
+      "forward_stability_floor",
+      "forward_calibration_floor",
+      "forward_liquidity_floor",
+      "insufficient_paper_forward_duration",
+      "insufficient_forward_regime_diversity"
+    ],
+    "successor_id": "synthetic-predecessor-v1:legacy-successor",
+    "synthetic_offline": true,
+    "workflow": "enqueue_legacy_successor"
+  },
+  "timestamps": {
+    "monotonic_non_decreasing": true,
+    "provider_samples": [
+      null,
+      null,
+      null,
+      null
+    ],
+    "request_samples": [
+      "2026-09-09T18:35:24.183180+00:00",
+      "2026-09-09T18:35:24.183180+00:00",
+      "2026-09-09T18:35:24.183180+00:00",
+      "2026-09-09T18:35:24.183180+00:00",
+      "2026-09-09T18:35:24.183180+00:00"
+    ]
+  }
+}

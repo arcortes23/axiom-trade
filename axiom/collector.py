@@ -33,6 +33,17 @@ from .domain import (
 )
 from .storage import AxiomStore
 _UNSET = object()
+_MAX_SCOPE_REQUEST_PATH_LENGTH = 512
+_MAX_SCOPE_QUERY_DEPTH = 8
+_MAX_SCOPE_QUERY_ITEMS = 128
+_MAX_SCOPE_QUERY_STRING_LENGTH = 1024
+
+
+class _ScopePersistenceValueError(ValueError):
+    """A provider pagination value cannot be persisted as plain JSON."""
+
+
+_MAX_SCOPE_CURSOR_HISTORY = 256
 
 
 @dataclass(frozen=True, slots=True)
@@ -217,6 +228,9 @@ class PolymarketCollector:
         self.config = config or CollectorConfig()
         self.clock = clock
         self.sleep = sleep
+        # The nested continuation is assembled during scope discovery and
+        # persisted with the root collector state at the end of the cycle.
+        self._scope_inventory_continuation: Mapping[str, Any] | None = None
 
     def collect_once(
         self,
@@ -227,6 +241,11 @@ class PolymarketCollector:
         started = ensure_utc(now or self.clock())
         monotonic_started = time.monotonic()
         root_state = self.store.get_collector_state(self.config.collector_name) or {}
+        self._scope_inventory_continuation = (
+            root_state.get("scope_inventory_continuation")
+            if isinstance(root_state.get("scope_inventory_continuation"), Mapping)
+            else None
+        )
         requested = tuple(dict.fromkeys(str(item).strip() for item in (market_ids or ()) if str(item).strip()))
         configured = requested or self.config.market_ids
         counters = self._new_counters()
@@ -581,6 +600,7 @@ class PolymarketCollector:
                 "stale_after_seconds": self.config.stale_after_seconds,
                 "discovery_carry_cursor": discovery_cursor,
                 "scope_discovery_carry_cursor": scope_cursor,
+                "scope_inventory_continuation": self._scope_inventory_continuation,
                 "candidate_bound_markets": list(candidate_bound),
                 "candidate_bound_scheduled": list(candidate_scheduled),
                 "candidate_bound_fresh": list(candidate_fresh),
@@ -817,7 +837,7 @@ class PolymarketCollector:
         candidate_ids: Sequence[str],
         root_state: Mapping[str, Any],
         counters: dict[str, Any],
-    ) -> tuple[list[str], dict[str, list[str]], dict[str, PredictionMarketSnapshot], int]:
+    ) -> tuple[list[str], dict[str, list[str]], dict[str, PredictionMarketSnapshot], Any]:
         """Resolve all frozen market policies against one shared inventory.
 
         Scope resolution deliberately happens before the normal candidate and
@@ -858,12 +878,22 @@ class PolymarketCollector:
             self._scope_document_needs_inventory(document)
             for _, document in documents
         )
+        scope_candidates = [candidate_id for candidate_id, _ in documents]
         if needs_inventory:
             current_records, snapshots, next_cursor = self._discover_scope_inventory(
                 observed_at,
                 counters,
                 carry_cursor=carry_cursor,
+                documents=tuple(document for _, document in documents),
             )
+            if (
+                isinstance(self._scope_inventory_continuation, Mapping)
+                and self._scope_inventory_continuation.get("query_reset")
+            ):
+                # A reset/rebase response is intentionally not a resolver
+                # input.  Keep the candidate scoped so legacy authority cannot
+                # leak into scheduling while the next cycle rebases.
+                return scope_candidates, {}, {}, next_cursor
         else:
             current_records, snapshots, next_cursor = [], {}, carry_cursor
         # Resolver limits are independently bounded from the scheduler's
@@ -871,7 +901,6 @@ class PolymarketCollector:
         # matches, while this cycle still schedules at most max_markets.
         max_scope_markets = min(1000, max(0, len(current_records)))
         candidate_markets: dict[str, list[str]] = {}
-        scope_candidates = [candidate_id for candidate_id, _ in documents]
         for candidate_id, document in documents:
             try:
                 result = resolve_market_scope(
@@ -913,12 +942,36 @@ class PolymarketCollector:
         return scope_candidates, candidate_markets, snapshots, next_cursor
 
     @staticmethod
-    def _scope_cursor(root_state: Mapping[str, Any]) -> int:
+    def _scope_cursor(root_state: Mapping[str, Any]) -> Any:
+        continuation = root_state.get("scope_inventory_continuation")
+        if isinstance(continuation, Mapping):
+            if str(continuation.get("coverage_status", "")).upper() == "COMPLETE":
+                return None
+            value = continuation.get("after_cursor", continuation.get("cursor"))
+            if isinstance(value, str) and value.strip():
+                return value
         value = root_state.get("scope_discovery_carry_cursor", root_state.get("discovery_carry_cursor", 0))
+        if isinstance(value, str):
+            return value.strip() or None
         try:
             return max(0, int(value))
         except (TypeError, ValueError):
             return 0
+    @staticmethod
+    def _scope_cursor_history(value: Any) -> list[str]:
+        """Normalize the bounded opaque-cursor history persisted in state."""
+        if not isinstance(value, (list, tuple)):
+            return []
+        history: list[str] = []
+        for item in value:
+            if not isinstance(item, str):
+                continue
+            cursor = item.strip()
+            if cursor and cursor not in history:
+                history.append(cursor)
+        return history[-_MAX_SCOPE_CURSOR_HISTORY:]
+
+
 
     @staticmethod
     def _has_scope_material(payload: Mapping[str, Any]) -> bool:
@@ -975,24 +1028,735 @@ class PolymarketCollector:
         # Hash/version-only or malformed bindings cannot authorize current
         # markets, so resolving them against an inventory is unnecessary.
         return False
+    @staticmethod
+    def _scope_policy(document: Mapping[str, Any]) -> Any | None:
+        source = document.get("experiment_plan")
+        source = source if isinstance(source, Mapping) else document
+        value = source.get("market_scope")
+        if value is None:
+            return None
+        try:
+            from .experiment_plan import MarketScopePolicy, normalize_market_scope
+            if isinstance(value, MarketScopePolicy):
+                return value
+            if isinstance(value, Mapping):
+                return normalize_market_scope(value)
+        except (TypeError, ValueError, ImportError):
+            return None
+        return None
+
+    def _scope_inventory_query(
+        self,
+        documents: Sequence[Mapping[str, Any]],
+        observed_at: datetime,
+        provider: Any,
+        *,
+        limit: int,
+        after_cursor: str | None,
+    ) -> dict[str, Any]:
+        """Build an OR-safe Gamma envelope for all active scope policies."""
+        policies = [
+            policy
+            for document in documents
+            if (policy := self._scope_policy(document)) is not None
+            and str(getattr(policy, "mode", "")).upper()
+            in {"EXACT_MARKETS", "RULE_BASED_MARKETS"}
+        ]
+        query: dict[str, Any] = {
+            "limit": limit,
+            "after_cursor": after_cursor,
+            "closed": False,
+            "tag_ids": (),
+            "include_tag": True,
+            "liquidity_num_min": None,
+            "end_date_min": None,
+            "end_date_max": None,
+        }
+        if not policies:
+            return query
+
+        # A category is safe only when every policy has exactly one identical
+        # category.  IDs are provider-owned; a slug is never sent as an ID.
+        category_values: list[str] = []
+        for policy in policies:
+            categories = tuple(
+                str(item).strip().casefold()
+                for item in getattr(policy, "categories", ())
+                if str(item).strip()
+            )
+            if len(categories) != 1:
+                category_values = []
+                break
+            category_values.append(categories[0])
+        if category_values and len(set(category_values)) == 1:
+            resolver = getattr(provider, "resolve_tag_slug", None)
+            if callable(resolver):
+                lookup_failed = False
+                try:
+                    resolved = resolver(category_values[0])
+                    if isinstance(resolved, Mapping):
+                        resolved = (
+                            resolved.get("id")
+                            or resolved.get("tag_id")
+                            or resolved.get("tagId")
+                        )
+                    if isinstance(resolved, (str, int)) and not isinstance(resolved, bool):
+                        query["tag_ids"] = (resolved,)
+                    else:
+                        lookup_failed = True
+                except Exception:
+                    # Taxonomy lookup is advisory.  Falling back to the
+                    # unfiltered page is safer than inventing an identifier.
+                    lookup_failed = True
+                if lookup_failed:
+                    # Optional lookup adapters may retain transport or
+                    # validation failures for the next provider operation.
+                    # Drain only after this failed advisory call so a
+                    # successful broader discovery page is not misclassified.
+                    self._consume_advisory_provider_errors(provider)
 
 
+        def scalar_bound(policy: Any, name: str) -> float | None:
+            filters = getattr(policy, "filters", {})
+            value = filters.get(name) if isinstance(filters, Mapping) else None
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return None
+            try:
+                number = float(value)
+            except (TypeError, ValueError, OverflowError):
+                return None
+            return number if math.isfinite(number) else None
+
+        # For the union of policies, a lower/upper envelope is safe only when
+        # every policy supplies that bound.  Otherwise an unconstrained policy
+        # could be silently filtered out by the server.
+        liquidity = [scalar_bound(policy, "min_liquidity") for policy in policies]
+        if all(value is not None for value in liquidity):
+            query["liquidity_num_min"] = min(value for value in liquidity if value is not None)
+
+        minimum_hours = [
+            scalar_bound(policy, "minimum_hours_to_resolution")
+            for policy in policies
+        ]
+        if all(value is not None for value in minimum_hours):
+            lower = observed_at + timedelta(hours=min(value for value in minimum_hours if value is not None))
+            query["end_date_min"] = lower.isoformat()
+
+        maximum_hours = [
+            scalar_bound(policy, "maximum_hours_to_resolution")
+            for policy in policies
+        ]
+        if all(value is not None for value in maximum_hours):
+            upper = observed_at + timedelta(hours=max(value for value in maximum_hours if value is not None))
+            query["end_date_max"] = upper.isoformat()
+        return query
+
+    @staticmethod
+    def _consume_advisory_provider_errors(provider: Any) -> None:
+        for name in ("consume_transport_errors", "consume_validation_errors"):
+            consumer = getattr(provider, name, None)
+            if not callable(consumer):
+                continue
+            try:
+                consumer()
+            except Exception:
+                # A best-effort advisory drain must never become a discovery
+                # failure or mask the broader page request.
+                pass
+
+    @staticmethod
+    def _scope_query_without_cursor(query: Mapping[str, Any]) -> dict[str, Any]:
+        return {
+            str(key): value
+            for key, value in query.items()
+            if str(key) != "after_cursor"
+        }
+
+    @staticmethod
+    def _scope_count(value: Any, default: int = 0) -> int:
+        if isinstance(value, bool):
+            return default
+        try:
+            number = int(value)
+        except (TypeError, ValueError, OverflowError):
+            return default
+        return max(0, number)
+    @staticmethod
+    def _scope_persistable(value: Any, *, depth: int = 0) -> Any:
+        """Project provider request metadata to bounded plain JSON values."""
+        if depth > _MAX_SCOPE_QUERY_DEPTH:
+            raise _ScopePersistenceValueError("pagination metadata nesting is too deep")
+        if value is None or isinstance(value, (bool, int)):
+            return value
+        if isinstance(value, float):
+            if not math.isfinite(value):
+                raise _ScopePersistenceValueError("pagination metadata contains a non-finite number")
+            return value
+        if isinstance(value, str):
+            return value[:_MAX_SCOPE_QUERY_STRING_LENGTH]
+        if isinstance(value, Mapping):
+            result: dict[str, Any] = {}
+            try:
+                items = value.items()
+                for index, (key, child) in enumerate(items):
+                    if index >= _MAX_SCOPE_QUERY_ITEMS:
+                        break
+                    if not isinstance(key, str):
+                        raise _ScopePersistenceValueError("pagination metadata keys must be strings")
+                    result[key[:_MAX_SCOPE_QUERY_STRING_LENGTH]] = PolymarketCollector._scope_persistable(
+                        child,
+                        depth=depth + 1,
+                    )
+            except _ScopePersistenceValueError:
+                raise
+            except Exception as exc:
+                raise _ScopePersistenceValueError("pagination metadata mapping is not readable") from exc
+            return result
+        if isinstance(value, (list, tuple)):
+            result = []
+            try:
+                for index, child in enumerate(value):
+                    if index >= _MAX_SCOPE_QUERY_ITEMS:
+                        break
+                    result.append(
+                        PolymarketCollector._scope_persistable(
+                            child,
+                            depth=depth + 1,
+                        )
+                    )
+            except _ScopePersistenceValueError:
+                raise
+            except Exception as exc:
+                raise _ScopePersistenceValueError("pagination metadata sequence is not readable") from exc
+            return result
+        raise _ScopePersistenceValueError(
+            f"unsupported pagination metadata value: {type(value).__name__}"
+        )
+
+    @classmethod
+    def _scope_persistable_query(
+        cls,
+        value: Any,
+        fallback: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        try:
+            projected = cls._scope_persistable(value)
+        except _ScopePersistenceValueError:
+            projected = None
+        if isinstance(projected, Mapping):
+            return dict(projected)
+        return dict(fallback)
+
+    @staticmethod
+    def _scope_persistable_path(value: Any, fallback: str) -> str:
+        if isinstance(value, str) and value.strip():
+            return value.strip()[:_MAX_SCOPE_REQUEST_PATH_LENGTH]
+        return fallback[:_MAX_SCOPE_REQUEST_PATH_LENGTH]
+
+
+    @staticmethod
+    def _scope_page_value(page: Any, name: str, default: Any = _UNSET) -> Any:
+        if isinstance(page, Mapping):
+            value = page.get(name, default)
+        else:
+            value = getattr(page, name, default)
+        return default if value is _UNSET else value
 
     def _discover_scope_inventory(
         self,
         observed_at: datetime,
         counters: dict[str, Any],
         *,
-        carry_cursor: int,
+        carry_cursor: Any,
         provider: Any | None = None,
-    ) -> tuple[list[Mapping[str, Any]], dict[str, PredictionMarketSnapshot], int]:
-        """Fetch one bounded current inventory shared by every candidate."""
+        documents: Sequence[Mapping[str, Any]] = (),
+    ) -> tuple[list[Mapping[str, Any]], dict[str, PredictionMarketSnapshot], Any]:
+        """Fetch exactly one bounded scope page, preserving opaque continuation."""
         provider = provider or self.provider
+        method_page = getattr(provider, "market_page", None)
+        if callable(method_page) and self.config.discovery_budget_per_cycle > 0:
+            limit = min(100, max(1, int(self.config.discovery_budget_per_cycle)))
+            previous = (
+                dict(self._scope_inventory_continuation)
+                if isinstance(self._scope_inventory_continuation, Mapping)
+                else {}
+            )
+            query = self._scope_inventory_query(
+                documents,
+                observed_at,
+                provider,
+                limit=limit,
+                after_cursor=None,
+            )
+            previous_request = previous.get("request_query")
+            if not isinstance(previous_request, Mapping):
+                previous_request = previous.get("query")
+            query_changed = (
+                isinstance(previous_request, Mapping)
+                and _stable_payload(self._scope_query_without_cursor(previous_request))
+                != _stable_payload(self._scope_query_without_cursor(query))
+            )
+            fingerprint_material = {
+                "request_path": "/markets/keyset",
+                "query": self._scope_query_without_cursor(query),
+            }
+            expected_fingerprint = "sha256:" + hashlib.sha256(
+                _stable_payload(fingerprint_material).encode("utf-8")
+            ).hexdigest()
+            saved_cursor = previous.get("after_cursor", previous.get("cursor"))
+            has_saved_cursor = isinstance(saved_cursor, str) and bool(saved_cursor.strip())
+            prior_terminal = bool(previous) and (
+                str(previous.get("coverage_status", "")).upper() == "COMPLETE"
+                or not has_saved_cursor
+            )
+            prior_rebase = bool(
+                previous.get("query_reset")
+                or previous.get("rebase_required")
+            )
+            stored_request_fingerprint = previous.get("request_fingerprint")
+            stored_request_fingerprint = (
+                str(stored_request_fingerprint).strip()
+                if (
+                    stored_request_fingerprint is not None
+                    and str(stored_request_fingerprint).strip()
+                )
+                else None
+            )
+            # Older continuations used query_fingerprint for the collector's
+            # request hash.  Only use it as a compatibility fallback when it
+            # actually matches the newly computed request fingerprint; a
+            # provider-owned fingerprint must not be mistaken for this hash.
+            if (
+                stored_request_fingerprint is None
+                and str(previous.get("query_fingerprint", "")).strip()
+                == expected_fingerprint
+            ):
+                stored_request_fingerprint = expected_fingerprint
+            stored_fingerprint_changed = (
+                stored_request_fingerprint is not None
+                and stored_request_fingerprint != expected_fingerprint
+            )
+            base_state = (
+                {}
+                if (
+                    query_changed
+                    or prior_terminal
+                    or prior_rebase
+                    or stored_fingerprint_changed
+                )
+                else previous
+            )
+            current_cursor: str | None = None
+            if base_state and str(base_state.get("coverage_status", "")).upper() != "COMPLETE":
+                saved_cursor = base_state.get("after_cursor", base_state.get("cursor"))
+                if isinstance(saved_cursor, str) and saved_cursor.strip():
+                    current_cursor = saved_cursor
+            cursor_history = self._scope_cursor_history(
+                base_state.get(
+                    "seen_cursor_history",
+                    base_state.get("seen_cursors", ()),
+                )
+            )
+            cursor_history_exhausted = False
+            if current_cursor is not None and current_cursor not in cursor_history:
+                if len(cursor_history) >= _MAX_SCOPE_CURSOR_HISTORY:
+                    cursor_history_exhausted = True
+                else:
+                    cursor_history.append(current_cursor)
+            stored_provider_fingerprint = base_state.get("provider_query_fingerprint")
+            stored_provider_fingerprint = (
+                str(stored_provider_fingerprint).strip()
+                if (
+                    stored_provider_fingerprint is not None
+                    and str(stored_provider_fingerprint).strip()
+                )
+                else None
+            )
+            if (
+                stored_provider_fingerprint is None
+                and base_state
+                and str(base_state.get("query_fingerprint", "")).strip()
+                not in {"", expected_fingerprint}
+            ):
+                # Compatibility with continuations written before the
+                # request/provider fingerprints were split.
+                stored_provider_fingerprint = str(base_state["query_fingerprint"]).strip()
+            # A provider fingerprint is optional.  Once a provider supplies
+            # one, it is adopted and must remain stable; the collector's
+            # request hash is never used as a provider-fingerprint surrogate.
+            expected_provider_fingerprint = stored_provider_fingerprint
+            query["after_cursor"] = current_cursor
+            request_path = "/markets/keyset"
+            request_query = dict(query)
+            safe_request_query = self._scope_persistable_query(request_query, {})
+            try:
+                parameters = inspect.signature(method_page).parameters
+            except (TypeError, ValueError):
+                parameters = {}
+            accepts_kwargs = any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters.values()
+            )
+            call_kwargs = dict(request_query)
+            if parameters and not accepts_kwargs:
+                call_kwargs = {
+                    key: value for key, value in call_kwargs.items() if key in parameters
+                }
+            def persist_query_reset(
+                reason: str,
+                *,
+                observed_fingerprint: str | None = None,
+            ) -> None:
+                counters["errors"] += 1
+                zero_counts = {
+                    "raw_count": 0,
+                    "unique_count": 0,
+                    "duplicate_count": 0,
+                    "malformed_count": 0,
+                }
+                continuation = {
+                    "request_path": request_path,
+                    "request_query": safe_request_query,
+                    "request": {
+                        "method": "GET",
+                        "path": request_path,
+                        "query": safe_request_query,
+                    },
+                    "query": dict(safe_request_query),
+                    "request_fingerprint": expected_fingerprint,
+                    "query_fingerprint": (
+                        expected_provider_fingerprint or expected_fingerprint
+                    ),
+                    "provider_query_fingerprint": expected_provider_fingerprint,
+                    "expected_query_fingerprint": expected_fingerprint,
+                    "after_cursor": None,
+                    "opaque_cursor": None,
+                    "seen_market_ids": [],
+                    "seen_cursor_history": [],
+                    "cursor": None,
+                    "coverage_status": "ERROR",
+                    "raw_count": 0,
+                    "unique_count": 0,
+                    "duplicate_count": 0,
+                    "malformed_count": 0,
+                    "cumulative": dict(zero_counts),
+                    "cumulative_raw_count": 0,
+                    "cumulative_unique_count": 0,
+                    "cumulative_duplicate_count": 0,
+                    "cumulative_malformed_count": 0,
+                    "query_reset": True,
+                    "rebase_required": True,
+                    "query_reset_reason": reason,
+                    "requested_at": observed_at.isoformat(),
+                    "last_request_at": observed_at.isoformat(),
+                    "response_received_at": observed_at.isoformat(),
+                    "last_response_at": observed_at.isoformat(),
+                    "updated_at": observed_at.isoformat(),
+                    "last_page_at": observed_at.isoformat(),
+                    "first_page_at": observed_at.isoformat(),
+                }
+                continuation["error_reason"] = (
+                    "QUERY_RESET"
+                    if reason == "QUERY_FINGERPRINT_MISMATCH"
+                    else reason
+                )
+                if observed_fingerprint is not None:
+                    continuation["observed_query_fingerprint"] = observed_fingerprint
+                self._scope_inventory_continuation = continuation
+            if cursor_history_exhausted:
+                persist_query_reset("CURSOR_HISTORY_EXHAUSTED")
+                return [], {}, None
+
+
+            try:
+                page = self._call_provider(
+                    "scope_discovery",
+                    lambda: method_page(**call_kwargs),
+                    observed_at,
+                    counters,
+                    provider=provider,
+                )
+            except Exception as exc:
+                counters["errors"] += 1
+                try:
+                    self.store.save_collection_error(None, observed_at, "scope_discovery", str(exc))
+                except Exception:
+                    pass
+                cumulative = {
+                    "raw_count": self._scope_count(base_state.get("cumulative_raw_count")),
+                    "unique_count": self._scope_count(base_state.get("cumulative_unique_count")),
+                    "duplicate_count": self._scope_count(base_state.get("cumulative_duplicate_count")),
+                    "malformed_count": self._scope_count(base_state.get("cumulative_malformed_count")),
+                }
+                continuation = {
+                    **base_state,
+                    "request_path": request_path,
+                    "request_query": safe_request_query,
+                    "request": {
+                        "method": "GET",
+                        "path": request_path,
+                        "query": safe_request_query,
+                    },
+                    "query": dict(safe_request_query),
+                    "request_fingerprint": expected_fingerprint,
+                    "query_fingerprint": (
+                        stored_provider_fingerprint or expected_fingerprint
+                    ),
+                    "provider_query_fingerprint": stored_provider_fingerprint,
+                    "expected_query_fingerprint": expected_fingerprint,
+                    "after_cursor": current_cursor,
+                    "opaque_cursor": current_cursor,
+                    "coverage_status": "ERROR",
+                    "raw_count": 0,
+                    "unique_count": 0,
+                    "duplicate_count": 0,
+                    "malformed_count": 0,
+                    "cumulative": cumulative,
+                    "cumulative_raw_count": cumulative["raw_count"],
+                    "cumulative_unique_count": cumulative["unique_count"],
+                    "cumulative_duplicate_count": cumulative["duplicate_count"],
+                    "cumulative_malformed_count": cumulative["malformed_count"],
+                    "seen_cursor_history": list(cursor_history),
+                    "requested_at": observed_at.isoformat(),
+                    "last_request_at": observed_at.isoformat(),
+                    "response_received_at": observed_at.isoformat(),
+                    "last_response_at": observed_at.isoformat(),
+                    "updated_at": observed_at.isoformat(),
+                    "last_page_at": observed_at.isoformat(),
+                    "first_page_at": base_state.get("first_page_at", observed_at.isoformat()),
+                }
+                self._scope_inventory_continuation = continuation
+                return [], {}, current_cursor
+            page_was_none = page is None
+            page_was_invalid = (
+                not page_was_none
+                and not isinstance(page, (Mapping, list, tuple))
+                and not hasattr(page, "snapshots")
+            )
+            if page_was_none or page_was_invalid:
+                persist_query_reset("INVALID_PAGE")
+                return [], {}, None
+            provided_fingerprint = self._scope_page_value(page, "query_fingerprint", _UNSET)
+            provided_fingerprint = (
+                str(provided_fingerprint).strip()
+                if provided_fingerprint not in (_UNSET, None)
+                and str(provided_fingerprint).strip()
+                else None
+            )
+            if (
+                provided_fingerprint is not None
+                and expected_provider_fingerprint is not None
+                and provided_fingerprint != expected_provider_fingerprint
+            ):
+                persist_query_reset(
+                    "QUERY_FINGERPRINT_MISMATCH",
+                    observed_fingerprint=provided_fingerprint,
+                )
+                return [], {}, None
+            raw_items = self._scope_page_value(page, "snapshots", _UNSET)
+            if raw_items is _UNSET and isinstance(page, Mapping):
+                raw_items = page.get("markets", page.get("data", ()))
+            if raw_items is _UNSET:
+                raw_items = page if isinstance(page, (list, tuple)) else ()
+            try:
+                raw_items = list(raw_items or ())
+            except TypeError:
+                raw_items = []
+            supplied_raw = self._scope_page_value(page, "raw_count", _UNSET)
+            supplied_unique = self._scope_page_value(page, "unique_count", _UNSET)
+            supplied_duplicate = self._scope_page_value(page, "duplicate_count", _UNSET)
+            supplied_malformed = self._scope_page_value(page, "malformed_count", _UNSET)
+            raw_count = self._scope_count(
+                supplied_raw,
+                len(raw_items) if supplied_raw is _UNSET else 0,
+            )
+            valid: list[PredictionMarketSnapshot] = []
+            malformed_computed = 0
+            page_ids: set[str] = set()
+            duplicate_computed = 0
+            for item in raw_items:
+                if not isinstance(item, PredictionMarketSnapshot):
+                    malformed_computed += 1
+                    continue
+                market_id = str(item.market_id).strip()
+                if not market_id:
+                    malformed_computed += 1
+                    continue
+                if market_id in page_ids:
+                    duplicate_computed += 1
+                    continue
+                page_ids.add(market_id)
+                valid.append(item)
+            malformed_count = max(
+                malformed_computed,
+                self._scope_count(supplied_malformed, 0) if supplied_malformed is not _UNSET else 0,
+            )
+            duplicate_count = max(
+                duplicate_computed,
+                self._scope_count(supplied_duplicate, 0) if supplied_duplicate is not _UNSET else 0,
+            )
+            page_error_reason = self._scope_page_value(page, "error_reason", None)
+            page_error_reason = (
+                str(page_error_reason).strip().upper()
+                if page_error_reason is not None and str(page_error_reason).strip()
+                else None
+            )
+            if page_error_reason == "REPEATED_CURSOR":
+                persist_query_reset(
+                    "REPEATED_CURSOR",
+                    observed_fingerprint=provided_fingerprint,
+                )
+                return [], {}, None
+            explicit_status = str(
+                self._scope_page_value(page, "coverage_status", "")
+            ).strip().upper()
+            if explicit_status == "ERROR":
+                # Error pages are discarded before their IDs can enter the
+                # cross-page seen set or be scheduled by scope resolution.
+                persist_query_reset(
+                    page_error_reason or "PAGE_ERROR",
+                    observed_fingerprint=provided_fingerprint,
+                )
+                return [], {}, None
+            next_cursor = self._scope_page_value(page, "next_cursor", None)
+            if next_cursor is not None:
+                if not isinstance(next_cursor, str) or not next_cursor.strip():
+                    persist_query_reset(
+                        "INVALID_NEXT_CURSOR",
+                        observed_fingerprint=provided_fingerprint,
+                    )
+                    return [], {}, None
+            if next_cursor is not None and next_cursor in cursor_history:
+                persist_query_reset(
+                    "REPEATED_CURSOR",
+                    observed_fingerprint=provided_fingerprint,
+                )
+                return [], {}, None
+            if next_cursor is not None:
+                if len(cursor_history) >= _MAX_SCOPE_CURSOR_HISTORY:
+                    persist_query_reset(
+                        "CURSOR_HISTORY_EXHAUSTED",
+                        observed_fingerprint=provided_fingerprint,
+                    )
+                    return [], {}, None
+                cursor_history.append(next_cursor)
+            provider_fingerprint = provided_fingerprint or stored_provider_fingerprint
+            page_fingerprint = provider_fingerprint or expected_fingerprint
+            seen_ids = {
+                str(item).strip()
+                for item in base_state.get("seen_market_ids", ())
+                if str(item).strip()
+            }
+            new_snapshots: list[PredictionMarketSnapshot] = []
+            cross_page_duplicates = 0
+            for item in valid:
+                market_id = str(item.market_id).strip()
+                if market_id in seen_ids:
+                    cross_page_duplicates += 1
+                    continue
+                seen_ids.add(market_id)
+                new_snapshots.append(item)
+            duplicate_count += cross_page_duplicates
+            unique_count = len(new_snapshots)
+            if supplied_unique is not _UNSET and not seen_ids:
+                unique_count = self._scope_count(supplied_unique, unique_count)
+            if next_cursor is None:
+                coverage_status = "PARTIAL" if explicit_status == "PARTIAL" or malformed_count else "COMPLETE"
+            elif explicit_status in {"PARTIAL", "BUDGET_EXHAUSTED"}:
+                coverage_status = explicit_status
+            else:
+                coverage_status = "BUDGET_EXHAUSTED"
+            cumulative_raw = self._scope_count(base_state.get("cumulative_raw_count")) + raw_count
+            cumulative_unique = self._scope_count(base_state.get("cumulative_unique_count")) + unique_count
+            cumulative_duplicate = self._scope_count(base_state.get("cumulative_duplicate_count")) + duplicate_count
+            cumulative_malformed = self._scope_count(base_state.get("cumulative_malformed_count")) + malformed_count
+            cumulative = {
+                "raw_count": cumulative_raw,
+                "unique_count": cumulative_unique,
+                "duplicate_count": cumulative_duplicate,
+                "malformed_count": cumulative_malformed,
+            }
+            page_query = self._scope_page_value(page, "query", _UNSET)
+            safe_page_query = self._scope_persistable_query(
+                page_query if isinstance(page_query, Mapping) else safe_request_query,
+                safe_request_query,
+            )
+            page_path = self._scope_persistable_path(
+                self._scope_page_value(page, "request_path", request_path),
+                request_path,
+            )
+            continuation = {
+                "request_path": page_path,
+                "request_query": safe_request_query,
+                "request": {
+                    "method": "GET",
+                    "path": page_path,
+                    "query": safe_page_query,
+                },
+                "query": dict(safe_page_query),
+                "request_fingerprint": expected_fingerprint,
+                "query_fingerprint": page_fingerprint,
+                "provider_query_fingerprint": provider_fingerprint,
+                "expected_query_fingerprint": expected_fingerprint,
+                "after_cursor": next_cursor,
+                "opaque_cursor": next_cursor,
+                "cursor": next_cursor,
+                "coverage_status": coverage_status,
+                "raw_count": raw_count,
+                "unique_count": unique_count,
+                "duplicate_count": duplicate_count,
+                "malformed_count": malformed_count,
+                "cumulative": cumulative,
+                "cumulative_raw_count": cumulative_raw,
+                "cumulative_unique_count": cumulative_unique,
+                "cumulative_duplicate_count": cumulative_duplicate,
+                "seen_market_ids": sorted(seen_ids)[:10000],
+                "seen_cursor_history": (
+                    list(cursor_history) if next_cursor is not None else []
+                ),
+                "requested_at": observed_at.isoformat(),
+                "last_request_at": observed_at.isoformat(),
+                "response_received_at": observed_at.isoformat(),
+                "last_response_at": observed_at.isoformat(),
+                "updated_at": observed_at.isoformat(),
+                "last_page_at": observed_at.isoformat(),
+                "first_page_at": base_state.get("first_page_at", observed_at.isoformat()),
+            }
+            if page_error_reason is not None:
+                continuation["error_reason"] = page_error_reason
+            self._scope_inventory_continuation = continuation
+            record_by_id = {
+                str(item.market_id).strip(): item
+                for item in new_snapshots
+                if str(item.market_id).strip()
+            }
+            records = [
+                self._scope_market_record(item, observed_at, provider)
+                for item in new_snapshots
+            ]
+            return records, record_by_id, next_cursor
+
+        if callable(method_page) and self.config.discovery_budget_per_cycle <= 0:
+            previous = (
+                dict(self._scope_inventory_continuation)
+                if isinstance(self._scope_inventory_continuation, Mapping)
+                else {}
+            )
+            previous["coverage_status"] = "BUDGET_EXHAUSTED"
+            previous["seen_cursor_history"] = self._scope_cursor_history(
+                previous.get(
+                    "seen_cursor_history",
+                    previous.get("seen_cursors", ()),
+                )
+            )
+            previous["updated_at"] = observed_at.isoformat()
+            self._scope_inventory_continuation = previous
+            return [], {}, carry_cursor
+
+        # Legacy/fake providers retain the original bounded offset behavior.
         method = getattr(provider, "markets", None)
         if not callable(method):
             return [], {}, carry_cursor
-        # Scope inventory must be the adapter's current/open view.  Passing
-        # ``active=False`` asks PolymarketAdapter for closed inventory.
         kwargs: dict[str, Any] = {"active": True}
         try:
             parameters = inspect.signature(method).parameters
@@ -1007,8 +1771,6 @@ class PolymarketCollector:
             max(1, self.config.max_markets, self.config.discovery_budget_per_cycle),
         )
         if "limit" in parameters or accepts_kwargs or not parameters:
-            # One bounded page is shared by every policy and never multiplied
-            # by candidate count.
             kwargs["limit"] = scan_budget
         try:
             values = self._call_provider(
@@ -1036,7 +1798,10 @@ class PolymarketCollector:
                 break
         if not snapshots:
             return [], {}, carry_cursor
-        offset = carry_cursor % len(snapshots)
+        try:
+            offset = int(carry_cursor) % len(snapshots)
+        except (TypeError, ValueError):
+            offset = 0
         rotated = snapshots[offset:] + snapshots[:offset]
         page = rotated[:scan_budget]
         records = [self._scope_market_record(item, observed_at, provider) for item in page]
@@ -1045,11 +1810,11 @@ class PolymarketCollector:
             for item in page
             if str(item.market_id).strip()
         }
-        # Advance the durable cursor by the bounded page, rather than by each
-        # candidate resolution.  Repeated policies therefore see identical
-        # inventory and cannot multiply network work.
         next_cursor = (offset + len(page)) % len(snapshots)
         return records, record_by_id, next_cursor
+
+
+
 
     @staticmethod
     def _scope_market_record(

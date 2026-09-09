@@ -36,6 +36,10 @@ from .experiment_plan import AUTONOMOUS_BUDGET_ID, ExperimentPlan, ExperimentPla
 _MAX_QUEUE_RESULT_ITEMS = 64
 _MAX_DATASET_ROWS = 100_000
 _MAX_FORWARD_ROWS = 100_000
+PAPER_MARKET_AUTHORITY_CAP = 100
+
+
+
 
 
 def _binding_value(value: Any) -> str | None:
@@ -334,7 +338,7 @@ class AutonomousResearchProcessor:
                             "candidate_id": candidate_id,
                             "stage": candidate.stage.value,
                             "forward_evidence": _compact_evidence(evidence),
-                            "promotion_reasons": list(reasons),
+                            "promotion_reasons": list(dict.fromkeys((*reasons, *hard_reasons))),
                         }
                     )
             except (KeyError, RuntimeError, ValueError) as exc:
@@ -1743,12 +1747,21 @@ class AutonomousResearchProcessor:
                     "paper_only": True,
                     "crypto_provenance": dict(crypto_binding or {}),
                 }
+            required_independent_samples = self.config.promotion_criteria.min_independent_samples
+            # A zero explicit threshold means no independent-sample
+            # qualification bound; it must not collapse current authority to
+            # one market.  Runtime defaults still bind authority to their
+            # required sample count, bounded by the global safety cap.
+            authority_market_cap = min(
+                PAPER_MARKET_AUTHORITY_CAP,
+                required_independent_samples or PAPER_MARKET_AUTHORITY_CAP,
+            )
             authority = self.store.candidate_forward_requirements(
                 candidate_ids=(candidate_id,),
                 now=now,
                 max_candidates=1,
-                max_markets_per_candidate=8,
-                max_total_markets=8,
+                max_markets_per_candidate=authority_market_cap,
+                max_total_markets=authority_market_cap,
             )
             authority_candidate = (
                 authority.get("candidates", [])[0]

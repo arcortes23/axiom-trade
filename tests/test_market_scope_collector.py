@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+import json
 import unittest
 
 from axiom.collector import CollectorConfig, PolymarketCollector
@@ -115,6 +116,75 @@ class _RecordingProvider(InMemoryPredictionProvider):
             tags=snapshot.tags,
             expiry=snapshot.expiry,
         )
+
+
+
+class _PagedProvider(_RecordingProvider):
+    def __init__(
+        self,
+        markets: tuple[PredictionMarketSnapshot, ...],
+        pages: tuple[dict[str, object], ...],
+        *,
+        tag_ids: dict[str, int] | None = None,
+    ) -> None:
+        super().__init__(markets)
+        self.pages = list(pages)
+        self.page_calls: list[dict[str, object]] = []
+        self.tag_calls: list[str] = []
+        self.book_calls: list[str] = []
+        self._tag_ids = dict(tag_ids or {})
+
+    def resolve_tag_slug(self, slug: str):
+        self.tag_calls.append(slug)
+        return self._tag_ids.get(slug)
+
+    def market_page(self, **kwargs):
+        self.page_calls.append(dict(kwargs))
+        if not self.pages:
+            raise AssertionError("unexpected metadata page")
+        page = dict(self.pages.pop(0))
+        page.setdefault("query", dict(kwargs))
+        return page
+
+    def order_books(self, market_id: str, depth: int = 20):
+        self.book_calls.append(str(market_id))
+        return super().order_books(market_id, depth=depth)
+
+
+class _AdvisoryLookupFailureProvider(_PagedProvider):
+    def __init__(
+        self,
+        markets: tuple[PredictionMarketSnapshot, ...],
+        pages: tuple[dict[str, object], ...],
+    ) -> None:
+        super().__init__(markets, pages)
+        self.transport_errors: list[Exception] = []
+        self.validation_errors: list[Exception] = []
+        self.drained_transport_errors = 0
+        self.drained_validation_errors = 0
+
+    def resolve_tag_slug(self, slug: str):
+        self.tag_calls.append(slug)
+        self.transport_errors.append(RuntimeError("advisory tag transport failure"))
+        self.validation_errors.append(ValueError("advisory tag validation failure"))
+        raise RuntimeError("tag lookup failed")
+
+    def consume_transport_errors(self) -> tuple[Exception, ...]:
+        errors = tuple(self.transport_errors)
+        self.transport_errors.clear()
+        self.drained_transport_errors += len(errors)
+        return errors
+
+    def consume_validation_errors(self) -> tuple[Exception, ...]:
+        errors = tuple(self.validation_errors)
+        self.validation_errors.clear()
+        self.drained_validation_errors += len(errors)
+        return errors
+
+    def market_page(self, **kwargs):
+        if self.transport_errors or self.validation_errors:
+            raise AssertionError("advisory lookup errors were not drained")
+        return super().market_page(**kwargs)
 
 
 class _ScopeStore:
@@ -396,6 +466,483 @@ class MarketScopeCollectorTests(unittest.TestCase):
         self.assertEqual(by_candidate["zero"].status, ZERO_MATCHES)
         self.assertEqual(by_candidate["zero"].reason, ZERO_MATCHES)
 
+    def test_keyset_scope_continuation_is_opaque_and_budgeted(self) -> None:
+        first = market("page-one", category="politics")
+        second = market("page-two", category="politics")
+        provider = _PagedProvider(
+            (first, second),
+            (
+                {"snapshots": (first,), "next_cursor": "opaque-1", "raw_count": 1, "unique_count": 1},
+                {"snapshots": (second,), "next_cursor": None, "raw_count": 1, "unique_count": 1},
+            ),
+            tag_ids={"politics": 11},
+        )
+        store = _ScopeStore(
+            {"candidate": {"experiment_plan": {"market_scope": scope("RULE_BASED_MARKETS", category="politics")}}}
+        )
+        collector = self._collector(provider, store, ("candidate",), max_markets=1)
+
+        collector.collect_once(now=T0)
+        collector.collect_once(now=T0)
+
+        self.assertEqual([call["after_cursor"] for call in provider.page_calls], [None, "opaque-1"])
+        self.assertEqual(provider.page_calls[0]["closed"], False)
+        continuation = store.states["polymarket"]["scope_inventory_continuation"]
+        self.assertEqual(continuation["coverage_status"], "COMPLETE")
+        self.assertEqual(continuation["cumulative"], {
+            "raw_count": 2,
+            "unique_count": 2,
+            "duplicate_count": 0,
+            "malformed_count": 0,
+        })
+        self.assertEqual(len(provider.book_calls), 2)
+
+    def test_scope_pushdown_is_shared_and_never_uses_price_or_spread(self) -> None:
+        rich = replace(
+            market("liquid", category="politics"),
+            liquidity=2_000.0,
+            expiry=T0 + timedelta(hours=120),
+        )
+        policy = scope("RULE_BASED_MARKETS", category="politics")
+        policy["filters"] = {
+            "category": "politics",
+            "min_liquidity": 1_000.0,
+            "minimum_hours_to_resolution": 24.0,
+            "maximum_hours_to_resolution": 168.0,
+        }
+        provider = _PagedProvider(
+            (rich,),
+            ({"snapshots": (rich,), "next_cursor": None},),
+            tag_ids={"politics": 17},
+        )
+        store = _ScopeStore({"candidate": {"experiment_plan": {"market_scope": policy}}})
+        collector = self._collector(provider, store, ("candidate",), max_markets=1)
+
+        collector.collect_once(now=T0)
+
+        request = provider.page_calls[0]
+        self.assertEqual(request["tag_ids"], (17,))
+        self.assertEqual(request["liquidity_num_min"], 1_000.0)
+        self.assertEqual(request["end_date_min"], (T0 + timedelta(hours=24)).isoformat())
+        self.assertEqual(request["end_date_max"], (T0 + timedelta(hours=168)).isoformat())
+        self.assertNotIn("price", request)
+        self.assertNotIn("spread", request)
+        self.assertEqual(provider.tag_calls, ["politics"])
+        self.assertEqual(len(provider.book_calls), 1)
+
+    def test_scope_query_change_resets_cursor_and_duplicate_only_pages_advance(self) -> None:
+        duplicate = market("duplicate", category="politics")
+        replacement = market("replacement", category="economics")
+        provider = _PagedProvider(
+            (duplicate, replacement),
+            (
+                {
+                    "snapshots": (duplicate, duplicate),
+                    "next_cursor": "stale-cursor",
+                    "raw_count": 2,
+                    "unique_count": 1,
+                    "duplicate_count": 1,
+                },
+                {
+                    "snapshots": (),
+                    "next_cursor": "unused-cursor",
+                    "raw_count": 1,
+                    "unique_count": 0,
+                    "duplicate_count": 1,
+                    "coverage_status": "PARTIAL",
+                },
+                {"snapshots": (replacement,), "next_cursor": None},
+            ),
+            tag_ids={"politics": 21, "economics": 22},
+        )
+        politics = scope("RULE_BASED_MARKETS", category="politics")
+        store = _ScopeStore({"candidate": {"experiment_plan": {"market_scope": politics}}})
+        collector = self._collector(provider, store, ("candidate",), max_markets=1)
+
+        collector.collect_once(now=T0)
+        state_after_first = store.states["polymarket"]["scope_inventory_continuation"]
+        self.assertEqual(state_after_first["coverage_status"], "BUDGET_EXHAUSTED")
+        self.assertEqual(state_after_first["cumulative_duplicate_count"], 1)
+
+        economics = scope("RULE_BASED_MARKETS", category="economics")
+        store.documents["candidate"]["payload"]["experiment_plan"]["market_scope"] = economics
+        collector.collect_once(now=T0)
+
+        self.assertEqual([call["after_cursor"] for call in provider.page_calls], [None, None])
+        self.assertEqual(provider.page_calls[1]["tag_ids"], (22,))
+
+
+
+    def test_failed_tag_lookup_drains_advisory_errors_before_broader_page(self) -> None:
+        broader = market("broader-page", category="politics")
+        provider = _AdvisoryLookupFailureProvider(
+            (broader,),
+            ({"snapshots": (broader,), "next_cursor": None},),
+        )
+        policy = scope("RULE_BASED_MARKETS", category="politics")
+        store = _ScopeStore({"candidate": {"experiment_plan": {"market_scope": policy}}})
+        collector = self._collector(provider, store, ("candidate",), max_markets=1)
+
+        cycle = collector.collect_once(now=T0)
+
+        self.assertEqual(list(cycle.candidate_bound_scheduled), ["broader-page"])
+        self.assertEqual(provider.tag_calls, ["politics"])
+        self.assertEqual(provider.page_calls[0]["tag_ids"], ())
+        self.assertEqual(provider.drained_transport_errors, 1)
+        self.assertEqual(provider.drained_validation_errors, 1)
+        self.assertEqual(store.errors, [])
+        self.assertEqual(
+            [item.market_id for item in store.resolutions[0].matched_markets],
+            ["broader-page"],
+        )
+
+    def test_repeated_cursor_error_persists_error_and_rebases_without_cursor(self) -> None:
+        repeated = market("repeated-page", category="politics")
+        provider = _PagedProvider(
+            (repeated,),
+            (
+                {"snapshots": (repeated,), "next_cursor": "opaque-repeat"},
+                {
+                    "snapshots": (repeated,),
+                    "next_cursor": "opaque-repeat",
+                },
+                {"snapshots": (repeated,), "next_cursor": None},
+            ),
+        )
+        policy = scope("RULE_BASED_MARKETS", category="politics")
+        store = _ScopeStore({"candidate": {"experiment_plan": {"market_scope": policy}}})
+        collector = self._collector(provider, store, ("candidate",), max_markets=1)
+
+        first_cycle = collector.collect_once(now=T0)
+        second_cycle = collector.collect_once(now=T0)
+        self.assertEqual(first_cycle.errors, 0)
+        self.assertEqual(second_cycle.errors, 1)
+
+        state_after_error = store.states["polymarket"]["scope_inventory_continuation"]
+        self.assertEqual(state_after_error["coverage_status"], "ERROR")
+        self.assertEqual(state_after_error["error_reason"], "REPEATED_CURSOR")
+        self.assertIsNone(state_after_error["after_cursor"])
+        self.assertIsNone(state_after_error["opaque_cursor"])
+        self.assertIsNone(state_after_error["cursor"])
+
+        collector.collect_once(now=T0)
+
+        self.assertEqual(
+            [call["after_cursor"] for call in provider.page_calls],
+            [None, "opaque-repeat", None],
+        )
+
+    def test_cursor_cycle_detects_non_adjacent_repeat_and_discards_page(self) -> None:
+        first = market("cycle-first", category="politics")
+        second = market("cycle-second", category="politics")
+        compromised = market("cycle-compromised", category="politics")
+        rebased = market("cycle-rebased", category="politics")
+        provider = _PagedProvider(
+            (first, second, compromised, rebased),
+            (
+                {"snapshots": (first,), "next_cursor": "cursor-a"},
+                {"snapshots": (second,), "next_cursor": "cursor-b"},
+                {"snapshots": (compromised,), "next_cursor": "cursor-a"},
+                {"snapshots": (rebased,), "next_cursor": None},
+            ),
+        )
+        policy = scope("RULE_BASED_MARKETS", category="politics")
+        store = _ScopeStore({"candidate": {"experiment_plan": {"market_scope": policy}}})
+        collector = self._collector(provider, store, ("candidate",), max_markets=1)
+
+        collector.collect_once(now=T0)
+        self.assertEqual(
+            store.states["polymarket"]["scope_inventory_continuation"]["seen_cursor_history"],
+            ["cursor-a"],
+        )
+        collector.collect_once(now=T0)
+        self.assertEqual(
+            store.states["polymarket"]["scope_inventory_continuation"]["seen_cursor_history"],
+            ["cursor-a", "cursor-b"],
+        )
+        collector.collect_once(now=T0)
+
+        state_after_error = store.states["polymarket"]["scope_inventory_continuation"]
+        self.assertEqual(
+            [call["after_cursor"] for call in provider.page_calls],
+            [None, "cursor-a", "cursor-b"],
+        )
+        self.assertEqual(state_after_error["coverage_status"], "ERROR")
+        self.assertEqual(state_after_error["error_reason"], "REPEATED_CURSOR")
+        self.assertEqual(state_after_error["seen_cursor_history"], [])
+        self.assertEqual(
+            [item.candidate_id for item in store.resolutions],
+            ["candidate", "candidate"],
+        )
+        self.assertEqual(
+            provider.book_calls,
+            ["cycle-first", "cycle-second"],
+        )
+
+        collector.collect_once(now=T0)
+
+        self.assertEqual(
+            [call["after_cursor"] for call in provider.page_calls],
+            [None, "cursor-a", "cursor-b", None],
+        )
+        self.assertEqual(provider.book_calls, ["cycle-first", "cycle-second", "cycle-rebased"])
+
+
+    def test_complete_terminal_restart_rebases_seen_ids_and_counts(self) -> None:
+        terminal = market("complete-terminal", category="politics")
+        provider = _PagedProvider(
+            (terminal,),
+            (
+                {"snapshots": (terminal,), "next_cursor": None},
+                {"snapshots": (terminal,), "next_cursor": None},
+            ),
+        )
+        policy = scope("RULE_BASED_MARKETS", category="politics")
+        store = _ScopeStore({"candidate": {"experiment_plan": {"market_scope": policy}}})
+        collector = self._collector(provider, store, ("candidate",), max_markets=1)
+
+        collector.collect_once(now=T0)
+        collector.collect_once(now=T0)
+
+        continuation = store.states["polymarket"]["scope_inventory_continuation"]
+        self.assertEqual([call["after_cursor"] for call in provider.page_calls], [None, None])
+        self.assertEqual(
+            continuation["cumulative"],
+            {
+                "raw_count": 1,
+                "unique_count": 1,
+                "duplicate_count": 0,
+                "malformed_count": 0,
+            },
+        )
+        self.assertEqual(continuation["seen_cursor_history"], [])
+        self.assertEqual(continuation["seen_market_ids"], ["complete-terminal"])
+        self.assertEqual(provider.book_calls, ["complete-terminal", "complete-terminal"])
+
+    def test_malformed_terminal_without_cursor_restarts_from_page_one(self) -> None:
+        fresh = market("after-malformed", category="politics")
+        provider = _PagedProvider(
+            (fresh,),
+            (
+                {"snapshots": ("malformed-row",), "next_cursor": None},
+                {"snapshots": (fresh,), "next_cursor": None},
+            ),
+        )
+        policy = scope("RULE_BASED_MARKETS", category="politics")
+        store = _ScopeStore({"candidate": {"experiment_plan": {"market_scope": policy}}})
+        collector = self._collector(provider, store, ("candidate",), max_markets=1)
+
+        collector.collect_once(now=T0)
+        collector.collect_once(now=T0)
+
+        continuation = store.states["polymarket"]["scope_inventory_continuation"]
+        self.assertEqual([call["after_cursor"] for call in provider.page_calls], [None, None])
+        self.assertEqual(continuation["coverage_status"], "COMPLETE")
+        self.assertEqual(
+            continuation["cumulative"],
+            {
+                "raw_count": 1,
+                "unique_count": 1,
+                "duplicate_count": 0,
+                "malformed_count": 0,
+            },
+        )
+        self.assertEqual(provider.book_calls, ["after-malformed"])
+
+    def test_fingerprint_mismatch_discards_page_and_rebases_next_cycle(self) -> None:
+        first = market("fingerprint-first", category="politics")
+        mismatched = market("fingerprint-mismatched", category="politics")
+        rebased = market("fingerprint-rebased", category="politics")
+        provider = _PagedProvider(
+            (first, mismatched, rebased),
+            (
+                {
+                    "snapshots": (first,),
+                    "next_cursor": "opaque-1",
+                    "query_fingerprint": "provider-generation",
+                },
+                {
+                    "snapshots": (mismatched,),
+                    "next_cursor": None,
+                    "query_fingerprint": "wrong-generation",
+                },
+                {"snapshots": (rebased,), "next_cursor": None},
+            ),
+        )
+        policy = scope("RULE_BASED_MARKETS", category="politics")
+        store = _ScopeStore({"candidate": {"experiment_plan": {"market_scope": policy}}})
+        collector = self._collector(provider, store, ("candidate",), max_markets=1)
+
+        first_cycle = collector.collect_once(now=T0)
+        second_cycle = collector.collect_once(now=T0)
+        self.assertEqual(first_cycle.errors, 0)
+        self.assertEqual(second_cycle.errors, 1)
+
+        reset = store.states["polymarket"]["scope_inventory_continuation"]
+        self.assertEqual([call["after_cursor"] for call in provider.page_calls], [None, "opaque-1"])
+        self.assertEqual(reset["coverage_status"], "ERROR")
+        self.assertEqual(reset["error_reason"], "QUERY_RESET")
+        self.assertEqual(reset["query_reset_reason"], "QUERY_FINGERPRINT_MISMATCH")
+        self.assertTrue(reset["query_reset"])
+        self.assertTrue(reset["rebase_required"])
+        self.assertIsNone(reset["after_cursor"])
+        self.assertEqual(reset["cumulative_unique_count"], 0)
+        self.assertEqual(reset["seen_market_ids"], [])
+        self.assertEqual(len(store.resolutions), 1)
+        self.assertEqual(provider.book_calls, ["fingerprint-first"])
+
+        collector.collect_once(now=T0)
+
+        continuation = store.states["polymarket"]["scope_inventory_continuation"]
+        self.assertEqual(
+            [call["after_cursor"] for call in provider.page_calls],
+            [None, "opaque-1", None],
+        )
+        self.assertEqual(continuation["cumulative_unique_count"], 1)
+        self.assertEqual(continuation["seen_market_ids"], ["fingerprint-rebased"])
+        self.assertEqual(len(store.resolutions), 2)
+        self.assertEqual(provider.book_calls, ["fingerprint-first", "fingerprint-rebased"])
+    def test_non_string_next_cursor_is_integrity_error_and_rebases(self) -> None:
+        rejected = market("invalid-cursor", category="politics")
+        accepted = market("after-invalid-cursor", category="politics")
+        provider = _PagedProvider(
+            (rejected, accepted),
+            (
+                {"snapshots": (rejected,), "next_cursor": 17},
+                {"snapshots": (accepted,), "next_cursor": None},
+            ),
+        )
+        policy = scope("RULE_BASED_MARKETS", category="politics")
+        store = _ScopeStore({"candidate": {"experiment_plan": {"market_scope": policy}}})
+        collector = self._collector(provider, store, ("candidate",), max_markets=1)
+
+        rejected_cycle = collector.collect_once(now=T0)
+        continuation = store.states["polymarket"]["scope_inventory_continuation"]
+        self.assertEqual(rejected_cycle.errors, 1)
+        self.assertEqual(continuation["coverage_status"], "ERROR")
+        self.assertEqual(continuation["error_reason"], "INVALID_NEXT_CURSOR")
+        self.assertEqual(continuation["seen_market_ids"], [])
+        self.assertIsNone(continuation["after_cursor"])
+        self.assertEqual(provider.book_calls, [])
+
+        accepted_cycle = collector.collect_once(now=T0)
+        self.assertEqual(accepted_cycle.errors, 0)
+        self.assertEqual([call["after_cursor"] for call in provider.page_calls], [None, None])
+        self.assertEqual(provider.book_calls, ["after-invalid-cursor"])
+
+    def test_explicit_error_page_discards_ids_and_counts_cycle_error(self) -> None:
+        poisoned = market("error-page-id", category="politics")
+        accepted = market("after-error-page", category="politics")
+        provider = _PagedProvider(
+            (poisoned, accepted),
+            (
+                {
+                    "snapshots": (poisoned,),
+                    "next_cursor": "should-not-continue",
+                    "coverage_status": "ERROR",
+                    "error_reason": "provider_payload_error",
+                },
+                {"snapshots": (accepted,), "next_cursor": None},
+            ),
+        )
+        policy = scope("RULE_BASED_MARKETS", category="politics")
+        store = _ScopeStore({"candidate": {"experiment_plan": {"market_scope": policy}}})
+        collector = self._collector(provider, store, ("candidate",), max_markets=1)
+
+        error_cycle = collector.collect_once(now=T0)
+        continuation = store.states["polymarket"]["scope_inventory_continuation"]
+        self.assertEqual(error_cycle.errors, 1)
+        self.assertEqual(continuation["error_reason"], "PROVIDER_PAYLOAD_ERROR")
+        self.assertEqual(continuation["seen_market_ids"], [])
+        self.assertIsNone(continuation["after_cursor"])
+        self.assertEqual(provider.book_calls, [])
+
+        collector.collect_once(now=T0)
+        self.assertEqual([call["after_cursor"] for call in provider.page_calls], [None, None])
+        self.assertEqual(provider.book_calls, ["after-error-page"])
+
+    def test_first_provider_fingerprint_is_adopted_without_request_hash_comparison(self) -> None:
+        first = market("optional-fingerprint-first", category="politics")
+        second = market("optional-fingerprint-second", category="politics")
+        provider = _PagedProvider(
+            (first, second),
+            (
+                {
+                    "snapshots": (first,),
+                    "next_cursor": "cursor-after-start",
+                    "query_fingerprint": "provider-generation-a",
+                },
+                {
+                    "snapshots": (second,),
+                    "next_cursor": None,
+                    "query_fingerprint": "provider-generation-a",
+                },
+            ),
+        )
+        policy = scope("RULE_BASED_MARKETS", category="politics")
+        store = _ScopeStore({"candidate": {"experiment_plan": {"market_scope": policy}}})
+        store.states["polymarket"] = {
+            "scope_inventory_continuation": {
+                "after_cursor": "cursor-start",
+                "coverage_status": "PARTIAL",
+                "seen_cursor_history": ["cursor-start"],
+                "seen_market_ids": [],
+            }
+        }
+        collector = self._collector(provider, store, ("candidate",), max_markets=1)
+
+        first_cycle = collector.collect_once(now=T0)
+        second_cycle = collector.collect_once(now=T0)
+        continuation = store.states["polymarket"]["scope_inventory_continuation"]
+        self.assertEqual(first_cycle.errors, 0)
+        self.assertEqual(second_cycle.errors, 0)
+        self.assertEqual(
+            [call["after_cursor"] for call in provider.page_calls],
+            ["cursor-start", "cursor-after-start"],
+        )
+        self.assertEqual(continuation["provider_query_fingerprint"], "provider-generation-a")
+        self.assertEqual(provider.book_calls, ["optional-fingerprint-first", "optional-fingerprint-second"])
+
+    def test_provider_query_metadata_is_bounded_json_without_losing_cursor(self) -> None:
+        first = market("metadata-first", category="politics")
+        second = market("metadata-second", category="politics")
+
+        class UnsupportedQueryValue:
+            pass
+
+        provider = _PagedProvider(
+            (first, second),
+            (
+                {
+                    "snapshots": (first,),
+                    "next_cursor": "metadata-cursor",
+                    "request_path": object(),
+                    "query": {"unsafe": UnsupportedQueryValue()},
+                },
+                {"snapshots": (second,), "next_cursor": None},
+            ),
+        )
+        policy = scope("RULE_BASED_MARKETS", category="politics")
+        store = _ScopeStore({"candidate": {"experiment_plan": {"market_scope": policy}}})
+        collector = self._collector(provider, store, ("candidate",), max_markets=1)
+
+        first_cycle = collector.collect_once(now=T0)
+        continuation = store.states["polymarket"]["scope_inventory_continuation"]
+        self.assertEqual(first_cycle.errors, 0)
+        self.assertEqual(continuation["request_path"], "/markets/keyset")
+        self.assertIsInstance(continuation["query"], dict)
+        self.assertNotIn("unsafe", continuation["query"])
+        json.dumps(continuation, allow_nan=False)
+        self.assertEqual(continuation["after_cursor"], "metadata-cursor")
+
+        collector.collect_once(now=T0)
+        self.assertEqual(
+            [call["after_cursor"] for call in provider.page_calls],
+            [None, "metadata-cursor"],
+        )
+        self.assertEqual(provider.book_calls, ["metadata-first", "metadata-second"])
+
 
 if __name__ == "__main__":
+
     unittest.main()

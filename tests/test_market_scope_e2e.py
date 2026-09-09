@@ -3,7 +3,14 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 import unittest
 
-from axiom.canary import CanaryService
+from axiom.autonomous import AutonomousResearchConfig, AutonomousResearchProcessor
+from axiom.forward import ForwardTestRegistry
+from axiom.lifecycle import CandidateStage, PromotionCriteria
+from axiom.paper_engine import run_forward_paper
+from axiom.canary import (
+    CanaryService,
+    EXECUTION_FEASIBILITY_MARKET_CAP,
+)
 from axiom.collector import CollectorConfig, PolymarketCollector
 from axiom.data import InMemoryPredictionProvider
 from axiom.director import validate_hermes_proposal
@@ -16,7 +23,7 @@ from axiom.domain import (
     SettlementState,
 )
 from axiom.experiment_plan import ExperimentPlan
-from axiom.market_scope import MATCHED
+from axiom.market_scope import MATCHED, resolve_market_scope
 from axiom.ranker import CandidateCanaryRanker
 from axiom.research_bus import DurableResearchBus, ResearchQueueStatus
 from axiom.storage import AxiomStore
@@ -27,6 +34,9 @@ from tests.test_phase4 import experiment_plan, prediction_rows, processor, propo
 
 UTC = timezone.utc
 T0 = datetime(2025, 1, 1, tzinfo=UTC)
+SYNTHETIC_MODEL_PROBABILITY = 0.80
+SYNTHETIC_MODEL_LABEL = "synthetic-only"
+SYNTHETIC_MARKET_COUNT = 30
 DATASET_ID = "SYNTHETIC_OFFLINE-polymarket-history"
 DATASET_VERSION = "synthetic-v1"
 MARKET_ID = "SYNTHETIC_OFFLINE-future-politics-market"
@@ -526,16 +536,554 @@ class MarketScopeEndToEndTests(unittest.TestCase):
                 {"READY_SIGNAL", "STRATEGY_EVALUATED_DECLINED"},
             )
             self.assertEqual(provider.submission_attempts, 0)
-            self.assertEqual(
-                store.connection.execute("SELECT COUNT(*) FROM canary_ledger").fetchone()[0],
-                0,
-            )
-            self.assertEqual(
-                store.connection.execute("SELECT COUNT(*) FROM canary_execution_events").fetchone()[0],
-                0,
-            )
+            paper_execution_events = store.connection.execute(
+                "SELECT COUNT(*) AS n FROM paper_execution_events"
+            ).fetchone()
+            self.assertIsNotNone(paper_execution_events)
+            assert paper_execution_events is not None
+            self.assertEqual(int(paper_execution_events["n"]), 0)
             self.assertFalse(store.list_collection_errors())
 
+
+def _synthetic_offline_history() -> list[dict[str, object]]:
+    """Create immutable, clearly labelled offline history for the queue proof."""
+    rows: list[dict[str, object]] = []
+    for index in range(SYNTHETIC_MARKET_COUNT):
+        market_id = f"synthetic-market-{index:02d}"
+        opened = T0 + timedelta(days=index)
+        for step in range(5):
+            stamp = opened + timedelta(hours=step)
+            rows.append(
+                {
+                    "market_id": market_id,
+                    "question": "Synthetic offline market resolves YES.",
+                    "category": "politics",
+                    "yes_bid": 0.49,
+                    "yes_ask": 0.51,
+                    "yes_mid": 0.50,
+                    "no_bid": 0.49,
+                    "no_ask": 0.51,
+                    "no_mid": 0.50,
+                    "model_probability": SYNTHETIC_MODEL_PROBABILITY,
+                    "liquidity": 1_500.0,
+                    "spread": 0.02,
+                    "expiry": (opened + timedelta(days=2)).isoformat(),
+                    "resolution_criteria": "synthetic offline fixture outcome",
+                    "timestamp": stamp.isoformat(),
+                    "settlement": "open",
+                    "regime": ("calm", "volatile", "transition")[step % 3],
+                    "source_type": "HISTORICAL",
+                    "fixture_label": "SYNTHETIC_OFFLINE",
+                    "model_label": SYNTHETIC_MODEL_LABEL,
+                }
+            )
+        rows.append(
+            {
+                "market_id": market_id,
+                "question": "Synthetic offline market resolves YES.",
+                "category": "politics",
+                "yes_bid": 0.49,
+                "yes_ask": 0.51,
+                "yes_mid": 0.50,
+                "no_bid": 0.49,
+                "no_ask": 0.51,
+                "no_mid": 0.50,
+                "model_probability": SYNTHETIC_MODEL_PROBABILITY,
+                "liquidity": 1_500.0,
+                "spread": 0.02,
+                "expiry": (opened + timedelta(days=2)).isoformat(),
+                "resolution_criteria": "synthetic offline fixture outcome",
+                "timestamp": (opened + timedelta(hours=5)).isoformat(),
+                "settlement": "resolved_yes",
+                "regime": "transition",
+                "source_type": "HISTORICAL",
+                "fixture_label": "SYNTHETIC_OFFLINE",
+                "model_label": SYNTHETIC_MODEL_LABEL,
+            }
+        )
+    return rows
+
+
+def _runtime_plan(proposal_id: str) -> dict[str, object]:
+    plan: dict[str, object] = {
+        "market_type": "prediction",
+        "template": "probability_mispricing",
+        "dataset_id": "synthetic-offline-history",
+        "dataset_version": "synthetic-offline-v1",
+        "dataset_selector": {
+            "dataset_id": "synthetic-offline-history",
+            "dataset_version": "synthetic-offline-v1",
+            "source_type": "HISTORICAL",
+        },
+        "target": {"instrument": "POLYMARKET", "categories": ["politics"]},
+        "market_scope": {
+            "schema_version": "1",
+            "mode": "RULE_BASED_MARKETS",
+            "instrument": "POLYMARKET",
+            "categories": ["politics"],
+            "market_ids": [],
+            "filters": {"category": "politics"},
+            "regime_restrictions": {},
+            "provenance": "canonical",
+        },
+        "filters": {"category": "politics"},
+        "parameters": {"threshold": [0.03]},
+        "methodology": {
+            "time_split": "train-validation-holdout",
+            "initial_cash": 10_000.0,
+            "fee_bps": 0.0,
+            "slippage_bps": 0.0,
+            "allocation": 0.25,
+        },
+        "metrics": ["expectancy", "drawdown", "trade_count", "sample_count"],
+        "min_samples": 30,
+        "min_trades": 0,
+        "max_variants": 1,
+        "model_document": {"probability": SYNTHETIC_MODEL_PROBABILITY},
+        "paper_only": True,
+    }
+    return {
+        "proposal_id": proposal_id,
+        "statement": "A deterministic synthetic offline probability edge is testable.",
+        "source": f"SYNTHETIC_OFFLINE {SYNTHETIC_MODEL_LABEL} model",
+        "tests": ["chronological train-validation-holdout", "bounded robustness checks"],
+        "dataset_version": "synthetic-offline-v1",
+        "time_split": "train-validation-holdout",
+        "paper_only": True,
+        "experiment_plan": plan,
+    }
+
+
+def _forward_metadata(market_id: str) -> dict[str, object]:
+    expiry = (T0 + timedelta(days=30)).isoformat()
+    return {
+        "market_id": market_id,
+        "condition_id": f"{market_id}-condition",
+        "yes_token_id": f"{market_id}-yes",
+        "no_token_id": f"{market_id}-no",
+        "instrument": "POLYMARKET",
+        "market_type": "prediction",
+        "category": "politics",
+        "yes_bid": 0.49,
+        "yes_ask": 0.51,
+        "yes_mid": 0.50,
+        "liquidity": 1_500.0,
+        "spread": 0.02,
+        "expiry": expiry,
+        "active": True,
+        "closed": False,
+        "metadata": {
+            "instrument": "POLYMARKET",
+            "market_type": "prediction",
+            "category": "politics",
+            "active": True,
+            "closed": False,
+            "expiry": expiry,
+            "provenance_label": SYNTHETIC_MODEL_LABEL,
+        },
+        "snapshot": {
+            "market_id": market_id,
+            "instrument": "POLYMARKET",
+            "market_type": "prediction",
+            "category": "politics",
+            "yes_mid": 0.50,
+            "liquidity": 1_500.0,
+            "spread": 0.02,
+            "expiry": expiry,
+            "settlement": "open",
+        },
+        "provenance_label": SYNTHETIC_MODEL_LABEL,
+    }
+
+
+def _forward_observation(
+    market_id: str,
+    stamp: datetime,
+    *,
+    settlement: str = "open",
+    regime: str = "calm",
+    no_fill: bool = False,
+) -> dict[str, object]:
+    observation: dict[str, object] = {
+        "market_id": market_id,
+        "instrument": "POLYMARKET",
+        "market_type": "prediction",
+        "timestamp": stamp.isoformat(),
+        "yes_bid": 0.49,
+        "yes_ask": 0.51,
+        "yes_mid": 0.50,
+        "no_bid": 0.49,
+        "no_ask": 0.51,
+        "no_mid": 0.50,
+        "model_probability": SYNTHETIC_MODEL_PROBABILITY,
+        "liquidity": 1_500.0,
+        "spread": 0.02,
+        "expiry": (T0 + timedelta(days=30)).isoformat(),
+        "resolution_criteria": "synthetic offline fixture outcome",
+        "settlement": settlement,
+        "regime": regime,
+        "source_type": "FORWARD_COLLECTED",
+        "model_label": SYNTHETIC_MODEL_LABEL,
+    }
+    if no_fill:
+        # A bid-only book is a real paper-execution no-fill, not a fabricated
+        # result: the strategy signals, the book has no executable ask, and
+        # the paper engine records ORDER_ATTEMPT followed by NO_FILL.
+        observation["yes_order_book"] = {
+            "timestamp": stamp.isoformat(),
+            "bids": [{"price": 0.49, "size": 10.0}],
+            "asks": [],
+        }
+    return observation
+
+
+class MarketScopeRuntimeQualificationTests(unittest.TestCase):
+    def test_ordinary_queue_qualifies_and_rejects_with_runtime_defaults(self) -> None:
+        runtime_criteria = PromotionCriteria()
+        relaxed_criteria = PromotionCriteria(
+            min_independent_samples=0,
+            min_trades=0,
+            max_drawdown=1.0,
+            min_expectancy=-1.0,
+            min_confidence_lower_bound=-1.0,
+            min_stability=0.0,
+            min_calibration=0.0,
+            min_liquidity=0.0,
+            min_forward_duration_seconds=0.0,
+            min_regimes=0,
+        )
+        runtime_record = runtime_criteria.as_record()
+        relaxed_record = relaxed_criteria.as_record()
+        configuration_record = {"relaxed": relaxed_record, "runtime": runtime_record}
+        self.assertEqual(
+            {key for key in runtime_record if relaxed_record[key] != runtime_record[key]},
+            {
+                "min_independent_samples",
+                "min_trades",
+                "max_drawdown",
+                "min_expectancy",
+                "min_confidence_lower_bound",
+                "min_stability",
+                "min_calibration",
+                "min_forward_duration_seconds",
+                "min_regimes",
+            },
+        )
+        self.assertEqual(configuration_record["runtime"], PromotionCriteria().as_record())
+        self.assertEqual(configuration_record["relaxed"], relaxed_criteria.as_record())
+
+        with AxiomStore(":memory:") as store:
+            history = _synthetic_offline_history()
+            store.save_dataset(
+                "synthetic-offline-history",
+                "synthetic-offline-v1",
+                history,
+                metadata={
+                    "source_type": "SYNTHETIC_OFFLINE",
+                    "model_label": SYNTHETIC_MODEL_LABEL,
+                    "model_probability": SYNTHETIC_MODEL_PROBABILITY,
+                },
+            )
+            store.save_dataset_catalog(
+                "synthetic-offline-history",
+                "synthetic-offline-v1",
+                provider="SYNTHETIC_OFFLINE",
+                instrument="POLYMARKET",
+                market_type=MarketType.PREDICTION,
+                timeframe="event",
+                start_timestamp=T0,
+                end_timestamp=T0 + timedelta(days=29, hours=5),
+                row_count=len(history),
+                completeness=1.0,
+                quality="PRICE_PROXY",
+                source_type="HISTORICAL",
+                snapshot_id="SYNTHETIC_OFFLINE-historical-catalog-v1",
+                metadata={
+                    "fixture_label": "SYNTHETIC_OFFLINE",
+                    "provider": "SYNTHETIC_OFFLINE",
+                    "source_type": "HISTORICAL",
+                    "research_quality": "PRICE_PROXY",
+                    "historical_order_book_available": False,
+                },
+            )
+            attestation = store.verify_dataset_integrity_attestation(
+                "synthetic-offline-history",
+                "synthetic-offline-v1",
+            )
+            self.assertEqual(attestation["status"], "CURRENT")
+            self.assertEqual(attestation["row_count"], len(history))
+            self.assertEqual(attestation["contamination_result"], "PASS")
+            dataset_record = store.load_dataset_record("synthetic-offline-history", "synthetic-offline-v1")
+            self.assertIsNotNone(dataset_record)
+            assert dataset_record is not None
+            self.assertEqual(dataset_record["metadata"]["source_type"], "SYNTHETIC_OFFLINE")
+            self.assertEqual(dataset_record["metadata"]["model_label"], SYNTHETIC_MODEL_LABEL)
+            self.assertEqual(dataset_record["metadata"]["model_probability"], SYNTHETIC_MODEL_PROBABILITY)
+            self.assertEqual(len(history), SYNTHETIC_MARKET_COUNT * 6)
+
+            market_ids = tuple(f"synthetic-market-{index:02d}" for index in range(SYNTHETIC_MARKET_COUNT))
+            for market_id in market_ids:
+                store.save_polymarket_market_metadata(
+                    market_id,
+                    _forward_metadata(market_id),
+                    observed_at=T0,
+                    source_type="FORWARD_COLLECTED",
+                )
+
+            bus = DurableResearchBus(store)
+            qualifying_item = bus.submit_hypothesis(
+                _runtime_plan("runtime-qualifying"),
+                available_at=T0,
+                dedupe_key="runtime-qualifying",
+            )
+            rejecting_item = bus.submit_hypothesis(
+                _runtime_plan("runtime-rejecting"),
+                available_at=T0,
+                dedupe_key="runtime-rejecting",
+            )
+            processor = AutonomousResearchProcessor(
+                store,
+                bus=bus,
+                config=AutonomousResearchConfig(
+                    max_items_per_cycle=2,
+                    max_plan_variants=1,
+                    max_children_per_parent=0,
+                    promotion_criteria=runtime_criteria,
+                ),
+                clock=lambda: T0,
+            )
+
+            queue_cycle = processor.process_pending(worker="ordinary-runtime-test", now=T0)
+            self.assertEqual(queue_cycle.claimed, 2)
+            self.assertEqual(queue_cycle.completed, 2)
+            self.assertEqual(queue_cycle.rejected, 0)
+            self.assertEqual(queue_cycle.failed, 0)
+            qualifying_queue_item = bus.get(qualifying_item.item_id)
+            rejecting_queue_item = bus.get(rejecting_item.item_id)
+            self.assertIsNotNone(qualifying_queue_item)
+            self.assertIsNotNone(rejecting_queue_item)
+            assert qualifying_queue_item is not None
+            assert rejecting_queue_item is not None
+            self.assertEqual(qualifying_queue_item.status, ResearchQueueStatus.COMPLETED)
+            self.assertEqual(rejecting_queue_item.status, ResearchQueueStatus.COMPLETED)
+            qualifying_queue_result = qualifying_queue_item.result
+            rejecting_queue_result = rejecting_queue_item.result
+            self.assertIsInstance(qualifying_queue_result, dict)
+            self.assertIsInstance(rejecting_queue_result, dict)
+            assert isinstance(qualifying_queue_result, dict)
+            assert isinstance(rejecting_queue_result, dict)
+            self.assertEqual(
+                qualifying_queue_result["hypothesis_id"],
+                qualifying_item.payload["proposal_id"],
+            )
+            self.assertEqual(
+                rejecting_queue_result["hypothesis_id"],
+                rejecting_item.payload["proposal_id"],
+            )
+            qualifying_results = qualifying_queue_result["candidate_results"]
+            rejecting_results = rejecting_queue_result["candidate_results"]
+            self.assertEqual(len(qualifying_results), 1)
+            self.assertEqual(len(rejecting_results), 1)
+            qualifying_result = qualifying_results[0]
+            rejecting_result = rejecting_results[0]
+            self.assertEqual(qualifying_result["stage"], CandidateStage.PAPER_FORWARD.value)
+            self.assertEqual(rejecting_result["stage"], CandidateStage.PAPER_FORWARD.value)
+            qualifying_id = str(qualifying_result["candidate_id"])
+            rejecting_id = str(rejecting_result["candidate_id"])
+
+            records = store.load_candidate_lifecycle(limit=None)
+            candidates = {
+                str(record["candidate_id"]): record
+                for record in records
+                if isinstance(record.get("payload"), dict)
+            }
+            qualifying = candidates[qualifying_id]
+            rejecting = candidates[rejecting_id]
+            qualifying_payload = qualifying["payload"]
+            rejecting_payload = rejecting["payload"]
+            self.assertEqual(qualifying_payload["hypothesis_id"], qualifying_item.payload["proposal_id"])
+            self.assertEqual(rejecting_payload["hypothesis_id"], rejecting_item.payload["proposal_id"])
+            self.assertEqual(qualifying["stage"], CandidateStage.PAPER_FORWARD.value)
+            self.assertEqual(rejecting["stage"], CandidateStage.PAPER_FORWARD.value)
+            qualifying_spec = ForwardTestRegistry(store).get(qualifying_payload["forward_test_id"])
+            rejecting_spec = ForwardTestRegistry(store).get(rejecting_payload["forward_test_id"])
+            self.assertIsNotNone(qualifying_spec)
+            self.assertIsNotNone(rejecting_spec)
+            assert qualifying_spec is not None
+            assert rejecting_spec is not None
+            self.assertEqual(qualifying_spec.config["execution"], "paper_only")
+            self.assertEqual(rejecting_spec.config["execution"], "paper_only")
+            self.assertEqual(qualifying_spec.model_hash, rejecting_spec.model_hash)
+            self.assertEqual(tuple(qualifying_spec.allowed_markets), market_ids)
+            self.assertEqual(len(qualifying_spec.allowed_markets), SYNTHETIC_MARKET_COUNT)
+            persisted_plans = store.list_experiment_plans(limit=10)
+            self.assertEqual(len(persisted_plans), 2)
+            for persisted in persisted_plans:
+                plan = persisted["plan"]
+                self.assertEqual(plan["min_samples"], 30)
+                self.assertEqual(plan["min_trades"], 0)
+                self.assertEqual(
+                    plan["model_document"],
+                    {"probability": SYNTHETIC_MODEL_PROBABILITY},
+                )
+
+
+            qualifying_observations = [
+                item
+                for market_id in qualifying_spec.allowed_markets
+                for item in (
+                    _forward_observation(market_id, T0 + timedelta(hours=1), regime=("calm", "volatile", "transition")[int(market_id[-2:]) % 3]),
+                    _forward_observation(market_id, T0 + timedelta(hours=1, minutes=1), settlement="resolved_yes"),
+                )
+            ]
+            qualifying_cycle = run_forward_paper(
+                qualifying_spec,
+                store=store,
+                strategy=qualifying_payload["strategy"],
+                model={"probability": SYNTHETIC_MODEL_PROBABILITY},
+                observations=qualifying_observations,
+                now=T0 + timedelta(days=7),
+            )
+            self.assertEqual(qualifying_cycle.fills_inserted, SYNTHETIC_MARKET_COUNT)
+            self.assertEqual(qualifying_cycle.settlements, SYNTHETIC_MARKET_COUNT)
+            self.assertEqual(qualifying_cycle.errors, ())
+
+            rejecting_observations = [
+                item
+                for market_id in rejecting_spec.allowed_markets[:5]
+                for item in (
+                    _forward_observation(
+                        market_id,
+                        T0 + timedelta(hours=2),
+                        regime="calm",
+                        no_fill=True,
+                    ),
+                    _forward_observation(
+                        market_id,
+                        T0 + timedelta(hours=2, minutes=1),
+                        settlement="resolved_yes",
+                    ),
+                )
+            ]
+            rejecting_cycle = run_forward_paper(
+                rejecting_spec,
+                store=store,
+                strategy=rejecting_payload["strategy"],
+                model={"probability": SYNTHETIC_MODEL_PROBABILITY},
+                observations=rejecting_observations,
+                now=T0 + timedelta(days=7),
+            )
+            self.assertEqual(rejecting_cycle.fills_inserted, 0)
+            self.assertEqual(rejecting_cycle.settlements, 5)
+            self.assertEqual(rejecting_cycle.errors, ())
+
+            reevaluated = processor.reevaluate_forward_candidates(now=T0 + timedelta(days=7))
+            outcomes = {item["candidate_id"]: item for item in reevaluated}
+            self.assertEqual(outcomes[qualifying_id]["candidate_id"], qualifying_id)
+            self.assertEqual(outcomes[rejecting_id]["candidate_id"], rejecting_id)
+            self.assertEqual(outcomes[qualifying_id]["stage"], CandidateStage.PAPER_PROMOTABLE.value)
+            self.assertEqual(outcomes[qualifying_id]["promotion_reasons"], [])
+            self.assertEqual(outcomes[rejecting_id]["stage"], CandidateStage.REJECTED.value)
+            self.assertIn("execution_impossible", outcomes[rejecting_id]["promotion_reasons"])
+            self.assertEqual(rejecting_payload["hypothesis_id"], rejecting_item.payload["proposal_id"])
+            self.assertEqual(rejecting_result["candidate_id"], rejecting_id)
+            self.assertEqual(rejecting_result["stage"], CandidateStage.PAPER_FORWARD.value)
+            scope_records = [
+                {
+                    **_forward_metadata(market_id),
+                    "source_type": "CURRENT",
+                    "provider": "polymarket",
+                    "venue": "POLYMARKET",
+                    "open": True,
+                    "accepting_orders": True,
+                    "enable_order_book": True,
+                }
+                for market_id in market_ids
+            ]
+            scope_resolution = resolve_market_scope(
+                qualifying_id,
+                store.load_candidate_lifecycle(qualifying_id)["payload"],
+                scope_records,
+                resolved_at=T0 + timedelta(days=7),
+                max_matches=100,
+                max_markets=100,
+            )
+            self.assertEqual(scope_resolution.status, MATCHED)
+            self.assertEqual(len(scope_resolution.matched_markets), SYNTHETIC_MARKET_COUNT)
+            store.save_market_scope_resolution(scope_resolution)
+            canary_evaluation = CanaryService(
+                store,
+                clock=lambda: T0 + timedelta(days=7),
+            ).evaluate_signal(
+                qualifying_id,
+                cycle_id="runtime-canary-cap",
+            )
+            self.assertEqual(
+                canary_evaluation["reason_code"],
+                EXECUTION_FEASIBILITY_MARKET_CAP,
+            )
+            self.assertIsNone(canary_evaluation["signal"])
+            self.assertEqual(
+                canary_evaluation["evidence"]["resolved_market_count"],
+                SYNTHETIC_MARKET_COUNT,
+            )
+            self.assertEqual(
+                canary_evaluation["evidence"]["execution_market_cap"],
+                8,
+            )
+            self.assertEqual(
+                CanaryService(store, clock=lambda: T0 + timedelta(days=7))
+                .list_signal_evaluations(
+                    candidate_id=qualifying_id,
+                    cycle_id="runtime-canary-cap",
+                    limit=1,
+                )[0]["reason_code"],
+                EXECUTION_FEASIBILITY_MARKET_CAP,
+            )
+            qualifying_events = store.list_candidate_lifecycle_events(qualifying_id, limit=100)
+            rejecting_events = store.list_candidate_lifecycle_events(rejecting_id, limit=100)
+            qualifying_promotion_events = [
+                event
+                for event in qualifying_events
+                if event["candidate_id"] == qualifying_id
+                and event["to_stage"] == CandidateStage.PAPER_PROMOTABLE.value
+                and event["reason"] == "paper-forward criteria passed; human review required"
+            ]
+            rejecting_rejection_events = [
+                event
+                for event in rejecting_events
+                if event["candidate_id"] == rejecting_id
+                and event["to_stage"] == CandidateStage.REJECTED.value
+                and event["reason"] == "execution_impossible"
+            ]
+            self.assertEqual(len(qualifying_promotion_events), 1)
+            self.assertEqual(len(rejecting_rejection_events), 1)
+            qualifying_promotion_event = qualifying_promotion_events[0]
+            rejecting_rejection_event = rejecting_rejection_events[0]
+            self.assertEqual(qualifying_promotion_event["candidate_id"], qualifying_id)
+            self.assertEqual(rejecting_rejection_event["candidate_id"], rejecting_id)
+            self.assertEqual(
+                rejecting_rejection_event["payload"]["rejection_reason"],
+                "execution_impossible",
+            )
+            self.assertEqual(
+                store.load_candidate_lifecycle(rejecting_id)["payload"]["rejection_reason"],
+                "execution_impossible",
+            )
+
+            execution_events = (
+                store.list_paper_execution_events(qualifying_spec.experiment_id)
+                + store.list_paper_execution_events(rejecting_spec.experiment_id)
+            )
+            self.assertTrue(execution_events)
+            self.assertTrue(all(item["payload"].get("paper_only") is True for item in execution_events))
+            self.assertFalse(any(item["payload"].get("live_execution") for item in execution_events))
+            live_submission_events = [
+                item
+                for item in execution_events
+                if item["payload"].get("live_execution") is True
+            ]
+            self.assertEqual(live_submission_events, [])
 
 if __name__ == "__main__":
     unittest.main()

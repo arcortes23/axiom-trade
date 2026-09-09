@@ -8,9 +8,12 @@ fabricating probabilities or settlement outcomes.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import urllib.parse
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Mapping, Sequence
 
@@ -27,6 +30,23 @@ from ..domain import (
 )
 from ._http import HTTPFetchError, as_float, decode_jsonish, fetch_json_strict, parse_timestamp, query_url
 from .interfaces import PredictionMarketDataProvider
+
+
+@dataclass(frozen=True, slots=True)
+class MarketDiscoveryPage:
+    """One read-only Gamma keyset page and its request accounting."""
+
+    snapshots: tuple[PredictionMarketSnapshot, ...]
+    next_cursor: str | None
+    request_path: str
+    query: Mapping[str, Any]
+    query_fingerprint: str
+    raw_count: int
+    unique_count: int
+    duplicate_count: int
+    malformed_count: int
+    coverage_status: str
+    error_reason: str | None = None
 
 
 _EPOCH = datetime.fromtimestamp(0, tz=timezone.utc)
@@ -163,6 +183,166 @@ class PolymarketAdapter(PredictionMarketDataProvider):
             if len(payload) < page_size or page_added == 0:
                 break
         return result
+    def resolve_tag_slug(self, slug: str) -> int | None:
+        """Resolve an exact Gamma tag slug to its documented numeric id."""
+        normalized = str(slug).strip()
+        if not normalized:
+            return None
+        payload = self._gamma_get("/tags/slug/" + urllib.parse.quote(normalized, safe=""))
+        if not isinstance(payload, Mapping) or payload.get("slug") != normalized:
+            return None
+        raw_id = payload.get("id")
+        if isinstance(raw_id, bool):
+            return None
+        if isinstance(raw_id, int):
+            return raw_id if raw_id > 0 else None
+        if not isinstance(raw_id, str) or not raw_id.isdecimal():
+            return None
+        identifier = int(raw_id)
+        return identifier if identifier > 0 else None
+
+    def market_page(
+        self,
+        limit: int,
+        after_cursor: str | None = None,
+        closed: bool = False,
+        tag_ids: Sequence[int] = (),
+        include_tag: bool = True,
+        liquidity_num_min: int | float | None = None,
+        end_date_min: Any | None = None,
+        end_date_max: Any | None = None,
+    ) -> MarketDiscoveryPage:
+        """Fetch one Gamma keyset page without broadening the requested scope."""
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+            raise ValueError("limit must be an integer between 1 and 100")
+        if not isinstance(closed, bool):
+            raise ValueError("closed must be a boolean")
+        if not isinstance(include_tag, bool):
+            raise ValueError("include_tag must be a boolean")
+        if after_cursor is not None and (
+            not isinstance(after_cursor, str) or not after_cursor
+        ):
+            raise ValueError("after_cursor must be an opaque non-empty string")
+        try:
+            raw_tag_ids = tuple(tag_ids)
+        except TypeError as exc:
+            raise ValueError("tag_ids must be a sequence of positive integers") from exc
+        normalized_tags: list[str] = []
+        for tag_id in raw_tag_ids:
+            if isinstance(tag_id, bool) or not isinstance(tag_id, int) or tag_id <= 0:
+                raise ValueError("tag_ids must be a sequence of positive integers")
+            normalized_tags.append(str(tag_id))
+
+        request_path = "/markets/keyset"
+        query: dict[str, Any] = {
+            "limit": str(limit),
+            "closed": str(closed).lower(),
+            "include_tag": str(include_tag).lower(),
+        }
+        if after_cursor is not None:
+            query["after_cursor"] = after_cursor
+        if normalized_tags:
+            query["tag_id[]"] = tuple(normalized_tags)
+        if liquidity_num_min is not None:
+            query["liquidity_num_min"] = _normalized_number(
+                liquidity_num_min, "liquidity_num_min", minimum=0.0
+            )
+        if end_date_min is not None:
+            query["end_date_min"] = _normalized_date_filter(end_date_min, "end_date_min")
+        if end_date_max is not None:
+            query["end_date_max"] = _normalized_date_filter(end_date_max, "end_date_max")
+        fingerprint = _market_query_fingerprint(request_path, query)
+        payload = self._gamma_get(request_path, **query)
+        if not isinstance(payload, Mapping):
+            return MarketDiscoveryPage(
+                snapshots=(),
+                next_cursor=None,
+                request_path=request_path,
+                query=query,
+                query_fingerprint=fingerprint,
+                raw_count=0,
+                unique_count=0,
+                duplicate_count=0,
+                malformed_count=1,
+                coverage_status="ERROR",
+            )
+        records = payload.get("markets")
+        if not isinstance(records, list):
+            return MarketDiscoveryPage(
+                snapshots=(),
+                next_cursor=None,
+                request_path=request_path,
+                query=query,
+                query_fingerprint=fingerprint,
+                raw_count=0,
+                unique_count=0,
+                duplicate_count=0,
+                malformed_count=1,
+                coverage_status="ERROR",
+            )
+        returned_cursor = payload.get("next_cursor")
+        if returned_cursor is not None and not isinstance(returned_cursor, str):
+            return MarketDiscoveryPage(
+                snapshots=(),
+                next_cursor=None,
+                request_path=request_path,
+                query=query,
+                query_fingerprint=fingerprint,
+                raw_count=len(records),
+                unique_count=0,
+                duplicate_count=0,
+                malformed_count=1,
+                coverage_status="ERROR",
+            )
+        next_cursor = returned_cursor or None
+        snapshots: list[PredictionMarketSnapshot] = []
+        seen_ids: set[str] = set()
+        duplicate_count = 0
+        malformed_count = 0
+        for record in records:
+            if not isinstance(record, Mapping):
+                malformed_count += 1
+                continue
+            raw_identifier = record.get(
+                "id", record.get("market_id", record.get("conditionId"))
+            )
+            if raw_identifier is not None and str(raw_identifier) in seen_ids:
+                duplicate_count += 1
+                continue
+            try:
+                snapshot = self._snapshot(record)
+            except (TypeError, ValueError, KeyError):
+                snapshot = None
+            if snapshot is None:
+                malformed_count += 1
+                continue
+            if snapshot.market_id in seen_ids:
+                duplicate_count += 1
+                continue
+            seen_ids.add(snapshot.market_id)
+            snapshots.append(snapshot)
+        coverage_status = "PARTIAL" if next_cursor is not None else "COMPLETE"
+        error_reason: str | None = None
+        if after_cursor is not None and next_cursor == after_cursor:
+            # A repeated opaque cursor cannot make progress.  Stop without
+            # handing the caller a continuation that would repeat forever.
+            next_cursor = None
+            coverage_status = "ERROR"
+            error_reason = "REPEATED_CURSOR"
+        return MarketDiscoveryPage(
+            snapshots=tuple(snapshots),
+            next_cursor=next_cursor,
+            request_path=request_path,
+            query=query,
+            query_fingerprint=fingerprint,
+            raw_count=len(records),
+            unique_count=len(snapshots),
+            duplicate_count=duplicate_count,
+            malformed_count=malformed_count,
+            coverage_status=coverage_status,
+            error_reason=error_reason,
+        )
+
 
     def market(self, market_id: str) -> PredictionMarketSnapshot | None:
         identifier = _text(market_id)
@@ -635,6 +815,47 @@ class PolymarketAdapter(PredictionMarketDataProvider):
         return snapshot
 
 
+def _normalized_number(value: Any, name: str, *, minimum: float | None = None) -> str:
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a finite number")
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{name} must be a finite number") from exc
+    if not math.isfinite(number) or (minimum is not None and number < minimum):
+        raise ValueError(f"{name} must be a finite number >= {minimum:g}")
+    return format(number, ".15g")
+
+
+def _normalized_date_filter(value: Any, name: str) -> str:
+    if isinstance(value, datetime):
+        return ensure_utc(value).isoformat()
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{name} must be a non-empty ISO-8601 string or datetime")
+    return value.strip()
+
+
+def _jsonable_query(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {str(key): _jsonable_query(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_jsonable_query(item) for item in value]
+    return value
+
+
+def _market_query_fingerprint(request_path: str, query: Mapping[str, Any]) -> str:
+    fingerprint_query = {
+        str(key): value for key, value in query.items() if str(key) != "after_cursor"
+    }
+    canonical = json.dumps(
+        {"request_path": str(request_path), "query": _jsonable_query(fingerprint_query)},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 _INVALID_BOOL = object()
 
 
@@ -858,6 +1079,7 @@ def _settlement(raw: Mapping[str, Any]) -> SettlementState:
 
 
 __all__ = [
+    "MarketDiscoveryPage",
     "PolymarketAdapter",
     "PolymarketPayloadError",
     "PolymarketIdentityError",

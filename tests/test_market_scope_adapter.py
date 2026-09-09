@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import json
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 import unittest
 
 from axiom.data import PolymarketAdapter
-from axiom.data.polymarket import PolymarketTokenMappingError
+from axiom.data.polymarket import MarketDiscoveryPage, PolymarketTokenMappingError
 from axiom.domain import SettlementState
 
 
@@ -126,6 +126,133 @@ class PolymarketMarketScopeAdapterTests(unittest.TestCase):
         self.assertIsNotNone(adapter.market("gamma-market-42"))
         self.assertIsNone(adapter.order_book("gamma-market-42"))
 
+
+    def test_keyset_page_encodes_scope_cursor_and_slug_lookup(self) -> None:
+        calls: list[str] = []
+
+        def opener(request: object, *, timeout: float) -> _Response:
+            url = str(getattr(request, "full_url", request))
+            calls.append(url)
+            path = urlparse(url).path
+            if path == "/tags/slug/politics":
+                return _Response({"id": "7", "slug": "politics", "label": "Politics"})
+            if path == "/markets/keyset":
+                return _Response(
+                    {
+                        "markets": [dict(GAMMA_MARKET, tags=[{"label": "Politics", "slug": "politics"}])],
+                        "next_cursor": "opaque-cursor/1",
+                    }
+                )
+            raise AssertionError(f"unexpected fixture request: {path}")
+
+        adapter = PolymarketAdapter(opener=opener)
+        self.assertEqual(adapter.resolve_tag_slug("politics"), 7)
+        page = adapter.market_page(
+            2,
+            tag_ids=(7, 11),
+            liquidity_num_min=1000,
+            end_date_min="2025-01-01T00:00:00Z",
+            end_date_max="2025-02-01T00:00:00Z",
+        )
+        self.assertIsInstance(page, MarketDiscoveryPage)
+        self.assertEqual(page.request_path, "/markets/keyset")
+        self.assertEqual(page.next_cursor, "opaque-cursor/1")
+        self.assertEqual(page.coverage_status, "PARTIAL")
+        query = parse_qs(urlparse(calls[-1]).query)
+        self.assertEqual(urlparse(calls[-1]).path, "/markets/keyset")
+        self.assertEqual(query["limit"], ["2"])
+        self.assertEqual(query["closed"], ["false"])
+        self.assertEqual(query["include_tag"], ["true"])
+        self.assertEqual(query["tag_id[]"], ["7", "11"])
+        self.assertEqual(query["liquidity_num_min"], ["1000"])
+        self.assertEqual(query["end_date_min"], ["2025-01-01T00:00:00Z"])
+        self.assertEqual(query["end_date_max"], ["2025-02-01T00:00:00Z"])
+        self.assertNotIn("after_cursor", query)
+        metadata = adapter.metadata("gamma-market-42")
+        self.assertIsNotNone(metadata)
+        assert metadata is not None
+        self.assertEqual(metadata.extra["lifecycle"]["acceptingOrders"], True)
+        self.assertEqual(metadata.tags, ("Politics",))
+
+        cursor_page = adapter.market_page(
+            2,
+            after_cursor="opaque-cursor/1",
+            tag_ids=(7, 11),
+            liquidity_num_min=1000,
+            end_date_min="2025-01-01T00:00:00Z",
+            end_date_max="2025-02-01T00:00:00Z",
+        )
+        self.assertEqual(page.query_fingerprint, cursor_page.query_fingerprint)
+        self.assertEqual(parse_qs(urlparse(calls[-1]).query)["after_cursor"], ["opaque-cursor/1"])
+        self.assertFalse(any(urlparse(url).path in {"/orders", "/order", "/trades"} for url in calls))
+        self.assertEqual(adapter.trades("gamma-market-42"), ())
+
+    def test_keyset_page_accounts_for_duplicates_and_malformed_rows(self) -> None:
+        calls: list[str] = []
+
+        def opener(request: object, *, timeout: float) -> _Response:
+            url = str(getattr(request, "full_url", request))
+            calls.append(url)
+            if len(calls) == 1:
+                return _Response(
+                    {
+                        "markets": [
+                            GAMMA_MARKET,
+                            dict(GAMMA_MARKET),
+                            None,
+                            {"question": "missing identity"},
+                        ],
+                        "next_cursor": "opaque-next",
+                    }
+                )
+            return _Response({"markets": [GAMMA_MARKET]})
+
+        adapter = PolymarketAdapter(opener=opener)
+        page = adapter.market_page(4)
+        self.assertEqual(page.raw_count, 4)
+        self.assertEqual(page.unique_count, 1)
+        self.assertEqual(page.duplicate_count, 1)
+        self.assertEqual(page.malformed_count, 2)
+        self.assertEqual(page.coverage_status, "PARTIAL")
+        self.assertEqual(page.next_cursor, "opaque-next")
+        complete = adapter.market_page(4, after_cursor=page.next_cursor)
+        self.assertEqual(complete.raw_count, 1)
+        self.assertEqual(complete.unique_count, 1)
+        self.assertEqual(complete.coverage_status, "COMPLETE")
+        self.assertIsNone(complete.next_cursor)
+
+    def test_keyset_page_rejects_repeated_cursor_without_continuation(self) -> None:
+        calls: list[str] = []
+
+        def opener(request: object, *, timeout: float) -> _Response:
+            url = str(getattr(request, "full_url", request))
+            calls.append(url)
+            self.assertEqual(urlparse(url).path, "/markets/keyset")
+            return _Response({"markets": [GAMMA_MARKET], "next_cursor": "opaque-repeat"})
+
+        adapter = PolymarketAdapter(opener=opener)
+        page = adapter.market_page(2, after_cursor="opaque-repeat")
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(page.raw_count, 1)
+        self.assertEqual(page.unique_count, 1)
+        self.assertEqual(page.coverage_status, "ERROR")
+        self.assertEqual(page.error_reason, "REPEATED_CURSOR")
+        self.assertIsNone(page.next_cursor)
+        query = parse_qs(urlparse(calls[0]).query)
+        self.assertEqual(query["after_cursor"], ["opaque-repeat"])
+
+    def test_keyset_fingerprint_changes_with_filters_not_cursor(self) -> None:
+        def opener(request: object, *, timeout: float) -> _Response:
+            return _Response({"markets": [], "next_cursor": None})
+
+        adapter = PolymarketAdapter(opener=opener)
+        first = adapter.market_page(2, liquidity_num_min=1000)
+        cursor = adapter.market_page(2, after_cursor="opaque", liquidity_num_min=1000)
+        changed = adapter.market_page(2, liquidity_num_min=1001)
+        self.assertEqual(first.query_fingerprint, cursor.query_fingerprint)
+        self.assertNotEqual(first.query_fingerprint, changed.query_fingerprint)
+        self.assertEqual(first.coverage_status, "COMPLETE")
 
 if __name__ == "__main__":
     unittest.main()

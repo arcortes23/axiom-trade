@@ -464,7 +464,7 @@ class Phase4AutonomousLoopTests(unittest.TestCase):
         self.assertEqual(nested_projected[0]["model_probability"], nested_expected)
         self.assertEqual(_CliProbabilityModel(nested_model).predict_probability(nested_observation), nested_expected)
 
-    def test_declarative_plan_runs_historical_lifecycle_and_registers_forward(self) -> None:
+    def test_synthetic_offline_plan_runs_historical_lifecycle_and_registers_forward(self) -> None:
         with AxiomStore(":memory:") as store:
             target_market_ids = ("declarative-forward-market",)
             store.save_dataset("dataset", "v1", prediction_rows())
