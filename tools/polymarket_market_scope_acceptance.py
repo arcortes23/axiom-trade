@@ -889,9 +889,17 @@ def _scrub(value: Any, *, key: str = "") -> Any:
         "order_transport_called",
         "secret_scrubbed",
     }
+    boolean_audit_status_keys = {"credential_state_exported"}
     normalized_key = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", str(key)).lower().replace("-", "_")
+    safe_status_key = (
+        normalized_key in safe_status_keys
+        or (
+            normalized_key in boolean_audit_status_keys
+            and isinstance(value, bool)
+        )
+    )
     sensitive_key = (
-        normalized_key not in safe_status_keys
+        not safe_status_key
         and not _PUBLIC_TOKEN_KEY_RE.fullmatch(normalized_key)
         and bool(_SENSITIVE_KEY_RE.search(normalized_key))
     )
@@ -913,6 +921,48 @@ def _scrub(value: Any, *, key: str = "") -> Any:
     if hasattr(value, "__dict__"):
         return _scrub(vars(value), key=key)
     return value
+def _without_order_book_simulated(value: Any, *, key: str = "") -> Any:
+    """Reconcile simulated-book labels to the historical price-proxy boundary.
+
+    Persisted processor payloads can carry a venue-quality label from a
+    different execution context.  Keep the field for status/provenance shape,
+    but never let it imply historical order books were used.
+    """
+    if isinstance(value, Mapping):
+        result: dict[str, Any] = {}
+        for name, child in value.items():
+            normalized = re.sub(
+                r"([a-z0-9])([A-Z])", r"\1_\2", str(name)
+            ).lower().replace("-", "_")
+            if (
+                isinstance(child, str)
+                and child.strip().upper() == "ORDER_BOOK_SIMULATED"
+            ):
+                result[str(name)] = "PRICE_PROXY"
+                continue
+            result[str(name)] = _without_order_book_simulated(
+                child, key=str(name)
+            )
+        return result
+    if isinstance(value, (list, tuple)):
+        return [
+            _without_order_book_simulated(child, key=key)
+            for child in value
+        ]
+    if isinstance(value, str) and value.strip().upper() == "ORDER_BOOK_SIMULATED":
+        return "PRICE_PROXY"
+    return value
+
+
+def _compact_processor_record(value: Any) -> Any:
+    """Project processor evidence while retaining status/rejection counters."""
+    return _without_order_book_simulated(value)
+
+
+def _persisted_fidelity_report(report: Mapping[str, Any]) -> dict[str, Any]:
+    """Apply the persisted price-proxy fidelity boundary before scrubbing."""
+    return _compact_processor_record(report)
+
 
 
 def _bounded_book(book: Any, depth: int) -> Any:
@@ -2439,7 +2489,7 @@ def _compact_candidate_lifecycle_evidence(value: Mapping[str, Any]) -> dict[str,
         compact_rows.append(
             {
                 "candidate_id": row.get("candidate_id"),
-                "stage": row.get("stage"),
+                "lifecycle_stage": row.get("stage"),
                 "updated_at": row.get("updated_at"),
                 "payload_hash": _sha256_json(payload),
                 "payload_keys": sorted(str(key) for key in payload) if isinstance(payload, Mapping) else [],
@@ -2449,20 +2499,20 @@ def _compact_candidate_lifecycle_evidence(value: Mapping[str, Any]) -> dict[str,
                 "evidence_gap": row.get("evidence_gap"),
             }
         )
-    selected = value.get("selected") if isinstance(value, Mapping) else None
+    assessment = value.get("selected") if isinstance(value, Mapping) else None
     return {
-        "selected_candidate_id": value.get("selected_candidate_id") if isinstance(value, Mapping) else None,
-        "selected_by_processor": bool(value.get("selected_by_processor")) if isinstance(value, Mapping) else False,
+        "assessment_candidate_id": value.get("selected_candidate_id") if isinstance(value, Mapping) else None,
+        "processor_selected": bool(value.get("selected_by_processor")) if isinstance(value, Mapping) else False,
         "candidates": compact_rows,
-        "selected": (
+        "assessment_candidate": (
             {
-                "candidate_id": selected.get("candidate_id"),
-                "stage": selected.get("stage"),
-                "payload_hash": _sha256_json(selected.get("payload")),
-                "events_count": len(selected.get("events", ())) if isinstance(selected.get("events"), (list, tuple)) else 0,
-                "metrics_hash": _sha256_json(selected.get("metrics", {})),
+                "candidate_id": assessment.get("candidate_id"),
+                "lifecycle_stage": assessment.get("stage"),
+                "payload_hash": _sha256_json(assessment.get("payload")),
+                "events_count": len(assessment.get("events", ())) if isinstance(assessment.get("events"), (list, tuple)) else 0,
+                "metrics_hash": _sha256_json(assessment.get("metrics", {})),
             }
-            if isinstance(selected, Mapping)
+            if isinstance(assessment, Mapping)
             else None
         ),
     }
@@ -2473,8 +2523,14 @@ def _runtime_metric_assessment(
     criteria: Mapping[str, Any] | None,
     *,
     current_market_blocker: str | None,
+    historical_metrics: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Compare observed validation metrics to untouched PromotionCriteria defaults."""
+    """Compare observed validation metrics to untouched PromotionCriteria defaults.
+    A numeric metric is not executable evidence by itself.  In particular,
+    zero-filled/zero-closed-trade and zero-scored-prediction fixtures often
+    carry default-looking zero or one values; retain those observations, but
+    prevent them from being treated as performance or calibration passes.
+    """
     defaults = dict(criteria or {})
     sections = candidate_metrics if isinstance(candidate_metrics, Mapping) else {}
     validation = sections.get("validation")
@@ -2493,6 +2549,17 @@ def _runtime_metric_assessment(
             if name in validation:
                 return validation[name], f"validation.{name}"
         return None, None
+
+    def counted(*names: str) -> tuple[float | None, str | None]:
+        historical = historical_metrics if isinstance(historical_metrics, Mapping) else {}
+        for name in names:
+            if name in historical:
+                count = _persisted_number(historical[name])
+                if count is not None and count >= 0.0:
+                    return count, f"historical_metrics.{name}"
+        value, source = observed(*names)
+        count = _persisted_number(value)
+        return (count if count is not None and count >= 0.0 else None), source
 
     def compare(
         name: str,
@@ -2513,13 +2580,48 @@ def _runtime_metric_assessment(
             "required": required,
             "operator": operator,
             "status": status,
+            "evidence_status": {
+                "pass": "PASS",
+                "fail": "FAIL",
+                "not_reached": "NOT_REACHED",
+            }[status],
             "source": source,
         }
 
+    def with_counts(
+        metric: dict[str, Any],
+        counts: Mapping[str, float | None],
+        *,
+        ready: bool,
+    ) -> dict[str, Any]:
+        """Attach the evidence counts and make an unobserved metric non-pass."""
+        result = dict(metric)
+        result["counts"] = dict(counts)
+        if not ready:
+            result["status"] = "not_reached" if any(
+                value is None or value <= 0.0 for value in counts.values()
+            ) else "insufficient"
+            result["evidence_status"] = (
+                "NOT_REACHED" if result["status"] == "not_reached" else "INSUFFICIENT"
+            )
+        return result
+
     independent, independent_source = observed("independent_samples")
-    filled_trades, filled_trades_source = observed("filled_trades")
+    filled_trades, filled_trades_source = counted(
+        "filled_trades", "fill_count", "fills", "forward_successful_order_attempts"
+    )
+    closed_trades, closed_trades_source = counted(
+        "closed_trade_count", "closed_trades", "realized_pnl_count"
+    )
+    scored_predictions, scored_predictions_source = counted(
+        "scored_predictions", "scored_prediction_count"
+    )
+    calibration_observations, calibration_observations_source = counted(
+        "calibration_observations", "calibration_observation_count"
+    )
     drawdown, drawdown_source = observed("max_drawdown")
     expectancy, expectancy_source = observed("expectancy")
+    profitability, profitability_source = observed("profitability", "expectancy")
     ci_lower = interval.get("lower") if isinstance(interval, Mapping) else None
     ci_source = "validation.validation.confidence_interval.lower" if ci_lower is not None else None
     stability = validation.get("validation_stability")
@@ -2535,27 +2637,99 @@ def _runtime_metric_assessment(
     )
     forward_duration, forward_duration_source = observed("forward_duration_seconds")
     order_attempts, order_attempts_source = observed("forward_order_attempts", "order_attempts")
+    trade_counts = {
+        "filled_trades": filled_trades,
+        "closed_trades": closed_trades,
+    }
+    calibration_counts = {
+        "scored_predictions": scored_predictions,
+        "calibration_observations": calibration_observations,
+    }
+    trade_evidence_ready = all(
+        value is not None and value > 0.0 for value in trade_counts.values()
+    )
+    calibration_evidence_ready = all(
+        value is not None and value > 0.0 for value in calibration_counts.values()
+    )
     metrics = {
-        "independent_samples": compare("independent_samples", independent, defaults.get("min_independent_samples"), ">=", independent_source),
-        "filled_trades": compare("filled_trades", filled_trades, defaults.get("min_trades"), ">=", filled_trades_source),
+        "independent_samples": compare(
+            "independent_samples", independent, defaults.get("min_independent_samples"), ">=", independent_source
+        ),
+        "filled_trades": compare(
+            "filled_trades", filled_trades, defaults.get("min_trades"), ">=", filled_trades_source
+        ),
         "drawdown": compare("drawdown", drawdown, defaults.get("max_drawdown"), "<=", drawdown_source),
-        "expectancy": compare("expectancy", expectancy, defaults.get("min_expectancy"), ">=", expectancy_source),
-        "confidence_interval_lower": compare("confidence_interval_lower", ci_lower, defaults.get("min_confidence_lower_bound"), ">=", ci_source),
+        "expectancy": with_counts(
+            compare("expectancy", expectancy, defaults.get("min_expectancy"), ">=", expectancy_source),
+            trade_counts,
+            ready=trade_evidence_ready,
+        ),
+        "profitability": with_counts(
+            compare(
+                "profitability",
+                profitability,
+                defaults.get("min_profitability", defaults.get("min_expectancy")),
+                ">=",
+                profitability_source,
+            ),
+            trade_counts,
+            ready=trade_evidence_ready,
+        ),
+        "confidence_interval_lower": with_counts(
+            compare(
+                "confidence_interval_lower",
+                ci_lower,
+                defaults.get("min_confidence_lower_bound"),
+                ">=",
+                ci_source,
+            ),
+            trade_counts,
+            ready=trade_evidence_ready,
+        ),
         "stability": compare("stability", stability, defaults.get("min_stability"), ">=", stability_source),
-        "calibration": compare("calibration", calibration, defaults.get("min_calibration"), ">=", calibration_source),
+        "calibration": with_counts(
+            compare("calibration", calibration, defaults.get("min_calibration"), ">=", calibration_source),
+            calibration_counts,
+            ready=calibration_evidence_ready,
+        ),
         "liquidity": compare("liquidity", liquidity, defaults.get("min_liquidity"), ">=", liquidity_source),
         "regimes": compare("regimes", regimes, defaults.get("min_regimes"), ">=", regimes_source),
-        "forward_duration_seconds": compare("forward_duration_seconds", forward_duration, defaults.get("min_forward_duration_seconds"), ">=", forward_duration_source),
-        "forward_order_attempts": compare("forward_order_attempts", order_attempts, defaults.get("min_order_attempts_for_execution_rejection"), ">=", order_attempts_source),
+        "forward_duration_seconds": compare(
+            "forward_duration_seconds",
+            forward_duration,
+            defaults.get("min_forward_duration_seconds"),
+            ">=",
+            forward_duration_source,
+        ),
+        "forward_order_attempts": compare(
+            "forward_order_attempts",
+            order_attempts,
+            defaults.get("min_order_attempts_for_execution_rejection"),
+            ">=",
+            order_attempts_source,
+        ),
     }
+    # ``confidence`` is the same observed lower-bound evidence under the
+    # shorter name used by historical projections and report consumers.
+    metrics["confidence"] = dict(metrics["confidence_interval_lower"])
     return {
         "criteria": defaults,
         "criteria_hash": _sha256_json(defaults),
         "observed_basis": "validation",
+        "counts": {
+            **trade_counts,
+            **calibration_counts,
+        },
+        "count_sources": {
+            "filled_trades": filled_trades_source,
+            "closed_trades": closed_trades_source,
+            "scored_predictions": scored_predictions_source,
+            "calibration_observations": calibration_observations_source,
+        },
         "metrics": metrics,
         "status": (
             "fail" if any(item["status"] == "fail" for item in metrics.values())
-            else "not_reached" if any(item["status"] == "not_reached" for item in metrics.values())
+            else "not_reached" if any(item["status"] in {"not_reached", "insufficient"} for item in metrics.values())
             else "pass"
         ),
         "decisive_current_market_blocker": {
@@ -2564,6 +2738,129 @@ def _runtime_metric_assessment(
             "source": "queue/candidate lifecycle" if current_market_blocker else None,
         },
     }
+def _historical_qualification_assessment(
+    candidate_metrics: Mapping[str, Any] | None,
+    runtime_metric_assessment: Mapping[str, Any] | None,
+    historical_support_audit: Mapping[str, Any] | None,
+    *,
+    processor_selected: bool,
+    lifecycle_stage: Any,
+    canonical_pipeline_reason: str | None,
+    historical_metrics: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Derive historical qualification from ordinary processor evidence.
+
+    Lifecycle stage is an observed outcome, not a qualification shortcut.
+    Selection, robustness, default criteria, minimum trades, and a
+    non-rejected lifecycle must all agree before current evaluation can run.
+    """
+    metrics = candidate_metrics if isinstance(candidate_metrics, Mapping) else {}
+    robustness = metrics.get("robustness")
+    robustness = robustness if isinstance(robustness, Mapping) else {}
+    minimum_sample = robustness.get("minimum_sample_check")
+    minimum_sample = minimum_sample if isinstance(minimum_sample, Mapping) else {}
+    criteria_assessment = (
+        runtime_metric_assessment
+        if isinstance(runtime_metric_assessment, Mapping)
+        else {}
+    )
+    criteria = criteria_assessment.get("criteria")
+    criteria = criteria if isinstance(criteria, Mapping) else {}
+    observed_metrics = criteria_assessment.get("metrics")
+    observed_metrics = observed_metrics if isinstance(observed_metrics, Mapping) else {}
+    historical = historical_metrics if isinstance(historical_metrics, Mapping) else {}
+    historical_closed = _persisted_number(
+        historical.get("closed_trade_count", historical.get("closed_trades"))
+    )
+    observed_trades = (
+        historical_closed
+        if historical_closed is not None
+        else _persisted_number(minimum_sample.get("trades", metrics.get("filled_trades")))
+    )
+    required_trades = _persisted_number(
+        minimum_sample.get("min_trades", criteria.get("min_trades"))
+    )
+    minimum_trades_met = (
+        observed_trades is not None
+        and required_trades is not None
+        and observed_trades >= required_trades
+    )
+    robustness_passed = robustness.get("robustness_passed") is True
+    default_evidence_present = bool(criteria) and bool(observed_metrics)
+    default_criteria_passed = criteria_assessment.get("status") == "pass"
+    normalized_stage = str(getattr(lifecycle_stage, "value", lifecycle_stage) or "").strip().upper() or None
+    non_rejected_lifecycle = normalized_stage is not None and normalized_stage != "REJECTED"
+    historical_support_status = (
+        str((historical_support_audit or {}).get("status") or "").strip().upper()
+        if isinstance(historical_support_audit, Mapping)
+        else ""
+    )
+    as_of_status = (
+        str((historical_support_audit or {}).get("as_of_lifecycle_status") or "").strip().upper()
+        if isinstance(historical_support_audit, Mapping)
+        else ""
+    )
+    actionable = _persisted_number(historical.get("actionable_signal_count"))
+    if actionable is None:
+        actionable = _persisted_number(metrics.get("actionable_signal_count"))
+    closed_trades = historical_closed
+    if closed_trades is None:
+        closed_trades = _persisted_number(
+            metrics.get("closed_trade_count", metrics.get("closed_trades"))
+        )
+    blockers: list[str] = []
+    if not minimum_trades_met:
+        blockers.append("HISTORICAL_MIN_TRADES_NOT_MET")
+    if as_of_status == "AS_OF_LIFECYCLE_UNAVAILABLE":
+        blockers.append("AS_OF_LIFECYCLE_UNAVAILABLE")
+    if actionable == 0.0:
+        blockers.append("ZERO_ACTIONABLE_SIGNALS")
+    if closed_trades == 0.0:
+        blockers.append("NO_CLOSED_TRADES")
+    if not processor_selected:
+        blockers.append("PROCESSOR_DID_NOT_SELECT_CANDIDATE")
+    if not robustness_passed:
+        blockers.append("HISTORICAL_ROBUSTNESS_NOT_PASSED")
+    if not default_evidence_present or not default_criteria_passed:
+        blockers.append("DEFAULT_CRITERIA_EVIDENCE_NOT_PASSED")
+    if not non_rejected_lifecycle:
+        blockers.append("LIFECYCLE_REJECTED" if normalized_stage == "REJECTED" else "LIFECYCLE_NOT_OBSERVED")
+    blockers = list(dict.fromkeys(blockers))
+    historical_qualified = not blockers and bool(processor_selected)
+    decisive_blocker = blockers[0] if blockers else None
+    return {
+        "status": "QUALIFIED" if historical_qualified else "REJECTED",
+        "historical_qualified": historical_qualified,
+        "decisive_blocker": decisive_blocker,
+        "blocker": decisive_blocker,
+        "blockers": blockers,
+        "canonical_pipeline_reason": canonical_pipeline_reason,
+        "canonical_pipeline_reason_source": "queue/current-authority" if canonical_pipeline_reason else None,
+        "processor_selected": bool(processor_selected),
+        "lifecycle_stage": normalized_stage,
+        "lifecycle_non_rejected": non_rejected_lifecycle,
+        "historical_support_status": historical_support_status or None,
+        "as_of_lifecycle_status": as_of_status or None,
+        "robustness_passed": robustness_passed,
+        "minimum_trades": {
+            "observed": observed_trades,
+            "required": required_trades,
+            "met": minimum_trades_met,
+        },
+        "default_evidence": {
+            "present": default_evidence_present,
+            "criteria_status": criteria_assessment.get("status"),
+            "passed": default_criteria_passed,
+            "criteria_hash": criteria_assessment.get("criteria_hash"),
+        },
+        "evidence": {
+            "actionable_signal_count": actionable,
+            "closed_trade_count": closed_trades,
+            "candidate_metrics_status": metrics.get("status"),
+        },
+    }
+
+
 def _validated_tag_id(value: Any) -> int | None:
     if isinstance(value, Mapping):
         value = value.get("id", value.get("tag_id", value.get("tagId")))
@@ -2833,6 +3130,7 @@ def _release_plan(
         "same_backup_for_validation_and_export": True,
     }
     return {
+        "release_branch": "feature/polymarket-acceptance-real-candidate",
         "prepared_not_executed": True,
         "merge_executed": False,
         "deploy_executed": False,
@@ -2849,8 +3147,8 @@ def _release_plan(
             "exact_reviewed_commit_required": True,
             "reviewed_commit_precondition": (
                 "At execution time, set EXACT_REVIEWED_COMMIT to the reviewed/pushed tip and "
-                "require local `git rev-parse feature/polymarket-market-scope` and the matching "
-                "`git ls-remote origin refs/heads/feature/polymarket-market-scope` to equal it; "
+                "require local `git rev-parse feature/polymarket-acceptance-real-candidate` and the matching "
+                "`git ls-remote origin refs/heads/feature/polymarket-acceptance-real-candidate` to equal it; "
                 "abort on any mismatch."
             ),
             "commands_executed": False,
@@ -2860,7 +3158,7 @@ def _release_plan(
                 "git fetch origin",
                 "git switch main",
                 "git pull --ff-only origin main",
-                "git merge --ff-only feature/polymarket-market-scope",
+                "git merge --ff-only feature/polymarket-acceptance-real-candidate",
                 "git push origin main",
             ],
             "prohibited": ["git merge --no-ff", "git push --force", "git reset --hard"],
@@ -3609,49 +3907,486 @@ def compute_dollar_limit_buy_feasibility(
 
 
 
+_PERSISTED_LOOKBACK = 1
+_PERSISTED_THRESHOLD = 0.05
+_PERSISTED_CONTROL_THRESHOLD = 0.03
+_PERSISTED_CAUSAL_ALLOWED_FEATURES = (
+    "timestamp",
+    "source_timestamp",
+    "market_id",
+    "token_id",
+    "yes_mid",
+    "price",
+)
+_PERSISTED_PROCESSOR_ALLOWED_FEATURES = ("timestamp", "market_id", "yes_mid")
+_PERSISTED_EXCLUDED_RESEARCH_FIELDS = frozenset(
+    {
+        "settlement",
+        "resolved",
+        "isResolved",
+        "is_resolved",
+        "resolved_flag",
+        "resolvedFlag",
+        "active",
+        "closed",
+        "archived",
+        "acceptingOrders",
+        "accepting_orders",
+        "enableOrderBook",
+        "enable_order_book",
+        "expiry",
+        "end_date",
+        "endDate",
+        "endDateIso",
+        "expirationDate",
+        "resolution_criteria",
+        "liquidity",
+        "liquidity_num",
+        "liquidityNum",
+        "volume",
+        "yes_bid",
+        "yes_ask",
+        "no_bid",
+        "no_ask",
+        "no_mid",
+        "spread",
+        "order_book",
+        "yes_order_book",
+        "no_order_book",
+        "model_probability",
+    }
+)
+
+
+def _persisted_candidate_policy(policy: Mapping[str, Any]) -> dict[str, Any]:
+    """Remove non-causal discovery filters from the price-history plan."""
+    result = dict(policy)
+    # Historical research cannot use copied lifecycle, expiry, liquidity,
+    # spread, category, or current-book fields as filters.
+    result["categories"] = []
+    result["market_ids"] = []
+    result["filters"] = {}
+    result["regime_restrictions"] = {}
+    return result
+
+
 def _persisted_proposal(
     dataset_id: str,
     dataset_version: str,
     policy: Mapping[str, Any],
 ) -> dict[str, Any]:
+    """Build the one frozen causal momentum research intent."""
+    candidate_policy = _persisted_candidate_policy(policy)
+    plan = {
+        "market_type": "prediction",
+        "template": "momentum",
+        "experiment_family": "momentum",
+        "dataset_id": dataset_id,
+        "dataset_version": dataset_version,
+        "dataset_selector": {
+            "dataset_id": dataset_id,
+            "dataset_version": dataset_version,
+            "source_type": "HISTORICAL",
+            "provider": "polymarket",
+        },
+        "target": {
+            "instrument": "POLYMARKET",
+            "categories": list(candidate_policy.get("categories", ())),
+        },
+        "market_scope": candidate_policy,
+        "filters": dict(candidate_policy.get("filters", {})),
+        "regime_restrictions": dict(candidate_policy.get("regime_restrictions", {})),
+        "allowed_features": list(_PERSISTED_PROCESSOR_ALLOWED_FEATURES),
+        "parameters": {
+            "lookback": [_PERSISTED_LOOKBACK],
+            "threshold": [_PERSISTED_THRESHOLD],
+        },
+        "methodology": {
+            "time_split": "train-validation-holdout",
+            "initial_cash": 10_000.0,
+            "fee_bps": 10.0,
+            "slippage_bps": 5.0,
+            "allocation": 0.25,
+        },
+        "metrics": [
+            "expectancy",
+            "drawdown",
+            "trade_count",
+            "sample_count",
+            "scored_predictions",
+            "calibration_observations",
+            "closed_trade_count",
+        ],
+        "min_samples": 30,
+        "min_trades": 20,
+        "max_variants": 1,
+        "paper_only": True,
+    }
     return {
-        "proposal_id": f"polymarket-historical-acceptance-{dataset_version.split(':')[-1][:16]}",
-        "statement": "A probability-mispricing strategy is evaluated against the immutable Polymarket historical price proxy.",
+        "proposal_id": f"polymarket-historical-momentum-{dataset_version.split(':')[-1][:16]}",
+        "statement": "A causal momentum strategy is evaluated against immutable Polymarket historical yes-mid price history.",
         "source": "Polymarket-historical persisted acceptance dataset",
-        "tests": ["chronological train-validation-holdout", "bounded robustness checks", "exact historical provenance"],
+        "tests": [
+            "chronological train-validation-holdout",
+            "bounded robustness checks",
+            "exact historical provenance",
+            "causal price-only projection",
+        ],
         "dataset_id": dataset_id,
         "dataset_version": dataset_version,
         "time_split": "train-validation-holdout",
         "paper_only": True,
-        "experiment_plan": {
-            "market_type": "prediction",
-            "template": "probability_mispricing",
-            "dataset_id": dataset_id,
-            "dataset_version": dataset_version,
-            "dataset_selector": {
-                "dataset_id": dataset_id,
-                "dataset_version": dataset_version,
-                "source_type": "HISTORICAL",
-                "provider": "polymarket",
-            },
-            "target": {"instrument": "POLYMARKET", "categories": list(policy.get("categories", ()))},
-            "market_scope": dict(policy),
-            "filters": dict(policy.get("filters", {})),
-            "parameters": {"threshold": [0.03]},
-            "methodology": {
-                "time_split": "train-validation-holdout",
-                "initial_cash": 10_000.0,
-                "fee_bps": 10.0,
-                "slippage_bps": 5.0,
-                "allocation": 0.25,
-            },
-            "metrics": ["expectancy", "drawdown", "trade_count", "sample_count"],
-            "min_samples": 30,
-            "min_trades": 0,
-            "max_variants": 1,
-            "model_document": {"field": "yes_mid"},
-            "paper_only": True,
+        "experiment_plan": plan,
+        "market_scope": candidate_policy,
+    }
+
+
+def _persisted_candidate_projection(
+    records: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Strip copied lifecycle, label, liquidity, and book fields before research."""
+    projected: list[dict[str, Any]] = []
+    for raw in records:
+        if not isinstance(raw, Mapping):
+            continue
+        row: dict[str, Any] = {}
+        for name in ("timestamp", "source_timestamp", "market_id", "token_id", "yes_mid"):
+            if name in raw:
+                row[name] = raw[name]
+        if row.get("timestamp") is None and row.get("source_timestamp") is not None:
+            row["timestamp"] = row["source_timestamp"]
+        if row.get("source_timestamp") is None and row.get("timestamp") is not None:
+            row["source_timestamp"] = row["timestamp"]
+        if row.get("market_id") and row.get("token_id") and "yes_mid" in row:
+            projected.append({key: row[key] for key in sorted(row)})
+    return projected
+
+
+def _persisted_historical_support_audit(
+    constituent_records: Sequence[Mapping[str, Any]],
+    aggregate_records: Sequence[Mapping[str, Any]],
+    *,
+    lookback: int = _PERSISTED_LOOKBACK,
+) -> dict[str, Any]:
+    """Audit exact imported rows before any candidate research is run."""
+    required = max(1, int(lookback)) + 1
+    rows_by_market: dict[str, list[Mapping[str, Any]]] = {}
+    market_order: list[str] = []
+    copied_fields: set[str] = set()
+    as_of_fields: set[str] = set()
+    for item in constituent_records if isinstance(constituent_records, (list, tuple)) else ():
+        if not isinstance(item, Mapping):
+            continue
+        expected_market = str(item.get("market_id") or "").strip()
+        raw_rows = item.get("records")
+        rows = list(raw_rows) if isinstance(raw_rows, (list, tuple)) else []
+        market = expected_market or "<missing>"
+        if market not in rows_by_market:
+            rows_by_market[market] = []
+            market_order.append(market)
+        rows_by_market[market].extend(row for row in rows if isinstance(row, Mapping))
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            for field in _PERSISTED_EXCLUDED_RESEARCH_FIELDS:
+                if field in row:
+                    copied_fields.add(field)
+                    if any(
+                        name in row
+                        for name in (
+                            f"{field}_as_of",
+                            f"{field}_timestamp",
+                            f"{field}_at",
+                            "lifecycle_as_of",
+                            "liquidity_as_of",
+                            "volume_as_of",
+                            "book_as_of",
+                        )
+                    ):
+                        as_of_fields.add(field)
+    # Include exact aggregate rows as a second identity/chronology check.  The
+    # constituent rows remain authoritative for market membership.
+    aggregate_market_ids = {
+        str(row.get("market_id") or "").strip()
+        for row in aggregate_records
+        if isinstance(row, Mapping) and str(row.get("market_id") or "").strip()
+    }
+    markets: list[dict[str, Any]] = []
+    eligible_markets = 0
+    eligible_rows = 0
+    ineligible_rows = 0
+    for market in market_order:
+        rows = rows_by_market[market]
+        reasons: list[str] = []
+        timestamps: list[datetime] = []
+        identity_consistent = bool(market and market != "<missing>")
+        prices_valid = True
+        for row in rows:
+            if str(row.get("market_id") or "").strip() != market:
+                identity_consistent = False
+            stamp = _persisted_datetime(row.get("source_timestamp", row.get("timestamp")))
+            if stamp is None:
+                reasons.append("SOURCE_TIMESTAMP_INVALID")
+            else:
+                timestamps.append(stamp)
+            price = _persisted_number(row.get("yes_mid", row.get("price")))
+            if price is None or not 0.0 <= price <= 1.0:
+                prices_valid = False
+        strict_chronology = all(
+            current > previous
+            for previous, current in zip(timestamps, timestamps[1:])
+        ) and len(timestamps) == len(set(timestamps))
+        if not strict_chronology:
+            reasons.append("SOURCE_TIMESTAMPS_NOT_STRICTLY_INCREASING")
+        if not identity_consistent:
+            reasons.append("MARKET_IDENTITY_INCONSISTENT")
+        if not prices_valid:
+            reasons.append("YES_MID_INVALID")
+        if len(rows) < required:
+            reasons.append("INSUFFICIENT_LOOKBACK")
+        eligible = not reasons
+        if eligible:
+            eligible_markets += 1
+            eligible_rows += len(rows)
+        else:
+            ineligible_rows += len(rows)
+        markets.append(
+            {
+                "market_id": None if market == "<missing>" else market,
+                "row_count": len(rows),
+                "eligible": eligible,
+                "eligible_row_count": len(rows) if eligible else 0,
+                "ineligible_row_count": 0 if eligible else len(rows),
+                "strict_increasing_unique_source_timestamps": strict_chronology,
+                "market_identity_consistent": identity_consistent,
+                "valid_yes_mid": prices_valid,
+                "lookback_sufficient": len(rows) >= required,
+                "reasons": list(dict.fromkeys(reasons)),
+            }
+        )
+    observed_market_count = len(rows_by_market)
+    aggregate_unknown_market_rows = sum(
+        1
+        for row in aggregate_records
+        if isinstance(row, Mapping)
+        and str(row.get("market_id") or "").strip() not in rows_by_market
+    )
+    if aggregate_unknown_market_rows:
+        ineligible_rows += aggregate_unknown_market_rows
+    as_of_unavailable = bool(copied_fields - as_of_fields) or not as_of_fields
+    markets_hash = _sha256_json(markets)
+    eligible_market_sample = _bounded_sample(
+        [item for item in markets if item.get("eligible")],
+        3,
+    )
+    ineligible_market_sample = _bounded_sample(
+        [item for item in markets if not item.get("eligible")],
+        3,
+    )
+    return {
+        "status": "PASSED" if eligible_markets else "INSUFFICIENT_DATA",
+        "lookback": int(lookback),
+        "required_observations_per_market": required,
+        "imported_market_count": observed_market_count,
+        "imported_row_count": sum(len(rows) for rows in rows_by_market.values()),
+        "eligible_market_count": eligible_markets,
+        "eligible_row_count": eligible_rows,
+        "ineligible_market_count": observed_market_count - eligible_markets,
+        "ineligible_row_count": ineligible_rows,
+        "aggregate_market_count": len(aggregate_market_ids),
+        "markets_hash": markets_hash,
+        "eligible_markets_sample": eligible_market_sample,
+        "ineligible_markets_sample": ineligible_market_sample,
+        "market_audit_bounded": True,
+        "copied_current_fields_observed": sorted(copied_fields),
+        "historical_as_of_fields_observed": sorted(as_of_fields),
+        "as_of_lifecycle_status": (
+            "AS_OF_LIFECYCLE_UNAVAILABLE" if as_of_unavailable else "AVAILABLE"
+        ),
+        "future_label_exclusion": {
+            "status": "EXCLUDED",
+            "fields": sorted(
+                {
+                    *copied_fields,
+                    "settlement",
+                    "resolution_criteria",
+                    "expiry",
+                    "liquidity",
+                    "volume",
+                    "order_book",
+                }
+            ),
+            "reason": "imported final settlement/lifecycle/current market metadata has no historical as-of timestamp",
         },
+        "research_projection": {
+            "included_features": list(_PERSISTED_CAUSAL_ALLOWED_FEATURES),
+            "processor_allowed_features": list(_PERSISTED_PROCESSOR_ALLOWED_FEATURES),
+            "excluded_fields": sorted(_PERSISTED_EXCLUDED_RESEARCH_FIELDS),
+            "historical_order_books_used": False,
+            "historical_liquidity_used": False,
+            "historical_volume_used": False,
+            "states_synthesized": False,
+        },
+    }
+
+
+def _persisted_historical_metrics(
+    records: Sequence[Mapping[str, Any]],
+    *,
+    family: str,
+    threshold: float,
+    historical_support_audit: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Count price-history evidence without treating labels or books as causal."""
+    by_market: dict[str, list[Mapping[str, Any]]] = {}
+    for row in records:
+        if not isinstance(row, Mapping):
+            continue
+        by_market.setdefault(str(row.get("market_id") or "").strip(), []).append(row)
+    raw_market_ids = {
+        market_id for market_id in by_market if market_id
+    }
+    signal_count = 0
+    actionable_count = 0
+    scored_markets: set[str] = set()
+    scored_predictions = 0
+    model_evaluation_count = 0
+    for market_id, rows in by_market.items():
+        ordered = sorted(
+            rows,
+            key=lambda row: _persisted_datetime(
+                row.get("source_timestamp", row.get("timestamp"))
+            )
+            or datetime.min.replace(tzinfo=timezone.utc),
+        )
+        previous: float | None = None
+        market_signals = 0
+        for row in ordered:
+            price = _persisted_number(row.get("yes_mid", row.get("price")))
+            if price is None:
+                continue
+            if family == "probability_mispricing":
+                # This self-referential control evaluates every row but cannot
+                # become a scored forecast without an as-of outcome.
+                model_evaluation_count += 1
+                score = 0.0
+            elif previous is None:
+                score = 0.0
+            else:
+                score = max(-1.0, min(1.0, (price - previous) / max(threshold, 0.05)))
+            if score != 0.0:
+                signal_count += 1
+                market_signals += 1
+                # Price proxy rows carry no executable historical quote/book.
+            previous = price
+        if market_signals and market_id:
+            scored_markets.add(market_id)
+    raw_count = len(records)
+    fill_count = 0
+    closed_trade_count = 0
+    calibration_count = 0
+    independent_raw_markets = len(raw_market_ids)
+    audited_eligible = (
+        _persisted_number(historical_support_audit.get("eligible_market_count"))
+        if isinstance(historical_support_audit, Mapping)
+        else None
+    )
+    independent_eligible_markets = (
+        int(audited_eligible) if audited_eligible is not None and audited_eligible >= 0.0 else 0
+    )
+    independent_scored_markets = len(scored_markets) if scored_predictions > 0 else 0
+    statuses = {
+        "forecast": "RECORDED" if scored_predictions else "NOT_REACHED",
+        "calibration": "INSUFFICIENT_DATA" if scored_predictions else "NOT_REACHED",
+        "closed_trade": "NOT_REACHED",
+        "expectancy": "NOT_REACHED",
+        "confidence": "NOT_REACHED",
+        "profitability": "NOT_REACHED",
+    }
+    evaluation_count = (
+        model_evaluation_count if family == "probability_mispricing" else signal_count
+    )
+    return {
+        "evidence_scope": "historical_validation",
+        "historical_execution_fidelity": "PRICE_PROXY",
+        "raw_observations": raw_count,
+        "sample_count": raw_count,
+        "signal_count": signal_count,
+        "signal_evaluations": signal_count if family != "probability_mispricing" else model_evaluation_count,
+        "signal_evaluation_count": evaluation_count,
+        "model_evaluations": model_evaluation_count,
+        "model_evaluation_count": model_evaluation_count,
+        "actionable_signal_count": actionable_count,
+        "fill_count": fill_count,
+        "fills": fill_count,
+        "filled_trades": fill_count,
+        "closed_trade_count": closed_trade_count,
+        "closed_trades": closed_trade_count,
+        "realized_pnl_count": 0,
+        "scored_predictions": scored_predictions,
+        "scored_prediction_count": scored_predictions,
+        "calibration_observations": calibration_count,
+        "calibration_observation_count": calibration_count,
+        "independent_raw_markets": independent_raw_markets,
+        "independent_eligible_markets": independent_eligible_markets,
+        "independent_scored_markets": independent_scored_markets,
+        "resolved_traded_markets": 0,
+        "counts": {
+            "fills": fill_count,
+            "filled_trades": fill_count,
+            "closed_trades": closed_trade_count,
+            "scored_predictions": scored_predictions,
+            "calibration_observations": calibration_count,
+        },
+        "expectancy": None,
+        "confidence_lower_bound": None,
+        "profitability": None,
+        "statuses": statuses,
+        "status_basis": {
+            "forecast": "valid model forecast observations with as-of outcomes",
+            "calibration": "scored predictions paired with historical as-of outcomes",
+            "closed_trade": "fills with non-future settlement",
+            "expectancy": "closed trades with realized PnL",
+            "confidence": "closed-trade return observations",
+            "profitability": "closed-trade expectancy after costs",
+        },
+        "configured_costs": {
+            "initial_cash": 10_000.0,
+            "allocation": 0.25,
+            "fee_bps": 10.0,
+            "slippage_bps": 5.0,
+        },
+        "threshold": float(threshold),
+        "lookback": _PERSISTED_LOOKBACK,
+        "nonzero_edge_count": 0 if family == "probability_mispricing" else None,
+    }
+
+
+def _persisted_control_proposal(
+    dataset_id: str,
+    dataset_version: str,
+    policy: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Describe the retained self-referential probability control only."""
+    candidate_policy = _persisted_candidate_policy(policy)
+    return {
+        "candidate_id": f"zero-edge-control:{dataset_version.split(':')[-1][:16]}",
+        "role": "ZERO_EDGE_CONTROL",
+        "selection_excluded": True,
+        "dataset_id": dataset_id,
+        "dataset_version": dataset_version,
+        "template": "probability_mispricing",
+        "parameters": {"threshold": [_PERSISTED_CONTROL_THRESHOLD]},
+        "allowed_features": list(_PERSISTED_PROCESSOR_ALLOWED_FEATURES),
+        "model_document": {"field": "yes_mid"},
+        "market_scope": candidate_policy,
+        "methodology": {
+            "initial_cash": 10_000.0,
+            "allocation": 0.25,
+            "fee_bps": 10.0,
+            "slippage_bps": 5.0,
+        },
+        "paper_only": True,
     }
 
 
@@ -3727,6 +4462,33 @@ def run_persisted_acceptance(
         "provenance": "canonical",
     }
     policy_record = _policy_record(supplied_policy)
+    constituent_records = source_result.get("constituent_records", [])
+    aggregate_records = source_result.get("aggregate_records", [])
+    constituent_records = constituent_records if isinstance(constituent_records, (list, tuple)) else []
+    aggregate_records = aggregate_records if isinstance(aggregate_records, (list, tuple)) else []
+    historical_support_audit = _persisted_historical_support_audit(
+        constituent_records,
+        aggregate_records,
+        lookback=_PERSISTED_LOOKBACK,
+    )
+    candidate_projection = _persisted_candidate_projection(aggregate_records)
+    positive_historical_metrics = _persisted_historical_metrics(
+        candidate_projection,
+        family="momentum",
+        threshold=_PERSISTED_THRESHOLD,
+        historical_support_audit=historical_support_audit,
+    )
+    control_historical_metrics = _persisted_historical_metrics(
+        candidate_projection,
+        family="probability_mispricing",
+        threshold=_PERSISTED_CONTROL_THRESHOLD,
+        historical_support_audit=historical_support_audit,
+    )
+    control_proposal = _persisted_control_proposal(
+        _PINNED_PERSISTED_DATASET_ID,
+        _PINNED_PERSISTED_DATASET_VERSION,
+        policy_record,
+    )
     config_record = asdict(config)
     if config_record.get("source_backup") is not None:
         config_record["source_backup"] = str(config_record["source_backup"])
@@ -3757,6 +4519,115 @@ def run_persisted_acceptance(
         "evaluated_records_hash": source_result.get("evaluated_records_hash"),
         "runtime_criteria": _runtime_criteria_record(),
         "proposal": None,
+        "no_edge_control": {
+            **control_proposal,
+            "evaluation_status": "NOT_RUN",
+            "proven_zero_edge": None,
+            "proof": {
+                "model_field": "yes_mid",
+                "market_field": "yes_mid",
+                "edge_definition": "model_probability - yes_mid",
+                "nonzero_edge_count": None,
+                "selection_excluded": True,
+            },
+            "metrics": None,
+            "selection_excluded": True,
+            "ranking_excluded": True,
+            "completion_candidate": False,
+        },
+        "assessment_candidate": {
+            "status": "PENDING",
+            "family": "momentum",
+            "template": "momentum",
+            "parameters": {
+                "lookback": _PERSISTED_LOOKBACK,
+                "threshold": _PERSISTED_THRESHOLD,
+            },
+            "allowed_features": list(_PERSISTED_PROCESSOR_ALLOWED_FEATURES),
+            "causal_allowed_features": list(_PERSISTED_CAUSAL_ALLOWED_FEATURES),
+            "costs": dict(positive_historical_metrics["configured_costs"]),
+            "excluded_control_candidates": [control_proposal["candidate_id"]],
+            "historical_metrics": positive_historical_metrics,
+            "historical_support_status": historical_support_audit["status"],
+            "assessment_candidate_defined_before_current_inspection": True,
+            "configuration_frozen_before_current_inspection": True,
+            "assessment_basis": "sole non-control candidate; momentum lookback/threshold frozen",
+            "configuration_freeze_basis": "proposal and candidate documents frozen before current market inspection",
+            "configuration_frozen_hash": None,
+        },
+        "historical_support_audit": historical_support_audit,
+        "historical_metrics": positive_historical_metrics,
+        "qualification": {
+            "status": "NOT_REACHED",
+            "blocker": "HISTORICAL_SUPPORT_NOT_A_CANDIDATE_QUALIFICATION",
+            "same_candidate_required": True,
+            "current_evaluation_allowed": False,
+        },
+        "gate_assessment": {
+            "historical": {
+                "status": "LIMITED",
+                "requirements": {
+                    "execution_fidelity": "TIMESTAMPED_DEPTH",
+                    "price_proxy_execution": "INSUFFICIENT",
+                    "historical_order_book": "REQUIRED_FOR_EXECUTION",
+                },
+                "evidence": {
+                    "execution_fidelity": "PRICE_PROXY",
+                    "historical_metrics": positive_historical_metrics,
+                    "historical_support_audit": historical_support_audit,
+                },
+                "blocker": "HISTORICAL_PRICE_PROXY_INSUFFICIENT_FOR_EXECUTION",
+            },
+            "canary": {
+                "status": "NOT_REACHED",
+                "requirements": {
+                    "same_candidate_qualified": True,
+                    "fresh_current_identity": True,
+                    "fresh_current_order_book": True,
+                },
+                "evidence": {
+                    "qualification_status": "NOT_REACHED",
+                    "current_market_resolution": "NOT_RUN",
+                    "fresh_identity_and_books": "NOT_RUN",
+                    "historical_order_book_available": False,
+                },
+                "blocker": "CURRENT_ORDER_BOOK_REQUIRED",
+            },
+            "PAPER_PROMOTABLE": {
+                "status": "NOT_REACHED",
+                "requirements": {
+                    "same_candidate": True,
+                    "forward_ledgers": True,
+                    "default_criteria": True,
+                    "required_stage": "PAPER_FORWARD",
+                },
+                "evidence": {
+                    "forward_ledgers": "NOT_RUN",
+                    "runtime_criteria": _runtime_criteria_record(),
+                    "runtime_metric_assessment": None,
+                },
+                "blocker": "PAPER_FORWARD_LEDGERS_AND_DEFAULT_CRITERIA_REQUIRED",
+            },
+        },
+        "current_market_input_readiness": {
+            "status": "SKIPPED",
+            "reason_code": "HISTORICAL_QUALIFICATION_REQUIRED",
+            "historical_order_book_available": False,
+            "historical_qualified": False,
+            "network_activity_allowed": False,
+        },
+        "actual_decision": {
+            "status": "SKIPPED",
+            "reason_code": "HISTORICAL_QUALIFICATION_REQUIRED",
+            "decision": None,
+            "current_evaluation_run": False,
+        },
+        "execution_feasibility": {
+            "status": "SKIPPED",
+            "reason_code": "HISTORICAL_QUALIFICATION_REQUIRED",
+            "current_book_required": False,
+            "order_transport_called": False,
+        },
         "timestamps": {
             "run_started_at": started_at,
             "source_read_at": datetime.now(timezone.utc).isoformat(),
@@ -3824,7 +4695,7 @@ def run_persisted_acceptance(
         },
         "chain": {
             "proposal_id": None, "queue_item_id": None, "plan_id": None,
-            "plan_hash": None, "candidate_ids": [], "frozen_hashes": [],
+            "plan_hash": None, "candidate_ids": [], "configuration_frozen_hashes": [],
             "queue_status": "NOT_RUN", "lifecycle_stage": None,
             "processor": None, "metrics": None, "reasons": list(source_result.get("reasons", [])),
         },
@@ -3875,12 +4746,37 @@ def run_persisted_acceptance(
             report.get("runtime_criteria"),
             current_market_blocker=None,
         )
-        return _scrub(report)
+        return _persisted_fidelity_report(_scrub(report))
+    report["no_edge_control"].update(
+        {
+            "evaluation_status": "RECORDED",
+            "proven_zero_edge": True,
+            "proof": {
+                "model_field": "yes_mid",
+                "market_field": "yes_mid",
+                "edge_definition": "model_probability - yes_mid",
+                "nonzero_edge_count": 0,
+                "selection_excluded": True,
+            },
+            "metrics": control_historical_metrics,
+        }
+    )
     export_started = datetime.now(timezone.utc).isoformat()
     report["timestamps"]["exported_at"] = export_started
     constituent_records = source_result.get("constituent_records", [])
     aggregate_records = source_result.get("aggregate_records", [])
+    constituent_records = constituent_records if isinstance(constituent_records, (list, tuple)) else []
+    aggregate_records = aggregate_records if isinstance(aggregate_records, (list, tuple)) else []
     attestation_row = source_result.get("attestation_row")
+    candidate_aggregate_records = _persisted_candidate_projection(aggregate_records)
+    candidate_constituent_records = [
+        {
+            **item,
+            "records": _persisted_candidate_projection(item.get("records", ())),
+        }
+        for item in constituent_records
+        if isinstance(item, Mapping)
+    ]
     try:
         from axiom.autonomous import AutonomousResearchProcessor
         from axiom.director import validate_hermes_proposal
@@ -3888,7 +4784,7 @@ def run_persisted_acceptance(
         from axiom.storage import AxiomStore
 
         with AxiomStore(":memory:") as store:
-            for item in constituent_records:
+            for item in candidate_constituent_records:
                 catalog = item["catalog"]
                 constituent_metadata = _persisted_metadata_projection(
                     catalog.get("metadata"),
@@ -3915,7 +4811,7 @@ def run_persisted_acceptance(
                 )
             aggregate_metadata_projection = _persisted_metadata_projection(aggregate_metadata)
             store.save_dataset(
-                dataset_id, dataset_version, aggregate_records,
+                dataset_id, dataset_version, candidate_aggregate_records,
                 metadata=aggregate_metadata_projection,
                 quality=aggregate.get("quality") or "PRICE_PROXY",
             )
@@ -3956,7 +4852,10 @@ def run_persisted_acceptance(
             controls = _persisted_control_projection(store)
             proposal = _persisted_proposal(dataset_id, dataset_version, policy_record)
             report["proposal"] = proposal
-            evaluated_records_hash = _sha256_json(aggregate_records)
+            report["assessment_candidate"]["status"] = "QUEUED"
+            report["assessment_candidate"]["proposal_id"] = proposal["proposal_id"]
+            report["assessment_candidate"]["configuration_frozen_hash"] = _sha256_json(proposal)
+            evaluated_records_hash = _sha256_json(candidate_aggregate_records)
             export_material = {
                 "catalog": _compact_persisted_catalog(aggregate),
                 "attestation": _persisted_attestation_projection(attestation_row),
@@ -3972,15 +4871,15 @@ def run_persisted_acceptance(
                         ),
                         "records": item["records"],
                     }
-                    for item in constituent_records
+                    for item in candidate_constituent_records
                 ],
             }
-            compact_constituents = _compact_constituent_records(constituent_records)
+            compact_constituents = _compact_constituent_records(candidate_constituent_records)
             report["export"]["status"] = "PASSED"
             report["export"]["controls"] = controls
             report["export"]["evaluated_records_hash"] = evaluated_records_hash
-            report["export"]["evaluated_records_count"] = len(aggregate_records)
-            report["export"]["evaluated_record_sample"] = _bounded_sample(aggregate_records, 2)
+            report["export"]["evaluated_records_count"] = len(candidate_aggregate_records)
+            report["export"]["evaluated_record_sample"] = _bounded_sample(candidate_aggregate_records, 2)
             report["export"]["constituent_catalogs_count"] = compact_constituents["count"]
             report["export"]["constituent_catalogs_hash"] = compact_constituents["catalogs_hash"]
             report["export"]["constituent_catalog_sample"] = compact_constituents["sample"]
@@ -4037,6 +4936,22 @@ def run_persisted_acceptance(
             selected_candidate_ids = result.get("selected_candidate_ids", ())
             if not isinstance(selected_candidate_ids, Sequence) or isinstance(selected_candidate_ids, (str, bytes)):
                 selected_candidate_ids = ()
+            selected_candidate_id_set = {
+                str(value).strip() for value in selected_candidate_ids if str(value).strip()
+            }
+            selected_candidate_result = next(
+                (
+                    item
+                    for item in candidate_results
+                    if isinstance(item, Mapping)
+                    and str(item.get("candidate_id", "")).strip()
+                    and (
+                        not selected_candidate_id_set
+                        or str(item.get("candidate_id")).strip() in selected_candidate_id_set
+                    )
+                ),
+                None,
+            )
             queue_evidence = _queue_demo_evidence(
                 final_item,
                 result,
@@ -4048,6 +4963,13 @@ def run_persisted_acceptance(
             )
             lifecycle_evidence = queue_evidence["lifecycle_evidence"]
             selected_lifecycle = lifecycle_evidence.get("selected")
+            selected_lifecycle_stage = (
+                selected_lifecycle.get("stage")
+                if isinstance(selected_lifecycle, Mapping)
+                else None
+            )
+            if selected_lifecycle_stage is None and isinstance(selected_candidate_result, Mapping):
+                selected_lifecycle_stage = selected_candidate_result.get("stage")
             compact_lifecycle_evidence = _compact_candidate_lifecycle_evidence(lifecycle_evidence)
             selected_payload = (
                 selected_lifecycle.get("payload")
@@ -4069,8 +4991,9 @@ def run_persisted_acceptance(
             )
             selected_payload_summary = {
                 "candidate_id": selected_payload.get("candidate_id") if selected_payload else None,
-                "stage": selected_payload.get("stage") if selected_payload else None,
-                "frozen_hash": selected_payload.get("frozen_hash") if selected_payload else None,
+                "payload_stage": selected_payload.get("stage") if selected_payload else None,
+                "lifecycle_stage": selected_lifecycle_stage,
+                "configuration_frozen_hash": selected_payload.get("frozen_hash") if selected_payload else None,
                 "reason_code": selected_payload.get("reason_code") if selected_payload else None,
                 "reason": selected_payload.get("reason") if selected_payload else None,
                 "payload_hash": _sha256_json(selected_payload),
@@ -4080,6 +5003,8 @@ def run_persisted_acceptance(
             report["chain"].update(
                 {
                     "observed_outcomes": queue_evidence["observed"],
+                    "canonical_pipeline_reason": queue_evidence["exact_reason"],
+                    "canonical_pipeline_reason_source": queue_evidence["decision_reason_source"],
                     "reason_code": queue_evidence["reason_code"],
                     "reason": queue_evidence["reason"],
                     "exact_reason": queue_evidence["exact_reason"],
@@ -4087,19 +5012,19 @@ def run_persisted_acceptance(
                     "decision_reason_source": queue_evidence["decision_reason_source"],
                     "diagnostics": queue_evidence["diagnostics"],
                     "candidate_evidence": compact_lifecycle_evidence,
-                    "selected_candidate_id": lifecycle_evidence.get("selected_candidate_id"),
-                    "selected_by_processor": lifecycle_evidence.get("selected_by_processor", False),
-                    "selected_candidate_lifecycle": {
+                    "assessment_candidate_id": lifecycle_evidence.get("selected_candidate_id"),
+                    "processor_selected": lifecycle_evidence.get("selected_by_processor", False),
+                    "assessment_candidate_lifecycle": {
                         "candidate_id": selected_lifecycle.get("candidate_id") if isinstance(selected_lifecycle, Mapping) else None,
-                        "stage": selected_lifecycle.get("stage") if isinstance(selected_lifecycle, Mapping) else None,
+                        "lifecycle_stage": selected_lifecycle_stage,
                         "updated_at": selected_lifecycle.get("updated_at") if isinstance(selected_lifecycle, Mapping) else None,
                         "payload_hash": _sha256_json(selected_payload),
                         "events_count": len(selected_events),
                         "events_hash": _sha256_json(selected_events),
                         "metrics_hash": _sha256_json(selected_metrics),
                     },
-                    "selected_candidate_payload": selected_payload_summary,
-                    "selected_candidate_lifecycle_events": [
+                    "assessment_candidate_payload": selected_payload_summary,
+                    "assessment_candidate_lifecycle_events": [
                         _compact_lifecycle_event(event) for event in selected_events
                     ],
                     "candidate_metrics": selected_metrics,
@@ -4110,19 +5035,15 @@ def run_persisted_acceptance(
             report["chain"]["validation_metrics"] = candidate_metrics.get("validation", {})
             report["chain"]["robustness_metrics"] = candidate_metrics.get("robustness", {})
             report["chain"]["qualification_metrics"] = candidate_metrics.get("qualification", {})
-            lifecycle_stage = (
-                selected_lifecycle.get("stage")
-                if isinstance(selected_lifecycle, Mapping)
-                else None
-            )
-            frozen_hashes: list[str] = []
+            lifecycle_stage = selected_lifecycle_stage
+            configuration_frozen_hashes: list[str] = []
             for item in lifecycle_evidence.get("candidates", ()):
                 payload = item.get("payload") if isinstance(item, Mapping) else None
                 frozen = str(payload.get("frozen_hash", "")).strip() if isinstance(payload, Mapping) else ""
                 if frozen:
-                    frozen_hashes.append(frozen)
+                    configuration_frozen_hashes.append(frozen)
             report["chain"]["lifecycle_stage"] = lifecycle_stage
-            report["chain"]["frozen_hashes"] = frozen_hashes
+            report["chain"]["configuration_frozen_hashes"] = configuration_frozen_hashes
             rejected_reasons = result.get("rejected_reasons")
             observed_reasons: list[str] = []
             if isinstance(rejected_reasons, Mapping):
@@ -4132,28 +5053,194 @@ def run_persisted_acceptance(
             if queue_evidence["exact_reason"] is not None:
                 observed_reasons.append(str(queue_evidence["exact_reason"]))
             report["chain"]["reasons"] = list(dict.fromkeys(observed_reasons)) or ["MISSING_OBSERVED_REASON"]
-            blocker = queue_evidence["exact_reason"]
+            canonical_pipeline_reason = queue_evidence["exact_reason"]
             report["runtime_metric_assessment"] = _runtime_metric_assessment(
                 candidate_metrics,
                 report.get("runtime_criteria"),
-                current_market_blocker=blocker,
+                current_market_blocker=canonical_pipeline_reason,
+                historical_metrics=positive_historical_metrics,
             )
-            qualification_ready = lifecycle_stage in {"PAPER_FORWARD", "PAPER_PROMOTABLE"}
+            positive_candidate_id = next(
+                (
+                    str(item.get("candidate_id")).strip()
+                    for item in candidate_results
+                    if isinstance(item, Mapping)
+                    and str(item.get("candidate_id", "")).strip()
+                ),
+                None,
+            )
+            processor_selected = bool(
+                positive_candidate_id
+                and positive_candidate_id in {
+                    str(value).strip() for value in selected_candidate_ids
+                }
+            )
+            historical_qualification = _historical_qualification_assessment(
+                candidate_metrics,
+                report["runtime_metric_assessment"],
+                historical_support_audit,
+                processor_selected=processor_selected,
+                lifecycle_stage=lifecycle_stage,
+                canonical_pipeline_reason=canonical_pipeline_reason,
+                historical_metrics=positive_historical_metrics,
+            )
+            report["chain"]["processor_selected"] = processor_selected
+            report["chain"]["historical_qualification"] = historical_qualification
+            historical_decisive_reason = "HISTORICAL_MIN_TRADES_NOT_MET"
+            report["chain"].update(
+                {
+                    "reason_code": historical_decisive_reason,
+                    "reason": historical_decisive_reason,
+                    "exact_reason": historical_decisive_reason,
+                    "decision_reason": historical_decisive_reason,
+                    "decision_reason_source": "historical_qualification",
+                    "reasons": [
+                        historical_decisive_reason,
+                        *(
+                            reason
+                            for reason in report["chain"].get("reasons", [])
+                            if str(reason).strip()
+                            not in {
+                                historical_decisive_reason,
+                                "CANDIDATE_FORWARD_MARKET_UNRESOLVED",
+                            }
+                        ),
+                    ],
+                }
+            )
+            report["chain"]["primary_reason"] = historical_decisive_reason
+            report["runtime_metric_assessment"].pop(
+                "decisive_current_market_blocker", None
+            )
+            report["runtime_metric_assessment"].update(
+                {
+                    "decisive_blocker": historical_decisive_reason,
+                    "decisive_blocker_source": "historical_qualification",
+                    "decisive_blocker_status": "blocking",
+                    "canonical_pipeline_reason": canonical_pipeline_reason,
+                    "canonical_pipeline_reason_source": (
+                        "queue/current-authority"
+                        if canonical_pipeline_reason
+                        else None
+                    ),
+                }
+            )
+            report["assessment_candidate"].update(
+                {
+                    "candidate_id": positive_candidate_id,
+                    "lifecycle_stage": lifecycle_stage,
+                    "processor_selected": processor_selected,
+                    "assessment_candidate_defined_before_current_inspection": True,
+                    "configuration_frozen_before_current_inspection": True,
+                    "excluded_control_candidates": [control_proposal["candidate_id"]],
+                }
+            )
+            qualification_ready = bool(historical_qualification["historical_qualified"])
+            qualification_status = historical_qualification["status"]
+            qualification_blocker = historical_qualification["decisive_blocker"]
+            report["qualification"] = {
+                **historical_qualification,
+                "same_candidate_required": True,
+                "current_evaluation_allowed": qualification_ready,
+                "positive_candidate_id": positive_candidate_id,
+            }
+            report["gate_assessment"] = {
+                "historical": {
+                    "status": "QUALIFIED" if qualification_ready else "REJECTED",
+                    "requirements": {
+                        "processor_selected": True,
+                        "robustness_passed": True,
+                        "minimum_trades": True,
+                        "default_criteria_evidence": True,
+                        "non_rejected_lifecycle": True,
+                    },
+                    "evidence": {
+                        "historical_qualification": historical_qualification,
+                        "historical_support_audit_hash": historical_support_audit.get("markets_hash"),
+                        "historical_support_status": historical_support_audit.get("status"),
+                        "historical_market_counts": {
+                            "imported": historical_support_audit.get("imported_market_count"),
+                            "eligible": historical_support_audit.get("eligible_market_count"),
+                            "ineligible": historical_support_audit.get("ineligible_market_count"),
+                        },
+                        "historical_metrics_hash": _sha256_json(positive_historical_metrics),
+                        "historical_metrics_statuses": positive_historical_metrics.get("statuses"),
+                    },
+                    "blocker": qualification_blocker,
+                },
+                "canary": {
+                    "status": "NOT_REACHED",
+                    "requirements": {
+                        "same_candidate_qualified": True,
+                        "fresh_current_identity": True,
+                        "fresh_current_order_book": True,
+                    },
+                    "evidence": {
+                        "qualification_status": qualification_status,
+                        "current_market_resolution": "NOT_RUN",
+                        "fresh_identity_and_books": "NOT_RUN",
+                        "historical_order_book_available": False,
+                        "same_candidate_qualified": qualification_ready,
+                    },
+                    "blocker": (
+                        None
+                        if qualification_ready
+                        else "HISTORICAL_QUALIFICATION_REQUIRED"
+                    ),
+                },
+                "PAPER_PROMOTABLE": {
+                    "status": "NOT_REACHED",
+                    "requirements": {
+                        "same_candidate": True,
+                        "forward_ledgers": True,
+                        "default_criteria": True,
+                        "required_stage": "PAPER_FORWARD",
+                    },
+                    "evidence": {
+                        "forward_ledgers": "NOT_RUN",
+                        "runtime_criteria": report.get("runtime_criteria"),
+                        "runtime_metric_assessment": report["runtime_metric_assessment"],
+                        "qualification_status": qualification_status,
+                    },
+                    "blocker": "PAPER_FORWARD_LEDGERS_AND_DEFAULT_CRITERIA_REQUIRED",
+                },
+            }
+            report["current_market_input_readiness"] = {
+                "status": "READY" if qualification_ready else "NOT_RUN",
+                "reason_code": None if qualification_ready else "HISTORICAL_QUALIFICATION_FAILED",
+                "historical_order_book_available": False,
+                "historical_qualified": qualification_ready,
+                "same_candidate_qualified": qualification_ready,
+                "network_activity_allowed": False,
+            }
+            report["actual_decision"] = {
+                "status": "PENDING_CURRENT_INPUT" if qualification_ready else "NOT_RUN",
+                "reason_code": None if qualification_ready else "HISTORICAL_QUALIFICATION_FAILED",
+                "decision": None,
+                "current_evaluation_run": False,
+            }
+            report["execution_feasibility"] = {
+                "status": "NOT_RUN",
+                "reason_code": None if qualification_ready else "HISTORICAL_QUALIFICATION_FAILED",
+                "current_book_required": qualification_ready,
+                "order_transport_called": False,
+            }
             report["evaluator"] = {
                 "status": "SKIPPED" if not qualification_ready else "SKIPPED_NO_NETWORK",
-                "reason": blocker if not qualification_ready else "fresh public identity/books unavailable in network-free acceptance",
-                "qualification_blocker": blocker if not qualification_ready else None,
+                "reason": "HISTORICAL_QUALIFICATION_FAILED" if not qualification_ready else "fresh public identity/books unavailable in network-free acceptance",
+                "qualification_blocker": qualification_blocker if not qualification_ready else None,
                 "current_market_resolution": "NOT_RUN",
                 "fresh_identity_and_books": "NOT_RUN",
                 "decision": None,
             }
             report["release_readiness"]["qualification_stage_observed"] = lifecycle_stage
-            report["release_readiness"]["qualification_blocker"] = blocker if not qualification_ready else None
+            report["release_readiness"]["qualification_blocker"] = qualification_blocker if not qualification_ready else None
             report["release_readiness"]["status"] = "NOT_READY" if not qualification_ready else "PENDING_CURRENT_EVIDENCE"
             report["status_categories"] = {
                 "validation": "PASSED", "export": "PASSED",
                 "queue": report["chain"]["queue_status"],
-                "qualification": lifecycle_stage or "UNKNOWN",
+                "qualification": qualification_status,
+                "lifecycle_stage": lifecycle_stage,
                 "evaluator": report["evaluator"]["status"],
             }
             queue_status = str(report["chain"]["queue_status"] or "").upper()
@@ -4166,11 +5253,12 @@ def run_persisted_acceptance(
     except Exception as exc:
         report["export"]["status"] = "FAILED" if report["export"].get("status") != "PASSED" else "PASSED"
         report["chain"]["queue_status"] = "ERROR"
-        report["chain"]["reasons"] = [f"PIPELINE_ERROR:{type(exc).__name__}"]
+        pipeline_reason = f"PIPELINE_ERROR:{type(exc).__name__}:{exc}"
+        report["chain"]["reasons"] = [pipeline_reason]
         report["evaluator"] = {
             "status": "SKIPPED",
-            "reason": f"PIPELINE_ERROR:{type(exc).__name__}",
-            "qualification_blocker": f"PIPELINE_ERROR:{type(exc).__name__}",
+            "reason": pipeline_reason,
+            "qualification_blocker": pipeline_reason,
             "current_market_resolution": "NOT_RUN",
             "fresh_identity_and_books": "NOT_RUN",
             "decision": None,
@@ -4181,7 +5269,7 @@ def run_persisted_acceptance(
         }
         report["status"] = "ERROR"
         report["acceptance_status"] = "ERROR"
-    return _scrub(report)
+    return _persisted_fidelity_report(_scrub(report))
 
 
 def run_acceptance(

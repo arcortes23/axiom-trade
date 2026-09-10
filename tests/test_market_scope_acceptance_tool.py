@@ -27,8 +27,9 @@ from tools.polymarket_market_scope_acceptance import (
     POLYMARKET_HISTORICAL_DATASET_VERSION,
     POLYMARKET_HISTORICAL_ROW_COUNT,
     _candidate_metric_projection,
-    _runtime_metric_assessment,
     _queue_demo_evidence,
+    _historical_qualification_assessment,
+    _runtime_metric_assessment,
     _sha256_json,
     build_offline_fixture_adapter,
     compute_dollar_limit_buy_feasibility,
@@ -154,7 +155,12 @@ def _build_compact_persisted_source(
 
 
 @contextmanager
-def _compact_contract(path: Path):
+def _compact_contract(
+    path: Path,
+    *,
+    expected_row_count: int = 1,
+    expected_constituent_count: int = 1,
+):
     if not path.exists():
         dataset_id, dataset_version, attestation_hash = _build_compact_persisted_source(path)
     else:
@@ -178,8 +184,8 @@ def _compact_contract(path: Path):
         "tools.polymarket_market_scope_acceptance._PINNED_PERSISTED_DATASET_ID": dataset_id,
         "tools.polymarket_market_scope_acceptance._PINNED_PERSISTED_DATASET_VERSION": dataset_version,
         "tools.polymarket_market_scope_acceptance._PINNED_PERSISTED_ATTESTATION_HASH": attestation_hash,
-        "tools.polymarket_market_scope_acceptance._PINNED_PERSISTED_ROW_COUNT": 1,
-        "tools.polymarket_market_scope_acceptance._PINNED_PERSISTED_CONSTITUENT_COUNT": 1,
+        "tools.polymarket_market_scope_acceptance._PINNED_PERSISTED_ROW_COUNT": expected_row_count,
+        "tools.polymarket_market_scope_acceptance._PINNED_PERSISTED_CONSTITUENT_COUNT": expected_constituent_count,
     }
     patches = []
     try:
@@ -193,8 +199,19 @@ def _compact_contract(path: Path):
             item.stop()
 
 
-def _compact_report(path: Path, **config_values: object) -> dict[str, object]:
-    with _compact_contract(path) as (dataset_id, dataset_version, _):
+def _compact_report(
+    path: Path,
+    *,
+    expected_row_count: int | None = None,
+    expected_constituent_count: int | None = None,
+    **config_values: object,
+) -> dict[str, object]:
+    contract_kwargs = {}
+    if expected_row_count is not None:
+        contract_kwargs["expected_row_count"] = expected_row_count
+    if expected_constituent_count is not None:
+        contract_kwargs["expected_constituent_count"] = expected_constituent_count
+    with _compact_contract(path, **contract_kwargs) as (dataset_id, dataset_version, _):
         values = {
             "mode": "persisted",
             "source_backup": path,
@@ -212,6 +229,125 @@ def _compact_report(path: Path, **config_values: object) -> dict[str, object]:
             config=config,
             generated_at=COMPACT_TIMESTAMP,
         )
+
+
+def _build_compact_historical_source(
+    path: Path,
+    records: list[dict[str, object]],
+) -> tuple[str, str, str]:
+    """Create a bounded attested source for chronology and feature-boundary tests."""
+    if not records:
+        raise ValueError("historical fixture requires at least one record")
+    token_id = f"yes-{COMPACT_MARKET_ID}"
+    constituent_id = f"prediction:{COMPACT_MARKET_ID}"
+    identity = [
+        {
+            "timestamp": record["source_timestamp"],
+            "price": record.get("price", record.get("yes_mid")),
+            "token_id": record["token_id"],
+        }
+        for record in records
+    ]
+    payload = json.dumps(identity, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    constituent_version = "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    timestamps = [datetime.fromisoformat(str(record["source_timestamp"])) for record in records]
+    start, end = min(timestamps), max(timestamps)
+    metadata = {
+        "market_id": COMPACT_MARKET_ID,
+        "token_ids": {"yes": token_id, "no": f"no-{COMPACT_MARKET_ID}"},
+        "source_type": "HISTORICAL",
+        "provider": "polymarket",
+        "instrument": "POLYMARKET",
+    }
+    aggregate_metadata = {
+        "source_type": "HISTORICAL",
+        "provider": "polymarket",
+        "instrument": "POLYMARKET",
+        "markets_discovered": 1,
+        "markets_imported": 1,
+        "price_points": len(records),
+        "category_counts": {"other": 1},
+        "market_versions": [{
+            "market_id": COMPACT_MARKET_ID,
+            "dataset_id": constituent_id,
+            "dataset_version": constituent_version,
+            "row_count": len(records),
+        }],
+    }
+    with AxiomStore(path) as store:
+        store.save_dataset(
+            constituent_id,
+            constituent_version,
+            records,
+            metadata=metadata,
+            quality="PRICE_PROXY",
+        )
+        store.save_dataset_catalog(
+            constituent_id,
+            constituent_version,
+            provider="polymarket",
+            instrument="POLYMARKET",
+            market_type="prediction",
+            timeframe="event",
+            start_timestamp=start,
+            end_timestamp=end,
+            row_count=len(records),
+            completeness=1.0,
+            missing_ranges=(),
+            quality="PRICE_PROXY",
+            source_type="HISTORICAL",
+            snapshot_id=f"{constituent_id}:{constituent_version}",
+            metadata=metadata,
+            created_at=start,
+            updated_at=end,
+        )
+        store.save_dataset_catalog(
+            COMPACT_DATASET_ID,
+            "compact-v1",
+            provider="polymarket",
+            instrument="POLYMARKET",
+            market_type="prediction",
+            timeframe="event",
+            start_timestamp=start,
+            end_timestamp=end,
+            row_count=len(records),
+            completeness=1.0,
+            missing_ranges=(),
+            quality="PRICE_PROXY",
+            source_type="HISTORICAL",
+            snapshot_id=f"{COMPACT_DATASET_ID}:compact-v1",
+            metadata=aggregate_metadata,
+            created_at=start,
+            updated_at=end,
+        )
+        attestation = store.verify_dataset_integrity_attestation(
+            COMPACT_DATASET_ID,
+            "compact-v1",
+            force=True,
+        )
+        attestation_hash = str(attestation["attestation_hash"])
+    return COMPACT_DATASET_ID, "compact-v1", attestation_hash
+
+
+def _historical_records(
+    *,
+    count: int = 4,
+    market_id: str = COMPACT_MARKET_ID,
+) -> list[dict[str, object]]:
+    token_id = f"yes-{market_id}"
+    return [
+        {
+            "source_timestamp": f"2026-01-01T0{index}:00:00+00:00",
+            "timestamp": f"2026-01-01T0{index}:00:00+00:00",
+            "observed_at": f"2026-01-01T0{index}:00:00+00:00",
+            "price": 0.40 + index * 0.05,
+            "token_id": token_id,
+            "market_id": market_id,
+            "provider": "polymarket",
+            "source_type": "HISTORICAL",
+        }
+        for index in range(count)
+    ]
 
 
 def _compact_mutate(path: Path, statement: str, parameters: tuple[object, ...] = ()) -> None:
@@ -1299,6 +1435,11 @@ class MarketScopeAcceptanceToolTests(unittest.TestCase):
                 POLYMARKET_HISTORICAL_CONSTITUENT_COUNT,
             )
             self.assertIn("SOURCE_BACKUP_NOT_FOUND", payload["validation"]["reasons"])
+            control = payload["no_edge_control"]
+            self.assertEqual(control["evaluation_status"], "NOT_RUN")
+            self.assertIsNone(control["proven_zero_edge"])
+            self.assertIsNone(control["metrics"])
+            self.assertIsNone(control["proof"]["nonzero_edge_count"])
 
 
 
@@ -1549,6 +1690,7 @@ class MarketScopeAcceptanceToolTests(unittest.TestCase):
             self.assertTrue(report["export"]["isolated"])
             self.assertTrue(report["export"]["temporary_store"])
             self.assertTrue(report["export"]["controls"]["disabled_or_absent"])
+            self.assertIs(report["export"]["controls"]["credential_state_exported"], False)
             self.assertTrue(report["security"]["controls_disabled_or_absent"])
             self.assertFalse(report["security"]["credentials_used"])
             self.assertFalse(report["security"]["network_calls"])
@@ -1613,6 +1755,422 @@ class MarketScopeAcceptanceToolTests(unittest.TestCase):
             self.assertEqual(metadata["instrument"], "POLYMARKET")
 
 
+    def test_persisted_shared_report_freezes_momentum_and_excludes_zero_edge_control(self) -> None:
+        records = _historical_records(count=4)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "momentum.sqlite"
+            _build_compact_historical_source(path, records)
+            report = _compact_report(path, expected_row_count=len(records))
+
+        control = report["no_edge_control"]
+        self.assertEqual(control["role"], "ZERO_EDGE_CONTROL")
+        self.assertEqual(control["template"], "probability_mispricing")
+        self.assertEqual(control["model_document"], {"field": "yes_mid"})
+        self.assertTrue(control["selection_excluded"])
+        self.assertTrue(control["proven_zero_edge"])
+        self.assertEqual(control["metrics"]["nonzero_edge_count"], 0)
+        self.assertGreater(control["metrics"]["model_evaluations"], 0)
+        self.assertGreater(control["metrics"]["raw_observations"], 0)
+        self.assertEqual(control["metrics"]["scored_predictions"], 0)
+
+        assessment = report["assessment_candidate"]
+        self.assertEqual(assessment["family"], "momentum")
+        self.assertEqual(assessment["template"], "momentum")
+        self.assertEqual(assessment["parameters"], {"lookback": 1, "threshold": 0.05})
+        self.assertEqual(assessment["status"], "QUEUED")
+        self.assertTrue(assessment["assessment_candidate_defined_before_current_inspection"])
+        self.assertTrue(assessment["configuration_frozen_before_current_inspection"])
+        self.assertTrue(assessment["configuration_frozen_hash"].startswith("sha256:"))
+        self.assertEqual(
+            set(assessment["causal_allowed_features"]),
+            {"timestamp", "source_timestamp", "market_id", "token_id", "yes_mid", "price"},
+        )
+        self.assertEqual(
+            assessment["costs"],
+            {
+                "initial_cash": 10_000.0,
+                "allocation": 0.25,
+                "fee_bps": 10.0,
+                "slippage_bps": 5.0,
+            },
+        )
+        self.assertFalse(assessment["processor_selected"])
+        self.assertFalse(report["chain"]["processor_selected"])
+        self.assertIsNone(report["chain"]["lifecycle_stage"])
+        self.assertNotEqual(
+            assessment["assessment_candidate_defined_before_current_inspection"],
+            report["chain"]["processor_selected"],
+        )
+        filled = compute_dollar_limit_buy_feasibility(
+            {"asks": [{"price": "0.50", "size": "10"}]},
+            budget=100.0,
+            slippage_bps=assessment["costs"]["slippage_bps"],
+            fee_bps=assessment["costs"]["fee_bps"],
+        )
+        self.assertTrue(filled["feasible"])
+        self.assertGreater(filled["quantity"], 0.0)
+        self.assertGreater(filled["fee"], 0.0)
+        self.assertGreater(filled["limit_price"], filled["best_ask"])
+
+        history_metrics = report["historical_metrics"]
+        audit = report["historical_support_audit"]
+        self.assertEqual(audit["required_observations_per_market"], 2)
+        self.assertEqual(audit["eligible_row_count"], len(records))
+        self.assertEqual(audit["imported_market_count"], 1)
+        self.assertEqual(audit["eligible_market_count"], 1)
+        self.assertEqual(audit["ineligible_market_count"], 0)
+        self.assertEqual(history_metrics["independent_raw_markets"], 1)
+        self.assertEqual(history_metrics["independent_eligible_markets"], 1)
+        self.assertTrue(audit["markets_hash"].startswith("sha256:"))
+        self.assertEqual(len(audit["eligible_markets_sample"]), 1)
+        self.assertEqual(audit["ineligible_markets_sample"], [])
+        self.assertNotIn("markets", audit)
+        self.assertGreater(history_metrics["raw_observations"], 0)
+        self.assertGreater(history_metrics["signal_evaluation_count"], 0)
+        self.assertGreaterEqual(history_metrics["signal_count"], 1)
+        self.assertEqual(history_metrics["actionable_signal_count"], 0)
+        self.assertEqual(history_metrics["model_evaluations"], 0)
+        self.assertEqual(history_metrics["independent_scored_markets"], 0)
+        self.assertEqual(history_metrics["scored_prediction_count"], 0)
+        self.assertEqual(history_metrics["calibration_observation_count"], 0)
+        self.assertEqual(history_metrics["fill_count"], 0)
+        self.assertEqual(history_metrics["fills"], 0)
+        self.assertEqual(history_metrics["closed_trade_count"], 0)
+        self.assertEqual(report["qualification"]["status"], "REJECTED")
+        self.assertEqual(report["qualification"]["blocker"], "HISTORICAL_MIN_TRADES_NOT_MET")
+        self.assertFalse(report["qualification"]["historical_qualified"])
+        self.assertFalse(report["qualification"]["current_evaluation_allowed"])
+        chain = report["chain"]
+        self.assertEqual(chain["reason_code"], "HISTORICAL_MIN_TRADES_NOT_MET")
+        self.assertEqual(chain["exact_reason"], "HISTORICAL_MIN_TRADES_NOT_MET")
+        self.assertEqual(chain["decision_reason"], "HISTORICAL_MIN_TRADES_NOT_MET")
+        self.assertEqual(chain["reason"], "HISTORICAL_MIN_TRADES_NOT_MET")
+        self.assertEqual(chain["primary_reason"], "HISTORICAL_MIN_TRADES_NOT_MET")
+        self.assertEqual(
+            chain["canonical_pipeline_reason"],
+            "INSUFFICIENT_DATA",
+        )
+        self.assertNotEqual(chain["reason_code"], chain["canonical_pipeline_reason"])
+        self.assertNotEqual(chain["exact_reason"], chain["canonical_pipeline_reason"])
+        self.assertNotEqual(chain["decision_reason"], chain["canonical_pipeline_reason"])
+        runtime = report["runtime_metric_assessment"]
+        self.assertEqual(
+            runtime["counts"],
+            {
+                "filled_trades": 0.0,
+                "closed_trades": 0.0,
+                "scored_predictions": 0.0,
+                "calibration_observations": 0.0,
+            },
+        )
+        self.assertEqual(runtime["decisive_blocker"], "HISTORICAL_MIN_TRADES_NOT_MET")
+        paper_runtime = report["gate_assessment"]["PAPER_PROMOTABLE"]["evidence"]["runtime_metric_assessment"]
+        self.assertEqual(paper_runtime["decisive_blocker"], "HISTORICAL_MIN_TRADES_NOT_MET")
+        self.assertEqual(
+            report["qualification"]["evidence"]["actionable_signal_count"],
+            0.0,
+        )
+        self.assertEqual(
+            report["qualification"]["evidence"]["closed_trade_count"],
+            0.0,
+        )
+        self.assertEqual(
+            report["source"]["attestation"]["execution_fidelity"],
+            "PRICE_PROXY",
+        )
+        self.assertEqual(
+            history_metrics["historical_execution_fidelity"],
+            "PRICE_PROXY",
+        )
+        processor_result = chain["processor"]["results"][0]
+        self.assertNotIn("data_quality", processor_result)
+        encoded_report = json.dumps(report, sort_keys=True, separators=(",", ":"))
+        self.assertNotIn("ORDER_BOOK_SIMULATED", encoded_report)
+        self.assertTrue(report["qualification"]["same_candidate_required"])
+        self.assertEqual(
+            report["qualification"]["canonical_pipeline_reason"],
+            report["chain"]["canonical_pipeline_reason"],
+        )
+        self.assertEqual(report["current_market_input_readiness"]["status"], "NOT_RUN")
+        self.assertEqual(
+            report["current_market_input_readiness"]["reason_code"],
+            "HISTORICAL_QUALIFICATION_FAILED",
+        )
+        self.assertEqual(report["evaluator"]["status"], "SKIPPED")
+        self.assertEqual(
+            report["evaluator"]["reason"],
+            "HISTORICAL_QUALIFICATION_FAILED",
+        )
+        self.assertEqual(
+            report["evaluator"]["qualification_blocker"],
+            "HISTORICAL_MIN_TRADES_NOT_MET",
+        )
+        self.assertEqual(report["actual_decision"]["status"], "NOT_RUN")
+        self.assertEqual(
+            report["actual_decision"]["reason_code"],
+            "HISTORICAL_QUALIFICATION_FAILED",
+        )
+        self.assertEqual(report["execution_feasibility"]["status"], "NOT_RUN")
+        self.assertEqual(
+            report["execution_feasibility"]["reason_code"],
+            "HISTORICAL_QUALIFICATION_FAILED",
+        )
+
+    def test_historical_metrics_count_raw_and_eligible_markets_from_lookback_audit(self) -> None:
+        from tools.polymarket_market_scope_acceptance import (
+            _persisted_historical_metrics,
+            _persisted_historical_support_audit,
+        )
+
+        def rows(market_id: str, prices: tuple[float, ...]) -> list[dict[str, object]]:
+            return [
+                {
+                    "market_id": market_id,
+                    "token_id": f"yes-{market_id}",
+                    "source_timestamp": f"2026-01-01T0{index}:00:00+00:00",
+                    "timestamp": f"2026-01-01T0{index}:00:00+00:00",
+                    "yes_mid": price,
+                    "price": price,
+                }
+                for index, price in enumerate(prices)
+            ]
+
+        constant = rows("constant-market", (0.50, 0.50))
+        moving = rows("moving-market", (0.40, 0.50))
+        short = rows("short-market", (0.70,))
+        constituents = [
+            {"market_id": market_id, "records": market_rows}
+            for market_id, market_rows in (
+                ("constant-market", constant),
+                ("moving-market", moving),
+                ("short-market", short),
+            )
+        ]
+        aggregate = [*constant, *moving, *short]
+        audit = _persisted_historical_support_audit(
+            constituents,
+            aggregate,
+            lookback=1,
+        )
+        metrics = _persisted_historical_metrics(
+            aggregate,
+            family="momentum",
+            threshold=0.05,
+            historical_support_audit=audit,
+        )
+
+        self.assertEqual(audit["imported_market_count"], 3)
+        self.assertEqual(audit["imported_row_count"], 5)
+        self.assertEqual(audit["eligible_market_count"], 2)
+        self.assertEqual(audit["eligible_row_count"], 4)
+        self.assertEqual(audit["ineligible_market_count"], 1)
+        self.assertEqual(audit["ineligible_row_count"], 1)
+        self.assertEqual(metrics["raw_observations"], 5)
+        self.assertEqual(metrics["sample_count"], 5)
+        self.assertEqual(metrics["independent_raw_markets"], 3)
+        self.assertEqual(metrics["independent_eligible_markets"], 2)
+        self.assertEqual(metrics["signal_count"], 1)
+        self.assertEqual(metrics["actionable_signal_count"], 0)
+
+
+    def test_paper_forward_stage_cannot_override_historical_rejection(self) -> None:
+        qualification = _historical_qualification_assessment(
+            {
+                "actionable_signal_count": 1,
+                "closed_trade_count": 1,
+                "filled_trades": 0,
+                "robustness": {
+                    "robustness_passed": True,
+                    "minimum_sample_check": {"trades": 0, "min_trades": 20},
+                },
+            },
+            {
+                "status": "pass",
+                "criteria": {"min_trades": 20},
+                "metrics": {"filled_trades": {"status": "pass"}},
+            },
+            {"status": "PASSED", "as_of_lifecycle_status": "AVAILABLE"},
+            processor_selected=False,
+            lifecycle_stage="PAPER_FORWARD",
+            canonical_pipeline_reason="CANDIDATE_FORWARD_MARKET_UNRESOLVED",
+        )
+        self.assertEqual(qualification["lifecycle_stage"], "PAPER_FORWARD")
+        self.assertFalse(qualification["processor_selected"])
+        self.assertFalse(qualification["historical_qualified"])
+        self.assertEqual(qualification["status"], "REJECTED")
+        self.assertEqual(qualification["blocker"], "HISTORICAL_MIN_TRADES_NOT_MET")
+        self.assertEqual(
+            qualification["canonical_pipeline_reason"],
+            "CANDIDATE_FORWARD_MARKET_UNRESOLVED",
+        )
+        self.assertEqual(
+            qualification["canonical_pipeline_reason_source"],
+            "queue/current-authority",
+        )
+
+    def test_persisted_history_projection_excludes_copied_terminal_and_market_state(self) -> None:
+        records = _historical_records(count=3)
+        records[1].update(
+            {
+                "settlement": "YES",
+                "liquidity": 12_345.0,
+                "volume": 98_765.0,
+                "order_book": {"asks": [{"price": 0.51, "size": 100.0}]},
+            }
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "causal-projection.sqlite"
+            _build_compact_historical_source(path, records)
+            report = _compact_report(path, expected_row_count=len(records))
+
+        audit = report["historical_support_audit"]
+        projection = audit["research_projection"]
+        self.assertEqual(
+            set(projection["included_features"]),
+            {"timestamp", "source_timestamp", "market_id", "token_id", "yes_mid", "price"},
+        )
+        for field in ("settlement", "liquidity", "volume", "order_book"):
+            self.assertIn(field, projection["excluded_fields"])
+        self.assertEqual(audit["as_of_lifecycle_status"], "AS_OF_LIFECYCLE_UNAVAILABLE")
+        self.assertEqual(audit["historical_as_of_fields_observed"], [])
+        self.assertEqual(audit["future_label_exclusion"]["status"], "EXCLUDED")
+        self.assertFalse(projection["historical_order_books_used"])
+        self.assertFalse(projection["historical_liquidity_used"])
+        self.assertFalse(projection["historical_volume_used"])
+        self.assertFalse(projection["states_synthesized"])
+
+        provenance = report["validation"]["record_provenance"]
+        self.assertEqual(provenance["explicit_source_type_rows"], len(records))
+        readiness = report["current_market_input_readiness"]
+        self.assertEqual(readiness["status"], "SKIPPED")
+        self.assertEqual(readiness["reason_code"], "HISTORICAL_QUALIFICATION_REQUIRED")
+        self.assertFalse(readiness["historical_order_book_available"])
+        execution = report["execution_feasibility"]
+        self.assertEqual(execution["status"], "SKIPPED")
+        self.assertEqual(execution["reason_code"], "HISTORICAL_QUALIFICATION_REQUIRED")
+        self.assertFalse(execution["current_book_required"])
+        self.assertFalse(execution["order_transport_called"])
+        self.assertIsNone(report["dollar_limit_buy_feasibility"]["selected_market"])
+
+    def test_persisted_history_requires_same_market_order_and_lookback(self) -> None:
+        duplicate = _historical_records(count=4)
+        duplicate[2]["source_timestamp"] = duplicate[1]["source_timestamp"]
+        duplicate[2]["timestamp"] = duplicate[1]["timestamp"]
+        out_of_order = _historical_records(count=4)
+        out_of_order[1]["source_timestamp"], out_of_order[2]["source_timestamp"] = (
+            out_of_order[2]["source_timestamp"],
+            out_of_order[1]["source_timestamp"],
+        )
+        out_of_order[1]["timestamp"], out_of_order[2]["timestamp"] = (
+            out_of_order[2]["timestamp"],
+            out_of_order[1]["timestamp"],
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name, records in (("duplicate", duplicate), ("out-of-order", out_of_order)):
+                with self.subTest(name=name):
+                    path = root / f"{name}.sqlite"
+                    _build_compact_historical_source(path, records)
+                    report = _compact_report(path, expected_row_count=len(records))
+                    audit = report["historical_support_audit"]
+                    if name == "duplicate":
+                        market = audit["ineligible_markets_sample"][0]
+                        self.assertFalse(market["strict_increasing_unique_source_timestamps"])
+                        self.assertIn("SOURCE_TIMESTAMPS_NOT_STRICTLY_INCREASING", market["reasons"])
+                        self.assertEqual(audit["eligible_market_count"], 0)
+                        self.assertEqual(audit["ineligible_market_count"], 1)
+                    else:
+                        market = audit["eligible_markets_sample"][0]
+                        self.assertTrue(market["strict_increasing_unique_source_timestamps"])
+                        self.assertEqual(market["reasons"], [])
+                        self.assertEqual(audit["eligible_market_count"], 1)
+                        self.assertEqual(audit["ineligible_market_count"], 0)
+                    self.assertTrue(audit["market_audit_bounded"])
+                    self.assertNotIn("markets", audit)
+                    if name == "duplicate":
+                        self.assertEqual(report["qualification"]["status"], "REJECTED")
+                    else:
+                        self.assertNotEqual(report["qualification"]["status"], "QUALIFIED")
+
+            insufficient_path = root / "lookback-insufficient.sqlite"
+            one = _historical_records(count=1)
+            _build_compact_historical_source(insufficient_path, one)
+            insufficient = _compact_report(insufficient_path, expected_row_count=1)
+            self.assertEqual(insufficient["historical_support_audit"]["eligible_row_count"], 0)
+            self.assertFalse(insufficient["historical_support_audit"]["ineligible_markets_sample"][0]["lookback_sufficient"])
+            self.assertEqual(insufficient["historical_metrics"]["signal_count"], 0)
+            self.assertEqual(insufficient["historical_metrics"]["raw_observations"], 1)
+            self.assertEqual(insufficient["historical_metrics"]["independent_raw_markets"], 1)
+            self.assertEqual(insufficient["historical_metrics"]["independent_eligible_markets"], 0)
+
+    def test_persisted_zero_observations_cannot_pass_calibration_or_profitability(self) -> None:
+        assessment = _runtime_metric_assessment(
+            {
+                "validation": {
+                    "validation": {
+                        "independent_samples": 0,
+                        "filled_trades": 0,
+                        "closed_trade_count": 0,
+                        "scored_predictions": 0,
+                        "calibration_observations": 0,
+                        "max_drawdown": 0.0,
+                        "expectancy": 0.0,
+                        "confidence_interval": {"lower": 0.0},
+                        "regime_count": 0,
+                    },
+                    "validation_stability": 1.0,
+                    "validation_calibration": 1.0,
+                }
+            },
+            {
+                "min_independent_samples": 30,
+                "min_trades": 20,
+                "max_drawdown": 0.20,
+                "min_expectancy": 0.0,
+                "min_confidence_lower_bound": 0.0,
+                "min_stability": 0.60,
+                "min_calibration": 0.80,
+                "min_liquidity": 0.0,
+                "min_forward_duration_seconds": 7.0 * 86400.0,
+                "min_regimes": 3,
+            },
+            current_market_blocker=None,
+        )
+        metrics = assessment["metrics"]
+        self.assertNotEqual(metrics["expectancy"]["status"], "pass")
+        self.assertNotEqual(metrics["calibration"]["status"], "pass")
+        self.assertNotEqual(assessment["status"], "pass")
+
+    def test_persisted_gate_and_current_evaluation_statuses_are_distinct_and_safe(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            report = _compact_report(Path(directory) / "gates.sqlite")
+
+        gates = report["gate_assessment"]
+        self.assertEqual(set(gates), {"historical", "canary", "PAPER_PROMOTABLE"})
+        self.assertEqual(gates["historical"]["status"], "REJECTED")
+        self.assertNotEqual(gates["canary"]["status"], "PASS")
+        self.assertNotEqual(gates["PAPER_PROMOTABLE"]["status"], "PASS")
+        self.assertEqual(report["actual_decision"]["status"], "NOT_RUN")
+        self.assertEqual(report["current_market_input_readiness"]["status"], "NOT_RUN")
+        self.assertEqual(report["evaluator"]["status"], "SKIPPED")
+        self.assertEqual(report["execution_feasibility"]["status"], "NOT_RUN")
+        for section in (
+            report["current_market_input_readiness"],
+            report["actual_decision"],
+            report["execution_feasibility"],
+        ):
+            self.assertEqual(section["reason_code"], "HISTORICAL_QUALIFICATION_FAILED")
+        self.assertEqual(report["evaluator"]["reason"], "HISTORICAL_QUALIFICATION_FAILED")
+        self.assertEqual(
+            report["evaluator"]["qualification_blocker"],
+            "HISTORICAL_MIN_TRADES_NOT_MET",
+        )
+        self.assertTrue(report["execution_feasibility"]["current_book_required"] is False)
+        self.assertFalse(report["security"]["credentials_used"])
+        self.assertFalse(report["security"]["authenticated_calls"])
+        self.assertFalse(report["security"]["submit_order_called"])
+
     def test_persisted_default_criteria_costs_and_no_synthetic_model_are_observable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             report = _compact_report(Path(directory) / "criteria.sqlite")
@@ -1625,20 +2183,44 @@ class MarketScopeAcceptanceToolTests(unittest.TestCase):
             self.assertEqual(methodology["fee_bps"], 10.0)
             self.assertEqual(methodology["slippage_bps"], 5.0)
             self.assertEqual(methodology["allocation"], 0.25)
-            self.assertEqual(report["proposal"]["experiment_plan"]["model_document"], {"field": "yes_mid"})
+            self.assertNotIn("model_document", report["proposal"]["experiment_plan"])
             self.assertEqual(report["chain"]["queue_status"], "REJECTED")
             self.assertEqual(report["acceptance_status"], "RESULT_RECORDED")
             processor_result = report["chain"]["processor"]["results"][0]
             self.assertFalse(processor_result["accepted"])
             self.assertEqual(processor_result["reason_code"], "INSUFFICIENT_DATA")
-            self.assertEqual(processor_result["reason"], "dataset contains no rows after plan filters")
+            self.assertEqual(processor_result["reason"], "at least three chronological observations are required")
             self.assertEqual(processor_result["paper_only"], True)
 
     def test_persisted_report_is_compact_and_samples_are_bounded(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             report = _compact_report(Path(directory) / "compact-artifact.sqlite")
         encoded = json.dumps(report, sort_keys=True, separators=(",", ":"))
-        self.assertLess(len(encoded), 1_000_000)
+        self.assertLess(len(encoded), 500_000)
+        self.assertNotIn('"markets":', encoded)
+        audit = report["historical_support_audit"]
+        self.assertTrue(audit["market_audit_bounded"])
+        self.assertEqual(audit["imported_market_count"], 1)
+        self.assertTrue(audit["markets_hash"].startswith("sha256:"))
+        self.assertLessEqual(len(audit["eligible_markets_sample"]), 3)
+        self.assertLessEqual(len(audit["ineligible_markets_sample"]), 3)
+        self.assertEqual(encoded.count('"historical_support_audit"'), 1)
+        historical_evidence = report["gate_assessment"]["historical"]["evidence"]
+        self.assertNotIn("historical_support_audit", historical_evidence)
+        self.assertNotIn("historical_metrics", historical_evidence)
+        self.assertEqual(
+            historical_evidence["historical_support_audit_hash"],
+            audit["markets_hash"],
+        )
+        self.assertEqual(
+            historical_evidence["historical_market_counts"],
+            {"imported": 1, "eligible": 0, "ineligible": 1},
+        )
+        self.assertEqual(
+            historical_evidence["historical_metrics_hash"],
+            _sha256_json(report["historical_metrics"]),
+        )
+
         source = report["source"]
         self.assertEqual(source["constituents"]["catalog_count"], 1)
         self.assertEqual(source["constituents"]["row_count"], 1)
@@ -1653,9 +2235,9 @@ class MarketScopeAcceptanceToolTests(unittest.TestCase):
         self.assertLessEqual(len(export["evaluated_record_sample"]), 2)
         self.assertNotIn("constituent_catalogs", export)
         chain = report["chain"]
-        self.assertNotIn("experiment_plan", chain.get("selected_candidate_payload", {}))
-        self.assertLessEqual(len(chain["selected_candidate_lifecycle_events"]), 100)
-        for event in chain["selected_candidate_lifecycle_events"]:
+        self.assertNotIn("experiment_plan", chain.get("assessment_candidate_payload", {}))
+        self.assertLessEqual(len(chain["assessment_candidate_lifecycle_events"]), 100)
+        for event in chain["assessment_candidate_lifecycle_events"]:
             self.assertNotIn("payload", event)
             self.assertIn("payload_hash", event)
             self.assertIn("payload_metrics", event)
@@ -1697,10 +2279,10 @@ class MarketScopeAcceptanceToolTests(unittest.TestCase):
         self.assertEqual(metrics["independent_samples"]["status"], "pass")
         self.assertEqual(metrics["filled_trades"]["status"], "fail")
         self.assertEqual(metrics["drawdown"]["status"], "pass")
-        self.assertEqual(metrics["expectancy"]["status"], "pass")
-        self.assertEqual(metrics["confidence_interval_lower"]["status"], "pass")
+        self.assertNotEqual(metrics["expectancy"]["status"], "pass")
+        self.assertEqual(metrics["confidence_interval_lower"]["status"], "not_reached")
         self.assertEqual(metrics["stability"]["status"], "pass")
-        self.assertEqual(metrics["calibration"]["status"], "pass")
+        self.assertNotEqual(metrics["calibration"]["status"], "pass")
         self.assertEqual(metrics["liquidity"]["status"], "not_reached")
         self.assertEqual(metrics["regimes"]["status"], "fail")
         self.assertEqual(metrics["forward_duration_seconds"]["status"], "not_reached")
@@ -1716,15 +2298,9 @@ class MarketScopeAcceptanceToolTests(unittest.TestCase):
             report = _compact_report(Path(directory) / "release.sqlite")
         plan = report["release_plan"]
         self.assertTrue(plan["prepared_not_executed"])
-        self.assertFalse(plan["merge_executed"])
-        self.assertFalse(plan["deploy_executed"])
-        self.assertFalse(plan["controls_altered"])
-        self.assertTrue(plan["merge_gates"]["clean_review_required"])
-        self.assertTrue(plan["merge_gates"]["fast_forward_only"])
-        self.assertTrue(plan["merge_gates"]["exact_reviewed_commit_required"])
-        self.assertFalse(plan["merge_gates"]["commands_executed"])
-        self.assertIn("git rev-parse feature/polymarket-market-scope", plan["merge_gates"]["reviewed_commit_precondition"])
-        self.assertIn("git ls-remote origin refs/heads/feature/polymarket-market-scope", plan["merge_gates"]["reviewed_commit_precondition"])
+        self.assertEqual(plan["release_branch"], "feature/polymarket-acceptance-real-candidate")
+        self.assertIn("git rev-parse feature/polymarket-acceptance-real-candidate", plan["merge_gates"]["reviewed_commit_precondition"])
+        self.assertIn("git ls-remote origin refs/heads/feature/polymarket-acceptance-real-candidate", plan["merge_gates"]["reviewed_commit_precondition"])
         self.assertEqual(
             plan["merge_gates"]["commands"],
             [
@@ -1733,10 +2309,11 @@ class MarketScopeAcceptanceToolTests(unittest.TestCase):
                 "git fetch origin",
                 "git switch main",
                 "git pull --ff-only origin main",
-                "git merge --ff-only feature/polymarket-market-scope",
+                "git merge --ff-only feature/polymarket-acceptance-real-candidate",
                 "git push origin main",
             ],
         )
+
         self.assertIn("python -m unittest tests.test_market_scope_acceptance_tool -v", plan["focused_unittest_command"])
         self.assertIn("python -m unittest discover", plan["full_unittest_command"])
         deployment = plan["deployment"]
@@ -1809,6 +2386,11 @@ class MarketScopeAcceptanceToolTests(unittest.TestCase):
             self.assertEqual(error["chain"]["queue_status"], "ERROR")
             self.assertEqual(error["status_categories"]["queue"], "ERROR")
             self.assertEqual(error["evaluator"]["status"], "SKIPPED")
+            self.assertEqual(error["current_market_input_readiness"]["status"], "SKIPPED")
+            self.assertEqual(
+                error["current_market_input_readiness"]["reason_code"],
+                "HISTORICAL_QUALIFICATION_REQUIRED",
+            )
             self.assertTrue(error["chain"]["reasons"][0].startswith("PIPELINE_ERROR:"))
 
     def test_sanitized_persisted_no_book_report_preserves_null_and_redacts_token(self) -> None:
@@ -1833,6 +2415,8 @@ class MarketScopeAcceptanceToolTests(unittest.TestCase):
             report = _compact_report(Path(directory) / "evaluator.sqlite")
             evaluator = report["evaluator"]
             self.assertEqual(evaluator["status"], "SKIPPED")
+            self.assertEqual(evaluator["reason"], "HISTORICAL_QUALIFICATION_FAILED")
+            self.assertEqual(evaluator["qualification_blocker"], "HISTORICAL_MIN_TRADES_NOT_MET")
             self.assertEqual(evaluator["current_market_resolution"], "NOT_RUN")
             self.assertEqual(evaluator["fresh_identity_and_books"], "NOT_RUN")
             self.assertIsNone(evaluator["decision"])
