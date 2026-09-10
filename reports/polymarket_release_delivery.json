@@ -1,7 +1,8 @@
 {
-  "status": "VERIFIED_READY_TO_PUBLISH",
+  "status": "DEPLOYED_DISARMED",
   "baseline": "c2a08f7bf468be20271a0b074a1ed6e0e12c2b94",
   "branch": "feature/polymarket-one-click-canary",
+  "deployed_revision": "d8befe093bfff9f1312a9e8b023d73d63ce52c46",
   "development_root": "C:/Users/User/projects/axiom-polymarket-release",
   "live_root": "C:/Users/User/projects/axiom",
   "live_database": "C:/Users/User/projects/axiom/runtime-data/axiom.sqlite",
@@ -295,6 +296,47 @@
       "path": "C:/Users/User/projects/axiom/runtime-data/backups/axiom-pre-polymarket-20260910T204354Z.sqlite",
       "method": "sqlite3.Connection.backup",
       "quick_check": "ok"
+    },
+    {
+      "stage": "python-3.11-live-runtime-compatibility",
+      "result": "PASS",
+      "revision": "66d8315",
+      "evidence": "Live Python 3.11 imported axiom successfully after immutable mapping defaults moved to dataclass default factories.",
+      "targeted_tests": "tests/test_market_scope_e2e.py tests/test_phase3.py tests/test_polymarket_research_orchestration.py"
+    },
+    {
+      "stage": "live-dependency-install-and-migration",
+      "result": "PASS",
+      "python": "C:/Users/User/projects/axiom/.venv/Scripts/python.exe",
+      "dependencies": "pip check passed; polymarket-client 0.9.0; Asia/Manila zoneinfo available",
+      "database": "C:/Users/User/projects/axiom/runtime-data/axiom.sqlite",
+      "migration": "CanaryService schema initialization completed through canary-disarm",
+      "control_state": "DISARMED",
+      "autonomous_canary_enabled": false,
+      "execution_events": 0
+    },
+    {
+      "stage": "live-collector-null-cursor-regression",
+      "result": "PASS",
+      "revision": "d8befe0",
+      "cause": "Persisted JSON null was converted to the string 'None' before public trade pagination.",
+      "verification": "Regression exercised None, numeric continuation, and persisted null resume; live collector heartbeats and a bounded public collection command completed with zero new trade/provider failures.",
+      "live_execution": false
+    },
+    {
+      "stage": "live-operator-deployment",
+      "result": "PASS_WITH_VISUAL_TOOL_UNAVAILABLE",
+      "revision": "d8befe093bfff9f1312a9e8b023d73d63ce52c46",
+      "url": "http://127.0.0.1:8187/",
+      "operator_pid": 27640,
+      "node_pid": 38172,
+      "execution_profile": "production",
+      "control_state": "DISARMED",
+      "autonomous_canary_enabled": false,
+      "live_execution": false,
+      "execution_events": 0,
+      "research_scheduler": "RUNNING",
+      "visual_verification": "Browser daemon unavailable; verified the running HTML and JSON surfaces directly."
     }
   ],
   "live_fills_verified": false
