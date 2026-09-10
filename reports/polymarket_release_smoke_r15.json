@@ -1,0 +1,986 @@
+{
+  "assumptions": [
+    "The export is the only historical input; the protected live database is never opened.",
+    "Historical rows retain source snapshot and raw-record hashes from the immutable export.",
+    "Forward replay consumes only timestamped recorded books and never future metadata.",
+    "All current observation and canary decisions remain paper-only; live fills are NOT_VERIFIED."
+  ],
+  "blockers": [
+    "NO_SUPPORTED_EDGE"
+  ],
+  "candidate": {
+    "candidate_ids": [
+      "candidate-0862526b10122b3d884c5a52",
+      "candidate-337422c1c8de1778ebca5046",
+      "candidate-4dd67f04c47009a123778b45"
+    ],
+    "candidate_stages": [
+      "SCHEMA_VALIDATED",
+      "SCHEMA_VALIDATED",
+      "SCHEMA_VALIDATED"
+    ],
+    "eligible_candidate_ids": [],
+    "normal_service": "AutonomousResearchProcessor.process_pending",
+    "process_cycles": [
+      {
+        "claimed": 3,
+        "completed": 0,
+        "failed": 0,
+        "paper_only": true,
+        "rejected": 3,
+        "released": 0,
+        "results": [
+          {
+            "accepted": false,
+            "blocker": "NO_SUPPORTED_EDGE",
+            "candidate_results": [
+              "<bounded>"
+            ],
+            "data_quality": "PRICE_PROXY_RESEARCH",
+            "dataset_selector": {
+              "dataset_id": "<bounded>",
+              "dataset_version": "<bounded>"
+            },
+            "dataset_version": "sha256:23eb6d6775c979765c32106bcbde903e1d106737a3419043e966bc25b1c091da",
+            "experiment_family": "momentum",
+            "holdout_evaluated": false,
+            "holdout_locked": true,
+            "holdout_used": false,
+            "hypothesis_id": "predeclared-aa844e2cd75eac5bf466ebfa",
+            "kind": "hypothesis",
+            "market_scope": {
+              "categories": "<bounded>",
+              "filters": "<bounded>",
+              "instrument": "<bounded>",
+              "market_ids": "<bounded>",
+              "mode": "<bounded>",
+              "provenance": "<bounded>",
+              "regime_restrictions": "<bounded>",
+              "schema_version": "<bounded>"
+            },
+            "market_scope_hash": "sha256:b8509e68253059a63beb0a13892b56bc3f898c0abca49ca73d7212b379473866",
+            "market_scope_version": "1",
+            "mutation_candidates": [],
+            "next_action": "CONTINUE_RESEARCH_AND_PAPER",
+            "paper_only": true,
+            "plan_hash": "sha256:e170b0d183965a46c5c76970fad23bf969e68cdc97588a1d99cb85a5400e2008",
+            "plan_id": "plan-e2582eae2deb09d0b5c8246f",
+            "reason": "at least three chronological observations are required",
+            "reason_code": "INSUFFICIENT_DATA",
+            "rejected_reasons": {},
+            "research_only": false,
+            "scope_hash": "sha256:b8509e68253059a63beb0a13892b56bc3f898c0abca49ca73d7212b379473866",
+            "scope_version": "1",
+            "selected_candidate_ids": [],
+            "selected_from_variants": 0,
+            "status": "unsupported_by_validation",
+            "supported_edge": false,
+            "trial_manifest": [
+              "<bounded>"
+            ],
+            "variants_tested": 1
+          },
+          {
+            "accepted": false,
+            "blocker": "NO_SUPPORTED_EDGE",
+            "candidate_results": [
+              "<bounded>"
+            ],
+            "data_quality": "PRICE_PROXY_RESEARCH",
+            "dataset_selector": {
+              "dataset_id": "<bounded>",
+              "dataset_version": "<bounded>"
+            },
+            "dataset_version": "sha256:23eb6d6775c979765c32106bcbde903e1d106737a3419043e966bc25b1c091da",
+            "experiment_family": "mean_reversion",
+            "holdout_evaluated": false,
+            "holdout_locked": true,
+            "holdout_used": false,
+            "hypothesis_id": "predeclared-744f3744a81503f1bfe29016",
+            "kind": "hypothesis",
+            "market_scope": {
+              "categories": "<bounded>",
+              "filters": "<bounded>",
+              "instrument": "<bounded>",
+              "market_ids": "<bounded>",
+              "mode": "<bounded>",
+              "provenance": "<bounded>",
+              "regime_restrictions": "<bounded>",
+              "schema_version": "<bounded>"
+            },
+            "market_scope_hash": "sha256:b8509e68253059a63beb0a13892b56bc3f898c0abca49ca73d7212b379473866",
+            "market_scope_version": "1",
+            "mutation_candidates": [],
+            "next_action": "CONTINUE_RESEARCH_AND_PAPER",
+            "paper_only": true,
+            "plan_hash": "sha256:971bcb5c4cf267110ddcdc6a4210e88069bb79cc9e89cb5b3fcaf29c3e82b239",
+            "plan_id": "plan-8ac63e17d15606b547e9000d",
+            "reason": "at least three chronological observations are required",
+            "reason_code": "INSUFFICIENT_DATA",
+            "rejected_reasons": {},
+            "research_only": false,
+            "scope_hash": "sha256:b8509e68253059a63beb0a13892b56bc3f898c0abca49ca73d7212b379473866",
+            "scope_version": "1",
+            "selected_candidate_ids": [],
+            "selected_from_variants": 0,
+            "status": "unsupported_by_validation",
+            "supported_edge": false,
+            "trial_manifest": [
+              "<bounded>"
+            ],
+            "variants_tested": 1
+          },
+          {
+            "accepted": false,
+            "blocker": "NO_SUPPORTED_EDGE",
+            "candidate_results": [
+              "<bounded>"
+            ],
+            "data_quality": "PRICE_PROXY_RESEARCH",
+            "dataset_selector": {
+              "dataset_id": "<bounded>",
+              "dataset_version": "<bounded>"
+            },
+            "dataset_version": "sha256:23eb6d6775c979765c32106bcbde903e1d106737a3419043e966bc25b1c091da",
+            "experiment_family": "probability_mispricing",
+            "holdout_evaluated": false,
+            "holdout_locked": true,
+            "holdout_used": false,
+            "hypothesis_id": "predeclared-21f9a1da18cea1605f2df0f6",
+            "kind": "hypothesis",
+            "market_scope": {
+              "categories": "<bounded>",
+              "filters": "<bounded>",
+              "instrument": "<bounded>",
+              "market_ids": "<bounded>",
+              "mode": "<bounded>",
+              "provenance": "<bounded>",
+              "regime_restrictions": "<bounded>",
+              "schema_version": "<bounded>"
+            },
+            "market_scope_hash": "sha256:b8509e68253059a63beb0a13892b56bc3f898c0abca49ca73d7212b379473866",
+            "market_scope_version": "1",
+            "mutation_candidates": [],
+            "next_action": "CONTINUE_RESEARCH_AND_PAPER",
+            "paper_only": true,
+            "plan_hash": "sha256:19578a9ae57bff481333dbd203f74878868f4bfae87db9e3d6c4a5b40b6096d1",
+            "plan_id": "plan-be65b033aa6e02704f3b010b",
+            "reason": "at least three chronological observations are required",
+            "reason_code": "INSUFFICIENT_DATA",
+            "rejected_reasons": {},
+            "research_only": false,
+            "scope_hash": "sha256:b8509e68253059a63beb0a13892b56bc3f898c0abca49ca73d7212b379473866",
+            "scope_version": "1",
+            "selected_candidate_ids": [],
+            "selected_from_variants": 0,
+            "status": "unsupported_by_validation",
+            "supported_edge": false,
+            "trial_manifest": [
+              "<bounded>"
+            ],
+            "variants_tested": 1
+          }
+        ]
+      }
+    ],
+    "status": "PASS"
+  },
+  "command_contract": {
+    "canonical_evaluator": "axiom.canary.CanaryService.evaluate_signal",
+    "canonical_feasibility": "axiom.canary.CanaryService.evaluate_signal",
+    "canonical_order": "process_pending -> public_collector -> paper_observation -> canary_evaluator",
+    "canonical_paper": "axiom.node.ResearchNode._run_paper_workers",
+    "canonical_research": "axiom.autonomous.AutonomousResearchProcessor.process_pending",
+    "holdout_used_for_selection": false,
+    "max_current_markets": 4,
+    "max_export_lines": 20000,
+    "max_forward_rows": 4096,
+    "max_historical_rows": 4096,
+    "paper_only": true,
+    "public_collector": "axiom.collector.PolymarketCollector",
+    "public_provider": "axiom.data.polymarket.PolymarketAdapter"
+  },
+  "current_data": {
+    "authenticated": false,
+    "cycle": {
+      "candidate_bound_fresh": [
+        "559651",
+        "559652"
+      ],
+      "candidate_bound_markets": [
+        "559651",
+        "559652"
+      ],
+      "candidate_bound_missing": [],
+      "candidate_bound_scheduled": [
+        "559651",
+        "559652"
+      ],
+      "candidate_bound_stale": [],
+      "candidate_references": {
+        "559651": [
+          "candidate-0862526b10122b3d884c5a52",
+          "candidate-337422c1c8de1778ebca5046",
+          "candidate-4dd67f04c47009a123778b45"
+        ],
+        "559652": [
+          "candidate-0862526b10122b3d884c5a52",
+          "candidate-337422c1c8de1778ebca5046",
+          "candidate-4dd67f04c47009a123778b45"
+        ]
+      },
+      "cooldowns": 0,
+      "discovery_deferred": [],
+      "discovery_scheduled": [],
+      "duration_seconds": 2.4839999999967404,
+      "ended_at": "2026-09-10T15:31:15.058515+00:00",
+      "errors": 0,
+      "markets_attempted": 2,
+      "markets_failed": 0,
+      "markets_seen": 2,
+      "markets_successful": 2,
+      "metadata_failures": 0,
+      "metadata_inserted": 2,
+      "order_book_failures": 0,
+      "paper_forward_markets": [],
+      "paper_forward_scheduled": [],
+      "provider_failures": 0,
+      "rate_limits": 0,
+      "requests": 9,
+      "retries": 0,
+      "skipped_markets": 0,
+      "snapshot_duplicates": 0,
+      "snapshots_inserted": 2,
+      "started_at": "2026-09-10T15:31:12.587033+00:00",
+      "trade_duplicates": 0,
+      "trade_failures": 0,
+      "trades_inserted": 2000
+    },
+    "market_ids": [
+      "559651",
+      "559652"
+    ],
+    "observed_at": {
+      "earliest": "2026-09-10T15:31:13.169306+00:00",
+      "latest": "2026-09-10T15:31:14.385753+00:00"
+    },
+    "observed_vs_replay": "fresh anonymous public FORWARD_COLLECTED observations",
+    "projection_hash": "sha256:a585588c6276215e91af200f1c2b0cc1227d0961bb3d872b882abfd0fbf2286e",
+    "quality": {
+      "ORDER_BOOK_SIMULATED": 2
+    },
+    "snapshot_count": 2,
+    "source_type": "FORWARD_COLLECTED",
+    "status": "PASS"
+  },
+  "decision": null,
+  "elapsed_seconds": 97.906,
+  "evaluation": {
+    "actual_current_evaluator": "CanaryService.evaluate_signal",
+    "actual_current_evaluator_ran": false,
+    "not_run_reason": "NO_ELIGIBLE_CANDIDATE",
+    "result": null
+  },
+  "feasibility": {
+    "reason": "NO_SUPPORTED_EDGE",
+    "status": "NOT_RUN"
+  },
+  "isolation": {
+    "account_mutation": false,
+    "credentials_read": false,
+    "execution_profile": "isolated",
+    "live_database_accessed": false,
+    "orders_submitted": false,
+    "output_database": "C:\\Users\\User\\projects\\axiom-polymarket-release\\runtime-data\\polymarket_release_smoke_r15.sqlite",
+    "output_log": "C:\\Users\\User\\projects\\axiom-polymarket-release\\runtime-data\\polymarket_release_smoke_r15.log",
+    "protected_live_root": "C:\\Users\\User\\projects\\axiom",
+    "required_execution_profile": "isolated",
+    "source_export": "C:\\Users\\User\\projects\\axiom-polymarket-release\\runtime-data\\polymarket_release_research_export.jsonl"
+  },
+  "live_fills": {
+    "observed_count": null,
+    "status": "NOT_VERIFIED"
+  },
+  "paper_observation": {
+    "candidate_count": 3,
+    "cycle": {
+      "candidate_count": 3,
+      "cycle_ended_at": "2026-09-10T15:32:47.781150+00:00",
+      "errors": [],
+      "failed_candidate_ids": [],
+      "failed_candidates": 0,
+      "fills_inserted": 0,
+      "next_candidate_id": "forward-candidate-0862526b10122b3d884c5a52",
+      "observations_processed": 3,
+      "processed_candidate_ids": [
+        "forward-candidate-0862526b10122b3d884c5a52",
+        "forward-candidate-337422c1c8de1778ebca5046",
+        "forward-candidate-4dd67f04c47009a123778b45"
+      ],
+      "processed_candidates": 3,
+      "remaining_candidates": 0,
+      "successful_candidates": 3
+    },
+    "normal_service": "ResearchNode._run_paper_workers",
+    "paper_only": true,
+    "status": "PASS"
+  },
+  "plan": {
+    "assumptions": {
+      "cost_sensitivity": {
+        "fee_bps": [
+          10.0,
+          20.0
+        ],
+        "slippage_bps": [
+          5.0,
+          10.0
+        ]
+      },
+      "fee_bps": 10.0,
+      "mode": "PRICE_PROXY_RESEARCH",
+      "roundtrip_fee_bps": 20.0,
+      "roundtrip_slippage_bps": 10.0,
+      "slippage_bps": 5.0,
+      "version": "price-proxy-v1"
+    },
+    "attestation_hash": "sha256:296d3b0b51c3b15a1f9cf0c9afa73dd7aa70973a031977c3c0b4ec95c3ac8f44",
+    "dataset_id": "Polymarket-historical",
+    "dataset_market_count": 91,
+    "dataset_row_count": 4096,
+    "dataset_version": "sha256:23eb6d6775c979765c32106bcbde903e1d106737a3419043e966bc25b1c091da",
+    "exit_policy": {
+      "holding_period": 1,
+      "type": "fixed_holding_period"
+    },
+    "holdout_used_for_selection": false,
+    "plan_hashes": [
+      "sha256:19578a9ae57bff481333dbd203f74878868f4bfae87db9e3d6c4a5b40b6096d1",
+      "sha256:971bcb5c4cf267110ddcdc6a4210e88069bb79cc9e89cb5b3fcaf29c3e82b239",
+      "sha256:e170b0d183965a46c5c76970fad23bf969e68cdc97588a1d99cb85a5400e2008"
+    ],
+    "status": "PREDECLARED_BY_AUTONOMOUS_SERVICE",
+    "trial_count": 3
+  },
+  "provenance": {
+    "export_sha256": "sha256:448e19a5895ca8e295fcef73d512f509d128f66bd455322799f88d25eab57868",
+    "forward_projection_hash": "sha256:684771506c40fdb504ac139ffcad599fcfe6ee09a9cac822ecd67d7346becc0e",
+    "historical_projection_hash": "sha256:23eb6d6775c979765c32106bcbde903e1d106737a3419043e966bc25b1c091da",
+    "historical_raw_provenance_preserved": true,
+    "metadata_as_of_rule": "forward metadata is never used by replay; any accepted metadata is prior/equal to its snapshot anchor"
+  },
+  "qualification": {
+    "candidate_ids": [],
+    "canonical": {},
+    "ready": false,
+    "status": "NO_SUPPORTED_EDGE"
+  },
+  "read_only_auth": {
+    "status": "NOT_RUN",
+    "transport_called": false
+  },
+  "release_root": "C:\\Users\\User\\projects\\axiom-polymarket-release",
+  "run_mode": "bounded_isolated_public_read_only",
+  "run_timestamp": "2026-09-10T15:31:09.869503+00:00",
+  "schema_version": "polymarket-release-smoke-v1",
+  "software_path": {
+    "collector": "PolymarketCollector",
+    "cycle": {
+      "candidate_bound_fresh": [
+        "559651",
+        "559652"
+      ],
+      "candidate_bound_markets": [
+        "559651",
+        "559652"
+      ],
+      "candidate_bound_missing": [],
+      "candidate_bound_scheduled": [
+        "559651",
+        "559652"
+      ],
+      "candidate_bound_stale": [],
+      "candidate_references": {
+        "559651": [
+          "candidate-0862526b10122b3d884c5a52",
+          "candidate-337422c1c8de1778ebca5046",
+          "candidate-4dd67f04c47009a123778b45"
+        ],
+        "559652": [
+          "candidate-0862526b10122b3d884c5a52",
+          "candidate-337422c1c8de1778ebca5046",
+          "candidate-4dd67f04c47009a123778b45"
+        ]
+      },
+      "cooldowns": 0,
+      "discovery_deferred": [],
+      "discovery_scheduled": [],
+      "duration_seconds": 2.4839999999967404,
+      "ended_at": "2026-09-10T15:31:15.058515+00:00",
+      "errors": 0,
+      "markets_attempted": 2,
+      "markets_failed": 0,
+      "markets_seen": 2,
+      "markets_successful": 2,
+      "metadata_failures": 0,
+      "metadata_inserted": 2,
+      "order_book_failures": 0,
+      "paper_forward_markets": [],
+      "paper_forward_scheduled": [],
+      "provider_failures": 0,
+      "rate_limits": 0,
+      "requests": 9,
+      "retries": 0,
+      "skipped_markets": 0,
+      "snapshot_duplicates": 0,
+      "snapshots_inserted": 2,
+      "started_at": "2026-09-10T15:31:12.587033+00:00",
+      "trade_duplicates": 0,
+      "trade_failures": 0,
+      "trades_inserted": 2000
+    },
+    "provider": "PolymarketAdapter",
+    "public_transport_called": true,
+    "status": "VERIFIED"
+  },
+  "source_export": {
+    "counts": {
+      "FORWARD_COLLECTED": {
+        "market_ids": 4,
+        "market_metadata_records": 8,
+        "quality": {
+          "ORDER_BOOK_SIMULATED": 4091
+        },
+        "snapshot_records": 4091
+      },
+      "HISTORICAL": {
+        "market_ids": 91,
+        "market_metadata_records": 0,
+        "quality": {
+          "PRICE_PROXY": 4096
+        },
+        "snapshot_records": 4096
+      }
+    },
+    "line_count": 8196,
+    "manifest_partitions": {
+      "FORWARD_COLLECTED": {
+        "forward_evidence_only": true,
+        "research_only": false,
+        "selected_market_ids_hash": "sha256:c2d0de3446c6709263887387d5aed5dd3eee93e611943cf527e8d04af0d95d9e",
+        "selected_market_ids_sample": [
+          "559651",
+          "559652",
+          "559653",
+          "559668"
+        ],
+        "selection": {
+          "max_snapshot_rows": 4096,
+          "partial_market_id": null,
+          "scope_is_reproducible": true,
+          "selected_market_count": 4,
+          "selection_policy": "lexicographic market_id; whole same-market sequences until bound, otherwise first contiguous prefix",
+          "skipped_market_ids_sample": [
+            "559654",
+            "559655",
+            "559656",
+            "559657",
+            "559658",
+            "559659",
+            "559660",
+            "559661",
+            "559662",
+            "559663",
+            "559664",
+            "559665",
+            "559666",
+            "559667",
+            "559669",
+            "559670",
+            "559671",
+            "559672",
+            "559673",
+            "559674",
+            "559675",
+            "559676",
+            "559677",
+            "559678",
+            "559679",
+            "559680",
+            "559681",
+            "559682",
+            "559683",
+            "559684",
+            "559685",
+            "559686"
+          ],
+          "skipped_markets_due_to_bound": 96
+        },
+        "source_type": "FORWARD_COLLECTED"
+      },
+      "HISTORICAL": {
+        "forward_evidence_only": false,
+        "research_only": true,
+        "selected_market_ids_hash": "sha256:0909192df77c40d9f93bca27e0dd742ea350f6a703cb0029c0c32b072e1da8a1",
+        "selected_market_ids_sample": [
+          "4199915",
+          "4199929",
+          "4199930",
+          "4199931",
+          "4199932",
+          "4199933",
+          "4199934",
+          "4199935",
+          "4199936",
+          "4199937",
+          "4199938",
+          "4199939",
+          "4199940",
+          "4199941",
+          "4199942",
+          "4200035",
+          "4200036",
+          "4200053",
+          "4200054",
+          "4200055",
+          "4200056",
+          "4200057",
+          "4200058",
+          "4200059",
+          "4200060",
+          "4200061",
+          "4200066",
+          "4200096",
+          "4200137",
+          "4200142",
+          "4200144",
+          "4200505"
+        ],
+        "selection": {
+          "max_snapshot_rows": 4096,
+          "partial_market_id": null,
+          "scope_is_reproducible": true,
+          "selected_market_count": 91,
+          "selection_policy": "lexicographic market_id; whole same-market sequences until bound, otherwise first contiguous prefix",
+          "skipped_market_ids_sample": [
+            "4200701",
+            "4200702",
+            "4200703",
+            "4200704",
+            "4200705",
+            "4200706",
+            "4200707",
+            "4200708",
+            "4200709",
+            "4200710",
+            "4200711",
+            "4200712",
+            "4200713",
+            "4200714",
+            "4200715",
+            "4200716",
+            "4200717",
+            "4200718",
+            "4200719",
+            "4200720",
+            "4200721",
+            "4200722",
+            "4200723",
+            "4200724",
+            "4200725",
+            "4200726",
+            "4200727",
+            "4200728",
+            "4200729",
+            "4200730",
+            "4200731",
+            "4200732"
+          ],
+          "skipped_markets_due_to_bound": 313
+        },
+        "source_type": "HISTORICAL"
+      }
+    },
+    "path": "C:\\Users\\User\\projects\\axiom-polymarket-release\\runtime-data\\polymarket_release_research_export.jsonl",
+    "schema_version": "polymarket-release-research-export-v1",
+    "sha256": "sha256:448e19a5895ca8e295fcef73d512f509d128f66bd455322799f88d25eab57868",
+    "status": "PASS",
+    "timestamps": {
+      "FORWARD_COLLECTED": {
+        "earliest": "2026-09-04T13:30:10.886000+00:00",
+        "latest": "2026-09-08T21:40:31.071423+00:00"
+      },
+      "HISTORICAL": {
+        "earliest": "2026-09-03T23:00:28+00:00",
+        "latest": "2026-09-04T13:40:20+00:00"
+      }
+    }
+  },
+  "stages": [
+    {
+      "forward_rows": 4091,
+      "historical_rows": 4096,
+      "name": "data",
+      "reason": null,
+      "status": "PASS"
+    },
+    {
+      "candidate_count": 3,
+      "name": "candidate",
+      "reason": "NO_SUPPORTED_EDGE",
+      "status": "BLOCKED"
+    },
+    {
+      "holdout_used_for_selection": false,
+      "name": "assessment",
+      "reason": "NO_SUPPORTED_EDGE",
+      "status": "NO_SUPPORTED_EDGE",
+      "trial_count": 3
+    },
+    {
+      "candidate_ids": [],
+      "name": "current_frozen_policy_resolution",
+      "reason": "CURRENT_SCOPE_UNRESOLVED",
+      "resolutions": {},
+      "status": "BLOCKED"
+    },
+    {
+      "market_ids": [
+        "559651",
+        "559652"
+      ],
+      "name": "fresh_inputs",
+      "reason": null,
+      "snapshot_count": 2,
+      "status": "PASS"
+    },
+    {
+      "cycle": {
+        "candidate_count": 3,
+        "cycle_ended_at": "2026-09-10T15:32:47.781150+00:00",
+        "errors": [],
+        "failed_candidate_ids": [],
+        "failed_candidates": 0,
+        "fills_inserted": 0,
+        "next_candidate_id": "forward-candidate-0862526b10122b3d884c5a52",
+        "observations_processed": 3,
+        "processed_candidate_ids": [
+          "forward-candidate-0862526b10122b3d884c5a52",
+          "forward-candidate-337422c1c8de1778ebca5046",
+          "forward-candidate-4dd67f04c47009a123778b45"
+        ],
+        "processed_candidates": 3,
+        "remaining_candidates": 0,
+        "successful_candidates": 3
+      },
+      "name": "paper_observation",
+      "reason": null,
+      "status": "PASS"
+    },
+    {
+      "name": "actual_canonical_decision",
+      "reason": "NO_SUPPORTED_EDGE",
+      "status": "NOT_RUN"
+    },
+    {
+      "name": "execution_feasibility",
+      "reason": "NO_SUPPORTED_EDGE",
+      "status": "NOT_RUN"
+    }
+  ],
+  "status": "BLOCKED",
+  "strategy_evidence": {
+    "assessment": "NO_SUPPORTED_EDGE",
+    "candidate_ids": [
+      "candidate-0862526b10122b3d884c5a52",
+      "candidate-337422c1c8de1778ebca5046",
+      "candidate-4dd67f04c47009a123778b45"
+    ],
+    "candidate_stages": [
+      "SCHEMA_VALIDATED",
+      "SCHEMA_VALIDATED",
+      "SCHEMA_VALIDATED"
+    ],
+    "classification": "RESEARCH_ONLY_PROXY_OR_REPLAY",
+    "historical_trials": [
+      {
+        "assumptions": {
+          "cost_sensitivity": {
+            "fee_bps": [
+              10.0,
+              20.0
+            ],
+            "slippage_bps": [
+              5.0,
+              10.0
+            ]
+          },
+          "fee_bps": 10.0,
+          "mode": "PRICE_PROXY_RESEARCH",
+          "roundtrip_fee_bps": 20.0,
+          "roundtrip_slippage_bps": 10.0,
+          "slippage_bps": 5.0,
+          "version": "price-proxy-v1"
+        },
+        "candidate_id": "candidate-0862526b10122b3d884c5a52",
+        "exit_policy": {
+          "holding_period": 1,
+          "type": "fixed_holding_period"
+        },
+        "holdout": null,
+        "holdout_used_for_selection": false,
+        "plan_hash": "sha256:19578a9ae57bff481333dbd203f74878868f4bfae87db9e3d6c4a5b40b6096d1",
+        "plan_id": "plan-be65b033aa6e02704f3b010b",
+        "reason": null,
+        "research_mode": "PRICE_PROXY_RESEARCH",
+        "stage": "SCHEMA_VALIDATED",
+        "train": null,
+        "validation": null
+      },
+      {
+        "assumptions": {
+          "cost_sensitivity": {
+            "fee_bps": [
+              10.0,
+              20.0
+            ],
+            "slippage_bps": [
+              5.0,
+              10.0
+            ]
+          },
+          "fee_bps": 10.0,
+          "mode": "PRICE_PROXY_RESEARCH",
+          "roundtrip_fee_bps": 20.0,
+          "roundtrip_slippage_bps": 10.0,
+          "slippage_bps": 5.0,
+          "version": "price-proxy-v1"
+        },
+        "candidate_id": "candidate-337422c1c8de1778ebca5046",
+        "exit_policy": {
+          "holding_period": 1,
+          "type": "fixed_holding_period"
+        },
+        "holdout": null,
+        "holdout_used_for_selection": false,
+        "plan_hash": "sha256:971bcb5c4cf267110ddcdc6a4210e88069bb79cc9e89cb5b3fcaf29c3e82b239",
+        "plan_id": "plan-8ac63e17d15606b547e9000d",
+        "reason": null,
+        "research_mode": "PRICE_PROXY_RESEARCH",
+        "stage": "SCHEMA_VALIDATED",
+        "train": null,
+        "validation": null
+      },
+      {
+        "assumptions": {
+          "cost_sensitivity": {
+            "fee_bps": [
+              10.0,
+              20.0
+            ],
+            "slippage_bps": [
+              5.0,
+              10.0
+            ]
+          },
+          "fee_bps": 10.0,
+          "mode": "PRICE_PROXY_RESEARCH",
+          "roundtrip_fee_bps": 20.0,
+          "roundtrip_slippage_bps": 10.0,
+          "slippage_bps": 5.0,
+          "version": "price-proxy-v1"
+        },
+        "candidate_id": "candidate-4dd67f04c47009a123778b45",
+        "exit_policy": {
+          "holding_period": 1,
+          "type": "fixed_holding_period"
+        },
+        "holdout": null,
+        "holdout_used_for_selection": false,
+        "plan_hash": "sha256:e170b0d183965a46c5c76970fad23bf969e68cdc97588a1d99cb85a5400e2008",
+        "plan_id": "plan-e2582eae2deb09d0b5c8246f",
+        "reason": null,
+        "research_mode": "PRICE_PROXY_RESEARCH",
+        "stage": "SCHEMA_VALIDATED",
+        "train": null,
+        "validation": null
+      }
+    ],
+    "holdout_used_for_selection": false,
+    "recorded_book_replay": {
+      "assumption_version": "recorded-book-replay-v1",
+      "holdout_used_for_selection": false,
+      "metadata_used": false,
+      "projection_hash": "sha256:131347a4c6ef08e758068cfae039e58e4326c9f2c3304f2a452e3b6d37a5ffba",
+      "research_mode": "RECORDED_BOOK_REPLAY",
+      "rows": 4091,
+      "source_type": "FORWARD_COLLECTED",
+      "status": "PASS",
+      "trials": [
+        {
+          "assumption_version": "recorded-book-replay-v1",
+          "candidate_id": "candidate-0862526b10122b3d884c5a52",
+          "canonical_assumption_version": "price-proxy-v1",
+          "cost_assumptions": {
+            "fee_bps": 10.0,
+            "roundtrip_fee_bps": 20.0,
+            "roundtrip_slippage_bps": 10.0,
+            "slippage_bps": 5.0
+          },
+          "cost_sensitivity": {
+            "fee_bps": [
+              10.0,
+              20.0
+            ],
+            "slippage_bps": [
+              5.0,
+              10.0
+            ]
+          },
+          "evaluator": "evaluate_signal_evaluation:v1",
+          "exit_policy": {
+            "assumptions": {
+              "fee_bps": 10.0,
+              "slippage_bps": 5.0,
+              "version": "recorded-book-replay-v1"
+            },
+            "holding_period": 1,
+            "type": "fixed_holding_period"
+          },
+          "filled_trades": 0,
+          "metrics": {
+            "brier": 0.0,
+            "ece": 0.0,
+            "executable_edge": 0.0,
+            "expected_roi": 0.0,
+            "expected_value": 0.0,
+            "fills": 0.0,
+            "final_equity": 10000.0,
+            "initial_equity": 10000.0,
+            "log_loss": 0.0,
+            "raw_edge": 0.0,
+            "roi": 0.0
+          },
+          "outcome_count": 0,
+          "plan_hash": "sha256:19578a9ae57bff481333dbd203f74878868f4bfae87db9e3d6c4a5b40b6096d1",
+          "research_mode": "RECORDED_BOOK_REPLAY",
+          "research_quality": "ORDER_BOOK_SIMULATED",
+          "sample_count": 4091,
+          "source_type": "FORWARD_COLLECTED",
+          "strategy_id": "candidate-0862526b10122b3d884c5a52",
+          "template": "probability_mispricing",
+          "unresolved_count": 0
+        },
+        {
+          "assumption_version": "recorded-book-replay-v1",
+          "candidate_id": "candidate-337422c1c8de1778ebca5046",
+          "canonical_assumption_version": "price-proxy-v1",
+          "cost_assumptions": {
+            "fee_bps": 10.0,
+            "roundtrip_fee_bps": 20.0,
+            "roundtrip_slippage_bps": 10.0,
+            "slippage_bps": 5.0
+          },
+          "cost_sensitivity": {
+            "fee_bps": [
+              10.0,
+              20.0
+            ],
+            "slippage_bps": [
+              5.0,
+              10.0
+            ]
+          },
+          "evaluator": "evaluate_signal_evaluation:v1",
+          "exit_policy": {
+            "assumptions": {
+              "fee_bps": 10.0,
+              "slippage_bps": 5.0,
+              "version": "recorded-book-replay-v1"
+            },
+            "holding_period": 1,
+            "type": "fixed_holding_period"
+          },
+          "filled_trades": 16,
+          "metrics": {
+            "brier": 0.0,
+            "ece": 0.0,
+            "executable_edge": 0.0,
+            "expected_roi": 0.0,
+            "expected_value": 0.0,
+            "fills": 16.0,
+            "final_equity": 9957.5750731989,
+            "initial_equity": 10000.0,
+            "log_loss": 0.0,
+            "raw_edge": 0.0,
+            "roi": -0.0042424926801101215
+          },
+          "outcome_count": 0,
+          "plan_hash": "sha256:971bcb5c4cf267110ddcdc6a4210e88069bb79cc9e89cb5b3fcaf29c3e82b239",
+          "research_mode": "RECORDED_BOOK_REPLAY",
+          "research_quality": "ORDER_BOOK_SIMULATED",
+          "sample_count": 4091,
+          "source_type": "FORWARD_COLLECTED",
+          "strategy_id": "candidate-337422c1c8de1778ebca5046",
+          "template": "mean_reversion",
+          "unresolved_count": 4
+        },
+        {
+          "assumption_version": "recorded-book-replay-v1",
+          "candidate_id": "candidate-4dd67f04c47009a123778b45",
+          "canonical_assumption_version": "price-proxy-v1",
+          "cost_assumptions": {
+            "fee_bps": 10.0,
+            "roundtrip_fee_bps": 20.0,
+            "roundtrip_slippage_bps": 10.0,
+            "slippage_bps": 5.0
+          },
+          "cost_sensitivity": {
+            "fee_bps": [
+              10.0,
+              20.0
+            ],
+            "slippage_bps": [
+              5.0,
+              10.0
+            ]
+          },
+          "evaluator": "evaluate_signal_evaluation:v1",
+          "exit_policy": {
+            "assumptions": {
+              "fee_bps": 10.0,
+              "slippage_bps": 5.0,
+              "version": "recorded-book-replay-v1"
+            },
+            "holding_period": 1,
+            "type": "fixed_holding_period"
+          },
+          "filled_trades": 16,
+          "metrics": {
+            "brier": 0.0,
+            "ece": 0.0,
+            "executable_edge": 0.0,
+            "expected_roi": 0.0,
+            "expected_value": 0.0,
+            "fills": 16.0,
+            "final_equity": 9966.894168075263,
+            "initial_equity": 10000.0,
+            "log_loss": 0.0,
+            "raw_edge": 0.0,
+            "roi": -0.0033105831924736817
+          },
+          "outcome_count": 0,
+          "plan_hash": "sha256:e170b0d183965a46c5c76970fad23bf969e68cdc97588a1d99cb85a5400e2008",
+          "research_mode": "RECORDED_BOOK_REPLAY",
+          "research_quality": "ORDER_BOOK_SIMULATED",
+          "sample_count": 4091,
+          "source_type": "FORWARD_COLLECTED",
+          "strategy_id": "candidate-4dd67f04c47009a123778b45",
+          "template": "momentum",
+          "unresolved_count": 4
+        }
+      ]
+    },
+    "status": "PASS"
+  }
+}

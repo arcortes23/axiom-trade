@@ -513,7 +513,7 @@ class Phase3CollectionTests(unittest.TestCase):
             _seed_frozen_candidate(
                 store,
                 "paper-priority",
-                ("paper-a",),
+                ("candidate-a", "paper-a"),
                 persist_resolution=False,
             )
             CandidateLifecycleManager(store).advance(
@@ -526,6 +526,7 @@ class Phase3CollectionTests(unittest.TestCase):
                 store,
                 CollectorConfig(
                     interval_seconds=60,
+                    market_ids=ids,
                     max_markets=4,
                     discovery_budget_per_cycle=1,
                     backoff_initial_seconds=0,
@@ -538,26 +539,33 @@ class Phase3CollectionTests(unittest.TestCase):
 
             self.assertEqual(
                 list(cycle.candidate_bound_markets),
-                ["candidate-a", "candidate-b", "paper-a"],
+                ["candidate-a", "candidate-b"],
             )
             self.assertEqual(
                 list(cycle.candidate_bound_scheduled),
-                ["candidate-a", "candidate-b", "paper-a"],
+                ["candidate-a", "candidate-b"],
             )
             self.assertEqual(
                 list(cycle.candidate_bound_fresh),
-                ["candidate-a", "candidate-b", "paper-a"],
+                ["candidate-a", "candidate-b"],
             )
             self.assertEqual(list(cycle.candidate_bound_stale), [])
             self.assertEqual(list(cycle.candidate_bound_missing), [])
-            self.assertEqual(list(cycle.paper_forward_markets), [])
-            self.assertEqual(list(cycle.paper_forward_scheduled), [])
+            self.assertEqual(list(cycle.paper_forward_markets), ["paper-a"])
+            self.assertEqual(list(cycle.paper_forward_scheduled), ["paper-a"])
+            self.assertEqual(
+                cycle.candidate_references,
+                {
+                    "candidate-a": ["candidate-priority"],
+                    "candidate-b": ["candidate-priority"],
+                },
+            )
             self.assertEqual(list(cycle.discovery_scheduled), [])
             self.assertEqual(list(cycle.discovery_deferred), [])
-            self.assertEqual(cycle.tier_attempts["candidate"], 3)  # type: ignore[index]
-            self.assertEqual(cycle.tier_successes["candidate"], 3)  # type: ignore[index]
-            self.assertEqual(cycle.tier_attempts["paper_forward"], 0)  # type: ignore[index]
-            self.assertEqual(cycle.tier_successes["paper_forward"], 0)  # type: ignore[index]
+            self.assertEqual(cycle.tier_attempts["candidate"], 2)  # type: ignore[index]
+            self.assertEqual(cycle.tier_successes["candidate"], 2)  # type: ignore[index]
+            self.assertEqual(cycle.tier_attempts["paper_forward"], 1)  # type: ignore[index]
+            self.assertEqual(cycle.tier_successes["paper_forward"], 1)  # type: ignore[index]
             self.assertEqual(cycle.tier_attempts["discovery"], 0)  # type: ignore[index]
             self.assertEqual(cycle.tier_successes["discovery"], 0)  # type: ignore[index]
             self.assertEqual(cycle.markets_seen, 3)
@@ -1147,7 +1155,7 @@ class Phase3PaperAndRiskTests(unittest.TestCase):
                             "settlement": "OPEN",
                         },
                         "source_timestamp": stamp,
-                        "observed_at": stamp,
+                        "observed_at": stamp + timedelta(seconds=1),
                     },
                 )
             first = run_forward_paper(
@@ -1176,12 +1184,29 @@ class Phase3PaperAndRiskTests(unittest.TestCase):
                 start_timestamp=T0,
                 allowed_markets=("m",),
             )
+            historical_stamp = T0 - timedelta(seconds=1)
             historical = {
                 "market_id": "m",
-                "timestamp": T0 - timedelta(seconds=1),
+                "timestamp": historical_stamp,
+                "source_timestamp": historical_stamp,
+                "source_snapshot_id": "historical-book-1",
+                "source_type": "FORWARD_COLLECTED",
                 "yes_mid": 0.4,
                 "yes_bid": 0.39,
                 "yes_ask": 0.41,
+                "yes_order_book": {
+                    "timestamp": historical_stamp.isoformat(),
+                    "bids": [[0.39, 10.0]],
+                    "asks": [[0.41, 10.0]],
+                },
+                "no_order_book": {
+                    "timestamp": historical_stamp.isoformat(),
+                    "bids": [[0.59, 10.0]],
+                    "asks": [[0.61, 10.0]],
+                },
+                "depth": 10,
+                "partial": False,
+                "gaps": [],
                 "settlement": "OPEN",
             }
             cycle = run_historical_replay(
@@ -1194,6 +1219,12 @@ class Phase3PaperAndRiskTests(unittest.TestCase):
             )
             self.assertEqual(cycle.observations_processed, 1)
             self.assertIsNotNone(store.load_paper_state(historical_replay_id(spec, [historical])))
+            replay_id = historical_replay_id(spec, [historical])
+            observations = store.list_paper_observations(replay_id)
+            self.assertEqual(observations[0]["payload"]["source_type"], "FORWARD_COLLECTED")
+            events = store.list_paper_execution_events(replay_id)
+            self.assertEqual(events[0]["payload"]["research_label"], "REPLAY")
+            self.assertNotEqual(events[0]["payload"]["source_type"], "PAPER_FORWARD")
 
     def test_failed_paper_state_cas_restores_caller_owned_objects_in_place(self) -> None:
         with AxiomStore(":memory:") as store:
@@ -1354,7 +1385,6 @@ class Phase3PaperAndRiskTests(unittest.TestCase):
             observation = {
                 "market_id": "m",
                 "timestamp": T0 + timedelta(minutes=1),
-                "yes_ask": 0.41,
                 "settlement": "OPEN",
             }
             cycle = run_forward_paper(
@@ -1368,6 +1398,8 @@ class Phase3PaperAndRiskTests(unittest.TestCase):
             self.assertEqual(cycle.observations_processed, 1)
             self.assertEqual(cycle.observations_skipped, 0)
             self.assertEqual(store.load_fills(), [])
+            events = store.list_paper_execution_events(spec.experiment_id)
+            self.assertEqual(events[0]["payload"]["reason"], "missing_executable_quote")
 
     def test_stateful_model_rolls_back_and_restores_across_restart(self) -> None:
         class StatefulModel:
@@ -1568,11 +1600,11 @@ class Phase3NodeDashboardTests(unittest.TestCase):
                     NodeConfig(db, log_path=log, interval_seconds=1, max_markets=1),
                     provider=provider,
                     store=store,
+                    clock=lambda: T0,
                 )
                 cycles = node.run(max_cycles=1)
                 status = node.status()
                 self.assertEqual(len(cycles), 1)
-                self.assertEqual(status["status"], "idle")
                 self.assertFalse(status["lock_exists"])
                 self.assertTrue(Path(log).exists())
                 self.assertEqual(store.list_worker_states()[0]["status"], "idle")

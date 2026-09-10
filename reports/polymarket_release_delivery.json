@@ -1,0 +1,301 @@
+{
+  "status": "VERIFIED_READY_TO_PUBLISH",
+  "baseline": "c2a08f7bf468be20271a0b074a1ed6e0e12c2b94",
+  "branch": "feature/polymarket-one-click-canary",
+  "development_root": "C:/Users/User/projects/axiom-polymarket-release",
+  "live_root": "C:/Users/User/projects/axiom",
+  "live_database": "C:/Users/User/projects/axiom/runtime-data/axiom.sqlite",
+  "development_port": 8187,
+  "authorization": {
+    "live_orders": false,
+    "live_activation": false,
+    "account_mutation": false,
+    "deployment_final_control": "DISARMED"
+  },
+  "observations": [
+    "Fetched origin; local main and origin/main equal baseline.",
+    "Existing live untracked axiom_platform.egg-info preserved.",
+    "Created separate branch/worktree and dedicated Python 3.12 virtual environment.",
+    "Use absolute interpreter paths: relative executable resolution unexpectedly selected live environment; no package installation occurred in that failed call.",
+    "No configured LSP servers. Repository uses Python/pytest, not Bun gates.",
+    "Installed polymarket-client 0.9.0; audited private SDK construction can create API credentials unless explicitly prevented.",
+    "Agent isolation incident: several workers edited live tracked source despite explicit release ownership; edits stopped and exact bytes preserved under release runtime-data/recovery.",
+    "Recovery verified by Main: live git status again contains only original untracked axiom_platform.egg-info; all task source changes transferred to isolated release.",
+    "Read-only archive inventory: 18141 historical snapshots across 1000 markets; 68793 forward snapshots across 100 markets; no persisted trades.",
+    "Historical contemporaneous lifecycle metadata coverage 0/18141; forward prior-or-equal metadata coverage 68793/68793.",
+    "Verified bounded mixed archive export SHA256 448e19a5895ca8e295fcef73d512f509d128f66bd455322799f88d25eab57868: 4096 historical and 4091 forward snapshots plus eight metadata anchors.",
+    "Remote main branch is unprotected; publication must still fetch, integrate and pass full gates.",
+    "Corrected an earlier API assumption after re-reading https://docs.polymarket.com/api-reference/core/get-trades-for-a-user-or-markets: public /trades supports start/end epoch-second windows, with limit/offset capped at 10000. Preserve supported window pagination; do not remove end parameters."
+  ],
+  "verification": [
+    {
+      "stage": "isolated-dependencies",
+      "result": "PASS",
+      "sdk": "polymarket-client 0.9.0",
+      "timezone_database": "tzdata 2026.3",
+      "pip_check": "No broken requirements found"
+    },
+    {
+      "stage": "complete-source-compilation",
+      "result": "PASS_AFTER_REPAIR",
+      "initial_defects": [
+        "Missing prediction effective_state closing parenthesis",
+        "Missing settings regression try/finally cleanup"
+      ]
+    },
+    {
+      "stage": "combined-repository-suite",
+      "result": "FAIL",
+      "passed": 778,
+      "failed": 259,
+      "skipped": 3,
+      "seconds": 210.11,
+      "junit": "runtime-data/release-suite.xml",
+      "failure_evidence": "runtime-data/release-failures.json",
+      "isolation": "AXIOM_EXECUTION_PROFILE=isolated; real keyring null; absolute release interpreter and import path",
+      "response": "Disjoint source and contract-test repairs dispatched; no merge or deployment authorized by this failed gate."
+    },
+    {
+      "stage": "independent-boundary-review",
+      "result": "THREE_P1_REPAIRS_REQUIRED",
+      "findings": [
+        "BOUNDARY-001: Official SDK market context omitted the tick size required for entry feasibility.",
+        "BOUNDARY-002: Collector-cadence stop polling could time out a restart then stop the node without replacement.",
+        "BOUNDARY-003: Windows PID query failure could reach terminating os.kill(pid, 0) before ownership proof."
+      ],
+      "response": "Official-context and Windows ownership/cooperative-stop repairs delegated; no production processes or orders exercised."
+    },
+    {
+      "stage": "independent-financial-review",
+      "result": "CORRECTIVE_HANDOFF_PENDING_FULL_GATE",
+      "repair_areas": [
+        "Stable confirmed trade identities; provisional MATCHED evidence never becomes settled inventory or realized profit.",
+        "Durable accounting failure and missing venue order identity remain UNKNOWN without blind retry.",
+        "Recovery of reservations and confirmed inventory before position-lot projection.",
+        "BUY-only actual-cost overrun breaker and authoritative UNKNOWN equity entry gate.",
+        "Fresh fee-aware owned-inventory valuation, preserving original trade and current assessment generations.",
+        "Confirmed partial acquisition, partial exit, late fills, terminal remainder release and allocated cost basis.",
+        "Legacy obligation adoption without synthetic aggregate fills or new-send authorization.",
+        "Original exit-policy recovery and explicit management blockers when provenance is unavailable.",
+        "Actual venue trade timestamps and canonical Manila-day submitted-order/PnL projections."
+      ],
+      "verification": "Review findings were delegated for source and regression repairs. No new complete gate, real-data smoke, browser verification, merge, or deployment has passed yet."
+    },
+    {
+      "stage": "complete-compilation-and-undefined-name-gate",
+      "compilation": "PASS",
+      "undefined_name_analysis": "PASS_AFTER_REPAIR",
+      "analyzer": "pyflakes 3.4.0",
+      "response": "Exact missing imports, catalog identity initialization, collector counter initialization and test fixture names delegated in three disjoint slices. Unrelated unused-import warnings are not suppressed or reformatted.",
+      "source_isolation_incident": "A corrective agent briefly added then reverted a Sequence import in the protected dashboard after using the wrong source root. Explicit full-path targets were reissued.",
+      "protected_source_check": "git status --short in the protected live checkout showed only the pre-existing untracked axiom_platform.egg-info directory; no tracked source changes remained.",
+      "full_pytest_rerun": "FAIL_SEE_R2"
+    },
+    {
+      "stage": "combined-repository-suite-r2",
+      "result": "FAIL",
+      "passed": 814,
+      "failed": 254,
+      "skipped": 3,
+      "subtests_passed": 274,
+      "seconds": 261.61,
+      "junit": "runtime-data/release-suite-r2.xml",
+      "failure_evidence": "runtime-data/release-failures-r2.json",
+      "dominant_failures": {
+        "missing_equity_loss_usd": 75,
+        "canary_settings_unavailable": 65,
+        "scope_store_missing_forward_test_protocol": 18,
+        "invalid_prediction_strategy_fixtures": 7
+      },
+      "response": "Seven disjoint accounting, research, mode, discovery, canary, position and runtime corrections dispatched. Merge and deployment remain blocked."
+    },
+    {
+      "stage": "operational-powershell-syntax",
+      "result": "PASS",
+      "scripts_parsed": 4,
+      "syntax_errors": 0,
+      "execution": "Parser only; no operational script executed."
+    },
+    {
+      "stage": "combined-repository-suite-r3",
+      "result": "FAIL",
+      "passed": 960,
+      "failed": 74,
+      "skipped": 3,
+      "subtests_passed": 342,
+      "seconds": 263.73,
+      "compilation": "PASS",
+      "undefined_name_errors": 0,
+      "junit": "runtime-data/release-suite-r3.xml",
+      "failure_evidence": "runtime-data/release-failures-r3.json",
+      "dataset_http_regressions": "PASS_AFTER_RESTORING_SQL_BOUND_VALUES",
+      "response": "Remaining nested transaction, candidate registration, source freshness, SDK constructor, position and projection defects assigned to disjoint owners. Real-data smoke capture chronology also requires correction. No merge or deployment."
+    },
+    {
+      "stage": "combined-repository-suite-r4",
+      "result": "FAIL",
+      "passed": 967,
+      "failed": 68,
+      "skipped": 3,
+      "subtests_passed": 342,
+      "seconds": 274.72,
+      "junit": "runtime-data/release-suite-r4.xml",
+      "failure_evidence": "runtime-data/release-failures-r4.json",
+      "response": "Main repaired an invalid fixture source type, dropped research result fields, and an accidentally lost canonical integration test declaration. No safety gates relaxed."
+    },
+    {
+      "stage": "focused-failure-regressions-r5",
+      "result": "FAIL",
+      "passed": 39,
+      "failed": 30,
+      "deselected": 970,
+      "seconds": 13.39,
+      "junit": "runtime-data/release-focused-r5.xml",
+      "failure_evidence": "runtime-data/release-failures-r5.json",
+      "scope": "Previously failing cases, including the restored canonical integration test; not a full-suite pass.",
+      "response": "Four disjoint owners correcting remaining risk/settlement, research/observation, worker and dashboard behavior. Publication remains blocked."
+    },
+    {
+      "stage": "focused-failure-regressions-r6",
+      "result": "FAIL",
+      "passed": 16,
+      "failed": 14,
+      "deselected": 1009,
+      "seconds": 8.10,
+      "junit": "runtime-data/release-focused-r6.xml",
+      "failure_evidence": "runtime-data/release-failures-r6.json",
+      "scope": "Previously failing cases only; full-suite gate remains unsatisfied.",
+      "undefined_name_errors": 0,
+      "response": "Remaining financial and research causes assigned to two disjoint owners. No merge, deployment, live activation or live fill verification."
+    },
+    {
+      "stage": "persisted-dashboard-projection-repairs",
+      "result": "PASS",
+      "passed": 2,
+      "seconds": 3.13,
+      "scope": "Targeted ranking/lifecycle projection and stale/error health regression tests only.",
+      "evidence": "Non-mutating return tracing proved counts disappeared from the active-control authoritative result. Restored its four already-computed count fields. Persisted normal worker health grade and scope; regression runs the health writer before storage-only dashboard reads.",
+      "response": "Both reproduced dashboard failures now pass. Twelve R6 financial/research failures remain under repair."
+    },
+    {
+      "stage": "combined-repository-suite-r13",
+      "result": "PASS",
+      "passed": 1037,
+      "failed": 0,
+      "skipped": 3,
+      "subtests_passed": 342,
+      "seconds": 212.25,
+      "junit": "runtime-data/release-suite-r13.xml",
+      "undefined_name_errors": 0,
+      "response": "The complete isolated suite passed after reconciliation identity, frozen experiment idempotence, readiness projection, health persistence, and fee-inclusive venue minimum repairs."
+    },
+    {
+      "stage": "bounded-real-data-smoke-r15",
+      "result": "NO_SUPPORTED_EDGE",
+      "seconds": 97.906,
+      "report": "reports/polymarket_release_smoke_r15.json",
+      "export_sha256": "448e19a5895ca8e295fcef73d512f509d128f66bd455322799f88d25eab57868",
+      "historical_rows": 4096,
+      "public_markets_attempted": 2,
+      "public_markets_successful": 2,
+      "public_collection_errors": 0,
+      "recorded_book_replay": "PASS",
+      "actual_current_evaluator_ran": false,
+      "reason": "NO_SUPPORTED_EDGE",
+      "isolation": {
+        "credentials_read": false,
+        "orders_submitted": false,
+        "account_mutation": false,
+        "live_database_accessed": false
+      },
+      "response": "Three canonical starters were evaluated but the bounded historical projection had insufficient chronological observations for supported-edge qualification. The smoke truthfully skipped current canary evaluation rather than fabricating eligibility."
+    },
+    {
+      "stage": "isolated-operator-surface",
+      "result": "PASS_WITH_VISUAL_TOOL_UNAVAILABLE",
+      "port": 8187,
+      "surface": "http://127.0.0.1:8187/",
+      "evidence": "The actual operator command launched its supervised isolated node and served the console on port 8187. The returned page identified live trading as Disabled, paper risk as Active, Polymarket production transport as disabled, and exposed no browser order action.",
+      "visual_verification": "Browser daemon unavailable; verified the running HTTP surface directly and stopped the isolated operator and child node."
+    },
+    {
+      "stage": "combined-repository-suite-r16",
+      "result": "PASS",
+      "passed": 1037,
+      "failed": 0,
+      "skipped": 3,
+      "subtests_passed": 342,
+      "seconds": 212.25,
+      "junit": "runtime-data/release-suite-r16.xml",
+      "undefined_name_errors": 0,
+      "response": "Final post-smoke source passed the complete isolated repository gate."
+    },
+    {
+      "stage": "final-financial-review",
+      "result": "CLEAN",
+      "scope": "Accepted-order accounting, exit-timeout handling, transition cleanup, canonical fill recovery, and mixed provisional-surveillance fixes.",
+      "verification": "The final financial reviewer reported no remaining findings in the reviewed areas.",
+      "release_implication": "This review does not replace the required post-lifecycle-change complete gate; deployment and live-fill verification remain unauthorized."
+    },
+    {
+      "stage": "final-isolation-review",
+      "result": "CLEAN",
+      "scope": "Execution-profile binding and isolated runtime boundaries.",
+      "verification": "The final isolation reviewer reported no remaining findings after execution-profile binding.",
+      "release_implication": "This review does not authorize deployment, activation, orders, or live-fill verification."
+    },
+    {
+      "stage": "combined-repository-suite-r21-pre-lifecycle-change",
+      "result": "PASS_PRE_LIFECYCLE_CHANGE",
+      "passed": 1040,
+      "failed": 0,
+      "skipped": 3,
+      "subtests_passed": 342,
+      "seconds": 221.985,
+      "junit": "reports/polymarket_release_r21_junit.xml",
+      "scope": "Complete isolated repository suite captured before the subsequent lifecycle-code changes.",
+      "response": "R21 is historical evidence only. It does not satisfy the required final post-lifecycle-change gate."
+    },
+    {
+      "stage": "required-post-lifecycle-change-complete-gate",
+      "result": "PASS",
+      "tests": 1437,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 3,
+      "seconds": 250.281,
+      "junit": "reports/polymarket_release_final_junit.xml",
+      "isolation": "AXIOM_EXECUTION_PROFILE=isolated",
+      "scope": "Complete isolated repository suite after all lifecycle, SDK compatibility, recovery-provenance, and financial-accounting changes."
+    },
+    {
+      "stage": "windows-node-lifecycle-r35",
+      "result": "PASS",
+      "evidence": "Started isolated node PID 33752, restarted without -Isolated as PID 28024 while preserving the isolated profile, validated PID/start-time identity, then stopped with markers cleaned.",
+      "process_identity": "Windows FILETIME ticks use epoch 504911232000000000 and agree with the running process StartTime."
+    },
+    {
+      "stage": "bundled-sdk-compatibility",
+      "result": "PASS",
+      "sdk": "polymarket-client 0.9.0",
+      "evidence": "Authenticated trade normalization retained taker_order_id and matched_at, omitted the SDK trade-id filter for order lookup, and locally selected only matching taker/maker order relationships. Entry and exit paths accept SDK live/matched/delayed success states."
+    },
+    {
+      "stage": "final-current-snapshot-reviews",
+      "result": "CLEAN",
+      "reviews": [
+        "Lifecycle ownership and persisted execution-profile review",
+        "Execution isolation and release-scope review",
+        "Financial accounting, recovery provenance, v2 execution-asset binding, and SDK response review"
+      ]
+    },
+    {
+      "stage": "pre-deployment-live-database-backup",
+      "result": "PASS",
+      "path": "C:/Users/User/projects/axiom/runtime-data/backups/axiom-pre-polymarket-20260910T204354Z.sqlite",
+      "method": "sqlite3.Connection.backup",
+      "quick_check": "ok"
+    }
+  ],
+  "live_fills_verified": false
+}

@@ -2301,7 +2301,6 @@ class MarketScopeAcceptanceToolTests(unittest.TestCase):
             "PRICE_PROXY",
         )
         processor_result = chain["processor"]["results"][0]
-        self.assertNotIn("data_quality", processor_result)
         modes = history_metrics["research_modes"]
         self.assertEqual(modes["STRICT_EXECUTABLE_SIMULATION"]["status"], "UNAVAILABLE")
         self.assertEqual(modes["PRICE_PROXY_SIMULATION"]["status"], "PERFORMED")

@@ -32,6 +32,7 @@ from .domain import (
     utc_now,
 )
 from .storage import AxiomStore
+from .forward import ForwardTestRegistry
 _UNSET = object()
 _MAX_SCOPE_REQUEST_PATH_LENGTH = 512
 _MAX_SCOPE_QUERY_DEPTH = 8
@@ -155,6 +156,8 @@ class CollectionCycle:
     tier_failures: Mapping[str, int] | None = None
     request_latency_summary: Mapping[str, Any] | None = None
     capacity_reason: str | None = None
+    discovery_coverage_status: str | None = None
+    discovery_cursor: str | None = None
 
     @property
     def duration_seconds(self) -> float:
@@ -204,6 +207,8 @@ class CollectionCycle:
             "tier_failures": dict(self.tier_failures or {}),
             "request_latency_summary": dict(self.request_latency_summary or {}),
             "capacity_reason": self.capacity_reason,
+            "discovery_coverage_status": self.discovery_coverage_status,
+            "discovery_cursor": self.discovery_cursor,
         }
 
 
@@ -228,6 +233,7 @@ class PolymarketCollector:
         self.config = config or CollectorConfig()
         self.clock = clock
         self.sleep = sleep
+        self._discovery_continuation: Mapping[str, Any] | None = None
         # The nested continuation is assembled during scope discovery and
         # persisted with the root collector state at the end of the cycle.
         self._scope_inventory_continuation: Mapping[str, Any] | None = None
@@ -246,22 +252,53 @@ class PolymarketCollector:
             if isinstance(root_state.get("scope_inventory_continuation"), Mapping)
             else None
         )
+        self._discovery_continuation = (
+            root_state.get("discovery_continuation")
+            if isinstance(root_state.get("discovery_continuation"), Mapping)
+            else None
+        )
         requested = tuple(dict.fromkeys(str(item).strip() for item in (market_ids or ()) if str(item).strip()))
         configured = requested or self.config.market_ids
-        counters = self._new_counters()
-        primary_candidate_ids = self._active_primary_candidate_ids()
+        configured_values = tuple(configured)
+        primary_candidate_ids = self._active_primary_candidate_ids() or []
         paper_ids = self._active_paper_forward_ids()
+        observation_intent_ids = self._active_observation_intent_ids()
+        primary_candidate_set = set(primary_candidate_ids)
+        paper_set = set(paper_ids)
+        observation_set = set(observation_intent_ids)
+        counters = self._new_counters()
         scope_candidate_ids, scope_candidate_markets, scope_discovered, scope_cursor = (
             self._resolve_market_scopes(
                 started,
-                tuple(dict.fromkeys([*(primary_candidate_ids or ()), *paper_ids])),
+                tuple(
+                    dict.fromkeys(
+                        [*(primary_candidate_ids or ()), *paper_ids, *observation_intent_ids]
+                    )
+                ),
                 root_state,
                 counters,
             )
         )
+        self._materialize_observation_intents(
+            started,
+            observation_intent_ids,
+            scope_candidate_markets,
+            counters,
+        )
         scope_candidate_set = set(scope_candidate_ids)
+        scope_primary_ids = [
+            identifier
+            for identifier in scope_candidate_ids
+            if identifier in primary_candidate_set
+        ]
+        scope_paper_ids = [
+            identifier
+            for identifier in scope_candidate_ids
+            if identifier not in primary_candidate_set
+            and (identifier in paper_set or identifier in observation_set)
+        ]
         legacy_primary_ids = [
-            identifier for identifier in (primary_candidate_ids or ())
+            identifier for identifier in primary_candidate_ids
             if identifier not in scope_candidate_set
         ]
         candidate_requirements = self._candidate_requirements(
@@ -273,24 +310,35 @@ class PolymarketCollector:
         # frozen market policy.  The older requirements projection is retained
         # only for candidates without one, preserving collection priority for
         # legacy stores while preventing a second scope authority.
-        for candidate_id in scope_candidate_ids:
+        for candidate_id in scope_primary_ids:
             for market_id in scope_candidate_markets.get(candidate_id, ()):
                 if market_id not in candidate_bound:
                     candidate_bound.append(market_id)
                 candidate_references.setdefault(market_id, [])
                 if candidate_id not in candidate_references[market_id]:
                     candidate_references[market_id].append(candidate_id)
-        if configured:
+        configured_paper_values: tuple[str, ...] = ()
+        if scope_candidate_set:
             allowed_scope_ids = {
                 market_id
                 for values in scope_candidate_markets.values()
                 for market_id in values
             }
-            configured_values = (
-                configured
-                if not scope_candidate_set
-                else tuple(item for item in configured if item in allowed_scope_ids)
+            configured_values = tuple(
+                item
+                for item in configured
+                if item in {
+                    market_id
+                    for candidate_id in scope_primary_ids
+                    for market_id in scope_candidate_markets.get(candidate_id, ())
+                }
             )
+            configured_paper_values = tuple(
+                item
+                for item in configured
+                if item in allowed_scope_ids and item not in configured_values
+            )
+        if configured_values:
             candidate_bound = list(dict.fromkeys([*configured_values, *candidate_bound]))
             for identifier in configured_values:
                 candidate_references.setdefault(identifier, [])
@@ -299,7 +347,7 @@ class PolymarketCollector:
         # Project resolved scope ids into that shape without asking storage to
         # rediscover or reinterpret the canonical policy.
         health_requirements: Mapping[str, Any] = candidate_requirements
-        if scope_candidate_set:
+        if scope_primary_ids:
             health_requirements = {
                 **dict(candidate_requirements),
                 "market_ids": list(candidate_bound),
@@ -309,28 +357,39 @@ class PolymarketCollector:
         candidate_fresh = list(candidate_health.get("fresh", ()))
         candidate_stale = list(candidate_health.get("stale", ()))
         candidate_missing = list(candidate_health.get("missing", ()))
-        if configured:
+        if configured_values:
             represented = set(candidate_fresh) | set(candidate_stale) | set(candidate_missing)
-            candidate_missing.extend(identifier for identifier in configured if identifier not in represented)
+            candidate_missing.extend(
+                identifier for identifier in configured_values if identifier not in represented
+            )
             candidate_missing = list(dict.fromkeys(candidate_missing))
         known_candidate = set(candidate_bound)
         due_set = set(candidate_stale) | set(candidate_missing)
         due_candidates = [identifier for identifier in candidate_bound if identifier in due_set]
         # Explicit/configured ids are authoritative even when no lifecycle
         # authority exists in a lightweight fake store.
-        if configured:
-            due_candidates = list(dict.fromkeys([*configured, *due_candidates]))
-            known_candidate.update(configured)
+        if configured_values:
+            due_candidates = list(dict.fromkeys([*configured_values, *due_candidates]))
+            known_candidate.update(configured_values)
 
-        legacy_paper_ids = [identifier for identifier in paper_ids if identifier not in scope_candidate_set]
+        legacy_paper_ids = [
+            identifier
+            for identifier in paper_ids
+            if identifier not in primary_candidate_set
+            and identifier not in scope_candidate_set
+        ]
         paper_requirements = self._candidate_requirements(started, candidate_ids=legacy_paper_ids)
         paper_markets = [
-            market_id for market_id in self._requirement_markets(paper_requirements)
+            market_id
+            for market_id in configured_paper_values
             if market_id not in known_candidate
         ]
-        for candidate_id in paper_ids:
-            if candidate_id not in scope_candidate_set:
-                continue
+        paper_markets.extend(
+            market_id
+            for market_id in self._requirement_markets(paper_requirements)
+            if market_id not in known_candidate and market_id not in paper_markets
+        )
+        for candidate_id in scope_paper_ids:
             for market_id in scope_candidate_markets.get(candidate_id, ()):
                 if market_id not in known_candidate and market_id not in paper_markets:
                     paper_markets.append(market_id)
@@ -341,14 +400,16 @@ class PolymarketCollector:
         paper_scheduled = paper_markets[:remaining]
         remaining = max(0, remaining - len(paper_scheduled))
 
-        discovery_cursor = scope_cursor if scope_candidate_set else root_state.get("discovery_carry_cursor", 0)
+        discovery_cursor = scope_cursor if scope_candidate_set else root_state.get(
+            "discovery_carry_cursor", 0
+        )
         discovery_scheduled: list[str] = []
         discovered: dict[str, PredictionMarketSnapshot] = {}
         discovery_deferred: list[str] = []
-        try:
-            discovery_cursor = max(0, int(discovery_cursor))
-        except (TypeError, ValueError):
-            discovery_cursor = 0
+        discovery_coverage_status = (
+            str((self._discovery_continuation or {}).get("coverage_status", "")).upper()
+            or None
+        )
         # A scope-bearing candidate has already consumed the one shared public
         # inventory pass above.  Never append unqualified inventory to its
         # schedule; this is what prevents research-only/invalid scopes from
@@ -380,6 +441,10 @@ class PolymarketCollector:
                     for identifier in deferred
                     if identifier not in known_candidate and identifier not in paper_markets
                 ]
+                discovery_coverage_status = (
+                    str((self._discovery_continuation or {}).get("coverage_status", "")).upper()
+                    or ("PARTIAL" if next_cursor is not None else "COMPLETE")
+                )
                 discovery_cursor = next_cursor
             except Exception as exc:
                 counters["errors"] += 1
@@ -533,6 +598,12 @@ class PolymarketCollector:
             tier_failures=tier_failures,
             request_latency_summary=self._latency_summary(counters.pop("_request_latencies", [])),
             capacity_reason=capacity_reason,
+            discovery_coverage_status=discovery_coverage_status,
+            discovery_cursor=(
+                str(discovery_cursor)
+                if isinstance(discovery_cursor, str) and discovery_cursor.strip()
+                else None
+            ),
             **counters,
         )
         cycle_payload = cycle.as_record()
@@ -599,6 +670,8 @@ class PolymarketCollector:
                 "markets_seen": len(planned_ids),
                 "stale_after_seconds": self.config.stale_after_seconds,
                 "discovery_carry_cursor": discovery_cursor,
+                "discovery_continuation": self._discovery_continuation,
+                "discovery_coverage_status": discovery_coverage_status,
                 "scope_discovery_carry_cursor": scope_cursor,
                 "scope_inventory_continuation": self._scope_inventory_continuation,
                 "candidate_bound_markets": list(candidate_bound),
@@ -809,9 +882,62 @@ class PolymarketCollector:
         return list(dict.fromkeys(
             str(row.get("candidate_id")).strip()
             for row in records
-            if isinstance(row, Mapping) and str(row.get("stage", "")).strip().upper() == "PAPER_FORWARD"
+            if isinstance(row, Mapping)
+            and str(row.get("stage", "")).strip().upper() in {"PAPER_FORWARD", "PAPER_PROMOTABLE"}
             and str(row.get("candidate_id", "")).strip()
         ))
+
+    def _active_observation_intent_ids(self) -> list[str]:
+        intents = ForwardTestRegistry(self.store).list_observation_intents()
+        result: list[str] = []
+        for spec in intents:
+            config = spec.config if isinstance(spec.config, Mapping) else {}
+            candidate_id = str(config.get("candidate_id", "")).strip()
+            if candidate_id:
+                result.append(candidate_id)
+        return list(dict.fromkeys(result))
+
+    def _materialize_observation_intents(
+        self,
+        observed_at: datetime,
+        candidate_ids: Sequence[str],
+        candidate_markets: Mapping[str, Sequence[str]],
+        counters: dict[str, Any],
+    ) -> None:
+        if not candidate_ids:
+            return
+        registry = ForwardTestRegistry(self.store)
+        by_candidate = {
+            str(spec.config.get("candidate_id", "")).strip(): spec
+            for spec in registry.list_observation_intents()
+            if isinstance(spec.config, Mapping)
+            and str(spec.config.get("candidate_id", "")).strip()
+        }
+        for candidate_id in candidate_ids:
+            markets = tuple(
+                str(item).strip()
+                for item in candidate_markets.get(candidate_id, ())
+                if str(item).strip()
+            )
+            if not markets:
+                continue
+            intent = by_candidate.get(str(candidate_id).strip())
+            if intent is None:
+                continue
+            # Later ticks refresh current scope authority, not the immutable
+            # experiment or its original registration timestamp.
+            if registry.get("forward-" + candidate_id) is not None:
+                continue
+            try:
+                registry.materialize_observation_intent(
+                    intent,
+                    allowed_markets=markets[:100],
+                    registration_timestamp=observed_at,
+                    now=observed_at,
+                    candidate_id=candidate_id,
+                )
+            except (TypeError, ValueError):
+                counters["errors"] += 1
 
     def _isolated_worker_providers(self) -> list[Any]:
         if self.config.max_concurrency <= 1:
@@ -864,11 +990,15 @@ class PolymarketCollector:
             if not isinstance(record, Mapping):
                 continue
             stage = str(record.get("stage", "")).strip().upper()
-            if stage not in {"FROZEN", "PAPER_FORWARD", "PAPER_PROMOTABLE"}:
-                continue
             payload = record.get("payload")
             if not isinstance(payload, Mapping):
                 continue
+            if stage not in {"FROZEN", "PAPER_FORWARD", "PAPER_PROMOTABLE"}:
+                if not (
+                    stage in {"SCHEMA_VALIDATED", "REJECTED"}
+                    and str(payload.get("paper_observation_intent_id", "")).strip()
+                ):
+                    continue
             if self._has_scope_material(payload):
                 documents.append((candidate_id, self._scope_document(payload)))
         if not documents:
@@ -1953,14 +2083,156 @@ class PolymarketCollector:
         counters: dict[str, Any],
         *,
         budget: int,
-        carry_cursor: int = 0,
+        carry_cursor: Any = None,
         provider: Any | None = None,
         exclude: set[str] | None = None,
-    ) -> tuple[Sequence[PredictionMarketSnapshot], int, Sequence[str]]:
+    ) -> tuple[Sequence[PredictionMarketSnapshot], Any, Sequence[str]]:
         provider = provider or self.provider
         excluded = exclude or set()
-        method = provider.markets
-        kwargs: dict[str, Any] = {"active": self.config.active}
+        budget = max(0, int(budget))
+        if budget <= 0:
+            self._discovery_continuation = {
+                **dict(self._discovery_continuation or {}),
+                "coverage_status": "BUDGET_EXHAUSTED",
+                "updated_at": observed_at.isoformat(),
+            }
+            return (), carry_cursor, ()
+
+        # Real Gamma adapters expose the documented keyset endpoint.  Keep the
+        # legacy offset path only for in-memory/test providers without it.
+        method_page = getattr(provider, "market_page", None)
+        if callable(method_page):
+            cursor = carry_cursor if isinstance(carry_cursor, str) and carry_cursor.strip() else None
+            limit = min(100, max(1, budget))
+            kwargs: dict[str, Any] = {
+                "limit": limit,
+                "after_cursor": cursor,
+                "closed": not self.config.active,
+                "include_tag": True,
+            }
+            try:
+                parameters = inspect.signature(method_page).parameters
+            except (TypeError, ValueError):
+                parameters = {}
+            if parameters and not any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters.values()
+            ):
+                kwargs = {key: value for key, value in kwargs.items() if key in parameters}
+            try:
+                page = self._call_provider(
+                    "discovery",
+                    lambda: method_page(**kwargs),
+                    observed_at,
+                    counters,
+                    provider=provider,
+                )
+            except Exception as exc:
+                counters["errors"] += 1
+                self._discovery_continuation = {
+                    **dict(self._discovery_continuation or {}),
+                    "coverage_status": "ERROR",
+                    "after_cursor": cursor,
+                    "error_reason": str(exc),
+                    "updated_at": observed_at.isoformat(),
+                }
+                self.store.save_collection_error(None, observed_at, "discovery", str(exc))
+                return (), cursor, ()
+            page_invalid = (
+                page is None
+                or (
+                    not isinstance(page, (Mapping, list, tuple))
+                    and not hasattr(page, "snapshots")
+                )
+            )
+            if page_invalid:
+                counters["errors"] += 1
+                self._discovery_continuation = {
+                    **dict(self._discovery_continuation or {}),
+                    "coverage_status": "ERROR",
+                    "after_cursor": cursor,
+                    "error_reason": "invalid discovery page",
+                    "updated_at": observed_at.isoformat(),
+                }
+                self.store.save_collection_error(None, observed_at, "discovery", "invalid discovery page")
+                return (), cursor, ()
+            status = str(self._scope_page_value(page, "coverage_status", "")).strip().upper()
+            next_cursor = self._scope_page_value(page, "next_cursor", None)
+            if next_cursor is not None and (
+                not isinstance(next_cursor, str) or not next_cursor.strip() or next_cursor == cursor
+            ):
+                counters["errors"] += 1
+                status = "ERROR"
+                next_cursor = cursor
+                self.store.save_collection_error(None, observed_at, "discovery", "invalid or repeated keyset cursor")
+            raw_items = self._scope_page_value(page, "snapshots", _UNSET)
+            if raw_items is _UNSET and isinstance(page, Mapping):
+                raw_items = page.get("markets", page.get("data", ()))
+            try:
+                snapshots = [
+                    item for item in list(raw_items or ())
+                    if isinstance(item, PredictionMarketSnapshot)
+                ]
+            except TypeError:
+                snapshots = []
+            malformed_count = self._scope_count(
+                self._scope_page_value(page, "malformed_count", 0)
+            )
+            if malformed_count:
+                counters["errors"] += malformed_count
+                self.store.save_collection_error(
+                    None,
+                    observed_at,
+                    "discovery_malformed_rows",
+                    f"{malformed_count} malformed public market rows",
+                )
+            if status == "ERROR":
+                counters["errors"] += 1
+                self._discovery_continuation = {
+                    **dict(self._discovery_continuation or {}),
+                    "coverage_status": status,
+                    "after_cursor": next_cursor,
+                    "updated_at": observed_at.isoformat(),
+                }
+                return (), next_cursor, ()
+            selected = [item for item in snapshots if item.market_id not in excluded][:budget]
+            selected_ids = {item.market_id for item in selected}
+            deferred = [
+                item.market_id
+                for item in snapshots
+                if item.market_id not in excluded and item.market_id not in selected_ids
+            ]
+            if not selected and not deferred and next_cursor is None:
+                status = "NO_MATCHING_MARKETS"
+            elif next_cursor is not None:
+                status = status if status in {"PARTIAL", "BUDGET_EXHAUSTED"} else "PARTIAL"
+            else:
+                status = status if status in {"PARTIAL", "COMPLETE"} else "COMPLETE"
+            self._discovery_continuation = {
+                "request_path": str(self._scope_page_value(page, "request_path", "/markets/keyset")),
+                "request_query": dict(kwargs),
+                "query_fingerprint": self._scope_page_value(page, "query_fingerprint", None),
+                "after_cursor": next_cursor,
+                "coverage_status": status,
+                "raw_count": self._scope_count(self._scope_page_value(page, "raw_count", len(snapshots))),
+                "unique_count": self._scope_count(self._scope_page_value(page, "unique_count", len(snapshots))),
+                "duplicate_count": self._scope_count(self._scope_page_value(page, "duplicate_count", 0)),
+                "malformed_count": self._scope_count(self._scope_page_value(page, "malformed_count", 0)),
+                "requested_at": observed_at.isoformat(),
+                "updated_at": observed_at.isoformat(),
+            }
+            return tuple(selected), next_cursor, tuple(deferred)
+
+        method = getattr(provider, "markets", None)
+        if not callable(method):
+            self._discovery_continuation = {
+                **dict(self._discovery_continuation or {}),
+                "coverage_status": "ERROR",
+                "error_reason": "provider has no market discovery method",
+                "updated_at": observed_at.isoformat(),
+            }
+            return (), carry_cursor, ()
+        kwargs = {"active": self.config.active}
         try:
             parameters = inspect.signature(method).parameters
         except (TypeError, ValueError):
@@ -1969,14 +2241,14 @@ class PolymarketCollector:
             parameter.kind is inspect.Parameter.VAR_KEYWORD
             for parameter in parameters.values()
         )
+        try:
+            legacy_cursor = int(carry_cursor or 0)
+        except (TypeError, ValueError):
+            legacy_cursor = 0
         if "limit" in parameters or accepts_kwargs or not parameters:
             kwargs["limit"] = min(
                 100,
-                max(
-                    self.config.max_markets,
-                    self.config.discovery_budget_per_cycle,
-                    carry_cursor + budget + 1,
-                ),
+                max(self.config.max_markets, self.config.discovery_budget_per_cycle, legacy_cursor + budget + 1),
             )
         values = self._call_provider(
             "discovery",
@@ -1987,8 +2259,13 @@ class PolymarketCollector:
         ) or ()
         snapshots = [item for item in values if isinstance(item, PredictionMarketSnapshot)]
         if not snapshots:
-            return (), carry_cursor, ()
-        offset = carry_cursor % len(snapshots)
+            self._discovery_continuation = {
+                "coverage_status": "NO_MATCHING_MARKETS",
+                "after_cursor": legacy_cursor,
+                "updated_at": observed_at.isoformat(),
+            }
+            return (), legacy_cursor, ()
+        offset = legacy_cursor % len(snapshots)
         rotated = snapshots[offset:] + snapshots[:offset]
         selected = [item for item in rotated if item.market_id not in excluded][:budget]
         selected_ids = {item.market_id for item in selected}
@@ -1999,6 +2276,11 @@ class PolymarketCollector:
         ]
         scanned = len(selected) + sum(1 for item in rotated if item.market_id in excluded)
         next_cursor = (offset + scanned) % len(snapshots)
+        self._discovery_continuation = {
+            "coverage_status": "PARTIAL",
+            "after_cursor": next_cursor,
+            "updated_at": observed_at.isoformat(),
+        }
         return selected, next_cursor, deferred
 
     def _collect_market(
@@ -2292,7 +2574,37 @@ class PolymarketCollector:
                 counters["errors"] += 1
                 self.store.save_collection_error(market_id, collection_observed_at, "future_trade", "trade timestamp is after collection observation")
                 continue
-            if self.store.save_polymarket_trade(market_id, trade):
+            provenance: Mapping[str, Any] = {}
+            provenance_getter = getattr(provider, "trade_provenance", None)
+            if callable(provenance_getter):
+                try:
+                    candidate_provenance = provenance_getter(trade)
+                except (TypeError, ValueError):
+                    candidate_provenance = {}
+                if isinstance(candidate_provenance, Mapping):
+                    # Query and collection time describe this observation, not
+                    # the immutable print.  Keeping them out of the stored
+                    # evidence prevents a repeated poll from conflicting with
+                    # the original trade payload.
+                    provenance = {
+                        key: candidate_provenance[key]
+                        for key in (
+                            "source_type",
+                            "provider",
+                            "endpoint",
+                            "condition_id",
+                            "source_identity",
+                            "response_timestamp",
+                        )
+                        if key in candidate_provenance
+                    }
+            trade_payload: Mapping[str, Any] = {
+                **to_record(trade),
+                "source_type": "FORWARD_COLLECTED",
+                "source_timestamp": trade.timestamp.isoformat(),
+                "provenance": dict(provenance),
+            }
+            if self.store.save_polymarket_trade(market_id, trade_payload):
                 counters["trades_inserted"] += 1
             else:
                 counters["trade_duplicates"] += 1

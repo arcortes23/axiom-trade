@@ -231,6 +231,11 @@ _PLAN_FIELDS = frozenset(
         "min_trades",
         "minimum_trades",
         "paper_only",
+        "research_mode",
+        "assumptions",
+        "exit_policy",
+        "exit",
+        "trial_budget",
     }
 )
 _SCOPE_PLAN_COMPATIBILITY_FIELDS = frozenset(
@@ -343,8 +348,26 @@ def _scope_source(document: Mapping[str, Any]) -> tuple[Mapping[str, Any], Mappi
 
 
 def _scope_arguments(source: Mapping[str, Any]) -> dict[str, Any]:
-    result = {name: source.get(name) for name in _SCOPE_ALIASES if name in source}
-    if "filters" not in result and "frozen_filters" in source:
+    """Return only material legacy aliases alongside an explicit policy.
+
+    Empty compatibility placeholders (``target={}``, ``filters={}``, and
+    similar values synthesized by older proposal adapters) carry no authority.
+    Passing them to ``normalize_market_scope`` would make an otherwise
+    equivalent canonical policy appear to conflict.
+    """
+    result: dict[str, Any] = {}
+    for name in _SCOPE_ALIASES:
+        if name not in source:
+            continue
+        value = source[name]
+        if value is None:
+            continue
+        if isinstance(value, Mapping) and not value:
+            continue
+        if isinstance(value, (list, tuple, set, frozenset)) and not value:
+            continue
+        result[name] = value
+    if "filters" not in result and source.get("frozen_filters") not in (None, {}):
         result["filters"] = source["frozen_filters"]
     return result
 def _legacy_conflict(source: Mapping[str, Any]) -> bool:
@@ -401,18 +424,6 @@ def _legacy_conflict(source: Mapping[str, Any]) -> bool:
     return False
 
 
-def _scope_source(document: Mapping[str, Any]) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
-    payload = document.get("payload")
-    root = payload if isinstance(payload, Mapping) else document
-    plan = root.get("experiment_plan") if isinstance(root, Mapping) else None
-    source = plan if isinstance(plan, Mapping) else root
-    # A row may persist a scope next to an embedded plan.  The embedded plan
-    # remains authoritative when present; top-level aliases are only a
-    # fallback when it has no scope material.
-    if isinstance(plan, Mapping) and not any(key in plan for key in (*_SCOPE_SOURCE_FIELDS, "market_scope")):
-        if any(key in root for key in (*_SCOPE_SOURCE_FIELDS, "market_scope")):
-            source = root
-    return root, source
 
 
 def classify_legacy_scope(
@@ -420,7 +431,7 @@ def classify_legacy_scope(
     *,
     source_document: Mapping[str, Any] | None = None,
 ) -> LegacyScopeAssessment:
-    """Classify one candidate/document without mutating or persisting it."""
+    """Classify one bounded document without mutating its source."""
     document = _resolve_document(document, source_document)
     if not isinstance(document, Mapping):
         return LegacyScopeAssessment(INVALID, "MALFORMED_DOCUMENT")
@@ -435,8 +446,20 @@ def classify_legacy_scope(
     candidate_id, frozen_hash = _references(bounded_document, root)
     if source is not root:
         for name in _SCOPE_SOURCE_FIELDS + ("market_scope",):
-            if name in source and name in root and _canonical(source[name]) != _canonical(root[name]):
-                return LegacyScopeAssessment(LEGACY_AMBIGUOUS, "CONFLICTING_MARKET_SCOPE", candidate_id, frozen_hash)
+            if name not in source or name not in root:
+                continue
+            if _canonical(source[name]) == _canonical(root[name]):
+                continue
+            if name == "market_scope":
+                try:
+                    left = _canonical_policy(MarketScopePolicy.from_mapping(source[name]))
+                    right = _canonical_policy(MarketScopePolicy.from_mapping(root[name]))
+                except (ExperimentPlanError, TypeError, ValueError):
+                    pass
+                else:
+                    if _canonical(left.as_dict()) == _canonical(right.as_dict()):
+                        continue
+            return LegacyScopeAssessment(LEGACY_AMBIGUOUS, "CONFLICTING_MARKET_SCOPE", candidate_id, frozen_hash)
         merged_source = dict(root)
         merged_source.update(source)
         source = merged_source
@@ -505,6 +528,14 @@ def _plan_document(root: Mapping[str, Any]) -> dict[str, Any]:
     nested = root.get("experiment_plan")
     if isinstance(nested, Mapping):
         result = {str(key): value for key, value in nested.items()}
+        for field_name in ("research_mode", "assumptions", "exit_policy", "trial_budget"):
+            if field_name in root and field_name in result and _canonical(root[field_name]) != _canonical(result[field_name]):
+                raise LegacyScopeError(
+                    "CONFLICTING_RESEARCH_CONTRACT",
+                    f"legacy top-level {field_name} conflicts with experiment_plan",
+                )
+            if field_name in root:
+                result.setdefault(field_name, root[field_name])
     else:
         result = {str(key): root[key] for key in _PLAN_FIELDS if key in root}
     for field_name in _SCOPE_PLAN_COMPATIBILITY_FIELDS:
@@ -549,7 +580,8 @@ def create_legacy_successor(
         raise LegacyScopeError("MISSING_PREDECESSOR_CANDIDATE", "predecessor candidate_id is required")
     if not frozen_hash:
         raise LegacyScopeError("MISSING_PREDECESSOR_FROZEN_HASH", "predecessor frozen hash is required")
-    root, _ = _scope_source(_bounded(document))
+    root, source = _scope_source(_bounded(document))
+    _verify_frozen_hash(root, frozen_hash)
     canonical_scope = _canonical_policy(assessment.scope)
     plan_document = _plan_document(root)
     plan_document["market_scope"] = canonical_scope.as_dict()
@@ -575,6 +607,7 @@ def create_legacy_successor(
         plan = ExperimentPlan.from_mapping(final_document)
     except ExperimentPlanError as exc:
         raise LegacyScopeError(exc.reason, exc.detail) from exc
+    resolution = _resolution_fields(root, source)
     proposal: dict[str, Any] = {
         "proposal_id": successor_id,
         "statement": _source_statement(root, candidate_id),
@@ -591,6 +624,8 @@ def create_legacy_successor(
         "successor_scope_version": plan.market_scope_version,
         "legacy_scope_classification": LEGACY_UNAMBIGUOUS,
         "successor_relation": "LEGACY_SCOPE_SUCCESSOR",
+        "current_resolution": resolution,
+        "resolution_fields": dict(resolution),
         "provenance": {
             "type": "legacy_scope_successor",
             "predecessor_candidate_id": candidate_id,
@@ -609,6 +644,151 @@ def create_legacy_successor(
         plan,
         assessment,
     )
+_RESOLUTION_FIELDS = (
+    "market_id",
+    "question",
+    "resolution_criteria",
+    "settlement",
+    "outcome",
+    "expiry",
+    "close_time",
+    "resolved_at",
+    "token_id",
+    "token_ids",
+)
+
+
+def _resolution_fields(root: Mapping[str, Any], source: Mapping[str, Any]) -> dict[str, Any]:
+    """Copy immutable market-resolution context without changing the source."""
+    result: dict[str, Any] = {}
+    for name in _RESOLUTION_FIELDS:
+        if name in root:
+            result[name] = root[name]
+        elif name in source:
+            result[name] = source[name]
+    return result
+
+
+def _verify_frozen_hash(root: Mapping[str, Any], frozen_hash: str) -> None:
+    """Verify modern predecessor hashes while preserving opaque legacy labels."""
+    components = root.get("immutable_hashes")
+    if not isinstance(components, Mapping):
+        components = root
+    values = tuple(_text(components.get(name)) for name in ("strategy_hash", "model_hash", "config_hash"))
+    if not all(values):
+        return
+    expected = hashlib.sha256("|".join(value for value in values if value is not None).encode("utf-8")).hexdigest()
+    supplied_digest = str(frozen_hash).strip().removeprefix("sha256:")
+    if supplied_digest != expected:
+        raise LegacyScopeError(
+            "PREDECESSOR_HASH_MISMATCH",
+            "predecessor_frozen_hash does not match immutable strategy/model/config hashes",
+        )
+
+
+def freeze_canonical_scope_proposal(
+    document: Mapping[str, Any],
+    *,
+    assumptions: Mapping[str, Any] | None = None,
+    current_resolution: Mapping[str, Any] | None = None,
+    source_candidate_id: str | None = None,
+    source_frozen_hash: str | None = None,
+) -> dict[str, Any]:
+    """Freeze one canonical research proposal with explicit resolution context."""
+    bounded = _bounded(document)
+    assessment = classify_legacy_scope(bounded)
+    if assessment.scope is None or assessment.classification not in {CANONICAL_VALID, LEGACY_UNAMBIGUOUS}:
+        raise LegacyScopeError(assessment.reason, "scope proposal is not canonical and unambiguous")
+    root, source = _scope_source(bounded)
+    candidate_id = _text(source_candidate_id) or assessment.candidate_id or _text(root.get("candidate_id"))
+    frozen_hash = _text(source_frozen_hash) or assessment.frozen_hash or _text(root.get("frozen_hash"))
+    if not candidate_id:
+        raise LegacyScopeError("MISSING_PREDECESSOR_CANDIDATE", "candidate_id is required")
+    if not frozen_hash:
+        raise LegacyScopeError("MISSING_PREDECESSOR_FROZEN_HASH", "frozen_hash is required")
+    _verify_frozen_hash(root, frozen_hash)
+    canonical_scope = _canonical_policy(assessment.scope)
+    resolution = dict(current_resolution) if isinstance(current_resolution, Mapping) else _resolution_fields(root, source)
+    assumption_values = dict(assumptions) if isinstance(assumptions, Mapping) else {}
+    assumption_hash = "sha256:" + hashlib.sha256(_canonical(assumption_values).encode("utf-8")).hexdigest()
+    identity = {
+        "predecessor_candidate_id": candidate_id,
+        "predecessor_frozen_hash": frozen_hash,
+        "scope_hash": canonical_scope.scope_hash,
+        "scope_version": canonical_scope.scope_version,
+        "assumptions_hash": assumption_hash,
+    }
+    proposal_id = "scope-proposal-" + hashlib.sha256(_canonical(identity).encode("utf-8")).hexdigest()[:24]
+    proposal: dict[str, Any] = {
+        "proposal_id": proposal_id,
+        "statement": _source_statement(root, candidate_id),
+        "source": _text(root.get("source")) or "canonical-scope-orchestration",
+        "tests": _source_tests(root),
+        "dataset_version": str(root.get("dataset_version") or source.get("dataset_version") or ""),
+        "time_split": str(root.get("time_split") or source.get("time_split") or "train-validation-holdout"),
+        "paper_only": True,
+        "market_scope": canonical_scope.as_dict(),
+        "market_scope_hash": canonical_scope.scope_hash,
+        "market_scope_version": canonical_scope.scope_version,
+        "predecessor_candidate_id": candidate_id,
+        "predecessor_frozen_hash": frozen_hash,
+        "current_resolution": resolution,
+        "resolution_fields": dict(resolution),
+        "assumptions": assumption_values,
+        "assumptions_hash": assumption_hash,
+        "canonical_scope_provenance": "canonical",
+        "proposal_relation": "CANONICAL_SCOPE_REVALIDATION",
+    }
+    plan = _plan_document(root)
+    plan["market_scope"] = canonical_scope.as_dict()
+    if assumption_values:
+        methodology = plan.get("methodology")
+        methodology = dict(methodology) if isinstance(methodology, Mapping) else {}
+        methodology["assumptions"] = assumption_values
+        plan["methodology"] = methodology
+    if plan:
+        proposal["experiment_plan"] = plan
+    return proposal
+
+
+def validate_frozen_scope_proposal(
+    proposal: Mapping[str, Any],
+    *,
+    previous: Mapping[str, Any] | None = None,
+) -> LegacyScopeAssessment:
+    """Validate a scope handoff and detect changed scope or assumptions."""
+    assessment = classify_legacy_scope(proposal)
+    if assessment.classification not in {CANONICAL_VALID, LEGACY_UNAMBIGUOUS}:
+        return assessment
+    if previous is not None:
+        previous_scope = classify_legacy_scope(previous)
+        if previous_scope.scope_hash and assessment.scope_hash != previous_scope.scope_hash:
+            return LegacyScopeAssessment(
+                LEGACY_AMBIGUOUS, "SCOPE_CHANGED", assessment.candidate_id, assessment.frozen_hash,
+                assessment.scope, assessment.scope_hash, assessment.scope_version,
+            )
+        previous_assumptions = previous.get("assumptions") if isinstance(previous, Mapping) else None
+        current_assumptions = proposal.get("assumptions")
+        if _canonical(previous_assumptions or {}) != _canonical(current_assumptions or {}):
+            return LegacyScopeAssessment(
+                LEGACY_AMBIGUOUS, "ASSUMPTIONS_CHANGED", assessment.candidate_id, assessment.frozen_hash,
+                assessment.scope, assessment.scope_hash, assessment.scope_version,
+            )
+    return assessment
+
+
+def handoff_current_scope_resolution(
+    proposal: Mapping[str, Any],
+    resolution: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return a revalidated proposal carrying one current resolution handoff."""
+    if not isinstance(resolution, Mapping):
+        raise TypeError("resolution must be a mapping")
+    result = dict(proposal)
+    result["current_resolution"] = dict(resolution)
+    result["resolution_fields"] = dict(resolution)
+    result["resolution_handoff_hash"] = "sha256:" + hashlib.sha256(_canonical(resolution).encode("utf-8")).hexdigest()
+    return result
 
 
 def enqueue_legacy_successor(
@@ -671,4 +851,7 @@ __all__ = [
     "create_legacy_successor",
     "enqueue_legacy_successor",
     "propose_legacy_successor",
+    "freeze_canonical_scope_proposal",
+    "validate_frozen_scope_proposal",
+    "handoff_current_scope_resolution",
 ]

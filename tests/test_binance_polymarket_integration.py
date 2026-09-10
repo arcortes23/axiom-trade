@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import os
 import json
 import sys
 import tempfile
@@ -14,7 +15,6 @@ from axiom.binance_dev import BinanceTestnetRuntime
 from axiom.binance_operator import BinanceTestnetControlPlane
 from axiom.binance_spot import (
     BINANCE_SPOT_TESTNET,
-    PAPER,
     BinanceCredentialRef,
     BinanceCredentialStore,
     BinanceRuntimeProfile,
@@ -24,6 +24,7 @@ from axiom.dashboard import DashboardData, _DashboardHandler, _jsonable
 from axiom.node import NodeConfig, ResearchNode
 from axiom.operator import OperatorControlPlane
 from axiom.storage import AxiomStore
+
 
 
 NOW = datetime(2026, 1, 1, tzinfo=timezone.utc)
@@ -187,7 +188,15 @@ class _FakePolymarketControl:
             },
         }
 
-    def execute(self, action: str, target: str = "", *, confirm: str = "") -> dict[str, object]:
+    def execute(
+        self,
+        action: str,
+        target: str = "",
+        *,
+        confirm: str = "",
+        payload: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        del payload
         self.calls.append((action, target, confirm))
         if action != "canary.enable_auto":
             return {"ok": False, "action": action, "reason": "ACTION_NOT_ALLOWED"}
@@ -249,19 +258,27 @@ class _HandlerProbe(_DashboardHandler):
         body: dict[str, object] | None = None,
         token: str = CONTROL_TOKEN,
     ) -> None:
+        authority = ("127.0.0.1", 8187)
+        origin = f"http://{authority[0]}:{authority[1]}"
         self.server = SimpleNamespace(
             dashboard_data=data,
             control_token=token,
+            server_address=authority,
         )
         self.path = path
         self.client_address = ("127.0.0.1", 43210)
         self.responses: list[tuple[int, object]] = []
+        base_headers = {
+            "Host": origin.removeprefix("http://"),
+            "Origin": origin,
+        }
         if body is None:
-            self.headers = {}
+            self.headers = base_headers
             self.rfile = io.BytesIO(b"")
         else:
             encoded = json.dumps(body).encode("utf-8")
             self.headers = {
+                **base_headers,
                 "Content-Type": "application/json",
                 "Content-Length": str(len(encoded)),
                 "X-Axiom-Control-Token": token,
@@ -436,7 +453,9 @@ class BinancePolymarketIntegrationTests(unittest.TestCase):
                 return self.values.get((service, username))
 
         backend = FakeKeyring()
-        with patch.dict(sys.modules, {"keyring": backend}):
+        with patch.dict(os.environ, {"AXIOM_EXECUTION_PROFILE": "production"}), patch.dict(
+            sys.modules, {"keyring": backend}
+        ):
             polymarket = PolymarketCredentialStore()
             values = iter(("polymarket-private-key", "polymarket-wallet"))
             polymarket.configure(reader=lambda _prompt: next(values))
@@ -560,6 +579,7 @@ class BinancePolymarketIntegrationTests(unittest.TestCase):
             polymarket.calls,
             [("canary.enable_auto", "", ""), ("PAUSE", "", "")],
         )
+
 
 
 if __name__ == "__main__":

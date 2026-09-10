@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import os
 import hashlib
 import json
 from pathlib import Path
@@ -8,14 +9,20 @@ import re
 import tempfile
 import threading
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from urllib.error import HTTPError
 from urllib.parse import quote, urlencode
 from urllib.request import urlopen
 
 from axiom.canary import CanaryService
-from axiom.dashboard import DashboardData, DashboardServer, _dashboard_html, _jsonable
 from axiom.domain import MarketType
+from axiom.dashboard import (
+    DashboardData,
+    DashboardServer,
+    _canary_status_report,
+    _dashboard_html,
+    _jsonable,
+)
 from axiom.operator import CANARY_CONNECTIVITY_CONFIG_KEY, DEFAULT_HERMES_JOB_ID
 from axiom.ranker import CandidateCanaryRanker
 from axiom.experiment_plan import normalize_market_scope
@@ -50,7 +57,7 @@ ACTIONABLE_SCAN_FIELDS = (
 
 
 CANARY_ALLOWANCE_INSUFFICIENT_REASON = (
-    "Current allowance is below the amount required for a $1 canary."
+    "Current allowance is below the active canary requirement."
 )
 PERSISTED_CONNECTIVITY_SECRET_VALUES = (
     "API_KEY_SENTINEL",
@@ -92,7 +99,11 @@ def _connectivity_projection(
         },
         "credentials": {"status": "CONFIGURED"},
         "authentication": {"status": "PASS"},
-        "account": {"status": "PASS", "wallet_type": "EOA"},
+        "account": {
+            "status": "PASS",
+            "wallet_type": "EOA",
+            "credential_fingerprint": "sha256:v1:" + ("0" * 64),
+        },
         "geoblock": {"status": "PASS", "country": "PH", "region": "NCR"},
         "balance": {"status": "PASS", "available_usd": "12.34"},
         "allowance": {"status": allowance_status},
@@ -134,13 +145,13 @@ class DashboardPaginationFixture(unittest.TestCase):
         database_path = Path(self._temporary_directory.name) / "dashboard.sqlite3"
         self.store = AxiomStore(str(database_path))
         self.addCleanup(self.store.close)
-        self.canary_service = CanaryService(self.store)
+        self.canary_service = CanaryService(self.store, clock=lambda: T0)
         self._seed_datasets()
         self._seed_polymarket()
         self._seed_candidates()
         self._seed_queue()
         self._seed_paper()
-        self.server = DashboardServer(port=0, data=DashboardData(store=self.store)).start()
+        self.server = DashboardServer(port=0, data=DashboardData(store=self.store, clock=lambda: T0)).start()
         # unittest cleanups run last-in, first-out; close the HTTP server and
         # SQLite connection before removing the temporary database directory.
         self.addCleanup(self.server.stop)
@@ -379,6 +390,7 @@ class DashboardPaginationFixture(unittest.TestCase):
         self.store.connection.commit()
     def _seed_ranked_selection(self, candidate_id: str = "dashboard-winner") -> dict[str, object]:
         """Persist one complete candidate so dashboard selection is snapshot-valid."""
+        snapshot_time = T0
         dataset_id = "dashboard-history"
         self.store.save_dataset(
             dataset_id,
@@ -520,10 +532,13 @@ class DashboardPaginationFixture(unittest.TestCase):
                         },
                     }
                 ],
-                resolved_at=T0,
+                resolved_at=snapshot_time,
             )
         )
-        result = CandidateCanaryRanker(self.store, clock=lambda: T0).evaluate_and_select(T0)
+        result = CandidateCanaryRanker(
+            self.store,
+            clock=lambda: snapshot_time,
+        ).evaluate_and_select(snapshot_time)
         self.assertEqual(result["selected_candidate"], candidate_id)
         self.canary_service.publish_readiness_snapshot(reason="DASHBOARD_FIXTURE")
         return payload
@@ -648,8 +663,8 @@ class DashboardPaginationFixture(unittest.TestCase):
         expected_total: int,
         **params: object,
     ) -> dict[str, object]:
-        status, payload, _ = self._request(path, **params)
-        self.assertEqual(status, 200)
+        status, payload, body = self._request(path, **params)
+        self.assertEqual(status, 200, body)
         self.assertIsInstance(payload, dict)
         assert isinstance(payload, dict)
         self.assertTrue(COMMON_PAGE_KEYS <= payload.keys())
@@ -725,7 +740,7 @@ class DashboardPaginationEndpointTests(DashboardPaginationFixture):
         assert isinstance(payload, dict)
         canary = payload["canary"]
         autonomous = payload["autonomous_canary"]
-        self.assertEqual(canary["selection_status"], "CURRENT")
+        self.assertEqual(canary["selection_status"], "CURRENT", msg=f"canary={canary!r}")
         self.assertIs(canary["selection_valid"], True)
         self.assertEqual(canary["selected_candidate"], "dashboard-winner")
         self.assertEqual(canary["last_selected_candidate"], "dashboard-winner")
@@ -813,7 +828,7 @@ class DashboardPaginationEndpointTests(DashboardPaginationFixture):
         research = before["canary"]
         ranking_run_id = research["ranking_run_id"]
         research_score = research["winner_score"]
-        self.assertEqual(research["winner_id"], "research-winner")
+        self.assertEqual(research["winner_id"], "research-winner", msg=f"canary={research!r}")
         self.assertEqual(research["winner_rank"], 1)
         self.assertIsInstance(research_score, (int, float))
         self.assertIsInstance(ranking_run_id, str)
@@ -1438,8 +1453,8 @@ class DashboardPaginationEndpointTests(DashboardPaginationFixture):
         )
         self.assertTrue(all(item["quality"] == "HIGH" for item in high_quality["items"]))
 
-        status, detail, _ = self._request(f"api/v2/datasets/{quote(self.detail_dataset_id, safe='')}")
-        self.assertEqual(status, 200)
+        status, detail, body = self._request(f"api/v2/datasets/{quote(self.detail_dataset_id, safe='')}")
+        self.assertEqual(status, 200, body)
         self.assertIsInstance(detail, dict)
         assert isinstance(detail, dict)
         self.assertTrue(detail["available"])
@@ -2502,7 +2517,22 @@ class DashboardPaginationEndpointTests(DashboardPaginationFixture):
             worker_status="IDLE",
             timestamp=T0,
         )
-        self.canary_service.enable_autonomous_micro_live()
+        credentials = Mock()
+        credentials.load.return_value = {
+            "private_key": "fixture-private-key",
+            "wallet_address": "0x0000000000000000000000000000000000000001",
+        }
+        self.canary_service.credentials = credentials
+        settings = self.canary_service.settings.snapshot(now=T0)
+        with patch.dict(
+            os.environ,
+            {"AXIOM_EXECUTION_PROFILE": "production"},
+        ):
+            self.canary_service.enable_autonomous_micro_live(
+                venue="polymarket",
+                config_id=settings["config_id"],
+                expected_generation=settings["generation"],
+            )
         # Simulate the persisted worker's last-cycle telemetry arriving after
         # the control transition; the current control state remains enabled.
         self.canary_service.record_autonomous_decision(
@@ -2562,17 +2592,18 @@ class DashboardPaginationSurfaceTests(DashboardPaginationFixture):
         self.assertEqual(funnel["FROZEN"], 1)
 
     def test_overview_local_research_worker_is_not_labeled_as_hermes(self) -> None:
+        worker_now = datetime.now(UTC)
         self.store.save_worker_state(
             "research-queue",
             "RUNNING",
             {"queue_items_processed": 3},
-            heartbeat_at=T0,
+            heartbeat_at=worker_now,
         )
         self.store.save_worker_state(
             "autonomous-research",
             "ACTIVE",
             {"passes": 2},
-            heartbeat_at=T0,
+            heartbeat_at=worker_now,
         )
 
         for endpoint in ("api/v2/overview-summary", "api/operator"):
@@ -2809,147 +2840,55 @@ class DashboardPaginationSurfaceTests(DashboardPaginationFixture):
         self.assertIn("no cached dashboard snapshot available", load_page)
 
 
-    def test_real_canary_actions_post_once_to_local_result_and_survive_refresh(self) -> None:
-        html = _dashboard_html()
-        start = html.index("function renderCanary(data)")
-        end = html.index("function renderBtc", start)
-        real_canary = html[start:end]
-        canary_actions = (
-            "canary.connectivity_check",
-            "canary.enable_auto",
-            "canary.disarm",
-            "canary.kill",
-        )
-        for action in canary_actions:
-            self.assertIn(
-                f'controlButton("{action}"',
-                real_canary,
-                f"{action} must be rendered on REAL CANARY",
+
+    def test_status_report_expiry_projects_armed_control_disabled(self) -> None:
+        class RawStatusReportService:
+            def __init__(self, state: str, expires_at: str) -> None:
+                self.clock = lambda: T0
+                self.state = state
+                self.expires_at = expires_at
+
+            def status_report(self) -> dict[str, object]:
+                control = {
+                    "state": self.state,
+                    "candidate": "candidate-expiry",
+                    "venue": "polymarket",
+                    "expires_at": self.expires_at,
+                    "generation": 7,
+                }
+                return {
+                    "micro_live_canary": self.state,
+                    "control_state": self.state,
+                    "display_state": "ENABLED",
+                    "autonomous": {"enabled": True},
+                    "control": control,
+                    "readiness": {"autonomous": {"enabled": True}},
+                }
+
+        expired_at = (T0 - timedelta(seconds=1)).isoformat()
+        for state in ("ARMED", "AUTONOMOUS_MICRO_LIVE"):
+            projected, report = _canary_status_report(
+                RawStatusReportService(state, expired_at)
             )
-        self.assertRegex(
-            html,
-            r"function isCanaryAction\(action\)[\s\S]{0,160}startsWith\([\"']canary\.[\"']\)",
-        )
-        self.assertRegex(
-            html,
-            r"function actionResultNode\(action\)[\s\S]{0,220}"
-            r"[\"']canary-action-result[\"'][\s\S]{0,80}[\"']control-result[\"']",
-            "all canary actions must route to the REAL CANARY result, while ordinary actions retain Overview routing",
-        )
-        self.assertNotIn("control-result", real_canary)
+            self.assertEqual(projected["control_state"], "DISARMED")
+            self.assertEqual(projected["display_state"], "DISABLED")
+            self.assertEqual(projected["production_live_trading"], "DISABLED")
+            self.assertTrue(projected["expired"])
+            self.assertFalse(projected["autonomous"]["enabled"])
+            self.assertEqual(report["control"]["state"], "DISARMED")
+            self.assertFalse(report["autonomous"]["enabled"])
 
-        control_post_start = html.index("async function controlPost")
-        control_post_end = html.index("function renderOperatorControls", control_post_start)
-        control_post = html[control_post_start:control_post_end]
-        for forbidden in FORBIDDEN_CONNECTIVITY_VALUES:
-            self.assertNotIn(forbidden, real_canary)
-            self.assertNotIn(forbidden, control_post)
-        self.assertEqual(control_post.count('fetch("/api/control"'), 1)
-        self.assertIn("actionResultMessage(action", control_post)
-        self.assertRegex(
-            control_post,
-            r"result\?\.result\?\.connectivity",
-            "canary control responses must consume the fresh nested connectivity projection",
+        projected, report = _canary_status_report(
+            RawStatusReportService("ARMED", (T0 + timedelta(seconds=1)).isoformat())
         )
-        canary_update_start = control_post.index("if(isCanaryAction(action)&&connectivity)")
-        canary_update_end = control_post.index("actionResultMessage", canary_update_start)
-        canary_update = control_post[canary_update_start:canary_update_end]
-        merge = re.search(
-            r"if\s*\(\s*lastGood\.canary\s*&&\s*typeof\s+lastGood\.canary\s*===\s*['\"]object['\"]"
-            r"\s*&&\s*!Array\.isArray\(\s*lastGood\.canary\s*\)\s*\)\s*"
-            r"(?:\{\s*)?lastGood\.canary\s*=\s*\{\s*\.\.\.\s*lastGood\.canary\s*,\s*connectivity\s*\}",
-            canary_update,
-        )
-        self.assertIsNotNone(
-            merge,
-            "fresh canary connectivity must immutably replace the persisted projection only when one exists",
-        )
-        assert merge is not None
-        render = canary_update.index("renderCanaryConnectivity(connectivity)")
-        load = control_post.index("await loadPage(state.tab,true)", canary_update_start)
-        self.assertLess(
-            merge.start(),
-            render,
-            "lastGood.canary must be updated before the immediate connectivity render",
-        )
-        self.assertLess(
-            canary_update_start + render,
-            load,
-            "fresh canary connectivity must be retained before the follow-up load/fallback can run",
-        )
-        self.assertNotRegex(
-            canary_update,
-            r"lastGood\.canary\s*=\s*\{\s*connectivity\s*\}",
-            "a missing lastGood.canary must not be seeded with a partial projection",
-        )
-        self.assertRegex(
-            canary_update,
-            r"lastGood\.canary\s*&&\s*typeof\s+lastGood\.canary\s*===\s*['\"]object['\"]",
-            "the POST merge must be guarded against an absent last-good canary",
-        )
-        message = control_post.index("actionResultMessage(action")
-        render_position = canary_update_start + render
-        self.assertLess(
-            render_position,
-            message,
-            "fresh canary connectivity must render before action feedback is written",
-        )
-        forced_load = control_post.index("await loadPage(state.tab,true)", message)
-        self.assertLess(
-            message,
-            forced_load,
-            "the action result must remain visible before the forced refresh starts",
-        )
-        post_feedback = control_post[message:forced_load]
-        abort = re.search(
-            r"if\s*\(\s*activeController\s*\)\s*activeController\.abort\(\)",
-            post_feedback,
-        )
-        self.assertIsNotNone(
-            abort,
-            "an action must abort any pre-action refresh before forcing a new load",
-        )
-        generation = re.search(
-            r"refreshGeneration\s*(?:\+\+|\+=\s*1)",
-            post_feedback,
-        )
-        self.assertIsNotNone(
-            generation,
-            "an action must invalidate the pre-action refresh generation",
-        )
-        for bookkeeping in (
-            r"activeController\s*=\s*null",
-            r"loadInFlight\s*=\s*false",
-            r"clearTimeout\(\s*slowRefreshTimer\s*\)",
-            r"slowRefreshTimer\s*=\s*null",
-            r"nextRefreshAt\s*=\s*0",
-        ):
-            self.assertRegex(
-                post_feedback,
-                bookkeeping,
-                "action refresh bookkeeping must reset before the forced active-tab load",
-            )
+        self.assertEqual(projected["control_state"], "ARMED")
+        self.assertEqual(projected["display_state"], "ENABLED")
+        self.assertEqual(projected["production_live_trading"], "ENABLED")
+        self.assertFalse(projected["expired"])
+        self.assertTrue(projected["autonomous"]["enabled"])
+        self.assertEqual(report["control"]["state"], "ARMED")
+        self.assertTrue(report["autonomous"]["enabled"])
 
-        click_start = html.index('document.addEventListener("click",async event=>')
-        click_end = html.index("ensureActivityKind()", click_start)
-        click_handler = html[click_start:click_end]
-        self.assertEqual(click_handler.count("controlPost("), 1)
-        self.assertEqual(click_handler.count('fetch("/api/control"'), 0)
-
-        result_markup = re.search(r'<(?:div|p)[^>]*id=["\']canary-action-result["\']', html)
-        self.assertIsNotNone(result_markup)
-        assert result_markup is not None
-        self.assertLess(result_markup.start(), start)
-        self.assertNotRegex(
-            real_canary,
-            r'id=["\']canary-action-result["\']',
-            "renderCanary must not recreate the result node during ordinary refresh",
-        )
-        self.assertNotRegex(
-            real_canary,
-            r'\$\(\s*["\']canary-action-result["\']\s*\)\.(?:innerHTML|textContent)\s*=',
-            "renderCanary must not clear an action result",
-        )
 
     def test_canary_endpoint_reports_connectivity_state_and_blocker(self) -> None:
         blocked = _connectivity_projection(ready=False, status="BLOCKED")

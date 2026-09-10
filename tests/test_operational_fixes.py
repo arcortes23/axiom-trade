@@ -1,6 +1,6 @@
 from __future__ import annotations
-
 from datetime import datetime, timedelta, timezone
+from email.message import Message
 import io
 import json
 from pathlib import Path
@@ -270,7 +270,13 @@ class DashboardDisconnectTests(unittest.TestCase):
     def _handler(self, path: str, *, data: object) -> _DashboardHandler:
         handler = _DashboardHandler.__new__(_DashboardHandler)
         handler.path = path
-        handler.server = SimpleNamespace(dashboard_data=data)
+        handler.client_address = ("127.0.0.1", 8080)
+        handler.headers = Message()
+        handler.headers["Host"] = "127.0.0.1:8080"
+        handler.server = SimpleNamespace(
+            dashboard_data=data,
+            server_address=("127.0.0.1", 8080),
+        )
         return handler
 
     def test_client_disconnect_during_body_write_is_quiet(self) -> None:

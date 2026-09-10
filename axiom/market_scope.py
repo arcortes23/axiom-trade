@@ -753,12 +753,29 @@ def resolve_market_scope(
             pass
         else:
             capacity = True
+    records.sort(
+        key=lambda item: (
+            item[0].market_id
+            if item[0] is not None
+            else _text(_nested(item[1], "market_id", "id", "market"))
+            or "\uffff"
+        )
+    )
     by_id: dict[str, tuple[CurrentMarket | None, dict[str, Any], str | None]] = {}
     for item in records:
         current, raw, malformed = item
         market_id = current.market_id if current is not None else _text(_nested(raw, "market_id", "id", "market"))
         if market_id and market_id not in by_id:
             by_id[market_id] = item
+    ordered_market_ids = sorted(by_id)
+    set_material = {"market_ids": ordered_market_ids}
+    provenance = {
+        **provenance,
+        "current_market_set": {
+            "market_ids": ordered_market_ids,
+            "order_token": "sha256:" + hashlib.sha256(_canonical(set_material).encode("utf-8")).hexdigest(),
+        },
+    }
     matched: list[CurrentMarket] = []
     excluded: list[MarketScopeDisposition] = []
     deferred: list[MarketScopeDisposition] = []

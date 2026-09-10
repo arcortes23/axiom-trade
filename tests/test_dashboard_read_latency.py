@@ -29,7 +29,7 @@ from axiom.storage import AxiomStore
 
 
 UTC = timezone.utc
-T0 = datetime.now(UTC)
+T0 = datetime(2026, 1, 2, 12, tzinfo=UTC)
 CANDIDATE_COUNT = 28
 HISTORICAL_MARKET_COUNT = 4
 HISTORICAL_ROWS_PER_MARKET = 8
@@ -54,6 +54,19 @@ class _NeverUsedVenue:
         raise AssertionError("execution venue must not be used after failed validation")
 
 
+class _FixtureCredentialStore(CredentialStore):
+    _VALUES = {
+        "private_key": "fixture-private-key",
+        "wallet_address": "0x0000000000000000000000000000000000000001",
+    }
+
+    def load(self, **_kwargs: object) -> dict[str, str]:
+        return dict(self._VALUES)
+
+    def configured(self, **_kwargs: object) -> bool:
+        return True
+
+
 class _ExplodingNetworkProvider:
     """A provider fake that makes any dashboard network access observable."""
 
@@ -73,16 +86,20 @@ class DashboardReadLatencyFixture(unittest.TestCase):
     """Persist a representative canary state without using runtime data."""
 
     def setUp(self) -> None:
-        global T0
-        T0 = datetime.now(UTC)
         self._temporary_directory = tempfile.TemporaryDirectory()
         self.addCleanup(self._temporary_directory.cleanup)
         self.database_path = Path(self._temporary_directory.name) / "dashboard-latency.sqlite3"
         self.store = AxiomStore(str(self.database_path))
         self.addCleanup(self.store.close)
+        self.credentials = _FixtureCredentialStore()
         self._seed_historical_aggregate()
         self._seed_candidates()
-        self.service = CanaryService(self.store, clock=lambda: T0, initialize=True)
+        self.service = CanaryService(
+            self.store,
+            credentials=self.credentials,
+            clock=lambda: T0,
+            initialize=True,
+        )
         ranker = CandidateCanaryRanker(self.store, service=self.service, clock=lambda: T0)
         ranking = ranker.evaluate_and_select(T0)
         self.assertEqual(ranking["selected_candidate"], "candidate-00")
@@ -90,9 +107,13 @@ class DashboardReadLatencyFixture(unittest.TestCase):
         self.assertEqual(ranking["rankable_count"], CANDIDATE_COUNT)
         self.assertEqual(len(ranker.rankings(limit=1000)), CANDIDATE_COUNT)
 
-        # Publish an explicit fixture snapshot after durable control and
-        # autonomous-state setup so endpoint assertions have one stable reason.
-        self.service.enable_autonomous_micro_live()
+        # Bind the worker fixture to the persisted ACTIVE settings identity.
+        settings = self.service.settings.snapshot(now=T0)
+        self.service.enable_autonomous_micro_live(
+            venue="polymarket",
+            config_id=settings["config_id"],
+            expected_generation=settings["generation"],
+        )
         self.service.record_autonomous_decision(
             next_decision="WAITING_FOR_NEXT_TICK",
             blocker=None,
@@ -117,7 +138,7 @@ class DashboardReadLatencyFixture(unittest.TestCase):
         self.control = OperatorControlPlane(self.dashboard_store)
         self.server = DashboardServer(
             port=0,
-            data=DashboardData(store=self.dashboard_store, control=self.control),
+            data=DashboardData(store=self.dashboard_store, control=self.control, clock=lambda: T0),
         ).start()
         self.addCleanup(self.server.stop)
 
@@ -356,7 +377,12 @@ class DashboardReadLatencyFixture(unittest.TestCase):
     def _seed_candidates(self) -> None:
         # CanaryService.mark_eligible is intentionally used here so every row
         # has the same authoritative binding shape as a production writer.
-        service = CanaryService(self.store, clock=lambda: T0, initialize=True)
+        service = CanaryService(
+            self.store,
+            credentials=self.credentials,
+            clock=lambda: T0,
+            initialize=True,
+        )
         for index in range(CANDIDATE_COUNT):
             candidate_id = f"candidate-{index:02d}"
             payload = self._candidate_payload(candidate_id, index)
@@ -401,7 +427,7 @@ class DashboardReadLatencyFixture(unittest.TestCase):
         control = OperatorControlPlane(reader)
         server = DashboardServer(
             port=0,
-            data=DashboardData(store=reader, control=control),
+            data=DashboardData(store=reader, control=control, clock=lambda: T0),
         ).start()
         self.addCleanup(server.stop)
         return server, reader
@@ -493,7 +519,7 @@ class DashboardReadLatencyFixture(unittest.TestCase):
         self.addCleanup(reader.close)
         server = DashboardServer(
             port=0,
-            data=DashboardData(store=reader, control=OperatorControlPlane(reader)),
+            data=DashboardData(store=reader, control=OperatorControlPlane(reader), clock=lambda: T0),
         ).start()
         self.addCleanup(server.stop)
         statements: list[str] = []
@@ -590,8 +616,8 @@ class DashboardReadLatencyFixture(unittest.TestCase):
         reranked = CandidateCanaryRanker(
             self.store,
             service=self.service,
-            clock=lambda: T0 + timedelta(minutes=1),
-        ).evaluate_and_select(T0 + timedelta(minutes=1))
+            clock=lambda: T0,
+        ).evaluate_and_select(T0)
         self.assertEqual(reranked["selected_candidate"], "candidate-00")
         republished = self.service.publish_readiness_snapshot(
             reason="AFTER_LIFECYCLE_REEVALUATION"
@@ -623,15 +649,15 @@ class DashboardReadLatencyFixture(unittest.TestCase):
             dict(record["payload"]),
             from_stage="PAPER_FORWARD",
             reason="latency ranking refresh",
-            timestamp=T0 + timedelta(minutes=1),
+            timestamp=T0,
         )
         ranking = CandidateCanaryRanker(
             self.store,
             service=self.service,
-            clock=lambda: T0 + timedelta(minutes=1),
-        ).evaluate_and_select(T0 + timedelta(minutes=1))
+            clock=lambda: T0,
+        ).evaluate_and_select(T0)
         self.assertEqual(ranking["selected_candidate"], "candidate-01")
-        self.assertEqual(ranking["eligible_count"], CANDIDATE_COUNT - 1)
+        self.assertEqual(ranking["eligible_count"], CANDIDATE_COUNT - 1, msg=f"ranking={ranking!r}")
         self.assertEqual(ranking["rankable_count"], CANDIDATE_COUNT - 1)
         published = self.service.publish_readiness_snapshot(reason="RANKING_REFRESH")
         self.assertEqual(published["readiness_snapshot_status"], "CURRENT")
@@ -666,8 +692,12 @@ class DashboardReadLatencyFixture(unittest.TestCase):
         self.assertEqual(candidate_zero["stage"], "REJECTED")
 
     def test_canary_enable_and_decision_signal_updates_projection(self) -> None:
-        enabled = self.service.enable_autonomous_micro_live()
-        self.assertEqual(enabled["micro_live_canary"], AUTONOMOUS_MICRO_LIVE)
+        settings = self.service.settings.snapshot(now=T0)
+        enabled = self.service.enable_autonomous_micro_live(
+            venue="polymarket",
+            config_id=settings["config_id"],
+            expected_generation=settings["generation"],
+        )
         self.service.record_autonomous_decision(
             next_decision="WAIT_FOR_CURRENT_ORDER_BOOK",
             blocker="CURRENT_ORDER_BOOK_REQUIRED",
@@ -815,6 +845,7 @@ class DashboardReadLatencyFixture(unittest.TestCase):
                 store=reader,
                 prediction_provider=provider,
                 crypto_provider=provider,
+                clock=lambda: T0,
             ),
         ).start()
         self.addCleanup(server.stop)

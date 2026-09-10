@@ -1,6 +1,7 @@
 """Bounded autonomous canary scheduling, isolated from collection and research."""
 from __future__ import annotations
 
+from decimal import Decimal, InvalidOperation
 from datetime import datetime, timedelta
 import hashlib
 import json
@@ -21,10 +22,18 @@ from .domain import ensure_utc, utc_now
 from .ranker import CandidateCanaryRanker
 from .lifecycle import _canonical_scope_gate_error
 from .storage import AxiomStore
-
+from .canary_positions import reconcile_pending, manage_positions, _ensure_schema
 class AutonomousCanaryWorker:
     """Run one serialized rank/signal/submit decision at a bounded cadence."""
-
+    _SUBMISSION_SUCCESS_STATUSES = frozenset(
+        {
+            "SUBMITTED",
+            "ACCEPTED",
+            "MATCHED",
+            "PARTIALLY_FILLED",
+            "SETTLED",
+        }
+    )
     _MAX_RETRY_DELAY_SECONDS = 30.0
 
     def __init__(
@@ -48,6 +57,138 @@ class AutonomousCanaryWorker:
         self._last_scan_skip_reasons: dict[str, int] = {
             reason: 0 for reason in self._SCAN_SKIP_REASONS
         }
+
+    @staticmethod
+    def _position_obligations(service: CanaryService) -> bool:
+        """Return whether this tick needs an authenticated position read."""
+        _ensure_schema(service)
+        connection = service.store.connection
+        confirmed_inventory = False
+        with service.store._lock:
+            pending = connection.execute(
+                "SELECT 1 FROM canary_position_requests "
+                "WHERE status IN ('PREPARED','SUBMITTING','SUBMITTED','ACKNOWLEDGED',"
+                "'OPEN','UNKNOWN','MATCHED','FILLED','PARTIAL','PARTIALLY_FILLED',"
+                "'EXIT_REQUESTED','RECONCILE_PENDING') LIMIT 1"
+            ).fetchone()
+            ledger = connection.execute(
+                "SELECT 1 FROM canary_ledger "
+                "WHERE UPPER(side) IN ('BUY','SELL') "
+                "AND UPPER(status) IN ('RESERVED','SUBMITTING','SUBMITTED','ACCEPTED',"
+                "'ACKNOWLEDGED','UNKNOWN','PARTIAL','PARTIALLY_FILLED','MATCHED','OPEN') "
+                "LIMIT 1"
+            ).fetchone()
+            reservations = connection.execute(
+                "SELECT 1 FROM canary_risk_reservations "
+                "WHERE UPPER(status) IN ('HELD','RESERVED','SUBMITTING','ACKNOWLEDGED',"
+                "'UNKNOWN','PARTIAL','PARTIALLY_FILLED','OPEN','SUBMITTED') "
+                "LIMIT 1"
+            ).fetchone()
+            attempts = connection.execute(
+                "SELECT 1 FROM canary_submission_attempts AS attempt "
+                "LEFT JOIN canary_risk_reservations AS reservation "
+                "ON reservation.intent_id=attempt.intent_id "
+                "WHERE UPPER(attempt.status) IN ('ATTEMPTED','SUBMITTING','SUBMITTED','ACCEPTED',"
+                "'ACKNOWLEDGED','UNKNOWN','PARTIAL','PARTIALLY_FILLED','MATCHED','OPEN') "
+                "AND (reservation.reservation_id IS NULL OR UPPER(reservation.status) IN "
+                "('HELD','RESERVED','SUBMITTING','ACKNOWLEDGED','UNKNOWN','PARTIAL',"
+                "'PARTIALLY_FILLED','OPEN','SUBMITTED')) LIMIT 1"
+            ).fetchone()
+            lots = connection.execute(
+                "SELECT 1 FROM canary_position_lots "
+                "WHERE status IN ('OPEN','EXIT_PENDING') LIMIT 1"
+            ).fetchone()
+            accounting_reader = getattr(service.store, "canary_risk_accounting", None)
+            if callable(accounting_reader):
+                try:
+                    accounting = accounting_reader(ensure_utc(service.clock()))
+                except Exception:
+                    accounting = {}
+                quantities = (
+                    accounting.get("open_quantity_by_market")
+                    if isinstance(accounting, Mapping)
+                    else None
+                )
+                if isinstance(quantities, Mapping):
+                    for quantity in quantities.values():
+                        try:
+                            if Decimal(str(quantity)) > 0:
+                                confirmed_inventory = True
+                                break
+                        except (InvalidOperation, TypeError, ValueError, ArithmeticError):
+                            continue
+        return any(
+            item is not None
+            for item in (pending, ledger, reservations, attempts, lots)
+        ) or confirmed_inventory
+    @staticmethod
+    def _unresolved_position_obligations(service: CanaryService) -> bool:
+        """Return whether a durable order identity still needs reconciliation."""
+        _ensure_schema(service)
+        connection = service.store.connection
+        orphan_inventory = False
+        with service.store._lock:
+            ledger = connection.execute(
+                "SELECT 1 FROM canary_ledger "
+                "WHERE UPPER(side) IN ('BUY','SELL') "
+                "AND UPPER(status) IN ('RESERVED','SUBMITTING','SUBMITTED','ACCEPTED',"
+                "'ACKNOWLEDGED','UNKNOWN','PARTIAL','PARTIALLY_FILLED','MATCHED','OPEN') "
+                "AND NULLIF(TRIM(COALESCE(exchange_order_id,'')),'') IS NULL LIMIT 1"
+            ).fetchone()
+            reservations = connection.execute(
+                "SELECT 1 FROM canary_risk_reservations "
+                "WHERE UPPER(status) IN ('HELD','RESERVED','SUBMITTING','ACKNOWLEDGED',"
+                "'UNKNOWN','PARTIAL','PARTIALLY_FILLED','OPEN','SUBMITTED') LIMIT 1"
+            ).fetchone()
+            attempts = connection.execute(
+                "SELECT 1 FROM canary_submission_attempts AS attempt "
+                "LEFT JOIN canary_risk_reservations AS reservation "
+                "ON reservation.intent_id=attempt.intent_id "
+                "WHERE UPPER(attempt.status) IN ('ATTEMPTED','SUBMITTING','SUBMITTED','ACCEPTED',"
+                "'ACKNOWLEDGED','UNKNOWN','PARTIAL','PARTIALLY_FILLED','MATCHED','OPEN') "
+                "AND (reservation.reservation_id IS NULL OR UPPER(reservation.status) IN "
+                "('HELD','RESERVED','SUBMITTING','ACKNOWLEDGED','UNKNOWN','PARTIAL',"
+                "'PARTIALLY_FILLED','OPEN','SUBMITTED')) LIMIT 1"
+            ).fetchone()
+            accounting_reader = getattr(service.store, "canary_risk_accounting", None)
+            if callable(accounting_reader):
+                try:
+                    accounting = accounting_reader(ensure_utc(service.clock()))
+                except Exception:
+                    accounting = {}
+                quantities = (
+                    accounting.get("open_quantity_by_market")
+                    if isinstance(accounting, Mapping)
+                    else None
+                )
+                if isinstance(quantities, Mapping):
+                    lot_rows = connection.execute(
+                        "SELECT market_id,quantity,sold_quantity "
+                        "FROM canary_position_lots "
+                        "WHERE status IN ('OPEN','EXIT_PENDING')"
+                    ).fetchall()
+                    projected: dict[str, Decimal] = {}
+                    for row in lot_rows:
+                        market_id = str(row["market_id"] or "").strip()
+                        if not market_id:
+                            continue
+                        try:
+                            quantity = Decimal(str(row["quantity"] or "0"))
+                            sold = Decimal(str(row["sold_quantity"] or "0"))
+                        except (InvalidOperation, TypeError, ValueError, ArithmeticError):
+                            continue
+                        projected[market_id] = projected.get(market_id, Decimal("0")) + max(
+                            Decimal("0"), quantity - sold
+                        )
+                    for market_id, quantity in quantities.items():
+                        try:
+                            canonical = Decimal(str(quantity))
+                        except (InvalidOperation, TypeError, ValueError, ArithmeticError):
+                            continue
+                        if canonical > projected.get(str(market_id), Decimal("0")):
+                            orphan_inventory = True
+                            break
+        return any(item is not None for item in (ledger, reservations, attempts)) or orphan_inventory
     _SCAN_CAP = 10
     _SIGNAL_REASON_CODES = (
         "READY_SIGNAL",
@@ -709,6 +850,9 @@ class AutonomousCanaryWorker:
         candidates_evaluated = 0
         signals_generated = 0
         orders_attempted = 0
+        position_reconciliation: Mapping[str, Any] = {}
+        position_management: Mapping[str, Any] = {}
+        position_blocker: str | None = None
         candidates_ranked = 0
         candidates_signal_checked = 0
         candidates_no_signal = 0
@@ -788,6 +932,68 @@ class AutonomousCanaryWorker:
         try:
             service = CanaryService(self.store, clock=self.clock)
             self._record_start(service, timestamp)
+            position_venue: Any | None = None
+            # Position reconciliation is read-only when disarmed/killed, but
+            # there is no reason to construct a credentialed venue for a tick
+            # with no durable position/order obligations.
+            if self._position_obligations(service):
+                try:
+                    service.require_current_credential_binding()
+                except CanaryBlocked as exc:
+                    reason = str(exc)
+                    position_reconciliation = {
+                        "status": "DEGRADED",
+                        "reconciled": 0,
+                        "blocked": 1,
+                        "requests": [{"status": "UNKNOWN", "reason": reason}],
+                        "entries": [],
+                    }
+                    position_management = {
+                        "status": "BLOCKED",
+                        "submitted": 0,
+                        "blocked": reason,
+                        "positions": [],
+                    }
+                    position_blocker = reason
+                else:
+                    position_venue = self.venue_factory()
+                    position_reconciliation = reconcile_pending(
+                        service,
+                        position_venue,
+                        allow_test_venue=self.allow_test_venue,
+                    )
+                    position_management = manage_positions(
+                        service,
+                        position_venue,
+                        allow_test_venue=self.allow_test_venue,
+                    )
+                    if str(position_reconciliation.get("status") or "").upper() == "DEGRADED":
+                        position_blocker = "CANARY_RECONCILIATION_PROVIDER_ERROR"
+                    elif (
+                        str(position_management.get("status") or "").upper() == "BLOCKED"
+                        and position_management.get("blocked")
+                    ):
+                        # Do not admit new BUY capacity while an originating
+                        # policy's required exit is blocked.
+                        position_blocker = "CANARY_POSITION_MANAGEMENT_BLOCKED"
+                    elif self._unresolved_position_obligations(service):
+                        # Reservations and attempts without a durable order
+                        # identity cannot be safely retried or released here.
+                        position_blocker = "CANARY_POSITION_OBLIGATION_UNRESOLVED"
+            else:
+                position_reconciliation = {
+                    "status": "IDLE",
+                    "reconciled": 0,
+                    "blocked": 0,
+                    "requests": [],
+                    "entries": [],
+                }
+                position_management = {
+                    "status": "IDLE",
+                    "submitted": 0,
+                    "blocked": [],
+                    "positions": [],
+                }
             ranker = CandidateCanaryRanker(
                 self.store,
                 service=service,
@@ -805,19 +1011,6 @@ class AutonomousCanaryWorker:
                         or attempt >= 2
                     ):
                         raise
-            if isinstance(ranking, Mapping):
-                try:
-                    candidates_evaluated = max(
-                        0,
-                        int(
-                            ranking.get(
-                                "candidates_evaluated",
-                                ranking.get("eligible_count", 0),
-                            )
-                        ),
-                    )
-                except (TypeError, ValueError):
-                    candidates_evaluated = 0
             signal_scan_ranking_run_id = (
                 str(ranking.get("ranking_run_id") or "").strip()
                 if isinstance(ranking, Mapping)
@@ -1057,7 +1250,14 @@ class AutonomousCanaryWorker:
                 )
 
             def result(**extra: Any) -> dict[str, Any]:
-                return {**extra, **scan_payload(), "ranking": ranking}
+                return {
+                    **extra,
+                    "position_reconciliation": dict(position_reconciliation),
+                    "position_management": dict(position_management),
+                    "position_blocker": position_blocker,
+                    **scan_payload(),
+                    "ranking": ranking,
+                }
 
             control = service.authoritative_status()
             if control.get("micro_live_canary") == "KILLED":
@@ -1080,6 +1280,18 @@ class AutonomousCanaryWorker:
                     status="DISABLED",
                     decision="AUTONOMOUS_CANARY_DISABLED",
                     blocker="AUTONOMOUS_CANARY_DISABLED",
+                )
+            if position_blocker is not None:
+                finish(
+                    next_decision="WAIT_FOR_POSITION_RECONCILIATION",
+                    blocker=position_blocker,
+                    worker_status="DEGRADED",
+                    error_code="CANARY_POSITION_RECONCILIATION_FAILED",
+                )
+                return result(
+                    status="BLOCKED",
+                    decision="POSITION_RECONCILIATION_BLOCKED",
+                    blocker=position_blocker,
                 )
             if not ordered:
                 blocker = "NO_ELIGIBLE_RANKABLE_CANDIDATE"
@@ -1110,6 +1322,7 @@ class AutonomousCanaryWorker:
                     if isinstance(evaluation, Mapping)
                     else None
                 )
+                candidates_evaluated += 1
                 reason = self._evaluation_reason(evaluation, signal)
                 evaluation_blocker = evaluation_blocker or self._evaluation_blocker(
                     evaluation
@@ -1240,27 +1453,25 @@ class AutonomousCanaryWorker:
                     candidate_id=selected_actionable_candidate,
                     signal_id=signal_id,
                 )
-            try:
-                venue = self.venue_factory()
-            except Exception as exc:
-                # Venue construction has not transmitted anything.  Keep the
-                # READY signal retryable and record a worker failure without
-                # counting an order attempt or poisoning the signal as UNKNOWN.
-                finish(
-                    next_decision="WORKER_ERROR_REVIEW_REQUIRED",
-                    blocker="AUTONOMOUS_WORKER_EXCEPTION",
-                    worker_status="DEGRADED",
-                    signal_id=signal_id,
-                    error_code="AUTONOMOUS_WORKER_EXCEPTION",
-                )
-                return result(
-                    status="ERROR",
-                    decision="AUTONOMOUS_WORKER_EXCEPTION",
-                    blocker="AUTONOMOUS_WORKER_EXCEPTION",
-                    candidate_id=selected_actionable_candidate,
-                    signal_id=signal_id,
-                    error_type=type(exc).__name__,
-                )
+            if position_venue is None:
+                try:
+                    service.require_current_credential_binding()
+                    position_venue = self.venue_factory()
+                except CanaryBlocked as exc:
+                    blocker = str(exc)
+                    finish(
+                        next_decision="WAIT_FOR_CREDENTIALS",
+                        blocker=blocker,
+                        signal_id=signal_id,
+                    )
+                    return result(
+                        status="BLOCKED",
+                        decision=blocker,
+                        blocker=blocker,
+                        candidate_id=selected_actionable_candidate,
+                        signal_id=signal_id,
+                    )
+            venue = position_venue
             try:
                 orders_attempted = 1
                 submission = service.submit_signal(
@@ -1316,6 +1527,44 @@ class AutonomousCanaryWorker:
                     signal_id=signal_id,
                     error_type=type(exc).__name__,
                 )
+            submission_outcome = (
+                str(submission.get("execution_status") or "").strip().upper()
+                if isinstance(submission, Mapping)
+                else ""
+            )
+            if submission_outcome == "REJECTED":
+                finish(
+                    next_decision="WAIT_FOR_NEXT_DECISION",
+                    blocker="CANARY_SUBMISSION_REJECTED",
+                    signal_id=signal_id,
+                )
+                return result(
+                    status="REJECTED",
+                    decision="NOT_SUBMITTED",
+                    blocker="CANARY_SUBMISSION_REJECTED",
+                    candidate_id=selected_actionable_candidate,
+                    signal_id=signal_id,
+                    submission=dict(submission),
+                )
+            if submission_outcome not in self._SUBMISSION_SUCCESS_STATUSES:
+                # ``submit_signal`` returns the durable ledger/signal outcome.
+                # Never infer success from a transport response or a normal
+                # return when that authoritative outcome is absent/unknown.
+                self._unknown_signal_ids.add(signal_id)
+                finish(
+                    next_decision="UNKNOWN_NO_RETRY",
+                    blocker="UNKNOWN_NO_RETRY",
+                    signal_id=signal_id,
+                    worker_status="DEGRADED",
+                    error_code="CANARY_SUBMISSION_UNKNOWN",
+                )
+                return result(
+                    status="BLOCKED",
+                    decision="UNKNOWN_NO_RETRY",
+                    blocker="UNKNOWN_NO_RETRY",
+                    candidate_id=selected_actionable_candidate,
+                    signal_id=signal_id,
+                )
             finish(
                 next_decision="WAIT_FOR_NEXT_DECISION",
                 signal_id=signal_id,
@@ -1327,6 +1576,56 @@ class AutonomousCanaryWorker:
                 signal_id=signal_id,
                 submission=dict(submission),
             )
+        except CanaryBlocked as exc:
+            blocker = str(exc) or "CANARY_BLOCKED"
+            persisted_payload: dict[str, Any] = {}
+            if update_scan_projection_fn is not None and scan_payload_fn is not None:
+                try:
+                    update_scan_projection_fn()
+                    persisted_payload = scan_payload_fn()
+                    persisted_payload["signal_scan_skip_reasons_json"] = (
+                        signal_scan_skip_reasons_json
+                    )
+                except Exception:
+                    persisted_payload = {}
+            if service is not None:
+                try:
+                    if persisted_payload:
+                        self._record_finish(
+                            service,
+                            timestamp=timestamp,
+                            next_decision=blocker,
+                            blocker=blocker,
+                            worker_status="IDLE",
+                            candidates_evaluated=candidates_evaluated,
+                            signals_generated=signals_generated,
+                            orders_attempted=orders_attempted,
+                            error_code=None,
+                            **persisted_payload,
+                        )
+                    else:
+                        self._record_finish(
+                            service,
+                            timestamp=timestamp,
+                            next_decision=blocker,
+                            blocker=blocker,
+                            worker_status="IDLE",
+                            candidates_evaluated=candidates_evaluated,
+                            signals_generated=signals_generated,
+                            orders_attempted=orders_attempted,
+                            signal_scan_checked_keys=signal_scan_checked_keys,
+                            error_code=None,
+                        )
+                except Exception:
+                    pass
+            return {
+                "status": "BLOCKED",
+                "decision": blocker,
+                "blocker": blocker,
+                "error_type": type(exc).__name__,
+                **persisted_payload,
+                "ranking": ranking,
+            }
         except BaseException as exc:
             persisted_payload: dict[str, Any] = {}
             if update_scan_projection_fn is not None and scan_payload_fn is not None:

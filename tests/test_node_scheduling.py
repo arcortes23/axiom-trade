@@ -2,12 +2,14 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 import math
+import os
 import sqlite3
 import tempfile
 import threading
 import time
 import traceback
 import unittest
+from unittest.mock import Mock, patch
 from pathlib import Path
 from typing import Any
 
@@ -15,9 +17,16 @@ from axiom.collector import CollectionCycle, CollectorConfig, PolymarketCollecto
 from axiom.dashboard import DashboardData
 from axiom.data import InMemoryPredictionProvider
 from axiom.forward import ForwardTestRegistry
-from axiom.node import NodeConfig, ResearchNode
+from axiom.node import (
+    ISOLATED_EXECUTION_PROFILE,
+    PRODUCTION_EXECUTION_PROFILE,
+    NodeConfig,
+    ResearchNode,
+    normalized_execution_profile,
+)
 from axiom.storage import AxiomStore
 from axiom.strategy import validate_strategy
+
 
 
 UTC = timezone.utc
@@ -25,6 +34,33 @@ T0 = datetime(2026, 1, 1, tzinfo=UTC)
 
 
 class NodeConfigValidationTests(unittest.TestCase):
+    def test_execution_profile_accepts_only_exact_supported_values(self) -> None:
+        self.assertEqual(
+            normalized_execution_profile(ISOLATED_EXECUTION_PROFILE),
+            ISOLATED_EXECUTION_PROFILE,
+        )
+        self.assertEqual(
+            normalized_execution_profile(PRODUCTION_EXECUTION_PROFILE),
+            PRODUCTION_EXECUTION_PROFILE,
+        )
+        for malformed in ("prod", "production ", " PRODUCTION", "isolated\n", 1, False):
+            with self.subTest(malformed=malformed):
+                with self.assertRaisesRegex(ValueError, "execution profile"):
+                    normalized_execution_profile(malformed)
+
+    def test_missing_profile_uses_default_only_when_requested(self) -> None:
+        with patch.dict(os.environ, {"AXIOM_EXECUTION_PROFILE": ""}):
+            self.assertIsNone(normalized_execution_profile())
+            self.assertEqual(
+                normalized_execution_profile(default=PRODUCTION_EXECUTION_PROFILE),
+                PRODUCTION_EXECUTION_PROFILE,
+            )
+
+    def test_node_config_rejects_malformed_profile_without_production_fallback(self) -> None:
+        for malformed in ("prod", "production ", "unsafe-profile"):
+            with self.subTest(malformed=malformed):
+                with self.assertRaisesRegex(ValueError, "execution profile"):
+                    NodeConfig(":memory:", execution_profile=malformed)
     def test_direct_construction_rejects_non_positive_depth(self) -> None:
         for depth in (0, -1, False):
             with self.subTest(depth=depth):
@@ -53,6 +89,41 @@ class NodeConfigValidationTests(unittest.TestCase):
         self.assertEqual(config.failure_cooldown_seconds, 0)
         self.assertEqual(config.discovery_budget_per_cycle, 4)
         self.assertEqual(config.max_concurrency, 2)
+
+
+
+class NodeIdentityPersistenceTests(unittest.TestCase):
+    def test_watchdog_and_root_heartbeat_keep_canonical_execution_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = str(Path(directory) / "identity.sqlite")
+            with AxiomStore(db) as store:
+                node = ResearchNode(
+                    NodeConfig(
+                        db,
+                        execution_profile="isolated",
+                        interval_seconds=60.0,
+                        crypto_enabled=False,
+                    ),
+                    provider=InMemoryPredictionProvider([]),
+                    store=store,
+                )
+                node.started_at = T0
+
+                # Caller payloads cannot overwrite the node-owned identity.
+                node._heartbeat("running", {"execution_profile": "production"})
+                root = next(
+                    row for row in store.list_worker_states(limit=32)
+                    if row["worker_name"] == node.config.worker_name
+                )
+                node._start_heartbeat_watchdog()
+                try:
+                    watchdog = next(
+                        row for row in store.list_worker_states(limit=32)
+                        if row["worker_name"] == f"{node.config.worker_name}:watchdog"
+                    )
+                    self.assertEqual(watchdog["payload"]["execution_profile"], "isolated")
+                finally:
+                    node._stop_heartbeat_watchdog()
 
 
 class SchedulerScaleTests(unittest.TestCase):
@@ -402,6 +473,189 @@ class SchedulerScaleTests(unittest.TestCase):
                 self.assertEqual(collector_worker["payload"]["configured_interval_seconds"], 0.01)
                 self.assertIn("next_scheduled_collection_at", collector_worker["payload"])
 
+
+
+class MutationSchedulingTests(unittest.TestCase):
+    def test_mutation_disabled_never_ticks_or_starts_auto_canary(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = str(Path(directory) / "mutation-disabled.sqlite")
+            with AxiomStore(db) as store:
+                node = ResearchNode(
+                    NodeConfig(
+                        db,
+                        mutation_enabled=False,
+                        crypto_enabled=False,
+                    ),
+                    provider=InMemoryPredictionProvider([]),
+                    store=store,
+                )
+                threads = [Mock(), Mock(), Mock()]
+                with patch.object(node._auto_canary_worker, "tick") as tick, patch(
+                    "axiom.node.threading.Thread", side_effect=threads
+                ) as thread_factory:
+                    node._start_worker_threads(max_cycles=1)
+                    self.assertIsNone(node._auto_canary_thread)
+                    self.assertEqual(thread_factory.call_count, 3)
+                    self.assertEqual(
+                        [call.kwargs["name"] for call in thread_factory.call_args_list],
+                        [
+                            "axiom-node-collector",
+                            "axiom-node-research",
+                            "axiom-node-health",
+                        ],
+                    )
+                    self.assertIs(node._collector_thread, threads[0])
+                    self.assertIs(node._research_thread, threads[1])
+                    self.assertIs(node._health_thread, threads[2])
+                    self.assertNotIn(
+                        "autonomous-canary",
+                        node._worker_thread_specs(max_cycles=1),
+                    )
+
+                node._auto_canary_worker_loop()
+                tick.assert_not_called()
+                auto_state = next(
+                    row
+                    for row in store.list_worker_states(limit=64)
+                    if row["worker_name"] == "autonomous-canary"
+                )
+                self.assertEqual(auto_state["status"], "disabled")
+                self.assertEqual(
+                    auto_state["payload"]["decision"],
+                    "AUTONOMOUS_CANARY_DISABLED",
+                )
+                self.assertEqual(
+                    auto_state["payload"]["blocker"],
+                    "AUTONOMOUS_CANARY_DISABLED",
+                )
+
+    def test_unknown_no_retry_result_marks_worker_degraded(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = str(Path(directory) / "unknown-no-retry.sqlite")
+            with AxiomStore(db) as store:
+                node = ResearchNode(
+                    NodeConfig(db, crypto_enabled=False),
+                    provider=InMemoryPredictionProvider([]),
+                    store=store,
+                )
+                result = {
+                    "status": "BLOCKED",
+                    "decision": "UNKNOWN_NO_RETRY",
+                    "blocker": "UNKNOWN_NO_RETRY",
+                }
+                with patch.object(
+                    node._auto_canary_worker,
+                    "tick",
+                    return_value=result,
+                ) as tick, patch.object(
+                    node,
+                    "_worker_tick_completed",
+                ) as tick_completed, patch.object(
+                    node.stop_event,
+                    "wait",
+                    return_value=True,
+                ):
+                    node._auto_canary_worker_loop()
+                tick.assert_called_once()
+                self.assertFalse(tick_completed.call_args.kwargs["successful"])
+                self.assertEqual(
+                    tick_completed.call_args.kwargs["error"],
+                    "UNKNOWN_NO_RETRY",
+                )
+
+
+class NodeStopPollingTests(unittest.TestCase):
+    def test_only_exact_owned_stop_marker_authorizes_shutdown(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = str(Path(directory) / "stop-marker.sqlite")
+            with AxiomStore(db) as store:
+                node = ResearchNode(
+                    NodeConfig(db, crypto_enabled=False),
+                    provider=InMemoryPredictionProvider([]),
+                    store=store,
+                )
+                lock_marker = f"{os.getpid()}\nowned-run\n"
+                Path(node.lock_path).write_text(lock_marker, encoding="ascii")
+                malformed = Path(node.stop_path)
+                malformed.write_text("not-a-canonical-marker", encoding="ascii")
+                self.assertFalse(node._external_stop_requested())
+                self.assertFalse(node.stop_event.is_set())
+                self.assertEqual(malformed.read_text(encoding="ascii"), "not-a-canonical-marker")
+
+                wrong_run = f"{os.getpid()}\nother-run\n"
+                malformed.write_text(wrong_run, encoding="ascii")
+                self.assertFalse(node._external_stop_requested())
+                self.assertFalse(node.stop_event.is_set())
+                self.assertEqual(malformed.read_text(encoding="ascii"), wrong_run)
+
+                malformed.write_text(lock_marker, encoding="ascii")
+                self.assertTrue(node._external_stop_requested())
+                self.assertTrue(node.stop_event.is_set())
+
+    def test_owned_stop_marker_wakes_long_collection_interval(self) -> None:
+        class OneCycleCollector:
+            def __init__(self) -> None:
+                self.completed = threading.Event()
+
+            def collect_once(self) -> CollectionCycle:
+                started = datetime.now(UTC)
+                ended = datetime.now(UTC)
+                self.completed.set()
+                return CollectionCycle(
+                    started,
+                    ended,
+                    0,
+                    markets_attempted=0,
+                    markets_successful=0,
+                    markets_failed=0,
+                    metadata_inserted=0,
+                    snapshots_inserted=0,
+                    snapshot_duplicates=0,
+                    trades_inserted=0,
+                    trade_duplicates=0,
+                    errors=0,
+                    elapsed_seconds=0.0,
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            db = str(Path(directory) / "stop-polling.sqlite")
+            with AxiomStore(db) as store:
+                node = ResearchNode(
+                    NodeConfig(
+                        db,
+                        interval_seconds=60.0,
+                        crypto_enabled=False,
+                    ),
+                    provider=InMemoryPredictionProvider([]),
+                    store=store,
+                )
+                collector = OneCycleCollector()
+                node.collector = collector  # type: ignore[assignment]
+                node._configure_logging = lambda: None  # type: ignore[method-assign]
+                node._start_heartbeat_watchdog = lambda: None  # type: ignore[method-assign]
+                node._stop_heartbeat_watchdog = lambda: None  # type: ignore[method-assign]
+                errors: list[BaseException] = []
+
+                def run_node() -> None:
+                    try:
+                        node.run()
+                    except BaseException as exc:  # pragma: no cover - surfaced below
+                        errors.append(exc)
+
+                runner = threading.Thread(target=run_node, daemon=True)
+                runner.start()
+                try:
+                    self.assertTrue(collector.completed.wait(timeout=2.0))
+                    marker = Path(node.lock_path).read_text(encoding="ascii")
+                    started_waiting = time.monotonic()
+                    Path(node.stop_path).write_text(marker, encoding="ascii")
+                    runner.join(timeout=2.0)
+                    self.assertFalse(runner.is_alive())
+                    self.assertLess(time.monotonic() - started_waiting, 2.0)
+                    self.assertFalse(errors, repr(errors))
+                finally:
+                    node.stop_event.set()
+                    runner.join(timeout=2.0)
 
 
 class CollectorConcurrencyTests(unittest.TestCase):

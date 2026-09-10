@@ -1076,6 +1076,7 @@ def _synthetic_successor_proposal(
         "metrics": ["expectancy", "drawdown", "trade_count", "sample_count"],
         "min_samples": 30,
         "min_trades": 0,
+        "exit_policy": {"type": "fixed_holding_period", "holding_period": 4},
         "max_variants": 1,
         "model_document": {"probability": 0.80},
         "paper_only": True,
@@ -5448,12 +5449,17 @@ def run_persisted_acceptance(
             )
             lifecycle_evidence = queue_evidence["lifecycle_evidence"]
             selected_lifecycle = lifecycle_evidence.get("selected")
+            selected_by_processor = bool(lifecycle_evidence.get("selected_by_processor"))
             selected_lifecycle_stage = (
                 selected_lifecycle.get("stage")
-                if isinstance(selected_lifecycle, Mapping)
+                if selected_by_processor and isinstance(selected_lifecycle, Mapping)
                 else None
             )
-            if selected_lifecycle_stage is None and isinstance(selected_candidate_result, Mapping):
+            if (
+                selected_lifecycle_stage is None
+                and selected_by_processor
+                and isinstance(selected_candidate_result, Mapping)
+            ):
                 selected_lifecycle_stage = selected_candidate_result.get("stage")
             compact_lifecycle_evidence = _compact_candidate_lifecycle_evidence(lifecycle_evidence)
             selected_payload = (

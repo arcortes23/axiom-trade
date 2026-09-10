@@ -1,18 +1,20 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import json
 import sqlite3
 import tempfile
 import threading
 import unittest
 from pathlib import Path
 
+from axiom.canary import CanaryService
 from axiom.binance_auto import BinanceAutonomousWorker
 from axiom.binance_dev import PaperBinanceSpotVenue
 from axiom.binance_execution import BinanceExecutionService
 from axiom.binance_operator import BinanceCanaryControlPlane
 from axiom.binance_research import BinanceCryptoQualificationService
-from axiom.canary import CanaryService
+from axiom.canary_settings import CanarySettingsService
 from axiom.dashboard import DashboardData
 from axiom.storage import AxiomStore
 
@@ -131,6 +133,220 @@ INSERT INTO binance_operator_actions(
     '2026-01-01T00:00:00+00:00','2026-01-01T08:00:00+08:00',
     0,'legacy sentinel','{"sentinel":"operator-payload"}','{"sentinel":"operator-result"}'
 );
+CREATE TABLE research_queue (
+    item_id TEXT PRIMARY KEY,
+    item_type TEXT NOT NULL,
+    dedupe_key TEXT NOT NULL UNIQUE,
+    status TEXT NOT NULL,
+    priority INTEGER NOT NULL DEFAULT 0,
+    payload_json TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT '',
+    author TEXT NOT NULL DEFAULT '',
+    lineage_json TEXT NOT NULL DEFAULT '[]',
+    schema_version TEXT NOT NULL DEFAULT '1',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    available_at TEXT NOT NULL,
+    lease_until TEXT,
+    lease_owner TEXT,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    result_json TEXT
+);
+INSERT INTO research_queue(
+    item_id,item_type,dedupe_key,status,priority,payload_json,source,author,
+    lineage_json,schema_version,created_at,updated_at,available_at
+) VALUES(
+    'legacy-research-item','HYPOTHESIS','legacy-research-dedupe','COMPLETED',3,
+    '{"statement":"historical research survives migration","paper_only":true}',
+    'legacy-research','operator','[]','1',
+    '2026-01-01T00:00:00+00:00','2026-01-01T00:01:00+00:00',
+    '2026-01-01T00:00:00+00:00'
+);
+CREATE TABLE fills (
+    fill_id TEXT PRIMARY KEY,
+    order_id TEXT NOT NULL,
+    timestamp TEXT NOT NULL,
+    strategy_id TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+INSERT INTO fills(
+    fill_id,order_id,timestamp,strategy_id,symbol,payload_json,created_at
+) VALUES(
+    'legacy-research-fill','legacy-research-order',
+    '2026-01-01T00:01:00+00:00','legacy-strategy','BTCUSDT',
+    '{"price":"10","quantity":"1","source":"historical"}',
+    '2026-01-01T00:01:00+00:00'
+);
+CREATE TABLE operator_config (
+    config_key TEXT PRIMARY KEY,
+    value_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+INSERT INTO operator_config(config_key,value_json,updated_at) VALUES(
+    'canary-risk-limits',
+    '{"target_notional_usd":"1.00","max_orders_per_day":1,"max_daily_loss_usd":"0.25"}',
+    '2026-01-01T00:00:00+00:00'
+);
+CREATE TABLE canary_setting_configs (
+    config_id TEXT PRIMARY KEY,
+    state TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    config_hash TEXT NOT NULL UNIQUE,
+    values_json TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    activated_at TEXT,
+    previous_config_id TEXT
+);
+INSERT INTO canary_setting_configs(
+    config_id,state,generation,config_hash,values_json,actor,created_at,
+    updated_at,activated_at,previous_config_id
+) VALUES(
+    'cfg-legacy-production','ACTIVE',4,'legacy-settings-hash',
+    '{"target_notional_usd":"1.00","max_exposure_usd":"5.00","max_daily_loss_usd":"0.25","max_open_positions":3,"max_orders_per_day":1,"max_slippage_bps":100,"max_all_in_buy_usd":"1.00","max_fee_reserve_usd":"0.01","max_gross_daily_buy_usd":"5.00","max_aggregate_open_cost_usd":"5.00","max_aggregate_exposure_usd":"5.00","max_positions":3,"max_submitted_orders_per_day":1,"realized_loss_entry_stop_usd":"0.25","equity_loss_entry_stop_usd":"0.25","per_market_buy_cap_usd":null,"per_event_buy_cap_usd":null,"cumulative_buy_cap_usd":null}',
+    'legacy-operator','2026-01-01T00:00:00+00:00',
+    '2026-01-01T00:00:00+00:00','2026-01-01T00:00:00+00:00',NULL
+);
+CREATE TABLE canary_risk_reservations (
+    reservation_id TEXT PRIMARY KEY,
+    intent_id TEXT NOT NULL UNIQUE,
+    side TEXT NOT NULL,
+    market_id TEXT,
+    event_id TEXT,
+    requested_cost TEXT NOT NULL DEFAULT '0',
+    filled_cost TEXT NOT NULL DEFAULT '0',
+    remaining_cost TEXT NOT NULL DEFAULT '0',
+    fee_reserve TEXT NOT NULL DEFAULT '0',
+    quantity TEXT NOT NULL DEFAULT '0',
+    filled_quantity TEXT NOT NULL DEFAULT '0',
+    status TEXT NOT NULL,
+    config_generation INTEGER,
+    config_hash TEXT,
+    created_at TEXT NOT NULL,
+    submitted_at TEXT,
+    updated_at TEXT NOT NULL,
+    released_at TEXT
+);
+INSERT INTO canary_risk_reservations(
+    reservation_id,intent_id,side,market_id,event_id,requested_cost,filled_cost,
+    remaining_cost,fee_reserve,quantity,filled_quantity,status,config_generation,
+    config_hash,created_at,submitted_at,updated_at,released_at
+) VALUES(
+    'legacy-canary-reservation','legacy-canary-intent','BUY','legacy-market',
+    'legacy-event','1.00','0.50','0.50','0.01','2','1','HELD',4,
+    'legacy-settings-hash','2026-01-01T00:00:00+00:00',
+    '2026-01-01T00:00:01+00:00','2026-01-01T00:00:01+00:00',NULL
+);
+CREATE TABLE binance_execution_order_intents (
+    intent_id TEXT PRIMARY KEY,
+    signal_id TEXT NOT NULL UNIQUE,
+    opportunity_id TEXT,
+    candidate_id TEXT NOT NULL,
+    binding_hash TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    environment TEXT NOT NULL,
+    intent TEXT NOT NULL,
+    side TEXT NOT NULL,
+    price TEXT NOT NULL,
+    quantity TEXT NOT NULL,
+    notional TEXT NOT NULL,
+    fee_reserve TEXT NOT NULL,
+    client_order_id TEXT NOT NULL UNIQUE,
+    exchange_order_id TEXT,
+    state TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    owner_id TEXT,
+    lease_expires_at TEXT,
+    reason TEXT,
+    exit_policy_json TEXT,
+    submitted_at TEXT,
+    acknowledged_at TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL,
+    raw_json TEXT
+);
+INSERT INTO binance_execution_order_intents(
+    intent_id,signal_id,candidate_id,binding_hash,symbol,environment,intent,side,
+    price,quantity,notional,fee_reserve,client_order_id,exchange_order_id,state,
+    generation,updated_at,raw_json
+) VALUES(
+    'legacy-order-intent','legacy-order-signal','legacy-candidate','legacy-binding',
+    'BTCUSDT','PAPER','ENTRY','BUY','10','1','10','0.01',
+    'legacy-client-order','legacy-exchange-order','FILLED',7,
+    '2026-01-01T00:01:00+00:00','{"source":"historical-order"}'
+);
+"""
+
+
+# A pre-settings database may have only the legacy operator/control envelopes.
+# The UNKNOWN row and historical fill evidence must remain visible while the
+# first versioned ACTIVE configuration is created.
+_NO_ACTIVE_SETTINGS_DDL = _MAIN_ERA_POLYMARKET_DDL + """
+CREATE TABLE operator_config (
+    config_key TEXT PRIMARY KEY,
+    value_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+INSERT INTO operator_config(config_key,value_json,updated_at) VALUES(
+    'canary-risk-limits',
+    '{"target_notional_usd":"1.00","max_orders_per_day":1,"max_daily_loss_usd":"0.25"}',
+    '2026-01-01T00:00:00+00:00'
+);
+UPDATE canary_control
+SET state='DISABLED',
+    limits_json='{"target_notional_usd":"0.50","max_orders_per_day":2,"max_daily_loss_usd":"0.50"}'
+WHERE singleton=1;
+CREATE TABLE fills (
+    fill_id TEXT PRIMARY KEY,
+    order_id TEXT NOT NULL,
+    timestamp TEXT NOT NULL,
+    strategy_id TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+INSERT INTO fills(
+    fill_id,order_id,timestamp,strategy_id,symbol,payload_json,created_at
+) VALUES(
+    'legacy-research-fill','legacy-research-order',
+    '2026-01-01T00:01:00+00:00','legacy-strategy','BTCUSDT',
+    '{"price":"10","quantity":"1","source":"historical"}',
+    '2026-01-01T00:01:00+00:00'
+);
+CREATE TABLE canary_ledger (
+    event_id TEXT PRIMARY KEY,
+    signal_id TEXT NOT NULL UNIQUE,
+    timestamp TEXT NOT NULL,
+    candidate_id TEXT NOT NULL,
+    venue TEXT NOT NULL,
+    market_id TEXT NOT NULL,
+    token_id TEXT NOT NULL,
+    side TEXT NOT NULL,
+    requested_notional TEXT NOT NULL,
+    paper_expected_price TEXT NOT NULL,
+    max_price TEXT NOT NULL,
+    submitted_quantity TEXT,
+    exchange_order_id TEXT,
+    fill_quantity TEXT,
+    actual_average_price TEXT,
+    fees TEXT,
+    status TEXT NOT NULL,
+    realized_pnl TEXT,
+    evidence_json TEXT NOT NULL
+);
+INSERT INTO canary_ledger(
+    event_id,signal_id,timestamp,candidate_id,venue,market_id,token_id,side,
+    requested_notional,paper_expected_price,max_price,submitted_quantity,
+    fill_quantity,actual_average_price,fees,status,realized_pnl,evidence_json
+) VALUES(
+    'legacy-unknown-event','legacy-unknown-signal','2026-01-01T00:00:00+00:00',
+    'legacy-candidate','polymarket','legacy-market','yes','BUY',
+    '1.00','0.50','0.50','2','1','0.50','0.01','UNKNOWN','-0.25',
+    '{"source":"legacy-canary"}'
+);
 """
 
 
@@ -164,10 +380,40 @@ _LEGACY_SENTINEL_ROWS = {
         "reservation_id",
         "legacy-reservation",
     ),
+    "canary_setting_configs": (
+        ("config_id", "state", "generation", "config_hash", "values_json", "actor", "updated_at"),
+        "config_id",
+        "cfg-legacy-production",
+    ),
+    "canary_risk_reservations": (
+        ("reservation_id", "intent_id", "side", "market_id", "requested_cost", "filled_cost", "remaining_cost", "fee_reserve", "quantity", "filled_quantity", "status", "config_generation", "config_hash", "updated_at"),
+        "reservation_id",
+        "legacy-canary-reservation",
+    ),
     "binance_operator_actions": (
         ("action_id", "action", "attempted_at", "completed_at", "created_at", "timestamp", "timestamp_utc", "timestamp_pht", "success", "reason", "payload_json", "result_json"),
         "action_id",
         "legacy-binance-action",
+    ),
+    "research_queue": (
+        ("item_id", "status", "priority", "payload_json", "source", "author", "result_json"),
+        "item_id",
+        "legacy-research-item",
+    ),
+    "fills": (
+        ("fill_id", "order_id", "timestamp", "strategy_id", "symbol", "payload_json"),
+        "fill_id",
+        "legacy-research-fill",
+    ),
+    "operator_config": (
+        ("config_key", "value_json", "updated_at"),
+        "config_key",
+        "canary-risk-limits",
+    ),
+    "binance_execution_order_intents": (
+        ("intent_id", "signal_id", "candidate_id", "symbol", "state", "client_order_id", "raw_json"),
+        "intent_id",
+        "legacy-order-intent",
     ),
 }
 
@@ -288,6 +534,47 @@ class CombinedSchemaMigrationTests(unittest.TestCase):
             self.assertIn("binance_auto_state", names)
             self.assertIn("binance_operator_actions", names)
             _assert_legacy_sentinel_rows(self, store, sentinels_before)
+            research_row = store.connection.execute(
+                "SELECT status,payload_json,result_json FROM research_queue "
+                "WHERE item_id='legacy-research-item'"
+            ).fetchone()
+            if research_row is not None:
+                self.assertEqual(research_row["status"], "COMPLETED")
+                self.assertEqual(
+                    json.loads(research_row["payload_json"])["statement"],
+                    "historical research survives migration",
+                )
+            fill_row = store.connection.execute(
+                "SELECT order_id,symbol,payload_json FROM fills "
+                "WHERE fill_id='legacy-research-fill'"
+            ).fetchone()
+            if fill_row is not None:
+                self.assertEqual(fill_row["order_id"], "legacy-research-order")
+                self.assertEqual(fill_row["symbol"], "BTCUSDT")
+                self.assertEqual(json.loads(fill_row["payload_json"])["price"], "10")
+            limits_row = store.connection.execute(
+                "SELECT value_json FROM operator_config "
+                "WHERE config_key='canary-risk-limits'"
+            ).fetchone()
+            if limits_row is not None:
+                limits = json.loads(limits_row["value_json"])
+                self.assertEqual(limits["target_notional_usd"], "1.00")
+                self.assertEqual(limits["max_orders_per_day"], 1)
+                self.assertEqual(limits["max_daily_loss_usd"], "0.25")
+            order_row = store.connection.execute(
+                "SELECT state,price,quantity,notional,raw_json "
+                "FROM binance_execution_order_intents "
+                "WHERE intent_id='legacy-order-intent'"
+            ).fetchone()
+            if order_row is not None:
+                self.assertEqual(order_row["state"], "FILLED")
+                self.assertEqual(order_row["price"], "10")
+                self.assertEqual(order_row["quantity"], "1")
+                self.assertEqual(order_row["notional"], "10")
+                self.assertEqual(
+                    json.loads(order_row["raw_json"])["source"],
+                    "historical-order",
+                )
 
             polymarket_control_columns = {
                 str(row[1])
@@ -473,6 +760,64 @@ class CombinedSchemaMigrationTests(unittest.TestCase):
                 expected_polymarket_control_state="DISABLED",
                 assert_legacy_columns=True,
             )
+
+    def test_missing_active_settings_preserve_legacy_envelope_and_history(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "legacy-settings.sqlite"
+            _seed_database(path, _NO_ACTIVE_SETTINGS_DDL)
+            store = AxiomStore(str(path))
+            try:
+                # The regular Polymarket initializer adds its projections, but
+                # must not alter the pre-existing authorization state or ledger.
+                CanaryService(store, clock=lambda: T0)
+                before = store.connection.execute(
+                    "SELECT status,fill_quantity,actual_average_price,fees,realized_pnl "
+                    "FROM canary_ledger WHERE event_id='legacy-unknown-event'"
+                ).fetchone()
+                self.assertIsNotNone(before)
+                legacy_fill_before = store.connection.execute(
+                    "SELECT order_id,symbol,payload_json FROM fills "
+                    "WHERE fill_id='legacy-research-fill'"
+                ).fetchone()
+                self.assertIsNotNone(legacy_fill_before)
+                settings = CanarySettingsService(store, clock=lambda: T0)
+                limits = settings.active_limits()
+                self.assertEqual(limits["target_notional_usd"], "0.50")
+                self.assertEqual(limits["max_all_in_buy_usd"], "0.50")
+                self.assertEqual(limits["max_orders_per_day"], 1)
+                self.assertEqual(limits["max_submitted_orders_per_day"], 1)
+                self.assertEqual(limits["max_daily_loss_usd"], "0.25")
+                self.assertEqual(limits["realized_loss_entry_stop_usd"], "0.25")
+                self.assertEqual(
+                    store.connection.execute(
+                        "SELECT state FROM canary_control WHERE singleton=1"
+                    ).fetchone()["state"],
+                    "DISABLED",
+                )
+                self.assertEqual(
+                    store.list_canary_setting_audit(limit=1)[0]["action"],
+                    "MIGRATION_DEFAULT_ACTIVE",
+                )
+                # Re-opening the settings facade is the migration retry path;
+                # it must not create another ACTIVE row or genesis audit.
+                CanarySettingsService(store, clock=lambda: T0)
+                self.assertEqual(
+                    len(store.list_canary_setting_configs(state="ACTIVE")),
+                    1,
+                )
+                self.assertEqual(len(store.list_canary_setting_audit(limit=10)), 1)
+                after = store.connection.execute(
+                    "SELECT status,fill_quantity,actual_average_price,fees,realized_pnl "
+                    "FROM canary_ledger WHERE event_id='legacy-unknown-event'"
+                ).fetchone()
+                self.assertEqual(dict(after), dict(before))
+                legacy_fill_after = store.connection.execute(
+                    "SELECT order_id,symbol,payload_json FROM fills "
+                    "WHERE fill_id='legacy-research-fill'"
+                ).fetchone()
+                self.assertEqual(dict(legacy_fill_after), dict(legacy_fill_before))
+            finally:
+                store.close()
 
 
 if __name__ == "__main__":

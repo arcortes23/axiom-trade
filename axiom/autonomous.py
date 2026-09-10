@@ -10,12 +10,13 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
-import re
 import math
 from statistics import mean
+import re
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
-from .backtest import CryptoBacktester, PredictionMarketBacktester
+from .backtest import CryptoBacktester
+from .backtest.prediction import run_prediction_research_mode
 from .forward import ForwardTestRegistry, _content_hash
 from .director import compact_report, validate_hermes_proposal
 from .domain import Fill, MarketType, ResearchQuality, SettlementState, ensure_utc, parse_timestamp, utc_now
@@ -24,8 +25,9 @@ from .paper_engine import build_resolved_bet
 from .lifecycle import CandidateLifecycle, CandidateLifecycleManager, CandidateStage, PromotionCriteria
 from .metrics import expected_calibration_error
 from .mutations import DeterministicMutationEngine, ExperimentBudget
-from .research_bus import DurableResearchBus, ResearchQueueItem, ResearchQueueStatus
+from .research_bus import DurableResearchBus, ResearchBusPermissionError, ResearchQueueItem, ResearchQueueStatus
 from .robustness import bootstrap_confidence_interval, minimum_sample_check, neighboring_parameter_stability
+
 from .storage import AxiomStore
 from .data_quality import evaluate_prediction_data_quality, persisted_quality_fields
 from .strategy import StrategyDefinition, load_strategy
@@ -37,6 +39,37 @@ _MAX_QUEUE_RESULT_ITEMS = 64
 _MAX_DATASET_ROWS = 100_000
 _MAX_FORWARD_ROWS = 100_000
 PAPER_MARKET_AUTHORITY_CAP = 100
+
+PREDECLARED_STRATEGY_STARTING_SET: tuple[Mapping[str, Any], ...] = (
+    {
+        "template": "momentum",
+        "parameters": {"lookback": (1,), "threshold": (0.05,)},
+        "metadata": {"research_role": "PRICE_MOMENTUM_ASSESSMENT"},
+    },
+    {
+        "template": "mean_reversion",
+        "parameters": {"lookback": (1,), "threshold": (0.05,)},
+        "metadata": {"research_role": "PRICE_MEAN_REVERSION_ASSESSMENT"},
+    },
+    {
+        "template": "probability_mispricing",
+        "parameters": {"threshold": (0.05,)},
+        "model_document": {"field": "yes_mid"},
+        "metadata": {
+            "research_role": "ZERO_EDGE_CONTROL",
+            "selection_excluded": True,
+            "proven_zero_edge": True,
+        },
+    },
+)
+
+
+def _variant_count(plan: ExperimentPlan) -> int:
+    count = 1
+    for values in plan.parameters.values():
+        count *= len(values)
+    return count
+
 
 
 
@@ -60,6 +93,16 @@ def _scope_binding(plan: ExperimentPlan) -> dict[str, Any]:
         "scope_version": plan.market_scope_version,
         "dataset_selector": dict(plan.as_dict()["dataset_selector"]),
     }
+def _strategy_metadata(strategy: StrategyDefinition) -> dict[str, Any]:
+    metadata = strategy.metadata if isinstance(strategy.metadata, Mapping) else {}
+    role = str(metadata.get("research_role", "")).strip()
+    return {
+        "research_role": role or None,
+        "selection_excluded": bool(metadata.get("selection_excluded", False)),
+        "proven_zero_edge": bool(metadata.get("proven_zero_edge", False)),
+    }
+
+
 
 
 def _canonical_binding(value: Any) -> str:
@@ -146,12 +189,248 @@ class AutonomousQueueCycle:
 
 
 class AutonomousResearchProcessor:
-    """Claim and execute work with paper-only forward evidence.
+    """Claim and execute bounded paper research with a locked holdout.
 
-    The locked holdout is intentionally never consumed by this processor. It
-    remains an immutable partition available only for a separately controlled
-    human audit; no holdout result enters mutation, Hermes, or promotion data.
+    Ordinary autonomous trials receive only train and validation partitions.
+    The holdout remains locked until an explicitly authorized post-selection
+    assessment; it is never used to select variants, mutate strategies, or
+    qualify a canary.
     """
+
+    @staticmethod
+    def predeclared_starting_set() -> tuple[Mapping[str, Any], ...]:
+        """Return the small deterministic strategy set owned by Axiom."""
+        return tuple(
+            {
+                "template": str(item["template"]),
+                "parameters": {
+                    str(name): tuple(values)
+                    for name, values in dict(item["parameters"]).items()
+                },
+                **(
+                    {"model_document": dict(item["model_document"])}
+                    if isinstance(item.get("model_document"), Mapping)
+                    else {}
+                ),
+                **(
+                    {"metadata": dict(item["metadata"])}
+                    if isinstance(item.get("metadata"), Mapping)
+                    else {}
+                ),
+            }
+            for item in PREDECLARED_STRATEGY_STARTING_SET
+        )
+
+    def enqueue_predeclared_starting_set(
+        self,
+        proposal: Mapping[str, Any],
+        *,
+        strategies: Sequence[Mapping[str, Any]] | None = None,
+        priority: int = 0,
+        available_at: datetime | None = None,
+    ) -> tuple[ResearchQueueItem, ...]:
+        """Durably enqueue Axiom's deterministic starter trials.
+
+        The caller provides research data selectors and assumptions, not
+        candidate/proposal ids.  Each family gets a deterministic identity and
+        bounded one-variant plan; queue dedupe makes retries idempotent.
+        """
+        if not isinstance(proposal, Mapping):
+            raise TypeError("proposal must be a mapping")
+        selected = tuple(strategies) if strategies is not None else self.predeclared_starting_set()
+        if not selected or len(selected) > self.config.max_plan_variants:
+            raise AutonomousResearchError(
+                "EXPERIMENT_BUDGET_EXCEEDED",
+                "predeclared strategy set is empty or exceeds the node bound",
+            )
+        base = dict(proposal)
+        base.pop("proposal_id", None)
+        base.pop("hypothesis_id", None)
+        items: list[ResearchQueueItem] = []
+        for index, strategy in enumerate(selected):
+            if not isinstance(strategy, Mapping):
+                raise AutonomousResearchError("UNSUPPORTED_STRATEGY_FAMILY", "predeclared strategy must be a mapping")
+            template = str(strategy.get("template", strategy.get("family", ""))).strip().lower()
+            parameters = strategy.get("parameters", {})
+            if not template or not isinstance(parameters, Mapping):
+                raise AutonomousResearchError("UNSUPPORTED_STRATEGY_FAMILY", "predeclared strategy requires template and parameters")
+            raw_metadata = strategy.get("metadata")
+            metadata = dict(raw_metadata) if isinstance(raw_metadata, Mapping) else {}
+            role = str(strategy.get("research_role", metadata.get("research_role", ""))).strip()
+            if role:
+                metadata["research_role"] = role
+            if "selection_excluded" in strategy:
+                metadata["selection_excluded"] = bool(strategy["selection_excluded"])
+            if "proven_zero_edge" in strategy:
+                metadata["proven_zero_edge"] = bool(strategy["proven_zero_edge"])
+            plan = base.get("experiment_plan")
+            plan_document = dict(plan) if isinstance(plan, Mapping) else {}
+            plan_document.update(
+                {
+                    "template": template,
+                    "parameters": dict(parameters),
+                    "max_variants": 1,
+                    "paper_only": True,
+                }
+            )
+            model_document = strategy.get("model_document")
+            if isinstance(model_document, Mapping):
+                plan_document["model_document"] = dict(model_document)
+            strategy_document = strategy.get("strategy_document")
+            if metadata:
+                strategy_document = dict(strategy_document) if isinstance(strategy_document, Mapping) else {
+                    "version": 1,
+                    "market_type": MarketType.PREDICTION.value,
+                    "family": template,
+                    "probability_model": "plan-model-probability",
+                    "resolution_aware": True,
+                    "resolution_inputs": ["expiry", "settlement"],
+                }
+                strategy_document["metadata"] = metadata
+                plan_document["strategy_document"] = strategy_document
+            material = {
+                "schema": "axiom-predeclared-starting-set-v1",
+                "base": base,
+                "template": template,
+                "parameters": dict(parameters),
+                "model_document": dict(model_document) if isinstance(model_document, Mapping) else None,
+                "metadata": metadata,
+                "index": index,
+            }
+            proposal_id = "predeclared-" + hashlib.sha256(
+                _canonical_binding(material).encode("utf-8")
+            ).hexdigest()[:24]
+            item_payload = {
+                **base,
+                "proposal_id": proposal_id,
+                "experiment_plan": plan_document,
+                "paper_only": True,
+                "predeclared_starting_set": True,
+            }
+            item = self.bus.submit_hypothesis(
+                item_payload,
+                dedupe_key=f"predeclared:{proposal_id}",
+                priority=priority,
+                available_at=available_at,
+            )
+            items.append(item)
+        return tuple(items)
+
+    submit_predeclared_starting_set = enqueue_predeclared_starting_set
+
+    def _enqueue_predeclared_from_persisted_scope(self, now: datetime) -> tuple[ResearchQueueItem, ...]:
+        """Seed bounded prediction research from the persisted historical catalog.
+
+        The seed is deterministic and policy-bound: the aggregate historical
+        dataset and canonical POLYMARKET forward rules are selected before any
+        candidate performance is inspected.  Queue deduplication makes this
+        safe to invoke on every normal worker tick.
+        """
+        list_catalog = getattr(self.store, "list_dataset_catalog", None)
+        if not callable(list_catalog):
+            return ()
+        try:
+            catalogs = list_catalog(source_type="HISTORICAL", market_type="prediction", limit=128)
+        except (TypeError, ValueError, RuntimeError):
+            return ()
+        if not isinstance(catalogs, Sequence):
+            return ()
+        def complete(item: Any) -> bool:
+            if not isinstance(item, Mapping):
+                return False
+            try:
+                return (
+                    bool(str(item.get("dataset_id", "")).strip())
+                    and bool(str(item.get("dataset_version", item.get("version", ""))).strip())
+                    and str(item.get("source_type", "")).strip().upper() == "HISTORICAL"
+                    and _finite(item.get("completeness"), 0.0) >= 1.0
+                    and int(item.get("row_count", 0) or 0) > 0
+                    and not item.get("missing_ranges")
+                )
+            except (TypeError, ValueError, OverflowError):
+                return False
+
+        eligible = [item for item in catalogs if complete(item)]
+        if not eligible:
+            return ()
+        catalog = next(
+            (
+                item
+                for item in eligible
+                if str(item.get("dataset_id", "")).strip() == "Polymarket-historical"
+                and str(item.get("instrument", "")).strip().upper() == "POLYMARKET"
+            ),
+            None,
+        )
+        if catalog is None:
+            return ()
+        dataset_id = str(catalog.get("dataset_id", "")).strip()
+        dataset_version = str(catalog.get("dataset_version", catalog.get("version", ""))).strip()
+        if not dataset_id or not dataset_version:
+            return ()
+        market_scope = {
+            "schema_version": "1",
+            "mode": "RULE_BASED_MARKETS",
+            "instrument": "POLYMARKET",
+            "categories": [],
+            # Keep discovery bounded and explicit; these are policy inputs,
+            # not a shortcut around current-market authority resolution.
+            "filters": {"min_liquidity": 1.0, "max_spread": 0.50},
+            "regime_restrictions": {},
+            "provenance": "canonical",
+        }
+        methodology = {
+            "research_mode": "PRICE_PROXY_RESEARCH",
+            "initial_cash": 10_000.0,
+            "allocation": 0.25,
+            "predeclared_starting_set": True,
+        }
+        assumptions = {
+            "version": "price-proxy-v1",
+            "fee_bps": 10.0,
+            "slippage_bps": 5.0,
+            "roundtrip_fee_bps": 20.0,
+            "roundtrip_slippage_bps": 10.0,
+            "cost_sensitivity": {
+                "fee_bps": [10.0, 20.0],
+                "slippage_bps": [5.0, 10.0],
+            },
+        }
+        exit_policy = {"type": "fixed_holding_period", "holding_period": 1}
+        allowed_features = ["timestamp", "market_id", "yes_mid"]
+        proposal = {
+            "statement": "Evaluate bounded Polymarket price-path momentum and mean reversion.",
+            "source": "axiom-autonomous-predeclared",
+            "tests": ["bounded chronological price-proxy backtest and validation"],
+            "market_type": MarketType.PREDICTION.value,
+            "market_scope": market_scope,
+            "dataset_id": dataset_id,
+            "dataset_version": dataset_version,
+            "allowed_features": allowed_features,
+            "time_split": "train-validation-holdout",
+            "min_samples": 30,
+            "max_variants": 1,
+            "paper_only": True,
+            "assumptions": assumptions,
+            "exit_policy": exit_policy,
+            "methodology": methodology,
+            "experiment_plan": {
+                "market_type": MarketType.PREDICTION.value,
+                "market_scope": market_scope,
+                "dataset_id": dataset_id,
+                "dataset_version": dataset_version,
+                "allowed_features": allowed_features,
+                "time_split": "train-validation-holdout",
+                "min_samples": 30,
+                "assumptions": assumptions,
+                "exit_policy": exit_policy,
+                "methodology": methodology,
+            },
+        }
+        try:
+            return self.enqueue_predeclared_starting_set(proposal, priority=0, available_at=now)
+        except (AutonomousResearchError, ResearchBusPermissionError, TypeError, ValueError, RuntimeError):
+            return ()
 
     def __init__(
         self,
@@ -176,9 +455,13 @@ class AutonomousResearchProcessor:
         duplicate experiments or lifecycle transitions.
         """
         current = ensure_utc(now or self.clock())
+        self._enqueue_predeclared_from_persisted_scope(current)
         released = self.bus.resume_expired(now=current)
-        claimed = completed = rejected = failed = 0
         results: list[Mapping[str, Any]] = []
+        claimed = 0
+        completed = 0
+        rejected = 0
+        failed = 0
         for _ in range(self.config.max_items_per_cycle):
             item = self.bus.claim(worker, lease_seconds=self.config.lease_seconds, now=current)
             if item is None:
@@ -360,6 +643,47 @@ class AutonomousResearchProcessor:
 
     def _process_hypothesis(self, item: ResearchQueueItem, now: datetime) -> Mapping[str, Any]:
         proposal = _normalize_hypothesis_payload(item.payload, item)
+        scope_declared = "market_scope" in proposal or any(
+            key in proposal
+            for key in ("predecessor_candidate_id", "predecessor_frozen_hash", "frozen_hash")
+        )
+        if scope_declared:
+            from .legacy_scope import (
+                CANONICAL_VALID,
+                LEGACY_UNAMBIGUOUS,
+                LegacyScopeError,
+                freeze_canonical_scope_proposal,
+                handoff_current_scope_resolution,
+                validate_frozen_scope_proposal,
+            )
+
+            scope_assessment = validate_frozen_scope_proposal(proposal)
+            if scope_assessment.classification not in {CANONICAL_VALID, LEGACY_UNAMBIGUOUS}:
+                raise AutonomousResearchError(
+                    scope_assessment.reason,
+                    f"scope proposal classification is {scope_assessment.classification}",
+                )
+            has_predecessor = any(
+                key in proposal
+                for key in ("predecessor_candidate_id", "predecessor_frozen_hash", "frozen_hash")
+            )
+            try:
+                if has_predecessor:
+                    proposal = freeze_canonical_scope_proposal(
+                        proposal,
+                        assumptions=proposal.get("assumptions"),
+                        current_resolution=proposal.get("current_resolution"),
+                        source_candidate_id=proposal.get("predecessor_candidate_id"),
+                        source_frozen_hash=proposal.get("predecessor_frozen_hash", proposal.get("frozen_hash")),
+                    )
+                resolution = proposal.get("current_resolution")
+                if isinstance(resolution, Mapping):
+                    proposal = handoff_current_scope_resolution(proposal, resolution)
+            except (LegacyScopeError, TypeError, ValueError) as exc:
+                raise AutonomousResearchError(
+                    getattr(exc, "reason", "INVALID_MARKET_SCOPE"),
+                    str(exc),
+                ) from exc
         validation = validate_hermes_proposal(proposal)
         if not validation.accepted:
             reason_code = next(
@@ -376,36 +700,21 @@ class AutonomousResearchProcessor:
                 "EXPERIMENT_BUDGET_EXCEEDED",
                 f"plan requests {plan.max_variants} variants; node limit is {self.config.max_plan_variants}",
             )
-        rows, split = self._load_split(plan)
-        if len(split.validation) < plan.min_samples:
+        if _variant_count(plan) > self.config.max_plan_variants:
             raise AutonomousResearchError(
-                "INSUFFICIENT_DATA",
-                f"validation sample count {len(split.validation)} is below {plan.min_samples}",
+                "EXPERIMENT_BUDGET_EXCEEDED",
+                "plan parameter space exceeds the node bound; all declared trials must run",
             )
         variants = plan.variants()
+        if len(variants) != _variant_count(plan):
+            raise AutonomousResearchError(
+                "EXPERIMENT_BUDGET_EXCEEDED",
+                "plan variant generation truncated; refusing incomplete trial set",
+            )
         if not variants:
             raise AutonomousResearchError("EXPERIMENT_BUDGET_EXCEEDED", "plan produced no bounded variants")
-        prepared: list[dict[str, Any]] = []
-        validation_scores: dict[str, float] = {}
-        for parameters in variants:
-            candidate_id = _candidate_id(plan, parameters, generation=0)
-            strategy = plan.strategy_for(parameters, candidate_id)
-            try:
-                evaluation = self._evaluate_datasets(plan, strategy, split.train, split.validation)
-            except AutonomousResearchError:
-                raise
-            except (KeyError, TypeError, ValueError) as exc:
-                raise AutonomousResearchError("INVALID_DATASET", str(exc)) from exc
-            prepared.append(
-                {
-                    "candidate_id": candidate_id,
-                    "strategy": strategy,
-                    "parameters": dict(parameters),
-                    "variant_id": plan.variant_id(parameters),
-                    "evaluation": evaluation,
-                }
-            )
-            validation_scores[candidate_id] = _finite(evaluation["validation"].get("expectancy"), 0.0)
+        # Record the immutable plan before attempting historical evaluation so
+        # schema-valid paper observation intents survive an insufficient split.
         self.store.save_experiment_plan(
             plan.plan_id,
             plan.as_dict(),
@@ -414,58 +723,176 @@ class AutonomousResearchProcessor:
             status="ACCEPTED",
             timestamp=now,
         )
-        results: list[dict[str, Any]] = []
-        for candidate in prepared:
-            candidate_id = candidate["candidate_id"]
-            strategy: StrategyDefinition = candidate["strategy"]
-            payload = self._candidate_payload(
+        prepared: list[dict[str, Any]] = []
+        validation_scores: dict[str, float] = {}
+        # Freeze every schema-valid bounded strategy and persist its paper
+        # observation intent before loading or judging historical evidence.
+        for parameters in variants:
+            candidate_id = _candidate_id(plan, parameters, generation=0)
+            strategy = plan.strategy_for(parameters, candidate_id)
+            self._initialize_candidate(
                 plan,
                 candidate_id,
                 strategy,
-                candidate["parameters"],
-                variant_id=candidate["variant_id"],
-                generation=0,
-                lineage=(),
+                parameters,
+                trial_index=len(prepared),
+                trial_count=len(variants),
+                now=now,
             )
-            self._reserve_candidate(plan, candidate_id, now)
-            self.store.save_strategy_if_absent(strategy.id, strategy.to_dict())
-            self.store.save_experiment_if_absent(
-                candidate_id,
+            prepared.append(
                 {
-                    "status": "IDEA",
-                    "run_id": candidate_id,
+                    "trial_index": len(prepared),
                     "candidate_id": candidate_id,
-                    "hypothesis_id": plan.hypothesis_id,
-                    "plan_id": plan.plan_id,
-                    "plan_hash": plan.plan_hash,
-                    **_scope_binding(plan),
-                    "dataset_id": plan.dataset_id,
-                    "dataset_version": plan.dataset_version,
-                    "variant": candidate["parameters"],
-                    "paper_only": True,
-                },
-                strategy_id=strategy.id,
+                    "strategy": strategy,
+                    "parameters": dict(parameters),
+                    "variant_id": plan.variant_id(parameters),
+                    "evaluation": None,
+                }
             )
-            self.lifecycle.register_idea(candidate_id, payload)
-            try:
-                result = self._advance_candidate(
-                    plan,
-                    candidate_id,
-                    strategy,
-                    candidate["evaluation"],
-                    variant_count=len(prepared),
-                    validation_scores=validation_scores,
-                    now=now,
-                    generation=0,
-                    lineage=(),
+        rows, split = self._load_split(plan)
+        historical_insufficient = len(split.validation) < plan.min_samples
+        if not historical_insufficient:
+            for candidate in prepared:
+                strategy: StrategyDefinition = candidate["strategy"]
+                try:
+                    evaluation = self._evaluate_datasets(
+                        plan,
+                        strategy,
+                        split.train,
+                        split.validation,
+                        (),
+                    )
+                except AutonomousResearchError:
+                    raise
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise AutonomousResearchError("INVALID_DATASET", str(exc)) from exc
+                candidate["evaluation"] = evaluation
+                validation_scores[str(candidate["candidate_id"])] = _finite(
+                    evaluation["validation"].get("expectancy"), 0.0
                 )
-            except AutonomousResearchError as exc:
-                current = self.lifecycle.get(candidate_id)
-                if current is not None and current.stage is not CandidateStage.REJECTED:
-                    self.lifecycle.reject(candidate_id, exc.reason, evidence={"reason_detail": exc.detail})
-                result = {"candidate_id": candidate_id, "stage": CandidateStage.REJECTED.value, "reason": exc.detail}
+        self.store.save_experiment_plan(
+            plan.plan_id,
+            plan.as_dict(),
+            hypothesis_id=plan.hypothesis_id,
+            plan_hash=plan.plan_hash,
+            status="ACCEPTED",
+            timestamp=now,
+        )
+        if historical_insufficient:
+            results: list[dict[str, Any]] = []
+            for candidate in prepared:
+                candidate_id = str(candidate["candidate_id"])
+                strategy: StrategyDefinition = candidate["strategy"]
+                observation_reason = (
+                    "at least three chronological observations are required"
+                    if len(rows) < 3
+                    else "INSUFFICIENT_DATA"
+                )
+                results.append(
+                    {
+                        "candidate_id": candidate_id,
+                        "stage": CandidateStage.SCHEMA_VALIDATED.value,
+                        "reason": observation_reason,
+                        "reason_code": "INSUFFICIENT_DATA",
+                        "forward_test_id": None,
+                        "paper_observation_intent": True,
+                        "research_only": True,
+                        "paper_only": True,
+                        "historical_blocker": (
+                            f"validation sample count {len(split.validation)} is below {plan.min_samples}"
+                        ),
+                        **_strategy_metadata(strategy),
+                    }
+                )
+            summary = self._hypothesis_result(plan, results, ())
+            self.store.save_experiment_plan(
+                plan.plan_id,
+                plan.as_dict(),
+                hypothesis_id=plan.hypothesis_id,
+                plan_hash=plan.plan_hash,
+                status="COMPLETED",
+                result=summary,
+                timestamp=now,
+            )
+            self.store.save_report_if_absent(
+                "autonomous-" + plan.plan_id,
+                {"report_type": "autonomous_experiment_result", **summary},
+                experiment_id=plan.plan_id,
+            )
+            return summary
+        results: list[dict[str, Any]] = []
+        for candidate in prepared:
+            candidate_id = str(candidate["candidate_id"])
+            strategy: StrategyDefinition = candidate["strategy"]
+            evaluation = candidate["evaluation"]
+            validation = (
+                evaluation.get("validation", {})
+                if isinstance(evaluation, Mapping)
+                else {}
+            )
+            sample_check = minimum_sample_check(
+                int(validation.get("sample_count", 0)),
+                trades=int(validation.get("filled_trades", 0)),
+                min_observations=plan.min_samples,
+                min_trades=plan.min_trades,
+            )
+            if not sample_check["passed"]:
+                # Historical qualification is a gate on promotion, not a
+                # reason to destroy a canonical paper observation intent.
+                # Leave the lifecycle at SCHEMA_VALIDATED so the collector
+                # can materialize bounded current observations later.
+                result = {
+                    "candidate_id": candidate_id,
+                    "reason": "INSUFFICIENT_DATA",
+                    "reason_code": "INSUFFICIENT_DATA",
+                    "forward_test_id": None,
+                    "paper_observation_intent": True,
+                    "research_only": True,
+                    "paper_only": True,
+                    "historical_blocker": (
+                        f"validation sample check failed: {sample_check}"
+                    ),
+                    "minimum_sample_check": sample_check,
+                    "validation": _compact_evidence(validation),
+                }
+            else:
+                try:
+                    result = self._advance_candidate(
+                        plan,
+                        candidate_id,
+                        strategy,
+                        evaluation,
+                        variant_count=len(prepared),
+                        validation_scores=validation_scores,
+                        now=now,
+                        generation=0,
+                        lineage=(),
+                    )
+                except AutonomousResearchError as exc:
+                    current = self.lifecycle.get(candidate_id)
+                    if current is not None and current.stage is not CandidateStage.REJECTED:
+                        self.lifecycle.reject(candidate_id, exc.reason, evidence={"reason_detail": exc.detail})
+                    result = {
+                        "candidate_id": candidate_id,
+                        "stage": CandidateStage.REJECTED.value,
+                        "reason": exc.detail,
+                        "reason_code": exc.reason,
+                    }
+            result = {**dict(result), **_strategy_metadata(strategy)}
+            holdout = evaluation.get("holdout") if isinstance(evaluation, Mapping) else None
+            if isinstance(holdout, Mapping):
+                result = {
+                    **dict(result),
+                    "holdout_evaluated": True,
+                    "holdout_used_for_selection": False,
+                    "holdout": _compact_evidence(holdout),
+                }
             results.append(result)
-        mutations = self._generate_mutations(plan, prepared, validation_scores, now, lineage=())
+        mutations = (
+            ()
+            if bool(item.payload.get("predeclared_starting_set"))
+            else self._generate_mutations(plan, prepared, validation_scores, now, lineage=())
+        )
         summary = self._hypothesis_result(plan, results, mutations)
         self.store.save_experiment_plan(
             plan.plan_id,
@@ -482,6 +909,135 @@ class AutonomousResearchProcessor:
             experiment_id=plan.plan_id,
         )
         return summary
+
+    def _initialize_candidate(
+        self,
+        plan: ExperimentPlan,
+        candidate_id: str,
+        strategy: StrategyDefinition,
+        parameters: Mapping[str, Any],
+        *,
+        trial_index: int,
+        trial_count: int,
+        now: datetime,
+    ) -> Mapping[str, Any]:
+        payload = self._candidate_payload(
+            plan,
+            candidate_id,
+            strategy,
+            parameters,
+            variant_id=plan.variant_id(parameters),
+            generation=0,
+            lineage=(),
+        )
+        # Register the worker-generated identity before any lifecycle
+        # transition or observation intent is persisted.  The surrounding
+        # queue transaction makes this registration durable with the plan,
+        # run, and completion record, while a crash rolls all of them back.
+        self.lifecycle.register_idea(candidate_id, payload)
+        self._reserve_candidate(plan, candidate_id, now)
+        self.store.save_strategy_if_absent(strategy.id, strategy.to_dict())
+        self.store.save_experiment_if_absent(
+            candidate_id,
+            {
+                "status": "IDEA",
+                "run_id": candidate_id,
+                "candidate_id": candidate_id,
+                "hypothesis_id": plan.hypothesis_id,
+                "plan_id": plan.plan_id,
+                "plan_hash": plan.plan_hash,
+                **_scope_binding(plan),
+                "dataset_id": plan.dataset_id,
+                "dataset_version": plan.dataset_version,
+                "variant": dict(parameters),
+                "trial_index": trial_index,
+                "trial_count": trial_count,
+                "holdout_evaluated": False,
+                "holdout_used_for_selection": False,
+                "paper_only": True,
+            },
+            strategy_id=strategy.id,
+        )
+        intent = (
+            self._register_schema_observation_intent(plan, candidate_id, strategy, now)
+            if plan.market_type is MarketType.PREDICTION
+            else None
+        )
+        result = {**dict(payload), "paper_observation_intent": intent is not None}
+        if intent is not None:
+            result.update(
+                {
+                    "paper_observation_intent_id": intent.experiment_id,
+                    "paper_observation_intent": True,
+                }
+            )
+        return result
+
+    def _register_schema_observation_intent(
+        self,
+        plan: ExperimentPlan,
+        candidate_id: str,
+        strategy: StrategyDefinition,
+        now: datetime,
+    ) -> Any:
+        model_document = plan.model_for() or {"type": "deterministic"}
+        if plan.market_type is MarketType.CRYPTO_SPOT:
+            config: dict[str, Any] = {"paper_only": True}
+            risk_limits: Mapping[str, Any] = {"max_position_fraction": 0.0}
+        else:
+            config = {
+                "execution": "paper_only",
+                "market_authority_required": False,
+            }
+            risk_limits = {"max_position_fraction": 0.05}
+        config.update(
+            {
+                "candidate_id": candidate_id,
+                "plan_id": plan.plan_id,
+                "dataset_id": plan.dataset_id,
+                "dataset_version": plan.dataset_version,
+                "strategy_document": strategy.to_dict(),
+                "model_document": dict(model_document),
+                **_scope_binding(plan),
+                "assumptions": dict(plan.assumptions),
+                "cost_assumptions": {
+                    "fee_bps": plan.assumptions.get("fee_bps"),
+                    "slippage_bps": plan.assumptions.get("slippage_bps"),
+                    "roundtrip_fee_bps": plan.assumptions.get("roundtrip_fee_bps"),
+                    "roundtrip_slippage_bps": plan.assumptions.get("roundtrip_slippage_bps"),
+                    "sensitivity": plan.assumptions.get("cost_sensitivity"),
+                },
+                "exit_policy": dict(plan.exit_policy),
+                "research_mode": plan.research_mode,
+            }
+        )
+        intent = ForwardTestRegistry(self.store).register_observation_intent(
+            strategy=strategy.to_dict(),
+            model=dict(model_document),
+            config=config,
+            registration_timestamp=now,
+            risk_limits=risk_limits,
+            candidate_id=candidate_id,
+        )
+        current = self.lifecycle.get(candidate_id)
+        if current is not None and current.stage is CandidateStage.IDEA:
+            self.lifecycle.advance(
+                candidate_id,
+                CandidateStage.SCHEMA_VALIDATED,
+                {
+                    **dict(current.payload),
+                    "schema_valid": True,
+                    "referenced_features": list(plan.allowed_features),
+                    "parameter_ranges_bounded": True,
+                    "paper_observation_intent_id": intent.experiment_id,
+                    "paper_observation_intent": True,
+                    "paper_only": True,
+                    "research_only": True,
+                    "historical_qualification": "PENDING",
+                },
+                reason="canonical paper observation intent registered before historical qualification",
+            )
+        return intent
 
     def _process_candidate(self, item: ResearchQueueItem, now: datetime) -> Mapping[str, Any]:
         payload = dict(item.payload)
@@ -1265,7 +1821,18 @@ class AutonomousResearchProcessor:
         rows = self._apply_plan_filters(plan, rows)
         rows = self._apply_model_document(plan, rows)
         if not rows:
-            raise AutonomousResearchError("INSUFFICIENT_DATA", "dataset contains no rows after plan filters")
+            # A schema-valid paper intent must remain durable when the immutable
+            # dataset is empty after scope/model filters.  Keep the historical
+            # partition empty; no observations or qualification are inferred.
+            empty_start = datetime(1970, 1, 1, tzinfo=timezone.utc)
+            return [], split_dataset(
+                (),
+                empty_start,
+                empty_start + timedelta(microseconds=1),
+                empty_start + timedelta(microseconds=2),
+                dataset_version=plan.dataset_version,
+                require_nonempty=False,
+            )
         for feature in plan.allowed_features:
             if feature in {"timestamp", "market_id", "symbol", "expiry", "settlement", "question", "resolution_criteria"}:
                 continue
@@ -1274,9 +1841,35 @@ class AutonomousResearchProcessor:
         stamps = [parse_timestamp(_value(row, "timestamp")) for row in rows]
         if any(stamp is None for stamp in stamps):
             raise AutonomousResearchError("INSUFFICIENT_DATA", "dataset contains rows without timestamps")
-        ordered = [row for _, row in sorted(zip(stamps, rows), key=lambda pair: (pair[0], _value(pair[1], "market_id", "")))]
+        ordered = [
+            row
+            for _, row in sorted(
+                zip(stamps, rows),
+                key=lambda pair: (pair[0], _value(pair[1], "market_id", "")),
+            )
+        ]
+
+        def sparse_split() -> Any:
+            # Preserve the immutable rows even when there are too few
+            # distinct time boundaries to form three non-empty partitions.
+            first_stamp = parse_timestamp(_value(ordered[0], "timestamp"))
+            if first_stamp is None:
+                raise AutonomousResearchError("INSUFFICIENT_DATA", "dataset timestamps are invalid")
+            return split_dataset(
+                ordered,
+                first_stamp + timedelta(microseconds=1),
+                first_stamp + timedelta(microseconds=2),
+                first_stamp + timedelta(microseconds=3),
+                dataset_version=plan.dataset_version,
+                require_nonempty=False,
+            )
+
         if len(ordered) < 3:
-            raise AutonomousResearchError("INSUFFICIENT_DATA", "at least three chronological observations are required")
+            # Keep the immutable rows and their chronological partition even
+            # when historical evidence is too small to backtest.  The caller
+            # records the already-registered paper intent as SCHEMA_VALIDATED;
+            # no historical metrics or forward authority are inferred here.
+            return ordered, sparse_split()
         train_count = max(1, int(len(ordered) * 0.60))
         validation_count = max(1, int(len(ordered) * 0.20))
         if train_count + validation_count >= len(ordered):
@@ -1287,19 +1880,18 @@ class AutonomousResearchProcessor:
         holdout_end = parse_timestamp(_value(ordered[-1], "timestamp"))
         if train_end is None or validation_end is None or holdout_end is None:
             raise AutonomousResearchError("INSUFFICIENT_DATA", "dataset timestamps are invalid")
-        from datetime import timedelta
-
         split = split_dataset(
             ordered,
             train_end,
             validation_end,
             holdout_end + timedelta(microseconds=1),
             dataset_version=plan.dataset_version,
-            require_nonempty=True,
+            require_nonempty=False,
         )
-        # Keep the locked holdout in the split object for provenance only.
-        # Autonomous evaluation, mutation, Hermes summaries, and promotion use
-        # train/validation evidence and never consume split.holdout.
+        if not split.train or not split.validation or not split.holdout:
+            return ordered, sparse_split()
+        # The locked holdout is evaluated once after the complete trial set is
+        # fixed. It never feeds selection, mutation, Hermes, or qualification.
         return ordered, split
 
     def _apply_plan_filters(self, plan: ExperimentPlan, rows: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
@@ -1420,28 +2012,59 @@ class AutonomousResearchProcessor:
         strategy: StrategyDefinition,
         train: Sequence[Mapping[str, Any]],
         validation: Sequence[Mapping[str, Any]],
+        holdout: Sequence[Mapping[str, Any]] = (),
     ) -> dict[str, Mapping[str, Any]]:
-        return {
+        result: dict[str, Mapping[str, Any]] = {
             "train": self._run_backtest(plan, strategy, train),
             "validation": self._run_backtest(plan, strategy, validation),
         }
+        if holdout:
+            # This is an attested, chronological review only.  It is not part
+            # of variant selection, mutation, or canary qualification.
+            result["holdout"] = self._run_backtest(plan, strategy, holdout)
+        return result
 
     @staticmethod
     def _run_backtest(plan: ExperimentPlan, strategy: StrategyDefinition, rows: Sequence[Mapping[str, Any]]) -> Mapping[str, Any]:
         methodology = plan.methodology
+        assumptions = plan.assumptions if isinstance(plan.assumptions, Mapping) else {}
         initial_cash = _finite(methodology.get("initial_cash"), 10_000.0)
-        fee_bps = _finite(methodology.get("fee_bps"), 0.0)
-        slippage_bps = _finite(methodology.get("slippage_bps"), 0.0)
+        fee_bps = _finite(assumptions.get("fee_bps"), _finite(methodology.get("fee_bps"), 0.0))
+        slippage_bps = _finite(assumptions.get("slippage_bps"), _finite(methodology.get("slippage_bps"), 0.0))
         allocation = _finite(methodology.get("allocation"), 0.25)
-        if not math.isfinite(initial_cash) or initial_cash <= 0 or not math.isfinite(fee_bps) or fee_bps < 0 or not math.isfinite(slippage_bps) or slippage_bps < 0:
+        if (
+            not math.isfinite(initial_cash)
+            or initial_cash <= 0
+            or not math.isfinite(fee_bps)
+            or fee_bps < 0
+            or not math.isfinite(slippage_bps)
+            or slippage_bps < 0
+        ):
             raise AutonomousResearchError("INVALID_PLAN", "cost assumptions must be finite and non-negative")
+        research_mode: str | None = None
+        exit_policy: Mapping[str, Any] | None = None
         if plan.market_type is MarketType.PREDICTION:
-            result = PredictionMarketBacktester(
+            research_mode = str(plan.research_mode or methodology.get("research_mode") or "PRICE_PROXY_RESEARCH").strip().upper()
+            exit_policy = dict(plan.exit_policy) if isinstance(plan.exit_policy, Mapping) else {
+                "type": "fixed_holding_period",
+                "holding_period": 1,
+            }
+            holding_period = exit_policy.get("holding_period")
+            if isinstance(holding_period, bool) or not isinstance(holding_period, int) or holding_period < 1:
+                raise AutonomousResearchError("INVALID_PLAN", "exit_policy.holding_period must be a bounded positive integer")
+            result = run_prediction_research_mode(
+                rows,
+                strategy,
+                mode=research_mode,
                 initial_cash=initial_cash,
                 fee_bps=fee_bps,
                 slippage_bps=slippage_bps,
                 allocation=max(0.0, min(1.0, allocation)),
-            ).run(rows, strategy, research_quality=ResearchQuality.ORDER_BOOK_SIMULATED if _has_book(rows) else ResearchQuality.PRICE_PROXY)
+                resolutions=None,
+                model_document=plan.model_document,
+                holding_period=holding_period,
+                exit_policy=exit_policy,
+            )
         else:
             result = CryptoBacktester(
                 initial_cash=initial_cash,
@@ -1485,6 +2108,14 @@ class AutonomousResearchProcessor:
             "liquidity": mean(liquidity_values) if liquidity_values else 0.0,
             "regime_count": len(regimes) if regimes else (1 if rows else 0),
             "quality": result_quality,
+            "assumption_version": assumptions.get("version"),
+            "cost_assumptions": {
+                "fee_bps": fee_bps,
+                "slippage_bps": slippage_bps,
+            },
+            "exit_policy": dict(exit_policy) if exit_policy is not None else None,
+            "research_mode": research_mode,
+            "execution_simulation": False,
             "costs": metrics.get("fees", 0.0) + metrics.get("slippage", 0.0),
             "confidence_lower_bound": _finite(confidence.get("lower"), 0.0),
             "confidence_interval": {
@@ -1525,6 +2156,7 @@ class AutonomousResearchProcessor:
             "hypothesis_id": plan.hypothesis_id,
             "plan_id": plan.plan_id,
             **_scope_binding(plan),
+            **_strategy_metadata(strategy),
             "plan_hash": plan.plan_hash,
             "dataset_id": plan.dataset_id,
             "dataset_version": plan.dataset_version,
@@ -1534,6 +2166,16 @@ class AutonomousResearchProcessor:
                 "time_split": plan.methodology.get("time_split"),
                 "universe": dict(plan.universe or {}),
             },
+            "assumptions": dict(plan.assumptions),
+            "cost_assumptions": {
+                "fee_bps": plan.assumptions.get("fee_bps"),
+                "slippage_bps": plan.assumptions.get("slippage_bps"),
+                "roundtrip_fee_bps": plan.assumptions.get("roundtrip_fee_bps"),
+                "roundtrip_slippage_bps": plan.assumptions.get("roundtrip_slippage_bps"),
+                "sensitivity": plan.assumptions.get("cost_sensitivity"),
+            },
+            "exit_policy": dict(plan.exit_policy),
+            "research_mode": plan.research_mode,
             "experiment_family": plan.experiment_family,
             "generation": generation,
             "lineage": list(dict.fromkeys([*(str(value) for value in lineage), *([candidate_id] if generation else [])])),
@@ -1585,7 +2227,11 @@ class AutonomousResearchProcessor:
                 expected_stage=candidate.stage,
                 expected_payload=candidate.payload,
             )
-            return {"candidate_id": candidate_id, "stage": CandidateStage.REJECTED.value, "reason": "negative_validation_expectancy"}
+            return {
+                "candidate_id": candidate_id,
+                "reason": "negative_validation_expectancy",
+                "reason_code": "NEGATIVE_VALIDATION_EXPECTANCY",
+            }
         if candidate.stage is CandidateStage.BACKTESTED:
             candidate = self.lifecycle.advance(
                 candidate_id,
@@ -1660,7 +2306,11 @@ class AutonomousResearchProcessor:
                     expected_stage=candidate.stage,
                     expected_payload=candidate.payload,
                 )
-                return {"candidate_id": candidate_id, "stage": CandidateStage.REJECTED.value, "reason": "INSUFFICIENT_DATA"}
+                return {
+                    "candidate_id": candidate_id,
+                    "reason": "INSUFFICIENT_DATA",
+                    "reason_code": "INSUFFICIENT_DATA",
+                }
             if stability_value < 0.60:
                 self.lifecycle.reject(
                     candidate_id,
@@ -1669,13 +2319,28 @@ class AutonomousResearchProcessor:
                     expected_stage=candidate.stage,
                     expected_payload=candidate.payload,
                 )
-                return {"candidate_id": candidate_id, "stage": CandidateStage.REJECTED.value, "reason": "unstable_neighbor_parameters"}
+                return {
+                    "candidate_id": candidate_id,
+                    "reason": "unstable_neighbor_parameters",
+                    "reason_code": "UNSTABLE_NEIGHBOR_PARAMETERS",
+                }
             candidate = self.lifecycle.advance(
                 candidate_id,
                 CandidateStage.ROBUSTNESS_CHECKED,
                 robust_evidence,
-                reason="sample, neighboring-parameter, regime, and cost checks passed",
+                reason="bounded validation robustness checks completed",
             )
+        if candidate.stage is CandidateStage.ROBUSTNESS_CHECKED and bool(base.get("selection_excluded")):
+            return {
+                "candidate_id": candidate_id,
+                "stage": candidate.stage.value,
+                "validation_expectancy": validation_expectancy,
+                "variant_count": variant_count,
+                "forward_test_id": None,
+                "research_only": True,
+                "paper_only": True,
+                **_strategy_metadata(strategy),
+            }
         if candidate.stage is CandidateStage.ROBUSTNESS_CHECKED:
             model_document = plan.model_for() or {"type": "deterministic"}
             dataset_attestation = self._dataset_attestation(plan)
@@ -1703,7 +2368,19 @@ class AutonomousResearchProcessor:
                     "strategy_document": strategy.to_dict(),
                     "model_document": dict(model_document),
                 }
+            forward_config["candidate_id"] = candidate_id
+            forward_config["observation_intent"] = True
             forward_config.update(_scope_binding(plan))
+            forward_config["assumptions"] = dict(plan.assumptions)
+            forward_config["cost_assumptions"] = {
+                "fee_bps": plan.assumptions.get("fee_bps"),
+                "slippage_bps": plan.assumptions.get("slippage_bps"),
+                "roundtrip_fee_bps": plan.assumptions.get("roundtrip_fee_bps"),
+                "roundtrip_slippage_bps": plan.assumptions.get("roundtrip_slippage_bps"),
+                "sensitivity": plan.assumptions.get("cost_sensitivity"),
+            }
+            forward_config["exit_policy"] = dict(plan.exit_policy)
+            forward_config["research_mode"] = plan.research_mode
             config_hash = _hash_document({"config": forward_config, "risk_limits": risk_snapshot})
             strategy_hash = _content_hash(strategy.to_dict())
             model_hash = _content_hash(model_document)
@@ -1789,6 +2466,7 @@ class AutonomousResearchProcessor:
                     "research_only": True,
                     "paper_only": True,
                 }
+
             registry = ForwardTestRegistry(self.store)
             spec = registry.register_forward_test(
                 strategy=strategy.to_dict(),
@@ -1808,9 +2486,9 @@ class AutonomousResearchProcessor:
                     **base,
                     "paper_forward_started": True,
                     "forward_test_id": spec.experiment_id,
+                    # Preserve the registry's real current-time provenance on
+                    # the lifecycle record; never reconstruct it from history.
                     "registration_timestamp": spec.registration_timestamp.isoformat(),
-                    "forward_duration_seconds": 0.0,
-                    "holdout_used": False,
                     "forward_evidence": {
                         "evidence_scope": "forward_only",
                         "forward_order_attempts": 0,
@@ -2024,6 +2702,7 @@ class AutonomousResearchProcessor:
             "experiment_plan": plan.as_dict(),
             **_scope_binding(plan),
             "strategy": strategy.to_dict(),
+            **_strategy_metadata(strategy),
             "parameters": dict(parameters),
             "variant_id": variant_id,
             "generation": generation,
@@ -2047,13 +2726,59 @@ class AutonomousResearchProcessor:
             if plan.market_type is MarketType.CRYPTO_SPOT
             else {CandidateStage.PAPER_FORWARD.value, CandidateStage.PAPER_PROMOTABLE.value}
         )
-        selected = [item for item in results if item.get("stage") in selected_stages]
+        selected = [
+            item
+            for item in results
+            if item.get("stage") in selected_stages
+            and not bool(item.get("selection_excluded"))
+            and str(item.get("research_role", "")).strip().upper() != "ZERO_EDGE_CONTROL"
+        ]
+        reason_codes = [
+            str(value).strip()
+            for item in results
+            for value in (item.get("reason_code"),)
+            if value is not None and str(value).strip()
+        ]
+        if not reason_codes:
+            reason_codes = [
+                str(item.get("reason")).strip()
+                for item in results
+                if re.fullmatch(r"[A-Z][A-Z0-9_]{2,63}", str(item.get("reason", "")).strip())
+            ]
+        reason_code = next(iter(dict.fromkeys(reason_codes)), None)
+        summary_reason = next(
+            (
+                str(item.get("reason")).strip()
+                for item in results
+                if item.get("reason") is not None and str(item.get("reason")).strip()
+            ),
+            None,
+        )
+        supported_edge = bool(selected)
+        if supported_edge:
+            summary_reason = None
         reasons: dict[str, int] = {}
         for item in rejected:
             reason = str(item.get("reason", "rejected"))
             reasons[reason] = reasons.get(reason, 0) + 1
+        trial_manifest = [
+            {
+                "trial_index": index,
+                "candidate_id": item.get("candidate_id"),
+                "stage": item.get("stage"),
+                "validation_expectancy": item.get("validation_expectancy"),
+                "research_role": item.get("research_role"),
+                "selection_excluded": bool(item.get("selection_excluded")),
+                "proven_zero_edge": bool(item.get("proven_zero_edge")),
+                "holdout_evaluated": bool(item.get("holdout_evaluated")),
+                "holdout_used_for_selection": bool(item.get("holdout_used_for_selection")),
+            }
+            for index, item in enumerate(results)
+        ]
         return {
-            "accepted": bool(selected),
+            "accepted": supported_edge,
+            "reason_code": None if supported_edge else reason_code,
+            "reason": summary_reason,
             "kind": "hypothesis",
             "hypothesis_id": plan.hypothesis_id,
             "plan_id": plan.plan_id,
@@ -2064,25 +2789,48 @@ class AutonomousResearchProcessor:
                 if plan.market_type is MarketType.CRYPTO_SPOT and selected
                 else "accepted" if selected else "unsupported_by_validation"
             ),
+            "supported_edge": supported_edge,
+            "blocker": None if supported_edge else "NO_SUPPORTED_EDGE",
+            "next_action": "AWAIT_PAPER_EVIDENCE" if supported_edge else "CONTINUE_RESEARCH_AND_PAPER",
             "variants_tested": len(results),
             "selected_from_variants": len(selected),
-            "selected_candidate_ids": [item.get("candidate_id") for item in selected[:_MAX_QUEUE_RESULT_ITEMS]],
+            "selected_candidate_ids": [
+                str(item.get("candidate_id"))
+                for item in selected
+                if str(item.get("candidate_id", "")).strip()
+            ],
+            "trial_manifest": trial_manifest,
             "candidate_results": [
                 {
                     "candidate_id": item.get("candidate_id"),
                     "stage": item.get("stage"),
                     "reason": item.get("reason"),
+                    "reason_code": item.get("reason_code"),
                     "forward_test_id": item.get("forward_test_id"),
+                    "research_role": item.get("research_role"),
+                    "selection_excluded": bool(item.get("selection_excluded")),
+                    "proven_zero_edge": bool(item.get("proven_zero_edge")),
+                    "holdout_evaluated": bool(item.get("holdout_evaluated")),
+                    "holdout_used_for_selection": bool(item.get("holdout_used_for_selection")),
+                    "holdout": item.get("holdout"),
                 }
-                for item in results[:_MAX_QUEUE_RESULT_ITEMS]
+                for item in results
             ],
             "rejected_reasons": dict(sorted(reasons.items())),
             "mutation_candidates": list(mutations[:_MAX_QUEUE_RESULT_ITEMS]),
             "experiment_family": plan.experiment_family,
             "dataset_version": plan.dataset_version,
-            "data_quality": "ORDER_BOOK_SIMULATED" if plan.market_type is MarketType.PREDICTION else "OHLCV_SIMULATED",
+            "data_quality": "PRICE_PROXY_RESEARCH" if plan.market_type is MarketType.PREDICTION else "OHLCV_SIMULATED",
             "paper_only": True,
             "research_only": plan.market_type is MarketType.CRYPTO_SPOT,
+            "holdout_used": False,
+            "holdout_evaluated": any(
+                bool(item.get("holdout_evaluated")) for item in results
+            ),
+            "holdout_locked": not any(
+                bool(item.get("holdout_evaluated")) for item in results
+            ),
+            "holdout_selection_fence": "validation_only",
         }
 
     def _forward_evidence(self, record: Mapping[str, Any], now: datetime) -> dict[str, Any]:
@@ -2677,6 +3425,7 @@ def _bounded_queue_result(value: Mapping[str, Any]) -> dict[str, Any]:
 
 
 __all__ = [
+    "PREDECLARED_STRATEGY_STARTING_SET",
     "AutonomousQueueCycle",
     "AutonomousResearchConfig",
     "AutonomousResearchError",

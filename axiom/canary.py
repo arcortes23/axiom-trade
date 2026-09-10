@@ -8,19 +8,22 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal, ROUND_DOWN, ROUND_UP
 import getpass
 import hashlib
 import importlib.metadata
 import json
 import logging
 import math
+import os
+import re
 import sqlite3
+import hmac
 import queue
 import threading
 import time
 from urllib.request import Request, urlopen
-from typing import Any, Mapping, Protocol, Sequence
+from typing import Any, Callable, Mapping, Protocol, Sequence
 
 from .domain import ensure_utc, parse_timestamp, utc_now
 from .storage import AxiomStore, SQLiteBusyTimeout, sqlite_retry
@@ -34,7 +37,11 @@ from .data_quality import (
 _LOGGER = logging.getLogger(__name__)
 from .strategy.signals import evaluate_model_document_probability
 
-SUPPORTED_POLYMARKET_SDK = "0.9"
+SUPPORTED_POLYMARKET_SDK = "0.9.0"
+POLYMARKET_CHAIN_ID = 137
+POLYMARKET_COLLATERAL_SYMBOL = "pUSD"
+POLYMARKET_COLLATERAL_ADDRESS = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
+POLYMARKET_COLLATERAL_DECIMALS = 6
 _OFFICIAL_GEOBLOCK_URL = "https://polymarket.com/api/geoblock"
 PRODUCTION_LIVE_EXECUTION = False
 AUTONOMOUS_MICRO_LIVE = "AUTONOMOUS_MICRO_LIVE"
@@ -62,6 +69,36 @@ CANARY_SIGNAL_MAX_AGE_SECONDS = 60.0
 CANARY_READINESS_SNAPSHOT_MAX_AGE_SECONDS = 60.0
 CANARY_EXECUTION_MARKET_CAP = 8
 EXECUTION_FEASIBILITY_MARKET_CAP = "EXECUTION_FEASIBILITY_MARKET_CAP"
+
+
+
+def _isolated_execution_profile() -> bool:
+    """Return whether this process is not in the exact production profile.
+
+    Profile parsing is centralized in ``node``.  A malformed ambient value is
+    deliberately treated as isolated here so it can never open a production
+    credential or account boundary.
+    """
+    try:
+        from .node import (
+            PRODUCTION_EXECUTION_PROFILE,
+            normalized_execution_profile,
+        )
+
+        return (
+            normalized_execution_profile(
+                os.environ.get("AXIOM_EXECUTION_PROFILE"),
+                default=PRODUCTION_EXECUTION_PROFILE,
+            )
+            != PRODUCTION_EXECUTION_PROFILE
+        )
+    except (ImportError, ValueError, TypeError):
+        return True
+
+
+def _deny_isolated_real_transport() -> None:
+    if _isolated_execution_profile():
+        raise CanaryBlocked("ISOLATED_EXECUTION_PROFILE")
 
 _CANARY_ELIGIBLE_STAGES = frozenset({"FROZEN", "PAPER_FORWARD", "PAPER_PROMOTABLE"})
 _CANARY_LAST_GOOD_MISSING_REASONS = frozenset(
@@ -136,9 +173,6 @@ def _canary_has_last_good(
             )
         except (TypeError, ValueError):
             parsed_external_version = None
-        if parsed_external_version is not None and parsed_external_version > 0:
-            raw_version = projection_version
-    if isinstance(raw_version, bool):
         raw_version = None
     try:
         parsed_version = int(raw_version) if raw_version is not None else 0
@@ -159,15 +193,75 @@ def _canary_has_last_good(
 
 _MANDATORY_SECRET_NAMES = ("private_key", "wallet_address")
 _OPTIONAL_SECRET_NAMES = ("relayer_api_key", "relayer_api_key_address")
-_SECRET_NAMES = _MANDATORY_SECRET_NAMES + _OPTIONAL_SECRET_NAMES
+_CLOB_SECRET_NAMES = ("api_key", "api_secret", "api_passphrase")
+_SECRET_NAMES = _MANDATORY_SECRET_NAMES + _OPTIONAL_SECRET_NAMES + _CLOB_SECRET_NAMES
+
+_CREDENTIAL_FINGERPRINT_VERSION = "v1"
+_CREDENTIAL_PROFILE = "production"
+_CREDENTIAL_FINGERPRINT_RE = re.compile(
+    r"^sha256:v1:[0-9a-f]{64}$"
+)
+
+
+def _credential_value(source: Any, name: str) -> str:
+    if isinstance(source, Mapping):
+        value = source.get(name)
+    else:
+        value = getattr(source, name, None) if source is not None else None
+    return str(value) if value not in (None, "") else ""
+
+
+def credential_fingerprint(
+    values: Mapping[str, Any] | CredentialStore | None,
+    *,
+    profile: Any = _CREDENTIAL_PROFILE,
+    execution_profile: Any = None,
+) -> str:
+    """Return a versioned digest of the configured credential identity.
+
+    Only the seven configured fields and the exact execution profile enter the
+    canonical document.  Missing optional values are represented as empty
+    strings; the returned value is the only form allowed across persistence
+    and operator projections.
+    """
+    selected_profile = profile if execution_profile is None else execution_profile
+    if isinstance(selected_profile, Mapping):
+        selected_profile = selected_profile.get("environment")
+    profile_value = str(selected_profile or "").strip()
+    body = {
+        "version": _CREDENTIAL_FINGERPRINT_VERSION,
+        "profile": profile_value,
+        "credentials": {
+            name: _credential_value(values, name)
+            for name in _SECRET_NAMES
+        },
+    }
+    encoded = json.dumps(
+        body,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return "sha256:v1:" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _valid_credential_fingerprint(value: Any) -> str | None:
+    if not isinstance(value, str) or _CREDENTIAL_FINGERPRINT_RE.fullmatch(value) is None:
+        return None
+    return value
+
 _ENV_NAMES = {
     "private_key": "POLYMARKET_PRIVATE_KEY",
     "wallet_address": "POLYMARKET_WALLET_ADDRESS",
     "relayer_api_key": "POLYMARKET_RELAYER_API_KEY",
     "relayer_api_key_address": "POLYMARKET_RELAYER_API_KEY_ADDRESS",
+    "api_key": "POLYMARKET_CLOB_API_KEY",
+    "api_secret": "POLYMARKET_CLOB_API_SECRET",
+    "api_passphrase": "POLYMARKET_CLOB_API_PASSPHRASE",
 }
-_SAFE_PROBE_TTL_SECONDS = 30.0
-_SAFE_PROBE_LOCK = threading.Lock()
+_SAFE_PROBE_LOCK = threading.RLock()
+_SAFE_PROBE_TTL_SECONDS = 5.0
 _SAFE_PROBE_CACHE: dict[tuple[type[Any], bool], tuple[float, bool]] = {}
 _SAFE_PROBE_GENERATIONS: dict[tuple[type[Any], bool], int] = {}
 _SAFE_PROBE_IN_FLIGHT: tuple[tuple[type[Any], bool], threading.Event, int] | None = None
@@ -188,12 +282,182 @@ def _sdk_value(source: Any, name: str, default: Any = None) -> Any:
     if isinstance(source, Mapping):
         return source.get(name, default)
     return getattr(source, name, default)
+_ORDER_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,255}$")
+_CANARY_REJECTION_STATUSES = frozenset(
+    {"REJECTED", "FAILED", "ERROR", "CANCELLED", "CANCELED", "EXPIRED"}
+)
+_CANARY_ACCEPTED_STATUSES = frozenset(
+    {
+        "ACCEPTED",
+        "SUBMITTED",
+        "MATCHED",
+        "FILLED",
+        "PARTIAL",
+        "PARTIALLY_FILLED",
+        "OPEN",
+        "LIVE",
+        "DELAYED",
+        "ACKNOWLEDGED",
+        "SETTLED",
+        "RESOLVED",
+    }
+)
+_CANARY_UNKNOWN_RESPONSE_CODES = frozenset(
+    {"", "UNKNOWN", "UNSPECIFIED", "NONE", "NULL"}
+)
+
+
+def _canonical_exchange_order_id(value: Any) -> str | None:
+    """Return one bounded, venue-canonical order ID or ``None``."""
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    return text if _ORDER_ID_PATTERN.fullmatch(text) is not None else None
+
+
+def _is_explicit_rejection_code(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and value.strip().upper() not in _CANARY_UNKNOWN_RESPONSE_CODES
+    )
+
+
+
+
+def _collateral_metadata() -> dict[str, Any]:
+    """Return the protocol collateral denomination used by safe diagnostics."""
+    return {
+        "symbol": POLYMARKET_COLLATERAL_SYMBOL,
+        "address": POLYMARKET_COLLATERAL_ADDRESS,
+        "decimals": POLYMARKET_COLLATERAL_DECIMALS,
+        "chain_id": POLYMARKET_CHAIN_ID,
+    }
 
 def _canary_closed_flag(value: Any) -> bool:
     """Normalize persisted closed flags like the storage market projection."""
     if isinstance(value, bool):
         return value
     return str(value).strip().lower() in {"1", "true", "yes", "y", "on", "closed"}
+
+def _sdk_api_key_credentials(sdk: Any, values: Mapping[str, Any]) -> Any:
+    """Build pre-supplied SDK credentials without invoking auth bootstrap.
+
+    ``SecureClient._create`` bootstraps credentials when ``credentials`` is
+    omitted.  The canary must never do that, so an installed SDK exposing
+    ``ApiKeyCreds`` requires all three locally configured fields.
+    """
+    creds_type = getattr(sdk, "ApiKeyCreds", None)
+    if not callable(creds_type):
+        raise CanaryBlocked("OFFICIAL_POLYMARKET_SDK_NOT_READONLY_COMPATIBLE")
+    aliases = {
+        "key": ("api_key", "clob_api_key"),
+        "secret": ("api_secret", "clob_api_secret"),
+        "passphrase": ("api_passphrase", "clob_api_passphrase"),
+    }
+    fields: dict[str, Any] = {}
+    for field, names in aliases.items():
+        value = next((values.get(name) for name in names if values.get(name)), None)
+        if not value:
+            raise CanaryBlocked("CLOB_API_CREDENTIALS_NOT_CONFIGURED")
+        fields[field] = value
+    try:
+        return creds_type(**fields)
+    except Exception as exc:
+        raise CanaryBlocked("CLOB_API_CREDENTIALS_INVALID") from exc
+
+def _derive_api_key_credentials(values: Mapping[str, Any]) -> Any:
+    """Derive existing CLOB credentials with the audited GET-only endpoint.
+
+    This intentionally imports the SDK's low-level ``derive_api_key_sync``
+    operation rather than ``SecureClient.create`` or
+    ``create_or_derive_api_key``: both of those bootstrap paths can POST
+    ``/auth/api-key``.  The derived credentials remain in memory for this
+    diagnostic/client lifetime and are never persisted or returned.
+    """
+    private_key = values.get("private_key")
+    if not private_key:
+        raise CanaryBlocked("CREDENTIALS_NOT_CONFIGURED")
+    try:
+        from eth_account import Account
+        from polymarket._internal.actions.auth import derive_api_key_sync
+        from polymarket._internal.environment import get_environment_config
+        from polymarket._internal.l1_auth import sign_api_key_auth
+        from polymarket.clients._transport import SyncTransport
+        from polymarket.environments import PRODUCTION
+
+
+        signer = Account.from_key(private_key)
+        config = get_environment_config(PRODUCTION)
+        signature = sign_api_key_auth(
+            signer,
+            chain_id=POLYMARKET_CHAIN_ID,
+            timestamp=int(time.time()),
+            nonce=0,
+        )
+        transport = SyncTransport(base_url=config.clob_url)
+        try:
+            return derive_api_key_sync(transport, signature)
+        finally:
+            transport.close()
+    except CanaryBlocked:
+        raise
+    except Exception as exc:
+        raise CanaryBlocked("CLOB_API_CREDENTIALS_DERIVATION_FAILED") from exc
+def _build_safe_sdk_client(
+    values: Mapping[str, Any],
+    *,
+    expected_fingerprint: str | None = None,
+) -> Any:
+    """Construct the audited SDK client used by every official canary path.
+
+    The constructor is deliberately shared by read-only diagnostics and the
+    fenced submission path.  It only uses the private ``_create`` seam with
+    explicit in-memory API credentials and validation disabled; SDK bootstrap
+    helpers can POST credentials and are never permitted here.
+    """
+    if (
+        not isinstance(values, Mapping)
+        or not all(_credential_value(values, name) for name in _MANDATORY_SECRET_NAMES)
+    ):
+        raise CanaryBlocked("CREDENTIALS_NOT_CONFIGURED")
+    if expected_fingerprint is not None:
+        expected = _valid_credential_fingerprint(expected_fingerprint)
+        actual = credential_fingerprint(values)
+        if expected is None or not hmac.compare_digest(actual, expected):
+            raise CanaryBlocked("CREDENTIAL_BINDING_MISMATCH")
+    try:
+        import polymarket
+        from polymarket import SecureClient
+    except ImportError as exc:
+        raise CanaryBlocked("OFFICIAL_POLYMARKET_SDK_NOT_INSTALLED") from exc
+    if str(PolymarketClobV2Venue.installed_sdk_version() or "") != SUPPORTED_POLYMARKET_SDK:
+        raise CanaryBlocked("UNSUPPORTED_POLYMARKET_SDK")
+    safe_create = getattr(SecureClient, "_create", None)
+    if not callable(safe_create):
+        raise CanaryBlocked("OFFICIAL_POLYMARKET_SDK_NOT_READONLY_COMPATIBLE")
+    try:
+        try:
+            credentials = _sdk_api_key_credentials(polymarket, values)
+        except CanaryBlocked as exc:
+            if str(exc) != "CLOB_API_CREDENTIALS_NOT_CONFIGURED":
+                raise
+            credentials = _derive_api_key_credentials(values)
+        return safe_create(
+            private_key=values["private_key"],
+            wallet=values["wallet_address"],
+            credentials=credentials,
+            validate_credentials=False,
+        )
+    except CanaryBlocked:
+        raise
+    except TypeError as exc:
+        raise CanaryBlocked(
+            "OFFICIAL_POLYMARKET_SDK_NOT_READONLY_COMPATIBLE"
+        ) from exc
+    except Exception as exc:
+        raise CanaryBlocked("AUTHENTICATED_CONNECTIVITY_FAILED") from exc
+
+
 
 def _base_units(value: Any, *, field: str) -> int:
     """Normalize an SDK base-unit value without accepting lossy numbers."""
@@ -381,41 +645,28 @@ def _read_only_operation(
     *,
     market_id: str | None = None,
     token_id: str | None = None,
+    order_id: str | None = None,
+    asset_id: str | None = None,
+    market: str | None = None,
+    maker_address: str | None = None,
+    after: str | None = None,
+    before: str | None = None,
 ) -> Any:
     """Construct one local read client and return normalized diagnostics only."""
-    if operation not in {"account", "balance", "allowance", "market_context"}:
+    _deny_isolated_real_transport()
+    if operation not in {
+        "account",
+        "balance",
+        "allowance",
+        "market_context",
+        "get_order",
+        "list_account_trades",
+    }:
         raise ValueError(f"unsupported read operation: {operation}")
-    try:
-        import polymarket
-        from polymarket import SecureClient
-    except ImportError as exc:
-        raise CanaryBlocked("OFFICIAL_POLYMARKET_SDK_NOT_INSTALLED") from exc
-    version = PolymarketClobV2Venue.installed_sdk_version()
-    parts = str(version or "").split(".")
-    if len(parts) < 2 or parts[0] != "0" or parts[1] != "9":
-        raise CanaryBlocked("UNSUPPORTED_POLYMARKET_SDK")
-    safe_create = getattr(SecureClient, "_create", None)
-    if not callable(safe_create):
-        raise CanaryBlocked("OFFICIAL_POLYMARKET_SDK_NOT_READONLY_COMPATIBLE")
-    # Official v0.9 ``SecureClient.create`` calls ``_ensure_wallet_ready``,
-    # which can deploy a wallet or invoke relayer workflows.  The canary uses
-    # private ``_create`` only after this compatibility guard to avoid that
-    # side effect during read-only connectivity.
-    try:
-        # A signer-backed CLOB client does not need relayer/gasless credentials.
-        client = safe_create(
-            private_key=values["private_key"],
-            wallet=values["wallet_address"],
-            validate_credentials=True,
-        )
-    except CanaryBlocked:
-        raise
-    except TypeError as exc:
-        raise CanaryBlocked(
-            "OFFICIAL_POLYMARKET_SDK_NOT_READONLY_COMPATIBLE"
-        ) from exc
-    except Exception as exc:
-        raise CanaryBlocked("AUTHENTICATED_CONNECTIVITY_FAILED") from exc
+    client = _build_safe_sdk_client(
+        values,
+        expected_fingerprint=credential_fingerprint(values),
+    )
 
     def close_client() -> None:
         close = getattr(client, "close", None)
@@ -423,9 +674,6 @@ def _read_only_operation(
             try:
                 close()
             except Exception:
-                # Diagnostics must not be replaced by a transport cleanup
-                # failure, and lightweight SDK test doubles need not expose
-                # close().
                 pass
 
     if operation == "account":
@@ -433,6 +681,7 @@ def _read_only_operation(
             return {
                 "authenticated": bool(getattr(client, "wallet", None)),
                 "wallet_type": str(getattr(client, "wallet_type", "") or ""),
+                "credential_fingerprint": credential_fingerprint(values),
             }
         finally:
             close_client()
@@ -442,7 +691,7 @@ def _read_only_operation(
             raw_balance = _sdk_value(value, "balance", 0)
             if isinstance(raw_balance, bool):
                 raise ValueError("balance must not be bool")
-            return Decimal(str(raw_balance)) / Decimal("1000000")
+            return Decimal(str(raw_balance)) / (Decimal(10) ** POLYMARKET_COLLATERAL_DECIMALS)
         except CanaryBlocked:
             raise
         except Exception as exc:
@@ -456,6 +705,7 @@ def _read_only_operation(
             return {
                 "status": "OK",
                 "asset_type": "COLLATERAL",
+                "collateral": _collateral_metadata(),
                 "balance_base_units": str(balance),
                 "spenders": sorted(allowances),
             }
@@ -463,6 +713,153 @@ def _read_only_operation(
             raise
         except Exception as exc:
             raise CanaryBlocked("BALANCE_RESPONSE_INVALID") from exc
+        finally:
+            close_client()
+
+    def normalize_record(value: Any, fields: tuple[str, ...]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for name in fields:
+            item = _sdk_value(value, name)
+            if item is None:
+                continue
+            if isinstance(item, (str, int, float, bool)):
+                result[name] = item
+            elif isinstance(item, Decimal):
+                result[name] = str(item)
+            elif isinstance(item, datetime):
+                result[name] = ensure_utc(item).isoformat()
+        return result
+
+    if operation == "get_order":
+        if not order_id:
+            raise ValueError("get_order requires order_id")
+        try:
+            value = client.get_order(order_id=str(order_id))
+            result = normalize_record(
+                value,
+                (
+                    "id",
+                    "order_id",
+                    "status",
+                    "asset_id",
+                    "market",
+                    "side",
+                    "price",
+                    "original_size",
+                    "size_matched",
+                    "created_at",
+                    "expiration",
+                    "order_type",
+                    "owner",
+                    "owner_address",
+                    "maker",
+                    "maker_address",
+                    "account",
+                    "account_address",
+                ),
+            )
+            durable_id = result.get("order_id") or result.get("id") or str(order_id)
+            result["order_id"] = str(durable_id)
+            return result
+        except CanaryBlocked:
+            raise
+        except Exception as exc:
+            raise CanaryBlocked("ORDER_READ_FAILED") from exc
+        finally:
+            close_client()
+
+    if operation == "list_account_trades":
+        try:
+            # The SDK/API ``id`` query addresses a trade ID, not an order ID.
+            # Bound the server read by asset/market where available, then apply
+            # the order relationship locally from taker/maker order IDs.
+            paginator = client.list_account_trades(
+                asset_id=asset_id,
+                token_id=token_id,
+                id=None,
+                market=market,
+                maker_address=maker_address,
+                after=after,
+                before=before,
+            )
+            records: list[dict[str, Any]] = []
+            iterator = (
+                iter(paginator)
+                if not isinstance(paginator, Mapping)
+                else iter((paginator,))
+            )
+            for sequence, value in enumerate(iterator):
+                record = normalize_record(
+                    value,
+                    (
+                        "id",
+                        "trade_id",
+                        "order_id",
+                        "taker_order_id",
+                        "condition_id",
+                        "asset_id",
+                        "market",
+                        "side",
+                        "price",
+                        "size",
+                        "timestamp",
+                        "fee",
+                        "fee_rate_bps",
+                        "match_time",
+                        "matched_at",
+                        "updated_at",
+                        "trader_side",
+                        "transaction_hash",
+                        "status",
+                        "state",
+                        "owner",
+                        "owner_address",
+                        "maker",
+                        "maker_address",
+                        "account",
+                        "account_address",
+                    ),
+                )
+                maker_orders = _sdk_value(value, "maker_orders", ())
+                maker_order_ids: list[str] = []
+                if isinstance(maker_orders, Sequence) and not isinstance(
+                    maker_orders, (str, bytes, bytearray)
+                ):
+                    maker_order_ids = [
+                        str(identifier)
+                        for maker_order in maker_orders
+                        if (
+                            identifier := _sdk_value(
+                                maker_order, "order_id", None
+                            )
+                        ) is not None
+                    ]
+                    if maker_order_ids:
+                        record["maker_order_ids"] = maker_order_ids
+                if order_id is not None:
+                    requested_order_id = str(order_id)
+                    direct_order_id = (
+                        record.get("taker_order_id") or record.get("order_id")
+                    )
+                    if (
+                        str(direct_order_id or "") != requested_order_id
+                        and requested_order_id not in maker_order_ids
+                    ):
+                        if sequence >= 255:
+                            break
+                        continue
+                durable_id = record.get("trade_id") or record.get("id")
+                if durable_id is not None:
+                    record["trade_id"] = str(durable_id)
+                record.setdefault("sequence", sequence)
+                records.append(record)
+                if sequence >= 255:
+                    break
+            return records
+        except CanaryBlocked:
+            raise
+        except Exception as exc:
+            raise CanaryBlocked("ACCOUNT_TRADES_READ_FAILED") from exc
         finally:
             close_client()
 
@@ -478,25 +875,53 @@ def _read_only_operation(
         state = _sdk_value(market, "state")
         trading = _sdk_value(market, "trading")
         fee_schedule = _sdk_value(trading, "fee_schedule")
-        neg_risk = _sdk_value(
-            state,
-            "neg_risk",
-            _sdk_value(market, "neg_risk"),
-        )
-        fee_rate = _sdk_value(fee_schedule, "rate")
-        fee_bps = (
-            Decimal(str(fee_rate)) * Decimal("10000")
-            if fee_rate is not None
-            else Decimal(str(_sdk_value(market, "fee_bps", 0) or 0))
-        )
+        context_obj = getattr(client, "_ctx", None)
+        metadata_cache = _sdk_value(context_obj, "order_metadata")
+        canonical = None
+        fetch_current = getattr(metadata_cache, "fetch_current_market", None)
+        if callable(fetch_current):
+            try:
+                canonical = fetch_current(context_obj, token_id=asset_id)
+            except Exception as exc:
+                raise CanaryBlocked("MARKET_CONTEXT_FAILED") from exc
+        canonical_neg_risk = _sdk_value(canonical, "neg_risk", None)
+        if not isinstance(canonical_neg_risk, bool):
+            canonical_neg_risk = _sdk_value(book, "neg_risk", None)
+        if not isinstance(canonical_neg_risk, bool):
+            canonical_neg_risk = _sdk_value(
+                state, "neg_risk", _sdk_value(market, "neg_risk")
+            )
+        canonical_tick = _sdk_value(canonical, "tick_size", None)
+        if canonical_tick is None:
+            canonical_tick = _sdk_value(book, "tick_size", "0")
+        fee_info = _sdk_value(canonical, "fee_info")
+        fee_rate = _sdk_value(fee_info, "rate", None)
+        fee_exponent = _sdk_value(fee_info, "exponent", None)
+        if fee_rate is None:
+            fee_rate = _sdk_value(fee_schedule, "rate", None)
+        if fee_rate is None:
+            fee_rate = Decimal(str(_sdk_value(market, "fee_bps", 0) or 0)) / Decimal("10000")
+        if fee_exponent is None:
+            fee_exponent = _sdk_value(fee_schedule, "exponent", 1)
+        market_version = "v2" if selected_position_id else "v1"
+        fee_rate = Decimal(str(fee_rate))
+        fee_exponent = Decimal(str(fee_exponent))
+        if (
+            not fee_rate.is_finite()
+            or fee_rate < 0
+            or not fee_exponent.is_finite()
+            or fee_exponent < 0
+        ):
+            raise CanaryBlocked("MARKET_CONTEXT_FAILED")
         allowance = {
             "status": "OK",
             "asset_type": "COLLATERAL",
+            "collateral": _collateral_metadata(),
             "spender": _resolve_official_spender(
                 client,
                 asset_id=asset_id,
-                market_version=_sdk_value(market, "version", ""),
-                neg_risk=neg_risk,
+                market_version=market_version,
+                neg_risk=canonical_neg_risk,
             ),
         }
         allowance_value = client.get_balance_allowance(asset_type="COLLATERAL")
@@ -505,11 +930,12 @@ def _read_only_operation(
             _allowance_for_spender(allowance_map, allowance["spender"])
         )
         allowance["available_usd"] = str(
-            Decimal(allowance["available_base_units"]) / Decimal("1000000")
+            Decimal(allowance["available_base_units"])
+            / (Decimal(10) ** POLYMARKET_COLLATERAL_DECIMALS)
         )
         return {
-            "market_version": str(_sdk_value(market, "version", "") or ""),
-            "neg_risk": neg_risk,
+            "market_version": market_version,
+            "neg_risk": canonical_neg_risk,
             "outcome": outcome,
             "token_id": selected_token_id,
             "position_id": selected_position_id,
@@ -522,7 +948,14 @@ def _read_only_operation(
                 )
             ),
             "min_order_size": str(_sdk_value(book, "min_order_size", "0")),
-            "tick_size": str(_sdk_value(book, "tick_size", "0")),
+            "tick_size": str(canonical_tick),
+            "size_increment": str(
+                _sdk_value(
+                    book,
+                    "size_increment",
+                    _sdk_value(book, "step_size", "0.01"),
+                )
+            ),
             "bids": [
                 {
                     "price": str(_sdk_value(level, "price")),
@@ -537,7 +970,16 @@ def _read_only_operation(
                 }
                 for level in (_sdk_value(book, "asks", ()) or ())
             ],
-            "fee_bps": str(fee_bps),
+            "min_notional": str(
+                _sdk_value(
+                    book,
+                    "min_notional",
+                    _sdk_value(market, "min_notional", "0"),
+                )
+            ),
+            "fee_rate": str(fee_rate),
+            "fee_exponent": str(fee_exponent),
+            "fee_bps": str(fee_rate * Decimal("10000")),
             "allowance": allowance,
         }
     except CanaryBlocked:
@@ -555,7 +997,11 @@ class CanaryVenue(Protocol):
     def account(self) -> Mapping[str, Any]: ...
     def market_context(self, market_id: str, token_id: str) -> Mapping[str, Any]: ...
     def balance(self) -> Decimal: ...
-    def submit_limit_order(self, *, token_id: str, side: str, price: Decimal, size: Decimal) -> Mapping[str, Any]: ...
+    def submit_limit_order(
+        self, *, token_id: str, side: str, price: Decimal, size: Decimal
+    ) -> Mapping[str, Any]: ...
+    def get_order(self, order_id: str) -> Mapping[str, Any]: ...
+    def list_account_trades(self, **kwargs: Any) -> Sequence[Mapping[str, Any]]: ...
 
 @dataclass(frozen=True, slots=True)
 class CanaryLimits:
@@ -575,7 +1021,7 @@ class CanaryLimits:
                 raise ValueError(f"{name} must be positive") from None
             if isinstance(raw_value, bool) or not value.is_finite() or value <= 0:
                 raise ValueError(f"{name} must be positive")
-        for name in ("max_open_positions", "max_orders_per_day", "max_slippage_bps"):
+        for name in ("max_open_positions", "max_orders_per_day"):
             raw_value = getattr(self, name)
             if isinstance(raw_value, bool):
                 raise ValueError(f"{name} must be a positive integer")
@@ -585,12 +1031,25 @@ class CanaryLimits:
                 raise ValueError(f"{name} must be a positive integer") from None
             if value <= 0:
                 raise ValueError(f"{name} must be a positive integer")
+        raw_value = self.max_slippage_bps
+        if isinstance(raw_value, bool):
+            raise ValueError("max_slippage_bps must be a non-negative integer")
+        try:
+            value = int(raw_value)
+        except (TypeError, ValueError, ArithmeticError):
+            raise ValueError("max_slippage_bps must be a non-negative integer") from None
+        if value < 0:
+            raise ValueError("max_slippage_bps must be a non-negative integer")
 
 class CredentialStore:
     """OS-keyring first; environment variables are an explicit fallback only."""
     service = "AXIOM-POLYMARKET-CANARY"
 
+    def _assert_transport_allowed(self) -> None:
+        _deny_isolated_real_transport()
+
     def configure(self, *, reader=getpass.getpass) -> None:
+        self._assert_transport_allowed()
         try:
             import keyring
         except ImportError as exc:
@@ -624,6 +1083,7 @@ class CredentialStore:
         _invalidate_safe_projection_cache(type(self))
 
     def load(self, *, allow_environment: bool = False) -> dict[str, str]:
+        self._assert_transport_allowed()
         values: dict[str, str] = {}
         try:
             import keyring
@@ -644,7 +1104,9 @@ class CredentialStore:
         )
 
     def configured(self, *, allow_environment: bool = False) -> bool:
+        self._assert_transport_allowed()
         return bool(self.load(allow_environment=allow_environment))
+
     @classmethod
     def cached_projection(
         cls,
@@ -773,7 +1235,13 @@ class CredentialStore:
         allow_environment: bool = False,
         timeout_seconds: float = 0.25,
     ) -> dict[str, Any]:
-        """Return cached credential metadata without exposing values or blocking reads."""
+        """Return credential metadata without exposing values or blocking reads."""
+        if _isolated_execution_profile():
+            return {
+                "configured": False,
+                "status": "ISOLATED_EXECUTION_PROFILE",
+                "secret_values_exposed": False,
+            }
         global _SAFE_PROBE_IN_FLIGHT
         try:
             timeout = max(0.01, min(float(timeout_seconds), 2.0))
@@ -864,6 +1332,7 @@ class PolymarketClobV2Venue:
         allow_environment: bool = False,
     ) -> None:
         self._allow_environment = bool(allow_environment)
+
     @staticmethod
     def installed_sdk_version() -> str | None:
         try:
@@ -881,17 +1350,28 @@ class PolymarketClobV2Venue:
         except importlib.metadata.PackageNotFoundError:
             return None
 
-
-
     def _read_operation(
         self,
         operation: str,
         *,
         market_id: str | None = None,
         token_id: str | None = None,
+        order_id: str | None = None,
+        asset_id: str | None = None,
+        market: str | None = None,
+        maker_address: str | None = None,
+        after: str | None = None,
+        before: str | None = None,
     ) -> Any:
         """Run one allowlisted authenticated read with a local SDK client."""
-        if operation not in {"account", "balance", "allowance", "market_context"}:
+        if operation not in {
+            "account",
+            "balance",
+            "allowance",
+            "market_context",
+            "get_order",
+            "list_account_trades",
+        }:
             raise ValueError(f"unsupported read operation: {operation}")
         try:
             values = CredentialStore().load(
@@ -911,9 +1391,16 @@ class PolymarketClobV2Venue:
             values,
             market_id=market_id,
             token_id=token_id,
+            order_id=order_id,
+            asset_id=asset_id,
+            market=market,
+            maker_address=maker_address,
+            after=after,
+            before=before,
         )
 
     def geoblock(self) -> Mapping[str, Any]:
+        _deny_isolated_real_transport()
         request = Request(
             _OFFICIAL_GEOBLOCK_URL,
             headers={"Accept": "application/json", "User-Agent": "AXIOM-canary/1"},
@@ -935,6 +1422,32 @@ class PolymarketClobV2Venue:
 
     def connectivity_check(self) -> bool:
         return bool(self.account().get("authenticated"))
+    def get_order(self, order_id: str) -> Mapping[str, Any]:
+        """Read one authenticated order by its durable exchange ID."""
+        return self._read_operation("get_order", order_id=str(order_id))
+
+    def list_account_trades(
+        self,
+        *,
+        asset_id: str | None = None,
+        token_id: str | None = None,
+        order_id: str | None = None,
+        market: str | None = None,
+        maker_address: str | None = None,
+        after: str | None = None,
+        before: str | None = None,
+    ) -> Sequence[Mapping[str, Any]]:
+        """Read authenticated account trades with durable exchange IDs."""
+        return self._read_operation(
+            "list_account_trades",
+            asset_id=asset_id,
+            token_id=token_id,
+            order_id=order_id,
+            market=market,
+            maker_address=maker_address,
+            after=after,
+            before=before,
+        )
 
 
     def market_context(self, market_id: str, token_id: str) -> Mapping[str, Any]:
@@ -2027,11 +2540,28 @@ class CanaryService:
         clock=utc_now,
         allow_environment: bool = False,
         initialize: bool = True,
+        settings: Any | None = None,
+        profile: Any | None = None,
     ) -> None:
         self.store = store
-        self.credentials = credentials or CredentialStore()
+        credential_source = credentials
+        if credential_source is None:
+            credential_source = getattr(store, "_canary_credential_store", None)
+        self.credentials = credential_source or CredentialStore()
+        if credentials is not None or not hasattr(store, "_canary_credential_store"):
+            setattr(store, "_canary_credential_store", self.credentials)
         self.clock = clock
         self.allow_environment = bool(allow_environment)
+        self.profile = profile
+        if settings is None:
+            from .canary_settings import CanarySettingsService
+
+            settings = CanarySettingsService(
+                store,
+                clock=clock,
+                initialize=initialize,
+            )
+        self.settings = settings
         if initialize:
             self._initialize()
 
@@ -2041,7 +2571,8 @@ class CanaryService:
             CREATE TABLE IF NOT EXISTS canary_control (
               singleton INTEGER PRIMARY KEY CHECK(singleton=1), state TEXT NOT NULL,
               candidate_id TEXT, venue TEXT, armed_at TEXT, expires_at TEXT,
-              limits_json TEXT NOT NULL, integrity_hash TEXT NOT NULL, updated_at TEXT NOT NULL);
+              limits_json TEXT NOT NULL, integrity_hash TEXT NOT NULL, updated_at TEXT NOT NULL,
+              settings_config_id TEXT, settings_generation INTEGER);
             CREATE TABLE IF NOT EXISTS canary_eligibility (
               candidate_id TEXT PRIMARY KEY, eligible_at TEXT NOT NULL,
               frozen_hash TEXT NOT NULL, evidence_json TEXT NOT NULL);
@@ -2052,7 +2583,8 @@ class CanaryService:
               max_price TEXT NOT NULL, submitted_quantity TEXT, exchange_order_id TEXT,
               fill_quantity TEXT, actual_average_price TEXT, fees TEXT, status TEXT NOT NULL,
               latency_ms INTEGER, price_difference TEXT, fee_difference TEXT, slippage_difference TEXT,
-              settlement TEXT, realized_pnl TEXT, evidence_json TEXT NOT NULL);
+              settlement TEXT, realized_pnl TEXT, evidence_json TEXT NOT NULL,
+              state_version INTEGER NOT NULL DEFAULT 0);
             CREATE TABLE IF NOT EXISTS canary_execution_events (
               execution_event_id TEXT PRIMARY KEY, canary_event_id TEXT NOT NULL,
               timestamp TEXT NOT NULL, exchange_order_id TEXT, status TEXT NOT NULL,
@@ -2190,6 +2722,11 @@ class CanaryService:
                     "ALTER TABLE canary_ledger ADD COLUMN control_generation "
                     "INTEGER NOT NULL DEFAULT 0"
                 )
+            if "state_version" not in columns:
+                self.store.connection.execute(
+                    "ALTER TABLE canary_ledger ADD COLUMN state_version "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
             for table, additions in (
                 (
                     "canary_rankings",
@@ -2244,6 +2781,14 @@ class CanaryService:
                         ("signal_scan_skip_reasons_json", "TEXT NOT NULL DEFAULT '{}'"),
                         ("signal_scan_reason_counts_json", "TEXT NOT NULL DEFAULT '{}'"),
                         ("signal_scan_status", "TEXT NOT NULL DEFAULT 'UNKNOWN'"),
+                    ),
+                ),
+                (
+                    "canary_control",
+                    (
+                        ("settings_config_id", "TEXT"),
+                        ("settings_generation", "INTEGER"),
+                        ("credential_fingerprint", "TEXT"),
                     ),
                 ),
                 (
@@ -2486,15 +3031,8 @@ class CanaryService:
 
     @staticmethod
     def _readiness_snapshot_default() -> dict[str, Any]:
-        limits = {
-            "target_notional_usd": str(DEFAULT_TARGET_NOTIONAL_USD),
-            "max_exposure_usd": str(DEFAULT_MAX_EXPOSURE_USD),
-            "max_daily_loss_usd": str(DEFAULT_DAILY_LOSS_USD),
-            "max_open_positions": DEFAULT_MAX_OPEN_POSITIONS,
-            "max_orders_per_day": DEFAULT_MAX_ORDERS_PER_DAY,
-            "max_slippage_bps": DEFAULT_MAX_SLIPPAGE_BPS,
-        }
-        risk = dict(AUTONOMOUS_CANARY_LIMITS)
+        limits: dict[str, Any] = {}
+        risk: dict[str, Any] = {}
         autonomous = {
             "enabled": False,
             "selected_candidate": None,
@@ -2652,7 +3190,8 @@ class CanaryService:
 
         control = fetchone(
             "SELECT state,candidate_id,venue,expires_at,control_generation,"
-            "updated_at,limits_json FROM canary_control WHERE singleton=1"
+            "updated_at,limits_json,settings_config_id,settings_generation "
+            "FROM canary_control WHERE singleton=1"
         )
         selection = fetchone(
             # ``canary_selection`` predates the readiness projection columns.
@@ -2695,6 +3234,15 @@ class CanaryService:
                 payload["control_generation"] = int(control["control_generation"])
             except (TypeError, ValueError):
                 payload["control_generation"] = None
+            payload["settings_config_id"] = control["settings_config_id"]
+            try:
+                payload["settings_generation"] = (
+                    int(control["settings_generation"])
+                    if control["settings_generation"] is not None
+                    else None
+                )
+            except (TypeError, ValueError):
+                payload["settings_generation"] = None
             try:
                 limits = json.loads(control["limits_json"] or "{}")
             except (TypeError, ValueError, json.JSONDecodeError):
@@ -3868,8 +4416,95 @@ class CanaryService:
                 updated_at=now,
             )
     def status(self) -> dict[str, Any]:
-        """Return the cheap persisted readiness projection."""
-        return self.readiness_snapshot()
+        """Return the cheap persisted readiness projection.
+
+        The readiness row is the display authority.  A control write with a
+        newer generation is overlaid so a kill/disarm remains visible even
+        when publication is stale or unavailable.  A raw row mutation that
+        does not advance the generation is not treated as an authorized
+        current projection.
+        """
+        payload = self.readiness_snapshot()
+        connection = self.store.connection
+        lock = getattr(self.store, "_lock", None)
+        try:
+            if lock is None:
+                row = connection.execute(
+                    "SELECT state,candidate_id,venue,expires_at,control_generation,"
+                    "settings_config_id,settings_generation "
+                    "FROM canary_control WHERE singleton=1"
+                ).fetchone()
+            else:
+                with lock:
+                    row = connection.execute(
+                        "SELECT state,candidate_id,venue,expires_at,control_generation,"
+                        "settings_config_id,settings_generation "
+                        "FROM canary_control WHERE singleton=1"
+                    ).fetchone()
+        except sqlite3.Error:
+            row = None
+        if row is None:
+            return payload
+        def generation(value: Any) -> int | None:
+            if isinstance(value, bool):
+                return None
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError, OverflowError):
+                return None
+            return parsed if parsed >= 0 else None
+
+        control_generation = generation(row["control_generation"])
+        projection_generation = generation(payload.get("control_generation"))
+        if (
+            control_generation is None
+            or projection_generation is None
+            or control_generation <= projection_generation
+        ):
+            return payload
+        state = str(row["state"] or "DISABLED").upper()
+        payload.update(
+            {
+                "micro_live_canary": state,
+                "control_state": state,
+                "display_state": (
+                    "KILLED"
+                    if state == "KILLED"
+                    else "ENABLED"
+                    if state in {"ARMED", AUTONOMOUS_MICRO_LIVE}
+                    else "DISABLED"
+                ),
+                "candidate": row["candidate_id"],
+                "venue": row["venue"],
+                "expiry": row["expires_at"],
+                "control_generation": row["control_generation"],
+                "settings_config_id": row["settings_config_id"],
+                "settings_generation": row["settings_generation"],
+            }
+        )
+        autonomous = payload.get("autonomous")
+        if isinstance(autonomous, Mapping):
+            autonomous = dict(autonomous)
+            autonomous.update(
+                {
+                    "enabled": state in {"ARMED", AUTONOMOUS_MICRO_LIVE},
+                    "control_state": state,
+                    "micro_live_canary": state,
+                }
+            )
+            payload["autonomous"] = autonomous
+        return payload
+
+    def _canonical_execution_usage(self, now: datetime) -> dict[str, Any]:
+        """Read the canonical PHT-bounded risk accounting for status projections."""
+        try:
+            usage = self.store.canary_risk_accounting(now=now)
+        except Exception:
+            _LOGGER.exception("canonical canary risk accounting read failed")
+            return {"_canonical_error": True}
+        if not isinstance(usage, Mapping):
+            return {"_canonical_error": True}
+        return dict(usage)
 
     def status_report(self) -> dict[str, Any]:
         """Return a bounded, read-only operator report without schema work.
@@ -3881,6 +4516,7 @@ class CanaryService:
         """
         connection = self.store.connection
         lock = getattr(self.store, "_lock", None)
+        now = ensure_utc(self.clock())
 
         def fetchone(query: str, parameters: tuple[Any, ...] = ()) -> Any:
             try:
@@ -3901,8 +4537,22 @@ class CanaryService:
 
         control_row = fetchone(
             "SELECT state,candidate_id,venue,expires_at,control_generation,"
-            "updated_at FROM canary_control WHERE singleton=1"
+            "settings_config_id,settings_generation,credential_fingerprint,updated_at "
+            "FROM canary_control WHERE singleton=1"
         )
+        if control_row is None:
+            # Cold-start/read-only callers may hold a pre-migration control
+            # table.  Recover the authoritative expiry from its legacy columns
+            # without writing schema or state.
+            control_row = fetchone(
+                "SELECT state,candidate_id,venue,expires_at,updated_at "
+                "FROM canary_control WHERE singleton=1"
+            )
+        def control_value(name: str, default: Any = None) -> Any:
+            try:
+                return control_row[name] if control_row is not None else default
+            except (IndexError, KeyError):
+                return default
         if control_row is None:
             control = {
                 "state": "UNKNOWN",
@@ -3910,21 +4560,56 @@ class CanaryService:
                 "venue": None,
                 "expires_at": None,
                 "generation": None,
+                "settings_config_id": None,
+                "settings_generation": None,
+                "credential_fingerprint": None,
+                "binding_blocker": None,
                 "updated_at": None,
             }
         else:
             try:
-                generation = int(control_row["control_generation"])
+                generation = int(control_value("control_generation"))
             except (TypeError, ValueError):
                 generation = None
             control = {
-                "state": str(control_row["state"] or "UNKNOWN").upper(),
-                "candidate": control_row["candidate_id"],
-                "venue": control_row["venue"],
-                "expires_at": control_row["expires_at"],
+                "state": str(control_value("state") or "UNKNOWN").upper(),
+                "candidate": control_value("candidate_id"),
+                "venue": control_value("venue"),
+                "expires_at": control_value("expires_at"),
                 "generation": generation,
-                "updated_at": control_row["updated_at"],
+                "settings_config_id": control_value("settings_config_id"),
+                "settings_generation": control_value("settings_generation"),
+                "credential_fingerprint": _valid_credential_fingerprint(
+                    control_value("credential_fingerprint")
+                ),
+                "binding_blocker": None,
+                "updated_at": control_value("updated_at"),
             }
+        raw_credential_fingerprint = control_value("credential_fingerprint")
+        if control["state"] in {"ARMED", AUTONOMOUS_MICRO_LIVE}:
+            if raw_credential_fingerprint in (None, ""):
+                control["state"] = "DISABLED"
+                control["binding_blocker"] = "CREDENTIAL_BINDING_MISSING"
+            elif control["credential_fingerprint"] is None:
+                control["state"] = "KILLED"
+                control["binding_blocker"] = "CREDENTIAL_BINDING_INVALID"
+        if control["state"] == "ARMED":
+            # Match the authoritative display rule without refreshing or
+            # mutating the durable control row.  A persisted arm whose
+            # deadline has passed is paper-only immediately at read time.
+            expires_at = control.get("expires_at")
+            if not expires_at:
+                control["state"] = "DISARMED"
+            else:
+                try:
+                    expired = (
+                        ensure_utc(datetime.fromisoformat(str(expires_at))) <= now
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    control["state"] = "KILLED"
+                else:
+                    if expired:
+                        control["state"] = "DISARMED"
 
         projection = self.readiness_snapshot()
         latest_signal = projection.get("latest_signal")
@@ -4180,41 +4865,40 @@ class CanaryService:
             report_autonomous["signal_scan_checked_keys"] = worker_checked_keys
             legacy_projection["autonomous"] = report_autonomous
             readiness["autonomous"] = report_autonomous
-
         now = ensure_utc(self.clock())
-        start = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
-        aggregates = fetchone(
-            "SELECT COUNT(*) AS orders,"
-            "COALESCE(SUM(CAST(realized_pnl AS REAL)),0) AS realized_pnl "
-            "FROM canary_ledger WHERE timestamp>=?",
-            (start,),
-        )
-        exposure = fetchone(
-            "SELECT COALESCE(SUM(CAST(requested_notional AS REAL)),0) AS exposure,"
-            "COUNT(DISTINCT market_id) AS open_positions FROM canary_ledger "
-            "WHERE status IN ('RESERVED','SUBMITTING','UNKNOWN','OPEN','PARTIAL','SUBMITTED')"
-        )
+        canonical = self._canonical_execution_usage(now)
         event_count = fetchone(
-            "SELECT COUNT(*) AS n FROM canary_execution_events WHERE timestamp>=?",
-            (start,),
+            "SELECT COUNT(*) AS n FROM canary_execution_events"
         )
         latest = fetchone(
             "SELECT status FROM canary_ledger ORDER BY timestamp DESC,event_id DESC LIMIT 1"
         )
-        execution = {
-            "today_orders": int(aggregates["orders"]) if aggregates is not None else 0,
-            "today_realized_pnl": (
-                float(aggregates["realized_pnl"]) if aggregates is not None else 0.0
-            ),
-            "total_exposure": float(exposure["exposure"]) if exposure is not None else 0.0,
-            "open_positions": (
-                int(exposure["open_positions"]) if exposure is not None else 0
-            ),
-            "execution_event_count": int(event_count["n"]) if event_count is not None else 0,
-            "last_request_status": (
-                str(latest["status"]).upper() if latest is not None else None
-            ),
-        }
+        if not canonical.get("_canonical_error"):
+            execution = {
+                "today_orders": int(canonical.get("submitted_orders", 0) or 0),
+                "today_realized_pnl": float(
+                    canonical.get("today_realized_pnl_usd", "0") or "0"
+                ),
+                "total_exposure": float(
+                    canonical.get("aggregate_exposure_usd", "0") or "0"
+                ),
+                "open_positions": int(canonical.get("open_positions", 0) or 0),
+            }
+        else:
+            execution = {
+                "today_orders": None,
+                "today_realized_pnl": None,
+                "total_exposure": None,
+                "open_positions": None,
+            }
+        execution.update(
+            {
+                "execution_event_count": int(event_count["n"]) if event_count is not None else 0,
+                "last_request_status": (
+                    str(latest["status"]).upper() if latest is not None else None
+                ),
+            }
+        )
         for key, value in worker.items():
             if key in legacy_aliases:
                 legacy_projection[key] = value
@@ -4236,6 +4920,8 @@ class CanaryService:
                 "micro_live_canary": control_state,
                 "control_state": control_state,
                 "display_state": display_state,
+                "credential_fingerprint": control.get("credential_fingerprint"),
+                "binding_blocker": control.get("binding_blocker"),
                 "candidate": control.get("candidate"),
                 "venue": control.get("venue"),
                 "expiry": control.get("expires_at"),
@@ -4249,6 +4935,8 @@ class CanaryService:
                 "enabled": control_state in {"ARMED", AUTONOMOUS_MICRO_LIVE},
                 "control_state": control_state,
                 "micro_live_canary": control_state,
+                "credential_fingerprint": control.get("credential_fingerprint"),
+                "binding_blocker": control.get("binding_blocker"),
             }
         )
         legacy_projection["autonomous"] = autonomous
@@ -4266,10 +4954,80 @@ class CanaryService:
 
 
     @staticmethod
-    def _integrity(candidate: str, venue: str, expires: str, limits: Mapping[str, Any]) -> str:
-        return hashlib.sha256(json.dumps({"candidate": candidate, "venue": venue, "expires": expires, "limits": limits}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    def _integrity(
+        candidate: str,
+        venue: str,
+        expires: str,
+        limits: Mapping[str, Any],
+    ) -> str:
+        return hashlib.sha256(
+            json.dumps(
+                {
+                    "candidate": candidate,
+                    "venue": venue,
+                    "expires": expires,
+                    "limits": limits,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+
     def _limits_record(self, limits: CanaryLimits) -> dict[str, Any]:
-        return {"target_notional_usd": str(limits.target_notional_usd), "max_exposure_usd": str(limits.max_exposure_usd), "max_daily_loss_usd": str(limits.max_daily_loss_usd), "max_open_positions": limits.max_open_positions, "max_orders_per_day": limits.max_orders_per_day, "max_slippage_bps": limits.max_slippage_bps}
+        return {
+            "target_notional_usd": str(limits.target_notional_usd),
+            "max_exposure_usd": str(limits.max_exposure_usd),
+            "max_daily_loss_usd": str(limits.max_daily_loss_usd),
+            "max_open_positions": limits.max_open_positions,
+            "max_orders_per_day": limits.max_orders_per_day,
+            "max_slippage_bps": limits.max_slippage_bps,
+        }
+    def _active_settings_values(self) -> Mapping[str, Any]:
+        if self.settings is None:
+            raise CanaryBlocked("CANARY_SETTINGS_UNAVAILABLE")
+        try:
+            values = self.settings.active_limits()
+        except Exception as exc:
+            raise CanaryBlocked("CANARY_SETTINGS_UNAVAILABLE") from exc
+        if not isinstance(values, Mapping):
+            raise CanaryBlocked("CANARY_SETTINGS_UNAVAILABLE")
+        return values
+
+    def _effective_limits(self, candidate: CanaryLimits | None = None) -> CanaryLimits:
+        base = self.autonomous_limits()
+        if candidate is None:
+            return CanaryLimits(
+                target_notional_usd=Decimal(base["target_notional_usd"]),
+                max_exposure_usd=Decimal(base["max_exposure_usd"]),
+                max_daily_loss_usd=Decimal(base["max_daily_loss_usd"]),
+                max_open_positions=int(base["max_open_positions"]),
+                max_orders_per_day=int(base["max_orders_per_day"]),
+                max_slippage_bps=int(base["max_slippage_bps"]),
+            )
+        values = self._limits_record(candidate)
+        return CanaryLimits(
+            target_notional_usd=min(
+                Decimal(base["target_notional_usd"]),
+                Decimal(values["target_notional_usd"]),
+            ),
+            max_exposure_usd=min(
+                Decimal(base["max_exposure_usd"]),
+                Decimal(values["max_exposure_usd"]),
+            ),
+            max_daily_loss_usd=min(
+                Decimal(base["max_daily_loss_usd"]),
+                Decimal(values["max_daily_loss_usd"]),
+            ),
+            max_open_positions=min(
+                int(base["max_open_positions"]), int(values["max_open_positions"])
+            ),
+            max_orders_per_day=min(
+                int(base["max_orders_per_day"]), int(values["max_orders_per_day"])
+            ),
+            max_slippage_bps=min(
+                int(base["max_slippage_bps"]), int(values["max_slippage_bps"])
+            ),
+        )
     @staticmethod
     def _merged_lifecycle_payload(record: Mapping[str, Any] | None) -> dict[str, Any] | None:
         return _canary_merged_lifecycle_payload(record)
@@ -4354,10 +5112,108 @@ class CanaryService:
                 if expected_int < 0 or (count if name != "min_trades" else trades) < expected_int:
                     return False
         return True
-    @staticmethod
-    def autonomous_limits() -> dict[str, Any]:
-        """Return the immutable operator risk envelope as a fresh mapping."""
-        return dict(AUTONOMOUS_CANARY_LIMITS)
+    def autonomous_limits(self) -> dict[str, Any]:
+        """Return the active shared risk envelope as JSON-safe values.
+
+        The constants remain the cold-start defaults only.  Once the risk
+        owner publishes active settings, every autonomous gate reads that
+        snapshot; no additional hidden one-dollar/five-dollar cap is applied.
+        """
+        if self.settings is None:
+            raise CanaryBlocked("CANARY_SETTINGS_UNAVAILABLE")
+        try:
+            snapshot = self._settings_snapshot()
+            raw = snapshot.get("effective_limits")
+            if not isinstance(raw, Mapping):
+                raw = self.settings.active_limits()
+        except Exception as exc:
+            raise CanaryBlocked("CANARY_SETTINGS_UNAVAILABLE") from exc
+        if isinstance(raw, Mapping):
+            source = raw
+        elif raw is not None:
+            source = {
+                name: getattr(raw, name, None)
+                for name in (
+                    "target_notional_usd",
+                    "max_exposure_usd",
+                    "max_daily_loss_usd",
+                    "max_open_positions",
+                    "max_orders_per_day",
+                    "max_slippage_bps",
+                )
+            }
+        else:
+            raise CanaryBlocked("CANARY_SETTINGS_UNAVAILABLE")
+        try:
+            limits = CanaryLimits(
+                target_notional_usd=Decimal(
+                    str(source.get("target_notional_usd", source.get("max_order_notional", DEFAULT_TARGET_NOTIONAL_USD)))
+                ),
+                max_exposure_usd=Decimal(
+                    str(source.get("max_exposure_usd", source.get("max_account_exposure", DEFAULT_MAX_EXPOSURE_USD)))
+                ),
+                max_daily_loss_usd=Decimal(
+                    str(source.get("max_daily_loss_usd", source.get("max_daily_loss", DEFAULT_DAILY_LOSS_USD)))
+                ),
+                max_open_positions=int(source.get("max_open_positions", DEFAULT_MAX_OPEN_POSITIONS)),
+                max_orders_per_day=int(source.get("max_orders_per_day", DEFAULT_MAX_ORDERS_PER_DAY)),
+                max_slippage_bps=int(source.get("max_slippage_bps", DEFAULT_MAX_SLIPPAGE_BPS)),
+            )
+        except (TypeError, ValueError, ArithmeticError) as exc:
+            raise CanaryBlocked("CANARY_SETTINGS_INVALID") from exc
+        return self._limits_record(limits)
+
+    def _settings_snapshot(self) -> Mapping[str, Any]:
+        if self.settings is None:
+            raise CanaryBlocked("CANARY_SETTINGS_UNAVAILABLE")
+        try:
+            snapshot = self.settings.snapshot(now=self.clock())
+        except Exception as exc:
+            raise CanaryBlocked("CANARY_SETTINGS_UNAVAILABLE") from exc
+        if not isinstance(snapshot, Mapping):
+            raise CanaryBlocked("CANARY_SETTINGS_UNAVAILABLE")
+        return snapshot
+
+    def _settings_identity(self) -> tuple[str | None, int | None, str | None]:
+        snapshot = self._settings_snapshot()
+        sources = [snapshot]
+        for name in ("active", "config", "settings"):
+            nested = snapshot.get(name)
+            if isinstance(nested, Mapping):
+                sources.append(nested)
+        config_id: str | None = None
+        generation: int | None = None
+        config_hash: str | None = None
+        for source in sources:
+            if config_id is None:
+                for key in ("config_id", "active_config_id", "settings_config_id", "id"):
+                    value = source.get(key)
+                    if value is not None and str(value).strip():
+                        config_id = str(value).strip()
+                        break
+            if config_hash is None:
+                for key in ("config_hash", "active_config_hash", "settings_hash"):
+                    value = source.get(key)
+                    if value is not None and str(value).strip():
+                        config_hash = str(value).strip()
+                        break
+            if generation is None:
+                for key in ("generation", "config_generation", "settings_generation", "active_generation"):
+                    value = source.get(key)
+                    if isinstance(value, bool):
+                        continue
+                    try:
+                        parsed = int(value)
+                    except (TypeError, ValueError):
+                        continue
+                    if parsed >= 0:
+                        generation = parsed
+                        break
+        return config_id, generation, config_hash
+
+    def _settings_binding(self) -> tuple[str | None, int | None]:
+        config_id, generation, _ = self._settings_identity()
+        return config_id, generation
 
     def invalidate_eligibility(
         self,
@@ -4656,14 +5512,109 @@ class CanaryService:
         self._patch_autonomous_snapshot()
         if publish:
             self.publish_readiness_snapshot(reason="AUTONOMOUS_DECISION")
-    def enable_autonomous_micro_live(self) -> Mapping[str, Any]:
-        """Enable the single autonomous $1 canary envelope.
+    def _load_credential_binding(self) -> tuple[dict[str, str], str]:
+        try:
+            values = self.credentials.load(
+                allow_environment=self.allow_environment
+            )
+        except CanaryBlocked:
+            raise
+        except Exception as exc:
+            raise CanaryBlocked("CREDENTIALS_NOT_CONFIGURED") from exc
+        if (
+            not isinstance(values, Mapping)
+            or not all(_credential_value(values, name) for name in _MANDATORY_SECRET_NAMES)
+        ):
+            raise CanaryBlocked("CREDENTIALS_NOT_CONFIGURED")
+        normalized = {
+            name: _credential_value(values, name)
+            for name in _SECRET_NAMES
+        }
+        return normalized, credential_fingerprint(normalized)
 
-        The caller is the typed operator action that has already required the
-        exact ``ENABLE AUTO CANARY`` confirmation.  No target, market, token,
-        leverage, or risk-limit input is accepted here.
-        """
+    @staticmethod
+    def _require_control_credential_binding(
+        row: Mapping[str, Any] | None,
+        current_fingerprint: str | None = None,
+    ) -> str:
+        try:
+            raw = row["credential_fingerprint"] if row is not None else None
+        except (IndexError, KeyError, TypeError):
+            raw = None
+        persisted = _valid_credential_fingerprint(raw)
+        if persisted is None:
+            raise CanaryBlocked("CREDENTIAL_BINDING_MISSING")
+        if current_fingerprint is not None and not hmac.compare_digest(
+            persisted, current_fingerprint
+        ):
+            raise CanaryBlocked("CREDENTIAL_BINDING_MISMATCH")
+        return persisted
+    def require_current_credential_binding(self) -> str:
+        """Load current credentials and require the durable control binding."""
+        _, current_fingerprint = self._load_credential_binding()
+        try:
+            with self.store._lock:
+                row = self.store.connection.execute(
+                    "SELECT credential_fingerprint FROM canary_control "
+                    "WHERE singleton=1"
+                ).fetchone()
+        except Exception as exc:
+            raise CanaryBlocked("CREDENTIAL_BINDING_MISSING") from exc
+        return self._require_control_credential_binding(row, current_fingerprint)
+
+    def enable_autonomous_micro_live(
+        self,
+        venue: str,
+        config_id: str,
+        expected_generation: int,
+        expected_credential_fingerprint: str | None = None,
+    ) -> Mapping[str, Any]:
+        """Enable autonomous canary only for the reviewed active settings."""
+        requested_venue = str(venue or "").strip().lower()
+        if requested_venue != AUTONOMOUS_CANARY_VENUE:
+            raise CanaryBlocked("UNSUPPORTED_VENUE")
+        requested_config = str(config_id or "").strip()
+        if not requested_config:
+            raise CanaryBlocked("CANARY_SETTINGS_CONFIG_REQUIRED")
+        if (
+            isinstance(expected_generation, bool)
+            or not isinstance(expected_generation, int)
+            or expected_generation < 1
+        ):
+            raise CanaryBlocked("CANARY_SETTINGS_GENERATION_REQUIRED")
+        _, credential_digest = self._load_credential_binding()
+        if expected_credential_fingerprint is not None:
+            expected_digest = _valid_credential_fingerprint(
+                expected_credential_fingerprint
+            )
+            if expected_digest is None or not hmac.compare_digest(
+                expected_digest, credential_digest
+            ):
+                raise CanaryBlocked("CREDENTIAL_BINDING_MISMATCH")
         now = ensure_utc(self.clock())
+        snapshot = self._settings_snapshot()
+        settings_config_id, settings_generation, settings_hash = self._settings_identity()
+        if (
+            settings_config_id != requested_config
+            or settings_generation != expected_generation
+            or not settings_hash
+        ):
+            raise CanaryBlocked("CANARY_SETTINGS_GENERATION_CHANGED")
+        active = snapshot.get("active")
+        active_generation = None
+        if isinstance(active, Mapping):
+            try:
+                active_generation = int(active.get("generation"))
+            except (TypeError, ValueError):
+                active_generation = None
+        if isinstance(active, Mapping) and (
+            str(active.get("state") or "").upper() not in {"ACTIVE", ""}
+            or str(active.get("config_id") or "").strip() != requested_config
+            or active_generation != expected_generation
+        ):
+            raise CanaryBlocked("CANARY_SETTINGS_GENERATION_CHANGED")
+        settings_config_id = requested_config
+        settings_generation = expected_generation
         values = self.autonomous_limits()
         digest = self._integrity("", AUTONOMOUS_CANARY_VENUE, "", values)
         connection = self.store.connection
@@ -4672,7 +5623,8 @@ class CanaryService:
                 raise CanaryBlocked("CANARY_TRANSACTION_ACTIVE")
             with connection:
                 current = connection.execute(
-                    "SELECT state,control_generation,limits_json,integrity_hash "
+                    "SELECT state,control_generation,limits_json,integrity_hash,"
+                    "settings_config_id,settings_generation,credential_fingerprint "
                     "FROM canary_control WHERE singleton=1"
                 ).fetchone()
                 if current is not None and str(current["state"]).upper() == "KILLED":
@@ -4684,6 +5636,18 @@ class CanaryService:
                         raise CanaryBlocked("CANARY_CONTROL_CORRUPT") from None
                     if persisted != values or current["integrity_hash"] != digest:
                         raise CanaryBlocked("CANARY_CONTROL_CORRUPT")
+                    self._require_control_credential_binding(
+                        current, credential_digest
+                    )
+                    if (
+                        str(current["settings_config_id"] or "") != str(settings_config_id or "")
+                        or (
+                            current["settings_generation"] is not None
+                            and settings_generation is not None
+                            and int(current["settings_generation"]) != settings_generation
+                        )
+                    ):
+                        raise CanaryBlocked("CANARY_SETTINGS_GENERATION_CHANGED")
                 else:
                     try:
                         generation = int(current["control_generation"] or 0) if current else 0
@@ -4700,12 +5664,16 @@ class CanaryService:
                     connection.execute(
                         "INSERT INTO canary_control("
                         "singleton,state,candidate_id,venue,armed_at,expires_at,"
-                        "limits_json,integrity_hash,updated_at,control_generation) "
-                        "VALUES(1,?,?,?,?,?,?,?,?,?) ON CONFLICT(singleton) DO UPDATE SET "
+                        "limits_json,integrity_hash,updated_at,control_generation,"
+                        "settings_config_id,settings_generation,credential_fingerprint) "
+                        "VALUES(1,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(singleton) DO UPDATE SET "
                         "state=excluded.state,candidate_id=excluded.candidate_id,"
                         "venue=excluded.venue,armed_at=excluded.armed_at,expires_at=excluded.expires_at,"
                         "limits_json=excluded.limits_json,integrity_hash=excluded.integrity_hash,"
-                        "updated_at=excluded.updated_at,control_generation=excluded.control_generation",
+                        "updated_at=excluded.updated_at,control_generation=excluded.control_generation,"
+                        "settings_config_id=excluded.settings_config_id,"
+                        "settings_generation=excluded.settings_generation,"
+                        "credential_fingerprint=excluded.credential_fingerprint",
                         (
                             AUTONOMOUS_MICRO_LIVE,
                             candidate_id,
@@ -4716,6 +5684,9 @@ class CanaryService:
                             digest,
                             now.isoformat(),
                             generation + 1,
+                            settings_config_id,
+                            settings_generation,
+                            credential_digest,
                         ),
                     )
                     connection.execute(
@@ -4727,7 +5698,6 @@ class CanaryService:
                         (now.isoformat(),),
                     )
         return self.publish_readiness_snapshot(reason="AUTONOMOUS_ENABLED")
-
     def bind_autonomous_selection(
         self,
         candidate_id: str | None,
@@ -5466,7 +6436,17 @@ class CanaryService:
                     row
                     for row in matching
                     if str(row["status"] or "").upper()
-                    in {"SUBMITTED", "SUBMITTING", "UNKNOWN", "REJECTED"}
+                    in {
+                        "SUBMITTED",
+                        "SUBMITTING",
+                        "UNKNOWN",
+                        "REJECTED",
+                        "ACCEPTED",
+                        "MATCHED",
+                        "PARTIAL",
+                        "PARTIALLY_FILLED",
+                        "SETTLED",
+                    }
                 ),
                 None,
             )
@@ -6521,14 +7501,24 @@ class CanaryService:
         venue: CanaryVenue,
         allow_test_venue: bool = False,
         allow_environment: bool | None = None,
-    ) -> Mapping[str, Any]:
-        """Submit exactly one persisted signal after immutable revalidation."""
+    ) -> dict[str, Any]:
         signal = self.get_signal(signal_id)
         if signal is None:
             raise CanaryBlocked("CANARY_SIGNAL_NOT_FOUND")
         current_status = str(signal.get("status", "")).upper()
         if current_status != "READY":
-            if current_status in {"SUBMITTED", "SUBMITTING", "UNKNOWN", "REJECTED"}:
+            if current_status in {
+                "SUBMITTED",
+                "SUBMITTING",
+                "UNKNOWN",
+                "REJECTED",
+                "ACCEPTED",
+                "MATCHED",
+                "PARTIAL",
+                "PARTIALLY_FILLED",
+                "SETTLED",
+                "RESOLVED",
+            }:
                 raise CanaryBlocked("DUPLICATE_SIGNAL")
             raise CanaryBlocked("CANARY_SIGNAL_NOT_SUBMITTABLE")
         now = ensure_utc(self.clock())
@@ -6788,6 +7778,538 @@ class CanaryService:
             allow_test_venue=allow_test_venue,
             allow_environment=allow_environment,
         )
+
+    @staticmethod
+    def _recovery_records(value: Any, *, key: str) -> list[Any]:
+        if isinstance(value, Mapping):
+            for field in (key, "data", "items", "results"):
+                nested = value.get(field)
+                if isinstance(nested, (list, tuple)):
+                    return list(nested)
+            return [value]
+        if isinstance(value, (list, tuple)):
+            return list(value)
+        return []
+
+    @staticmethod
+    def _recovery_method(
+        venue: Any,
+        name: str,
+        order_id: str,
+        **read_scope: Any,
+    ) -> Any:
+        method = getattr(venue, name, None)
+        if not callable(method):
+            raise CanaryBlocked("CANARY_RECOVERY_READ_UNAVAILABLE")
+        try:
+            return method(order_id=order_id, **read_scope)
+        except TypeError:
+            try:
+                return method(order_id=order_id)
+            except TypeError:
+                return method(order_id)
+
+    @staticmethod
+    def _validate_recovery_persisted_binding(
+        ledger: Mapping[str, Any],
+        signal: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        evidence_raw = ledger.get("evidence_json")
+        if not isinstance(evidence_raw, str) or not evidence_raw.strip():
+            raise CanaryBlocked("CANARY_RECOVERY_BINDING_INVALID")
+        try:
+            evidence = json.loads(evidence_raw)
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise CanaryBlocked("CANARY_RECOVERY_BINDING_INVALID") from exc
+        if not isinstance(evidence, Mapping):
+            raise CanaryBlocked("CANARY_RECOVERY_BINDING_INVALID")
+        required = (
+            "control_generation", "control_state", "control_candidate",
+            "control_expiry", "signal_candidate_id", "signal_market_id",
+            "signal_token_id", "signal_side", "signal_frozen_hash",
+            "signal_strategy_hash", "signal_model_hash", "signal_config_hash",
+            "resolved_asset_id",
+        )
+        if any(name not in evidence for name in required):
+            raise CanaryBlocked("CANARY_RECOVERY_BINDING_INVALID")
+        try:
+            generation = int(ledger.get("control_generation") or 0)
+        except (TypeError, ValueError) as exc:
+            raise CanaryBlocked("CANARY_RECOVERY_CONTROL_BINDING_INVALID") from exc
+        if generation <= 0:
+            raise CanaryBlocked("CANARY_RECOVERY_CONTROL_BINDING_INVALID")
+        persisted_generation = evidence.get("control_generation")
+        if (
+            isinstance(persisted_generation, bool)
+            or not isinstance(persisted_generation, int)
+            or persisted_generation != generation
+        ):
+            raise CanaryBlocked("CANARY_RECOVERY_CONTROL_BINDING_INVALID")
+        candidate_id = str(ledger.get("candidate_id") or "").strip()
+        control_candidate = str(evidence.get("control_candidate") or "").strip()
+        control_state = str(evidence.get("control_state") or "").strip().upper()
+        if not candidate_id or control_candidate != candidate_id or not control_state:
+            raise CanaryBlocked("CANARY_RECOVERY_CONTROL_BINDING_INVALID")
+        for name in ("candidate_id", "market_id", "token_id"):
+            expected = str(ledger.get(name) or "").strip()
+            actual = str(signal.get(name) or "").strip()
+            persisted = str(evidence.get(f"signal_{name}") or "").strip()
+            if not expected or actual != expected or persisted != expected:
+                raise CanaryBlocked("CANARY_RECOVERY_SIGNAL_BINDING_MISMATCH")
+        expected_side = str(ledger.get("side") or "").strip().upper()
+        signal_side = str(signal.get("side") or "").strip().upper()
+        persisted_side = str(evidence.get("signal_side") or "").strip().upper()
+        if (
+            expected_side != "BUY"
+            or signal_side != expected_side
+            or persisted_side != expected_side
+        ):
+            raise CanaryBlocked("CANARY_RECOVERY_SIDE_MISMATCH")
+        for name in ("frozen_hash", "strategy_hash", "model_hash", "config_hash"):
+            expected = str(signal.get(name) or "").strip()
+            persisted = str(evidence.get(f"signal_{name}") or "").strip()
+            if not expected or persisted != expected:
+                raise CanaryBlocked("CANARY_RECOVERY_CONFIG_BINDING_INVALID")
+        return dict(evidence)
+
+    def _validate_recovery_observation(
+        self,
+        ledger: Mapping[str, Any],
+        signal: Mapping[str, Any],
+        order: Any,
+        trades: Sequence[Any],
+        exchange_order_id: str,
+        *,
+        now: datetime,
+    ) -> dict[str, Any]:
+        binding_evidence = self._validate_recovery_persisted_binding(ledger, signal)
+        if response_order_id(order) != exchange_order_id:
+            raise CanaryBlocked("CANARY_RECOVERY_ORDER_ID_MISMATCH")
+        if response_side(order) != "BUY":
+            raise CanaryBlocked("CANARY_RECOVERY_SIDE_MISMATCH")
+        expected_token = str(ledger.get("token_id") or "").strip()
+        expected_asset = str(binding_evidence.get("resolved_asset_id") or "").strip()
+        if (
+            not expected_token
+            or not expected_asset
+            or response_token(order) != expected_asset
+        ):
+            raise CanaryBlocked("CANARY_RECOVERY_TOKEN_MISMATCH")
+        returned_market = response_market(order)
+        expected_market = str(ledger.get("market_id") or "").strip()
+        if returned_market is not None and returned_market != expected_market:
+            raise CanaryBlocked("CANARY_RECOVERY_MARKET_MISMATCH")
+        try:
+            order_price = response_price(order)
+            order_quantity = response_quantity(order)
+            max_price = decimal_value(ledger.get("max_price"), "max price", positive=True)
+            submitted_quantity = decimal_value(
+                ledger.get("submitted_quantity"), "submitted quantity", positive=True
+            )
+        except ValueError as exc:
+            raise CanaryBlocked("CANARY_RECOVERY_ORDER_BINDING_INVALID") from exc
+        if order_price != max_price or order_quantity > submitted_quantity:
+            raise CanaryBlocked("CANARY_RECOVERY_ORDER_BOUNDS_MISMATCH")
+        try:
+            order_timestamp = response_timestamp(order)
+            reservation_timestamp = timestamp_value(
+                ledger.get("timestamp"), "reservation timestamp"
+            )
+        except ValueError as exc:
+            raise CanaryBlocked("CANARY_RECOVERY_TIMESTAMP_MISMATCH") from exc
+        if order_timestamp is not None and (
+            order_timestamp < reservation_timestamp or order_timestamp > now
+        ):
+            raise CanaryBlocked("CANARY_RECOVERY_TIMESTAMP_MISMATCH")
+        try:
+            generation = int(ledger.get("control_generation") or 0)
+        except (TypeError, ValueError) as exc:
+            raise CanaryBlocked("CANARY_RECOVERY_CONTROL_BINDING_INVALID") from exc
+        total_filled = Decimal("0")
+        safe_trade_count = 0
+        trade_provenance: list[dict[str, Any]] = []
+        for trade in trades:
+            direct_trade_order_id = trade_order_id(trade)
+            maker_order_ids = mapping_value(
+                trade, "maker_order_ids", "makerOrderIds"
+            )
+            bound_order_ids = {
+                str(identifier).strip()
+                for identifier in (
+                    [direct_trade_order_id] + list(maker_order_ids)
+                    if isinstance(maker_order_ids, Sequence)
+                    and not isinstance(maker_order_ids, (str, bytes, bytearray))
+                    else [direct_trade_order_id]
+                )
+                if str(identifier or "").strip()
+            }
+            if exchange_order_id not in bound_order_ids:
+                raise CanaryBlocked("CANARY_RECOVERY_TRADE_ORDER_ID_MISMATCH")
+            if trade_token(trade) != expected_asset:
+                raise CanaryBlocked("CANARY_RECOVERY_TRADE_TOKEN_MISMATCH")
+            returned_trade_market = response_market(trade)
+            if returned_trade_market is not None and returned_trade_market != expected_market:
+                raise CanaryBlocked("CANARY_RECOVERY_TRADE_MARKET_MISMATCH")
+            trade_id = str(mapping_value(trade, "trade_id", "id") or "").strip()
+            if not trade_id:
+                raise CanaryBlocked("CANARY_RECOVERY_TRADE_ID_REQUIRED")
+            trade_state = str(
+                mapping_value(trade, "status", "state") or ""
+            ).strip().upper()
+            try:
+                trade_price_value = trade_price(trade)
+                trade_quantity_value = trade_quantity(trade)
+                trade_time = trade_timestamp(trade)
+            except ValueError as exc:
+                raise CanaryBlocked("CANARY_RECOVERY_TRADE_BINDING_INVALID") from exc
+            if trade_price_value > order_price:
+                raise CanaryBlocked("CANARY_RECOVERY_TRADE_BOUNDS_MISMATCH")
+            if trade_time is not None and (
+                trade_time < reservation_timestamp or trade_time > now
+            ):
+                raise CanaryBlocked("CANARY_RECOVERY_TIMESTAMP_MISMATCH")
+            trade_provenance.append(
+                {
+                    "trade_id": trade_id,
+                    "order_id": exchange_order_id,
+                    "timestamp": trade_time.isoformat() if trade_time is not None else None,
+                    "price": str(trade_price_value),
+                    "quantity": str(trade_quantity_value),
+                    "market_id": returned_trade_market,
+                    "token_id": expected_asset,
+                    "signal_token_id": expected_token,
+                    "side": "BUY",
+                    "status": trade_state or None,
+                    "confirmed": trade_state
+                    in {"CONFIRMED", "TRADE_STATUS_CONFIRMED", "SETTLED", "TRADE_STATUS_SETTLED"},
+                    "owner": mapping_value(
+                        trade,
+                        "owner",
+                        "owner_address",
+                        "maker",
+                        "maker_address",
+                        "account",
+                        "account_address",
+                    ),
+                }
+            )
+            if trade_state not in {
+                "CONFIRMED",
+                "TRADE_STATUS_CONFIRMED",
+                "SETTLED",
+                "TRADE_STATUS_SETTLED",
+            }:
+                continue
+            total_filled += trade_quantity_value
+            safe_trade_count += 1
+        if total_filled > order_quantity or total_filled > submitted_quantity:
+            raise CanaryBlocked("CANARY_RECOVERY_QUANTITY_MISMATCH")
+        control = self.store.connection.execute(
+            "SELECT state,candidate_id,control_generation FROM canary_control WHERE singleton=1"
+        ).fetchone()
+        if control is None:
+            raise CanaryBlocked("CANARY_RECOVERY_CONTROL_BINDING_INVALID")
+        current_state = str(control["state"] or "").strip().upper()
+        if current_state not in {
+            "DISABLED", "DISARMED", "KILLED", "ARMED", AUTONOMOUS_MICRO_LIVE
+        }:
+            raise CanaryBlocked("CANARY_RECOVERY_CONTROL_BINDING_INVALID")
+        return {
+            "exchange_order_id": exchange_order_id,
+            "order_price": str(order_price),
+            "order_quantity": str(order_quantity),
+            "filled_quantity": str(total_filled),
+            "trade_count": safe_trade_count,
+            "control_generation": generation,
+            "control_state": current_state,
+            "candidate_id": str(ledger.get("candidate_id") or "").strip(),
+            "market_id": expected_market,
+            "token_id": expected_token,
+            "execution_asset_id": expected_asset,
+            "side": "BUY",
+            "order_provenance": {
+                "order_id": exchange_order_id,
+                "status": response_status(order),
+                "timestamp": order_timestamp.isoformat() if order_timestamp is not None else None,
+                "price": str(order_price),
+                "quantity": str(order_quantity),
+                "market_id": returned_market,
+                "token_id": expected_asset,
+                "signal_token_id": expected_token,
+                "side": "BUY",
+                "owner": mapping_value(
+                    order,
+                    "owner",
+                    "owner_address",
+                    "maker",
+                    "maker_address",
+                    "account",
+                    "account_address",
+                ),
+            },
+            "trade_provenance": trade_provenance,
+        }
+
+    @staticmethod
+    def _recovery_status(order: Any, filled: Decimal, quantity: Decimal) -> str:
+        state = response_status(order)
+        if quantity > 0 and filled >= quantity:
+            return "FILLED"
+        if filled > 0:
+            return "PARTIAL"
+        if state in {"CANCELED", "CANCELLED"}:
+            return "CANCELED"
+        if state == "EXPIRED":
+            return "EXPIRED"
+        if state in {"OPEN", "LIVE", "UNMATCHED", "ACTIVE"}:
+            return "OPEN"
+        return "SUBMITTED"
+
+    def reconcile_entry_intent(
+        self,
+        event_id: str,
+        *,
+        venue: Any | None = None,
+        _observed: tuple[Any, Sequence[Any]] | None = None,
+    ) -> dict[str, Any]:
+        connection = self.store.connection
+        event_key = str(event_id).strip()
+        with self.store._lock:
+            row = connection.execute(
+                "SELECT * FROM canary_ledger WHERE event_id=?", (event_key,)
+            ).fetchone()
+        if row is None:
+            raise CanaryBlocked("CANARY_RECOVERY_EVENT_NOT_FOUND")
+        ledger = dict(row)
+        exchange_order_id = str(ledger.get("exchange_order_id") or "").strip()
+        if not exchange_order_id:
+            raise CanaryBlocked("CANARY_RECOVERY_ORDER_ID_REQUIRED")
+        signal_row = connection.execute(
+            "SELECT * FROM canary_signals WHERE signal_id=?",
+            (str(ledger.get("signal_id") or ""),),
+        ).fetchone()
+        signal = dict(signal_row) if signal_row is not None else {}
+        binding_evidence = self._validate_recovery_persisted_binding(ledger, signal)
+        try:
+            state_version = int(ledger.get("state_version") or 0)
+        except (TypeError, ValueError) as exc:
+            raise CanaryBlocked("CANARY_RECOVERY_STALE_CONCURRENT_ATTACH") from exc
+        if _observed is None:
+            if venue is None:
+                raise CanaryBlocked("CANARY_RECOVERY_READ_UNAVAILABLE")
+            order = self._recovery_method(venue, "get_order", exchange_order_id)
+            raw_trades = self._recovery_method(
+                venue,
+                "list_account_trades",
+                exchange_order_id,
+                token_id=str(binding_evidence.get("resolved_asset_id") or "") or None,
+                market=str(signal.get("market_id") or "") or None,
+            )
+            trades = self._recovery_records(raw_trades, key="trades")
+        else:
+            order, trades = _observed
+            trades = list(trades)
+        observed = self._validate_recovery_observation(
+            ledger, signal, order, trades, exchange_order_id,
+            now=ensure_utc(self.clock()),
+        )
+        filled = Decimal(observed["filled_quantity"])
+        quantity = Decimal(observed["order_quantity"])
+        status = self._recovery_status(order, filled, quantity)
+        now = ensure_utc(self.clock()).isoformat()
+        evidence = {
+            **binding_evidence,
+            "recovery": True,
+            "read_only": True,
+            **observed,
+            "order_status": response_status(order),
+        }
+        with self.store._lock:
+            if connection.in_transaction:
+                raise CanaryBlocked("CANARY_TRANSACTION_ACTIVE")
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                current = connection.execute(
+                    "SELECT exchange_order_id,state_version FROM canary_ledger WHERE event_id=?",
+                    (event_key,),
+                ).fetchone()
+                if (
+                    current is None
+                    or str(current["exchange_order_id"] or "").strip() != exchange_order_id
+                    or int(current["state_version"] or 0) != state_version
+                ):
+                    raise CanaryBlocked("CANARY_RECOVERY_STALE_CONCURRENT_ATTACH")
+                updated = connection.execute(
+                    "UPDATE canary_ledger SET status=?,fill_quantity=?,evidence_json=?,"
+                    "state_version=state_version+1 WHERE event_id=? "
+                    "AND exchange_order_id=? AND state_version=?",
+                    (status, str(filled), json.dumps(evidence, sort_keys=True, separators=(",", ":")),
+                     event_key, exchange_order_id, state_version),
+                )
+                if updated.rowcount != 1:
+                    raise CanaryBlocked("CANARY_RECOVERY_STALE_CONCURRENT_ATTACH")
+                connection.execute(
+                    "UPDATE canary_signals SET status=?,reason=NULL,updated_at=? "
+                    "WHERE signal_id=? AND status IN ('UNKNOWN','SUBMITTING')",
+                    (status, now, str(ledger.get("signal_id") or "")),
+                )
+                connection.commit()
+            except BaseException:
+                if connection.in_transaction:
+                    connection.rollback()
+                raise
+        self.publish_readiness_snapshot(reason="CANARY_RECOVERY_RECONCILED")
+        return {
+            "event_id": event_key,
+            "signal_id": str(ledger.get("signal_id") or "").strip(),
+            "exchange_order_id": exchange_order_id,
+            "status": status,
+            "fill_quantity": str(filled),
+            "read_only": True,
+        }
+
+    def recover_entry_intent(
+        self,
+        event_id: str,
+        exchange_order_id: str,
+        *,
+        signal_id: str | None = None,
+        venue: Any | None = None,
+        profile: Any | None = None,
+        confirmation: str = "",
+    ) -> dict[str, Any]:
+        if confirmation != RECOVERY_CONFIRMATION:
+            raise CanaryBlocked("EXACT_CONFIRMATION_REQUIRED")
+        try:
+            selected_profile = normalize_recovery_profile(
+                self.profile if profile is None else profile
+            )
+        except RecoveryProfileError as exc:
+            raise CanaryBlocked(exc.code) from exc
+        if selected_profile["allow_environment"]:
+            raise CanaryBlocked("RECOVERY_PRODUCTION_PROFILE_REQUIRED")
+        event_key = recovery_identifier(event_id, "event ID")
+        order_key = recovery_identifier(exchange_order_id, "exchange order ID")
+        if signal_id is None:
+            raise CanaryBlocked("CANARY_RECOVERY_SIGNAL_REQUIRED")
+        signal_key = recovery_identifier(signal_id, "signal ID")
+        if venue is None:
+            raise CanaryBlocked("CANARY_RECOVERY_READ_UNAVAILABLE")
+        connection = self.store.connection
+        with self.store._lock:
+            row = connection.execute(
+                "SELECT * FROM canary_ledger WHERE event_id=?", (event_key,)
+            ).fetchone()
+            if row is None:
+                raise CanaryBlocked("CANARY_RECOVERY_EVENT_NOT_FOUND")
+            ledger = dict(row)
+            if str(ledger.get("signal_id") or "").strip() != signal_key:
+                raise CanaryBlocked("CANARY_RECOVERY_SIGNAL_MISMATCH")
+            if str(ledger.get("status") or "").upper() not in UNKNOWN_ENTRY_STATUSES:
+                raise CanaryBlocked("CANARY_RECOVERY_NOT_UNRESOLVED")
+            if str(ledger.get("exchange_order_id") or "").strip():
+                raise CanaryBlocked("CANARY_RECOVERY_ALREADY_ATTACHED")
+            duplicate = connection.execute(
+                "SELECT event_id FROM canary_ledger WHERE exchange_order_id=? AND event_id<>?",
+                (order_key, event_key),
+            ).fetchone()
+            if duplicate is not None:
+                raise CanaryBlocked("CANARY_RECOVERY_DUPLICATE_ORDER_ID")
+            signal_row = connection.execute(
+                "SELECT * FROM canary_signals WHERE signal_id=?",
+                (str(ledger.get("signal_id") or ""),),
+            ).fetchone()
+            if signal_row is None:
+                raise CanaryBlocked("CANARY_RECOVERY_SIGNAL_NOT_FOUND")
+            signal = dict(signal_row)
+            binding_evidence = self._validate_recovery_persisted_binding(ledger, signal)
+            try:
+                state_version = int(ledger.get("state_version") or 0)
+            except (TypeError, ValueError) as exc:
+                raise CanaryBlocked("CANARY_RECOVERY_STALE_CONCURRENT_ATTACH") from exc
+            expected_status = str(ledger.get("status") or "").upper()
+        self.require_current_credential_binding()
+        order = self._recovery_method(venue, "get_order", order_key)
+        raw_trades = self._recovery_method(
+            venue,
+            "list_account_trades",
+            order_key,
+            token_id=str(binding_evidence.get("resolved_asset_id") or "") or None,
+            market=str(signal.get("market_id") or "") or None,
+        )
+        trades = self._recovery_records(raw_trades, key="trades")
+        observed = self._validate_recovery_observation(
+            ledger, signal, order, trades, order_key, now=ensure_utc(self.clock())
+        )
+        with self.store._lock:
+            if connection.in_transaction:
+                raise CanaryBlocked("CANARY_TRANSACTION_ACTIVE")
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                current = connection.execute(
+                    "SELECT status,exchange_order_id,state_version FROM canary_ledger WHERE event_id=?",
+                    (event_key,),
+                ).fetchone()
+                if (
+                    current is None
+                    or str(current["status"] or "").upper() != expected_status
+                    or str(current["exchange_order_id"] or "").strip()
+                    or int(current["state_version"] or 0) != state_version
+                ):
+                    raise CanaryBlocked("CANARY_RECOVERY_STALE_CONCURRENT_ATTACH")
+                duplicate = connection.execute(
+                    "SELECT event_id FROM canary_ledger WHERE exchange_order_id=? AND event_id<>?",
+                    (order_key, event_key),
+                ).fetchone()
+                if duplicate is not None:
+                    raise CanaryBlocked("CANARY_RECOVERY_DUPLICATE_ORDER_ID")
+                evidence = {
+                    **binding_evidence,
+                    "recovery": True,
+                    "read_only": True,
+                    "event_id": event_key,
+                    "signal_id": str(ledger.get("signal_id") or "").strip(),
+                    **observed,
+                    "order_status": response_status(order),
+                }
+                updated = connection.execute(
+                    "UPDATE canary_ledger SET status=?,exchange_order_id=?,"
+                    "evidence_json=?,state_version=state_version+1 "
+                    "WHERE event_id=? AND status=? AND exchange_order_id IS NULL "
+                    "AND state_version=?",
+                    (RECOVERY_ATTACHED, order_key,
+                     json.dumps(evidence, sort_keys=True, separators=(",", ":")),
+                     event_key, expected_status, state_version),
+                )
+                if updated.rowcount != 1:
+                    raise CanaryBlocked("CANARY_RECOVERY_STALE_CONCURRENT_ATTACH")
+                connection.execute(
+                    "INSERT INTO canary_execution_events("
+                    "execution_event_id,canary_event_id,timestamp,exchange_order_id,status,"
+                    "fill_quantity,actual_average_price,fees,latency_ms,evidence_json) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (event_key + "-recovery", event_key, ensure_utc(self.clock()).isoformat(),
+                     order_key, RECOVERY_ATTACHED, observed["filled_quantity"],
+                     None, None, None,
+                     json.dumps(evidence, sort_keys=True, separators=(",", ":"))),
+                )
+                connection.commit()
+            except BaseException:
+                if connection.in_transaction:
+                    connection.rollback()
+                raise
+        result = self.reconcile_entry_intent(
+            event_key, venue=venue, _observed=(order, trades)
+        )
+        return {
+            "event_id": event_key,
+            "signal_id": str(ledger.get("signal_id") or "").strip(),
+            "exchange_order_id": order_key,
+            "status": result["status"],
+            "reconciled": True,
+            "read_only": True,
+            "profile": selected_profile["environment"],
+        }
 
     def validate_eligibility(
         self,
@@ -7230,11 +8752,48 @@ class CanaryService:
         candidate_id: str,
         *,
         venue: CanaryVenue,
-        target_notional_usd: Decimal = DEFAULT_TARGET_NOTIONAL_USD,
+        config_id: str,
+        expected_generation: int,
+        target_notional_usd: Decimal | None = None,
         expires_hours: Decimal = Decimal("24"),
         limits: CanaryLimits | None = None,
         credentials_configured: bool | None = None,
     ) -> Mapping[str, Any]:
+        requested_config_id = str(config_id or "").strip()
+        if not requested_config_id or isinstance(expected_generation, bool):
+            raise CanaryBlocked("CANARY_SETTINGS_GENERATION_CHANGED")
+        try:
+            requested_generation = int(expected_generation)
+        except (TypeError, ValueError, OverflowError):
+            raise CanaryBlocked("CANARY_SETTINGS_GENERATION_CHANGED") from None
+        if requested_generation < 1:
+            raise CanaryBlocked("CANARY_SETTINGS_GENERATION_CHANGED")
+        settings_config_id, settings_generation, _ = self._settings_identity()
+        if (
+            settings_config_id != requested_config_id
+            or settings_generation != requested_generation
+        ):
+            raise CanaryBlocked("CANARY_SETTINGS_GENERATION_CHANGED")
+        if credentials_configured is False:
+            raise CanaryBlocked("CREDENTIALS_NOT_CONFIGURED")
+        _, credential_digest = self._load_credential_binding()
+        geo = venue.geoblock()
+        if geo.get("blocked") or geo.get("close_only"):
+            raise CanaryBlocked("GEOGRAPHICALLY_BLOCKED")
+        candidate_limits = limits
+        if target_notional_usd is not None:
+            if candidate_limits is None:
+                candidate_limits = CanaryLimits(target_notional_usd=target_notional_usd)
+            else:
+                candidate_limits = CanaryLimits(
+                    target_notional_usd=target_notional_usd,
+                    max_exposure_usd=candidate_limits.max_exposure_usd,
+                    max_daily_loss_usd=candidate_limits.max_daily_loss_usd,
+                    max_open_positions=candidate_limits.max_open_positions,
+                    max_orders_per_day=candidate_limits.max_orders_per_day,
+                    max_slippage_bps=candidate_limits.max_slippage_bps,
+                )
+        limits = self._effective_limits(candidate_limits)
         connection = self.store.connection
         with self.store._lock:
             if connection.in_transaction:
@@ -7304,13 +8863,6 @@ class CanaryService:
             health = self.store.polymarket_health(now=now)
             if str(health.get("grade", "F")).upper() not in {"A", "B"}:
                 raise CanaryBlocked("COLLECTOR_DEGRADED")
-            if credentials_configured is False or not self.credentials.configured(
-                allow_environment=self.allow_environment
-            ):
-                raise CanaryBlocked("CREDENTIALS_NOT_CONFIGURED")
-            geo = venue.geoblock()
-            if geo.get("blocked") or geo.get("close_only"):
-                raise CanaryBlocked("GEOGRAPHICALLY_BLOCKED")
             expires = now + timedelta(hours=float(expires_hours))
             values = self._limits_record(limits)
             digest = self._integrity(
@@ -7346,15 +8898,19 @@ class CanaryService:
                 connection.execute(
                     "INSERT INTO canary_control("
                     "singleton,state,candidate_id,venue,armed_at,expires_at,"
-                    "limits_json,integrity_hash,updated_at,control_generation) "
-                    "VALUES(1,'ARMED',?,?,?,?,?,?,?,?) "
+                    "limits_json,integrity_hash,updated_at,control_generation,"
+                    "settings_config_id,settings_generation,credential_fingerprint) "
+                    "VALUES(1,'ARMED',?,?,?,?,?,?,?,?,?,?,?) "
                     "ON CONFLICT(singleton) DO UPDATE SET "
                     "state=excluded.state,candidate_id=excluded.candidate_id,"
                     "venue=excluded.venue,armed_at=excluded.armed_at,"
                     "expires_at=excluded.expires_at,limits_json=excluded.limits_json,"
                     "integrity_hash=excluded.integrity_hash,"
                     "updated_at=excluded.updated_at,"
-                    "control_generation=excluded.control_generation",
+                    "control_generation=excluded.control_generation,"
+                    "settings_config_id=excluded.settings_config_id,"
+                    "settings_generation=excluded.settings_generation,"
+                    "credential_fingerprint=excluded.credential_fingerprint",
                     (
                         candidate_id,
                         "polymarket",
@@ -7364,6 +8920,9 @@ class CanaryService:
                         digest,
                         now.isoformat(),
                         current_generation + 1,
+                        settings_config_id,
+                        settings_generation,
+                        credential_digest,
                     ),
                 )
                 connection.commit()
@@ -7887,14 +9446,18 @@ class CanaryService:
             if isinstance(selection, Mapping)
             else ""
         ) or None
-        risk_envelope = self.autonomous_limits()
+        try:
+            risk_envelope = self.autonomous_limits()
+            settings_available = True
+        except CanaryBlocked:
+            risk_envelope = {}
+            settings_available = False
         autonomous_state = None
         try:
             autonomous_state = _fetchone(
                 "SELECT last_tick_at,last_tick_started_at,last_tick_completed_at,"
                 "last_successful_tick,last_error_code,consecutive_failures,next_retry_at,"
                 "candidates_evaluated,signals_generated,orders_attempted,"
-                "candidates_ranked,candidates_signal_checked,candidates_no_signal,"
                 "actionable_candidates_found,selected_actionable_candidate,"
                 "selected_actionable_rank,selected_actionable_score,signal_scan_cursor,"
                 "signal_scan_ranking_run_id,next_signal_scan_start_rank,next_signal_scan_end_rank,"
@@ -7936,6 +9499,14 @@ class CanaryService:
             if latest_ranking is not None:
                 ranking_run_id = ranking_run_id or latest_ranking["ranking_run_id"]
                 ranking_timestamp = latest_ranking["ranking_timestamp"]
+        def autonomous_value(name: str, default: Any = None) -> Any:
+            if autonomous_state is None:
+                return default
+            try:
+                return autonomous_state[name]
+            except (IndexError, KeyError):
+                return default
+
         disabled_auto = {
             "enabled": False,
             "selected_candidate": winner_id,
@@ -7952,157 +9523,64 @@ class CanaryService:
             "eligible_count": eligible_count,
             "rankable_raw_count": rankable_raw_count,
             "rankable_count": rankable_count,
-            "candidates_ranked": (
-                autonomous_state["candidates_ranked"]
-                if autonomous_state is not None else None
+            "candidates_ranked": autonomous_value("candidates_ranked"),
+            "candidates_signal_checked": autonomous_value("candidates_signal_checked"),
+            "candidates_no_signal": autonomous_value("candidates_no_signal"),
+            "actionable_candidates_found": autonomous_value("actionable_candidates_found"),
+            "selected_actionable_candidate": autonomous_value("selected_actionable_candidate"),
+            "selected_actionable_rank": autonomous_value("selected_actionable_rank"),
+            "selected_actionable_score": autonomous_value("selected_actionable_score"),
+            "signal_scan_cursor": autonomous_value("signal_scan_cursor", 0),
+            "signal_scan_ranking_run_id": autonomous_value("signal_scan_ranking_run_id"),
+            "next_signal_scan_start_rank": autonomous_value("next_signal_scan_start_rank"),
+            "next_signal_scan_end_rank": autonomous_value("next_signal_scan_end_rank"),
+            "signal_scan_cycle_id": autonomous_value("signal_scan_cycle_id"),
+            "signal_scan_candidate_universe_hash": autonomous_value(
+                "signal_scan_candidate_universe_hash"
             ),
-            "candidates_signal_checked": (
-                autonomous_state["candidates_signal_checked"]
-                if autonomous_state is not None else None
+            "signal_scan_cycle_started_at": autonomous_value(
+                "signal_scan_cycle_started_at"
             ),
-            "candidates_no_signal": (
-                autonomous_state["candidates_no_signal"]
-                if autonomous_state is not None else None
+            "signal_scan_cycle_completed_at": autonomous_value(
+                "signal_scan_cycle_completed_at"
             ),
-            "actionable_candidates_found": (
-                autonomous_state["actionable_candidates_found"]
-                if autonomous_state is not None else None
+            "signal_scan_cycle_complete": autonomous_value(
+                "signal_scan_cycle_complete", 0
             ),
-            "selected_actionable_candidate": (
-                autonomous_state["selected_actionable_candidate"]
-                if autonomous_state is not None else None
+            "signal_scan_checked_this_cycle": autonomous_value(
+                "signal_scan_checked_this_cycle", 0
             ),
-            "selected_actionable_rank": (
-                autonomous_state["selected_actionable_rank"]
-                if autonomous_state is not None else None
+            "signal_scan_remaining_this_cycle": autonomous_value(
+                "signal_scan_remaining_this_cycle", 0
             ),
-            "selected_actionable_score": (
-                autonomous_state["selected_actionable_score"]
-                if autonomous_state is not None else None
+            "signal_scan_coverage_percentage": autonomous_value(
+                "signal_scan_coverage_percentage", 0.0
             ),
-            "signal_scan_cursor": (
-                autonomous_state["signal_scan_cursor"]
-                if autonomous_state is not None else 0
+            "signal_scan_skip_reasons_json": autonomous_value(
+                "signal_scan_skip_reasons_json", "{}"
             ),
-            "signal_scan_ranking_run_id": (
-                autonomous_state["signal_scan_ranking_run_id"]
-                if autonomous_state is not None else None
+            "signal_scan_reason_counts_json": autonomous_value(
+                "signal_scan_reason_counts_json", "{}"
             ),
-            "next_signal_scan_start_rank": (
-                autonomous_state["next_signal_scan_start_rank"]
-                if autonomous_state is not None else None
-            ),
-            "next_signal_scan_end_rank": (
-                autonomous_state["next_signal_scan_end_rank"]
-                if autonomous_state is not None else None
-            ),
-            "signal_scan_cycle_id": (
-                autonomous_state["signal_scan_cycle_id"]
-                if autonomous_state is not None else None
-            ),
-            "signal_scan_candidate_universe_hash": (
-                autonomous_state["signal_scan_candidate_universe_hash"]
-                if autonomous_state is not None else None
-            ),
-            "signal_scan_cycle_started_at": (
-                autonomous_state["signal_scan_cycle_started_at"]
-                if autonomous_state is not None else None
-            ),
-            "signal_scan_cycle_completed_at": (
-                autonomous_state["signal_scan_cycle_completed_at"]
-                if autonomous_state is not None else None
-            ),
-            "signal_scan_cycle_complete": (
-                autonomous_state["signal_scan_cycle_complete"]
-                if autonomous_state is not None else 0
-            ),
-            "signal_scan_checked_this_cycle": (
-                autonomous_state["signal_scan_checked_this_cycle"]
-                if autonomous_state is not None else 0
-            ),
-            "signal_scan_remaining_this_cycle": (
-                autonomous_state["signal_scan_remaining_this_cycle"]
-                if autonomous_state is not None else 0
-            ),
-            "signal_scan_coverage_percentage": (
-                autonomous_state["signal_scan_coverage_percentage"]
-                if autonomous_state is not None else 0.0
-            ),
-            "signal_scan_skip_reasons_json": (
-                autonomous_state["signal_scan_skip_reasons_json"]
-                if autonomous_state is not None else "{}"
-            ),
-            "signal_scan_reason_counts_json": (
-                autonomous_state["signal_scan_reason_counts_json"]
-                if autonomous_state is not None else "{}"
-            ),
-            "signal_scan_status": (
-                autonomous_state["signal_scan_status"]
-                if autonomous_state is not None else "UNKNOWN"
-            ),
+            "signal_scan_status": autonomous_value("signal_scan_status", "UNKNOWN"),
             "signal_scan_checked_keys": checked_keys,
             **winner_quality,
-            "next_decision": (
-                autonomous_state["next_decision"]
-                if autonomous_state is not None
-                else "ENABLE AUTO CANARY"
+            "next_decision": autonomous_value(
+                "next_decision", "ENABLE AUTO CANARY"
             ),
-            "blocker": (
-                autonomous_state["blocker"]
-                if autonomous_state is not None
-                else "AUTONOMOUS_CANARY_DISABLED"
-            ),
-            "last_tick_at": (
-                autonomous_state["last_tick_at"]
-                if autonomous_state is not None
-                else None
-            ),
-            "last_signal_id": (
-                autonomous_state["last_signal_id"]
-                if autonomous_state is not None
-                else None
-            ),
-            "worker_status": (
-                autonomous_state["worker_status"]
-                if autonomous_state is not None
-                else "IDLE"
-            ),
-            "last_tick_started_at": (
-                autonomous_state["last_tick_started_at"]
-                if autonomous_state is not None else None
-            ),
-            "last_tick_completed_at": (
-                autonomous_state["last_tick_completed_at"]
-                if autonomous_state is not None else None
-            ),
-            "last_successful_tick": (
-                autonomous_state["last_successful_tick"]
-                if autonomous_state is not None else None
-            ),
-            "last_error_code": (
-                autonomous_state["last_error_code"]
-                if autonomous_state is not None else None
-            ),
-            "consecutive_failures": (
-                autonomous_state["consecutive_failures"]
-                if autonomous_state is not None else None
-            ),
-            "next_retry_at": (
-                autonomous_state["next_retry_at"]
-                if autonomous_state is not None else None
-            ),
-            "candidates_evaluated": (
-                autonomous_state["candidates_evaluated"]
-                if autonomous_state is not None else None
-            ),
-            "signals_generated": (
-                autonomous_state["signals_generated"]
-                if autonomous_state is not None else None
-            ),
-            "orders_attempted": (
-                autonomous_state["orders_attempted"]
-                if autonomous_state is not None else None
-            ),
+            "blocker": autonomous_value("blocker", "AUTONOMOUS_CANARY_DISABLED"),
+            "last_tick_at": autonomous_value("last_tick_at"),
+            "last_signal_id": autonomous_value("last_signal_id"),
+            "worker_status": autonomous_value("worker_status", "IDLE"),
+            "last_tick_started_at": autonomous_value("last_tick_started_at"),
+            "last_tick_completed_at": autonomous_value("last_tick_completed_at"),
+            "last_successful_tick": autonomous_value("last_successful_tick"),
+            "last_error_code": autonomous_value("last_error_code"),
+            "consecutive_failures": autonomous_value("consecutive_failures"),
+            "next_retry_at": autonomous_value("next_retry_at"),
+            "candidates_evaluated": autonomous_value("candidates_evaluated"),
+            "signals_generated": autonomous_value("signals_generated"),
+            "orders_attempted": autonomous_value("orders_attempted"),
         }
         scan_projection = {
             name: disabled_auto.get(name)
@@ -8145,12 +9623,36 @@ class CanaryService:
             )
 
         display_state = "DISABLED"
+        canonical = self._canonical_execution_usage(now)
+        canonical_error = canonical.get("_canonical_error")
+        cold_orders = (
+            None
+            if canonical_error
+            else int(canonical.get("submitted_orders", 0) or 0)
+        )
+        cold_pnl = (
+            None
+            if canonical_error
+            else float(canonical.get("today_realized_pnl_usd", "0") or "0")
+        )
+        cold_exposure = (
+            None
+            if canonical_error
+            else float(canonical.get("aggregate_exposure_usd", "0") or "0")
+        )
+        cold_positions = (
+            None
+            if canonical_error
+            else int(canonical.get("open_positions", 0) or 0)
+        )
         if row is None:
             return {
                 "production_live_trading": "DISABLED",
                 "micro_live_canary": "DISABLED",
                 "display_state": display_state,
                 "control_state": "DISABLED",
+                "credential_fingerprint": None,
+                "binding_blocker": None,
                 "candidate": winner_id,
                 "control_candidate": None,
                 "winner_id": winner_id,
@@ -8172,13 +9674,23 @@ class CanaryService:
                 "venue": None,
                 "expiry": None,
                 "control_generation": 0,
-                "last_request_status": None,
-                "today_orders": 0,
-                "today_realized_pnl": 0.0,
-                "total_exposure": 0.0,
-                "open_positions": 0,
-                "daily_loss_budget_remaining": float(DEFAULT_DAILY_LOSS_USD),
-                "limits": self._limits_record(CanaryLimits()),
+                "settings_config_id": None,
+                "settings_generation": None,
+                "settings_available": settings_available,
+                "today_orders": cold_orders,
+                "today_realized_pnl": cold_pnl,
+                "total_exposure": cold_exposure,
+                "open_positions": cold_positions,
+                "daily_loss_budget_remaining": (
+                    None
+                    if cold_pnl is None
+                    else max(
+                        0,
+                        float(risk_envelope.get("max_daily_loss_usd", "0"))
+                        + cold_pnl,
+                    )
+                ),
+                "limits": dict(risk_envelope),
                 "risk_envelope": risk_envelope,
                 "risk_limits": risk_envelope,
                 "real_execution_events": execution_event_count,
@@ -8190,7 +9702,20 @@ class CanaryService:
                 "live_execution": False,
                 "kill_semantics": "KILL_PREVENTS_NEW_SUBMISSIONS; IN_FLIGHT_REQUESTS_ARE_NOT_RETRACTED",
             }
-        data=dict(row); state=str(data.get("state") or "DISABLED").upper()
+        data = dict(row)
+        state = str(data.get("state") or "DISABLED").upper()
+        persisted_credential_fingerprint = data.get("credential_fingerprint")
+        credential_digest = _valid_credential_fingerprint(
+            persisted_credential_fingerprint
+        )
+        binding_blocker: str | None = None
+        if state in {"ARMED", AUTONOMOUS_MICRO_LIVE}:
+            if persisted_credential_fingerprint in (None, ""):
+                binding_blocker = "CREDENTIAL_BINDING_MISSING"
+                state = "DISABLED"
+            elif credential_digest is None:
+                binding_blocker = "CREDENTIAL_BINDING_INVALID"
+                state = "KILLED"
         limits: dict[str, Any] = {}
         try:
             parsed_limits = json.loads(data.get("limits_json") or "{}")
@@ -8240,8 +9765,6 @@ class CanaryService:
             expected = self._integrity("", AUTONOMOUS_CANARY_VENUE, "", limits)
             if limits != self.autonomous_limits() or expected != data.get("integrity_hash"):
                 state = "KILLED"
-        start=now.replace(hour=0,minute=0,second=0,microsecond=0).isoformat()
-        active_states = "('RESERVED','SUBMITTING','UNKNOWN','OPEN','PARTIAL','SUBMITTED')"
         trades = [dict(x) for x in _optional_fetchall(
             "SELECT l.timestamp,l.candidate_id,l.market_id,l.side,"
             "l.requested_notional,l.paper_expected_price,e.actual_average_price,"
@@ -8255,23 +9778,15 @@ class CanaryService:
             "e2.execution_event_id DESC LIMIT 1) ORDER BY l.timestamp DESC LIMIT 100"
         )]
         last_request_status = str(trades[0].get("status") or "").upper() if trades else None
-        aggregates = _optional_fetchone(
-            "SELECT COALESCE(SUM(CASE WHEN timestamp>=? THEN 1 ELSE 0 END),0) orders,"
-            "COALESCE(SUM(CASE WHEN status IN " + active_states
-            + " THEN CAST(requested_notional AS REAL) ELSE 0 END),0) exposure,"
-            "COUNT(DISTINCT CASE WHEN status IN " + active_states
-            + " THEN market_id END) positions,"
-            "COALESCE(SUM(CASE WHEN timestamp>=? THEN CAST(realized_pnl AS REAL) "
-            "ELSE 0 END),0) pnl FROM canary_ledger WHERE timestamp>=? OR status IN "
-            + active_states,
-            (start, start, start),
-        )
-        if aggregates is None:
+        canonical = self._canonical_execution_usage(now)
+        if canonical.get("_canonical_error"):
+            aggregates = {"orders": None, "exposure": None, "positions": None, "pnl": None}
+        else:
             aggregates = {
-                "orders": 0,
-                "exposure": 0,
-                "positions": 0,
-                "pnl": 0,
+                "orders": int(canonical.get("submitted_orders", 0) or 0),
+                "exposure": float(canonical.get("aggregate_exposure_usd", "0") or "0"),
+                "positions": int(canonical.get("open_positions", 0) or 0),
+                "pnl": float(canonical.get("today_realized_pnl_usd", "0") or "0"),
             }
         try:
             control_generation = int(data.get("control_generation") or 0)
@@ -8286,7 +9801,7 @@ class CanaryService:
         selected_candidate = (
             winner_id if state == AUTONOMOUS_MICRO_LIVE else control_candidate
         )
-        auto_enabled = state == AUTONOMOUS_MICRO_LIVE
+        auto_enabled = state == AUTONOMOUS_MICRO_LIVE and binding_blocker is None
         if state == "KILLED":
             display_state = "KILLED"
         elif state in {"ARMED", AUTONOMOUS_MICRO_LIVE}:
@@ -8299,13 +9814,16 @@ class CanaryService:
             "selected_candidate": winner_id,
             "next_decision": (
                 autonomous_state["next_decision"]
-                if autonomous_state is not None and (auto_enabled or state == "KILLED")
+                if autonomous_state is not None
                 else "KILL_LATCHED" if state == "KILLED" else "ENABLE AUTO CANARY"
             ),
             "blocker": (
-                autonomous_state["blocker"]
-                if autonomous_state is not None and (auto_enabled or state == "KILLED")
-                else "CANARY_KILLED" if state == "KILLED" else "AUTONOMOUS_CANARY_DISABLED"
+                binding_blocker
+                or (
+                    autonomous_state["blocker"]
+                    if autonomous_state is not None and (auto_enabled or state == "KILLED")
+                    else "CANARY_KILLED" if state == "KILLED" else "AUTONOMOUS_CANARY_DISABLED"
+                )
             ),
             "last_tick_at": (
                 autonomous_state["last_tick_at"]
@@ -8323,11 +9841,27 @@ class CanaryService:
                 else "IDLE"
             ),
         }
+        daily_loss_budget_remaining = (
+            None
+            if aggregates["pnl"] is None
+            else max(
+                0,
+                float(
+                    limits.get(
+                        "max_daily_loss_usd",
+                        risk_envelope.get("max_daily_loss_usd", "0"),
+                    )
+                )
+                + float(aggregates["pnl"]),
+            )
+        )
         return {
             "production_live_trading": "DISABLED",
             "micro_live_canary": state,
             "display_state": display_state,
             "control_state": state,
+            "credential_fingerprint": credential_digest,
+            "binding_blocker": binding_blocker,
             "candidate": selected_candidate,
             "control_candidate": control_candidate,
             "winner_id": winner_id,
@@ -8339,31 +9873,38 @@ class CanaryService:
             "selection_invalidation_reason": selection_invalidation_reason,
             "selected_candidate": winner_id,
             "last_selected_candidate": last_selected_candidate,
-            **scan_projection,
-            "ranking_run_id": ranking_run_id,
-            "ranking_timestamp": ranking_timestamp,
-            "venue": data.get("venue"),
-            "expiry": data.get("expires_at"),
-            "control_generation": control_generation,
-            "last_request_status": last_request_status,
-            "today_orders": int(aggregates["orders"]),
-            "today_realized_pnl": float(aggregates["pnl"]),
-            "total_exposure": float(aggregates["exposure"]),
-            "open_positions": int(aggregates["positions"]),
-            "limits": limits,
-            "risk_envelope": risk_envelope,
-            "risk_limits": risk_envelope,
             "eligibility_raw_count": eligibility_raw_count,
             "eligible_count": eligible_count,
             "rankable_raw_count": rankable_raw_count,
             "rankable_count": rankable_count,
+            **scan_projection,
+            "ranking_run_id": ranking_run_id,
+            "ranking_timestamp": ranking_timestamp,
+            "venue": data.get("venue"),
+            "settings_config_id": data.get("settings_config_id"),
+            "settings_generation": data.get("settings_generation"),
+            "settings_available": settings_available,
+            "expiry": data.get("expires_at"),
+            "control_generation": control_generation,
+            "last_request_status": last_request_status,
+            "today_orders": (
+                int(aggregates["orders"]) if aggregates["orders"] is not None else None
+            ),
+            "today_realized_pnl": (
+                float(aggregates["pnl"]) if aggregates["pnl"] is not None else None
+            ),
+            "total_exposure": (
+                float(aggregates["exposure"]) if aggregates["exposure"] is not None else None
+            ),
+            "open_positions": (
+                int(aggregates["positions"]) if aggregates["positions"] is not None else None
+            ),
+            "limits": limits,
+            "risk_envelope": risk_envelope,
+            "daily_loss_budget_remaining": daily_loss_budget_remaining,
             "real_execution_events": execution_event_count,
             "execution_event_count": execution_event_count,
             **winner_quality,
-            "daily_loss_budget_remaining": max(
-                0,
-                float(limits.get("max_daily_loss_usd", 2)) + float(aggregates["pnl"]),
-            ),
             "autonomous": auto_payload,
             "selected_winner": selection_audit,
             "trades": trades,
@@ -8394,26 +9935,41 @@ class CanaryService:
                 failures.append("CANARY_NOT_ARMED")
             if candidate_id and candidate_id != status.get("candidate"):
                 failures.append("CANDIDATE_NOT_ARMED")
-        credentials_configured = self.credentials.configured(
-            allow_environment=environment
-        )
-        if not credentials_configured:
-            failures.append("CREDENTIALS_NOT_CONFIGURED")
-        if venue is None and (
-            credentials_configured
-            or (
-                not _connectivity_only
-                and status["micro_live_canary"] in {"ARMED", AUTONOMOUS_MICRO_LIVE}
+        credential_failure: str | None = None
+        try:
+            credentials_configured = bool(
+                self.credentials.configured(allow_environment=environment)
             )
-        ):
+        except CanaryBlocked as exc:
+            credentials_configured = False
+            credential_failure = str(exc)
+        except Exception:
+            credentials_configured = False
+            credential_failure = "CREDENTIALS_NOT_CONFIGURED"
+        if not credentials_configured and not credential_failure:
+            credential_failure = "CREDENTIALS_NOT_CONFIGURED"
+        if credential_failure:
+            failures.append(credential_failure)
+        if venue is None:
             failures.append("VENUE_REQUIRED")
         diagnostics: dict[str, Any] = {
             "sdk_version": (
                 venue.installed_sdk_version()
-                if venue is not None and callable(getattr(venue, "installed_sdk_version", None))
+                if venue is not None
+                and callable(getattr(venue, "installed_sdk_version", None))
                 else None
             ),
+            "execution_profile": (
+                "ISOLATED_EXECUTION_PROFILE"
+                if _isolated_execution_profile()
+                else "STANDARD"
+            ),
+            "credentials_status": (
+                credential_failure
+                or ("CONFIGURED" if credentials_configured else "NOT CONFIGURED")
+            ),
             "credentials_configured": credentials_configured,
+            "collateral": _collateral_metadata(),
             "geoblock": {"status": "SKIPPED"},
             "authentication": {"status": "SKIPPED"},
             "account": {"status": "SKIPPED"},
@@ -8467,7 +10023,11 @@ class CanaryService:
                             # arbitrary SDK response fields.
                             diagnostics["account"] = {
                                 key: account[key]
-                                for key in ("authenticated", "wallet_type")
+                                for key in (
+                                    "authenticated",
+                                    "wallet_type",
+                                    "credential_fingerprint",
+                                )
                                 if key in account
                             }
                         except CanaryBlocked as exc:
@@ -8484,7 +10044,12 @@ class CanaryService:
                             "available_usd": str(balance),
                         }
                         target = Decimal(
-                            str(status.get("limits", {}).get("target_notional_usd", 1))
+                            str(
+                                status.get("limits", {}).get(
+                                    "target_notional_usd",
+                                    self.autonomous_limits()["target_notional_usd"],
+                                )
+                            )
                         )
                         if available < target:
                             failures.append("INSUFFICIENT_BALANCE")
@@ -8525,7 +10090,12 @@ class CanaryService:
                                     failures.append("CANARY_ALLOWANCE_UNAVAILABLE")
                                 else:
                                     target = Decimal(
-                                        str(status.get("limits", {}).get("target_notional_usd", 1))
+                                        str(
+                                            status.get("limits", {}).get(
+                                                "target_notional_usd",
+                                                self.autonomous_limits()["target_notional_usd"],
+                                            )
+                                        )
                                     )
                                     available_allowance = Decimal(
                                         _base_units(
@@ -8533,7 +10103,9 @@ class CanaryService:
                                             field="allowance",
                                         )
                                     )
-                                    if available_allowance < target * Decimal("1000000"):
+                                    if available_allowance < target * (
+                                        Decimal(10) ** POLYMARKET_COLLATERAL_DECIMALS
+                                    ):
                                         failures.append("CANARY_ALLOWANCE_INSUFFICIENT")
                             elif type(venue) is PolymarketClobV2Venue:
                                 failures.append("CANARY_ALLOWANCE_UNAVAILABLE")
@@ -8560,26 +10132,87 @@ class CanaryService:
                                 )
                                 if key in context
                             }
-                            if not context.get("accepting_orders"):
-                                failures.append("MARKET_NOT_ACCEPTING_ORDERS")
-                            asks = context.get("asks")
-                            best_ask = _best_ask_price(asks)
-                            minimum = Decimal(str(context.get("min_order_size", 0)))
                             target = Decimal(
-                                str(status.get("limits", {}).get("target_notional_usd", 1))
+                                str(
+                                    status.get("limits", {}).get(
+                                        "target_notional_usd",
+                                        self.autonomous_limits()["target_notional_usd"],
+                                    )
+                                )
                             )
-                            if minimum * best_ask > target:
+                            best_ask = _best_ask_price(context.get("asks") or [])
+                            minimum = Decimal(str(context.get("min_order_size", 0)))
+                            size_increment = Decimal(
+                                str(context.get("size_increment", "0.01"))
+                            )
+                            minimum = (
+                                minimum / size_increment
+                            ).to_integral_value(rounding=ROUND_UP) * size_increment
+                            minimum_notional = Decimal(
+                                str(
+                                    context.get(
+                                        "min_notional",
+                                        context.get("minimum_notional", "0"),
+                                    )
+                                )
+                            )
+                            if minimum_notional > 0:
+                                minimum = max(
+                                    minimum,
+                                    (
+                                        minimum_notional / best_ask / size_increment
+                                    ).to_integral_value(rounding=ROUND_UP)
+                                    * size_increment,
+                                )
+                            fee_rate = Decimal(
+                                str(
+                                    context.get(
+                                        "fee_rate",
+                                        Decimal(str(context.get("fee_bps", 0)))
+                                        / Decimal("10000"),
+                                    )
+                                )
+                            )
+                            fee_exponent = Decimal(
+                                str(context.get("fee_exponent", 1))
+                            )
+                            curve = best_ask * (Decimal("1") - best_ask)
+                            unit_fee = max(
+                                fee_rate * (curve ** fee_exponent),
+                                fee_rate * (Decimal("0.25") ** fee_exponent),
+                            )
+                            if minimum * (best_ask + unit_fee) > target:
                                 failures.append("VENUE_MINIMUM_EXCEEDS_CANARY_TARGET")
                             if diagnostics["balance"].get("status") == "OK":
-                                fee_bps = Decimal(
-                                    str(context.get("fee_bps", 0))
-                                )
-                                if not fee_bps.is_finite() or fee_bps < 0:
+                                try:
+                                    fee_rate = Decimal(
+                                        str(
+                                            context.get(
+                                                "fee_rate",
+                                                Decimal(str(context.get("fee_bps", 0)))
+                                                / Decimal("10000"),
+                                            )
+                                        )
+                                    )
+                                    fee_exponent = Decimal(
+                                        str(context.get("fee_exponent", 1))
+                                    )
+                                    if (
+                                        not fee_rate.is_finite()
+                                        or fee_rate < 0
+                                        or not fee_exponent.is_finite()
+                                        or fee_exponent < 0
+                                    ):
+                                        raise ValueError("invalid fee")
+                                    conservative_fee = (
+                                        target
+                                        * fee_rate
+                                        * (Decimal("0.25") ** fee_exponent)
+                                    )
+                                    if available < target + conservative_fee:
+                                        failures.append("INSUFFICIENT_BALANCE")
+                                except (TypeError, ValueError, ArithmeticError):
                                     failures.append("MARKET_CONNECTIVITY_FAILED")
-                                elif available < target + (
-                                    target * fee_bps / Decimal(10000)
-                                ):
-                                    failures.append("INSUFFICIENT_BALANCE")
                         except CanaryBlocked as exc:
                             failures.append(str(exc))
                         except Exception:
@@ -8649,6 +10282,7 @@ class CanaryService:
         allow_environment: bool | None = None,
     ) -> Mapping[str, Any]:
         now = ensure_utc(self.clock())
+        request_settings_config_id, request_settings_generation = self._settings_binding()
         environment = (
             self.allow_environment
             if allow_environment is None
@@ -8663,6 +10297,9 @@ class CanaryService:
         def block(reason: str) -> None:
             raise CanaryBlocked(reason)
 
+        if _isolated_execution_profile():
+            block("ISOLATED_EXECUTION_PROFILE")
+
         def enforce_controls(
             snapshot: Mapping[str, Any],
             *,
@@ -8674,6 +10311,19 @@ class CanaryService:
             state = str(snapshot.get("micro_live_canary") or "DISABLED").upper()
             if state not in {"ARMED", AUTONOMOUS_MICRO_LIVE}:
                 block("CANARY_NOT_ARMED")
+            snapshot_settings_id = snapshot.get("settings_config_id")
+            snapshot_settings_generation = snapshot.get("settings_generation")
+            if (
+                request_settings_config_id is not None
+                and str(snapshot_settings_id or "") != request_settings_config_id
+            ):
+                block("CANARY_SETTINGS_GENERATION_CHANGED")
+            if request_settings_generation is not None:
+                try:
+                    if int(snapshot_settings_generation) != request_settings_generation:
+                        block("CANARY_SETTINGS_GENERATION_CHANGED")
+                except (TypeError, ValueError):
+                    block("CANARY_SETTINGS_GENERATION_CHANGED")
             if state == AUTONOMOUS_MICRO_LIVE and limits != self.autonomous_limits():
                 block("AUTONOMOUS_RISK_ENVELOPE_CORRUPT")
             if state_only:
@@ -8707,8 +10357,6 @@ class CanaryService:
                 if snapshot["open_positions"] >= int(limits["max_open_positions"]):
                     block("OPEN_POSITION_LIMIT")
                 target = Decimal(limits["target_notional_usd"])
-                if state == AUTONOMOUS_MICRO_LIVE and target > DEFAULT_TARGET_NOTIONAL_USD:
-                    block("AUTONOMOUS_TARGET_LIMIT")
                 exposure = Decimal(str(snapshot["total_exposure"])) + target
             else:
                 if snapshot["today_orders"] > int(limits["max_orders_per_day"]):
@@ -8732,7 +10380,18 @@ class CanaryService:
             signal = self._signal_from_row(row)
             status = str(signal.get("status") or "").upper()
             if status != "READY":
-                if status in {"SUBMITTED", "SUBMITTING", "UNKNOWN", "REJECTED"}:
+                if status in {
+                    "SUBMITTED",
+                    "SUBMITTING",
+                    "UNKNOWN",
+                    "REJECTED",
+                    "ACCEPTED",
+                    "MATCHED",
+                    "PARTIAL",
+                    "PARTIALLY_FILLED",
+                    "SETTLED",
+                    "RESOLVED",
+                }:
                     block("DUPLICATE_SIGNAL")
                 block("CANARY_SIGNAL_NOT_READY")
             return signal
@@ -8873,7 +10532,18 @@ class CanaryService:
                 if (
                     required_status.upper() == "READY"
                     and str(signal.get("status") or "").upper()
-                    in {"SUBMITTED", "SUBMITTING", "UNKNOWN", "REJECTED"}
+                    in {
+                        "SUBMITTED",
+                        "SUBMITTING",
+                        "UNKNOWN",
+                        "REJECTED",
+                        "ACCEPTED",
+                        "MATCHED",
+                        "PARTIAL",
+                        "PARTIALLY_FILLED",
+                        "SETTLED",
+                        "RESOLVED",
+                    }
                 ):
                     block("DUPLICATE_SIGNAL")
                 block(
@@ -8964,6 +10634,32 @@ class CanaryService:
                     > CANARY_SIGNAL_MAX_AGE_SECONDS
                 ):
                     block("CANARY_SIGNAL_STALE")
+                current_market = self._current_signal_market(
+                    str(signal.get("market_id") or ""),
+                    now=fence_now,
+                )
+                if current_market is None:
+                    block("CANARY_SIGNAL_STALE")
+                latest_row, latest_observation = current_market
+                if str(latest_row.get("snapshot_id") or "") != str(
+                    signal.get("source_snapshot_id") or ""
+                ):
+                    block("CANARY_SIGNAL_NO_LONGER_VALID")
+                outcome = str(signal.get("outcome") or "").strip().lower()
+                latest_book = self._current_order_book(
+                    latest_observation,
+                    outcome,
+                    now=fence_now,
+                    token_id=str(signal.get("token_id") or ""),
+                )
+                if latest_book is None:
+                    block("CURRENT_ORDER_BOOK_REQUIRED")
+                latest_token = latest_observation.get(f"{outcome}_token_id")
+                token_ids = latest_observation.get("token_ids")
+                if not latest_token and isinstance(token_ids, Mapping):
+                    latest_token = token_ids.get(outcome)
+                if str(latest_token or "") != str(signal.get("token_id") or ""):
+                    block("CANARY_SIGNAL_NO_LONGER_VALID")
             if required_status.upper() == "READY":
                 return signal
             lifecycle = self.store.load_candidate_lifecycle(
@@ -9058,6 +10754,11 @@ class CanaryService:
 
 
 
+
+        transport_state_lock = threading.Lock()
+        submission_cancelled = threading.Event()
+        network_send_started = False
+
         def submit_official_order(
             *,
             market_version: Any,
@@ -9067,132 +10768,33 @@ class CanaryService:
             price: Decimal,
             size: Decimal,
         ) -> Mapping[str, Any]:
-            """Sign, check allowance, and post only after reservation."""
-            try:
-                values = self.credentials.load(allow_environment=environment)
-            except CanaryBlocked:
-                raise
-            except Exception as exc:
-                raise CanaryBlocked("CREDENTIALS_NOT_CONFIGURED") from exc
-            if (
-                not isinstance(values, Mapping)
-                or not all(values.get(name) for name in _MANDATORY_SECRET_NAMES)
-            ):
-                raise CanaryBlocked("CREDENTIALS_NOT_CONFIGURED")
-            try:
-                import polymarket
-                from polymarket import SecureClient
-            except ImportError as exc:
-                raise CanaryBlocked(
-                    "OFFICIAL_POLYMARKET_SDK_NOT_INSTALLED"
-                ) from exc
-            version = PolymarketClobV2Venue.installed_sdk_version()
-            parts = str(version or "").split(".")
-            if len(parts) < 2 or parts[0] != "0" or parts[1] != "9":
-                raise CanaryBlocked("UNSUPPORTED_POLYMARKET_SDK")
-            safe_create = getattr(SecureClient, "_create", None)
-            if not callable(safe_create):
-                raise CanaryBlocked(
-                    "OFFICIAL_POLYMARKET_SDK_NOT_READONLY_COMPATIBLE"
-                )
-            # Official v0.9 ``SecureClient.create`` calls ``_ensure_wallet_ready``,
-            # which can deploy a wallet or invoke relayer workflows.  The
-            # canary uses private ``_create`` only after this compatibility
-            # guard to avoid that side effect.
-
-            # In official v0.9, ``place_limit_order`` delegates to allowance
-            # recovery: an allowance rejection can reach ``approve_erc20`` or
-            # ``approve_erc1155_for_all`` and the ``/balance-allowance/update``
-            # endpoint.  The canary therefore splits local signing from
-            # posting, checks the exact maker amount first, and never invokes
-            # that recovery path.
-            client: Any = None
-            try:
-                client = safe_create(
-                    private_key=values["private_key"],
-                    wallet=values["wallet_address"],
-                    validate_credentials=True,
-                )
-                signed = client.create_limit_order(
-                    asset_id=asset_id,
-                    side=side.upper(),
-                    price=str(price),
-                    size=str(size),
-                )
-                try:
-                    required = _base_units(
-                        _sdk_value(signed, "maker_amount", None),
-                        field="signed maker_amount",
-                    )
-                except ValueError as exc:
-                    raise CanaryBlocked("CANARY_ALLOWANCE_UNAVAILABLE") from exc
-
-                asset_type, allowance_asset_id = _order_balance_allowance_target(
-                    side=side,
-                    asset_id=asset_id,
-                    market_version=market_version,
-                )
-                spender = _resolve_official_spender(
-                    client,
-                    asset_id=asset_id,
-                    market_version=market_version,
-                    neg_risk=neg_risk,
-                )
-                request: dict[str, Any] = {"asset_type": asset_type}
-                if allowance_asset_id is not None:
-                    request["asset_id"] = allowance_asset_id
-                try:
-                    balance_allowance = client.get_balance_allowance(**request)
-                    balance, allowances = _normalize_balance_allowance(
-                        balance_allowance
-                    )
-                    allowance = _allowance_for_spender(allowances, spender)
-                except CanaryBlocked:
-                    raise
-                except (TypeError, ValueError) as exc:
-                    raise CanaryBlocked("CANARY_ALLOWANCE_UNAVAILABLE") from exc
-                if balance < required:
-                    raise CanaryBlocked("INSUFFICIENT_BALANCE")
-                if allowance < required:
-                    raise CanaryBlocked("CANARY_ALLOWANCE_INSUFFICIENT")
+            def before_post() -> None:
                 enforce_submission_fence(required_status="SUBMITTING")
                 final_submission_fence()
-                response = client.post_order(signed)
-                accepted = bool(_sdk_value(response, "ok", False))
-                if accepted:
-                    return {
-                        "ok": True,
-                        "order_id": _sdk_value(response, "order_id"),
-                        "status": _sdk_value(response, "status"),
-                        "trade_ids": list(
-                            _sdk_value(response, "trade_ids", ()) or ()
-                        ),
-                    }
-                return {
-                    "ok": False,
-                    "status": "REJECTED",
-                    "error_code": _sdk_value(response, "code", "unknown"),
-                    "error_message": _sdk_value(
-                        response, "message", "order rejected"
-                    ),
-                }
-            except CanaryBlocked:
-                raise
-            except TypeError as exc:
-                raise CanaryBlocked(
-                    "OFFICIAL_POLYMARKET_SDK_NOT_READONLY_COMPATIBLE"
-                ) from exc
-            except Exception as exc:
-                raise CanaryBlocked("ORDER_SUBMISSION_FAILED") from exc
-            finally:
-                if client is not None:
-                    close = getattr(client, "close", None)
-                    if callable(close):
-                        try:
-                            close()
-                        except Exception:
-                            pass
+                fresh_id, fresh_generation, _ = self._settings_identity()
+                if (
+                    fresh_id != request_settings_config_id
+                    or fresh_generation != request_settings_generation
+                ):
+                    raise CanaryBlocked("CANARY_SETTINGS_GENERATION_CHANGED")
 
+            def mark_send_started() -> None:
+                nonlocal network_send_started
+                with transport_state_lock:
+                    if submission_cancelled.is_set():
+                        raise CanaryBlocked("CANARY_SUBMISSION_TIMEOUT")
+                    network_send_started = True
+
+            return self.submit_position_order(
+                market_version=market_version,
+                neg_risk=neg_risk,
+                asset_id=asset_id,
+                side=side,
+                price=price,
+                size=size,
+                before_post=before_post,
+                on_send_started=mark_send_started,
+            )
         def execution_parameters(
             limits: Mapping[str, Any],
             context: Mapping[str, Any],
@@ -9204,8 +10806,32 @@ class CanaryService:
                 expected_price = Decimal(str(paper_expected_price))
                 slippage_bps = Decimal(str(limits["max_slippage_bps"]))
                 minimum = Decimal(str(context["min_order_size"]))
+                size_increment = Decimal(
+                    str(
+                        context.get(
+                            "size_increment",
+                            context.get("quantity_step", "0.01"),
+                        )
+                    )
+                )
+                documented_min_notional = Decimal(
+                    str(
+                        context.get(
+                            "min_notional",
+                            context.get("minimum_notional", "0"),
+                        )
+                    )
+                )
             except Exception:
                 block("INVALID_CANARY_PARAMETERS")
+            allowed_ticks = {
+                Decimal("0.1"),
+                Decimal("0.01"),
+                Decimal("0.005"),
+                Decimal("0.0025"),
+                Decimal("0.001"),
+                Decimal("0.0001"),
+            }
             if (
                 not target.is_finite()
                 or target <= 0
@@ -9216,9 +10842,13 @@ class CanaryService:
                 or not best.is_finite()
                 or best <= 0
                 or not tick.is_finite()
-                or tick <= 0
+                or tick not in allowed_ticks
                 or not minimum.is_finite()
                 or minimum < 0
+                or not size_increment.is_finite()
+                or size_increment <= 0
+                or not documented_min_notional.is_finite()
+                or documented_min_notional < 0
             ):
                 block("INVALID_CANARY_PARAMETERS")
             max_price = expected_price * (
@@ -9227,20 +10857,31 @@ class CanaryService:
             max_price = (
                 max_price / tick
             ).to_integral_value(rounding=ROUND_DOWN) * tick
-            if not max_price.is_finite() or max_price <= 0:
+            if (
+                not max_price.is_finite()
+                or max_price < tick
+                or max_price > Decimal(1) - tick
+            ):
                 block("INVALID_CANARY_PARAMETERS")
             if best > max_price:
                 block("SLIPPAGE_LIMIT")
-            # Size against the worst permitted execution price, never just
-            # the current ask.  This keeps the target a hard notional cap.
-            quantity = (target / max_price).quantize(
-                Decimal("0.01"), rounding=ROUND_DOWN
-            )
-            if quantity < minimum:
+            minimum_quantity = (
+                minimum / size_increment
+            ).to_integral_value(rounding=ROUND_UP) * size_increment
+            if documented_min_notional > 0:
+                minimum_quantity = max(
+                    minimum_quantity,
+                    (
+                        documented_min_notional / max_price / size_increment
+                    ).to_integral_value(rounding=ROUND_UP)
+                    * size_increment,
+                )
+            quantity = minimum_quantity
+            if quantity <= 0:
                 block("VENUE_MINIMUM_EXCEEDS_CANARY_TARGET")
             notional = quantity * max_price
             if notional > target:
-                block("CANARY_TARGET_EXCEEDED")
+                block("VENUE_MINIMUM_EXCEEDS_CANARY_TARGET")
             return target, max_price, quantity, notional, tick
 
         def prepare_order(
@@ -9278,14 +10919,35 @@ class CanaryService:
                 limits, context, best, tick
             )
             try:
-                fee_bps = Decimal(str(context.get("fee_bps", 0)))
-                estimated_fees = notional * fee_bps / Decimal(10000)
+                fee_rate = Decimal(
+                    str(
+                        context.get(
+                            "fee_rate",
+                            Decimal(str(context.get("fee_bps", 0)))
+                            / Decimal("10000"),
+                        )
+                    )
+                )
+                fee_exponent = Decimal(str(context.get("fee_exponent", 1)))
+                curve = max_price * (Decimal("1") - max_price)
+                unit_fee = max(
+                    fee_rate * (curve ** fee_exponent),
+                    fee_rate * (Decimal("0.25") ** fee_exponent),
+                )
+                if quantity * (max_price + unit_fee) > target:
+                    block("VENUE_MINIMUM_EXCEEDS_CANARY_TARGET")
+                estimated_fees = quantity * unit_fee
+            except CanaryBlocked:
+                raise
             except Exception:
                 block("INVALID_CANARY_PARAMETERS")
             if (
-                not fee_bps.is_finite()
-                or fee_bps < 0
+                not fee_rate.is_finite()
+                or fee_rate < 0
+                or not fee_exponent.is_finite()
+                or fee_exponent < 0
                 or not estimated_fees.is_finite()
+                or notional + estimated_fees > target
             ):
                 block("INVALID_CANARY_PARAMETERS")
             evidence = {
@@ -9294,7 +10956,13 @@ class CanaryService:
                 "depth": asks,
                 "tick_size": str(tick),
                 "min_order_size": str(context["min_order_size"]),
+                "fee_rate": str(fee_rate),
+                "fee_exponent": str(fee_exponent),
                 "estimated_fees": str(estimated_fees),
+                "resolved_asset_id": resolved_asset_id,
+                "market_version": context.get("market_version"),
+                "selected_token_id": context.get("token_id"),
+                "selected_position_id": context.get("position_id"),
                 "geoblock": {
                     "blocked": False,
                     "country": geo.get("country"),
@@ -9341,6 +11009,7 @@ class CanaryService:
             block("UNSUPPORTED_VENUE")
         if not self.credentials.configured(allow_environment=environment):
             block("CREDENTIALS_NOT_CONFIGURED")
+        self.require_current_credential_binding()
         (
             geo,
             context,
@@ -9362,6 +11031,63 @@ class CanaryService:
         # persisted control state immediately afterward.
         enforce_balance(venue.balance(), notional, estimated_fees)
         event_id = "canary-" + hashlib.sha256(signal_id.encode()).hexdigest()[:24]
+        current_config_id, current_generation, current_config_hash = (
+            self._settings_identity()
+        )
+        if (
+            current_config_id != request_settings_config_id
+            or current_generation != request_settings_generation
+            or not current_config_hash
+        ):
+            block("CANARY_SETTINGS_GENERATION_CHANGED")
+        try:
+            reservation_control_generation = int(
+                preflight_snapshot.get("control_generation") or 0
+            )
+        except (TypeError, ValueError):
+            block("CANARY_CONTROL_CORRUPT")
+        if reservation_control_generation <= 0:
+            block("CANARY_CONTROL_CORRUPT")
+        if not current_config_id or current_generation is None:
+            block("CANARY_SETTINGS_GENERATION_CHANGED")
+        try:
+            self.store.reserve_canary_capacity(
+                intent_id=event_id,
+                reservation_id=event_id,
+                event_id=event_id,
+                side=side.upper(),
+                requested_cost=notional,
+                fee_reserve=estimated_fees,
+                quantity=quantity,
+                market_id=market_id,
+                limits=self._active_settings_values(),
+                config_id=current_config_id,
+                config_generation=current_generation,
+                config_hash=current_config_hash,
+                control_generation=reservation_control_generation,
+                detail={
+                    "candidate_id": candidate_id,
+                    "token_id": token_id,
+                    "control_generation": reservation_control_generation,
+                },
+                timestamp=ensure_utc(self.clock()),
+            )
+        except Exception as exc:
+            raise CanaryBlocked("CANARY_RESERVATION_FAILED") from exc
+        risk_reservation_created = True
+        def release_risk_reservation(status: str = "REJECTED") -> None:
+            if not risk_reservation_created:
+                return
+            try:
+                self.store.release_canary_capacity(
+                    event_id,
+                    status=status,
+                    timestamp=ensure_utc(self.clock()),
+                )
+            except Exception:
+                _LOGGER.exception(
+                    "canary risk reservation release failed event=%s", event_id
+                )
 
         connection = self.store.connection
         with self.store._lock:
@@ -9371,11 +11097,13 @@ class CanaryService:
             try:
                 locked_snapshot = self.authoritative_status()
                 reservation_control_row = connection.execute(
-                    "SELECT state,candidate_id,expires_at,control_generation "
+                    "SELECT state,candidate_id,expires_at,control_generation,"
+                    "settings_config_id,settings_generation,credential_fingerprint "
                     "FROM canary_control WHERE singleton=1"
                 ).fetchone()
                 if reservation_control_row is None:
                     block("CANARY_NOT_ARMED")
+                self._require_control_credential_binding(reservation_control_row)
                 try:
                     reservation_control_state = str(
                         reservation_control_row["state"] or ""
@@ -9392,6 +11120,15 @@ class CanaryService:
                     )
                     reservation_control_generation = int(
                         reservation_control_row["control_generation"] or 0
+                    )
+                    reservation_settings_config_id = (
+                        str(reservation_control_row["settings_config_id"] or "").strip()
+                        or None
+                    )
+                    reservation_settings_generation = (
+                        int(reservation_control_row["settings_generation"])
+                        if reservation_control_row["settings_generation"] is not None
+                        else None
                     )
                 except (TypeError, ValueError):
                     block("CANARY_CONTROL_CORRUPT")
@@ -9460,6 +11197,14 @@ class CanaryService:
                 ).fetchone()
                 if stored_signal is not None and str(stored_signal["status"]).upper() != "READY":
                     block("DUPLICATE_SIGNAL")
+                prior_unresolved = connection.execute(
+                    "SELECT 1 FROM canary_ledger WHERE candidate_id=? AND market_id=? "
+                    "AND UPPER(status) IN ('SUBMITTING','UNKNOWN','RECOVERY_ATTACHED') "
+                    "LIMIT 1",
+                    (candidate_id, market_id),
+                ).fetchone()
+                if prior_unresolved is not None:
+                    block("DUPLICATE_SIGNAL")
                 event_time = ensure_utc(self.clock())
                 evidence_record = dict(evidence)
                 evidence_record["control_generation"] = control_generation
@@ -9502,10 +11247,12 @@ class CanaryService:
             except sqlite3.IntegrityError as exc:
                 if connection.in_transaction:
                     connection.rollback()
+                release_risk_reservation()
                 raise CanaryBlocked("DUPLICATE_SIGNAL") from exc
             except BaseException:
                 if connection.in_transaction:
                     connection.rollback()
+                release_risk_reservation()
                 raise
         self.publish_readiness_snapshot(reason="CANARY_RESERVATION")
 
@@ -9517,11 +11264,12 @@ class CanaryService:
             try:
                 control = connection.execute(
                     "SELECT state,candidate_id,expires_at,limits_json,"
-                    "integrity_hash,control_generation "
+                    "integrity_hash,control_generation,credential_fingerprint "
                     "FROM canary_control WHERE singleton=1"
                 ).fetchone()
                 if control is None:
                     block("CANARY_NOT_ARMED")
+                self._require_control_credential_binding(control)
                 control_state = str(control["state"]).upper()
                 if control_state == "KILLED":
                     block("CANARY_KILLED")
@@ -9621,11 +11369,102 @@ class CanaryService:
                 if updated.rowcount != 1:
                     block("CANARY_RESERVATION_FAILED")
                 connection.commit()
+            except BaseException as exc:
+                if connection.in_transaction:
+                    connection.rollback()
+                reason = (
+                    str(exc)
+                    if isinstance(exc, CanaryBlocked)
+                    else "CANARY_RESERVATION_FAILED"
+                )
+                failure_at = ensure_utc(self.clock())
+                try:
+                    connection.execute("BEGIN IMMEDIATE")
+                    connection.execute(
+                        "UPDATE canary_ledger SET status='REJECTED' "
+                        "WHERE event_id=? AND status='RESERVED'",
+                        (event_id,),
+                    )
+                    connection.execute(
+                        "UPDATE canary_signals SET status='REJECTED',reason=?,updated_at=? "
+                        "WHERE signal_id=? AND status='SUBMITTING'",
+                        (reason, failure_at.isoformat(), signal_id),
+                    )
+                    connection.commit()
+                except BaseException:
+                    if connection.in_transaction:
+                        connection.rollback()
+                    raise CanaryBlocked("CANARY_RISK_ACCOUNTING_FAILED") from exc
+                release_risk_reservation()
+                raise
+        self.publish_readiness_snapshot(reason="CANARY_SUBMITTING")
+        try:
+            self.store.record_canary_submission_attempt(
+                attempt_id=event_id + "-attempt",
+                intent_id=event_id,
+                side=side.upper(),
+                attempted_at=ensure_utc(self.clock()),
+                status="ATTEMPTED",
+                config_id=current_config_id,
+                config_generation=current_generation,
+                config_hash=current_config_hash,
+                control_generation=reservation_control_generation,
+                detail={"market_id": market_id, "candidate_id": candidate_id},
+            )
+        except Exception as exc:
+            # The submission-attempt ledger is itself fenced by control
+            # generation. Preserve the authoritative transition reason rather
+            # than collapsing kill/disarm/TOCTOU changes into reservation
+            # failure.
+            try:
+                current_control = connection.execute(
+                    "SELECT state,control_generation FROM canary_control "
+                    "WHERE singleton=1"
+                ).fetchone()
+                current_state = (
+                    str(current_control["state"] or "").upper()
+                    if current_control is not None
+                    else ""
+                )
+                current_generation = (
+                    int(current_control["control_generation"] or 0)
+                    if current_control is not None
+                    else 0
+                )
+            except (sqlite3.Error, TypeError, ValueError):
+                current_state = ""
+                current_generation = reservation_control_generation or 0
+            if current_state == "KILLED":
+                reason = "CANARY_KILLED"
+            elif current_state not in {"ARMED", AUTONOMOUS_MICRO_LIVE}:
+                reason = "CANARY_NOT_ARMED"
+            elif current_generation != (reservation_control_generation or 0):
+                reason = "CANARY_CONTROL_CHANGED"
+            else:
+                reason = "CANARY_RESERVATION_FAILED"
+            failure_at = ensure_utc(self.clock())
+            try:
+                with self.store._lock:
+                    if connection.in_transaction:
+                        connection.rollback()
+                    connection.execute("BEGIN IMMEDIATE")
+                    connection.execute(
+                        "UPDATE canary_ledger SET status='REJECTED' "
+                        "WHERE event_id=? AND status='SUBMITTING'",
+                        (event_id,),
+                    )
+                    connection.execute(
+                        "UPDATE canary_signals SET status='REJECTED',reason=?,updated_at=? "
+                        "WHERE signal_id=? AND status='SUBMITTING'",
+                        (reason, failure_at.isoformat(), signal_id),
+                    )
+                    connection.commit()
             except BaseException:
                 if connection.in_transaction:
                     connection.rollback()
-                raise
-        self.publish_readiness_snapshot(reason="CANARY_SUBMITTING")
+                raise CanaryBlocked("CANARY_RISK_ACCOUNTING_FAILED") from exc
+            release_risk_reservation()
+            raise CanaryBlocked(reason) from exc
 
         submitted_at = ensure_utc(self.clock())
 
@@ -9638,11 +11477,12 @@ class CanaryService:
                 try:
                     control = connection.execute(
                         "SELECT state,candidate_id,expires_at,limits_json,"
-                        "integrity_hash,control_generation "
+                        "integrity_hash,control_generation,credential_fingerprint "
                         "FROM canary_control WHERE singleton=1"
                     ).fetchone()
                     if control is None:
                         block("CANARY_NOT_ARMED")
+                    self._require_control_credential_binding(control)
                     control_state = str(control["state"] or "").upper()
                     if control_state == "KILLED":
                         block("CANARY_KILLED")
@@ -9772,6 +11612,13 @@ class CanaryService:
                     raise
 
         def external_submission() -> Mapping[str, Any]:
+            nonlocal network_send_started
+            fresh_id, fresh_generation, _ = self._settings_identity()
+            if (
+                fresh_id != request_settings_config_id
+                or fresh_generation != request_settings_generation
+            ):
+                block("CANARY_SETTINGS_GENERATION_CHANGED")
             if is_official_venue:
                 return submit_official_order(
                     market_version=context.get("market_version"),
@@ -9781,14 +11628,97 @@ class CanaryService:
                     price=max_price,
                     size=quantity,
                 )
+            # Test/dry-run venues use the same final durable fence as the
+            # official sink. ``allow_test_venue`` changes transport identity,
+            # never the control, signal, scope, risk, or expiry guarantees.
             enforce_submission_fence(required_status="SUBMITTING")
             final_submission_fence()
+            fresh_id, fresh_generation, _ = self._settings_identity()
+            if (
+                fresh_id != request_settings_config_id
+                or fresh_generation != request_settings_generation
+            ):
+                block("CANARY_SETTINGS_GENERATION_CHANGED")
+            with transport_state_lock:
+                if submission_cancelled.is_set():
+                    block("CANARY_SUBMISSION_TIMEOUT")
+                network_send_started = True
             return venue.submit_limit_order(
                 token_id=resolved_asset_id,
                 side=side.upper(),
                 price=max_price,
                 size=quantity,
             )
+        def durable_accounting_failure(exc: BaseException) -> None:
+            """Persist an unknown outcome and trip the canary kill latch."""
+            reason = "CANARY_RISK_ACCOUNTING_FAILED"
+            marker = {
+                "accounting_status": "UNKNOWN",
+                "accounting_error": type(exc).__name__,
+                "reason": reason,
+            }
+            def merge_evidence(raw: Any) -> str:
+                try:
+                    payload = json.loads(raw or "{}")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    payload = {}
+                if not isinstance(payload, Mapping):
+                    payload = {}
+                merged = dict(payload)
+                merged["accounting"] = dict(marker)
+                return json.dumps(merged, sort_keys=True)
+            try:
+                with self.store._lock:
+                    if connection.in_transaction:
+                        connection.rollback()
+                    connection.execute("BEGIN IMMEDIATE")
+                    ledger_row = connection.execute(
+                        "SELECT evidence_json FROM canary_ledger WHERE event_id=?",
+                        (event_id,),
+                    ).fetchone()
+                    event_row = connection.execute(
+                        "SELECT evidence_json FROM canary_execution_events "
+                        "WHERE canary_event_id=? ORDER BY execution_event_id DESC LIMIT 1",
+                        (event_id,),
+                    ).fetchone()
+                    ledger_evidence = merge_evidence(
+                        ledger_row["evidence_json"] if ledger_row is not None else None
+                    )
+                    event_evidence = merge_evidence(
+                        event_row["evidence_json"] if event_row is not None else None
+                    )
+                    connection.execute(
+                        "UPDATE canary_execution_events SET status='UNKNOWN',"
+                        "evidence_json=? WHERE canary_event_id=?",
+                        (event_evidence, event_id),
+                    )
+                    connection.execute(
+                        "UPDATE canary_ledger SET status='UNKNOWN',"
+                        "evidence_json=? WHERE event_id=?",
+                        (ledger_evidence, event_id),
+                    )
+                    connection.execute(
+                        "UPDATE canary_signals SET status='UNKNOWN',reason=?,"
+                        "updated_at=? WHERE signal_id=? AND status IN "
+                        "('ACCEPTED','MATCHED','PARTIALLY_FILLED','SETTLED','REJECTED','SUBMITTING')",
+                        (reason, ensure_utc(self.clock()).isoformat(), signal_id),
+                    )
+                    connection.commit()
+            except BaseException:
+                if connection.in_transaction:
+                    connection.rollback()
+                _LOGGER.exception(
+                    "canary durable accounting marker failed event=%s",
+                    event_id,
+                )
+            try:
+                self.kill()
+            except BaseException:
+                _LOGGER.exception(
+                    "canary accounting breaker failed event=%s",
+                    event_id,
+                )
+            raise CanaryBlocked(reason) from exc
 
         def persist_outcome(
             *,
@@ -9797,7 +11727,13 @@ class CanaryService:
             error: str | None = None,
         ) -> str:
             received_at = ensure_utc(self.clock())
+            outcome = str(outcome or "").strip().upper()
             response = response or {}
+            canonical_order_id = _canonical_exchange_order_id(
+                response.get("order_id")
+            )
+            if outcome not in {"REJECTED", "UNKNOWN"} and canonical_order_id is None:
+                raise CanaryBlocked("CANARY_EXTERNAL_IDENTITY_MISSING")
             def _decimal(value: Any, fallback: Any = None) -> Decimal | None:
                 if value is None:
                     value = fallback
@@ -9878,11 +11814,9 @@ class CanaryService:
                             event_id + "-submitted",
                             event_id,
                             received_at.isoformat(),
-                            response.get("order_id"),
+                            canonical_order_id,
                             outcome,
-                            str(response.get("fill_quantity"))
-                            if response.get("fill_quantity") is not None
-                            else None,
+                            None,
                             str(response.get("actual_average_price"))
                             if response.get("actual_average_price") is not None
                             else None,
@@ -9900,10 +11834,8 @@ class CanaryService:
                         "event_id=? AND status='SUBMITTING'",
                         (
                             outcome,
-                            response.get("order_id"),
-                            str(response.get("fill_quantity"))
-                            if response.get("fill_quantity") is not None
-                            else None,
+                            canonical_order_id,
+                            None,
                             str(actual_price) if actual_price is not None else None,
                             str(actual_fees) if actual_fees is not None else None,
                             latency_ms,
@@ -9923,10 +11855,21 @@ class CanaryService:
                     if connection.in_transaction:
                         connection.rollback()
                     raise
+            if risk_reservation_created and outcome == "REJECTED":
+                try:
+                    self.store.release_canary_capacity(
+                        event_id,
+                        status="REJECTED",
+                        timestamp=received_at,
+                    )
+                except Exception as exc:
+                    durable_accounting_failure(exc)
             self.publish_readiness_snapshot(reason="CANARY_EXECUTION_OUTCOME")
             return current_control_state
 
         response: Mapping[str, Any] | None = None
+        outcome: str | None = None
+        outcome_error: str | None = None
         try:
             response = _call_with_timeout(
                 external_submission,
@@ -9934,32 +11877,96 @@ class CanaryService:
             )
             if not isinstance(response, Mapping):
                 raise RuntimeError("external submission response is not a mapping")
-            raw_status = str(
-                response.get("status")
-                or ("SUBMITTED" if response.get("ok") else "REJECTED")
-            ).upper()
-            outcome = (
-                "SUBMITTED"
-                if response.get("ok")
-                and raw_status
-                not in {"REJECTED", "FAILED", "ERROR", "CANCELLED", "CANCELED", "EXPIRED"}
-                else "REJECTED"
+            response = dict(response)
+            ok_value = response.get("ok", _UNSET)
+            status_value = response.get("status", _UNSET)
+            code_value = response.get(
+                "code",
+                response.get("error_code", _UNSET),
             )
-            control_state = persist_outcome(outcome=outcome, response=response)
+            malformed = (
+                not isinstance(ok_value, bool)
+                or (
+                    status_value is not _UNSET
+                    and status_value is not None
+                    and not isinstance(status_value, str)
+                )
+                or (
+                    code_value is not _UNSET
+                    and code_value is not None
+                    and not isinstance(code_value, str)
+                )
+            )
+            status_text = (
+                status_value.strip().upper()
+                if isinstance(status_value, str)
+                else ""
+            )
+            raw_order_id: Any = None
+            for name in ("order_id", "orderId", "id", "exchange_order_id"):
+                value = response.get(name)
+                if raw_order_id is None and value is not None:
+                    raw_order_id = value
+                if _canonical_exchange_order_id(value) is not None:
+                    raw_order_id = value
+                    break
+            canonical_order_id = _canonical_exchange_order_id(raw_order_id)
+            response["order_id"] = canonical_order_id
+            if malformed:
+                outcome = "UNKNOWN"
+                outcome_error = "CANARY_SUBMISSION_RESPONSE_INVALID"
+            elif ok_value is True:
+                if status_text in _CANARY_REJECTION_STATUSES:
+                    outcome = "REJECTED"
+                elif canonical_order_id is None:
+                    outcome = "UNKNOWN"
+                    outcome_error = "CANARY_EXTERNAL_IDENTITY_MISSING"
+                elif (
+                    not status_text
+                    or status_text not in _CANARY_ACCEPTED_STATUSES
+                ):
+                    outcome = "UNKNOWN"
+                    outcome_error = "CANARY_SUBMISSION_RESPONSE_INVALID"
+                elif status_text in {"SETTLED", "RESOLVED"}:
+                    outcome = status_text
+                elif status_text in {"MATCHED", "FILLED"}:
+                    outcome = "MATCHED"
+                elif status_text in {"PARTIAL", "PARTIALLY_FILLED"}:
+                    outcome = "PARTIALLY_FILLED"
+                else:
+                    outcome = "ACCEPTED"
+            elif (
+                status_text in _CANARY_REJECTION_STATUSES
+                or _is_explicit_rejection_code(code_value)
+            ):
+                outcome = "REJECTED"
+            else:
+                outcome = "UNKNOWN"
+                outcome_error = "CANARY_SUBMISSION_RESPONSE_INVALID"
+            control_state = persist_outcome(
+                outcome=outcome,
+                response=response,
+                error=outcome_error,
+            )
         except CanaryBlocked as exc:
             code = str(exc)
-            pre_submission_rejection = (
+            if code == "CANARY_RISK_ACCOUNTING_FAILED":
+                raise
+            pre_submission_rejection = (not network_send_started) or (
                 code in {
                     "CANARY_ALLOWANCE_INSUFFICIENT",
                     "CANARY_ALLOWANCE_UNAVAILABLE",
                     "CANARY_SPENDER_UNAVAILABLE",
                     "INSUFFICIENT_BALANCE",
                     "CREDENTIALS_NOT_CONFIGURED",
+                    "CLOB_API_CREDENTIALS_NOT_CONFIGURED",
+                    "CLOB_API_CREDENTIALS_INVALID",
                     "OFFICIAL_POLYMARKET_SDK_NOT_INSTALLED",
                     "OFFICIAL_POLYMARKET_SDK_NOT_READONLY_COMPATIBLE",
                     "UNSUPPORTED_POLYMARKET_SDK",
                     "CANARY_CONTROL_CHANGED",
                     "CANARY_CONTROL_CORRUPT",
+                    "CANARY_SETTINGS_GENERATION_CHANGED",
                     "AUTONOMOUS_RISK_ENVELOPE_CORRUPT",
                     "CANARY_KILLED",
                     "CANARY_RESERVATION_FAILED",
@@ -9996,11 +12003,28 @@ class CanaryService:
             persist_outcome(outcome="UNKNOWN", error=code)
             raise CanaryBlocked("CANARY_SUBMISSION_UNKNOWN") from exc
         except TimeoutError as exc:
+            with transport_state_lock:
+                submission_cancelled.set()
+                transport_started_before_timeout = network_send_started
+            if not transport_started_before_timeout:
+                control_state = persist_outcome(
+                    outcome="REJECTED",
+                    response={
+                        "ok": False,
+                        "status": "REJECTED",
+                        "code": "CANARY_SUBMISSION_TIMEOUT",
+                        "message": "CANARY_SUBMISSION_TIMEOUT",
+                    },
+                    error=str(exc),
+                )
+                raise CanaryBlocked("CANARY_SUBMISSION_TIMEOUT") from exc
             persist_outcome(outcome="UNKNOWN", error=str(exc))
             raise CanaryBlocked("CANARY_SUBMISSION_UNKNOWN") from exc
         except BaseException as exc:
             persist_outcome(outcome="UNKNOWN", error=type(exc).__name__)
             raise
+        if outcome == "UNKNOWN":
+            raise CanaryBlocked("CANARY_SUBMISSION_UNKNOWN")
         return {
             "event_id": event_id,
             "status": response.get("status") if response is not None else outcome,
@@ -10009,4 +12033,211 @@ class CanaryService:
             "requested_notional": str(notional),
             "production_live_execution": False,
         }
-__all__=["AUTONOMOUS_MICRO_LIVE","AUTONOMOUS_CANARY_VENUE","AUTONOMOUS_CANARY_LIMITS","CANARY_EXECUTION_MARKET_CAP","CANARY_READINESS_SNAPSHOT_MAX_AGE_SECONDS","CANARY_SIGNAL_TRANSIENT_RETENTION","EXECUTION_FEASIBILITY_MARKET_CAP","CanaryBlocked","CanaryLimits","CanaryService","CanaryVenue","CredentialStore","PolymarketClobV2Venue","PRODUCTION_LIVE_EXECUTION"]
+    def submit_position_order(
+        self,
+        *,
+        market_version: Any,
+        neg_risk: Any,
+        asset_id: str,
+        side: str,
+        price: Decimal,
+        size: Decimal,
+        before_post: Callable[[], None],
+        on_send_started: Callable[[], None],
+    ) -> Mapping[str, Any]:
+        """Submit one already-fenced owned-position order through the SDK.
+
+        Position management performs ownership, settings, control, price, and
+        reservation fences.  This method is the shared signer/allowance/post
+        boundary for those exits; it never invokes SDK approval or credential
+        bootstrap flows.
+        """
+        _deny_isolated_real_transport()
+        try:
+            values = self.credentials.load(
+                allow_environment=self.allow_environment
+            )
+        except CanaryBlocked:
+            raise
+        except Exception as exc:
+            raise CanaryBlocked("CREDENTIALS_NOT_CONFIGURED") from exc
+        if (
+            not isinstance(values, Mapping)
+            or not all(values.get(name) for name in _MANDATORY_SECRET_NAMES)
+        ):
+            raise CanaryBlocked("CREDENTIALS_NOT_CONFIGURED")
+        normalized_values = {
+            name: _credential_value(values, name)
+            for name in _SECRET_NAMES
+        }
+        current_fingerprint = credential_fingerprint(normalized_values)
+        control_row = self.store.connection.execute(
+            "SELECT credential_fingerprint FROM canary_control WHERE singleton=1"
+        ).fetchone()
+        self._require_control_credential_binding(control_row, current_fingerprint)
+        client: Any = None
+        try:
+            client = _build_safe_sdk_client(values)
+            try:
+                signed = client.create_limit_order(
+                    asset_id=str(asset_id),
+                    side=str(side).upper(),
+                    price=str(price),
+                    size=str(size),
+                )
+            except TypeError as exc:
+                raise CanaryBlocked(
+                    "OFFICIAL_POLYMARKET_SDK_NOT_READONLY_COMPATIBLE"
+                ) from exc
+            required = _base_units(
+                _sdk_value(signed, "maker_amount", None),
+                field="signed maker_amount",
+            )
+            asset_type, allowance_asset_id = _order_balance_allowance_target(
+                side=side,
+                asset_id=str(asset_id),
+                market_version=market_version,
+            )
+            spender = _resolve_official_spender(
+                client,
+                asset_id=str(asset_id),
+                market_version=market_version,
+                neg_risk=neg_risk,
+            )
+            request: dict[str, Any] = {"asset_type": asset_type}
+            if allowance_asset_id is not None:
+                request["asset_id"] = allowance_asset_id
+            try:
+                balance_allowance = client.get_balance_allowance(**request)
+                balance, allowances = _normalize_balance_allowance(
+                    balance_allowance
+                )
+                allowance = _allowance_for_spender(allowances, spender)
+            except CanaryBlocked:
+                raise
+            except (TypeError, ValueError) as exc:
+                raise CanaryBlocked("CANARY_ALLOWANCE_UNAVAILABLE") from exc
+            if balance < required:
+                raise CanaryBlocked("INSUFFICIENT_BALANCE")
+            if allowance < required:
+                raise CanaryBlocked("CANARY_ALLOWANCE_INSUFFICIENT")
+            before_post()
+            on_send_started()
+            # Recheck after transitioning the timeout state and immediately
+            # before the irreversible transport call.
+            before_post()
+            try:
+                response = client.post_order(signed)
+            except CanaryBlocked:
+                raise
+            except Exception as exc:
+                raise CanaryBlocked("ORDER_SUBMISSION_FAILED") from exc
+            if isinstance(response, Mapping):
+                return dict(response)
+            try:
+                normalized: dict[str, Any] = {}
+                for name in (
+                    "ok",
+                    "order_id",
+                    "orderId",
+                    "id",
+                    "status",
+                    "state",
+                    "code",
+                    "message",
+                    "trade_ids",
+                    "tradeIds",
+                ):
+                    value = _sdk_value(response, name, _UNSET)
+                    if value is not _UNSET:
+                        normalized[name] = value
+                return normalized
+            except Exception as exc:
+                raise CanaryBlocked("ORDER_SUBMISSION_FAILED") from exc
+        except CanaryBlocked:
+            raise
+        except Exception as exc:
+            raise CanaryBlocked("ORDER_SUBMISSION_FAILED") from exc
+        finally:
+            if client is not None:
+                close = getattr(client, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception:
+                        pass
+
+    def submit_exit(
+        self,
+        position_id: str,
+        venue: CanaryVenue,
+        *,
+        expected_generation: int,
+        config_id: str,
+        allow_test_venue: bool = False,
+    ) -> Mapping[str, Any]:
+        from . import canary_positions
+
+        return canary_positions.submit_exit(
+            self,
+            position_id,
+            venue,
+            expected_generation=expected_generation,
+            config_id=config_id,
+            allow_test_venue=allow_test_venue,
+        )
+
+    def reconcile_pending(
+        self,
+        venue: CanaryVenue,
+        *,
+        allow_test_venue: bool = False,
+    ) -> Mapping[str, Any]:
+        from . import canary_positions
+
+        return canary_positions.reconcile_pending(
+            self,
+            venue,
+            allow_test_venue=allow_test_venue,
+        )
+
+    def manage_positions(
+        self,
+        venue: CanaryVenue,
+        *,
+        allow_test_venue: bool = False,
+    ) -> Mapping[str, Any]:
+        from . import canary_positions
+
+        return canary_positions.manage_positions(
+            self,
+            venue,
+            allow_test_venue=allow_test_venue,
+        )
+from .canary_positions import (
+    RECOVERY_ACTION,
+    RECOVERY_ATTACHED,
+    RECOVERY_CONFIRMATION,
+    UNKNOWN_ENTRY_STATUSES,
+    RecoveryProfileError,
+    decimal_value,
+    mapping_value,
+    normalize_recovery_profile,
+    recovery_identifier,
+    response_market,
+    response_order_id,
+    response_price,
+    response_quantity,
+    response_token,
+    response_side,
+    response_status,
+    response_timestamp,
+    timestamp_value,
+    trade_order_id,
+    trade_price,
+    trade_quantity,
+    trade_side,
+    trade_timestamp,
+    trade_token,
+)
+__all__=["AUTONOMOUS_MICRO_LIVE","AUTONOMOUS_CANARY_VENUE","AUTONOMOUS_CANARY_LIMITS","CANARY_EXECUTION_MARKET_CAP","CANARY_READINESS_SNAPSHOT_MAX_AGE_SECONDS","CANARY_SIGNAL_TRANSIENT_RETENTION","EXECUTION_FEASIBILITY_MARKET_CAP","RECOVERY_ACTION","RECOVERY_ATTACHED","RECOVERY_CONFIRMATION","CanaryBlocked","CanaryLimits","CanaryService","CanaryVenue","CredentialStore","PolymarketClobV2Venue","PRODUCTION_LIVE_EXECUTION","credential_fingerprint"]

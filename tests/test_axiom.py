@@ -1091,18 +1091,75 @@ class PhaseTwoQualityTests(unittest.TestCase):
         self.assertEqual(fills[0].timestamp, T0)
         self.assertEqual(portfolio.get_position("m", outcome="yes").quantity, 0.0)  # type: ignore[union-attr]
 
-    def test_polymarket_public_collector_does_not_call_private_trades_endpoint(self) -> None:
+    def test_polymarket_public_collector_uses_data_api_without_private_trades_endpoint(self) -> None:
         calls: list[str] = []
+        condition_id = "0x" + "1" * 64
+
+        class _Response:
+            def __init__(self, payload: object) -> None:
+                self.payload = json.dumps(payload).encode("utf-8")
+
+            def read(self) -> bytes:
+                return self.payload
+
+            def close(self) -> None:
+                return
+
 
         def opener(request: object, timeout: float) -> object:
             del timeout
-            calls.append(str(getattr(request, "full_url")))
-            raise AssertionError("public collector must not call authenticated /trades")
+            url = str(getattr(request, "full_url"))
+            calls.append(url)
+            parsed = urlparse(url)
+            if parsed.netloc == "gamma.example" and parsed.path == "/markets/m":
+                return _Response(
+                    {
+                        "id": "m",
+                        "conditionId": condition_id,
+                        "question": "Will it happen?",
+                        "outcomes": ["Yes", "No"],
+                        "clobTokenIds": ["yes-token", "no-token"],
+                        "outcomePrices": ["0.4", "0.6"],
+                        "updatedAt": T0.isoformat(),
+                    }
+                )
+            if parsed.netloc == "data.example" and parsed.path == "/trades":
+                query = parse_qs(parsed.query)
+                self.assertEqual(query["market"], [condition_id])
+                self.assertEqual(query["takerOnly"], ["true"])
+                self.assertEqual(query["limit"], ["1000"])
+                self.assertEqual(query["offset"], ["0"])
+                return _Response(
+                    [
+                        {
+                            "conditionId": condition_id,
+                            "timestamp": int(T0.timestamp()),
+                            "price": "0.50",
+                            "size": "2.0",
+                            "side": "BUY",
+                            "asset": "yes-token",
+                            "transactionHash": "0xtrade",
+                        }
+                    ]
+                )
+            raise AssertionError(f"unexpected public market-data URL: {url}")
 
-        adapter = PolymarketAdapter(opener=opener, timeout=1.0)
-        self.assertEqual(adapter.trades("m"), ())
-        self.assertFalse(adapter.public_trade_history_available)
-        self.assertEqual(calls, [])
+        adapter = PolymarketAdapter(
+            opener=opener,
+            gamma_url="https://gamma.example",
+            data_api_url="https://data.example",
+            clob_url="https://clob.example",
+            timeout=1.0,
+        )
+        trades = adapter.trades("m")
+        self.assertEqual(len(trades), 1)
+        self.assertEqual(trades[0].market_id, "m")
+        self.assertEqual(trades[0].token_id, "yes-token")
+        self.assertEqual(trades[0].side, Side.BUY)
+        self.assertEqual(trades[0].price, 0.5)
+        self.assertTrue(adapter.public_trade_history_available)
+        self.assertTrue(any("data.example/trades" in call for call in calls))
+        self.assertFalse(any("clob.example" in call for call in calls))
 
     def test_immutable_trade_keys_are_scoped_and_robustness_rejects_bad_counts(self) -> None:
         trade = TradePrint(T0, 0.5, 1.0, trade_id="same")

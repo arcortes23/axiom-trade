@@ -3,7 +3,8 @@ param(
     [string]$DbPath = "runtime-data/axiom.sqlite",
     [int]$GracefulTimeoutSeconds = 120,
     [string]$LockPath = "",
-    [switch]$Force
+    [switch]$Force,
+    [switch]$Isolated
 )
 
 $ErrorActionPreference = "Stop"
@@ -15,6 +16,8 @@ $dbAbsolute = [System.IO.Path]::GetFullPath($dbInput)
 $pidPath = "$dbAbsolute.node.pid"
 $lockInput = if ([string]::IsNullOrWhiteSpace($LockPath)) { "$dbAbsolute.lock" } elseif ([System.IO.Path]::IsPathRooted($LockPath)) { $LockPath } else { Join-Path $root $LockPath }
 $lockPath = [System.IO.Path]::GetFullPath($lockInput)
+
+$expectedProfile = if ($Isolated) { "isolated" } else { "" }
 $stopPath = "$dbAbsolute.stop"
 
 function Get-NodeCommandLine([int]$ProcessId) {
@@ -36,14 +39,15 @@ function Get-CommandTokens([string]$CommandLine) {
     return $tokens
 }
 
-function Test-NodeCommand([string]$CommandLine, [string]$ExpectedDb) {
+function Test-NodeCommand([string]$CommandLine, [string]$ExpectedDb, [string]$ExpectedProfile = "") {
     if (-not $CommandLine) { return $false }
     $tokens = @(Get-CommandTokens $CommandLine)
     if ($tokens.Count -eq 0) { return $false }
     $executable = $tokens[0].Replace("\", "/").Split("/")[-1].ToLowerInvariant()
+    if ($executable -match "^pythonw(?:\d+(?:\.\d+)?)?(?:\.exe)?$") { return $false }
     if ($executable -in @("axiom", "axiom.exe")) {
         $commandIndex = 1
-    } elseif ($executable -in @("py", "py.exe") -or $executable -match "^pythonw?(?:\d+(?:\.\d+)?)?(?:\.exe)?$") {
+    } elseif ($executable -in @("py", "py.exe") -or $executable -match "^python(?:\d+(?:\.\d+)?)?(?:\.exe)?$") {
         if ($tokens.Count -lt 4 -or $tokens[1].ToLowerInvariant() -ne "-m" -or $tokens[2].ToLowerInvariant() -ne "axiom.cli") { return $false }
         $commandIndex = 3
     } else {
@@ -64,22 +68,37 @@ function Test-NodeCommand([string]$CommandLine, [string]$ExpectedDb) {
     }
     if (-not $actual) { return $false }
     try {
-        return [StringComparer]::OrdinalIgnoreCase.Equals([System.IO.Path]::GetFullPath($actual), $ExpectedDb)
+        if (-not [StringComparer]::OrdinalIgnoreCase.Equals([System.IO.Path]::GetFullPath($actual), $ExpectedDb)) {
+            return $false
+        }
     } catch {
         return $false
     }
+    if (-not [string]::IsNullOrWhiteSpace($ExpectedProfile)) {
+        $isolatedFlag = $tokens | Where-Object { $_.ToLowerInvariant() -eq "--isolated" }
+        if ($ExpectedProfile -eq "isolated") { return $null -ne $isolatedFlag }
+        if ($ExpectedProfile -eq "production") { return $null -eq $isolatedFlag }
+    }
+    return $true
+}
+function Test-RecordedStartTime([datetime]$ProcessStartTime, [datetime]$RecordedStartTime) {
+    if (
+        $ProcessStartTime.Ticks -eq [datetime]::MinValue.Ticks -or
+        $RecordedStartTime.Ticks -eq [datetime]::MinValue.Ticks
+    ) { return $false }
+    return $ProcessStartTime.ToUniversalTime().Ticks -eq $RecordedStartTime.ToUniversalTime().Ticks
 }
 
-function Test-ProcessIdentity($Process, [datetime]$StartTime, [string]$ExpectedDb) {
+function Test-ProcessIdentity($Process, [datetime]$StartTime, [string]$ExpectedDb, [string]$ExpectedProfile = "") {
     if (-not $Process) { return $false }
     try {
         $Process.Refresh()
         $currentStart = ([datetime]$Process.StartTime).ToUniversalTime()
-        if ($Process.HasExited -or $currentStart.Ticks -ne $StartTime.ToUniversalTime().Ticks) { return $false }
+        if ($Process.HasExited -or -not (Test-RecordedStartTime $currentStart $StartTime)) { return $false }
     } catch {
         return $false
     }
-    return Test-NodeCommand (Get-NodeCommandLine $Process.Id) $ExpectedDb
+    return Test-NodeCommand (Get-NodeCommandLine $Process.Id) $ExpectedDb $ExpectedProfile
 }
 function Get-ProcessSafe([int]$ProcessId, [ref]$QueryFailed) {
     $QueryFailed.Value = $false
@@ -110,7 +129,11 @@ function Get-FileStartTime([string]$Path) {
     try {
         $lines = @(Get-Content -LiteralPath $Path)
         if ($lines.Count -lt 2) { return [datetime]::MinValue }
-        return [datetime]::new([long]$lines[1], [DateTimeKind]::Utc)
+        $raw = [long]$lines[1]
+        if ($raw -gt 1000000000000000000) {
+            return [DateTimeOffset]::FromUnixTimeMilliseconds([long]($raw / 1000000)).UtcDateTime
+        }
+        return [datetime]::new($raw, [DateTimeKind]::Utc)
     } catch {
         return [datetime]::MinValue
     }
@@ -118,55 +141,95 @@ function Get-FileStartTime([string]$Path) {
 
 
 $nodePid = Get-FilePid $pidPath
-if ([string]::IsNullOrWhiteSpace($customLockPath) -and $nodePid -gt 0) {
-    $processQueryFailed = $false
-    $candidateProcess = Get-ProcessSafe $nodePid ([ref]$processQueryFailed)
-    if ($processQueryFailed) {
-        throw "Cannot establish identity for PID $nodePid; refusing to infer its lock path."
-    }
-    if ($candidateProcess) {
-        $tokens = @(Get-CommandTokens (Get-NodeCommandLine $nodePid))
-        for ($index = 0; $index -lt $tokens.Count; $index++) {
-            if ($tokens[$index].ToLowerInvariant() -eq "--lock" -and $index + 1 -lt $tokens.Count) {
-                $lockCandidate = $tokens[$index + 1]
-                $lockInput = if ([System.IO.Path]::IsPathRooted($lockCandidate)) { $lockCandidate } else { Join-Path $root $lockCandidate }
-                $lockPath = [System.IO.Path]::GetFullPath($lockInput)
-                break
-            }
-            if ($tokens[$index].ToLowerInvariant().StartsWith("--lock=")) {
-                $lockCandidate = $tokens[$index].Substring(7)
-                $lockInput = if ([System.IO.Path]::IsPathRooted($lockCandidate)) { $lockCandidate } else { Join-Path $root $lockCandidate }
-                $lockPath = [System.IO.Path]::GetFullPath($lockInput)
-                break
-            }
+$recordedStart = Get-FileStartTime $pidPath
+
+# Prefer the lock owner over the PID-file candidate.  A Windows venv
+# redirector can remain the PID-file process while its base interpreter owns
+# the lock and does the work.
+$candidatePid = $nodePid
+$candidateQueryFailed = $false
+$candidateProcess = if ($candidatePid -gt 0) {
+    Get-ProcessSafe $candidatePid ([ref]$candidateQueryFailed)
+} else {
+    $null
+}
+if ($candidateQueryFailed) {
+    throw "Cannot establish identity for PID $candidatePid; refusing to stop it."
+}
+if ([string]::IsNullOrWhiteSpace($customLockPath) -and $candidateProcess) {
+    $tokens = @(Get-CommandTokens (Get-NodeCommandLine $candidatePid))
+    for ($index = 0; $index -lt $tokens.Count; $index++) {
+        if ($tokens[$index].ToLowerInvariant() -eq "--lock" -and $index + 1 -lt $tokens.Count) {
+            $lockCandidate = $tokens[$index + 1]
+            $lockInput = if ([System.IO.Path]::IsPathRooted($lockCandidate)) { $lockCandidate } else { Join-Path $root $lockCandidate }
+            $lockPath = [System.IO.Path]::GetFullPath($lockInput)
+            break
+        }
+        if ($tokens[$index].ToLowerInvariant().StartsWith("--lock=")) {
+            $lockCandidate = $tokens[$index].Substring(7)
+            $lockInput = if ([System.IO.Path]::IsPathRooted($lockCandidate)) { $lockCandidate } else { Join-Path $root $lockCandidate }
+            $lockPath = [System.IO.Path]::GetFullPath($lockInput)
+            break
         }
     }
 }
-$recordedStart = Get-FileStartTime $pidPath
-if ($nodePid -le 0) {
-    $lockPid = Get-FilePid $lockPath
-    if ($lockPid -gt 0) {
-        $processQueryFailed = $false
-        $lockProcess = Get-ProcessSafe $lockPid ([ref]$processQueryFailed)
-        if ($processQueryFailed) {
-            throw "Cannot establish ownership of Axiom node lock $lockPath; refusing cleanup."
-        }
-        if ($lockProcess) {
-            if (Test-NodeCommand (Get-NodeCommandLine $lockPid) $dbAbsolute) {
-                throw "Axiom node lock $lockPath belongs to live PID $lockPid; refusing to remove it."
+
+$lockPid = Get-FilePid $lockPath
+$lockQueryFailed = $false
+$lockProcess = if ($lockPid -gt 0) {
+    Get-ProcessSafe $lockPid ([ref]$lockQueryFailed)
+} else {
+    $null
+}
+if ($lockQueryFailed) {
+    throw "Cannot establish ownership of Axiom node lock $lockPath; refusing cleanup."
+}
+
+$ownerPid = if ($lockPid -gt 0) { $lockPid } else { $candidatePid }
+$process = $lockProcess
+$processStartTime = [datetime]::MinValue
+$candidateStartTime = [datetime]::MinValue
+if ($candidateProcess) {
+    try { $candidateStartTime = ([datetime]$candidateProcess.StartTime).ToUniversalTime() } catch {
+        throw "Cannot establish process identity for PID $candidatePid; refusing to stop it."
+    }
+}
+if ($process) {
+    try { $processStartTime = ([datetime]$process.StartTime).ToUniversalTime() } catch {
+        throw "Cannot establish process identity for PID $ownerPid; refusing to stop it."
+    }
+}
+
+if ($lockPid -gt 0 -and $lockPid -ne $candidatePid) {
+    if ($candidatePid -le 0 -or $recordedStart.Ticks -eq [datetime]::MinValue.Ticks) {
+        throw "Lock $lockPath has owner PID $lockPid but PID file $pidPath cannot prove its launcher identity; refusing to stop."
+    }
+    if ($candidateProcess -and (
+        -not (Test-RecordedStartTime $candidateStartTime $recordedStart) -or
+        -not (Test-ProcessIdentity $candidateProcess $recordedStart $dbAbsolute $expectedProfile)
+    )) {
+        throw "PID $candidatePid changed identity; refusing to stop its child owner."
+    }
+    if ($lockProcess) {
+        try {
+            $ownerRecord = Get-CimInstance Win32_Process -Filter "ProcessId=$lockPid" -ErrorAction Stop
+            if (-not $ownerRecord -or [int]$ownerRecord.ParentProcessId -ne $candidatePid) {
+                throw "Lock owner PID $lockPid is not the verified child of PID $candidatePid; refusing to stop it."
             }
-            throw "Axiom node lock $lockPath references live PID $lockPid; refusing to remove it."
+        } catch {
+            if ($_.Exception.Message -like "Lock owner PID*") { throw }
+            throw "Cannot establish parent identity for lock owner PID $lockPid; refusing to stop it."
         }
-        if ((Get-FilePid $lockPath) -eq $lockPid) {
-            $staleLockPath = "$lockPath.stale.$([guid]::NewGuid().ToString('N'))"
-            try {
-                Move-Item -LiteralPath $lockPath -Destination $staleLockPath -ErrorAction Stop
-                Remove-Item -LiteralPath $staleLockPath -Force -ErrorAction Stop
-            } catch {
-                throw "Axiom node lock $lockPath changed while checking its stale owner; refusing cleanup."
-            }
+        if (-not (Test-NodeCommand (Get-NodeCommandLine $lockPid) $dbAbsolute $expectedProfile)) {
+            throw "Lock owner PID $lockPid does not identify this Axiom node; refusing to stop it."
+        }
+        if ($candidateProcess -and $processStartTime -lt $candidateStartTime) {
+            throw "Lock owner PID $lockPid predates its verified launcher PID $candidatePid; refusing to stop it."
         }
     }
+}
+
+if ($ownerPid -le 0) {
     if (Test-Path -LiteralPath $stopPath) {
         $staleStopPath = "$stopPath.stale.$([guid]::NewGuid().ToString('N'))"
         try {
@@ -180,33 +243,28 @@ if ($nodePid -le 0) {
     return
 }
 
-$processQueryFailed = $false
-$process = Get-ProcessSafe $nodePid ([ref]$processQueryFailed)
-if ($processQueryFailed) {
-    throw "Cannot establish process identity for PID $nodePid; refusing to stop it."
-}
 if ($process) {
-    if (-not (Test-NodeCommand (Get-NodeCommandLine $nodePid) $dbAbsolute)) {
-        throw "PID file $pidPath does not identify this Axiom node; refusing to stop PID $nodePid."
-    }
     if ($recordedStart.Ticks -eq [datetime]::MinValue.Ticks) {
-        throw "PID file $pidPath has no persisted process start time; refusing to stop PID $nodePid."
+        throw "PID file $pidPath has no persisted process start time; refusing to stop PID $ownerPid."
     }
-    try { $processStartTime = ([datetime]$process.StartTime).ToUniversalTime() } catch {
-        throw "Cannot establish process identity for PID $nodePid; refusing to stop it."
+    if ($lockPid -eq $candidatePid -and (
+        -not (Test-RecordedStartTime $processStartTime $recordedStart) -or
+        -not (Test-ProcessIdentity $process $recordedStart $dbAbsolute $expectedProfile)
+    )) {
+        throw "PID $ownerPid changed identity; refusing to stop it."
     }
-    if ($processStartTime.Ticks -ne $recordedStart.Ticks -or -not (Test-ProcessIdentity $process $recordedStart $dbAbsolute)) {
-        throw "PID $nodePid changed identity; refusing to stop it."
+    if ($lockPid -ne $candidatePid -and -not (Test-ProcessIdentity $process $processStartTime $dbAbsolute $expectedProfile)) {
+        throw "Lock owner PID $ownerPid changed identity; refusing to stop it."
     }
     $lockMarker = ""
     try { $lockMarker = (Get-Content -LiteralPath $lockPath -Raw).Trim() } catch {}
-    if ([string]::IsNullOrWhiteSpace($lockMarker) -or (Get-FilePid $lockPath) -ne $nodePid) {
-        throw "Axiom node lock $lockPath changed before stop request; refusing to stop PID $nodePid."
+    if ([string]::IsNullOrWhiteSpace($lockMarker) -or (Get-FilePid $lockPath) -ne $ownerPid) {
+        throw "Axiom node lock $lockPath changed before stop request; refusing to stop PID $ownerPid."
     }
     Set-Content -LiteralPath $stopPath -Value $lockMarker -NoNewline
     $deadline = (Get-Date).AddSeconds($GracefulTimeoutSeconds)
     while ((Get-Date) -lt $deadline) {
-        if (-not (Test-ProcessIdentity $process $processStartTime $dbAbsolute)) { break }
+        if (-not (Test-ProcessIdentity $process $processStartTime $dbAbsolute $expectedProfile)) { break }
         Start-Sleep -Milliseconds 250
     }
     try { $process.Refresh() } catch {}
@@ -214,36 +272,51 @@ if ($process) {
     try { $stillRunning = -not $process.HasExited } catch {}
     if ($stillRunning) {
         if (-not $Force) {
-            throw "Axiom node PID $nodePid did not stop within $GracefulTimeoutSeconds seconds; it remains marked for graceful shutdown. Rerun with -Force only if required."
+            throw "Axiom node PID $ownerPid did not stop within $GracefulTimeoutSeconds seconds; it remains marked for graceful shutdown. Rerun with -Force only if required."
         }
-        if (-not (Test-ProcessIdentity $process $processStartTime $dbAbsolute)) {
-            throw "PID $nodePid changed identity; refusing forced stop."
+        if (-not (Test-ProcessIdentity $process $processStartTime $dbAbsolute $expectedProfile)) {
+            throw "PID $ownerPid changed identity; refusing forced stop."
         }
         Stop-Process -InputObject $process -Force -ErrorAction Stop
         Start-Sleep -Milliseconds 250
         try { $process.Refresh() } catch {}
         try {
-            if (-not $process.HasExited) { throw "Axiom node PID $nodePid did not exit after forced shutdown." }
+            if (-not $process.HasExited) { throw "Axiom node PID $ownerPid did not exit after forced shutdown." }
         } catch {
-            throw "Axiom node PID $nodePid did not exit after forced shutdown."
+            throw "Axiom node PID $ownerPid did not exit after forced shutdown."
         }
     }
-    Write-Output "Axiom node stopped (PID $nodePid)."
+    Write-Output "Axiom node stopped (PID $ownerPid)."
 } else {
-    Write-Output "Axiom node process $nodePid was already stopped."
+    Write-Output "Axiom node process $ownerPid was already stopped."
 }
 
-# Do not delete a file that a reused PID now owns.
-$processQueryFailed = $false
-$currentProcess = Get-ProcessSafe $nodePid ([ref]$processQueryFailed)
-if ($processQueryFailed) {
-    throw "Cannot revalidate PID $nodePid; refusing stale-file cleanup."
-}
-if ($currentProcess) {
-    throw "PID $nodePid was reused; refusing stale-file cleanup."
+# Do not delete a marker if either the verified owner or its launcher PID was
+# reused while shutdown was in progress.
+$markerPids = @($ownerPid)
+if ($candidatePid -gt 0 -and $candidatePid -ne $ownerPid) { $markerPids += $candidatePid }
+foreach ($markerPid in $markerPids) {
+    $processQueryFailed = $false
+    $currentProcess = Get-ProcessSafe $markerPid ([ref]$processQueryFailed)
+    if ($processQueryFailed) {
+        throw "Cannot revalidate PID $markerPid; refusing stale-file cleanup."
+    }
+    if ($currentProcess) {
+        if ($markerPid -eq $ownerPid) {
+            throw "PID $markerPid was reused; refusing stale-file cleanup."
+        }
+        if ($candidatePid -eq $markerPid -and $recordedStart.Ticks -ne [datetime]::MinValue.Ticks) {
+            if (-not (Test-ProcessIdentity $currentProcess $recordedStart $dbAbsolute $expectedProfile)) {
+                throw "Launcher PID $markerPid was reused; refusing stale-file cleanup."
+            }
+        } else {
+            throw "PID $markerPid was reused; refusing stale-file cleanup."
+        }
+    }
 }
 if (Test-Path -LiteralPath $pidPath) {
-    if ((Get-FilePid $pidPath) -eq $nodePid) {
+    $currentPidMarker = Get-FilePid $pidPath
+    if ($currentPidMarker -eq $candidatePid -or $currentPidMarker -eq $ownerPid) {
         $stalePidPath = "$pidPath.stale.$([guid]::NewGuid().ToString('N'))"
         try {
             Move-Item -LiteralPath $pidPath -Destination $stalePidPath -ErrorAction Stop
@@ -254,7 +327,7 @@ if (Test-Path -LiteralPath $pidPath) {
     }
 }
 if (Test-Path -LiteralPath $lockPath) {
-    if ((Get-FilePid $lockPath) -eq $nodePid) {
+    if ((Get-FilePid $lockPath) -eq $ownerPid) {
         $staleLockPath = "$lockPath.stale.$([guid]::NewGuid().ToString('N'))"
         try {
             Move-Item -LiteralPath $lockPath -Destination $staleLockPath -ErrorAction Stop
@@ -266,7 +339,7 @@ if (Test-Path -LiteralPath $lockPath) {
 }
 if (Test-Path -LiteralPath $stopPath) {
     $markerPid = Get-FilePid $stopPath
-    if ($markerPid -le 0 -or $markerPid -eq $nodePid) {
+    if ($markerPid -le 0 -or $markerPid -eq $ownerPid -or $markerPid -eq $candidatePid) {
         $staleStopPath = "$stopPath.stale.$([guid]::NewGuid().ToString('N'))"
         try {
             Move-Item -LiteralPath $stopPath -Destination $staleStopPath -ErrorAction Stop

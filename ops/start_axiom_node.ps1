@@ -8,8 +8,8 @@ param(
     [int]$Depth = 20,
     [ValidateRange(1, 1000)]
     [int]$MaxMarkets = 100,
-    [string]$LockPath = "",
     [string]$LogPath = "",
+    [switch]$Isolated,
     [string]$Python = "python"
 )
 
@@ -19,10 +19,10 @@ $dbInput = if ([System.IO.Path]::IsPathRooted($DbPath)) { $DbPath } else { Join-
 $dbAbsolute = [System.IO.Path]::GetFullPath($dbInput)
 $pidPath = "$dbAbsolute.node.pid"
 $logInput = if ([string]::IsNullOrWhiteSpace($LogPath)) { "$dbAbsolute.log" } elseif ([System.IO.Path]::IsPathRooted($LogPath)) { $LogPath } else { Join-Path $root $LogPath }
-$lockInput = if ([string]::IsNullOrWhiteSpace($LockPath)) { "$dbAbsolute.lock" } elseif ([System.IO.Path]::IsPathRooted($LockPath)) { $LockPath } else { Join-Path $root $LockPath }
+$lockPath = "$dbAbsolute.lock"
 $logPath = [System.IO.Path]::GetFullPath($logInput)
-$lockPath = [System.IO.Path]::GetFullPath($lockInput)
 $stopPath = "$dbAbsolute.stop"
+[System.IO.Directory]::CreateDirectory((Split-Path -Parent $pidPath)) | Out-Null
 [System.IO.Directory]::CreateDirectory((Split-Path -Parent $dbAbsolute)) | Out-Null
 [System.IO.Directory]::CreateDirectory((Split-Path -Parent $logPath)) | Out-Null
 [System.IO.Directory]::CreateDirectory((Split-Path -Parent $lockPath)) | Out-Null
@@ -30,6 +30,32 @@ $pythonExecutable = $Python
 if (-not [System.IO.Path]::IsPathRooted($Python) -and ($Python.Contains("\") -or $Python.Contains("/") -or $Python.StartsWith("."))) {
     $pythonExecutable = [System.IO.Path]::GetFullPath((Join-Path $root $Python))
 }
+
+function Get-ConfiguredExecutionProfile {
+    $rawProfile = [Environment]::GetEnvironmentVariable("AXIOM_EXECUTION_PROFILE", "Process")
+    if ([string]::IsNullOrEmpty($rawProfile)) { return "production" }
+    if ($rawProfile -eq "production" -or $rawProfile -eq "isolated") { return $rawProfile }
+    throw "AXIOM_EXECUTION_PROFILE must be exactly 'production' or 'isolated'; refusing to start."
+}
+
+$ambientProfile = Get-ConfiguredExecutionProfile
+$expectedProfile = if ($Isolated) { "isolated" } else { $ambientProfile }
+$effectiveIsolated = $expectedProfile -eq "isolated"
+if ([System.IO.Path]::GetFileNameWithoutExtension($pythonExecutable).ToLowerInvariant() -match "^pythonw(?:\d+(?:\.\d+)?)?$") {
+    throw "Python launcher '$Python' cannot be used for node readiness because pythonw has no stdout."
+}
+
+function Quote-ProcessArgument([AllowNull()][string]$Value) {
+    # Start-Process joins ArgumentList into one command line.  Quote using
+    # CommandLineToArgvW-compatible escaping, including trailing backslashes.
+    if ($null -eq $Value) { return '""' }
+    $text = [string]$Value
+    if ($text.Length -eq 0) { return '""' }
+    $escaped = $text -replace '(\\*)"', '$1$1\"'
+    $escaped = $escaped -replace '(\\+)$', '$1$1'
+    return '"' + $escaped + '"'
+}
+
 
 function Get-NodeCommandLine([int]$ProcessId) {
     try {
@@ -50,14 +76,15 @@ function Get-CommandTokens([string]$CommandLine) {
     return $tokens
 }
 
-function Test-NodeCommand([string]$CommandLine, [string]$ExpectedDb) {
+function Test-NodeCommand([string]$CommandLine, [string]$ExpectedDb, [string]$ExpectedProfile = "") {
     if (-not $CommandLine) { return $false }
     $tokens = @(Get-CommandTokens $CommandLine)
     if ($tokens.Count -eq 0) { return $false }
     $executable = $tokens[0].Replace("\", "/").Split("/")[-1].ToLowerInvariant()
+    if ($executable -match "^pythonw(?:\d+(?:\.\d+)?)?(?:\.exe)?$") { return $false }
     if ($executable -in @("axiom", "axiom.exe")) {
         $commandIndex = 1
-    } elseif ($executable -in @("py", "py.exe") -or $executable -match "^pythonw?(?:\d+(?:\.\d+)?)?(?:\.exe)?$") {
+    } elseif ($executable -in @("py", "py.exe") -or $executable -match "^python(?:\d+(?:\.\d+)?)?(?:\.exe)?$") {
         if ($tokens.Count -lt 4 -or $tokens[1].ToLowerInvariant() -ne "-m" -or $tokens[2].ToLowerInvariant() -ne "axiom.cli") { return $false }
         $commandIndex = 3
     } else {
@@ -78,22 +105,45 @@ function Test-NodeCommand([string]$CommandLine, [string]$ExpectedDb) {
     }
     if (-not $actual) { return $false }
     try {
-        return [StringComparer]::OrdinalIgnoreCase.Equals([System.IO.Path]::GetFullPath($actual), $ExpectedDb)
+        if (-not [StringComparer]::OrdinalIgnoreCase.Equals([System.IO.Path]::GetFullPath($actual), $ExpectedDb)) {
+            return $false
+        }
     } catch {
         return $false
     }
+    if (-not [string]::IsNullOrWhiteSpace($ExpectedProfile)) {
+        $isolatedFlag = $tokens | Where-Object { $_.ToLowerInvariant() -eq "--isolated" }
+        if ($ExpectedProfile -eq "isolated") { return $null -ne $isolatedFlag }
+        if ($ExpectedProfile -eq "production") { return $null -eq $isolatedFlag }
+    }
+    return $true
+}
+function Test-RecordedStartTime([datetime]$ProcessStartTime, [datetime]$RecordedStartTime) {
+    if (
+        $ProcessStartTime.Ticks -eq [datetime]::MinValue.Ticks -or
+        $RecordedStartTime.Ticks -eq [datetime]::MinValue.Ticks
+    ) { return $false }
+    return $ProcessStartTime.ToUniversalTime().Ticks -eq $RecordedStartTime.ToUniversalTime().Ticks
+}
+function Test-ExactStartTime([datetime]$ExpectedStartTime, [datetime]$ActualStartTime) {
+    if (
+        $ExpectedStartTime.Ticks -eq [datetime]::MinValue.Ticks -or
+        $ActualStartTime.Ticks -eq [datetime]::MinValue.Ticks
+    ) { return $false }
+    return $ExpectedStartTime.ToUniversalTime().Ticks -eq $ActualStartTime.ToUniversalTime().Ticks
 }
 
-function Test-ProcessIdentity($Process, [datetime]$StartTime, [string]$ExpectedDb) {
+
+function Test-ProcessIdentity($Process, [datetime]$StartTime, [string]$ExpectedDb, [string]$ExpectedProfile = "") {
     if (-not $Process) { return $false }
     try {
         $Process.Refresh()
         $currentStart = ([datetime]$Process.StartTime).ToUniversalTime()
-        if ($Process.HasExited -or $currentStart.Ticks -ne $StartTime.ToUniversalTime().Ticks) { return $false }
+        if ($Process.HasExited -or -not (Test-RecordedStartTime $currentStart $StartTime)) { return $false }
     } catch {
         return $false
     }
-    return Test-NodeCommand (Get-NodeCommandLine $Process.Id) $ExpectedDb
+    return Test-NodeCommand (Get-NodeCommandLine $Process.Id) $ExpectedDb $ExpectedProfile
 }
 function Get-ProcessSafe([int]$ProcessId, [ref]$QueryFailed) {
     $QueryFailed.Value = $false
@@ -122,11 +172,16 @@ function Get-FileStartTime([string]$Path) {
     try {
         $lines = @(Get-Content -LiteralPath $Path)
         if ($lines.Count -lt 2) { return [datetime]::MinValue }
-        return [datetime]::new([long]$lines[1], [DateTimeKind]::Utc)
+        $raw = [long]$lines[1]
+        if ($raw -gt 1000000000000000000) {
+            return [DateTimeOffset]::FromUnixTimeMilliseconds([long]($raw / 1000000)).UtcDateTime
+        }
+        return [datetime]::new($raw, [DateTimeKind]::Utc)
     } catch {
         return [datetime]::MinValue
     }
 }
+
 
 if (Test-Path -LiteralPath $lockPath) {
     $lockPid = Get-FilePid $lockPath
@@ -139,29 +194,12 @@ if (Test-Path -LiteralPath $lockPath) {
         throw "Cannot establish ownership of Axiom node lock $lockPath; refusing to start."
     }
     if ($lockProcess) {
-        if (Test-NodeCommand (Get-NodeCommandLine $lockPid) $dbAbsolute) {
+        if (Test-NodeCommand (Get-NodeCommandLine $lockPid) $dbAbsolute $expectedProfile) {
             throw "Axiom node already holds $lockPath (PID $lockPid)."
         }
         throw "Axiom node lock $lockPath belongs to another live PID $lockPid; refusing to remove it."
     }
-    $currentLockPid = Get-FilePid $lockPath
-    if ($currentLockPid -eq $lockPid) {
-        $processQueryFailed = $false
-        $recheckProcess = Get-ProcessSafe $lockPid ([ref]$processQueryFailed)
-        if ($processQueryFailed) {
-            throw "Cannot revalidate Axiom node lock $lockPath; refusing to start."
-        }
-        if ($recheckProcess) {
-            throw "Axiom node lock $lockPath was reused by live PID $lockPid; refusing to remove it."
-        }
-        $staleLockPath = "$lockPath.stale.$([guid]::NewGuid().ToString('N'))"
-        try {
-            Move-Item -LiteralPath $lockPath -Destination $staleLockPath -ErrorAction Stop
-            Remove-Item -LiteralPath $staleLockPath -Force -ErrorAction Stop
-        } catch {
-            throw "Axiom node lock $lockPath changed while checking its stale owner; refusing to start."
-        }
-    }
+    throw "NODE_STALE_LOCK_MANUAL_RECOVERY: Axiom node lock $lockPath has stale owner PID $lockPid; manual recovery is required; refusing to start."
 }
 
 if (Test-Path -LiteralPath $pidPath) {
@@ -175,12 +213,12 @@ if (Test-Path -LiteralPath $pidPath) {
         }
     }
     if ($existing) {
-        if (Test-NodeCommand (Get-NodeCommandLine $existingPid) $dbAbsolute) {
+        if (Test-NodeCommand (Get-NodeCommandLine $existingPid) $dbAbsolute $expectedProfile) {
             $existingStart = Get-FileStartTime $pidPath
             if ($existingStart.Ticks -eq [datetime]::MinValue.Ticks) {
                 throw "PID file $pidPath has no persisted process start time; refusing to trust PID $existingPid."
             }
-            if (-not (Test-ProcessIdentity $existing $existingStart $dbAbsolute)) {
+            if (-not (Test-ProcessIdentity $existing $existingStart $dbAbsolute $expectedProfile)) {
                 throw "PID $existingPid changed identity; refusing to trust PID file $pidPath."
             }
             if ((Get-FilePid $lockPath) -ne $existingPid) {
@@ -211,9 +249,6 @@ if (Test-Path -LiteralPath $stopPath) {
     }
 }
 
-function Quote-ProcessArgument([string]$Value) {
-    return '"' + $Value.Replace('"', '\"') + '"'
-}
 $arguments = @(
     "-m", "axiom.cli", "node-run",
     "--db", (Quote-ProcessArgument $dbAbsolute),
@@ -222,30 +257,163 @@ $arguments = @(
     "--max-markets", $MaxMarkets,
     "--crypto-source", $CryptoSource,
     "--log", (Quote-ProcessArgument $logPath),
-    "--lock", (Quote-ProcessArgument $lockPath)
+    "--lock", (Quote-ProcessArgument $lockPath),
+    "--pid", (Quote-ProcessArgument $pidPath),
+    "--cycles", "0"
 )
-$process = Start-Process -FilePath $pythonExecutable -ArgumentList $arguments -WorkingDirectory $root -WindowStyle Hidden -PassThru
-$processStartTime = [datetime]$process.StartTime
+if ($effectiveIsolated) { $arguments += "--isolated" }
+
+$launcherProcess = $null
+$process = $null
+$launcherStartTime = [datetime]::MinValue
+$processStartTime = [datetime]::MinValue
+$ownerPid = 0
+$status = $null
 $ready = $false
-$probe = 'import sqlite3,sys; c=sqlite3.connect(sys.argv[1], timeout=45); c.execute("PRAGMA busy_timeout=45000"); c.execute("PRAGMA query_only=ON"); r=c.execute("SELECT status FROM worker_state WHERE worker_name=?", ("axiom-node",)).fetchone(); print(r[0] if r else ""); c.close()'
-for ($attempt = 0; $attempt -lt 40; $attempt++) {
-    Start-Sleep -Milliseconds 250
-    if ($process.HasExited) { break }
-    $ownerPid = 0
-    if (-not (Test-Path -LiteralPath $lockPath)) { continue }
-    try { $ownerPid = Get-FilePid $lockPath } catch { continue }
-    if ($ownerPid -ne $process.Id) { continue }
-    if (-not (Test-ProcessIdentity $process ([datetime]$process.StartTime) $dbAbsolute)) { continue }
-    $state = ((& $pythonExecutable -c $probe $dbAbsolute 2>$null) | Out-String).Trim()
-    if ($LASTEXITCODE -eq 0 -and $state -eq "running") {
-        $ready = $true
-        break
+$startedSuccessfully = $false
+$previousExecutionProfile = [Environment]::GetEnvironmentVariable("AXIOM_EXECUTION_PROFILE", "Process")
+try {
+    # Set the child environment explicitly for both launch and probe.  Restore
+    # the caller's environment before returning, even when readiness fails.
+    [Environment]::SetEnvironmentVariable("AXIOM_EXECUTION_PROFILE", $expectedProfile, "Process")
+    $launcherProcess = Start-Process -FilePath $pythonExecutable -ArgumentList $arguments -WorkingDirectory $root -WindowStyle Hidden -PassThru
+    $process = $launcherProcess
+    $launcherStartTime = ([datetime]$launcherProcess.StartTime).ToUniversalTime()
+    $processStartTime = $launcherStartTime
+
+    for ($attempt = 0; $attempt -lt 40; $attempt++) {
+        Start-Sleep -Milliseconds 250
+        # A py/venv launcher may exit after handing ownership to its child.
+        # Continue probing the lock owner instead of mistaking that handoff
+        # for a failed launch.
+        if (-not (Test-Path -LiteralPath $lockPath)) { continue }
+        $ownerPid = Get-FilePid $lockPath
+        if ($ownerPid -le 0) { continue }
+        $ownerQueryFailed = $false
+        $ownerProcess = Get-ProcessSafe $ownerPid ([ref]$ownerQueryFailed)
+        if ($ownerQueryFailed -or -not $ownerProcess) { continue }
+
+        if ($ownerPid -eq $launcherProcess.Id) {
+            $process = $launcherProcess
+            $processStartTime = $launcherStartTime
+        } else {
+            try {
+                $ownerRecord = Get-CimInstance Win32_Process -Filter "ProcessId=$ownerPid" -ErrorAction Stop
+                if (-not $ownerRecord -or [int]$ownerRecord.ParentProcessId -ne $launcherProcess.Id) { continue }
+                if (-not (Test-NodeCommand ([string]$ownerRecord.CommandLine) $dbAbsolute $expectedProfile)) { continue }
+                $ownerStartTime = ([datetime]$ownerProcess.StartTime).ToUniversalTime()
+                if ($ownerStartTime -lt $launcherStartTime) { continue }
+            } catch {
+                continue
+            }
+            $process = $ownerProcess
+            $processStartTime = $ownerStartTime
+        }
+
+        # The lock is created before the PID marker.  Require both markers to
+        # identify the same owner before trusting readiness output.
+        if ((Get-FilePid $lockPath) -ne $ownerPid -or (Get-FilePid $pidPath) -ne $ownerPid) { continue }
+        if (-not (Test-ProcessIdentity $process $processStartTime $dbAbsolute $expectedProfile)) { continue }
+
+        # Use only PowerShell/.NET for the independent identity/profile probe.
+        # Windows PowerShell 5.1 can otherwise strip an embedded Python -c
+        # program while constructing native arguments.
+        $probePid = Get-FilePid $pidPath
+        if ($probePid -ne $ownerPid) { continue }
+        $probeQueryFailed = $false
+        $probeProcess = Get-ProcessSafe $probePid ([ref]$probeQueryFailed)
+        if ($probeQueryFailed -or -not $probeProcess) { continue }
+        if (-not (Test-ProcessIdentity $probeProcess $processStartTime $dbAbsolute $expectedProfile)) { continue }
+        if (-not (Test-NodeCommand (Get-NodeCommandLine $probePid) $dbAbsolute $expectedProfile)) { continue }
+
+        $statusArguments = @(
+            "-m", "axiom.cli", "node-status",
+            "--db", $dbAbsolute,
+            "--lock", $lockPath,
+            "--log", $logPath,
+            "--pid", $pidPath
+        )
+        if ($effectiveIsolated) { $statusArguments += "--isolated" }
+        $statusText = ((& $pythonExecutable @statusArguments 2>$null) | Out-String).Trim()
+        if ($LASTEXITCODE -ne 0 -or -not $statusText) { continue }
+        try { $status = $statusText | ConvertFrom-Json } catch { continue }
+        if (
+            [string]$status.status -eq "running" -and
+            [int]$status.pid -eq $ownerPid -and
+            [int]$status.lock_owner_pid -eq $ownerPid -and
+            [bool]$status.worker_alive -and
+            [bool]$status.worker_identity_valid -and
+            [string]$status.execution_profile -eq $expectedProfile -and
+            [string]$status.worker.execution_profile -eq $expectedProfile
+        ) {
+            $ready = $true
+            break
+        }
     }
+    if (-not $ready) {
+        throw "Axiom node failed readiness; no running worker state at $dbAbsolute."
+    }
+
+    # Revalidate the lock owner and both marker PIDs after the independent
+    # probe and status query.  The lock marker's OS timestamp is written by
+    # the node itself and is a second representation of the owner's start
+    # time; comparing it again with Process.StartTime can reject a valid
+    # venv launcher/base-child handoff due to timestamp precision/encoding.
+    $finalLockPid = Get-FilePid $lockPath
+    $finalPidMarker = Get-FilePid $pidPath
+    if (
+        $finalLockPid -ne $ownerPid -or
+        $finalPidMarker -ne $ownerPid -or
+        $process.Id -ne $ownerPid
+    ) {
+        throw "Axiom node ownership changed during readiness; refusing startup."
+    }
+    $finalQueryFailed = $false
+    $finalProcess = Get-ProcessSafe $ownerPid ([ref]$finalQueryFailed)
+    if ($finalQueryFailed -or -not $finalProcess) {
+        throw "Axiom node owner disappeared during readiness; refusing startup."
+    }
+    if (-not (Test-ProcessIdentity $finalProcess $processStartTime $dbAbsolute $expectedProfile)) {
+        throw "Axiom node owner identity changed during readiness; refusing startup."
+    }
+    try {
+        $finalOwnerStartTime = ([datetime]$finalProcess.StartTime).ToUniversalTime()
+    } catch {
+        throw "Cannot revalidate Axiom node owner start time during readiness; refusing startup."
+    }
+    if (-not (Test-ExactStartTime $processStartTime $finalOwnerStartTime)) {
+        throw "Axiom node owner identity changed during readiness; refusing startup."
+    }
+    if ($ownerPid -ne $launcherProcess.Id) {
+        try {
+            $finalOwnerRecord = Get-CimInstance Win32_Process -Filter "ProcessId=$ownerPid" -ErrorAction Stop
+            if (
+                -not $finalOwnerRecord -or
+                [int]$finalOwnerRecord.ParentProcessId -ne $launcherProcess.Id -or
+                -not (Test-NodeCommand ([string]$finalOwnerRecord.CommandLine) $dbAbsolute $expectedProfile)
+            ) {
+                throw "Axiom node owner parent or command changed during readiness; refusing startup."
+            }
+        } catch {
+            if ($_.Exception.Message -like "Axiom node owner parent*") { throw }
+            throw "Cannot revalidate Axiom node owner parent during readiness; refusing startup."
+        }
+    }
+    $process = $finalProcess
+    $processStartTime = $finalOwnerStartTime
+
+    $startedSuccessfully = $true
+    Write-Output "Axiom node started (PID $($process.Id)); lock $lockPath; log $logPath."
+} catch {
+    if (-not $startedSuccessfully) {
+        if ($process -and $processStartTime.Ticks -ne [datetime]::MinValue.Ticks -and (Test-ProcessIdentity $process $processStartTime $dbAbsolute $expectedProfile)) {
+            Stop-Process -InputObject $process -Force -ErrorAction SilentlyContinue
+        }
+        if ($launcherProcess -and $launcherProcess.Id -ne $ownerPid -and $launcherStartTime.Ticks -ne [datetime]::MinValue.Ticks -and (Test-ProcessIdentity $launcherProcess $launcherStartTime $dbAbsolute $expectedProfile)) {
+            Stop-Process -InputObject $launcherProcess -Force -ErrorAction SilentlyContinue
+        }
+    }
+    throw
+} finally {
+    [Environment]::SetEnvironmentVariable("AXIOM_EXECUTION_PROFILE", $previousExecutionProfile, "Process")
 }
-if (-not $ready) {
-    if (-not $process.HasExited) { Stop-Process -InputObject $process -Force -ErrorAction SilentlyContinue }
-    throw "Axiom node failed readiness; no running worker state at $dbAbsolute."
-}
-$persistedStart = ([datetime]$processStartTime).ToUniversalTime()
-Set-Content -LiteralPath $pidPath -Value @([string]$process.Id, [string]$persistedStart.Ticks)
-Write-Output "Axiom node started (PID $($process.Id)); lock $lockPath; log $logPath."

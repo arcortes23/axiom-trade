@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+import os
 from pathlib import Path
+import shutil
 from unittest.mock import patch
 import tempfile
 import unittest
@@ -12,8 +14,12 @@ from axiom.canary import (
     CanaryBlocked,
     CanaryService,
     CredentialStore,
+    PolymarketClobV2Venue,
 )
+from axiom.dashboard import DashboardData
+
 from axiom.lifecycle import CandidateLifecycleManager, CandidateStage
+from axiom.node import NodeConfig, ResearchNode
 from axiom.ranker import CandidateCanaryRanker
 from axiom.storage import AxiomStore
 from axiom.experiment_plan import normalize_market_scope
@@ -36,6 +42,19 @@ def _canonical_unresolved_scope() -> tuple[dict[str, object], str, str]:
     return policy.as_dict(), policy.scope_hash, policy.scope_version
 
 T0 = datetime(2026, 1, 2, 12, tzinfo=timezone.utc)
+class _FixtureCredentialStore(CredentialStore):
+    _VALUES = {
+        "private_key": "fixture-private-key",
+        "wallet_address": "0x0000000000000000000000000000000000000001",
+    }
+
+    def configured(self, **_kwargs: object) -> bool:
+        return True
+
+    def load(self, **_kwargs: object) -> dict[str, str]:
+        return dict(self._VALUES)
+
+
 
 
 class PolymarketTruthfulnessRegressionTests(unittest.TestCase):
@@ -137,8 +156,17 @@ class PolymarketTruthfulnessRegressionTests(unittest.TestCase):
 
     def test_unknown_submission_is_not_successful_and_is_not_resubmitted(self) -> None:
         store = self.make_store()
-        service = CanaryService(store, clock=lambda: T0)
-        service.enable_autonomous_micro_live()
+        service = CanaryService(
+            store,
+            credentials=_FixtureCredentialStore(),
+            clock=lambda: T0,
+        )
+        settings = service.settings.snapshot()
+        service.enable_autonomous_micro_live(
+            venue="polymarket",
+            config_id=str(settings["config_id"]),
+            expected_generation=int(settings["generation"]),
+        )
         candidate_id = "unknown-submission"
         row = {
             "candidate_id": candidate_id,
@@ -221,6 +249,120 @@ class PolymarketTruthfulnessRegressionTests(unittest.TestCase):
         )
         self.assertEqual(first_report["micro_live_canary"], AUTONOMOUS_MICRO_LIVE)
 
+    def test_isolated_profile_blocks_real_transport_before_and_after_copied_enable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            source_path = Path(temporary) / "source.sqlite3"
+            copied_path = Path(temporary) / "copied.sqlite3"
+            source_store = AxiomStore(str(source_path))
+            try:
+                source_service = CanaryService(
+                    source_store,
+                    credentials=_FixtureCredentialStore(),
+                    clock=lambda: T0,
+                )
+                with patch.dict(os.environ, {"AXIOM_EXECUTION_PROFILE": "isolated"}):
+                    with self.assertRaisesRegex(
+                        CanaryBlocked, "ISOLATED_EXECUTION_PROFILE"
+                    ):
+                        CredentialStore().configured()
+                    with self.assertRaisesRegex(
+                        CanaryBlocked, "ISOLATED_EXECUTION_PROFILE"
+                    ):
+                        PolymarketClobV2Venue().geoblock()
+                with patch.dict(os.environ, {"AXIOM_EXECUTION_PROFILE": "production"}):
+                    settings = source_service.settings.snapshot()
+                    source_service.enable_autonomous_micro_live(
+                        venue="polymarket",
+                        config_id=str(settings["config_id"]),
+                        expected_generation=int(settings["generation"]),
+                    )
+            finally:
+                source_store.close()
+            shutil.copyfile(source_path, copied_path)
+
+            copied_store = AxiomStore(str(copied_path))
+            try:
+                copied_service = CanaryService(
+                    copied_store,
+                    credentials=_FixtureCredentialStore(),
+                    clock=lambda: T0,
+                )
+                with patch.dict(os.environ, {"AXIOM_EXECUTION_PROFILE": "isolated"}):
+                    self.assertEqual(
+                        copied_service.status()["micro_live_canary"],
+                        AUTONOMOUS_MICRO_LIVE,
+                    )
+                    with self.assertRaisesRegex(
+                        CanaryBlocked, "ISOLATED_EXECUTION_PROFILE"
+                    ):
+                        PolymarketClobV2Venue().account()
+            finally:
+                copied_store.close()
+
+    def test_dashboard_exposes_stale_and_error_reasons_not_no_signal(self) -> None:
+        store = self.make_store()
+        service = CanaryService(store, clock=lambda: T0)
+        service.record_autonomous_decision(
+            next_decision="WAIT_FOR_FRESH_INPUTS",
+            blocker="STALE_INPUT",
+            worker_status="DEGRADED",
+            timestamp=T0,
+        )
+        service.publish_readiness_snapshot(reason="STALE_INPUT")
+        store.save_polymarket_market_metadata(
+            "ui-error-market",
+            {
+                "market_id": "ui-error-market",
+                "active": True,
+                "closed": False,
+                "snapshot": {"settlement": "open"},
+                "source_type": "FORWARD_COLLECTED",
+            },
+            observed_at=T0,
+        )
+        store.save_polymarket_snapshot(
+            "ui-error-snapshot",
+            "ui-error-market",
+            T0,
+            T0,
+            {
+                "market_id": "ui-error-market",
+                "source_type": "FORWARD_COLLECTED",
+                "snapshot": {
+                    "settlement": "open",
+                    "expiry": (T0 + timedelta(hours=2)).isoformat(),
+                },
+            },
+            quality="TIMESTAMPED_DEPTH",
+            source_type="FORWARD_COLLECTED",
+        )
+        store.save_collection_error(
+            "ui-error-market",
+            T0,
+            kind="TRANSPORT_ERROR",
+            detail="fixture transport unavailable",
+            source_type="FORWARD_COLLECTED",
+        )
+        node = ResearchNode(
+            NodeConfig(":memory:", crypto_enabled=False),
+            provider=object(),
+            store=store,
+            clock=lambda: T0,
+        )
+        self.addCleanup(node.stop)
+        self.assertTrue(node._run_health_monitor())
+
+        canonical = service.status_report()
+        self.assertEqual(canonical["worker"]["blocker"], "STALE_INPUT")
+        self.assertEqual(canonical["blocker"], "STALE_INPUT")
+        dashboard = DashboardData(store=store, clock=lambda: T0)
+        canary = dashboard.canary_data()
+        self.assertEqual(canary["canary"]["autonomous"]["blocker"], "STALE_INPUT")
+        self.assertNotEqual(canary["canary"]["autonomous"]["blocker"], "NO_SIGNAL")
+        overview = dashboard.overview_summary()
+        self.assertEqual(overview["health_reason_code"], "CURRENT_COLLECTION_FAILURES")
+        self.assertEqual(overview["historical_error_count"], 0)
+        self.assertNotEqual(overview["health_reason_code"], "NO_SIGNAL")
 
 if __name__ == "__main__":
     unittest.main()

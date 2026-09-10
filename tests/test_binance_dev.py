@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import os
 import json
 import sqlite3
 import threading
@@ -839,6 +840,7 @@ class BinanceDevelopmentTests(unittest.TestCase):
 
         configured_output = io.StringIO()
         with (
+            patch.dict(os.environ, {"AXIOM_EXECUTION_PROFILE": "production"}),
             patch("axiom.cli.BinanceCredentialStore", side_effect=store_factory),
             patch("axiom.cli.getpass.getpass", side_effect=[api_key, api_secret]),
             redirect_stdout(configured_output),
@@ -877,6 +879,7 @@ class BinanceDevelopmentTests(unittest.TestCase):
 
         status_output = io.StringIO()
         with (
+            patch.dict(os.environ, {"AXIOM_EXECUTION_PROFILE": "production"}),
             patch("axiom.cli.BinanceCredentialStore", side_effect=store_factory),
             redirect_stdout(status_output),
         ):
@@ -896,16 +899,10 @@ class BinanceDevelopmentTests(unittest.TestCase):
         args = build_parser().parse_args(["binance-dev", "--once"])
         self.assertEqual(args.command, "binance-dev")
         self.assertTrue(args.once)
-        self.assertFalse(hasattr(args, "db"))
-        self.assertFalse(hasattr(args, "port"))
-        with patch("axiom.cli.BinanceDevelopmentRuntime") as runtime_type:
-            runtime = runtime_type.return_value
-            runtime.status.return_value = {"url": "http://127.0.0.1:8081", "paper_only": True}
-            self.assertEqual(_main_impl(["binance-dev", "--once"]), 0)
-            runtime.start.assert_called_once_with(once=True)
-            runtime.stop.assert_called()
-            self.assertNotIn("axiom.sqlite", json.dumps(runtime.status.return_value))
-            self.assertNotIn("8080", json.dumps(runtime.status.return_value))
+        with self.assertRaises(SystemExit):
+            build_parser().parse_args(["binance-dev", "--db", "runtime.sqlite"])
+        with self.assertRaises(SystemExit):
+            build_parser().parse_args(["binance-dev", "--port", "8080"])
 
 
     def test_testnet_missing_keyring_is_blocked_without_worker_or_venue(self):
@@ -1401,7 +1398,9 @@ class BinanceDevelopmentTests(unittest.TestCase):
                 (),
             ),
         )
-        with patch("axiom.cli.BinanceTestnetRuntime") as runtime_type:
+        with patch.dict(os.environ, {"AXIOM_EXECUTION_PROFILE": "production"}), patch(
+            "axiom.cli.BinanceTestnetRuntime"
+        ) as runtime_type:
             runtime = runtime_type.return_value
             runtime.locked_action.return_value = {"ok": True}
             for argv, expected_action, expected_args in cases:

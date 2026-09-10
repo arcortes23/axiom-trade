@@ -52,6 +52,13 @@ def prediction_rows(*, version: str = "v1", model_probability: float = 0.8) -> l
             {
                 **common,
                 "timestamp": (opened + timedelta(hours=1)).isoformat(),
+                "settlement": "open",
+            }
+        )
+        rows.append(
+            {
+                **common,
+                "timestamp": (opened + timedelta(hours=2)).isoformat(),
                 "settlement": "resolved_yes",
             }
         )
@@ -87,6 +94,7 @@ def experiment_plan(
         "min_samples": 1,
         "min_trades": 0,
         "max_variants": max_variants,
+        "exit_policy": {"type": "fixed_holding_period", "holding_period": 1},
         "paper_only": True,
     }
 
@@ -477,7 +485,7 @@ class Phase4AutonomousLoopTests(unittest.TestCase):
             )
             cycle = processor(store, bus).process_pending(now=T0)
 
-            self.assertEqual(cycle.completed, 1)
+            self.assertEqual(cycle.completed, 1, repr(cycle))
             queued = bus.get(item.item_id)
             self.assertIsNotNone(queued)
             assert queued is not None
@@ -504,7 +512,41 @@ class Phase4AutonomousLoopTests(unittest.TestCase):
             self.assertEqual(candidate["stage"], CandidateStage.PAPER_FORWARD.value)
             self.assertFalse(candidate["payload"]["holdout_used"])
             self.assertEqual(candidate["payload"]["registration_timestamp"], T0.isoformat())
-            self.assertEqual(len(store.load_forward_tests()), 1)
+            forward_tests = store.load_forward_tests()
+            self.assertEqual(len(forward_tests), 2)
+            intent_tests = [
+                item
+                for item in forward_tests
+                if str(item.get("experiment_id", "")).startswith("observation-intent-")
+            ]
+            executable_tests = [
+                item
+                for item in forward_tests
+                if str(item.get("experiment_id", "")).startswith("forward-")
+            ]
+            self.assertEqual(len(intent_tests), 1)
+            self.assertEqual(len(executable_tests), 1)
+            self.assertEqual(
+                intent_tests[0]["config"]["candidate_id"],
+                candidate["candidate_id"],
+            )
+            self.assertEqual(
+                executable_tests[0]["config"]["candidate_id"],
+                candidate["candidate_id"],
+            )
+            self.assertNotEqual(
+                intent_tests[0]["experiment_id"],
+                executable_tests[0]["experiment_id"],
+            )
+            self.assertEqual(intent_tests[0]["allowed_markets"], [])
+            self.assertEqual(
+                intent_tests[0]["config"]["market_authority_required"],
+                False,
+            )
+            self.assertTrue(executable_tests[0]["allowed_markets"])
+            self.assertTrue(
+                executable_tests[0]["config"]["market_authority_required"],
+            )
 
             phases = [event["to_status"] for event in store.list_research_queue_events(item.item_id)]
             self.assertEqual(
@@ -524,7 +566,7 @@ class Phase4AutonomousLoopTests(unittest.TestCase):
             )
             budget = store.load_experiment_budget("autonomous")
             self.assertEqual(budget["budget"]["used_by_family"], {"probability_mispricing": 1})
-            forward_config = store.load_forward_tests()[0]["config"]
+            forward_config = executable_tests[0]["config"]
             self.assertEqual(forward_config["execution"], "paper_only")
             self.assertNotIn("live_execution", forward_config)
 
@@ -1164,14 +1206,14 @@ class Phase4AutonomousLoopTests(unittest.TestCase):
             class RecordingProcessor(AutonomousResearchProcessor):
                 seen_splits: list[tuple[tuple[str, ...], tuple[str, ...]]] = []
 
-                def _evaluate_datasets(self, plan, strategy, train, validation):  # type: ignore[no-untyped-def]
+                def _evaluate_datasets(self, plan, strategy, train, validation, holdout):  # type: ignore[no-untyped-def]
                     self.seen_splits.append(
                         (
                             tuple(str(row.get("question", "")) for row in train),
                             tuple(str(row.get("question", "")) for row in validation),
                         )
                     )
-                    return super()._evaluate_datasets(plan, strategy, train, validation)
+                    return super()._evaluate_datasets(plan, strategy, train, validation, holdout)
 
             active = RecordingProcessor(
                 store,
@@ -1192,7 +1234,7 @@ class Phase4AutonomousLoopTests(unittest.TestCase):
                 dedupe_key="holdout-isolation",
             )
             cycle = active.process_pending(now=T0)
-            self.assertEqual(cycle.completed, 1)
+            self.assertEqual(cycle.completed, 1, repr(cycle))
             self.assertTrue(active.seen_splits)
             for train_questions, validation_questions in active.seen_splits:
                 self.assertNotIn(marker, train_questions)
@@ -1242,8 +1284,8 @@ class Phase4AutonomousLoopTests(unittest.TestCase):
 
             retry = processor(store, bus, lease_seconds=1)
             cycle = retry.process_pending(now=T0 + timedelta(seconds=2))
-            self.assertEqual(cycle.released, 1)
-            self.assertEqual(cycle.completed, 1)
+            self.assertEqual(cycle.released, 1, repr(cycle))
+            self.assertEqual(cycle.completed, 1, repr(cycle))
             self.assertEqual(len(store.list_experiment_plans()), 1)
             self.assertEqual(len(store.load_candidate_lifecycle(limit=None)), 1)
             self.assertEqual(len(store.list_strategies()), 1)
@@ -1350,7 +1392,7 @@ class Phase4AutonomousLoopTests(unittest.TestCase):
             )
             active = processor(store, bus, max_items=1, max_children=1, max_generation=1, criteria=relaxed_criteria())
             first = active.process_pending(now=T0)
-            self.assertEqual(first.completed, 1)
+            self.assertEqual(first.completed, 1, repr(first))
             pending = store.list_research_items(status="PENDING", limit=1)
             self.assertEqual(len(pending), 1)
             worker_payload = dict(pending[0]["payload"])

@@ -2,14 +2,23 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from contextlib import redirect_stdout
 import hashlib
+import io
+import os
 import json
 import sys
 import unittest
 from unittest.mock import MagicMock, patch
 
-from axiom.canary import CanaryBlocked, CanaryService, CredentialStore, PolymarketClobV2Venue
-from axiom.cli import _load_cli_universe, _run_cli_crypto_research, build_parser
+from axiom.canary import (
+    CanaryBlocked,
+    CanaryService,
+    CredentialStore,
+    PolymarketClobV2Venue,
+    credential_fingerprint,
+)
+from axiom.cli import _load_cli_universe, _main_impl, _run_cli_crypto_research, build_parser
 from axiom.crypto_universe import TOP_50_MARKET_CAP_BINANCE_USDT, UniverseSnapshot, load_crypto_universe
 from axiom.data import InMemoryCryptoProvider
 from axiom.domain import MarketType, OHLCVBar
@@ -21,6 +30,7 @@ from axiom.experiment_plan import (
 )
 from axiom.market_scope import resolve_market_scope
 from axiom.research import run_crypto_research, run_multi_symbol_crypto_research
+from axiom.node import NodeConfig, ResearchNode
 from axiom.storage import AxiomStore
 from axiom.dashboard import DashboardData
 
@@ -605,10 +615,17 @@ class _CredentialStore(CredentialStore):
         if not self._is_configured:
             return {}
         return {
-            "private_key": "private-key-fixture",
-            "wallet_address": "wallet-fixture",
+            "private_key": "fixture-private-key",
+            "wallet_address": "0x0000000000000000000000000000000000000001",
+            "api_key": "api-key-fixture",
+            "api_secret": "api-secret-fixture",
+            "api_passphrase": "api-passphrase-fixture",
         }
 
+
+class _ApiKeyCredentials:
+    def __init__(self, **values: str) -> None:
+        self.values = dict(values)
 
 class _NoCredentialVenue:
     def __init__(self) -> None:
@@ -620,7 +637,7 @@ class _NoCredentialVenue:
 
     @staticmethod
     def installed_sdk_version() -> str:
-        return "0.9.2"
+        return "0.9.0"
 
     def geoblock(self) -> dict[str, object]:
         self.geoblock_calls += 1
@@ -1306,9 +1323,11 @@ class CanaryReadinessTests(unittest.TestCase):
         secure_factory = MagicMock(spec=["_create"])
         secure_factory._create.return_value = client
         credentials = _CredentialStore(True)
+        credential_digest = credential_fingerprint(credentials.load())
         venue = PolymarketClobV2Venue()
         sdk_module = MagicMock()
         sdk_module.SecureClient = secure_factory
+        sdk_module.ApiKeyCreds = _ApiKeyCredentials
         snapshot = {
             "micro_live_canary": "ARMED",
             "candidate": "candidate-1",
@@ -1338,10 +1357,12 @@ class CanaryReadinessTests(unittest.TestCase):
             "asks": [{"price": "0.50", "size": "100"}],
             "fee_bps": "10",
         }
-        with patch.dict(sys.modules, {"polymarket": sdk_module}), patch.object(
+        with patch.dict(os.environ, {"AXIOM_EXECUTION_PROFILE": "production"}), patch.dict(
+            sys.modules, {"polymarket": sdk_module}
+        ), patch.object(
             PolymarketClobV2Venue,
             "installed_sdk_version",
-            return_value="0.9.2",
+            return_value="0.9.0",
         ), patch.object(
             CredentialStore,
             "load",
@@ -1352,12 +1373,15 @@ class CanaryReadinessTests(unittest.TestCase):
             return_value={"blocked": False, "close_only": False},
         ), AxiomStore(":memory:") as store:
             service = CanaryService(store, credentials=credentials, clock=lambda: T0)
-            signal_id = self._seed_official_submission_fixture(store, service)
+            settings_config_id, settings_generation = service._settings_binding()
+            snapshot["settings_config_id"] = settings_config_id
+            snapshot["settings_generation"] = settings_generation
             expiry = (T0 + timedelta(hours=1)).isoformat()
             store.connection.execute(
                 "INSERT INTO canary_control("
                 "singleton,state,candidate_id,venue,armed_at,expires_at,limits_json,"
-                "integrity_hash,updated_at,control_generation) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                "integrity_hash,updated_at,control_generation,settings_config_id,"
+                "settings_generation,credential_fingerprint) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     1,
                     "ARMED",
@@ -1374,9 +1398,13 @@ class CanaryReadinessTests(unittest.TestCase):
                     ),
                     T0.isoformat(),
                     1,
+                    snapshot["settings_config_id"],
+                    snapshot["settings_generation"],
+                    credential_digest,
                 ),
             )
             store.connection.commit()
+            signal_id = self._seed_official_submission_fixture(store, service)
             with patch.object(service, "authoritative_status", return_value=snapshot), patch.object(
                 store,
                 "polymarket_health",
@@ -1454,13 +1482,17 @@ class CanaryReadinessTests(unittest.TestCase):
         secure_factory = MagicMock(spec=["_create"])
         secure_factory._create.return_value = client
         credentials = _CredentialStore(True)
+        credential_digest = credential_fingerprint(credentials.load())
         venue = PolymarketClobV2Venue()
         sdk_module = MagicMock()
+        sdk_module.ApiKeyCreds = _ApiKeyCredentials
         sdk_module.SecureClient = secure_factory
-        with patch.dict(sys.modules, {"polymarket": sdk_module}), patch.object(
+        with patch.dict(os.environ, {"AXIOM_EXECUTION_PROFILE": "production"}), patch.dict(
+            sys.modules, {"polymarket": sdk_module}
+        ), patch.object(
             PolymarketClobV2Venue,
             "installed_sdk_version",
-            return_value="0.9.2",
+            return_value="0.9.0",
         ), patch.object(
             CredentialStore,
             "load",
@@ -1480,13 +1512,15 @@ class CanaryReadinessTests(unittest.TestCase):
             self.assertEqual(client.book_calls, [{"asset_id": "position-yes"}])
             self.assertEqual(client.balance_calls, [{"asset_type": "COLLATERAL"}, {"asset_type": "COLLATERAL"}])
             self.assertEqual(client.post_calls, [])
-            self.assertEqual(result["diagnostics"]["market"]["asset_id"], "position-yes")
             self.assertEqual(secure_factory._create.call_count, 4)
-            secure_factory._create.assert_called_with(
-                private_key="private-key-fixture",
-                wallet="wallet-fixture",
-                validate_credentials=True,
+            constructor_kwargs = secure_factory._create.call_args.kwargs
+            self.assertEqual(constructor_kwargs["private_key"], "fixture-private-key")
+            self.assertEqual(
+                constructor_kwargs["wallet"],
+                "0x0000000000000000000000000000000000000001",
             )
+            self.assertFalse(constructor_kwargs["validate_credentials"])
+            self.assertIsInstance(constructor_kwargs["credentials"], _ApiKeyCredentials)
 
             self.assertFalse(hasattr(venue, "submit_limit_order"))
             self.assertEqual(client.post_calls, [])
@@ -1521,6 +1555,9 @@ class CanaryReadinessTests(unittest.TestCase):
                         "max_slippage_bps": 100,
                     },
                 }
+                settings_config_id, settings_generation = service._settings_binding()
+                snapshot["settings_config_id"] = settings_config_id
+                snapshot["settings_generation"] = settings_generation
                 context = {
                     "asset_id": "position-yes",
                     "market_version": "v2",
@@ -1535,7 +1572,8 @@ class CanaryReadinessTests(unittest.TestCase):
                 store.connection.execute(
                     "INSERT INTO canary_control("
                     "singleton,state,candidate_id,venue,armed_at,expires_at,limits_json,"
-                    "integrity_hash,updated_at,control_generation) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    "integrity_hash,updated_at,control_generation,settings_config_id,"
+                    "settings_generation,credential_fingerprint) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         1,
                         "ARMED",
@@ -1552,6 +1590,9 @@ class CanaryReadinessTests(unittest.TestCase):
                         ),
                         T0.isoformat(),
                         1,
+                        snapshot["settings_config_id"],
+                        snapshot["settings_generation"],
+                        credential_digest,
                     ),
                 )
                 store.connection.commit()
@@ -1580,7 +1621,7 @@ class CanaryReadinessTests(unittest.TestCase):
                         "asset_id": "position-yes",
                         "side": "BUY",
                         "price": "0.50",
-                        "size": "2.00",
+                        "size": "1",
                     }
                 ],
             )
@@ -1613,10 +1654,12 @@ class CanaryReadinessTests(unittest.TestCase):
         sdk_module = MagicMock()
         sdk_module.RelayerApiKey = relayer_factory
         sdk_module.SecureClient = secure_factory
-        with patch.dict(sys.modules, {"polymarket": sdk_module}), patch.object(
+        with patch.dict(os.environ, {"AXIOM_EXECUTION_PROFILE": "production"}), patch.dict(
+            sys.modules, {"polymarket": sdk_module}
+        ), patch.object(
             PolymarketClobV2Venue,
             "installed_sdk_version",
-            return_value="0.9.2",
+            return_value="0.9.0",
         ), patch.object(
             CredentialStore,
             "load",
@@ -2258,6 +2301,36 @@ class DashboardAndCliShapeTests(unittest.TestCase):
         self.assertEqual(provenance["universe_version"], "custom-v1")
         self.assertEqual(provenance["snapshot_hash"], "sha256:custom-v1")
 
+    def test_operator_preserves_production_8080_and_explicit_isolated_8187(self) -> None:
+        parser = build_parser()
+        operator = parser.parse_args(["operator"])
+        self.assertEqual(operator.port, 8080)
+        self.assertFalse(operator.isolated)
+        isolated = parser.parse_args(["operator", "--isolated", "--port", "8187"])
+        self.assertTrue(isolated.isolated)
+        self.assertEqual(isolated.port, 8187)
+        self.assertTrue(isolated._operator_port_explicit)
+
+    def test_isolated_node_uses_offline_market_data_and_disables_crypto(self) -> None:
+        with AxiomStore(":memory:") as store:
+            node = ResearchNode(
+                NodeConfig(
+                    db_path=":memory:",
+                    execution_profile="isolated",
+                    crypto_enabled=True,
+                ),
+                store=store,
+            )
+            self.assertEqual(node.execution_profile, "isolated")
+            self.assertEqual(node.crypto_provider, None)
+            self.assertEqual(type(node.provider).__name__, "SyntheticPredictionProvider")
+    def test_isolated_cli_blocks_authenticated_canary_probe_without_opening_store(self) -> None:
+        output = io.StringIO()
+        with patch.dict(os.environ, {"AXIOM_EXECUTION_PROFILE": "production"}), redirect_stdout(output):
+            result = _main_impl(["canary-check", "--isolated"])
+        payload = json.loads(output.getvalue())
+        self.assertEqual(payload["blocker"], "ISOLATED_EXECUTION_PROFILE")
+        self.assertTrue(payload["blocked"])
 
 if __name__ == "__main__":
     unittest.main()

@@ -14,7 +14,8 @@ import math
 import urllib.parse
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+import re
 from typing import Any, Callable, Mapping, Sequence
 
 from ..domain import (
@@ -82,6 +83,7 @@ class PolymarketAdapter(PredictionMarketDataProvider):
         self,
         *,
         gamma_url: str = "https://gamma-api.polymarket.com",
+        data_api_url: str = "https://data-api.polymarket.com",
         clob_url: str = "https://clob.polymarket.com",
         base_url: str | None = None,
         timeout: float = 10.0,
@@ -90,8 +92,8 @@ class PolymarketAdapter(PredictionMarketDataProvider):
         timeout_value = float(timeout)
         if not math.isfinite(timeout_value) or timeout_value <= 0:
             raise ValueError("timeout must be finite and positive")
-        # base_url is a convenient alias for Gamma's origin.
         self.gamma_url = str(base_url or gamma_url).rstrip("/")
+        self.data_api_url = str(data_api_url).rstrip("/")
         self.clob_url = str(clob_url).rstrip("/")
         self.timeout = timeout_value
         self._opener = opener
@@ -101,16 +103,25 @@ class PolymarketAdapter(PredictionMarketDataProvider):
         self._transport_errors: list[HTTPFetchError] = []
         self._provider_timestamps: dict[tuple[str, str], datetime | None] = {}
         self._book_provider_timestamps: dict[str, datetime | None] = {}
+        self._trade_provenance: dict[str, Mapping[str, Any]] = {}
         self._last_trades_complete = True
         self._last_trade_cursor: str | None = None
+        self._last_trade_query: Mapping[str, Any] = {}
 
     def isolated_worker_factory(self) -> Callable[[], "PolymarketAdapter"]:
         """Return a factory for workers with independent mutable adapter state."""
-        gamma_url, clob_url, timeout, opener = self.gamma_url, self.clob_url, self.timeout, self._opener
+        gamma_url, data_api_url, clob_url, timeout, opener = (
+            self.gamma_url,
+            self.data_api_url,
+            self.clob_url,
+            self.timeout,
+            self._opener,
+        )
 
         def create() -> "PolymarketAdapter":
             return PolymarketAdapter(
                 gamma_url=gamma_url,
+                data_api_url=data_api_url,
                 clob_url=clob_url,
                 timeout=timeout,
                 opener=opener,
@@ -148,41 +159,45 @@ class PolymarketAdapter(PredictionMarketDataProvider):
         except HTTPFetchError as exc:
             self._transport_errors.append(exc)
             return None
+    def _data_get(self, path: str, **params: Any) -> Any | None:
+        try:
+            return fetch_json_strict(query_url(self.data_api_url, path, params), self.timeout, self._opener)
+        except HTTPFetchError as exc:
+            self._transport_errors.append(exc)
+            return None
+
+    @staticmethod
+    def _keyset_market_limit(limit: int | None) -> int:
+        return min(100, limit) if limit is not None else 100
 
     def markets(self, active: bool = True, *, limit: int | None = None) -> Sequence[PredictionMarketSnapshot]:
+        """Return a bounded keyset-paginated Gamma market inventory."""
+        if not isinstance(active, bool):
+            raise ValueError("active must be a boolean")
         if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 0):
             raise ValueError("limit must be a non-negative integer")
         if limit == 0:
             return []
-        page_size = min(100, limit) if limit is not None else 100
-        params: dict[str, Any] = {"active": str(bool(active)).lower(), "limit": page_size}
-        if not active:
-            params["closed"] = "true"
-            params["order"] = "createdAt"
-            params["ascending"] = "false"
+        page_size = self._keyset_market_limit(limit)
         result: list[PredictionMarketSnapshot] = []
         seen_ids: set[str] = set()
-        for page_number in range(100):
-            params["offset"] = page_number * page_size
-            payload = self._gamma_get("/markets", **params)
-            if isinstance(payload, Mapping):
-                payload = payload.get("markets", payload.get("data", []))
-            if not isinstance(payload, list):
+        cursor: str | None = None
+        for _ in range(100):
+            page = self.market_page(page_size, after_cursor=cursor, closed=not active)
+            if page.coverage_status == "ERROR":
                 break
-            page_added = 0
-            for record in payload:
-                if not isinstance(record, Mapping):
+            for snapshot in page.snapshots:
+                if snapshot.market_id in seen_ids:
                     continue
-                snapshot = self._snapshot(record)
-                if snapshot is not None and snapshot.market_id not in seen_ids:
-                    seen_ids.add(snapshot.market_id)
-                    result.append(snapshot)
-                    page_added += 1
-                    if limit is not None and len(result) >= int(limit):
-                        return result
-            if len(payload) < page_size or page_added == 0:
+                seen_ids.add(snapshot.market_id)
+                result.append(snapshot)
+                if limit is not None and len(result) >= limit:
+                    return result
+            if page.next_cursor is None:
                 break
+            cursor = page.next_cursor
         return result
+
     def resolve_tag_slug(self, slug: str) -> int | None:
         """Resolve an exact Gamma tag slug to its documented numeric id."""
         normalized = str(slug).strip()
@@ -499,12 +514,19 @@ class PolymarketAdapter(PredictionMarketDataProvider):
 
     @property
     def public_trade_history_available(self) -> bool:
-        """CLOB ``GET /trades`` is authenticated in the current V2 API."""
-        return False
+        """Public Data API market prints are available without credentials."""
+        return True
 
     @property
     def last_trade_cursor(self) -> str | None:
-        return None
+        return self._last_trade_cursor
+
+    @property
+    def last_trades_complete(self) -> bool:
+        return self._last_trades_complete
+
+    def trade_provenance(self, trade: TradePrint) -> Mapping[str, Any]:
+        return dict(self._trade_provenance.get(str(trade.trade_id), {}))
 
     def trades(
         self,
@@ -515,16 +537,238 @@ class PolymarketAdapter(PredictionMarketDataProvider):
         max_pages: int = 100,
         cursor: str | None = None,
     ) -> Sequence[TradePrint]:
-        """Return no rows rather than calling the authenticated account endpoint.
-
-        Public price history and last-trade streams remain available, but they
-        are not equivalent to authenticated account trade history.
-        """
+        """Read public market trades from the credential-free Data API."""
         if isinstance(max_pages, bool) or not isinstance(max_pages, int) or max_pages <= 0:
             raise ValueError("max_pages must be a positive integer")
-        self._last_trades_complete = True
-        self._last_trade_cursor = None
-        return ()
+        identifier = _text(market_id)
+        if identifier is None:
+            raise ValueError("market_id is required")
+        start_utc = ensure_utc(start) if start is not None else None
+        end_utc = ensure_utc(end) if end is not None else None
+        if start_utc is not None and end_utc is not None and start_utc > end_utc:
+            raise ValueError("trade start must not be after end")
+        cursor_text = str(cursor).strip() if cursor is not None else ""
+        window_end = end_utc
+        offset_text = cursor_text
+        coverage_gap = False
+        resume_overlap = False
+        overlap_fingerprint: str | None = None
+        gap_boundary: datetime | None = None
+        if cursor_text.startswith("gap:"):
+            try:
+                gap_boundary = datetime.fromtimestamp(
+                    float(cursor_text.split(":", 1)[1]), tz=timezone.utc
+                )
+            except (TypeError, ValueError, OverflowError, OSError) as exc:
+                raise ValueError("trade cursor gap is malformed") from exc
+            self._last_trades_complete = False
+            self._last_trade_cursor = cursor_text
+            return ()
+        if cursor_text.startswith("window:"):
+            parts = cursor_text.split(":")
+            if len(parts) not in (3, 6) or (len(parts) == 6 and parts[3] != "partial"):
+                raise ValueError("trade cursor window is malformed")
+            try:
+                window_end = datetime.fromtimestamp(float(parts[1]), tz=timezone.utc)
+                offset_text = parts[2]
+                if len(parts) == 6:
+                    coverage_gap = True
+                    resume_overlap = parts[4] != "-"
+                    overlap_fingerprint = parts[4] if resume_overlap else None
+                    gap_boundary = datetime.fromtimestamp(float(parts[5]), tz=timezone.utc)
+            except (TypeError, ValueError, OverflowError, OSError) as exc:
+                raise ValueError("trade cursor window is malformed") from exc
+        try:
+            offset = int(offset_text) if offset_text else 0
+        except (TypeError, ValueError) as exc:
+            raise ValueError("trade cursor must be a non-negative offset") from exc
+        if offset < 0 or offset > 10_000:
+            raise ValueError("trade cursor offset must be in [0,10000]")
+        if (
+            start_utc is not None
+            and window_end is not None
+            and start_utc > window_end
+            and not coverage_gap
+        ):
+            self._last_trades_complete = True
+            self._last_trade_cursor = None
+            return ()
+        request_start = start_utc
+        if coverage_gap and request_start is not None and window_end is not None and request_start > window_end:
+            # A continuation window intentionally backfills below the latest
+            # stored print; the cursor is the authoritative lower boundary.
+            request_start = None
+        snapshot = self._raw_cache.get(identifier)
+        condition_id: str | None = None
+        if isinstance(snapshot, Mapping):
+            condition_id = _text(snapshot.get("conditionId", snapshot.get("condition_id")))
+        if condition_id is None:
+            loaded = self.market(identifier)
+            condition_id = loaded.condition_id if loaded is not None else None
+        # Data API validates market as a 0x-prefixed 64-hex condition id.
+        if condition_id is None or re.fullmatch(r"0x[0-9a-fA-F]{64}", condition_id) is None:
+            self._last_trades_complete = True
+            self._last_trade_cursor = None
+            return ()
+        limit = 1000
+        rows: list[TradePrint] = []
+        seen: set[str] = set()
+        complete = not coverage_gap
+        next_offset = offset
+        continuation_cursor: str | None = None
+        window_first_fingerprint: str | None = None
+        if coverage_gap and gap_boundary is None:
+            raise ValueError("trade cursor partial window is missing its gap boundary")
+        for _ in range(max_pages):
+            # Track valid timestamps for this page only.  The offset cap uses
+            # the oldest valid print as its inclusive continuation boundary;
+            # carrying timestamps across pages could skip a same-second fill.
+            page_timestamps: list[datetime] = []
+            page_identities: list[str] = []
+            query: dict[str, Any] = {
+                "limit": limit,
+                "offset": next_offset,
+                "takerOnly": "true",
+                "market": condition_id,
+            }
+            if request_start is not None:
+                query["start"] = max(0, int(request_start.timestamp()))
+            if window_end is not None:
+                query["end"] = max(0, int(window_end.timestamp()))
+            self._last_trade_query = dict(query)
+            payload = self._data_get("/trades", **query)
+            if payload is None:
+                complete = False
+                break
+            if isinstance(payload, Mapping):
+                payload = payload.get("trades", payload.get("data", []))
+            if not isinstance(payload, list):
+                self._validation_errors.append(PolymarketPayloadError("Data API trades payload is not an array"))
+                complete = False
+                break
+            for raw in payload:
+                if not isinstance(raw, Mapping):
+                    self._validation_errors.append(PolymarketPayloadError("Data API trade row is malformed"))
+                    continue
+                returned_condition = _text(raw.get("conditionId", raw.get("condition_id")))
+                if returned_condition is not None and returned_condition != condition_id:
+                    self._validation_errors.append(
+                        PolymarketBookIdentityError("Data API trade conditionId does not match requested market")
+                    )
+                    continue
+                timestamp = parse_timestamp(raw.get("timestamp", raw.get("time")))
+                if timestamp is None:
+                    try:
+                        timestamp = datetime.fromtimestamp(float(raw.get("timestamp")), tz=timezone.utc)
+                    except (TypeError, ValueError, OverflowError):
+                        timestamp = None
+                price = as_float(raw.get("price"))
+                size = as_float(raw.get("size", raw.get("quantity")))
+                side_text = _text(raw.get("side"))
+                side = side_text.lower() if side_text and side_text.upper() in {"BUY", "SELL"} else None
+                if timestamp is None or price is None or size is None or price <= 0 or size <= 0 or side is None:
+                    self._validation_errors.append(PolymarketPayloadError("Data API trade row is invalid"))
+                    continue
+                page_timestamps.append(timestamp)
+                token_id = _text(raw.get("asset")) or _text(raw.get("token_id"))
+                source_identity = _trade_source_identity(raw)
+                identity = _trade_identity(
+                    condition_id=condition_id,
+                    raw=raw,
+                    timestamp=timestamp,
+                    token_id=token_id,
+                    side=side,
+                    price=price,
+                    size=size,
+                )
+                page_identities.append(identity)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                trade = TradePrint(
+                    timestamp=timestamp,
+                    price=price,
+                    size=size,
+                    side=side,
+                    trade_id=identity,
+                    market_id=identifier,
+                    token_id=token_id,
+                )
+                rows.append(trade)
+                self._trade_provenance.setdefault(
+                    identity,
+                    {
+                        "source_type": "FORWARD_COLLECTED",
+                        "provider": self.provider_name,
+                        "endpoint": "/trades",
+                        "query": dict(query),
+                        "condition_id": condition_id,
+                        "source_identity": source_identity,
+                        "response_timestamp": timestamp.isoformat(),
+                    },
+                )
+            page_fingerprint = _trade_page_fingerprint(page_identities)
+            if window_first_fingerprint is None:
+                window_first_fingerprint = page_fingerprint
+            if resume_overlap:
+                resume_overlap = False
+                if overlap_fingerprint is not None and page_fingerprint == overlap_fingerprint:
+                    # Replaying the inclusive boundary is intentional.  Once
+                    # the overlap is confirmed, move below that second so a
+                    # bounded poll does not restart page one forever.
+                    boundary = gap_boundary
+                    if boundary is None:
+                        raise ValueError("trade cursor partial window is missing its gap boundary")
+                    window_end = boundary - timedelta(seconds=1)
+                    request_start = None
+                    next_offset = 0
+                    overlap_fingerprint = None
+                    window_first_fingerprint = None
+                    if len(payload) < limit:
+                        continuation_cursor = f"gap:{boundary.timestamp():.6f}"
+                        break
+                    continue
+            next_offset += len(payload)
+            if len(payload) < limit:
+                if coverage_gap and gap_boundary is not None:
+                    continuation_cursor = f"gap:{gap_boundary.timestamp():.6f}"
+                break
+            complete = False
+            if next_offset > 10_000:
+                if not page_timestamps:
+                    self._validation_errors.append(
+                        PolymarketPayloadError("Data API trade page has no valid timestamps for continuation")
+                    )
+                    break
+                boundary = min(page_timestamps)
+                coverage_gap = True
+                if gap_boundary is None:
+                    gap_boundary = boundary
+                overlap_fingerprint = window_first_fingerprint or page_fingerprint
+                continuation_cursor = (
+                    f"window:{boundary.timestamp():.6f}:0:partial:"
+                    f"{overlap_fingerprint}:{gap_boundary.timestamp():.6f}"
+                )
+                self._validation_errors.append(
+                    PolymarketPayloadError(
+                        "Data API trade pagination reached the offset cap; "
+                        "the boundary timestamp may contain an unrecoverable partial gap"
+                    )
+                )
+                break
+        if continuation_cursor is None and not complete:
+            if coverage_gap and gap_boundary is not None:
+                current_end = window_end.timestamp() if window_end is not None else 0.0
+                continuation_cursor = (
+                    f"window:{current_end:.6f}:{next_offset}:partial:-:"
+                    f"{gap_boundary.timestamp():.6f}"
+                )
+            else:
+                continuation_cursor = str(next_offset)
+        self._last_trades_complete = bool(complete and not coverage_gap)
+        self._last_trade_cursor = continuation_cursor if not self._last_trades_complete else None
+        rows.sort(key=lambda item: (item.timestamp, item.trade_id or ""))
+        return tuple(rows)
 
     @staticmethod
     def _levels(value: Any, *, reverse: bool, depth: int) -> list[OrderBookLevel]:
@@ -813,6 +1057,61 @@ class PolymarketAdapter(PredictionMarketDataProvider):
         )
         self._provider_timestamps[("market", identifier)] = timestamp
         return snapshot
+
+
+def _trade_source_identity(raw: Mapping[str, Any]) -> dict[str, str | None]:
+    transaction_hash = _text(raw.get("transactionHash")) or _text(raw.get("transaction_hash"))
+    fill_id = (
+        _text(raw.get("fillId"))
+        or _text(raw.get("fill_id"))
+        or _text(raw.get("tradeId"))
+        or _text(raw.get("trade_id"))
+        or _text(raw.get("id"))
+    )
+    return {
+        "transaction_hash": transaction_hash,
+        "fill_id": fill_id,
+    }
+
+
+def _trade_identity(
+    *,
+    condition_id: str,
+    raw: Mapping[str, Any],
+    timestamp: datetime,
+    token_id: str | None,
+    side: str,
+    price: float,
+    size: float,
+) -> str:
+    """Build a durable identity for one public fill, not only its transaction.
+
+    A single on-chain transaction can settle several fills.  The Data API does
+    not promise a transaction hash is a row identity, so the canonical key
+    includes the source/fill identifiers and every economic field that
+    distinguishes one print from another.  Replayed rows with the same fields
+    hash to the same key while same-transaction fills remain separate.
+    """
+    source_identity = _trade_source_identity(raw)
+    canonical = {
+        "condition_id": condition_id,
+        "source": source_identity,
+        "token_id": token_id,
+        "side": side,
+        "timestamp": timestamp.isoformat(),
+        "price": format(price, ".17g"),
+        "size": format(size, ".17g"),
+    }
+    digest = hashlib.sha256(
+        json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return f"polymarket:{digest}"
+
+
+def _trade_page_fingerprint(identities: Sequence[str]) -> str:
+    return hashlib.sha256(
+        json.dumps(list(identities), separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
 
 
 def _normalized_number(value: Any, name: str, *, minimum: float | None = None) -> str:

@@ -4,10 +4,13 @@ from datetime import datetime, timedelta, timezone
 import unittest
 
 from axiom.backtest.prediction import PredictionMarketBacktester
+from axiom.strategy import SignalEvaluator
 from axiom.strategy.signals import (
     CONSTANT_BASELINE,
+    DIRECTIONAL_OOS_TRADING,
     INSUFFICIENT_LOOKBACK,
     MODEL_INPUT_MISSING,
+    PROBABILITY_CALIBRATION_UNKNOWN,
     SIGNAL_PRODUCED,
     STRATEGY_EVALUATED_DECLINED,
     WARMING_UP,
@@ -58,6 +61,11 @@ class MarketScopeStrategyInputTests(unittest.TestCase):
         context = {"market_id": "a", "observations": rows}
         evaluation = evaluate_signal_evaluation(prediction_strategy("momentum", lookback=1, threshold=0.1), context)
         self.assertEqual(evaluation.reason_code, SIGNAL_PRODUCED)
+        self.assertEqual(evaluation.evidence["assessment_type"], DIRECTIONAL_OOS_TRADING)
+        self.assertEqual(
+            evaluation.evidence["probability_calibration"],
+            PROBABILITY_CALIBRATION_UNKNOWN,
+        )
         self.assertGreater(evaluation.score, 0.0)
         backtest = PredictionMarketBacktester(fee_bps=0.0, slippage_bps=0.0).run(
             rows,
@@ -98,12 +106,35 @@ class MarketScopeStrategyInputTests(unittest.TestCase):
             {"observations": [equal]},
         )
         self.assertEqual(declined.reason_code, STRATEGY_EVALUATED_DECLINED)
+        self.assertEqual(declined.score, 0.0)
+        self.assertEqual(declined.side, "flat")
         produced = evaluate_signal_evaluation(
             prediction_strategy("probability_mispricing", threshold=0.05),
             {"observations": [snapshot("a", T0, 0.40, model=0.80)]},
         )
         self.assertEqual(produced.reason_code, SIGNAL_PRODUCED)
-        self.assertTrue(produced.actionable)
+        self.assertGreater(produced.score, 0.0)
+        self.assertEqual(produced.side, "buy")
+        self.assertEqual(produced.evidence["model"]["probability"], 0.80)
+        negative = evaluate_signal_evaluation(
+            prediction_strategy("probability_mispricing", threshold=0.05),
+            {"observations": [snapshot("a", T0, 0.60, model=0.20)]},
+        )
+        self.assertEqual(negative.reason_code, SIGNAL_PRODUCED)
+        self.assertLess(negative.score, 0.0)
+        self.assertEqual(negative.side, "sell")
+        self.assertEqual(negative.evidence["model"]["probability"], 0.20)
+
+    def test_public_signal_evaluator_import_and_record_contract(self) -> None:
+        evaluator = SignalEvaluator()
+        strategy = prediction_strategy("probability_mispricing", threshold=0.05)
+        context = {"observations": [snapshot("a", T0, 0.40, model=0.80)]}
+        score = evaluator(strategy, context)
+        record = evaluator.evaluate_record(strategy, context)
+        self.assertGreater(score, 0.0)
+        self.assertEqual(record.score, score)
+        self.assertEqual(record.reason_code, SIGNAL_PRODUCED)
+        self.assertEqual(record.evidence["model"]["evidence"]["model_source"], "OBSERVATION")
 
 
 if __name__ == "__main__":

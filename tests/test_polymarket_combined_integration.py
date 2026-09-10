@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 import hashlib
 import json
 from pathlib import Path
@@ -9,9 +10,15 @@ import unittest
 from unittest.mock import patch
 
 from axiom.auto_canary import AutonomousCanaryWorker
-from axiom.canary import CanaryService
+from axiom.canary import CanaryService, CredentialStore
+from axiom.canary_positions import CanaryPositionManager
 from axiom.dashboard import DashboardData
+
 from axiom.experiment_plan import normalize_market_scope
+from axiom.legacy_scope import (
+    freeze_canonical_scope_proposal,
+    handoff_current_scope_resolution,
+)
 from axiom.market_scope import resolve_market_scope
 from axiom.storage import AxiomStore
 
@@ -50,6 +57,105 @@ class _NoCredentialProbe:
         type(self).forbidden_calls.append("load")
         raise AssertionError("dashboard attempted credential loading")
 
+class _QualifiedCanaryCredentials(CredentialStore):
+    _VALUES = {
+        "private_key": "fixture-private-key",
+        "wallet_address": "0x0000000000000000000000000000000000000001",
+    }
+
+    def configured(self, **_kwargs: object) -> bool:
+        return True
+
+    def load(self, **_kwargs: object) -> dict[str, str]:
+        return dict(self._VALUES)
+
+
+class _PositionCanaryVenue:
+    def __init__(self, *, timestamp: datetime = T0) -> None:
+        self.submissions: list[dict[str, object]] = []
+        self.orders: dict[str, dict[str, object]] = {}
+        self._entry_count = 0
+        self.timestamp = timestamp
+
+    def geoblock(self) -> dict[str, object]:
+        return {"blocked": False, "close_only": False, "country": "ZZ"}
+
+    def connectivity_check(self) -> bool:
+        return True
+
+    def balance(self) -> Decimal:
+        return Decimal("100")
+
+    def market_context(self, market_id: str, token_id: str) -> dict[str, object]:
+        return {
+            "market_id": market_id,
+            "token_id": token_id,
+            "asset_id": token_id,
+            "market_version": "v2",
+            "neg_risk": False,
+            "accepting_orders": True,
+            "min_order_size": "0.01",
+            "tick_size": "0.01",
+            "fee_bps": "10",
+            "bids": [{"price": "0.22", "size": "100"}],
+            "asks": [{"price": "0.21", "size": "100"}],
+        }
+
+    def submit_limit_order(
+        self,
+        *,
+        token_id: str,
+        side: str,
+        price: Decimal,
+        size: Decimal,
+    ) -> dict[str, object]:
+        is_exit = str(side).upper() == "SELL"
+        order_id = (
+            "exit-order"
+            if is_exit
+            else f"entry-order-{self._entry_count + 1}"
+        )
+        if not is_exit:
+            self._entry_count += 1
+        quantity = Decimal(str(size))
+        fill_quantity = quantity if is_exit or self._entry_count > 1 else quantity / 2
+        order = {
+            "ok": True,
+            "order_id": order_id,
+            "status": "FILLED" if is_exit else "MATCHED",
+            "fill_quantity": str(fill_quantity),
+            "settlement_status": "SETTLED" if is_exit else None,
+            "actual_average_price": str(price),
+            "fees": str(fill_quantity * price * (Decimal("1") - price) * Decimal("0.001")),
+            "fill_timestamp": self.timestamp.isoformat(),
+        }
+        self.submissions.append(
+            {
+                "token_id": token_id,
+                "side": side,
+                "price": str(price),
+                "size": str(size),
+            }
+        )
+        self.orders[order_id] = order
+        return order
+
+    def get_order(self, *, order_id: str) -> dict[str, object]:
+        return dict(self.orders[order_id])
+
+    def list_account_trades(self, *, order_id: str) -> list[dict[str, object]]:
+        order = self.orders[order_id]
+        return [
+            {
+                "id": f"{order_id}-trade",
+                "quantity": order["fill_quantity"],
+                "price": order["actual_average_price"],
+                "fee": order["fees"],
+                "status": "CONFIRMED",
+                "timestamp": order["fill_timestamp"],
+            }
+        ]
+
 
 def _document_hash(value: object) -> str:
     encoded = json.dumps(
@@ -61,15 +167,32 @@ def _document_hash(value: object) -> str:
     return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
-def _historical_dataset(store: AxiomStore) -> None:
-    store.save_dataset(
-        "prediction-history",
-        "v1",
-        [{"timestamp": T0.isoformat(), "price": 0.5, "source_type": "HISTORICAL"}],
-    )
+def _historical_dataset(
+    store: AxiomStore,
+    *,
+    dataset_id: str = "prediction-history",
+    dataset_version: str = "v1",
+    market_id: str | None = None,
+) -> tuple[str, str]:
+    row: dict[str, object] = {
+        "timestamp": T0.isoformat(),
+        "price": 0.5,
+        "source_type": "HISTORICAL",
+    }
+    if market_id:
+        row["market_id"] = market_id
+    store.save_dataset(dataset_id, dataset_version, [row])
+    catalog_metadata: dict[str, object] = {
+        "provider": "polymarket",
+        "source_type": "HISTORICAL",
+        "research_quality": "PRICE_PROXY",
+        "historical_order_book_available": False,
+    }
+    if market_id:
+        catalog_metadata["market_id"] = market_id
     store.save_dataset_catalog(
-        "prediction-history",
-        "v1",
+        dataset_id,
+        dataset_version,
         provider="polymarket",
         instrument="POLYMARKET",
         market_type="prediction",
@@ -80,14 +203,14 @@ def _historical_dataset(store: AxiomStore) -> None:
         completeness=1.0,
         quality="PRICE_PROXY",
         source_type="HISTORICAL",
-        snapshot_id="prediction-history:v1",
-        metadata={
-            "provider": "polymarket",
-            "source_type": "HISTORICAL",
-            "research_quality": "PRICE_PROXY",
-            "historical_order_book_available": False,
-        },
+        snapshot_id=f"{dataset_id}:{dataset_version}",
+        metadata=catalog_metadata,
     )
+    store.verify_dataset_integrity_attestation(
+        dataset_id,
+        dataset_version,
+    )
+    return dataset_id, dataset_version
 
 
 def _candidate_payload(
@@ -98,28 +221,32 @@ def _candidate_payload(
     model_probability: float = 0.80,
     cluster: str = "cluster-a",
     score: float = 0.10,
+    dataset_id: str = "prediction-history",
+    dataset_version: str = "v1",
+    dataset_attestation: dict[str, object] | None = None,
 ) -> dict[str, object]:
     parts = ("strategy-v1", "model-v1", "config-v1")
     payload: dict[str, object] = {
         "market_type": "prediction",
-        "dataset_id": "prediction-history",
-        "dataset_version": "v1",
+        "dataset_id": dataset_id,
+        "dataset_version": dataset_version,
         "plan_hash": "sha256:fixture-plan",
         "dataset_selector": {
-            "dataset_id": "prediction-history",
-            "dataset_version": "v1",
+            "dataset_id": dataset_id,
+            "dataset_version": dataset_version,
             "source_type": "HISTORICAL",
         },
-        "dataset_attestation": {
-            "dataset_id": "prediction-history",
-            "dataset_version": "v1",
+        "dataset_attestation": dataset_attestation
+        or {
+            "dataset_id": dataset_id,
+            "dataset_version": dataset_version,
             "status": "CURRENT",
             "policy_version": "v1",
             "attestation_hash": "fixture-attestation",
         },
         "dataset_provenance": {
-            "dataset_id": "prediction-history",
-            "dataset_version": "v1",
+            "dataset_id": dataset_id,
+            "dataset_version": dataset_version,
             "source_type": "HISTORICAL",
             "time_split": "train-validation-holdout",
         },
@@ -130,6 +257,7 @@ def _candidate_payload(
         "validation_passed": True,
         "robustness_passed": True,
         "data_quality_passed": True,
+        "exit_policy": {"type": "fixed_holding_period", "holding_period_seconds": 0},
         "frozen": True,
         "holdout_used": False,
         "strategy_hash": parts[0],
@@ -260,6 +388,8 @@ def _seed_market(
     *,
     snapshot: bool,
     stale_model_probability: float = 0.10,
+    observed_at: datetime = T0,
+    snapshot_id: str | None = None,
 ) -> None:
     expiry = (T0 + timedelta(hours=2)).isoformat()
     store.save_polymarket_market_metadata(
@@ -273,13 +403,13 @@ def _seed_market(
             "expiry": expiry,
             "source_type": "FORWARD_COLLECTED",
         },
-        observed_at=T0,
+        observed_at=observed_at,
         source_type="FORWARD_COLLECTED",
     )
     if not snapshot:
         return
     order_book = {
-        "timestamp": T0.isoformat(),
+        "timestamp": observed_at.isoformat(),
         "token_id": f"{market_id}-yes-token",
         "asks": [{"price": "0.21", "size": "10"}],
     }
@@ -303,10 +433,10 @@ def _seed_market(
         },
     }
     store.save_polymarket_snapshot(
-        f"{market_id}-snapshot-1",
+        snapshot_id or f"{market_id}-snapshot-1",
         market_id,
-        T0,
-        T0,
+        observed_at,
+        observed_at,
         {
             "source_type": "FORWARD_COLLECTED",
             "snapshot": observation,
@@ -378,7 +508,11 @@ class PolymarketCombinedIntegrationTests(unittest.TestCase):
     def test_worker_scans_eligible_candidates_without_persisted_ranking(self):
         store = self._store()
         _historical_dataset(store)
-        service = CanaryService(store, clock=lambda: T0)
+        service = CanaryService(
+            store,
+            credentials=_QualifiedCanaryCredentials(),
+            clock=lambda: T0,
+        )
         candidate_ids = [f"scan-candidate-{index:02d}" for index in range(12)]
         for index, candidate_id in enumerate(candidate_ids):
             market_id = f"scan-market-{index:02d}"
@@ -392,7 +526,12 @@ class PolymarketCombinedIntegrationTests(unittest.TestCase):
                 cluster="cluster-a" if index < 6 else f"cluster-{index:02d}",
                 score=0.90 - index / 100,
             )
-        service.enable_autonomous_micro_live()
+        settings = service.settings.snapshot()
+        service.enable_autonomous_micro_live(
+            venue="polymarket",
+            config_id=str(settings["config_id"]),
+            expected_generation=int(settings["generation"]),
+        )
 
         with store._lock:
             ranking_count_before = store.connection.execute(
@@ -461,7 +600,11 @@ class PolymarketCombinedIntegrationTests(unittest.TestCase):
     def test_worker_surfaces_missing_executable_authority_after_binding_fence(self):
         store = self._store()
         _historical_dataset(store)
-        service = CanaryService(store, clock=lambda: T0)
+        service = CanaryService(
+            store,
+            credentials=_QualifiedCanaryCredentials(),
+            clock=lambda: T0,
+        )
         candidate_id = "missing-executable-authority"
         market_id = "missing-authority-market"
         _seed_market(store, market_id, snapshot=True)
@@ -472,7 +615,12 @@ class PolymarketCombinedIntegrationTests(unittest.TestCase):
             target_market_id=market_id,
             executable=True,
         )
-        service.enable_autonomous_micro_live()
+        settings = service.settings.snapshot()
+        service.enable_autonomous_micro_live(
+            venue="polymarket",
+            config_id=str(settings["config_id"]),
+            expected_generation=int(settings["generation"]),
+        )
 
         original_evaluate = CanaryService.evaluate_signal
 
@@ -589,6 +737,388 @@ class PolymarketCombinedIntegrationTests(unittest.TestCase):
             f"{market_id}-snapshot-1",
         )
 
+    @patch.dict("os.environ", {"AXIOM_EXECUTION_PROFILE": "production"})
+    def test_dashboard_canary_accepts_qualified_partial_full_and_owned_exit(self):
+        store = self._store()
+        _historical_dataset(store)
+        now = [T0]
+        service = CanaryService(
+            store,
+            credentials=_QualifiedCanaryCredentials(),
+            clock=lambda: now[0],
+        )
+        candidate_id = "dashboard-position-candidate"
+        market_id = "dashboard-position-market"
+        _seed_market(store, market_id, snapshot=True)
+        _seed_candidate(
+            store,
+            service,
+            candidate_id,
+            target_market_id=market_id,
+            executable=True,
+        )
+        venue = _PositionCanaryVenue(timestamp=now[0])
+        settings = service.settings.snapshot()
+        armed = service.arm(
+            candidate_id,
+            venue=venue,
+            credentials_configured=True,
+            config_id=str(settings["config_id"]),
+            expected_generation=int(settings["generation"]),
+        )
+        self.assertEqual(armed["micro_live_canary"], "ARMED")
+        positions = CanaryPositionManager(service)
+        positions.reconcile_pending(venue, allow_test_venue=True)
+
+        first_evaluation = service.evaluate_signal(
+            candidate_id,
+            cycle_id="dashboard-position-partial",
+        )
+        first_signal = first_evaluation.get("signal")
+        self.assertIsInstance(first_signal, dict)
+        first_submission = service.submit_signal(
+            str(first_signal["signal_id"]),
+            venue=venue,
+            allow_test_venue=True,
+        )
+        self.assertEqual(first_submission["execution_status"], "MATCHED", first_submission)
+        provisional_event = store.connection.execute(
+            "SELECT event_id,status,fill_quantity,settlement FROM canary_ledger "
+            "WHERE signal_id=?",
+            (first_signal["signal_id"],),
+        ).fetchone()
+        self.assertIsNotNone(provisional_event)
+        assert provisional_event is not None
+        self.assertEqual(provisional_event["status"], "MATCHED")
+        self.assertIsNone(provisional_event["fill_quantity"])
+        self.assertIsNone(provisional_event["settlement"])
+        self.assertIsNone(
+            store.connection.execute(
+                "SELECT 1 FROM canary_position_lots WHERE event_id=?",
+                (provisional_event["event_id"],),
+            ).fetchone()
+        )
+        self.assertIsNone(
+            store.connection.execute(
+                "SELECT 1 FROM canary_risk_fills AS f "
+                "JOIN canary_risk_reservations AS r "
+                "ON r.reservation_id=f.reservation_id WHERE r.event_id=?",
+                (provisional_event["event_id"],),
+            ).fetchone()
+        )
+        with store.connection:
+            store.connection.execute(
+                "UPDATE canary_ledger SET status='ACCEPTED' WHERE signal_id=?",
+                (first_signal["signal_id"],),
+            )
+        entry_reconciliation = positions.reconcile_pending(
+            venue,
+            allow_test_venue=True,
+        )
+        self.assertEqual(entry_reconciliation["status"], "RECONCILED")
+        self.assertEqual(entry_reconciliation["blocked"], 0)
+
+        first_event = store.connection.execute(
+            "SELECT event_id,fill_quantity,submitted_quantity,status "
+            "FROM canary_ledger WHERE signal_id=?",
+            (first_signal["signal_id"],),
+        ).fetchone()
+        self.assertIsNotNone(first_event)
+        assert first_event is not None
+        self.assertGreater(Decimal(first_event["fill_quantity"]), Decimal("0"))
+        self.assertLess(
+            Decimal(first_event["fill_quantity"]),
+            Decimal(first_event["submitted_quantity"]),
+        )
+
+        now[0] += timedelta(seconds=1)
+        venue.timestamp = now[0]
+        _seed_market(
+            store,
+            market_id,
+            snapshot=True,
+            observed_at=now[0],
+            snapshot_id=f"{market_id}-snapshot-2",
+        )
+        second_evaluation = service.evaluate_signal(
+            candidate_id,
+            cycle_id="dashboard-position-full",
+        )
+        second_signal = second_evaluation.get("signal")
+        self.assertIsInstance(second_signal, dict)
+        second_submission = service.submit_signal(
+            str(second_signal["signal_id"]),
+            venue=venue,
+            allow_test_venue=True,
+        )
+        self.assertEqual(second_submission["execution_status"], "MATCHED", second_submission)
+        entry_reconciliation = CanaryPositionManager(service).reconcile_pending(
+            venue,
+            allow_test_venue=True,
+        )
+        self.assertEqual(entry_reconciliation["status"], "RECONCILED")
+        self.assertEqual(entry_reconciliation["blocked"], 0)
+        second_event = store.connection.execute(
+            "SELECT event_id,fill_quantity,submitted_quantity FROM canary_ledger "
+            "WHERE signal_id=?",
+            (second_signal["signal_id"],),
+        ).fetchone()
+        self.assertIsNotNone(second_event)
+        assert second_event is not None
+        self.assertEqual(
+            Decimal(second_event["fill_quantity"]),
+            Decimal(second_event["submitted_quantity"]),
+        )
+        full_reservation = store.connection.execute(
+            "SELECT status,remaining_cost,released_at FROM canary_risk_reservations "
+            "WHERE event_id=?",
+            (second_event["event_id"],),
+        ).fetchone()
+        self.assertEqual(full_reservation["status"], "RELEASED")
+        self.assertEqual(Decimal(full_reservation["remaining_cost"]), Decimal("0"))
+        self.assertIsNotNone(full_reservation["released_at"])
+        dashboard = DashboardData(store=store, control=service)
+        canary_projection = dashboard.canary_data()
+        self.assertGreaterEqual(
+            canary_projection["canary"]["execution_event_count"],
+            2,
+        )
+        self.assertEqual(
+            canary_projection["canary"]["production_live_trading"],
+            "DISABLED",
+        )
+        latest_signal = canary_projection["canary"]["latest_signal"]
+        self.assertIsInstance(latest_signal, dict)
+        self.assertNotEqual(latest_signal["status"], "NO_SIGNAL")
+
+        positions = CanaryPositionManager(service)
+        # The minimum-sized partial fill is below the venue's exit minimum.
+        # Exit the fully filled lot without consuming that separate inventory.
+        position_id = "position:" + str(second_event["event_id"])
+        exit_settings = service.settings.snapshot()
+        exit_request = positions.submit_exit(
+            position_id,
+            venue,
+            expected_generation=int(exit_settings["generation"]),
+            config_id=str(exit_settings["config_id"]),
+            allow_test_venue=True,
+        )
+        self.assertEqual(exit_request["status"], "FILLED", exit_request)
+        pending_lot = store.connection.execute(
+            "SELECT sold_quantity,pending_exit_quantity FROM canary_position_lots WHERE position_id=?",
+            (position_id,),
+        ).fetchone()
+        self.assertEqual(Decimal(pending_lot["sold_quantity"]), Decimal("0"))
+        self.assertEqual(
+            Decimal(pending_lot["pending_exit_quantity"]),
+            Decimal(second_event["fill_quantity"]),
+        )
+        reconciliation = positions.reconcile_pending(venue, allow_test_venue=True)
+        self.assertEqual(reconciliation["status"], "RECONCILED")
+        self.assertEqual(reconciliation["blocked"], 0)
+        self.assertEqual(reconciliation["requests"][0]["status"], "SETTLED")
+        lot = store.connection.execute(
+            "SELECT sold_quantity,pending_exit_quantity,status "
+            "FROM canary_position_lots WHERE position_id=?",
+            (position_id,),
+        ).fetchone()
+        self.assertIsNotNone(lot)
+        assert lot is not None
+        self.assertEqual(Decimal(lot["pending_exit_quantity"]), Decimal("0"))
+        self.assertEqual(lot["status"], "CLOSED")
+        self.assertEqual(Decimal(lot["sold_quantity"]), Decimal(second_event["fill_quantity"]))
+        partial_lot = store.connection.execute(
+            "SELECT quantity,sold_quantity FROM canary_position_lots WHERE event_id=?",
+            (first_event["event_id"],),
+        ).fetchone()
+        self.assertEqual(
+            Decimal(partial_lot["quantity"]) - Decimal(partial_lot["sold_quantity"]),
+            Decimal(first_event["fill_quantity"]),
+        )
+
+    def test_canonical_proposal_research_freeze_resolution_fresh_inputs_decide(self):
+        store = self._store()
+        market_id = "canonical-chain-market"
+        canonical_identity = _document_hash(
+            [{"timestamp": T0.isoformat(), "price": 0.5, "market_id": market_id}]
+        )
+        dataset_id, dataset_version = _historical_dataset(
+            store,
+            dataset_id=f"prediction:{market_id}",
+            dataset_version=canonical_identity,
+            market_id=market_id,
+        )
+        dataset_attestation = store.verify_dataset_integrity_attestation(
+            dataset_id,
+            dataset_version,
+        )
+        candidate_id = "canonical-chain-predecessor"
+        predecessor_hash = "canonical-predecessor-frozen"
+        proposal_document = {
+            "proposal_id": "canonical-chain-proposal",
+            "candidate_id": candidate_id,
+            "predecessor_frozen_hash": predecessor_hash,
+            "statement": "A bounded current market probability edge is testable.",
+            "source": "canonical integration fixture",
+            "tests": ["chronological train-validation-holdout"],
+            "dataset_version": dataset_version,
+            "time_split": "train-validation-holdout",
+            "paper_only": True,
+            "market_scope": {
+                "schema_version": "1",
+                "mode": "EXACT_MARKETS",
+                "instrument": "POLYMARKET",
+                "categories": [],
+                "market_ids": [market_id],
+                "filters": {},
+                "regime_restrictions": {},
+                "provenance": "canonical",
+            },
+            "experiment_plan": {
+                "market_type": "prediction",
+                "dataset_id": dataset_id,
+                "dataset_version": dataset_version,
+                "dataset_selector": {
+                    "dataset_id": dataset_id,
+                    "dataset_version": dataset_version,
+                    "source_type": "HISTORICAL",
+                },
+                "market_scope": {
+                    "schema_version": "1",
+                    "mode": "EXACT_MARKETS",
+                    "instrument": "POLYMARKET",
+                    "categories": [],
+                    "market_ids": [market_id],
+                    "filters": {},
+                    "regime_restrictions": {},
+                    "provenance": "canonical",
+                },
+            },
+        }
+        # The proposal enters the ordinary durable research queue before the
+        # canonical scope is frozen; the completion record is the research
+        # evidence consumed by the successor proposal.
+        from axiom.research_bus import DurableResearchBus
+
+        bus = DurableResearchBus(store, source="integration", author="test")
+        queued = bus.submit_proposal(
+            proposal_document,
+            dedupe_key="canonical-chain-proposal",
+            available_at=T0,
+        )
+        claimed = bus.claim("canonical-chain-researcher", now=T0)
+        self.assertIsNotNone(claimed)
+        assert claimed is not None
+        research = {
+            "proposal_id": proposal_document["proposal_id"]
+            if "proposal_id" in proposal_document
+            else queued.payload.get("proposal_id"),
+            "status": "HISTORICAL_RESEARCH_COMPLETE",
+            "metrics": {
+                "sample_count": 100,
+                "trade_count": 50,
+                "expectancy": 0.10,
+            },
+        }
+        completed = bus.complete(
+            claimed.item_id,
+            result=research,
+            worker="canonical-chain-researcher",
+            now=T0,
+        )
+        self.assertEqual(completed.status.value, "COMPLETED")
+
+        frozen = freeze_canonical_scope_proposal(
+            {**proposal_document, "research": research},
+            assumptions={"input_age_seconds": 30, "execution": "paper_only"},
+            source_candidate_id=candidate_id,
+            source_frozen_hash=predecessor_hash,
+        )
+        self.assertEqual(frozen["canonical_scope_provenance"], "canonical")
+        self.assertEqual(frozen["assumptions"]["input_age_seconds"], 30)
+        self.assertEqual(frozen["predecessor_candidate_id"], candidate_id)
+        current_resolution = {
+            "market_id": market_id,
+            "question": f"Will {market_id} resolve yes?",
+            "settlement": "open",
+            "outcome": None,
+            "expiry": (T0 + timedelta(hours=2)).isoformat(),
+            "token_ids": {
+                "yes": f"{market_id}-yes-token",
+                "no": f"{market_id}-no-token",
+            },
+        }
+        handed_off = handoff_current_scope_resolution(frozen, current_resolution)
+        self.assertEqual(handed_off["current_resolution"], current_resolution)
+        self.assertTrue(str(handed_off["resolution_handoff_hash"]).startswith("sha256:"))
+
+        _seed_market(store, market_id, snapshot=True, stale_model_probability=0.05)
+        service = CanaryService(store, clock=lambda: T0)
+        payload = _candidate_payload(
+            frozen["proposal_id"],
+            target_market_id=market_id,
+            executable=True,
+            model_probability=0.80,
+            dataset_id=dataset_id,
+            dataset_version=dataset_version,
+            dataset_attestation=dict(dataset_attestation),
+        )
+        payload.update(
+            {
+                "proposal_id": frozen["proposal_id"],
+                "research": research,
+                "current_resolution": handed_off["current_resolution"],
+                "resolution_fields": handed_off["resolution_fields"],
+                "resolution_handoff_hash": handed_off["resolution_handoff_hash"],
+            }
+        )
+        store.save_candidate_lifecycle(
+            frozen["proposal_id"],
+            "IDEA",
+            payload,
+            timestamp=T0,
+        )
+        store.save_candidate_lifecycle(
+            frozen["proposal_id"],
+            "FROZEN",
+            payload,
+            from_stage="IDEA",
+            timestamp=T0,
+        )
+        service.mark_eligible(frozen["proposal_id"], publish_readiness=False)
+        resolution = resolve_market_scope(
+            frozen["proposal_id"],
+            payload,
+            [
+                {
+                    **current_resolution,
+                    "condition_id": f"{market_id}-condition",
+                    "yes_token_id": f"{market_id}-yes-token",
+                    "no_token_id": f"{market_id}-no-token",
+                    "source_type": "CURRENT",
+                    "provider": "polymarket",
+                    "instrument": "POLYMARKET",
+                    "active": True,
+                    "open": True,
+                    "closed": False,
+                    "accepting_orders": True,
+                    "order_book_available": True,
+                }
+            ],
+            resolved_at=T0,
+        )
+        store.save_market_scope_resolution(resolution)
+
+        decision = service.evaluate_signal(
+            frozen["proposal_id"],
+            cycle_id="canonical-chain-fresh-inputs",
+        )
+        self.assertEqual(decision["reason_code"], "READY_SIGNAL")
+        self.assertEqual(decision["market_id"], market_id)
+        self.assertEqual(decision["evidence"]["scope_resolution_status"], "MATCHED")
+        self.assertEqual(decision["evidence"]["source_type"], "FORWARD_COLLECTED")
+        self.assertEqual(decision["signal"]["evidence"]["model_probability"], 0.80)
+        self.assertNotEqual(decision["signal"]["evidence"]["model_probability"], 0.05)
 
 if __name__ == "__main__":
     unittest.main()

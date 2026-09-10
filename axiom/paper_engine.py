@@ -106,10 +106,12 @@ class ForwardPaperEngine:
         if self._execution_mode not in {"forward", "historical_replay", "isolated"}:
             raise ValueError("execution_mode is invalid")
         self._execution_strategy_id = spec.strategy_hash
+        self._research_mode = "RECORDED_BOOK_REPLAY" if self._execution_mode == "historical_replay" else "PAPER_FORWARD"
         self._execution_binding = {
             "experiment_id": self._run_id,
             "spec_experiment_id": spec.experiment_id,
             "execution_mode": self._execution_mode,
+            "research_mode": self._research_mode,
             "strategy_hash": spec.strategy_hash,
             "model_hash": spec.model_hash,
             "config_hash": hashlib.sha256(
@@ -367,25 +369,73 @@ class ForwardPaperEngine:
                 errors.append("malformed prediction observation")
                 continue
             market_id, observation, yes_book, no_book = normalized
-            source_type = str(observation.get("source_type", "FORWARD_COLLECTED")).strip().upper()
-            if self._execution_mode != "historical_replay" and source_type != "FORWARD_COLLECTED":
+            terminal = _is_terminal(observation.get("settlement"))
+
+            source_type = str(observation.get("source_type", "FORWARD_COLLECTED")).strip().upper() or "FORWARD_COLLECTED"
+            observation["source_type"] = source_type
+            if self._execution_mode == "historical_replay":
+                if source_type == "PAPER_FORWARD":
+                    skipped += 1
+                    errors.append(f"historical replay rejects PAPER_FORWARD for {market_id}")
+                    continue
+                if not terminal and not (
+                    _explicit_book_timestamp(_raw_observation_book(raw, "yes"))
+                    or _explicit_book_timestamp(_raw_observation_book(raw, "no"))
+                ):
+                    skipped += 1
+                    errors.append(f"historical replay missing observed order book for {market_id}")
+                    continue
+            elif source_type != "FORWARD_COLLECTED":
                 skipped += 1
                 errors.append(f"stored fallback requires FORWARD_COLLECTED for {market_id}")
                 continue
             if self.spec.allowed_markets and market_id not in self.spec.allowed_markets:
                 skipped += 1
                 continue
+            observed_at = parse_timestamp(observation.get("observed_at"))
+            source_future = next(
+                (
+                    (name, parsed)
+                    for name in (
+                        "source_timestamp",
+                        "as_of_timestamp",
+                        "asof_timestamp",
+                        "as_of",
+                        "provider_timestamp",
+                    )
+                    if (parsed := parse_timestamp(observation.get(name))) is not None
+                    and parsed > stamp
+                ),
+                None,
+            )
+            if source_future is not None:
+                skipped += 1
+                errors.append(f"{source_future[0]} after observation for {market_id}")
+                continue
             available_at = parse_timestamp(observation.get("available_at"))
-            if available_at is not None and available_at > started:
+            availability_cutoff = observed_at or stamp
+            if available_at is not None and available_at > availability_cutoff:
                 skipped += 1
                 errors.append(f"observation unavailable until {available_at.isoformat()}")
+                continue
+            capture_future = next(
+                (
+                    (name, parsed)
+                    for name in ("request_started_at", "response_received_at")
+                    if (parsed := parse_timestamp(observation.get(name))) is not None
+                    and parsed > availability_cutoff
+                ),
+                None,
+            )
+            if capture_future is not None:
+                skipped += 1
+                errors.append(f"{capture_future[0]} after observation capture for {market_id}")
                 continue
             if any(book is not None and ensure_utc(book.timestamp) > stamp for book in (yes_book, no_book)):
                 skipped += 1
                 errors.append(f"future order book for {market_id}")
                 continue
             cursor = self._cursor.get(market_id)
-            terminal = _is_terminal(observation.get("settlement"))
             if cursor is not None and stamp < cursor:
                 skipped += 1
                 continue
@@ -443,6 +493,24 @@ class ForwardPaperEngine:
                     strategy_evaluation = evaluate_signal_evaluation(self._strategy_document, evaluation_data)
                 except (TypeError, ValueError):
                     strategy_evaluation = None
+            replay_missing_book = False
+            if self._execution_mode == "historical_replay" and not terminal:
+                score = getattr(strategy_evaluation, "score", None)
+                if score is not None and score < 0:
+                    replay_missing_book = no_book is None or not _explicit_book_timestamp(
+                        _raw_observation_book(raw, "no")
+                    )
+                elif score is not None and score > 0:
+                    replay_missing_book = yes_book is None or not _explicit_book_timestamp(
+                        _raw_observation_book(raw, "yes")
+                    )
+                else:
+                    replay_missing_book = not (
+                        yes_book is not None
+                        and no_book is not None
+                        and _explicit_book_timestamp(_raw_observation_book(raw, "yes"))
+                        and _explicit_book_timestamp(_raw_observation_book(raw, "no"))
+                    )
             if (
                 model_evaluation is not None
                 and model_evaluation.probability is None
@@ -454,13 +522,7 @@ class ForwardPaperEngine:
             if model_evaluation is not None and model_evaluation.probability is None:
                 observation["model_evaluation"]["reason_code"] = model_evaluation.reason_code
             price = _reference_price(observation, yes_book, no_book)
-            if price is None and not terminal:
-                _restore_object_state(self.model, model_state_before)
-                skipped += 1
-                errors.append(f"missing executable quote for {market_id}")
-                continue
-            if price is None:
-                price = 0.5
+            missing_execution_quote = price is None and not terminal
             previous_cursor = self._cursor.get(market_id)
             previous_source_cursor = self._source_cursor.get(market_id)
             was_settled = market_id in self._settled
@@ -478,6 +540,7 @@ class ForwardPaperEngine:
             state_version_before = self._state_version
             trader_sequence_before = self.trader._sequence
             strategy_state_before = _snapshot_object_state(self.strategy)
+            execution_events_before = execution_events
             try:
                 with self.store.transaction():
                     inserted_observation = self.store.save_paper_observation(
@@ -488,24 +551,51 @@ class ForwardPaperEngine:
                         observation,
                     )
                     if inserted_observation:
-                        fill = self.trader._run_observation(
-                            symbol=market_id,
-                            observation=observation,
-                            book=yes_book,
-                            no_book=no_book,
-                            timestamp=stamp,
-                            reference=price,
-                            market_id=market_id,
-                            signal_history=history_before,
-                        )
+                        if replay_missing_book:
+                            fill = None
+                            execution_event = {
+                                "status": "NO_FILL",
+                                "reason": "missing_observed_order_book",
+                                "liquidity_rejected": True,
+                            }
+                        elif missing_execution_quote:
+                            fill = None
+                            execution_event = {
+                                "status": "NO_FILL",
+                                "reason": "missing_executable_quote",
+                                "liquidity_rejected": True,
+                            }
+                        else:
+                            fill = self.trader._run_observation(
+                                symbol=market_id,
+                                observation=observation,
+                                book=yes_book,
+                                no_book=no_book,
+                                timestamp=stamp,
+                                reference=price,
+                                market_id=market_id,
+                                signal_history=history_before,
+                            )
                         if fill is not None:
                             fill = self._bind_fill(fill)
                             if self.store.save_fill(fill, fill_id="paper-fill-" + self._run_id + "-" + fill.order_id):
                                 fill_saved = True
-                        execution_event = self.trader.last_execution_event
+                        execution_event = dict(
+                            execution_event
+                            if replay_missing_book or missing_execution_quote
+                            else self.trader.last_execution_event
+                        )
                         execution_event["observation_id"] = observation_id
                         execution_event["experiment_id"] = self._run_id
                         execution_event["paper_only"] = True
+                        execution_event["research_mode"] = self._research_mode
+                        execution_event["source_type"] = source_type
+                        execution_event["research_label"] = (
+                            "REPLAY" if self._execution_mode == "historical_replay" else "FORWARD"
+                        )
+                        execution_event["retrospective_replay"] = self._execution_mode == "historical_replay"
+                        if replay_missing_book or missing_execution_quote:
+                            execution_event["execution_blocked"] = True
                         if strategy_evaluation is not None:
                             execution_event["reason_code"] = strategy_evaluation.reason_code
                             execution_event["evaluation_reason"] = strategy_evaluation.reason_code
@@ -573,6 +663,7 @@ class ForwardPaperEngine:
                 self.trader._fills = trader_fills_before
                 self.trader._sequence = trader_sequence_before
                 self._state_version = state_version_before
+                execution_events = execution_events_before
                 self._state = state_before
                 self._processed.discard(observation_id)
                 if previous_cursor is None:
@@ -598,11 +689,9 @@ class ForwardPaperEngine:
             if not inserted_observation:
                 skipped += 1
                 continue
-            if fill_saved:
-                fills_inserted += 1
-            if settlement_saved:
-                settlements += 1
             processed += 1
+            fills_inserted += int(fill_saved)
+            settlements += int(settlement_saved)
         ended = ensure_utc(now or utc_now())
         if ended < started:
             ended = started
@@ -854,6 +943,7 @@ class ForwardPaperEngine:
                 "experiment_id": self._run_id,
                 "registration_timestamp": self.spec.registration_timestamp.isoformat(),
                 "execution_binding": dict(self._execution_binding),
+                "research_mode": self._research_mode,
                 "execution_strategy_id": self._execution_strategy_id,
                 "processed_observations": sorted(self._processed),
                 "cursor_by_market": {key: value.isoformat() for key, value in sorted(self._cursor.items())},
@@ -873,6 +963,7 @@ class ForwardPaperEngine:
                 "fill_count": len(self.portfolio.fills),
                 "paper_only": True,
                 "live_execution": False,
+                "retrospective_replay": self._execution_mode == "historical_replay",
             }
         )
         self._state_version = self.store.save_paper_state(
@@ -1033,6 +1124,27 @@ def build_resolved_bet(
     }
 
 
+def _raw_observation_book(raw: Any, outcome: str) -> Any:
+    if isinstance(raw, PredictionMarketSnapshot):
+        return raw.order_book if outcome == "yes" else None
+    if not isinstance(raw, Mapping):
+        return None
+    nested = raw.get("snapshot") if isinstance(raw.get("snapshot"), Mapping) else raw
+    source = nested if isinstance(nested, Mapping) else raw
+    if outcome == "yes":
+        return source.get(
+            "yes_order_book",
+            source.get("order_book", raw.get("yes_order_book", raw.get("order_book"))),
+        )
+    return source.get("no_order_book", raw.get("no_order_book"))
+
+
+def _explicit_book_timestamp(value: Any) -> bool:
+    if isinstance(value, OrderBookSnapshot):
+        return parse_timestamp(value.timestamp) is not None
+    return isinstance(value, Mapping) and parse_timestamp(value.get("timestamp")) is not None
+
+
 def _normalize_observation(raw: Any) -> tuple[str, dict[str, Any], OrderBookSnapshot | None, OrderBookSnapshot | None] | None:
     if isinstance(raw, PredictionMarketSnapshot):
         observation = dict(to_record(raw))
@@ -1060,12 +1172,28 @@ def _normalize_observation(raw: Any) -> tuple[str, dict[str, Any], OrderBookSnap
         "asof_timestamp",
         "as_of",
         "source_type",
+        "provider_timestamp",
+        "observed_timestamp",
+        "observed_at",
+        "request_started_at",
+        "response_received_at",
         "available_at",
+        "depth",
+        "order_book_depth",
+        "delay",
+        "response_delay_seconds",
+        "partial",
+        "gaps",
+        "gap",
+        "fees",
+        "fee_bps",
     ):
         if key not in observation and key in raw:
             observation[key] = raw[key]
-    yes_book = _book(raw.get("yes_order_book", raw.get("order_book")), stamp)
-    no_book = _book(raw.get("no_order_book"), stamp)
+    yes_raw = _raw_observation_book(raw, "yes")
+    no_raw = _raw_observation_book(raw, "no")
+    yes_book = _book(yes_raw, stamp)
+    no_book = _book(no_raw, stamp)
     if yes_book is not None:
         observation["yes_order_book"] = yes_book
     if no_book is not None:
@@ -1206,30 +1334,32 @@ def _observation_timestamp(value: Any) -> datetime | None:
     return parse_timestamp(getattr(value, "timestamp", None))
 
 
-def _observation_sort_key(value: Any, tzinfo: Any) -> tuple[datetime, str, str]:
+def _observation_sort_key(value: Any, tzinfo: Any) -> tuple[datetime, str, datetime, str]:
     if isinstance(value, Mapping):
         nested = value.get("snapshot") if isinstance(value.get("snapshot"), Mapping) else value
         if isinstance(nested, Mapping):
-            source_stamp = (
-                parse_timestamp(nested.get("source_timestamp"))
-                or parse_timestamp(nested.get("as_of_timestamp"))
-                or parse_timestamp(nested.get("asof_timestamp"))
-                or parse_timestamp(nested.get("as_of"))
-                or parse_timestamp(value.get("source_timestamp"))
-                or parse_timestamp(value.get("as_of_timestamp"))
-                or parse_timestamp(value.get("asof_timestamp"))
-                or parse_timestamp(value.get("as_of"))
-                or _observation_timestamp(value)
+            decision_stamp = _observation_timestamp(value)
+            source_stamps = [
+                parse_timestamp(nested.get(name))
+                for name in ("source_timestamp", "as_of_timestamp", "asof_timestamp", "as_of", "provider_timestamp")
+            ]
+            source_stamps.extend(
+                parse_timestamp(value.get(name))
+                for name in ("source_timestamp", "as_of_timestamp", "asof_timestamp", "as_of", "provider_timestamp")
             )
+            source_stamp = max((stamp for stamp in source_stamps if stamp is not None), default=decision_stamp)
             market = nested.get("market_id", value.get("market_id", ""))
         else:
-            source_stamp = _observation_timestamp(value)
+            decision_stamp = _observation_timestamp(value)
+            source_stamp = parse_timestamp(getattr(value, "source_timestamp", None)) or decision_stamp
             market = value.get("market_id", "")
     else:
-        source_stamp = parse_timestamp(getattr(value, "source_timestamp", None)) or _observation_timestamp(value)
+        decision_stamp = _observation_timestamp(value)
+        source_stamp = parse_timestamp(getattr(value, "source_timestamp", None)) or decision_stamp
         market = getattr(value, "market_id", "")
-    stamp = source_stamp or datetime.fromtimestamp(0, tz=tzinfo)
-    return stamp, str(market), _canonical_json(value)
+    decision = decision_stamp or datetime.fromtimestamp(0, tz=tzinfo)
+    source = source_stamp or decision
+    return decision, str(market), source, _canonical_json(value)
 
 def _model_probability_evaluation(model: Any | None, observation: Mapping[str, Any]):
     return evaluate_model_probability_evidence(model, observation)

@@ -3,11 +3,14 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from dataclasses import replace
+from contextlib import redirect_stdout
+from io import StringIO
 import json
 import hashlib
-import sys
+import os
 import multiprocessing
 import sqlite3
+import sys
 import tempfile
 import threading
 import time
@@ -142,16 +145,75 @@ class BlockedRequiredHealthStore(HealthyStore):
 class FakeCredentials(CredentialStore):
     def __init__(self, configured=True): self.value=configured
     def configured(self, **kwargs): return self.value
-    def load(self, **kwargs): return {name:"test-only" for name in ("private_key","wallet_address","relayer_api_key","relayer_api_key_address")} if self.value else {}
+    def load(self, **kwargs):
+        return {
+            name: "test-only"
+            for name in (
+                "private_key",
+                "wallet_address",
+                "relayer_api_key",
+                "relayer_api_key_address",
+                "api_key",
+                "api_secret",
+                "api_passphrase",
+            )
+
+        } if self.value else {}
+
+class FakeApiKeyCreds:
+    def __init__(self, **values):
+        self.values = dict(values)
 
 class FakeVenue:
-    def __init__(self, *, blocked=False, close_only=False, minimum="1", ask="0.50", asks=None, balance="10", accepting=True):
-        self.blocked=blocked; self.close_only=close_only; self.minimum=minimum; self.ask=ask; self.asks=asks if asks is not None else [{"price":ask,"size":"100"}]; self._balance=balance; self.accepting=accepting; self.submissions=[]
-    def geoblock(self): return {"blocked":self.blocked,"close_only":self.close_only,"country":"ZZ","region":"T"}
-    def connectivity_check(self): return True
-    def market_context(self, market_id, token_id): return {"accepting_orders":self.accepting,"min_order_size":self.minimum,"tick_size":"0.01","bids":[{"price":"0.49","size":"100"}],"asks":self.asks,"fee_bps":"10"}
-    def balance(self): return Decimal(self._balance)
-    def submit_limit_order(self, **kwargs): self.submissions.append(kwargs); return {"ok":True,"order_id":"fake-order","status":"matched"}
+    def __init__(
+        self,
+        *,
+        blocked=False,
+        close_only=False,
+        minimum="1",
+        ask="0.50",
+        asks=None,
+        balance="10",
+        accepting=True,
+        fee_bps="0",
+    ):
+        self.blocked = blocked
+        self.close_only = close_only
+        self.minimum = minimum
+        self.ask = ask
+        self.asks = asks if asks is not None else [{"price": ask, "size": "100"}]
+        self._balance = balance
+        self.accepting = accepting
+        self.fee_bps = fee_bps
+        self.submissions = []
+
+    def geoblock(self):
+        return {
+            "blocked": self.blocked,
+            "close_only": self.close_only,
+            "country": "ZZ",
+            "region": "T",
+        }
+
+    def connectivity_check(self):
+        return True
+
+    def market_context(self, market_id, token_id):
+        return {
+            "accepting_orders": self.accepting,
+            "min_order_size": self.minimum,
+            "tick_size": "0.01",
+            "bids": [{"price": "0.49", "size": "100"}],
+            "asks": self.asks,
+            "fee_bps": self.fee_bps,
+        }
+
+    def balance(self):
+        return Decimal(self._balance)
+
+    def submit_limit_order(self, **kwargs):
+        self.submissions.append(kwargs)
+        return {"ok": True, "order_id": "fake-order", "status": "matched"}
 class CrashGapVenue(FakeVenue):
     def __init__(self, store):
         super().__init__()
@@ -210,6 +272,12 @@ def _blocked_submit_worker(database_path, entered, release, results):
 class CanaryTests(unittest.TestCase):
 
     def setUp(self):
+        self._production_profile = patch.dict(
+            os.environ,
+            {"AXIOM_EXECUTION_PROFILE": "production"},
+        )
+        self._production_profile.start()
+        self.addCleanup(self._production_profile.stop)
         self.store=HealthyStore(":memory:")
         self.store.save_dataset(
             "prediction-history",
@@ -321,6 +389,53 @@ class CanaryTests(unittest.TestCase):
             "scope_hash": payload["market_scope_hash"],
             "scope_version": payload["market_scope_version"],
         }
+        self.store.save_polymarket_market_metadata(
+            "m",
+            {
+                "market_id": "m",
+                "active": True,
+                "closed": False,
+                "settlement": "open",
+                "accepting_orders": True,
+            },
+            observed_at=T0,
+            source_type="FORWARD_COLLECTED",
+        )
+        self.store.save_polymarket_snapshot(
+            "direct-test",
+            "m",
+            T0,
+            T0,
+            {
+                "source_type": "FORWARD_COLLECTED",
+                "snapshot": {
+                    "market_id": "m",
+                    "timestamp": T0.isoformat(),
+                    "yes_ask": "0.50",
+                    "no_ask": "0.50",
+                    "yes_token_id": "yes",
+                    "no_token_id": "no",
+                    "yes_order_book": {
+                        "asks": [{"price": "0.50", "size": "100"}],
+                        "bids": [{"price": "0.49", "size": "100"}],
+                        "timestamp": T0.isoformat(),
+                        "token_id": "yes",
+                    },
+                    "no_order_book": {
+                        "asks": [{"price": "0.50", "size": "100"}],
+                        "bids": [{"price": "0.49", "size": "100"}],
+                        "timestamp": T0.isoformat(),
+                        "token_id": "no",
+                    },
+                    "settlement": "open",
+                    "active": True,
+                    "closed": False,
+                },
+                "active": True,
+                "settlement": "open",
+            },
+            source_type="FORWARD_COLLECTED",
+        )
         self.store.connection.execute(
             "INSERT INTO canary_signals("
             "signal_id,candidate_id,frozen_hash,strategy_hash,model_hash,config_hash,"
@@ -522,7 +637,10 @@ class CanaryTests(unittest.TestCase):
             def _create(**kwargs):
                 return client
 
-        sdk = SimpleNamespace(SecureClient=SecureClient)
+        sdk = SimpleNamespace(
+            ApiKeyCreds=FakeApiKeyCreds,
+            SecureClient=SecureClient,
+        )
         venue = PolymarketClobV2Venue()
         original_publish = self.service.publish_readiness_snapshot
 
@@ -531,10 +649,12 @@ class CanaryTests(unittest.TestCase):
                 self.service.clock = lambda: T0 + timedelta(seconds=60)
             return original_publish(reason=reason)
 
-        with patch.dict(sys.modules, {"polymarket": sdk}), patch.object(
+        with patch.dict(os.environ, {"AXIOM_EXECUTION_PROFILE": "production"}), patch.dict(
+            sys.modules, {"polymarket": sdk}
+        ), patch.object(
             PolymarketClobV2Venue,
             "installed_sdk_version",
-            return_value="0.9.2",
+            return_value="0.9.0",
         ), patch.object(
             PolymarketClobV2Venue,
             "geoblock",
@@ -597,7 +717,16 @@ class CanaryTests(unittest.TestCase):
         self.assertIsNone(status["selection_reason"])
         self.assertIsNone(status["selection_invalidation_reason"])
 
-    def arm(self, **kwargs): return self.service.arm("C123",venue=kwargs.pop("venue",self.venue),credentials_configured=True,**kwargs)
+    def arm(self, **kwargs):
+        config_id, generation = self.service._settings_binding()
+        return self.service.arm(
+            "C123",
+            venue=kwargs.pop("venue", self.venue),
+            credentials_configured=True,
+            config_id=config_id,
+            expected_generation=generation,
+            **kwargs,
+        )
     def submit(self, signal="s1", **kwargs):
         candidate_id = kwargs.pop("candidate_id", "C123")
         self._ensure_direct_signal(signal, candidate_id)
@@ -632,7 +761,7 @@ class CanaryTests(unittest.TestCase):
                 CanaryLimits(**{field: Decimal("Infinity")})
     def test_missing_credentials_cannot_arm(self):
         service=CanaryService(self.store,credentials=FakeCredentials(False),clock=lambda:T0)
-        self.assertBlocked("CREDENTIALS_NOT_CONFIGURED",lambda:service.arm("C123",venue=self.venue,credentials_configured=True))
+        self.assertBlocked("CREDENTIALS_NOT_CONFIGURED",lambda:service.arm("C123",venue=self.venue,credentials_configured=True,config_id=service._settings_binding()[0],expected_generation=service._settings_binding()[1]))
 
     def test_credentials_require_only_signer_and_preserve_optional_relayer_values(self):
         class Keyring:
@@ -650,7 +779,9 @@ class CanaryTests(unittest.TestCase):
                 cls.values[name] = value
 
         responses = iter(("private-key", "wallet-address", "", ""))
-        with patch.dict(sys.modules, {"keyring": Keyring}):
+        with patch.dict(
+            os.environ, {"AXIOM_EXECUTION_PROFILE": "production"}
+        ), patch.dict(sys.modules, {"keyring": Keyring}):
             credentials = CredentialStore()
             credentials.configure(reader=lambda _prompt: next(responses))
             loaded = credentials.load()
@@ -697,7 +828,9 @@ class CanaryTests(unittest.TestCase):
             finally:
                 completed[index].set()
 
-        with patch.object(CredentialStore, "configured", blocked_configured):
+        with patch.dict(
+            os.environ, {"AXIOM_EXECUTION_PROFILE": "production"}
+        ), patch.object(CredentialStore, "configured", blocked_configured):
             threads = [
                 threading.Thread(target=project, args=(index,))
                 for index in range(len(results))
@@ -743,7 +876,7 @@ class CanaryTests(unittest.TestCase):
         from axiom.director import validate_hermes_proposal
         result=validate_hermes_proposal({"proposal_id":"x","statement":"x","source":"x","tests":["x"],"dataset_version":"v","time_split":"train-validation-holdout","paper_only":True,"canary_arm":True})
         self.assertFalse(result.accepted)
-    def test_ineligible_candidate_cannot_arm(self): self.assertBlocked("NOT_CANARY_ELIGIBLE",lambda:self.service.arm("other",venue=self.venue,credentials_configured=True))
+    def test_ineligible_candidate_cannot_arm(self): self.assertBlocked("NOT_CANARY_ELIGIBLE",lambda:self.service.arm("other",venue=self.venue,credentials_configured=True,config_id=self.service._settings_binding()[0],expected_generation=self.service._settings_binding()[1]))
     def test_frozen_and_paper_forward_stages_store_bounded_qualification_evidence(self):
         template = dict(self.store.load_candidate_lifecycle("C123")["payload"])
         progression = (
@@ -932,6 +1065,8 @@ class CanaryTests(unittest.TestCase):
                 candidate_id,
                 venue=self.venue,
                 credentials_configured=True,
+                config_id=self.service._settings_binding()[0],
+                expected_generation=self.service._settings_binding()[1],
             ),
         )
 
@@ -1037,6 +1172,39 @@ class CanaryTests(unittest.TestCase):
             len(report["latest_signal"]["evidence"]["depth"]),
             1,
         )
+
+    def test_status_report_projects_expired_arm_without_mutating_control(self):
+        self.arm()
+        expired_at = (T0 - timedelta(seconds=1)).isoformat()
+        self.store.connection.execute(
+            "UPDATE canary_control SET state='ARMED',candidate_id=?,venue=?,"
+            "armed_at=?,expires_at=?,updated_at=? WHERE singleton=1",
+            ("C123", "polymarket", T0.isoformat(), expired_at, T0.isoformat()),
+        )
+        self.store.connection.commit()
+        before = self.store.connection.execute(
+            "SELECT state,expires_at FROM canary_control WHERE singleton=1"
+        ).fetchone()
+        report = self.service.status_report()
+        after = self.store.connection.execute(
+            "SELECT state,expires_at FROM canary_control WHERE singleton=1"
+        ).fetchone()
+
+        self.assertEqual(report["micro_live_canary"], "DISARMED")
+        self.assertEqual(report["display_state"], "DISABLED")
+        self.assertEqual(report["control"]["state"], "DISARMED")
+        self.assertEqual(report["authoritative_control"]["state"], "DISARMED")
+        self.assertEqual(report["readiness"]["micro_live_canary"], "DISARMED")
+        self.assertEqual(report["readiness"]["display_state"], "DISABLED")
+        self.assertEqual(report["expiry"], expired_at)
+        self.assertEqual(tuple(after), tuple(before))
+
+        self.store.connection.execute(
+            "UPDATE canary_control SET state='ARMED',expires_at=? WHERE singleton=1",
+            ((T0 + timedelta(hours=1)).isoformat(),),
+        )
+        self.store.connection.commit()
+        self.assertEqual(self.service.status_report()["micro_live_canary"], "ARMED")
 
     def test_schema_initialization_migration_holds_store_lock(self):
         legacy_store = HealthyStore(":memory:")
@@ -1788,10 +1956,13 @@ class CanaryTests(unittest.TestCase):
         )
         validation = restarted.validate_eligibility("C123")
         self.assertTrue(validation["eligible"], validation)
+        config_id, generation = restarted._settings_binding()
         restarted.arm(
             "C123",
             venue=self.venue,
             credentials_configured=True,
+            config_id=config_id,
+            expected_generation=generation,
         )
         self.assertEqual(restarted.status()["micro_live_canary"], "ARMED")
     def test_public_counts_exclude_tampered_eligibility_binding(self):
@@ -1884,6 +2055,8 @@ class CanaryTests(unittest.TestCase):
                 "C123",
                 venue=KillingVenue(),
                 credentials_configured=True,
+                config_id=service._settings_binding()[0],
+                expected_generation=service._settings_binding()[1],
             ),
         )
         self.assertEqual(service.status()["micro_live_canary"], "KILLED")
@@ -1897,6 +2070,26 @@ class CanaryTests(unittest.TestCase):
         self.arm(); self.assertBlocked("GEOGRAPHICALLY_BLOCKED",lambda:self.submit(venue=blocked))
     def test_target_is_never_silently_increased(self): self.arm(); result=self.submit(); self.assertLessEqual(Decimal(result["requested_notional"]),Decimal("1.00"))
     def test_market_minimum_exceeding_target_skips(self): self.arm(); venue=FakeVenue(minimum="5",ask="0.50"); self.assertBlocked("VENUE_MINIMUM_EXCEEDS",lambda:self.submit(venue=venue)); self.assertFalse(venue.submissions)
+
+    def test_documented_notional_minimum_rounds_up_to_quantity_step(self):
+        class MinimumNotionalVenue(FakeVenue):
+            def market_context(self, market_id, token_id):
+                return {
+                    **super().market_context(market_id, token_id),
+                    "min_notional": "0.26",
+                    "size_increment": "0.01",
+                }
+
+        venue = MinimumNotionalVenue(minimum="0.01")
+        self.arm(venue=venue)
+        self.submit(venue=venue)
+        order = venue.submissions[0]
+        quantity = Decimal(str(order["size"]))
+        price = Decimal(str(order["price"]))
+        step = Decimal("0.01")
+        self.assertGreaterEqual(quantity * price, Decimal("0.26"))
+        self.assertLess((quantity - step) * price, Decimal("0.26"))
+        self.assertEqual(quantity % step, Decimal("0"))
 
     def test_non_polymarket_venue_requires_explicit_test_opt_in(self):
         self.arm()
@@ -1927,6 +2120,7 @@ class CanaryTests(unittest.TestCase):
                 {"price": "0.50", "size": "100"},
                 {"price": "0.55", "size": "100"},
             ],
+            fee_bps="0",
         )
         readiness = self.service.check(
             candidate_id="C123",
@@ -1977,7 +2171,7 @@ class CanaryTests(unittest.TestCase):
 
     def test_insufficient_balance_blocks_readiness_and_submission(self):
         self.arm()
-        venue = FakeVenue(balance="0.50")
+        venue = FakeVenue(balance="0.49")
         readiness = self.service.check(candidate_id="C123", venue=venue)
         self.assertFalse(readiness["ready"])
         self.assertIn("INSUFFICIENT_BALANCE", readiness["failures"])
@@ -1986,7 +2180,7 @@ class CanaryTests(unittest.TestCase):
 
     def test_balance_includes_worst_case_fees(self):
         self.arm()
-        venue = FakeVenue(balance="1.00")
+        venue = FakeVenue(balance="0.5001", fee_bps="10")
         self.assertBlocked(
             "INSUFFICIENT_BALANCE",
             lambda: self.submit(venue=venue),
@@ -2024,14 +2218,23 @@ class CanaryTests(unittest.TestCase):
             def _create(**kwargs):
                 return client
 
-        sdk = SimpleNamespace(RelayerApiKey=RelayerApiKey, SecureClient=SecureClient)
+        sdk = SimpleNamespace(
+            ApiKeyCreds=FakeApiKeyCreds,
+            RelayerApiKey=RelayerApiKey,
+            SecureClient=SecureClient,
+        )
         values = {
             "private_key": "key",
             "wallet_address": "wallet",
             "relayer_api_key": "api-key",
             "relayer_api_key_address": "api-address",
+            "api_key": "clob-key",
+            "api_secret": "clob-secret",
+            "api_passphrase": "clob-passphrase",
         }
-        with patch.dict(sys.modules, {"polymarket": sdk}), patch.object(
+        with patch.dict(os.environ, {"AXIOM_EXECUTION_PROFILE": "production"}), patch.dict(
+            sys.modules, {"polymarket": sdk}
+        ), patch.object(
             PolymarketClobV2Venue,
             "installed_sdk_version",
             return_value="0.9.0",
@@ -2039,8 +2242,193 @@ class CanaryTests(unittest.TestCase):
             result = _read_only_operation("account", values)
         self.assertTrue(result["authenticated"])
         self.assertTrue(client.closed)
+
+    def test_official_market_context_tick_reaches_buy_preflight(self):
+        self.arm()
+        posted = []
+
+        class OrderMetadata:
+            @staticmethod
+            def fetch_current_market(context, *, token_id):
+                return SimpleNamespace(
+                    tick_size="0.01",
+                    neg_risk=False,
+                    fee_info=SimpleNamespace(rate="0", exponent="1"),
+                )
+
+        class SDKClient:
+            wallet = "wallet"
+            wallet_type = "safe"
+
+            def __init__(self):
+                self._ctx = SimpleNamespace(
+                    environment_config=SimpleNamespace(
+                        standard_exchange="0xstandard",
+                    ),
+                    order_metadata=OrderMetadata(),
+                )
+
+            def get_market(self, *, id):
+                return SimpleNamespace(
+                    version="v1",
+                    outcomes=SimpleNamespace(
+                        yes=SimpleNamespace(label="yes", token_id="yes"),
+                    ),
+                    state=SimpleNamespace(accepting_orders=True),
+                    fee_bps="0",
+                )
+
+            def get_order_book(self, *, asset_id):
+                return SimpleNamespace(
+                    min_order_size="1",
+                    size_increment="0.01",
+                    tick_size="0.01",
+                    min_notional="0",
+                    neg_risk=False,
+                    bids=[SimpleNamespace(price="0.49", size="100")],
+                    asks=[SimpleNamespace(price="0.50", size="100")],
+                )
+
+            def get_balance_allowance(self, **kwargs):
+                return {
+                    "balance": "2000000",
+                    "allowances": {"0xstandard": "2000000"},
+                }
+
+            def create_limit_order(self, **kwargs):
+                return {"maker_amount": "500000"}
+
+            def post_order(self, signed):
+                posted.append(signed)
+                return {"ok": True, "order_id": "official-order", "status": "matched"}
+
+            def close(self):
+                pass
+
+        class SecureClient:
+            @staticmethod
+            def _create(**kwargs):
+                return SDKClient()
+
+        sdk = SimpleNamespace(
+            ApiKeyCreds=FakeApiKeyCreds,
+            SecureClient=SecureClient,
+        )
+        values = {
+            "private_key": "key",
+            "wallet_address": "wallet",
+            "api_key": "clob-key",
+            "api_secret": "clob-secret",
+            "api_passphrase": "clob-passphrase",
+        }
+        with patch.dict(os.environ, {"AXIOM_EXECUTION_PROFILE": "production"}), patch.dict(
+            sys.modules, {"polymarket": sdk}
+        ), patch.object(
+            PolymarketClobV2Venue,
+            "installed_sdk_version",
+            return_value="0.9.0",
+        ), patch.object(
+            CredentialStore,
+            "load",
+            return_value=values,
+        ), patch.object(
+            PolymarketClobV2Venue,
+            "geoblock",
+            return_value={"blocked": False, "close_only": False},
+        ):
+            result = self.submit(
+                "official-context-tick",
+                venue=PolymarketClobV2Venue(),
+                allow_test_venue=False,
+            )
+        self.assertEqual(result["execution_status"], "MATCHED")
+        self.assertEqual(result["status"], "matched")
+        self.assertEqual(len(posted), 1)
+
+    def test_official_trade_settlement_status_is_preserved(self):
+        calls: list[dict[str, object]] = []
+        class SDKClient:
+            def list_account_trades(self, **kwargs):
+                calls.append(dict(kwargs))
+                return [
+                    SimpleNamespace(
+                        id="trade-unrelated",
+                        taker_order_id="different-order",
+                        status="CONFIRMED",
+                        price="0.40",
+                        size="1",
+                    ),
+                    SimpleNamespace(
+                        id="trade-confirmed",
+                        taker_order_id="order-confirmed",
+                        status="CONFIRMED",
+                        state="CONFIRMED",
+                        price="0.50",
+                        size="1",
+                        matched_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+                    ),
+                ]
+
+            def close(self):
+                pass
+
+        class SecureClient:
+            @staticmethod
+            def _create(**kwargs):
+                return SDKClient()
+
+        sdk = SimpleNamespace(
+            ApiKeyCreds=FakeApiKeyCreds,
+            SecureClient=SecureClient,
+        )
+        values = {
+            "private_key": "key",
+            "wallet_address": "wallet",
+            "api_key": "clob-key",
+            "api_secret": "clob-secret",
+            "api_passphrase": "clob-passphrase",
+        }
+        with patch.dict(os.environ, {"AXIOM_EXECUTION_PROFILE": "production"}), patch.dict(
+            sys.modules, {"polymarket": sdk}
+        ), patch.object(
+            PolymarketClobV2Venue,
+            "installed_sdk_version",
+            return_value="0.9.0",
+        ), patch.object(
+            CredentialStore,
+            "load",
+            return_value=values,
+        ):
+            trades = PolymarketClobV2Venue().list_account_trades(order_id="order-confirmed")
+        self.assertEqual(calls[0]["id"], None)
+        self.assertEqual(len(trades), 1)
+        self.assertEqual(trades[0]["trade_id"], "trade-confirmed")
+        self.assertEqual(trades[0]["taker_order_id"], "order-confirmed")
+        self.assertEqual(trades[0]["matched_at"], "2026-01-01T00:00:00+00:00")
+        self.assertEqual(trades[0]["status"], "CONFIRMED")
+        self.assertEqual(trades[0]["state"], "CONFIRMED")
     def test_daily_loss_limit_prevents_submission(self):
-        self.arm(); self.store.connection.execute("INSERT INTO canary_ledger(event_id,signal_id,timestamp,candidate_id,venue,market_id,token_id,side,requested_notional,paper_expected_price,max_price,status,realized_pnl,evidence_json) VALUES('e','old',?,?,?,?,?,?,?,?,?,'RESOLVED','-2.00','{}')",(T0.isoformat(),"C123","polymarket","m0","t","BUY","1",".5",".5")); self.store.connection.commit(); self.assertBlocked("DAILY_LOSS_LIMIT",self.submit)
+        self.arm()
+        self.store.connection.execute(
+            "INSERT INTO canary_ledger("
+            "event_id,signal_id,timestamp,candidate_id,venue,market_id,token_id,side,"
+            "requested_notional,paper_expected_price,max_price,status,realized_pnl,evidence_json)"
+            " VALUES('e','old',?,?,?,?,?,?,?,?,?,'RESOLVED','-2.00',"
+            "'{\"settlement_status\":\"SETTLED\",\"realized_pnl\":\"-2.00\"}')",
+            (
+                T0.isoformat(),
+                "C123",
+                "polymarket",
+                "m0",
+                "t",
+                "SELL",
+                "1",
+                ".5",
+                ".5",
+            ),
+        )
+        self.store.connection.commit()
+        self.assertBlocked("DAILY_LOSS_LIMIT", self.submit)
     def test_exposure_limit_prevents_submission(self):
         self.arm(limits=CanaryLimits(max_exposure_usd=Decimal("1"))); self.store.connection.execute("INSERT INTO canary_ledger(event_id,signal_id,timestamp,candidate_id,venue,market_id,token_id,side,requested_notional,paper_expected_price,max_price,status,evidence_json) VALUES('e','old',?,?,?,?,?,?,?,?,?,'OPEN','{}')",(T0.isoformat(),"C123","polymarket","m0","t","BUY","1",".5",".5")); self.store.connection.commit(); self.assertBlocked("EXPOSURE_LIMIT",self.submit)
     def test_max_order_count_prevents_submission(self):
@@ -2098,6 +2486,20 @@ class CanaryTests(unittest.TestCase):
             with self.assertRaisesRegex(CanaryBlocked, "CANARY_KILLED"):
                 self.submit("killed-before-sink", venue=venue)
         self.assertFalse(venue.submissions)
+        ledger = self.store.connection.execute(
+            "SELECT status FROM canary_ledger WHERE signal_id=?",
+            ("killed-before-sink",),
+        ).fetchone()
+        self.assertIsNotNone(ledger)
+        self.assertEqual(ledger["status"], "REJECTED")
+        reservation = self.store.connection.execute(
+            "SELECT status,released_at FROM canary_risk_reservations "
+            "WHERE intent_id=(SELECT event_id FROM canary_ledger WHERE signal_id=?)",
+            ("killed-before-sink",),
+        ).fetchone()
+        self.assertIsNotNone(reservation)
+        self.assertEqual(reservation["status"], "REJECTED")
+        self.assertIsNotNone(reservation["released_at"])
 
     def test_disarm_after_reservation_blocks_sink(self):
         self.arm()
@@ -2132,14 +2534,13 @@ class CanaryTests(unittest.TestCase):
                     )
                     self.store.connection.commit()
             return original_publish(reason=reason)
-
         with patch.object(
             self.service,
             "publish_readiness_snapshot",
             side_effect=change_generation_before_final_fence,
         ):
             with self.assertRaisesRegex(CanaryBlocked, "CANARY_CONTROL_CHANGED"):
-                self.submit("generation-changed-before-sink", venue=venue)
+                self.submit("generation-race", venue=venue)
         self.assertFalse(venue.submissions)
     def test_final_risk_and_health_fences_block_direct_sink(self):
         mutations = (
@@ -2152,14 +2553,15 @@ class CanaryTests(unittest.TestCase):
                         "event_id,signal_id,timestamp,candidate_id,venue,market_id,"
                         "token_id,side,requested_notional,paper_expected_price,max_price,"
                         "status,realized_pnl,evidence_json) "
-                        "VALUES('final-risk-loss','final-risk-loss-signal',?,?,?,?,?,?,?,?,?,'RESOLVED','-2.00','{}')",
+                        "VALUES('final-risk-loss','final-risk-loss-signal',?,?,?,?,?,?,?,?,?,'RESOLVED','-2.00',"
+                        "'{\"settlement_status\":\"SETTLED\",\"realized_pnl\":\"-2.00\"}')",
                         (
                             T0.isoformat(),
                             "C123",
                             "polymarket",
                             "m0",
                             "t",
-                            "BUY",
+                            "SELL",
                             "1",
                             ".5",
                             ".5",
@@ -2268,14 +2670,15 @@ class CanaryTests(unittest.TestCase):
                         "event_id,signal_id,timestamp,candidate_id,venue,market_id,"
                         "token_id,side,requested_notional,paper_expected_price,max_price,"
                         "status,realized_pnl,evidence_json) "
-                        "VALUES('final-official-loss','final-official-loss-signal',?,?,?,?,?,?,?,?,?,'RESOLVED','-2.00','{}')",
+                        "VALUES('final-official-loss','final-official-loss-signal',?,?,?,?,?,?,?,?,?,'RESOLVED','-2.00',"
+                        "'{\"settlement_status\":\"SETTLED\",\"realized_pnl\":\"-2.00\"}')",
                         (
                             T0.isoformat(),
                             "C123",
                             "polymarket",
                             "m0",
                             "t",
-                            "BUY",
+                            "SELL",
                             "1",
                             ".5",
                             ".5",
@@ -2308,7 +2711,10 @@ class CanaryTests(unittest.TestCase):
                 def _create(**kwargs):
                     return client
 
-            sdk = SimpleNamespace(SecureClient=SecureClient)
+            sdk = SimpleNamespace(
+                ApiKeyCreds=FakeApiKeyCreds,
+                SecureClient=SecureClient,
+            )
             venue = PolymarketClobV2Venue()
             original_publish = self.service.publish_readiness_snapshot
 
@@ -2317,10 +2723,12 @@ class CanaryTests(unittest.TestCase):
                     mutate()
                 return original_publish(reason=reason)
 
-            with patch.dict(sys.modules, {"polymarket": sdk}), patch.object(
+            with patch.dict(os.environ, {"AXIOM_EXECUTION_PROFILE": "production"}), patch.dict(
+                sys.modules, {"polymarket": sdk}
+            ), patch.object(
                 PolymarketClobV2Venue,
                 "installed_sdk_version",
-                return_value="0.9.2",
+                return_value="0.9.0",
             ), patch.object(
                 PolymarketClobV2Venue,
                 "geoblock",
@@ -2371,43 +2779,16 @@ class CanaryTests(unittest.TestCase):
             )
     def _scope_race_mutations(self, resolution):
         current_at = T0 + timedelta(microseconds=1)
-        stale_at = T0 + timedelta(seconds=62)
 
-        def refresh_direct_signal_timestamps(timestamp):
-            row = self.store.connection.execute(
-                "SELECT signal_id,evidence_json FROM canary_signals "
-                "ORDER BY signal_id DESC LIMIT 1"
-            ).fetchone()
-            if row is None:
-                return
-            try:
-                evidence = json.loads(row["evidence_json"] or "{}")
-            except (TypeError, ValueError, json.JSONDecodeError):
-                evidence = {}
-            if not isinstance(evidence, dict):
-                evidence = {}
-            evidence["current_order_book_timestamp"] = timestamp.isoformat()
-            self.store.connection.execute(
-                "UPDATE canary_signals SET source_timestamp=?,expires_at=?,"
-                "evidence_json=? WHERE signal_id=?",
-                (
-                    timestamp.isoformat(),
-                    (timestamp + timedelta(seconds=60)).isoformat(),
-                    json.dumps(evidence, sort_keys=True),
-                    row["signal_id"],
-                ),
-            )
-            self.store.connection.commit()
 
         def stale():
             changed = replace(
                 resolution,
-                resolved_at=current_at,
+                resolved_at=T0 - timedelta(seconds=62),
                 resolution_id="",
             )
             self.store.save_market_scope_resolution(changed)
-            self.service.clock = lambda: stale_at
-            refresh_direct_signal_timestamps(stale_at)
+            self.service.clock = lambda: current_at
             return changed
 
         def unbound():
@@ -2549,14 +2930,19 @@ class CanaryTests(unittest.TestCase):
                 def _create(**kwargs):
                     return client
 
-            sdk = SimpleNamespace(SecureClient=SecureClient)
+            sdk = SimpleNamespace(
+                ApiKeyCreds=FakeApiKeyCreds,
+                SecureClient=SecureClient,
+            )
             venue = PolymarketClobV2Venue()
-            with self._scope_race_loader(mutate), patch.dict(
+            with patch.dict(
+                os.environ, {"AXIOM_EXECUTION_PROFILE": "production"}
+            ), self._scope_race_loader(mutate), patch.dict(
                 sys.modules, {"polymarket": sdk}
             ), patch.object(
                 PolymarketClobV2Venue,
                 "installed_sdk_version",
-                return_value="0.9.2",
+                return_value="0.9.0",
             ), patch.object(
                 PolymarketClobV2Venue,
                 "geoblock",
@@ -2594,6 +2980,7 @@ class CanaryTests(unittest.TestCase):
         class SDKClient:
             def __init__(self):
                 self.post_calls = []
+                self.allowance_reads = 0
                 self.closed = False
                 self._ctx = {
                     "environment_config": {
@@ -2605,7 +2992,9 @@ class CanaryTests(unittest.TestCase):
                 return {"maker_amount": "1000000"}
 
             def get_balance_allowance(self, **kwargs):
-                self.service.kill()
+                self.allowance_reads += 1
+                if self.allowance_reads > 1:
+                    self.service.kill()
                 return {
                     "balance": "2500000",
                     "allowances": {"0xexchange-v3": "1000000"},
@@ -2637,11 +3026,16 @@ class CanaryTests(unittest.TestCase):
             "asks": [{"price": "0.50", "size": "100"}],
             "fee_bps": "10",
         }
-        sdk = SimpleNamespace(SecureClient=SecureClient)
-        with patch.dict(sys.modules, {"polymarket": sdk}), patch.object(
+        sdk = SimpleNamespace(
+            ApiKeyCreds=FakeApiKeyCreds,
+            SecureClient=SecureClient,
+        )
+        with patch.dict(os.environ, {"AXIOM_EXECUTION_PROFILE": "production"}), patch.dict(
+            sys.modules, {"polymarket": sdk}
+        ), patch.object(
             PolymarketClobV2Venue,
             "installed_sdk_version",
-            return_value="0.9.2",
+            return_value="0.9.0",
         ), patch.object(
             PolymarketClobV2Venue,
             "geoblock",
@@ -2650,6 +3044,10 @@ class CanaryTests(unittest.TestCase):
             PolymarketClobV2Venue,
             "market_context",
             return_value=context,
+        ), patch.object(
+            CredentialStore,
+            "load",
+            return_value=FakeCredentials().load(),
         ):
             with self.assertRaisesRegex(CanaryBlocked, "CANARY_KILLED"):
                 self.service.submit(
@@ -2662,8 +3060,25 @@ class CanaryTests(unittest.TestCase):
                     venue=PolymarketClobV2Venue(),
                 )
         self.assertFalse(client.post_calls)
+        ledger = self.store.connection.execute(
+            "SELECT status FROM canary_ledger WHERE signal_id=?",
+            (signal_id,),
+        ).fetchone()
+        self.assertIsNotNone(ledger)
+        assert ledger is not None
+        self.assertEqual(ledger["status"], "REJECTED")
+        reservation = self.store.connection.execute(
+            "SELECT status,remaining_cost FROM canary_risk_reservations "
+            "WHERE event_id=("
+            "SELECT event_id FROM canary_ledger WHERE signal_id=?"
+            ")",
+            (signal_id,),
+        ).fetchone()
+        self.assertIsNotNone(reservation)
+        assert reservation is not None
+        self.assertEqual(reservation["status"], "REJECTED")
+        self.assertEqual(reservation["remaining_cost"], "0")
         self.assertTrue(client.closed)
-
     def test_cross_process_kill_does_not_wait_for_blocked_submission(self):
         self.arm()
         self._ensure_direct_signal("cross-process")
@@ -2716,13 +3131,14 @@ class CanaryTests(unittest.TestCase):
             self.assertEqual(process.exitcode, 0)
             result = results.get(timeout=5)
             self.assertEqual(result[0], "ok")
+            self.assertEqual(result[1]["canary_state"], "KILLED")
             final_store = HealthyStore(database_path)
             try:
                 self.assertEqual(
                     final_store.connection.execute(
                         "SELECT status FROM canary_ledger WHERE signal_id='cross-process'"
                     ).fetchone()[0],
-                    "SUBMITTED",
+                    "MATCHED",
                 )
                 self.assertEqual(
                     CanaryService(
@@ -2754,7 +3170,7 @@ class CanaryTests(unittest.TestCase):
                 return {"ok": True, "order_id": "late-order", "status": "matched"}
 
         try:
-            with patch("axiom.canary.CANARY_SUBMISSION_TIMEOUT_SECONDS", 0.01):
+            with patch("axiom.canary.CANARY_SUBMISSION_TIMEOUT_SECONDS", 0.2):
                 with self.assertRaisesRegex(
                     CanaryBlocked,
                     "CANARY_SUBMISSION_UNKNOWN",
@@ -2783,15 +3199,235 @@ class CanaryTests(unittest.TestCase):
         self.submit("matched")
         status = self.service.status()
         self.assertEqual(status["open_positions"], 1)
-        self.assertEqual(status["total_exposure"], 1.0)
+        self.assertEqual(status["total_exposure"], 0.5)
         event_status = self.store.connection.execute(
             "SELECT status FROM canary_execution_events"
         ).fetchone()[0]
         ledger_status = self.store.connection.execute(
             "SELECT status FROM canary_ledger"
         ).fetchone()[0]
-        self.assertEqual(event_status, "SUBMITTED")
-        self.assertEqual(ledger_status, "SUBMITTED")
+        self.assertEqual(event_status, "MATCHED")
+        self.assertEqual(ledger_status, "MATCHED")
+
+    def assertAcceptedSdkStatus(self, status):
+        class AcceptedVenue(FakeVenue):
+            def submit_limit_order(self, **kwargs):
+                self.submissions.append(kwargs)
+                return {
+                    "ok": True,
+                    "order_id": f"order-{status}",
+                    "status": status,
+                }
+
+        self.arm()
+        result = self.submit(status, venue=AcceptedVenue())
+        self.assertEqual(result["execution_status"], "ACCEPTED")
+        order_id = self.store.connection.execute(
+            "SELECT exchange_order_id FROM canary_ledger WHERE signal_id=?",
+            (status,),
+        ).fetchone()[0]
+        self.assertEqual(order_id, f"order-{status}")
+
+    def test_live_sdk_acceptance_is_a_durable_success(self):
+        self.assertAcceptedSdkStatus("live")
+
+    def test_delayed_sdk_acceptance_is_a_durable_success(self):
+        self.assertAcceptedSdkStatus("delayed")
+
+    def test_status_projects_confirmed_exit_pnl_on_pht_day(self):
+        self.arm()
+        config = self.service.settings.snapshot(now=T0)
+        limits = {
+            "max_all_in_buy_usd": "5.00",
+            "max_gross_daily_buy_usd": "10.00",
+            "max_aggregate_exposure_usd": "10.00",
+            "max_submitted_orders_per_day": 20,
+        }
+        prior_day = datetime(2026, 1, 2, 15, 59, tzinfo=timezone.utc)
+        current_day = datetime(2026, 1, 2, 16, 30, tzinfo=timezone.utc)
+        binding = {
+            "config_id": str(config["config_id"]),
+            "config_generation": int(config["generation"]),
+            "config_hash": str(config["config_hash"]),
+            "control_generation": int(config["control_generation"]),
+        }
+        buy = self.store.reserve_canary_capacity(
+            intent_id="pht-entry",
+            reservation_id="pht-entry-reservation",
+            side="BUY",
+            requested_cost="0.50",
+            fee_reserve="0",
+            quantity="1",
+            market_id="pht-market",
+            event_id="pht-entry-event",
+            detail={"side": "BUY", "token_id": "pht-token"},
+            limits=limits,
+            timestamp=prior_day,
+            **binding,
+        )
+        self.store.record_canary_fill(
+            fill_id="pht-entry-fill",
+            reservation_id=buy["reservation_id"],
+            quantity="1",
+            price="0.50",
+            cost="0.50",
+            fee="0",
+            filled_at=prior_day,
+            detail={"side": "BUY", "settlement_status": "CONFIRMED"},
+        )
+        sell = self.store.reserve_canary_capacity(
+            intent_id="pht-exit",
+            reservation_id="pht-exit-reservation",
+            side="SELL",
+            requested_cost="0",
+            fee_reserve="0",
+            quantity="1",
+            market_id="pht-market",
+            event_id="pht-exit-event",
+            detail={"side": "SELL", "token_id": "pht-token"},
+            limits=limits,
+            timestamp=current_day,
+            **binding,
+        )
+        self.store.record_canary_fill(
+            fill_id="pht-exit-fill",
+            reservation_id=sell["reservation_id"],
+            quantity="1",
+            price="0.25",
+            cost="0.25",
+            fee="0",
+            filled_at=current_day,
+            detail={
+                "side": "SELL",
+                "settlement_status": "CONFIRMED",
+                "entry_cost_usd": "0.50",
+                "proceeds_usd": "0.25",
+                "realized_pnl_usd": "-0.25",
+            },
+        )
+
+        self.service.clock = lambda: prior_day
+        prior_status = self.service.authoritative_status()
+        self.assertEqual(prior_status["today_realized_pnl"], 0.0)
+        self.service.clock = lambda: datetime(2026, 1, 2, 17, tzinfo=timezone.utc)
+        current_status = self.service.authoritative_status()
+        self.assertEqual(current_status["today_realized_pnl"], -0.25)
+        report = self.service.status_report()
+        self.assertEqual(report["execution"]["today_realized_pnl"], -0.25)
+
+    def test_success_response_without_order_identity_stays_unknown(self):
+        self.arm()
+
+        class NoIdentityVenue(FakeVenue):
+            def submit_limit_order(self, **kwargs):
+                self.submissions.append(kwargs)
+                return {"ok": True, "status": "accepted"}
+
+        with self.assertRaisesRegex(CanaryBlocked, "CANARY_SUBMISSION_UNKNOWN"):
+            self.submit("missing-order-id", venue=NoIdentityVenue())
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT status FROM canary_ledger WHERE signal_id=?",
+                ("missing-order-id",),
+            ).fetchone()[0],
+            "UNKNOWN",
+        )
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT status FROM canary_execution_events"
+            ).fetchone()[0],
+            "UNKNOWN",
+        )
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT status FROM canary_risk_reservations"
+            ).fetchone()[0],
+            "SUBMITTING",
+        )
+
+    def test_risk_accounting_failure_trips_durable_breaker(self):
+        self.arm()
+
+        class RejectedVenue(FakeVenue):
+            def submit_limit_order(self, **kwargs):
+                self.submissions.append(kwargs)
+                return {"ok": False, "status": "rejected"}
+
+        with patch.object(
+            self.store,
+            "release_canary_capacity",
+            side_effect=RuntimeError("accounting unavailable"),
+        ), self.assertRaisesRegex(
+            CanaryBlocked,
+            "CANARY_RISK_ACCOUNTING_FAILED",
+        ):
+            self.submit("accounting-failure", venue=RejectedVenue())
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT status FROM canary_ledger WHERE signal_id=?",
+                ("accounting-failure",),
+            ).fetchone()[0],
+            "UNKNOWN",
+        )
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT status FROM canary_execution_events"
+            ).fetchone()[0],
+            "UNKNOWN",
+        )
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT state FROM canary_control WHERE singleton=1"
+            ).fetchone()[0],
+            "KILLED",
+        )
+
+    def test_aggregate_match_ack_waits_for_authoritative_trade_fill(self):
+        self.arm()
+
+        class AggregateVenue(FakeVenue):
+            def submit_limit_order(self, **kwargs):
+                self.submissions.append(kwargs)
+                return {
+                    "ok": True,
+                    "order_id": "aggregate-order",
+                    "status": "matched",
+                    "fill_quantity": "1",
+                    "actual_average_price": "0.50",
+                    "fees": "0.01",
+                    "trade_ids": ["trade-a", "trade-b"],
+                }
+
+        self.submit("aggregate-match", venue=AggregateVenue())
+        ledger = self.store.connection.execute(
+            "SELECT status,fill_quantity FROM canary_ledger WHERE signal_id=?",
+            ("aggregate-match",),
+        ).fetchone()
+        self.assertEqual(ledger["status"], "MATCHED")
+        self.assertIsNone(ledger["fill_quantity"])
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM canary_risk_fills"
+            ).fetchone()[0],
+            0,
+        )
+        event = self.store.connection.execute(
+            "SELECT status,fill_quantity,evidence_json "
+            "FROM canary_execution_events "
+            "WHERE canary_event_id=("
+            "SELECT event_id FROM canary_ledger WHERE signal_id=?"
+            ")",
+            ("aggregate-match",),
+        ).fetchone()
+        self.assertIsNotNone(event)
+        assert event is not None
+        self.assertEqual(event["status"], "MATCHED")
+        self.assertIsNone(event["fill_quantity"])
+        evidence = json.loads(event["evidence_json"])
+        self.assertEqual(evidence["trade_ids"], ["trade-a", "trade-b"])
+        self.assertEqual(evidence["actual_average_price"], "0.50")
+        self.assertEqual(evidence["actual_fees"], "0.01")
+
     def test_different_candidate_cannot_trade_or_write_ledger(self):
         self.arm()
         venue = FakeVenue()
@@ -2853,7 +3489,7 @@ class CanaryTests(unittest.TestCase):
         self.service.kill()
         canary = DashboardData(store=self.store).operator_data()["canary"]
         self.assertEqual(canary["micro_live_canary"], "KILLED")
-        self.assertEqual(canary["last_request_status"], "SUBMITTED")
+        self.assertEqual(canary["last_request_status"], "MATCHED")
         html = _dashboard_html()
         self.assertEqual(
             canary["expiry"],
@@ -2883,7 +3519,7 @@ class CanaryTests(unittest.TestCase):
     def test_dashboard_labels_real_canary_and_production_disabled(self):
         data=DashboardData(store=self.store).operator_data(); self.assertFalse(data["live_execution"]); self.assertFalse(PRODUCTION_LIVE_EXECUTION); self.assertIn("REAL CANARY MONEY",_dashboard_html()); self.assertEqual(data["canary"]["production_live_trading"],"DISABLED")
     def test_autonomous_scan_reaches_persisted_rank_after_1000_without_exceeding_tick_cap(self):
-        self.service.enable_autonomous_micro_live()
+        self.service.enable_autonomous_micro_live("polymarket", self.service._settings_binding()[0], self.service._settings_binding()[1])
         ranking_run_id = "persisted-run-after-1000"
         ranking_timestamp = T0.isoformat()
         rows = [
@@ -2979,7 +3615,7 @@ class CanaryTests(unittest.TestCase):
             "evaluate_signal",
             side_effect=evaluate_signal,
         ), patch.object(
-            CredentialStore,
+            FakeCredentials,
             "configured",
             return_value=False,
         ):
@@ -2996,7 +3632,7 @@ class CanaryTests(unittest.TestCase):
         self.assertEqual(results[-1]["blocker"], "CREDENTIALS_NOT_CONFIGURED")
 
     def test_published_readiness_projects_scan_cycle_fields_consistently(self):
-        self.service.enable_autonomous_micro_live()
+        self.service.enable_autonomous_micro_live("polymarket", self.service._settings_binding()[0], self.service._settings_binding()[1])
         ranking_run_id = "readiness-cycle-run"
         scan_rows = [
             {
@@ -3126,7 +3762,7 @@ class CanaryTests(unittest.TestCase):
         )
         self.assertEqual(self.service.autonomous_limits(), AUTONOMOUS_CANARY_LIMITS)
         self.assertFalse(PRODUCTION_LIVE_EXECUTION)
-        self.service.enable_autonomous_micro_live()
+        self.service.enable_autonomous_micro_live("polymarket", self.service._settings_binding()[0], self.service._settings_binding()[1])
         control = self.store.connection.execute(
             "SELECT limits_json FROM canary_control WHERE singleton=1"
         ).fetchone()
@@ -3141,6 +3777,12 @@ class CanaryTests(unittest.TestCase):
 
 class CanarySignalTests(unittest.TestCase):
     def setUp(self):
+        self._production_profile = patch.dict(
+            os.environ,
+            {"AXIOM_EXECUTION_PROFILE": "production"},
+        )
+        self._production_profile.start()
+        self.addCleanup(self._production_profile.stop)
         self.now = T0
         self.store = HealthyStore(":memory:")
         self.store.save_dataset(
@@ -4301,10 +4943,13 @@ class CanarySignalTests(unittest.TestCase):
             "READY_SIGNAL",
         )
         with self.assertRaisesRegex(CanaryBlocked, "CREDENTIALS_NOT_CONFIGURED"):
+            config_id, generation = no_credentials._settings_binding()
             no_credentials.arm(
                 "C",
                 venue=venue,
                 credentials_configured=True,
+                config_id=config_id,
+                expected_generation=generation,
             )
 
     def test_selected_candidate_stale_market_blocks_submission_before_order(self):
@@ -4331,10 +4976,13 @@ class CanarySignalTests(unittest.TestCase):
         )
 
     def _arm(self, candidate_id="C"):
+        config_id, generation = self.service._settings_binding()
         return self.service.arm(
             candidate_id,
             venue=FakeVenue(),
             credentials_configured=True,
+            config_id=config_id,
+            expected_generation=generation,
         )
 
 
@@ -4501,7 +5149,7 @@ class CanarySignalTests(unittest.TestCase):
             clock=lambda: self.now,
         ).evaluate_and_select(self.now)
         signal = self._signal()
-        self.service.enable_autonomous_micro_live()
+        self.service.enable_autonomous_micro_live("polymarket", self.service._settings_binding()[0], self.service._settings_binding()[1])
         with self.store.connection:
             self.store.connection.execute(
                 "UPDATE canary_rankings SET rank=0, cluster_representative=1, "
@@ -4661,10 +5309,13 @@ class CanarySignalTests(unittest.TestCase):
         )
         validation = restarted.validate_eligibility("C")
         self.assertTrue(validation["eligible"], validation)
+        config_id, generation = restarted._settings_binding()
         restarted.arm(
             "C",
             venue=FakeVenue(),
             credentials_configured=True,
+            config_id=config_id,
+            expected_generation=generation,
         )
         self.assertEqual(restarted.status()["micro_live_canary"], "ARMED")
 
@@ -4694,6 +5345,80 @@ class CanarySignalTests(unittest.TestCase):
                     "forged-market",
                 ]
             )
+
+    def test_cli_canary_status_rejects_expired_effective_control(self):
+        report = {
+            "control": {
+                "state": "DISARMED",
+                "expires_at": "2000-01-01T00:00:00+00:00",
+            },
+            "readiness": {"status": "CURRENT", "stale": False},
+        }
+        service = SimpleNamespace(status_report=lambda: report)
+        output = StringIO()
+        with tempfile.TemporaryDirectory() as directory:
+            database = f"{directory}\\canary.sqlite3"
+            with patch("axiom.cli.CanaryService", return_value=service), redirect_stdout(
+                output
+            ):
+                result = main(["canary-status", "--db", database])
+        rendered = json.loads(output.getvalue())
+        self.assertEqual(result, 1)
+        self.assertEqual(rendered["control"]["state"], "DISARMED")
+        self.assertEqual(rendered["readiness"]["status"], "CURRENT")
+
+    def test_cli_canary_submit_rejected_outcome_returns_nonzero(self):
+        response = {
+            "event_id": "event-rejected",
+            "status": "REJECTED",
+            "execution_status": "REJECTED",
+            "canary_state": "ARMED",
+            "production_live_execution": False,
+        }
+        service = SimpleNamespace(
+            submit_signal=lambda *args, **kwargs: response,
+        )
+        output = StringIO()
+        with tempfile.TemporaryDirectory() as directory:
+            database = f"{directory}\\canary.sqlite3"
+            with patch.dict(os.environ, {"AXIOM_EXECUTION_PROFILE": "production"}), patch(
+                "axiom.cli.CanaryService", return_value=service
+            ), patch(
+                "axiom.cli.PolymarketClobV2Venue", return_value=object()
+            ), patch("builtins.input", return_value="SUBMIT $1"), redirect_stdout(output):
+                result = main(
+                    ["canary-submit", "--db", database, "--signal", "signal-rejected"]
+                )
+        rendered = json.loads(output.getvalue())
+        self.assertEqual(result, 1)
+        self.assertEqual(rendered["execution_status"], "REJECTED")
+
+    def test_cli_canary_submit_accepts_durable_success_outcomes(self):
+        for outcome in ("SUBMITTED", "ACCEPTED", "MATCHED", "PARTIALLY_FILLED", "SETTLED"):
+            with self.subTest(outcome=outcome):
+                response = {
+                    "event_id": f"event-{outcome.lower()}",
+                    "status": outcome,
+                    "execution_status": outcome,
+                    "canary_state": "ARMED",
+                    "production_live_execution": False,
+                }
+                service = SimpleNamespace(
+                    submit_signal=lambda *args, _response=response, **kwargs: _response,
+                )
+                output = StringIO()
+                with tempfile.TemporaryDirectory() as directory:
+                    database = f"{directory}\\canary.sqlite3"
+                    with patch.dict(os.environ, {"AXIOM_EXECUTION_PROFILE": "production"}), patch(
+                        "axiom.cli.CanaryService", return_value=service
+                    ), patch(
+                        "axiom.cli.PolymarketClobV2Venue", return_value=object()
+                    ), patch("builtins.input", return_value="SUBMIT $1"), redirect_stdout(output):
+                        result = main(
+                            ["canary-submit", "--db", database, "--signal", "signal-success"]
+                        )
+                self.assertEqual(result, 0)
+                self.assertEqual(json.loads(output.getvalue())["execution_status"], outcome)
 
     def test_armed_candidate_mismatch_rejects_without_submission(self):
         signal = self._signal()
@@ -4796,14 +5521,25 @@ class CanarySignalTests(unittest.TestCase):
         signal = self._signal()
         self._arm()
         release = threading.Event()
+        entered_transport = threading.Event()
 
         class TimeoutVenue(FakeVenue):
             def submit_limit_order(self, **kwargs):
+                entered_transport.set()
                 release.wait(1)
                 return {"ok": True, "order_id": "late-order", "status": "matched"}
 
+        def timeout_after_transport_started(operation, _timeout_seconds):
+            worker = threading.Thread(target=operation, daemon=True)
+            worker.start()
+            self.assertTrue(entered_transport.wait(1))
+            raise TimeoutError("canary external submission timed out")
+
         try:
-            with patch("axiom.canary.CANARY_SUBMISSION_TIMEOUT_SECONDS", 0.01):
+            with patch(
+                "axiom.canary._call_with_timeout",
+                side_effect=timeout_after_transport_started,
+            ):
                 with self.assertRaisesRegex(
                     CanaryBlocked, "CANARY_SUBMISSION_UNKNOWN"
                 ):

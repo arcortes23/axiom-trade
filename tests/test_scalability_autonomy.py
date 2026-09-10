@@ -163,7 +163,7 @@ class CryptoAutonomyScalabilityTests(unittest.TestCase):
             _, split = processor._load_split(plan)
             self.assertEqual(split.holdout[-1]["close"], 111.5)
             cycle = processor.process_pending(now=T0)
-            self.assertEqual(cycle.completed, 1)
+            self.assertEqual(cycle.completed, 1, repr(cycle))
             self.assertTrue(cycle.results[0]["accepted"])
             self.assertTrue(cycle.results[0]["research_only"])
             self.assertEqual(store.load_forward_tests(), [])

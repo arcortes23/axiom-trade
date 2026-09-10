@@ -78,6 +78,44 @@ def _validate_forward_config(config: Mapping[str, Any]) -> None:
         _validate_payload(public)
     except (ResearchBusPermissionError, TypeError, ValueError) as exc:
         raise ValueError("forward test config contains forbidden private or execution fields") from exc
+def _canonical_scope_config(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate one canonical scope binding carried by a frozen forward test."""
+    result = dict(config)
+    scope = result.get("market_scope")
+    if scope is None:
+        return result
+    try:
+        from .experiment_plan import normalize_market_scope
+
+        policy = normalize_market_scope(scope)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("forward test market_scope is not canonical") from exc
+    for field, expected in (
+        ("market_scope_hash", policy.scope_hash),
+        ("scope_hash", policy.scope_hash),
+        ("market_scope_version", policy.scope_version),
+        ("scope_version", policy.scope_version),
+    ):
+        supplied = result.get(field)
+        if supplied is not None and str(supplied).strip() != expected:
+            raise ValueError(f"forward test {field} does not match canonical market scope")
+        result[field] = expected
+    result["market_scope"] = policy.as_dict()
+    return result
+
+
+def _scope_allowed_markets(config: Mapping[str, Any]) -> tuple[str, ...] | None:
+    scope = config.get("market_scope")
+    if not isinstance(scope, Mapping):
+        return None
+    mode = str(scope.get("mode", "")).strip().upper()
+    if mode != "EXACT_MARKETS":
+        return None
+    values = scope.get("market_ids", ())
+    if not isinstance(values, (list, tuple, set, frozenset)):
+        return ()
+    return tuple(dict.fromkeys(str(item).strip() for item in values if str(item).strip()))
+
 @dataclass(frozen=True, slots=True)
 class ForwardTestSpec:
     experiment_id: str
@@ -112,19 +150,25 @@ class ForwardTestSpec:
             raise ValueError("registration_timestamp must equal start_timestamp for a frozen test")
         object.__setattr__(self, "start_timestamp", start)
         object.__setattr__(self, "registration_timestamp", registration)
-        _validate_forward_config(self.config)
+        normalized_config = _canonical_scope_config(self.config)
+        _validate_forward_config(normalized_config)
         try:
             RiskLimits(**dict(self.risk_limits))
         except (TypeError, ValueError) as exc:
             raise ValueError("forward risk_limits are invalid") from exc
         _validate_private_fields(self.risk_limits, path="risk_limits")
-        normalized_markets = tuple(dict.fromkeys(str(item).strip() for item in self.allowed_markets if str(item).strip()))
-        if bool(self.config.get("market_authority_required", False)) and not normalized_markets:
+        normalized_markets = tuple(
+            dict.fromkeys(str(item).strip() for item in self.allowed_markets if str(item).strip())
+        )
+        if bool(normalized_config.get("market_authority_required", False)) and not normalized_markets:
             raise ValueError("forward test requires a non-empty frozen market authority")
+        allowed_by_scope = _scope_allowed_markets(normalized_config)
+        if allowed_by_scope is not None and any(item not in allowed_by_scope for item in normalized_markets):
+            raise ValueError("forward test allowed_markets exceed the exact canonical market scope")
         if len(normalized_markets) > 1000:
             raise ValueError("forward test allowed_markets exceeds 1000 entries")
         object.__setattr__(self, "allowed_markets", normalized_markets)
-        object.__setattr__(self, "config", _freeze_json(self.config))
+        object.__setattr__(self, "config", _freeze_json(normalized_config))
         object.__setattr__(self, "risk_limits", _freeze_json(self.risk_limits))
     def as_record(self) -> dict[str, Any]:
         return {
@@ -222,6 +266,88 @@ class ForwardTestRegistry:
             allowed_markets=allowed_markets,
             risk_limits=risk_limits,
             experiment_id=experiment_id,
+        )
+
+    def register_observation_intent(
+        self,
+        *,
+        strategy: Any,
+        model: Any,
+        config: Mapping[str, Any],
+        registration_timestamp: datetime | None = None,
+        bankroll: float = 10_000.0,
+        risk_limits: Mapping[str, Any] | None = None,
+        candidate_id: str,
+    ) -> ForwardTestSpec:
+        """Persist a bounded paper observation intent before qualification.
+
+        An intent is immutable evidence configuration, not a candidate
+        lifecycle transition or an executable forward authority.  It is kept
+        out of the paper scheduler until the collector materializes a bounded
+        current-market registry entry.
+        """
+        identifier = str(candidate_id).strip()
+        if not identifier:
+            raise ValueError("candidate_id is required for an observation intent")
+        intent_config = dict(config)
+        intent_config["observation_intent"] = True
+        intent_config["market_authority_required"] = False
+        return self.freeze(
+            strategy=strategy,
+            model=model,
+            config=intent_config,
+            start_timestamp=registration_timestamp or utc_now(),
+            bankroll=bankroll,
+            allowed_markets=(),
+            risk_limits=risk_limits,
+            experiment_id="observation-intent-" + identifier,
+        )
+
+    def list_observation_intents(self) -> tuple[ForwardTestSpec, ...]:
+        return tuple(
+            spec
+            for spec in self.list()
+            if bool((spec.config if isinstance(spec.config, Mapping) else {}).get("observation_intent"))
+            and spec.experiment_id.startswith("observation-intent-")
+        )
+
+    def materialize_observation_intent(
+        self,
+        intent: ForwardTestSpec | str,
+        *,
+        allowed_markets: Sequence[str],
+        registration_timestamp: datetime | None = None,
+        now: datetime | None = None,
+        candidate_id: str | None = None,
+    ) -> ForwardTestSpec:
+        """Create the immutable bounded forward spec after collector resolution."""
+        source = intent if isinstance(intent, ForwardTestSpec) else self.get(str(intent))
+        if source is None:
+            raise ValueError("observation intent is missing")
+        source_config = dict(source.config) if isinstance(source.config, Mapping) else {}
+        if not bool(source_config.get("observation_intent")):
+            raise ValueError("forward spec is not an observation intent")
+        markets = tuple(dict.fromkeys(str(item).strip() for item in allowed_markets if str(item).strip()))
+        if not markets or len(markets) > 100:
+            raise ValueError("collector must materialize a non-empty bounded market set")
+        source_config["market_authority_required"] = True
+        identifier = str(candidate_id or source_config.get("candidate_id") or "").strip()
+        if not identifier:
+            identifier = source.experiment_id.removeprefix("observation-intent-").strip()
+        if not identifier:
+            raise ValueError("observation intent has no candidate identity")
+        current = ensure_utc(now or utc_now())
+        registration = ensure_utc(registration_timestamp or current)
+        return self.register_forward_test(
+            strategy=dict(source_config["strategy_document"]),
+            model=dict(source_config["model_document"]),
+            registration_timestamp=registration,
+            now=current,
+            config=source_config,
+            bankroll=source.bankroll,
+            allowed_markets=markets,
+            risk_limits=dict(source.risk_limits),
+            experiment_id="forward-" + identifier,
         )
 
 

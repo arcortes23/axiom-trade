@@ -12,6 +12,7 @@ import unittest
 from unittest.mock import patch
 
 from axiom.canary import CanaryService
+from axiom.canary_settings import CanarySettingsService
 from axiom.cli import main
 from axiom.bootstrap import BTC_DATASET_IDS, HistoricalBootstrapper
 from axiom.dashboard import DashboardData
@@ -447,6 +448,70 @@ class SQLiteConcurrencyTests(unittest.TestCase):
                 blocked.close()
                 holder.close()
 
+    def test_concurrent_final_submission_slot_has_one_winner(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "risk-slot.sqlite3")
+            left = AxiomStore(path)
+            right = AxiomStore(path)
+            service = CanarySettingsService(left, clock=lambda: T0)
+            draft = service.save_draft({"max_orders_per_day": 2}, "operator-a")
+            service.activate_draft(draft["config_id"], "operator-a", expected_generation=1)
+            results: list[dict[str, object]] = []
+            errors: list[BaseException] = []
+            barrier = threading.Barrier(2)
 
+            def worker(store: AxiomStore, intent: str) -> None:
+                try:
+                    barrier.wait(5)
+                    results.append(
+                        store.reserve_canary_capacity(
+                            intent_id=intent,
+                            side="BUY",
+                            requested_cost="0.50",
+                            quantity="1",
+                            market_id=intent,
+                            timestamp=T0,
+                        )
+                    )
+                except BaseException as exc:
+                    errors.append(exc)
+
+            threads = [
+                threading.Thread(target=worker, args=(left, "slot-a")),
+                threading.Thread(target=worker, args=(right, "slot-b")),
+            ]
+            try:
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(10)
+                self.assertFalse(any(thread.is_alive() for thread in threads))
+                self.assertEqual(len(results), 1)
+                self.assertEqual(len(errors), 1)
+            finally:
+                right.close()
+                left.close()
+
+    def test_partial_risk_schema_adds_indexed_columns_before_indexes(self) -> None:
+        connection = sqlite3.connect(":memory:", check_same_thread=False)
+        connection.execute(
+            "CREATE TABLE canary_risk_reservations("
+            "reservation_id TEXT PRIMARY KEY,intent_id TEXT NOT NULL UNIQUE,"
+            "side TEXT NOT NULL,market_id TEXT)"
+        )
+        store = AxiomStore(connection=connection)
+        try:
+            columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(canary_risk_reservations)")
+            }
+            self.assertTrue({"event_id", "updated_at", "config_id", "control_generation"} <= columns)
+            indexes = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA index_list(canary_risk_reservations)")
+            }
+            self.assertIn("idx_canary_risk_reservations_market", indexes)
+        finally:
+            store.close()
 if __name__ == "__main__":
     unittest.main()

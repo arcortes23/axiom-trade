@@ -25,6 +25,8 @@ SIGNAL_PRODUCED = "SIGNAL_PRODUCED"
 MODEL_INPUT_PRESENT = "MODEL_INPUT_PRESENT"
 CONSTANT_BASELINE = "CONSTANT_BASELINE"
 
+DIRECTIONAL_OOS_TRADING = "DIRECTIONAL_OOS_TRADING"
+PROBABILITY_CALIBRATION_UNKNOWN = "PROBABILITY_CALIBRATION_UNKNOWN"
 
 def _number(value: Any, default: float = 0.0) -> float:
     try:
@@ -717,8 +719,23 @@ def evaluate_signal_evaluation(
     else:
         snapshots = _ordered_prediction_snapshots(data)
         if not snapshots:
-            return Signal(definition.family, 0.0, "flat", definition.market_type.value, WARMING_UP, {"history_count": 0})
+            empty_evidence: dict[str, Any] = {"history_count": 0}
+            if definition.family == "momentum":
+                empty_evidence.update(
+                    {
+                        "assessment_type": DIRECTIONAL_OOS_TRADING,
+                        "probability_calibration": PROBABILITY_CALIBRATION_UNKNOWN,
+                    }
+                )
+            return Signal(definition.family, 0.0, "flat", definition.market_type.value, WARMING_UP, empty_evidence)
         lookback = _declared_lookback(definition.parameters)
+        if definition.family == "momentum":
+            evidence.update(
+                {
+                    "assessment_type": DIRECTIONAL_OOS_TRADING,
+                    "probability_calibration": PROBABILITY_CALIBRATION_UNKNOWN,
+                }
+            )
         if definition.family in {"momentum", "mean_reversion"}:
             required = lookback + 1
             evidence.update({"lookback": lookback, "history_count": len(snapshots), "required": required})
@@ -776,10 +793,10 @@ class BuiltinSignalEvaluator:
 
 SignalEvaluator = BuiltinSignalEvaluator
 
-
 __all__ = [
-    "BuiltinSignalEvaluator", "CONSTANT_BASELINE", "INSUFFICIENT_LOOKBACK",
-    "MODEL_INPUT_MISSING", "MODEL_INPUT_PRESENT", "ModelProbabilityEvaluation",
+    "BuiltinSignalEvaluator", "CONSTANT_BASELINE", "DIRECTIONAL_OOS_TRADING",
+    "INSUFFICIENT_LOOKBACK", "MODEL_INPUT_MISSING", "MODEL_INPUT_PRESENT",
+    "ModelProbabilityEvaluation", "PROBABILITY_CALIBRATION_UNKNOWN",
     "SIGNAL_PRODUCED", "STRATEGY_EVALUATED_DECLINED", "Signal", "SignalEvaluator",
     "WARMING_UP", "evaluate_crypto_family", "evaluate_model_document",
     "evaluate_model_document_probability", "evaluate_model_probability_evidence",

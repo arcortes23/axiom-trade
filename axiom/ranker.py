@@ -743,7 +743,9 @@ class CandidateCanaryRanker:
     def evaluate_and_select(self, now: datetime | None = None) -> dict[str, Any]:
         expected_projection_version = self.service._readiness_projection_version()
         try:
-            return self._evaluate_and_select(now)
+            result = self._evaluate_and_select(now)
+            result["opportunity_scan"] = self.opportunity_scan(now=now)
+            return result
         except Exception as exc:
             error_code = getattr(exc, "error_code", None)
             if not isinstance(error_code, str) or not error_code:
@@ -1493,6 +1495,171 @@ class CandidateCanaryRanker:
 
     def eligible_count(self) -> int:
         return int(self.service.authoritative_status().get("eligible_count") or 0)
+
+    def opportunity_scan(
+        self,
+        *,
+        now: datetime | None = None,
+        max_candidates: int = 100,
+        max_markets_per_candidate: int = 8,
+        max_total_markets: int = 100,
+    ) -> dict[str, Any]:
+        """Persist a bounded, fair scan of current candidate-market pairs.
+
+        The authority resolver has a global unique-market cap, but it returns
+        candidates in input order.  Asking it for that cap directly lets early
+        candidates consume all capacity and starves later candidates.  Resolve
+        the bounded candidate inventory first, then admit pairs round-robin so
+        every candidate gets an opportunity before any candidate receives its
+        second market.  This is read-only with respect to selection: the
+        singleton winner is neither consulted nor changed.
+        """
+        timestamp = ensure_utc(now or self.clock())
+        for name, value in (
+            ("max_candidates", max_candidates),
+            ("max_markets_per_candidate", max_markets_per_candidate),
+            ("max_total_markets", max_total_markets),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+        candidate_limit = max_candidates
+        market_limit = max_markets_per_candidate
+        total_market_limit = max_total_markets
+        rows = self.rankings(limit=max(1, candidate_limit))
+        valid: list[dict[str, Any]] = []
+        for row in rows[:candidate_limit]:
+            run_id = str(row.get("ranking_run_id") or "").strip()
+            if not run_id or not self.validate_persisted_ranking(
+                row,
+                ranking_run_id=run_id,
+                now=timestamp,
+            ):
+                continue
+            valid.append(dict(row))
+        valid.sort(
+            key=lambda row: (
+                int(row.get("rank") or 0)
+                if str(row.get("rank") or "").isdigit()
+                else 0,
+                str(row.get("candidate_id") or ""),
+            )
+        )
+        candidate_ids = tuple(
+            str(row["candidate_id"])
+            for row in valid
+            if str(row.get("candidate_id") or "").strip()
+        )
+        authority = self.store.candidate_forward_requirements(
+            candidate_ids=candidate_ids,
+            now=timestamp,
+            max_candidates=candidate_limit,
+            max_markets_per_candidate=market_limit,
+            max_total_markets=total_market_limit,
+        )
+        # If the shared cap excluded any candidate's pairs, resolve only those
+        # candidates independently.  This preserves the authority API's
+        # global bound while preventing rank-order starvation in the projection.
+        authority_candidates = {
+            str(item.get("candidate_id") or "").strip(): item
+            for item in authority.get("candidates", ())
+            if isinstance(item, Mapping) and str(item.get("candidate_id") or "").strip()
+        }
+        excluded_ids = [
+            candidate_id
+            for candidate_id in candidate_ids
+            if isinstance(authority_candidates.get(candidate_id), Mapping)
+            and authority_candidates[candidate_id].get("capacity_excluded_market_ids")
+        ]
+        for candidate_id in excluded_ids:
+            individual = self.store.candidate_forward_requirements(
+                candidate_ids=(candidate_id,),
+                now=timestamp,
+                max_candidates=1,
+                max_markets_per_candidate=market_limit,
+                max_total_markets=market_limit,
+            )
+            replacement = next(
+                (
+                    item
+                    for item in individual.get("candidates", ())
+                    if isinstance(item, Mapping)
+                    and str(item.get("candidate_id") or "").strip() == candidate_id
+                ),
+                None,
+            )
+            if replacement is not None:
+                authority_candidates[candidate_id] = replacement
+        rank_by_id = {str(row["candidate_id"]): row for row in valid}
+        candidate_pairs: list[tuple[str, Mapping[str, Any], list[str]]] = []
+        for candidate in (
+            authority_candidates.get(candidate_id) for candidate_id in candidate_ids
+        ):
+            if not isinstance(candidate, Mapping):
+                continue
+            candidate_id = str(candidate.get("candidate_id") or "").strip()
+            ranking = rank_by_id.get(candidate_id)
+            if (
+                ranking is None
+                or str(candidate.get("resolution") or "").upper() != "RESOLVED"
+            ):
+                continue
+            market_ids = list(
+                dict.fromkeys(
+                    str(market_id).strip()
+                    for market_id in candidate.get("permitted_market_ids", ())
+                    if str(market_id).strip()
+                )
+            )[:market_limit]
+            if market_ids:
+                candidate_pairs.append((candidate_id, ranking, market_ids))
+
+        opportunities: list[dict[str, Any]] = []
+        admitted_markets: set[str] = set()
+        admitted_pairs: set[tuple[str, str]] = set()
+        for market_index in range(market_limit):
+            for candidate_id, ranking, market_ids in candidate_pairs:
+                if market_index >= len(market_ids):
+                    continue
+                market_id = market_ids[market_index]
+                pair = (candidate_id, market_id)
+                if pair in admitted_pairs:
+                    continue
+                if (
+                    market_id not in admitted_markets
+                    and len(admitted_markets) >= total_market_limit
+                ):
+                    continue
+                admitted_markets.add(market_id)
+                admitted_pairs.add(pair)
+                opportunities.append(
+                    {
+                        "candidate_id": candidate_id,
+                        "market_id": market_id,
+                        "rank": ranking.get("rank"),
+                        "total_score": ranking.get("total_score"),
+                        "ranking_run_id": ranking.get("ranking_run_id"),
+                        "ranking_snapshot_hash": ranking.get("ranking_snapshot_hash"),
+                        "qualification_hash": ranking.get("qualification_hash"),
+                        "selection_status": "CURRENT_VALID_RANKING",
+                        "observed_at": timestamp.isoformat(),
+                        "paper_only": True,
+                    }
+                )
+        saver = getattr(self.store, "save_opportunity_snapshots", None)
+        persisted = int(saver(timestamp, opportunities)) if callable(saver) and opportunities else 0
+        return {
+            "observed_at": timestamp.isoformat(),
+            "candidate_count": len(valid),
+            "opportunity_count": len(opportunities),
+            "persisted_count": persisted,
+            "opportunities": opportunities,
+            "blocker": None if opportunities else "NO_CURRENT_VALID_CANDIDATE_MARKET_PAIR",
+            "paper_only": True,
+        }
+
+    scan_opportunities = opportunity_scan
+    fair_opportunity_scan = opportunity_scan
+    scan_candidate_market_opportunities = opportunity_scan
 
 
 __all__ = ["CandidateCanaryRanker"]

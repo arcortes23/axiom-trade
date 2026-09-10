@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -51,10 +52,17 @@ class OperatorBootstrapRegressionTests(unittest.TestCase):
                     started = control.start_bootstrap(resume=False)
                     self.assertTrue(entered.wait(timeout=1))
                     self.assertEqual(started["status"], "RUNNING")
-                    worker = control._bootstrap_threads[BOOTSTRAP_JOB_NAME]
                     release.set()
-                    worker.join(timeout=2)
-                    self.assertFalse(worker.is_alive())
+                    deadline = time.monotonic() + 2.0
+                    persisted = None
+                    while time.monotonic() < deadline:
+                        persisted = store.get_operator_job(BOOTSTRAP_JOB_NAME)
+                        if persisted is not None and persisted["status"] != "RUNNING":
+                            break
+                        time.sleep(0.01)
+                    self.assertIsNotNone(persisted)
+                    assert persisted is not None
+                    self.assertEqual(persisted["status"], "COMPLETE")
 
             with AxiomStore(db_path) as reopened:
                 result = reopened.get_operator_job(BOOTSTRAP_JOB_NAME)

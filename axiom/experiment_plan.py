@@ -352,9 +352,28 @@ def normalize_market_scope(
     """Normalize one explicit policy or legacy target/filter sources."""
     if value is not None:
         explicit = MarketScopePolicy.from_mapping(value)
+
+        def has_material(item: Any) -> bool:
+            if item is None:
+                return False
+            if isinstance(item, Mapping) and not item:
+                return False
+            if isinstance(item, (list, tuple, set, frozenset)) and not item:
+                return False
+            return True
+
         legacy_present = any(
-            item is not None
-            for item in (target, market_ids, target_market_ids, target_instrument, instrument, categories, filters, regime_restrictions)
+            has_material(item)
+            for item in (
+                target,
+                market_ids,
+                target_market_ids,
+                target_instrument,
+                instrument,
+                categories,
+                filters,
+                regime_restrictions,
+            )
         )
         if not legacy_present:
             return explicit
@@ -563,12 +582,17 @@ _ALLOWED_FIELDS = frozenset(
         "experiment_family",
         "family_budget",
         "budget",
+        "trial_budget",
         "max_variants",
         "min_samples",
         "minimum_samples",
         "min_trades",
         "minimum_trades",
         "paper_only",
+        "research_mode",
+        "assumptions",
+        "exit_policy",
+        "exit",
     }
 )
 
@@ -758,6 +782,65 @@ def _time_split(value: Any) -> str:
     ):
         raise ExperimentPlanError("LOCKED_HOLDOUT_FORBIDDEN", "time_split must be chronological train-validation-holdout")
     return value.strip()
+def _research_mode(value: Any, market_type: MarketType) -> str:
+    if market_type is not MarketType.PREDICTION:
+        return "NOT_APPLICABLE"
+    normalized = str(value or "PRICE_PROXY_RESEARCH").strip().upper().replace("-", "_").replace(" ", "_")
+    aliases = {"PRICE_PROXY": "PRICE_PROXY_RESEARCH", "RECORDED_BOOK": "RECORDED_BOOK_REPLAY"}
+    normalized = aliases.get(normalized, normalized)
+    if normalized not in {"PRICE_PROXY_RESEARCH", "RECORDED_BOOK_REPLAY"}:
+        raise ExperimentPlanError("UNSUPPORTED_RESEARCH_MODE", f"unsupported research_mode {value!r}")
+    return normalized
+
+
+def _research_assumptions(value: Any, mode: str) -> dict[str, Any]:
+    source = _as_mapping(value, name="assumptions") if value is not None else {}
+    version = str(source.get("version", "")).strip()
+    expected = "price-proxy-v1" if mode == "PRICE_PROXY_RESEARCH" else "recorded-book-replay-v1"
+    if mode != "NOT_APPLICABLE" and not version:
+        version = expected
+    if mode != "NOT_APPLICABLE" and version != expected:
+        raise ExperimentPlanError("UNSUPPORTED_SCHEMA", f"assumptions.version must be {expected!r}")
+    for name in ("fee_bps", "slippage_bps", "roundtrip_fee_bps", "roundtrip_slippage_bps"):
+        if name in source:
+            value_number = source[name]
+            if isinstance(value_number, bool):
+                raise ExperimentPlanError("INVALID_PLAN", f"assumptions.{name} must be non-negative")
+            try:
+                value_number = float(value_number)
+            except (TypeError, ValueError):
+                raise ExperimentPlanError("INVALID_PLAN", f"assumptions.{name} must be numeric") from None
+            if not math.isfinite(value_number) or value_number < 0:
+                raise ExperimentPlanError("INVALID_PLAN", f"assumptions.{name} must be non-negative")
+            source[name] = value_number
+    source["version"] = version or "not-applicable"
+    source["mode"] = mode
+    return source
+
+
+def _exit_policy(value: Any, mode: str) -> dict[str, Any]:
+    if value is None:
+        value = {"type": "fixed_holding_period", "holding_period": 1}
+    if isinstance(value, str):
+        value = {"type": value}
+    policy = _as_mapping(value, name="exit_policy")
+    kind = str(policy.get("type", policy.get("kind", ""))).strip().lower()
+    if kind != "fixed_holding_period":
+        raise ExperimentPlanError("INVALID_PLAN", "prediction research requires fixed_holding_period exit_policy")
+    period = policy.get("holding_period", policy.get("bars", policy.get("observations", 1)))
+    if isinstance(period, bool) or not isinstance(period, int) or period < 1 or period > MAX_SAMPLES:
+        raise ExperimentPlanError("INVALID_PLAN", "exit_policy.holding_period must be a bounded positive integer")
+    return {"type": "fixed_holding_period", "holding_period": period}
+
+
+def _trial_budget(value: Any, *, max_variants: int) -> dict[str, Any]:
+    budget = _as_mapping(value, name="trial_budget")
+    limit = budget.get("limit", budget.get("max_trials", max_variants))
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_PLAN_VARIANTS:
+        raise ExperimentPlanError("EXPERIMENT_BUDGET_EXCEEDED", "trial_budget.limit must be between one and 64")
+    budget["limit"] = limit
+    budget["locked"] = True
+    return budget
 
 
 def _parameter_values(value: Any, *, name: str) -> tuple[Any, ...]:
@@ -939,6 +1022,10 @@ class ExperimentPlan:
     strategy_document: Mapping[str, Any] | None = None
     model_document: Mapping[str, Any] | None = None
     universe: Mapping[str, Any] | None = None
+    research_mode: str = "PRICE_PROXY_RESEARCH"
+    assumptions: Mapping[str, Any] = MappingProxyType({})
+    exit_policy: Mapping[str, Any] = MappingProxyType({"type": "fixed_holding_period", "holding_period": 1})
+    trial_budget: Mapping[str, Any] = MappingProxyType({"limit": 1, "locked": True})
 
     @classmethod
     def from_mapping(cls, document: Mapping[str, Any], *, hypothesis_id: str | None = None) -> "ExperimentPlan":
@@ -1117,6 +1204,14 @@ class ExperimentPlan:
         max_variants = raw.get("max_variants", min(MAX_PLAN_VARIANTS, possible_variants))
         if isinstance(max_variants, bool) or not isinstance(max_variants, int) or not 1 <= max_variants <= MAX_PLAN_VARIANTS:
             raise ExperimentPlanError("EXPERIMENT_BUDGET_EXCEEDED", "max_variants must be between one and 64")
+        research_mode = _research_mode(raw.get("research_mode"), market_type)
+        assumptions = _research_assumptions(raw.get("assumptions"), research_mode)
+        exit_policy = _exit_policy(raw.get("exit_policy", raw.get("exit")), research_mode) if market_type is MarketType.PREDICTION else {"type": "not_applicable"}
+        trial_budget = _trial_budget(raw.get("trial_budget"), max_variants=max_variants)
+        methodology["research_mode"] = research_mode
+        methodology["assumptions"] = assumptions
+        methodology["exit_policy"] = exit_policy
+        methodology["chronological_locked"] = True
         min_samples = raw.get("min_samples", raw.get("minimum_samples", 30))
         min_trades = raw.get("min_trades", raw.get("minimum_trades", 0))
         for value, name in ((min_samples, "min_samples"), (min_trades, "min_trades")):
@@ -1180,10 +1275,14 @@ class ExperimentPlan:
             "metrics": list(metrics),
             "experiment_family": experiment_family,
             "family_budget": family_budget,
+            "trial_budget": trial_budget,
             "max_variants": max_variants,
             "min_samples": min_samples,
             "min_trades": min_trades,
             "paper_only": True,
+            "research_mode": research_mode,
+            "assumptions": assumptions,
+            "exit_policy": exit_policy,
             "strategy_document": dict(strategy_document) if strategy_document is not None else None,
             "model_document": dict(model_document) if model_document is not None else None,
             "universe": universe,
@@ -1223,6 +1322,10 @@ class ExperimentPlan:
             strategy_document=_freeze_json(strategy_document) if strategy_document is not None else None,
             model_document=_freeze_json(model_document) if model_document is not None else None,
             universe=_freeze_json(universe) if universe is not None else None,
+            research_mode=research_mode,
+            assumptions=_freeze_json(assumptions),
+            exit_policy=_freeze_json(exit_policy),
+            trial_budget=_freeze_json(trial_budget),
         )
 
     @classmethod
@@ -1254,8 +1357,8 @@ class ExperimentPlan:
                 "template": proposal.get("template", proposal.get("strategy_family", "probability_mispricing")),
                 "features": proposal.get("features"),
                 "parameters": proposal.get("parameters", proposal.get("parameter_ranges")),
-                "filters": proposal.get("filters", {}),
-                "target": proposal.get("target", {}),
+                "filters": proposal.get("filters"),
+                "target": proposal.get("target"),
                 "dataset_version": proposal.get("dataset_version"),
                 "time_split": proposal.get("time_split", "train-validation-holdout"),
                 "metrics": proposal.get("metrics") or ("expectancy", "drawdown", "trade_count", "sample_count"),
@@ -1263,6 +1366,10 @@ class ExperimentPlan:
                 "max_variants": proposal.get("max_variants", 4),
                 "min_samples": proposal.get("min_samples", 30),
                 "min_trades": proposal.get("min_trades", 0),
+                "research_mode": proposal.get("research_mode"),
+                "assumptions": proposal.get("assumptions"),
+                "exit_policy": proposal.get("exit_policy", proposal.get("exit")),
+                "trial_budget": proposal.get("trial_budget"),
                 "paper_only": proposal.get("paper_only") if proposal.get("paper_only") is not None else True,
             }
             if raw_plan.get("experiment_family") is None:
@@ -1301,20 +1408,40 @@ class ExperimentPlan:
             if alias not in proposal:
                 continue
             supplied = proposal[alias]
+            scope_alias = alias in {
+                "market_scope",
+                "market_scope_hash",
+                "market_scope_version",
+                "filters",
+                "regime_restrictions",
+                "target",
+                "target_instrument",
+                "market_ids",
+                "target_market_ids",
+                "instrument",
+                "categories",
+            }
+            if scope_alias and (
+                supplied is None
+                or supplied == {}
+                or supplied == []
+                or supplied == ()
+            ):
+                continue
             if alias in plan_document and _canonical(plan_document[alias]) != _canonical(supplied):
-                reason = "CONFLICTING_MARKET_SCOPE" if alias in {
-                    "market_scope",
-                    "market_scope_hash",
-                    "market_scope_version",
-                    "filters",
-                    "regime_restrictions",
-                    "target",
-                    "target_instrument",
-                    "market_ids",
-                    "target_market_ids",
-                    "instrument",
-                    "categories",
-                } else "CONFLICTING_DATASET_SELECTOR"
+                if alias == "market_scope":
+                    try:
+                        nested_scope = normalize_market_scope(plan_document[alias])
+                        supplied_scope = normalize_market_scope(supplied)
+                    except (ExperimentPlanError, TypeError, ValueError):
+                        nested_scope = supplied_scope = None
+                    if (
+                        nested_scope is not None
+                        and supplied_scope is not None
+                        and _scope_equivalent(nested_scope, supplied_scope)
+                    ):
+                        continue
+                reason = "CONFLICTING_MARKET_SCOPE" if scope_alias else "CONFLICTING_DATASET_SELECTOR"
                 raise ExperimentPlanError(reason, f"proposal and experiment plan {alias} values differ")
             plan_document.setdefault(alias, supplied)
         if proposal.get("dataset_id") is not None:
@@ -1462,10 +1589,14 @@ class ExperimentPlan:
             "metrics": list(self.metrics),
             "experiment_family": self.experiment_family,
             "family_budget": _plain_json(self.family_budget),
+            "trial_budget": _plain_json(self.trial_budget),
             "max_variants": self.max_variants,
             "min_samples": self.min_samples,
             "min_trades": self.min_trades,
             "paper_only": True,
+            "research_mode": self.research_mode,
+            "assumptions": _plain_json(self.assumptions),
+            "exit_policy": _plain_json(self.exit_policy),
         }
         if self.strategy_document is not None:
             result["strategy_document"] = _plain_json(self.strategy_document)

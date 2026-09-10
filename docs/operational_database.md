@@ -10,7 +10,10 @@ runtime-data/axiom.sqlite
 
 Commands and PowerShell lifecycle scripts use that path when no database
 argument is supplied. An explicit `--db` or `-DbPath` remains an intentional
-override. AXIOM never merges databases implicitly.
+override. AXIOM never merges databases implicitly. For development diagnostics,
+always provide a dedicated `--db`/`-DbPath` and the isolated profile switch
+(`--isolated` for the CLI or `-Isolated` for PowerShell); omitting that switch
+is not a supported development diagnostic profile.
 
 Previous Phase 3, Phase 4, and Phase 4.2 databases, including names such as
 `runtime-data/axiom_phase3.sqlite`, `runtime-data/axiom_phase4.sqlite`, and
@@ -106,7 +109,6 @@ per candidate are protected.
 
 ```powershell
 python -m axiom.cli node-run --cycles 0 --disable-research --disable-mutations
-python -m axiom.cli dashboard
 python -m axiom.cli dataset-catalog --status
 python -m axiom.cli research-summary
 python -m axiom.cli submit-proposal --proposal '{"proposal_id":"proposal-example","statement":"<one falsifiable statement>","source":"<public source or immutable AXIOM result>","tests":["<bounded chronological test>"],"dataset_version":"<immutable version>","time_split":"train-validation-holdout","paper_only":true,"experiment_plan":{"schema_version":"1","market_type":"prediction","template":"probability_mispricing","dataset_version":"<immutable version>","max_variants":4,"min_samples":30,"paper_only":true}}'
@@ -114,40 +116,64 @@ python -m axiom.cli submit-proposal --proposal '{"proposal_id":"proposal-example
 
 ## Micro-live Polymarket canary
 
-Production live trading remains disabled. The optional `LIVE_CANARY` path uses
-the current official Polymarket unified Python SDK and CLOB V2 semantics only.
-Use a dedicated Polymarket wallet containing only the small amount intended for
-AXIOM canary testing. Never provide a primary-wallet private key.
-
-Credentials are stored through Windows Credential Manager via the OS keyring:
+Production live trading remains disabled by default. This release documents
+only an isolated development and diagnostic path; deployment remains
+`DISARMED`. Launch the control-wired operator surface, which supervises one
+paper node, with a dedicated development database:
 
 ```powershell
-python -m axiom.cli credentials configure polymarket
-python -m axiom.cli credentials status
+python -m axiom.cli operator --isolated --db <development-db> --port 8187
 ```
 
-Environment variables are supported only when `--allow-environment` is passed.
-They are `POLYMARKET_PRIVATE_KEY`, `POLYMARKET_WALLET_ADDRESS`,
-`POLYMARKET_RELAYER_API_KEY`, and `POLYMARKET_RELAYER_API_KEY_ADDRESS`.
-Credential values never enter SQLite, dashboard JSON, reports, or logs.
+Do not pair the node lifecycle start script with the control-less `dashboard`
+surface for operator **Enable**/**Disable** actions. `dashboard` is not the
+operator surface. Isolated mode denies production credential loads, configured
+credential probes, authenticated connectivity, and account/order transports.
+It cannot activate a canary. Do not configure or provide Polymarket
+credentials for this diagnostic path; no credential or wallet command is part
+of this procedure.
+
+1. In the operator dashboard, review the **ACTIVE**/**DRAFT** settings, exact
+   config ID/hash, settings and canary control generations, PHT reset, all
+   independent remaining capacities, unresolved/UNKNOWN intents,
+   candidate-bound forward evidence, and the expected price/fee/slippage.
+2. Do not manually copy candidate, market, or token IDs into a normal run.
+3. Do not click **Enable** or attempt activation from this isolated diagnostic
+   surface. It cannot authenticate, reach account/order paths, or authorize a
+   live canary; no live order or fill is implied.
+4. On completion or emergency, pause entries, reconcile UNKNOWN intents by
+   exact client ID, use **Disable/Disarm** if a persisted control state must be
+   cleared, and verify the persisted state. Never delete rows or release a
+   reservation to make a projection look clear.
+
+Risk settings use exact pUSD decimal strings; `_usd` names are legacy labels
+only and do not imply fiat conversion. Polygon chain 137 collateral uses
+integer micro-pUSD base units (six decimals), token
+`0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB`. The isolated canary does not
+fund, convert, create credentials, repair allowances, or access authenticated
+venue paths. The settings panel displays the complete active/draft surface and
+engineering bounds (money `0.01`–`1,000,000.00` pUSD, positions `1`–`10,000`,
+submissions `1`–`100,000`, slippage `0`–`10,000` bps); invalid, non-finite,
+boolean, fractional, or cross-budget values are rejected rather than clamped.
+
+The following backend commands are optional storage-only diagnostics and
+emergency controls for the same dedicated development database, not the normal
+operator launch:
 
 ```powershell
-python -m axiom.cli canary-check --candidate <candidate-id> --market <market-id> --token <token-id>
-python -m axiom.cli canary-arm --venue polymarket --candidate <candidate-id> --target-notional-usd 1.00 --expires-hours 24
-python -m axiom.cli canary-status
-python -m axiom.cli canary-disarm
-python -m axiom.cli canary-kill
+python -m axiom.cli canary-status --db <development-db>
+python -m axiom.cli canary-disarm --db <development-db>
+python -m axiom.cli canary-kill --db <development-db>
 ```
 
-`canary-check` is no-order. `canary-kill` prevents further submissions
-immediately. An expired arm returns to paper-only automatically.
-
-Forward-evidence changes do not relax live-order gates. `canary-signal`
-evaluates persisted authorized evidence and remains paper-only. The
-order-capable `canary-submit` path still rechecks signal expiry and immutable
-candidate bindings, candidate research/data-quality gates, candidate-bound
-health, the fresh source snapshot and current order book, arm/control state,
-credentials, geoblock, and risk limits; any failed check remains fail-closed.
+`canary-status` reads persisted projections. `canary-disarm` returns immediately
+to paper-only and `canary-kill` prevents further submissions. The authenticated
+`canary-check` path is not available in isolated mode and must not be used as a
+substitute for this diagnostic procedure. An expired authorization returns to
+paper-only automatically. SDK 0.9 checks are read-only, but isolated mode does
+not run authenticated connectivity checks. Forward evidence, research, paper
+signals, and simulated fills do not establish live-order readiness; no live
+order or fill is claimed here.
 
 Dashboard HTTP `GET` endpoints and `canary-status` read persisted projections.
 They never probe a provider or the keyring; a credential cache miss is shown as
@@ -158,13 +184,17 @@ configured public providers. It is therefore not a provider-free dry proof or
 live-order readiness proof. Use `node-status`, `canary-status`,
 `dataset-catalog --status`, or dashboard `GET` for storage-only inspection.
 
-PowerShell lifecycle commands use the same default:
+PowerShell lifecycle commands are node-only diagnostics, not the control-wired
+operator surface. When they are used for development diagnostics,
+`-Isolated` is REQUIRED on every invocation, and `-DbPath` must point to the
+same dedicated development database. Never omit `-Isolated` or pair these
+commands with the control-less dashboard for operator Enable/Disable:
 
 ```powershell
-.\ops\start_axiom_node.ps1
-.\ops\status_axiom_node.ps1
-.\ops\restart_axiom_node.ps1
-.\ops\stop_axiom_node.ps1
+.\ops\start_axiom_node.ps1 -DbPath <development-db> -Isolated
+.\ops\status_axiom_node.ps1 -DbPath <development-db> -Isolated
+.\ops\restart_axiom_node.ps1 -DbPath <development-db> -Isolated
+.\ops\stop_axiom_node.ps1 -DbPath <development-db> -Isolated
 ```
 
 ## Binance Spot canary
@@ -185,5 +215,5 @@ pass it explicitly:
 
 ```powershell
 python -m axiom.cli dataset-catalog --db runtime-data/axiom_phase42.sqlite --status
-.\ops\status_axiom_node.ps1 -DbPath runtime-data/axiom_phase42.sqlite
+.\ops\status_axiom_node.ps1 -DbPath runtime-data/axiom_phase42.sqlite -Isolated
 ```

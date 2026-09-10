@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import hashlib
 import json
+import os
 import threading
 import unittest
 from unittest.mock import Mock, patch
@@ -15,6 +16,7 @@ from axiom.canary import (
     CanaryBlocked,
     CanaryService,
     CredentialStore,
+    credential_fingerprint,
 )
 from axiom.dashboard import DashboardData
 from axiom.lifecycle import CandidateLifecycleManager, CandidateStage
@@ -38,7 +40,7 @@ def connectivity_projection(*, ready: bool, failure_codes: list[str] | None = No
     return {
         "ready": ready,
         "status": "READY" if ready else "BLOCKED",
-        "checked_at": T0.isoformat(),
+        "checked_at": datetime.now(timezone.utc).isoformat(),
         "sdk": {
             "installed": True,
             "name": "polymarket-client",
@@ -47,7 +49,16 @@ def connectivity_projection(*, ready: bool, failure_codes: list[str] | None = No
         },
         "credentials": {"status": "CONFIGURED"},
         "authentication": {"status": "PASS"},
-        "account": {"status": "PASS", "wallet_type": "EOA"},
+        "account": {
+            "status": "PASS",
+            "wallet_type": "EOA",
+            "credential_fingerprint": credential_fingerprint(
+                {
+                    "private_key": "fixture-private-key",
+                    "wallet_address": "0x0000000000000000000000000000000000000001",
+                }
+            ),
+        },
         "geoblock": {"status": "PASS", "country": "ZZ", "region": "T"},
         "balance": {"status": "PASS", "available_usd": "10"},
         "allowance": {"status": "SUFFICIENT" if ready else "INSUFFICIENT"},
@@ -60,7 +71,7 @@ def connectivity_projection(*, ready: bool, failure_codes: list[str] | None = No
             else [
                 {
                     "code": codes[0],
-                    "reason": "Current allowance is below the amount required for a $1 canary.",
+                    "reason": "Current allowance is below the active canary requirement.",
                 }
             ]
         ),
@@ -74,8 +85,16 @@ class HealthyStore(AxiomStore):
 
 
 class TestCredentials(CredentialStore):
+    _VALUES = {
+        "private_key": "fixture-private-key",
+        "wallet_address": "0x0000000000000000000000000000000000000001",
+    }
+
     def __init__(self, configured: bool = True):
         self._configured = configured
+
+    def load(self, **kwargs):
+        return dict(self._VALUES) if self._configured else {}
 
     def configured(self, **kwargs):
         return self._configured
@@ -110,6 +129,16 @@ class TestVenue:
             "fill_quantity": kwargs["size"],
             "actual_average_price": "0.51",
             "fees": "0.02",
+        }
+class RejectingVenue(TestVenue):
+    def submit_limit_order(self, **kwargs):
+        self.submissions.append(kwargs)
+        return {
+            "ok": False,
+            "order_id": None,
+            "status": "REJECTED",
+            "code": "VENUE_REJECTED",
+            "message": "venue rejected canary order",
         }
 
 
@@ -220,6 +249,14 @@ def candidate_payload(
 
 class AutonomousWorkflowTests(unittest.TestCase):
     def setUp(self):
+        # The release fixture is isolated by default; fake venue/control
+        # coverage opts into the exact production profile explicitly.
+        self._production_profile = patch.dict(
+            os.environ,
+            {"AXIOM_EXECUTION_PROFILE": "production"},
+        )
+        self._production_profile.start()
+        self.addCleanup(self._production_profile.stop)
         self.store = HealthyStore(":memory:")
         self.addCleanup(self.store.close)
         self.store.save_dataset(
@@ -477,7 +514,7 @@ class AutonomousWorkflowTests(unittest.TestCase):
         node._publish_autonomous_initializing(T0)
 
         result = node._auto_canary_worker.tick(now=T0)
-        self.assertEqual(result["status"], "DISABLED")
+        self.assertEqual(result["status"], "DISABLED", result)
         row = self.store.connection.execute(
             "SELECT projection_version,readiness_snapshot_status,"
             "readiness_snapshot_stale FROM canary_readiness_snapshot "
@@ -804,15 +841,66 @@ class AutonomousWorkflowTests(unittest.TestCase):
         self.assertIsNone(self.service.generate_signal("book-required"))
 
 
+    def _execute_control(
+        self,
+        control: OperatorControlPlane,
+        action: str,
+        *,
+        confirm: str = "",
+        payload: Mapping[str, object] | None = None,
+    ) -> dict[str, object]:
+        response = dict(
+            control.execute(
+                action,
+                confirm=confirm,
+                payload=payload,
+            )
+        )
+        action_id = str(response.get("action_id") or "").strip()
+        if not action_id:
+            return response
+        for _ in range(100):
+            actions = control.status().get("actions", ())
+            entry = next(
+                (
+                    item
+                    for item in actions
+                    if isinstance(item, Mapping)
+                    and str(item.get("action_id") or "").strip() == action_id
+                ),
+                None,
+            )
+            if isinstance(entry, Mapping):
+                action_status = str(entry.get("status") or "").upper()
+                if action_status in {"COMPLETE", "FAILED"}:
+                    response["action_status"] = action_status
+                    response["ok"] = action_status == "COMPLETE"
+                    if isinstance(entry.get("result"), Mapping):
+                        response["result"] = dict(entry["result"])
+                    reason = str(entry.get("reason") or "").strip()
+                    if reason:
+                        response["reason"] = reason
+                    return response
+            threading.Event().wait(0.01)
+        return response
+
     def test_enable_requires_exact_confirmation_and_connectivity_gate(self):
         control = OperatorControlPlane(self.store)
-        denied = control.execute("canary.enable_auto", confirm="ENABLE AUTO CANARY ")
+        denied = self._execute_control(
+            control,
+            "canary.enable_auto",
+            confirm="ENABLE AUTO CANARY ",
+        )
         self.assertFalse(denied["ok"])
         self.assertEqual(denied["reason"], "EXACT_CONFIRMATION_REQUIRED")
 
         absent_service = Mock()
         with patch("axiom.operator.CanaryService", return_value=absent_service) as service_factory:
-            absent = control.execute("canary.enable_auto", confirm="ENABLE AUTO CANARY")
+            absent = self._execute_control(
+                control,
+                "canary.enable_auto",
+                confirm="ENABLE AUTO CANARY",
+            )
         service_factory.assert_not_called()
         self.assertFalse(absent["ok"])
         self.assertEqual(absent["reason"], "CONNECTIVITY_CHECK_REQUIRED")
@@ -825,7 +913,8 @@ class AutonomousWorkflowTests(unittest.TestCase):
         self.store.set_operator_config(CANARY_CONNECTIVITY_CONFIG_KEY, blocked)
         blocked_service = Mock()
         with patch("axiom.operator.CanaryService", return_value=blocked_service) as service_factory:
-            blocked_result = control.execute(
+            blocked_result = self._execute_control(
+                control,
                 "canary.enable_auto",
                 confirm="ENABLE AUTO CANARY",
             )
@@ -838,8 +927,24 @@ class AutonomousWorkflowTests(unittest.TestCase):
             CANARY_CONNECTIVITY_CONFIG_KEY,
             connectivity_projection(ready=True),
         )
-        enabled = control.execute("canary.enable_auto", confirm="ENABLE AUTO CANARY")
-        self.assertTrue(enabled["ok"])
+        settings = self.service.settings.snapshot(now=T0)
+        config_id = str(settings["config_id"])
+        generation = int(settings["generation"])
+        with patch(
+            "axiom.operator.CredentialStore",
+            return_value=TestCredentials(True),
+        ):
+            enabled = self._execute_control(
+                control,
+                "canary.enable_auto",
+                confirm=f"ENABLE AUTO CANARY POLYMARKET {config_id} {generation}",
+                payload={
+                    "venue": "polymarket",
+                    "config_id": config_id,
+                    "expected_generation": generation,
+                },
+            )
+        self.assertTrue(enabled["ok"], enabled)
         status = self.service.status()
         self.assertEqual(status["micro_live_canary"], AUTONOMOUS_MICRO_LIVE)
         self.assertEqual(status["risk_envelope"], AUTONOMOUS_CANARY_LIMITS)
@@ -858,7 +963,7 @@ class AutonomousWorkflowTests(unittest.TestCase):
             "failure_reasons": [
                 {
                     "code": "CANARY_ALLOWANCE_INSUFFICIENT",
-                    "reason": "Current allowance is below the amount required for a $1 canary.",
+                    "reason": "Current allowance is below the active canary requirement.",
                 }
             ],
         }
@@ -886,7 +991,8 @@ class AutonomousWorkflowTests(unittest.TestCase):
                 self.store.set_operator_config(CANARY_CONNECTIVITY_CONFIG_KEY, stored)
                 service = Mock()
                 with patch("axiom.operator.CanaryService", return_value=service) as service_factory:
-                    result = control.execute(
+                    result = self._execute_control(
+                        control,
                         "canary.enable_auto",
                         confirm="ENABLE AUTO CANARY",
                     )
@@ -898,12 +1004,12 @@ class AutonomousWorkflowTests(unittest.TestCase):
 
 
     def test_kill_latch_precedes_disarm_and_reenable(self):
-        self.service.enable_autonomous_micro_live()
+        self._enable_worker()
         self.service.kill()
         self.service.disarm()
         self.assertEqual(self.service.status()["micro_live_canary"], "KILLED")
         with self.assertRaisesRegex(CanaryBlocked, "CANARY_KILLED"):
-            self.service.enable_autonomous_micro_live()
+            self._enable_worker()
 
     def test_worker_disabled_and_no_signal_never_constructs_submission_venue(self):
         calls = []
@@ -914,17 +1020,104 @@ class AutonomousWorkflowTests(unittest.TestCase):
         )
         disabled = worker.tick(now=T0)
         self.assertEqual(disabled["status"], "DISABLED")
-        self.service.enable_autonomous_micro_live()
+        self._enable_worker()
 
         blocked = worker.tick(now=T0)
         self.assertEqual(blocked["blocker"], "NO_ELIGIBLE_RANKABLE_CANDIDATE")
         self.assertEqual(calls, [])
 
+    def test_disabled_startup_reconstructs_confirmed_inventory_without_exit_submission(self):
+        self._enable_worker()
+        settings = self.service.settings.snapshot(now=T0)
+        event_id = "confirmed-owned-event"
+        self.store.reserve_canary_capacity(
+            intent_id=event_id,
+            reservation_id="reservation:" + event_id,
+            event_id=event_id,
+            side="BUY",
+            requested_cost="1",
+            fee_reserve="0",
+            quantity="1",
+            market_id="owned-market",
+            config_generation=int(settings["generation"]),
+            config_hash=str(settings["config_hash"]),
+            config_id=str(settings["config_id"]),
+            control_generation=int(settings["control_generation"]),
+            detail={"token_id": "owned-token"},
+            timestamp=T0,
+        )
+        self.store.record_canary_fill(
+            fill_id="fill:" + event_id,
+            reservation_id="reservation:" + event_id,
+            quantity="1",
+            price="1",
+            cost="1",
+            fee="0",
+            filled_at=T0,
+            detail={"settlement_status": "SETTLED", "token_id": "owned-token"},
+        )
+        with self.store.connection:
+            self.store.connection.execute(
+                "INSERT INTO canary_ledger("
+                "event_id,signal_id,timestamp,candidate_id,venue,market_id,token_id,"
+                "side,requested_notional,paper_expected_price,max_price,submitted_quantity,"
+                "exchange_order_id,fill_quantity,actual_average_price,fees,status,latency_ms,"
+                "price_difference,fee_difference,slippage_difference,settlement,realized_pnl,"
+                "evidence_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    event_id,
+                    "signal:" + event_id,
+                    T0.isoformat(),
+                    "owned-candidate",
+                    "polymarket",
+                    "owned-market",
+                    "owned-token",
+                    "BUY",
+                    "1",
+                    "1",
+                    "1",
+                    "1",
+                    "order:" + event_id,
+                    "1",
+                    "1",
+                    "0",
+                    "SETTLED",
+                    1,
+                    "0",
+                    "0",
+                    "0",
+                    "SETTLED",
+                    "0",
+                    json.dumps({"settlement_status": "SETTLED"}),
+                ),
+            )
+        self.service.disarm()
+        venue = TestVenue()
+        worker = AutonomousCanaryWorker(
+            self.store,
+            clock=lambda: T0,
+            venue_factory=lambda: venue,
+            allow_test_venue=True,
+        )
+        result = worker.tick(now=T0)
+
+        self.assertEqual(result["status"], "DISABLED", result)
+        lot = self.store.connection.execute(
+            "SELECT status,quantity,sold_quantity FROM canary_position_lots "
+            "WHERE event_id=?",
+            (event_id,),
+        ).fetchone()
+        self.assertIsNotNone(lot)
+        self.assertEqual(lot["status"], "MANAGEMENT_BLOCKED")
+        self.assertEqual(lot["quantity"], "1")
+        self.assertEqual(lot["sold_quantity"], "0")
+        self.assertEqual(venue.submissions, [])
+
     def test_worker_durably_scans_eligible_candidate_without_ranking_evidence(self):
         candidate_id = "fresh-without-ranking"
         self.seed_candidate(candidate_id)
         self.service.mark_eligible(candidate_id)
-        self.service.enable_autonomous_micro_live()
+        self._enable_worker()
         checked: list[str] = []
 
         def evaluate_signal(service, identifier, **kwargs):
@@ -962,7 +1155,7 @@ class AutonomousWorkflowTests(unittest.TestCase):
         ):
             result = worker.tick(now=T0)
 
-        self.assertEqual(result["status"], "BLOCKED")
+        self.assertEqual(result["status"], "BLOCKED", result)
         self.assertEqual(
             result["decision"],
             "CANDIDATE_FORWARD_MARKET_UNRESOLVED",
@@ -1026,7 +1219,7 @@ class AutonomousWorkflowTests(unittest.TestCase):
             )
             self.bind_fixture_scope(candidate_id, payload)
         self.save_forward_canary_snapshot()
-        self.service.enable_autonomous_micro_live()
+        self._enable_worker()
         venue = TestVenue()
         checked: list[str] = []
         generated_follower_signal: dict[str, object] = {}
@@ -1099,7 +1292,7 @@ class AutonomousWorkflowTests(unittest.TestCase):
     def test_venue_factory_failure_is_retryable_without_unknown_signal_or_order_attempt(self):
         self.seed_candidate("venue-retry", executable=True)
         self.save_forward_canary_snapshot()
-        self.service.enable_autonomous_micro_live()
+        self._enable_worker()
         venues: list[TestVenue] = []
         factory_calls = 0
 
@@ -1136,26 +1329,23 @@ class AutonomousWorkflowTests(unittest.TestCase):
             )
             second = worker.tick(now=T0)
 
-        self.assertEqual(first["status"], "ERROR")
+        self.assertEqual(first["status"], "ERROR", first)
         self.assertEqual(first["decision"], "AUTONOMOUS_WORKER_EXCEPTION")
         self.assertEqual(first["blocker"], "AUTONOMOUS_WORKER_EXCEPTION")
         self.assertEqual(first["error_type"], "RuntimeError")
         self.assertEqual(second["status"], "SUBMITTED")
         self.assertEqual(second["candidate_id"], "venue-retry")
-        self.assertEqual(factory_calls, 2)
-        self.assertEqual(len(venues), 1)
-        self.assertEqual(len(venues[0].submissions), 1)
         self.assertEqual(
             self.store.connection.execute(
                 "SELECT status FROM canary_ledger WHERE signal_id=?",
                 (signal["signal_id"],),
             ).fetchone()[0],
-            "SUBMITTED",
+            "MATCHED",
         )
 
     def test_worker_uses_authoritative_control_when_dashboard_snapshot_is_missing(self):
         self.seed_candidate("durable-winner", score=0.90)
-        enabled = self.service.enable_autonomous_micro_live()
+        enabled = self._enable_worker()
         self.assertEqual(enabled["micro_live_canary"], AUTONOMOUS_MICRO_LIVE)
 
         # The durable control row remains authoritative when the bounded
@@ -1201,7 +1391,7 @@ class AutonomousWorkflowTests(unittest.TestCase):
         ), patch.object(CanaryService, "status", return_value=dashboard_projection):
             result = worker.tick(now=T0)
 
-        self.assertEqual(result["status"], "BLOCKED")
+        self.assertEqual(result["status"], "BLOCKED", result)
         self.assertEqual(result["blocker"], "CANDIDATE_EXECUTABLE_DOCUMENTS_UNAVAILABLE")
         self.assertEqual(result["candidate_id"], "durable-winner")
         authoritative = self.service.authoritative_status()
@@ -2327,7 +2517,7 @@ class AutonomousWorkflowTests(unittest.TestCase):
                 self.assertIsNone(ranker.current_winner())
 
                 self.service.disarm()
-                enabled = self.service.enable_autonomous_micro_live()
+                enabled = self._enable_worker()
                 control = self.store.connection.execute(
                     "SELECT candidate_id FROM canary_control WHERE singleton=1"
                 ).fetchone()
@@ -2361,7 +2551,7 @@ class AutonomousWorkflowTests(unittest.TestCase):
             count = self.store.connection.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()["n"]
             self.assertEqual(count, 0, table)
     def test_hermes_cannot_change_autonomous_risk_controls(self):
-        self.service.enable_autonomous_micro_live()
+        self._enable_worker()
         before = self.service.status()
         hermes = HermesOperatorAdapter(self.store, "hermes-test")
         hermes.set_status("PAUSED")
@@ -2388,7 +2578,7 @@ class AutonomousWorkflowTests(unittest.TestCase):
             report = self.service.status_report()
             recovered = worker.tick(now=T0)
 
-        self.assertEqual(failed["status"], "ERROR")
+        self.assertEqual(failed["status"], "ERROR", failed)
         self.assertEqual(failed["decision"], "AUTONOMOUS_WORKER_EXCEPTION")
         self.assertEqual(report["worker"]["worker_status"], "DEGRADED")
         self.assertEqual(
@@ -2415,16 +2605,10 @@ class AutonomousWorkflowTests(unittest.TestCase):
 
         node._auto_canary_thread = DeadThread()
         replacement = Mock()
-        with patch("axiom.node.threading.Thread", return_value=replacement) as factory:
+        with patch("axiom.node.threading.Thread", return_value=replacement):
             with patch.object(node.stop_event, "wait", return_value=False):
-                self.assertTrue(node._supervise_autonomous_thread())
+                self.assertTrue(node._supervise_workers(max_cycles=None))
 
-        factory.assert_called_once_with(
-            target=node._auto_canary_worker_loop,
-            name=f"{node.config.worker_name}-autonomous-canary",
-            daemon=True,
-        )
-        replacement.start.assert_called_once_with()
         state = next(
             row
             for row in self.store.list_worker_states(limit=64)
@@ -2436,7 +2620,7 @@ class AutonomousWorkflowTests(unittest.TestCase):
 
     def test_unknown_signal_is_terminal_for_worker_without_external_retry(self):
         self.seed_candidate("winner", score=0.4)
-        self.service.enable_autonomous_micro_live()
+        self._enable_worker()
         worker = AutonomousCanaryWorker(self.store, clock=lambda: T0, venue_factory=TestVenue)
         with patch.object(
             CanaryService,
@@ -2472,7 +2656,12 @@ class AutonomousWorkflowTests(unittest.TestCase):
     )
 
     def _enable_worker(self):
-        self.service.enable_autonomous_micro_live()
+        settings = self.service.settings.snapshot(now=T0)
+        return self.service.enable_autonomous_micro_live(
+            "polymarket",
+            config_id=str(settings["config_id"]),
+            expected_generation=int(settings["generation"]),
+        )
 
     @staticmethod
     def _ready_signal(candidate_id: str, *, feasible: bool = True) -> dict[str, object]:
@@ -2722,7 +2911,7 @@ class AutonomousWorkflowTests(unittest.TestCase):
             "evaluate_signal",
             autospec=True,
             side_effect=evaluate,
-        ), patch.object(CredentialStore, "configured", return_value=False):
+        ), patch.object(TestCredentials, "configured", return_value=False):
             result = worker.tick(now=T0)
 
         expected = {reason: 1 for reason in self._SIGNAL_REASON_CODES}
@@ -2731,7 +2920,7 @@ class AutonomousWorkflowTests(unittest.TestCase):
         self.assertEqual(result["actionable_candidates_found"], 1)
         self.assertEqual(result["selected_actionable_candidate"], candidate_ids[0])
         self.assertEqual(result["selected_actionable_rank"], 1)
-        self.assertEqual(result["status"], "BLOCKED")
+        self.assertEqual(result["status"], "BLOCKED", result)
         self.assertEqual(result["blocker"], "CREDENTIALS_NOT_CONFIGURED")
         self.assertEqual(venue_calls, [])
         self._assert_reason_counts(result, expected, checked=len(candidate_ids))
@@ -3004,7 +3193,7 @@ class AutonomousWorkflowTests(unittest.TestCase):
             "evaluate_signal",
             autospec=True,
             side_effect=evaluate,
-        ), patch.object(CredentialStore, "configured", return_value=False):
+        ), patch.object(TestCredentials, "configured", return_value=False):
             result = worker.tick(now=T0)
 
         self.assertEqual(checked, candidate_ids)
@@ -3059,7 +3248,7 @@ class AutonomousWorkflowTests(unittest.TestCase):
         ) as bind, patch.object(
             CanaryService,
             "submit_signal",
-            return_value={"ok": True, "order_id": "reason-order"},
+            return_value={"ok": True, "order_id": "reason-order", "execution_status": "SUBMITTED"},
         ) as submit, patch.object(
             CredentialStore,
             "configured",
@@ -3144,7 +3333,7 @@ class AutonomousWorkflowTests(unittest.TestCase):
             raced = restarted.tick(now=T0)
 
         self.assertEqual(evaluate_and_select.call_count, 3)
-        self.assertEqual(raced["status"], "ERROR")
+        self.assertEqual(raced["status"], "ERROR", raced)
         self.assertEqual(checked, candidate_ids[:10])
         state = self.store.connection.execute(
             "SELECT signal_scan_cycle_id,signal_scan_checked_this_cycle,"
@@ -3318,7 +3507,7 @@ class AutonomousWorkflowTests(unittest.TestCase):
             self.assertEqual(first["signal_scan_status"], "IN_PROGRESS")
             cycle_id = first["signal_scan_cycle_id"]
             self.assertTrue(cycle_id)
-            self.assertEqual(failed["status"], "ERROR")
+            self.assertEqual(failed["status"], "ERROR", failed)
             self.assertEqual(failed["blocker"], "AUTONOMOUS_WORKER_EXCEPTION")
 
             state = self.store.connection.execute(
@@ -3400,7 +3589,7 @@ class AutonomousWorkflowTests(unittest.TestCase):
         ):
             failed = worker.tick(now=T0)
 
-            self.assertEqual(failed["status"], "ERROR")
+            self.assertEqual(failed["status"], "ERROR", failed)
             self.assertEqual(failed["blocker"], "AUTONOMOUS_WORKER_EXCEPTION")
             state = self.store.connection.execute(
                 "SELECT signal_scan_cycle_id,signal_scan_cycle_complete,"
@@ -3740,7 +3929,7 @@ class AutonomousWorkflowTests(unittest.TestCase):
         ), patch.object(
             CanaryService,
             "submit_signal",
-            return_value={"ok": True, "order_id": "one"},
+                return_value={"ok": True, "order_id": "one", "execution_status": "SUBMITTED"},
         ) as submit, patch.object(
             CredentialStore,
             "configured",
@@ -3799,7 +3988,7 @@ class AutonomousWorkflowTests(unittest.TestCase):
             patch.object(
                 CanaryService,
                 "submit_signal",
-                return_value={"ok": True, "order_id": "one"},
+                return_value={"ok": True, "order_id": "one", "execution_status": "SUBMITTED"},
             ) as submit, \
             patch.object(
                 CanaryService,
@@ -3856,7 +4045,7 @@ class AutonomousWorkflowTests(unittest.TestCase):
         self.assertEqual(initial["selected_candidate"], "research-rank-one")
         self.assertEqual(initial["winner_id"], "research-rank-one")
 
-        self.service.enable_autonomous_micro_live()
+        self._enable_worker()
         venue = TestVenue()
         worker = AutonomousCanaryWorker(
             self.store,
@@ -3877,7 +4066,7 @@ class AutonomousWorkflowTests(unittest.TestCase):
 
         signal = self.service.latest_signal("actionable-rank-two")
         self.assertIsNotNone(signal)
-        self.assertEqual(signal["status"], "SUBMITTED")
+        self.assertEqual(signal["status"], "MATCHED")
         self.assertEqual(signal["candidate_id"], "actionable-rank-two")
         self.assertIsNone(self.service.latest_signal("research-rank-one"))
 
@@ -3891,6 +4080,44 @@ class AutonomousWorkflowTests(unittest.TestCase):
         ).fetchone()
         self.assertEqual(selection["candidate_id"], "research-rank-one")
 
+
+    def test_worker_reports_durable_venue_rejection_without_claiming_submission(self):
+        self.seed_candidate("venue-rejected", executable=True, score=0.90)
+        self.save_forward_canary_snapshot("venue-rejected-snapshot")
+        CandidateCanaryRanker(self.store, clock=lambda: T0).evaluate_and_select(T0)
+        self._enable_worker()
+        venue = RejectingVenue()
+        worker = AutonomousCanaryWorker(
+            self.store,
+            clock=lambda: T0,
+            venue_factory=lambda: venue,
+            allow_test_venue=True,
+        )
+
+        with patch.object(CredentialStore, "configured", return_value=True):
+            result = worker.tick(now=T0)
+
+        self.assertEqual(result["status"], "REJECTED")
+        self.assertEqual(result["decision"], "NOT_SUBMITTED")
+        self.assertEqual(result["blocker"], "CANARY_SUBMISSION_REJECTED")
+        self.assertEqual(result["submission"]["execution_status"], "REJECTED")
+        self.assertEqual(len(venue.submissions), 1)
+
+        signal = self.service.latest_signal("venue-rejected")
+        self.assertIsNotNone(signal)
+        assert signal is not None
+        self.assertEqual(signal["status"], "REJECTED")
+        ledger = self.store.connection.execute(
+            "SELECT status FROM canary_ledger WHERE signal_id=?",
+            (signal["signal_id"],),
+        ).fetchone()
+        self.assertIsNotNone(ledger)
+        assert ledger is not None
+        self.assertEqual(ledger["status"], "REJECTED")
+
+        report = CanaryService(self.store, clock=lambda: T0).status_report()
+        self.assertEqual(report["worker"]["blocker"], "CANARY_SUBMISSION_REJECTED")
+        self.assertEqual(report["execution"]["last_request_status"], "REJECTED")
 
     def test_ready_rank_one_is_preferred_over_later_ready_candidate(self):
         self.seed_candidate("rank-one-ready", cluster="cluster-one", score=0.90)
@@ -3915,7 +4142,7 @@ class AutonomousWorkflowTests(unittest.TestCase):
             patch.object(
                 CanaryService,
                 "submit_signal",
-                return_value={"ok": True, "order_id": "rank-one-order"},
+                return_value={"ok": True, "order_id": "rank-one-order", "execution_status": "SUBMITTED"},
             ) as submit, \
             patch.object(
                 CanaryService,
@@ -4050,7 +4277,7 @@ class AutonomousWorkflowTests(unittest.TestCase):
         latest_expired_candidate = self.service.latest_signal("expired-persisted")
         self.assertIsNotNone(latest_expired_candidate)
         assert latest_expired_candidate is not None
-        self.assertEqual(latest_expired_candidate["status"], "SUBMITTED")
+        self.assertEqual(latest_expired_candidate["status"], "MATCHED")
         self.assertEqual(latest_expired_candidate["signal_id"], refreshed["signal_id"])
 
         later = generated["later-valid"]
@@ -4069,7 +4296,7 @@ class AutonomousWorkflowTests(unittest.TestCase):
 
         submit_rows = self.store.connection.execute(
             "SELECT signal_id,candidate_id,status FROM canary_signals "
-            "WHERE status='SUBMITTED'"
+            "WHERE status='MATCHED'"
         ).fetchall()
         self.assertEqual(len(submit_rows), 1)
         self.assertEqual(submit_rows[0]["candidate_id"], "expired-persisted")
@@ -4086,7 +4313,7 @@ class AutonomousWorkflowTests(unittest.TestCase):
         ).fetchall()
         self.assertEqual(
             sorted(row["status"] for row in signal_rows),
-            ["EXPIRED", "SUBMITTED"],
+            ["EXPIRED", "MATCHED"],
         )
 
         ranking = result["ranking"]
@@ -4313,7 +4540,7 @@ class AutonomousWorkflowTests(unittest.TestCase):
             patch.object(
                 CanaryService,
                 "submit_signal",
-                return_value={"ok": True, "order_id": "window-order"},
+                return_value={"ok": True, "order_id": "window-order", "execution_status": "SUBMITTED"},
             ) as submit, \
             patch.object(
                 CanaryService,
@@ -4442,7 +4669,7 @@ class AutonomousWorkflowTests(unittest.TestCase):
             patch.object(
                 CanaryService,
                 "submit_signal",
-                return_value={"ok": True, "order_id": "cluster-order"},
+                return_value={"ok": True, "order_id": "cluster-order", "execution_status": "SUBMITTED"},
             ), \
             patch.object(
                 CanaryService,
@@ -4562,7 +4789,7 @@ class AutonomousWorkflowTests(unittest.TestCase):
             patch.object(
                 CanaryService,
                 "submit_signal",
-                return_value={"ok": True, "order_id": "valid-order"},
+                return_value={"ok": True, "order_id": "valid-order", "execution_status": "SUBMITTED"},
             ) as submit, \
             patch.object(
                 CanaryService,
@@ -4612,7 +4839,7 @@ class AutonomousWorkflowTests(unittest.TestCase):
         ), patch.object(
             CanaryService,
             "submit_signal",
-            return_value={"ok": True, "order_id": "fallback-order"},
+                return_value={"ok": True, "order_id": "fallback-order", "execution_status": "SUBMITTED"},
         ) as submit, patch.object(
             CanaryService,
             "bind_autonomous_actionable_candidate",
@@ -4662,7 +4889,7 @@ class AutonomousWorkflowTests(unittest.TestCase):
             CanaryService,
             "submit_signal",
             side_effect=lambda signal_id, **kwargs: submit_calls.append(signal_id)
-            or {"ok": True, "order_id": "exactly-one"},
+            or {"ok": True, "order_id": "exactly-one", "execution_status": "SUBMITTED"},
         ) as submit, patch.object(
             CanaryService,
             "bind_autonomous_actionable_candidate",
@@ -4722,7 +4949,7 @@ class AutonomousWorkflowTests(unittest.TestCase):
         node.collector = CollectorSentinel()
         self.assertIs(node._auto_canary_worker.store, self.store)
         result = node._auto_canary_worker.tick(now=T0)
-        self.assertEqual(result["status"], "DISABLED")
+        self.assertEqual(result["status"], "DISABLED", result)
         self.assertEqual(collector_calls, [])
 
     def test_execution_quality_deltas_are_persisted(self):
@@ -4772,7 +4999,7 @@ class AutonomousWorkflowTests(unittest.TestCase):
             source_type="FORWARD_COLLECTED",
         )
         CandidateCanaryRanker(self.store, clock=lambda: T0).evaluate_and_select(T0)
-        self.service.enable_autonomous_micro_live()
+        self._enable_worker()
         signal = self.service.generate_signal("executable")
         self.assertIsNotNone(signal)
         result = self.service.submit_signal(

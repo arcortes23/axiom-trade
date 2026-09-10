@@ -13,16 +13,57 @@ import json
 import logging
 import math
 import os
-import threading
 import sqlite3
+import threading
 import time
-from itertools import islice
 from dataclasses import asdict, is_dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 from enum import Enum
+from itertools import islice
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
+from zoneinfo import ZoneInfo
 _MAX_LATEST_SCAN_ROWS = 10_000
+_CANARY_EQUITY_MARK_MAX_AGE_SECONDS = 300.0
+_CANARY_CONFIRMED_SETTLEMENT_STATUSES = frozenset(
+    {"CONFIRMED", "TRADE_STATUS_CONFIRMED", "SETTLED", "TRADE_STATUS_SETTLED"}
+)
+_CANARY_LIMIT_ALIASES = {
+    "target_notional_usd": "max_all_in_buy_usd",
+    "max_exposure_usd": "max_aggregate_exposure_usd",
+    "max_open_positions": "max_positions",
+    "max_orders_per_day": "max_submitted_orders_per_day",
+    "orders_per_day": "max_submitted_orders_per_day",
+    "max_submissions_per_day": "max_submitted_orders_per_day",
+    "submitted_orders_per_day": "max_submitted_orders_per_day",
+    "total_submitted_orders_per_day": "max_submitted_orders_per_day",
+    "max_total_submitted_orders_per_day": "max_submitted_orders_per_day",
+    "daily_submission_limit": "max_submitted_orders_per_day",
+    "max_all_in_buy_fee_reserve_usd": "max_all_in_buy_usd",
+    "max_all_in_buy_reserve_usd": "max_all_in_buy_usd",
+    "max_buy_reserve_usd": "max_all_in_buy_usd",
+    "aggregate_open_cost_usd": "max_aggregate_open_cost_usd",
+    "aggregate_exposure_usd": "max_aggregate_exposure_usd",
+    "positions": "max_positions",
+    "realized_loss_stop_usd": "realized_loss_entry_stop_usd",
+    "equity_loss_stop_usd": "equity_loss_entry_stop_usd",
+    "per_market_cap_usd": "per_market_buy_cap_usd",
+    "per_event_cap_usd": "per_event_buy_cap_usd",
+    "cumulative_cap_usd": "cumulative_buy_cap_usd",
+}
+_CANARY_DECIMAL_LIMITS = {
+    "max_all_in_buy_usd",
+    "max_fee_reserve_usd",
+    "max_gross_daily_buy_usd",
+    "max_aggregate_open_cost_usd",
+    "max_aggregate_exposure_usd",
+    "realized_loss_entry_stop_usd",
+    "equity_loss_entry_stop_usd",
+    "per_market_buy_cap_usd",
+    "per_event_buy_cap_usd",
+    "cumulative_buy_cap_usd",
+}
 _MAX_EVIDENCE_SCAN_ROWS = 100_000
 _QUEUE_RELEASE_BATCH = 256
 _QUEUE_LINEAGE_LIMIT = 256
@@ -842,6 +883,7 @@ class AxiomStore:
                     "ALTER TABLE dataset_integrity_attestation ADD COLUMN reason TEXT NOT NULL DEFAULT ''"
                 )
             self._migrate_market_tables()
+            self._initialize_canary_risk_schema()
             self._create_dataset_attestation_triggers()
     def _migrate_market_tables(self) -> None:
         """Upgrade pre-versioned market tables without discarding records."""
@@ -906,6 +948,2022 @@ class AxiomStore:
                 self._conn.execute(query, (_now_iso(),) if created_expr == "?" else ())
                 self._conn.execute("DROP TABLE snapshots_legacy")
                 self._conn.execute("CREATE INDEX idx_snapshots_key_time ON snapshots(key, timestamp)")
+    def _initialize_canary_risk_schema(self) -> None:
+        """Create versioned canary settings and append-only risk accounting.
+
+        The tables are independent of the legacy ``canary_*`` tables so an
+        older checkout can be upgraded without rewriting or dropping any live
+        ledger evidence.  Missing columns on a partially-created development
+        database are added conservatively.
+        """
+        preflight_columns = {
+            "canary_risk_reservations": {
+                # Every column used by the indexes and risk methods must exist
+                # before the CREATE INDEX statements below.  ALTER TABLE needs
+                # defaults for NOT NULL additions so existing partial rows stay
+                # readable and are never discarded.
+                "event_id": "TEXT",
+                "requested_cost": "TEXT NOT NULL DEFAULT '0'",
+                "filled_cost": "TEXT NOT NULL DEFAULT '0'",
+                "remaining_cost": "TEXT NOT NULL DEFAULT '0'",
+                "fee_reserve": "TEXT NOT NULL DEFAULT '0'",
+                "quantity": "TEXT NOT NULL DEFAULT '0'",
+                "filled_quantity": "TEXT NOT NULL DEFAULT '0'",
+                "status": "TEXT NOT NULL DEFAULT 'HELD'",
+                "config_generation": "INTEGER",
+                "config_hash": "TEXT",
+                "config_id": "TEXT",
+                "control_generation": "INTEGER",
+                "detail_json": "TEXT NOT NULL DEFAULT '{}'",
+                "created_at": "TEXT NOT NULL DEFAULT ''",
+                "submitted_at": "TEXT",
+                "updated_at": "TEXT NOT NULL DEFAULT ''",
+                "released_at": "TEXT",
+            },
+            "canary_submission_attempts": {
+                "intent_id": "TEXT NOT NULL DEFAULT ''",
+                "side": "TEXT NOT NULL DEFAULT 'BUY'",
+                "attempted_at": "TEXT NOT NULL DEFAULT ''",
+                "status": "TEXT NOT NULL DEFAULT 'ATTEMPTED'",
+                "config_generation": "INTEGER",
+                "config_hash": "TEXT",
+                "config_id": "TEXT",
+                "control_generation": "INTEGER",
+                "detail_json": "TEXT NOT NULL DEFAULT '{}'",
+            },
+            "canary_equity_marks": {
+                "mark_id": "TEXT",
+                "market_id": "TEXT NOT NULL DEFAULT ''",
+                "token_id": "TEXT NOT NULL DEFAULT ''",
+                "side": "TEXT NOT NULL DEFAULT 'SELL'",
+                "quantity": "TEXT NOT NULL DEFAULT '0'",
+                "mark_price": "TEXT NOT NULL DEFAULT '0'",
+                "cost_basis_usd": "TEXT NOT NULL DEFAULT '0'",
+                "mark_fee": "TEXT NOT NULL DEFAULT '0'",
+                "observed_at": "TEXT NOT NULL DEFAULT ''",
+                "source": "TEXT NOT NULL DEFAULT ''",
+                "config_id": "TEXT",
+                "config_generation": "INTEGER",
+                "control_generation": "INTEGER",
+                "detail_json": "TEXT NOT NULL DEFAULT '{}'",
+                "created_at": "TEXT NOT NULL DEFAULT ''",
+            },
+        }
+        for table, columns in preflight_columns.items():
+            exists = self._conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                (table,),
+            ).fetchone()
+            if exists is None:
+                continue
+            existing = {
+                str(row["name"])
+                for row in self._conn.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+            for name, definition in columns.items():
+                if name not in existing:
+                    self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+        self._conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS canary_setting_configs (
+                config_id TEXT PRIMARY KEY,
+                state TEXT NOT NULL CHECK(state IN ('DRAFT','ACTIVE','ARCHIVED')),
+                generation INTEGER NOT NULL,
+                config_hash TEXT NOT NULL,
+                values_json TEXT NOT NULL,
+                actor TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                activated_at TEXT,
+                previous_config_id TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_canary_setting_configs_hash
+                ON canary_setting_configs(config_hash);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_canary_setting_configs_active
+                ON canary_setting_configs(state) WHERE state='ACTIVE';
+            CREATE INDEX IF NOT EXISTS idx_canary_setting_configs_state_time
+                ON canary_setting_configs(state, created_at DESC, config_id DESC);
+            CREATE TABLE IF NOT EXISTS canary_setting_audit (
+                audit_id TEXT PRIMARY KEY,
+                config_id TEXT NOT NULL,
+                action TEXT NOT NULL,
+                actor TEXT NOT NULL,
+                previous_config_id TEXT,
+                previous_config_hash TEXT,
+                new_config_id TEXT NOT NULL,
+                new_config_hash TEXT NOT NULL,
+                previous_generation INTEGER NOT NULL,
+                new_generation INTEGER NOT NULL,
+                timestamp TEXT NOT NULL,
+                detail_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE INDEX IF NOT EXISTS idx_canary_setting_audit_time
+                ON canary_setting_audit(timestamp DESC, audit_id DESC);
+            CREATE TABLE IF NOT EXISTS canary_risk_reservations (
+                reservation_id TEXT PRIMARY KEY,
+                intent_id TEXT NOT NULL UNIQUE,
+                side TEXT NOT NULL,
+                market_id TEXT,
+                event_id TEXT,
+                requested_cost TEXT NOT NULL DEFAULT '0',
+                filled_cost TEXT NOT NULL DEFAULT '0',
+                remaining_cost TEXT NOT NULL DEFAULT '0',
+                fee_reserve TEXT NOT NULL DEFAULT '0',
+                quantity TEXT NOT NULL DEFAULT '0',
+                filled_quantity TEXT NOT NULL DEFAULT '0',
+                status TEXT NOT NULL,
+                config_generation INTEGER,
+                config_hash TEXT,
+                config_id TEXT,
+                control_generation INTEGER,
+                detail_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                submitted_at TEXT,
+                updated_at TEXT NOT NULL,
+                released_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_canary_risk_reservations_status
+                ON canary_risk_reservations(status, side, updated_at);
+            CREATE INDEX IF NOT EXISTS idx_canary_risk_reservations_market
+                ON canary_risk_reservations(market_id, event_id, status);
+            CREATE TABLE IF NOT EXISTS canary_submission_attempts (
+                attempt_id TEXT PRIMARY KEY,
+                intent_id TEXT NOT NULL,
+                side TEXT NOT NULL,
+                attempted_at TEXT NOT NULL,
+                status TEXT NOT NULL,
+                config_generation INTEGER,
+                config_hash TEXT,
+                config_id TEXT,
+                control_generation INTEGER,
+                detail_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE INDEX IF NOT EXISTS idx_canary_submission_attempts_time
+                ON canary_submission_attempts(attempted_at, attempt_id);
+            CREATE TABLE IF NOT EXISTS canary_risk_fills (
+                fill_id TEXT PRIMARY KEY,
+                reservation_id TEXT NOT NULL,
+                quantity TEXT NOT NULL,
+                price TEXT NOT NULL,
+                cost TEXT NOT NULL,
+                fee TEXT NOT NULL DEFAULT '0',
+                filled_at TEXT NOT NULL,
+                detail_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_canary_risk_fills_reservation_fill
+                ON canary_risk_fills(reservation_id, fill_id);
+            CREATE INDEX IF NOT EXISTS idx_canary_risk_fills_time
+                ON canary_risk_fills(filled_at, reservation_id);
+            CREATE TABLE IF NOT EXISTS canary_equity_marks (
+                mark_id TEXT PRIMARY KEY,
+                market_id TEXT NOT NULL,
+                token_id TEXT NOT NULL,
+                side TEXT NOT NULL,
+                quantity TEXT NOT NULL,
+                mark_price TEXT NOT NULL,
+                cost_basis_usd TEXT NOT NULL,
+                mark_fee TEXT NOT NULL DEFAULT '0',
+                observed_at TEXT NOT NULL,
+                source TEXT NOT NULL,
+                config_id TEXT,
+                config_generation INTEGER,
+                control_generation INTEGER,
+                detail_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS canary_risk_cashflows (
+                flow_id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                amount TEXT NOT NULL,
+                occurred_at TEXT NOT NULL,
+                detail_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE INDEX IF NOT EXISTS idx_canary_risk_cashflows_time
+                ON canary_risk_cashflows(occurred_at, kind, flow_id);
+            """
+        )
+        # A handful of early local prototypes created the config table without
+        # audit/activation columns.  Add only absent columns; never rewrite rows.
+        for table, columns in {
+            "canary_setting_configs": {
+                "activated_at": "TEXT",
+                "previous_config_id": "TEXT",
+            },
+            "canary_risk_reservations": {
+                "event_id": "TEXT",
+                "config_id": "TEXT",
+                "control_generation": "INTEGER",
+                "filled_cost": "TEXT NOT NULL DEFAULT '0'",
+                "remaining_cost": "TEXT NOT NULL DEFAULT '0'",
+                "quantity": "TEXT NOT NULL DEFAULT '0'",
+                "filled_quantity": "TEXT NOT NULL DEFAULT '0'",
+                "config_generation": "INTEGER",
+                "config_hash": "TEXT",
+                "detail_json": "TEXT NOT NULL DEFAULT '{}'",
+                "submitted_at": "TEXT",
+                "updated_at": "TEXT",
+                "released_at": "TEXT",
+            },
+            "canary_submission_attempts": {
+                "config_id": "TEXT",
+                "control_generation": "INTEGER",
+            },
+        }.items():
+            existing = {str(row["name"]) for row in self._conn.execute(f"PRAGMA table_info({table})").fetchall()}
+            for name, definition in columns.items():
+                if name not in existing:
+                    self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+        self._conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_canary_equity_marks_id "
+            "ON canary_equity_marks(mark_id)"
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_canary_equity_marks_identity "
+            "ON canary_equity_marks(market_id, token_id, side, observed_at DESC, mark_id DESC)"
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_canary_equity_marks_observed "
+            "ON canary_equity_marks(observed_at, mark_id)"
+        )
+
+    def save_canary_setting_config(
+        self,
+        *,
+        config_id: str,
+        state: str,
+        generation: int,
+        config_hash: str,
+        values: Mapping[str, Any],
+        actor: str,
+        timestamp: datetime | None = None,
+        activated_at: datetime | None = None,
+        previous_config_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Persist one immutable settings version and return its projection."""
+        identifier = str(config_id or "").strip()
+        state_value = str(state or "").strip().upper()
+        digest = str(config_hash or "").strip()
+        owner = str(actor or "").strip()
+        if not identifier or state_value not in {"DRAFT", "ACTIVE", "ARCHIVED"} or not digest or not owner:
+            raise ValueError("config_id, state, config_hash, and actor are required")
+        if isinstance(generation, bool) or not isinstance(generation, int) or generation < 1:
+            raise ValueError("settings generation must be a positive integer")
+        encoded = _dump(dict(values))
+        stamp = timestamp or utc_now()
+        activated = _iso(activated_at) if activated_at is not None else None
+        with self._write_context():
+            try:
+                self._conn.execute(
+                    "INSERT INTO canary_setting_configs("
+                    "config_id,state,generation,config_hash,values_json,actor,created_at,updated_at,activated_at,previous_config_id"
+                    ") VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        identifier,
+                        state_value,
+                        int(generation),
+                        digest,
+                        encoded,
+                        owner,
+                        _iso(stamp),
+                        _iso(stamp),
+                        activated,
+                        str(previous_config_id) if previous_config_id else None,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                existing = self._conn.execute(
+                    "SELECT config_hash,values_json FROM canary_setting_configs WHERE config_id=?",
+                    (identifier,),
+                ).fetchone()
+                if existing is None or str(existing["config_hash"]) != digest or str(existing["values_json"]) != encoded:
+                    raise ValueError(f"settings config already exists: {identifier}") from exc
+        return self.load_canary_setting_config(config_id=identifier) or {}
+
+    def load_canary_setting_config(
+        self,
+        config_id: str | None = None,
+        *,
+        state: str | None = None,
+        status: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Load one settings config, or the newest config in a state."""
+        state_value = str(state if state is not None else status or "").strip().upper()
+        query = "SELECT * FROM canary_setting_configs"
+        values: list[Any] = []
+        clauses: list[str] = []
+        if config_id is not None:
+            clauses.append("config_id=?")
+            values.append(str(config_id).strip())
+        if state_value:
+            if state_value not in {"DRAFT", "ACTIVE", "ARCHIVED"}:
+                raise ValueError("invalid settings config state")
+            clauses.append("state=?")
+            values.append(state_value)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY created_at DESC,rowid DESC,config_id DESC LIMIT 1"
+        with self._lock:
+            row = self._conn.execute(query, values).fetchone()
+        if row is None:
+            return None
+        return {
+            "config_id": row["config_id"],
+            "state": row["state"],
+            "status": row["state"],
+            "generation": int(row["generation"]),
+            "config_hash": row["config_hash"],
+            "values": _load(row["values_json"]),
+            "settings": _load(row["values_json"]),
+            "actor": row["actor"],
+            "created_at": _parse_datetime(row["created_at"]),
+            "updated_at": _parse_datetime(row["updated_at"]),
+            "activated_at": _parse_datetime(row["activated_at"]),
+            "previous_config_id": row["previous_config_id"],
+        }
+
+    def list_canary_setting_configs(self, *, state: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+            raise ValueError("limit must be a non-negative integer")
+        state_value = str(state or "").strip().upper()
+        if state_value and state_value not in {"DRAFT", "ACTIVE", "ARCHIVED"}:
+            raise ValueError("invalid settings config state")
+        query = "SELECT * FROM canary_setting_configs"
+        values: list[Any] = []
+        if state_value:
+            query += " WHERE state=?"
+            values.append(state_value)
+        query += " ORDER BY created_at DESC,rowid DESC,config_id DESC LIMIT ?"
+        values.append(int(limit))
+        with self._lock:
+            rows = self._conn.execute(query, values).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            result.append({
+                "config_id": row["config_id"],
+                "state": row["state"],
+                "status": row["state"],
+                "generation": int(row["generation"]),
+                "config_hash": row["config_hash"],
+                "values": _load(row["values_json"]),
+                "settings": _load(row["values_json"]),
+                "actor": row["actor"],
+                "created_at": _parse_datetime(row["created_at"]),
+                "updated_at": _parse_datetime(row["updated_at"]),
+                "activated_at": _parse_datetime(row["activated_at"]),
+                "previous_config_id": row["previous_config_id"],
+            })
+        return result
+
+    def activate_canary_setting_config(
+        self,
+        *,
+        config_id: str,
+        actor: str,
+        expected_generation: int,
+        timestamp: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Atomically activate a draft with a generation compare-and-swap."""
+        identifier = str(config_id or "").strip()
+        owner = str(actor or "").strip()
+        if not identifier or not owner:
+            raise ValueError("config_id and actor are required")
+        if isinstance(expected_generation, bool) or not isinstance(expected_generation, int) or expected_generation < 1:
+            raise ValueError("expected_generation must be a positive integer")
+        stamp = timestamp or utc_now()
+        with self.transaction(immediate=True):
+            current = self._conn.execute(
+                "SELECT * FROM canary_setting_configs WHERE state='ACTIVE' ORDER BY generation DESC LIMIT 1"
+            ).fetchone()
+            if current is None:
+                raise ValueError("active canary settings are unavailable")
+            current_generation = int(current["generation"])
+            if current_generation != int(expected_generation):
+                raise ValueError("settings generation changed")
+            draft = self._conn.execute(
+                "SELECT * FROM canary_setting_configs WHERE config_id=? AND state='DRAFT'",
+                (identifier,),
+            ).fetchone()
+            if draft is None:
+                raise ValueError("settings config is not a draft")
+            next_generation = current_generation + 1
+            self._conn.execute(
+                "UPDATE canary_setting_configs SET state='ARCHIVED',updated_at=? WHERE state='ACTIVE'",
+                (_iso(stamp),),
+            )
+            self._conn.execute(
+                "UPDATE canary_setting_configs SET state='ACTIVE',generation=?,updated_at=?,"
+                "activated_at=?,previous_config_id=? WHERE config_id=? AND state='DRAFT'",
+                (next_generation, _iso(stamp), _iso(stamp), current["config_id"], identifier),
+            )
+            self._conn.execute(
+                "INSERT INTO canary_setting_audit("
+                "audit_id,config_id,action,actor,previous_config_id,previous_config_hash,"
+                "new_config_id,new_config_hash,previous_generation,new_generation,timestamp,detail_json"
+                ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    "audit:" + hashlib.sha256(
+                        _dump({"config_id": identifier, "generation": next_generation, "timestamp": _iso(stamp)}).encode()
+                    ).hexdigest(),
+                    identifier,
+                    "ACTIVATED",
+                    owner,
+                    current["config_id"],
+                    current["config_hash"],
+                    identifier,
+                    draft["config_hash"],
+                    current_generation,
+                    next_generation,
+                    _iso(stamp),
+                    _dump({"activation": True}),
+                ),
+            )
+        return self.load_canary_setting_config(config_id=identifier) or {}
+
+    def record_canary_setting_audit(
+        self,
+        *,
+        config_id: str,
+        action: str,
+        actor: str,
+        previous_config_id: str | None,
+        previous_config_hash: str | None,
+        new_config_id: str,
+        new_config_hash: str,
+        previous_generation: int,
+        new_generation: int,
+        timestamp: datetime | None = None,
+        detail: Mapping[str, Any] | None = None,
+    ) -> str:
+        stamp = timestamp or utc_now()
+        body = {
+            "config_id": str(config_id),
+            "action": str(action),
+            "actor": str(actor),
+            "previous_config_id": previous_config_id,
+            "previous_config_hash": previous_config_hash,
+            "new_config_id": str(new_config_id),
+            "new_config_hash": str(new_config_hash),
+            "previous_generation": int(previous_generation),
+            "new_generation": int(new_generation),
+            "timestamp": _iso(stamp),
+            "detail": dict(detail or {}),
+        }
+        audit_id = "audit:" + hashlib.sha256(_dump(body).encode()).hexdigest()
+        with self._write_context():
+            self._conn.execute(
+                "INSERT OR IGNORE INTO canary_setting_audit("
+                "audit_id,config_id,action,actor,previous_config_id,previous_config_hash,"
+                "new_config_id,new_config_hash,previous_generation,new_generation,timestamp,detail_json"
+                ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    audit_id,
+                    str(config_id),
+                    str(action).strip().upper(),
+                    str(actor),
+                    previous_config_id,
+                    previous_config_hash,
+                    str(new_config_id),
+                    str(new_config_hash),
+                    int(previous_generation),
+                    int(new_generation),
+                    _iso(stamp),
+                    _dump(detail or {}),
+                ),
+            )
+        return audit_id
+
+    def list_canary_setting_audit(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+            raise ValueError("limit must be a non-negative integer")
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM canary_setting_audit ORDER BY timestamp DESC,rowid DESC,audit_id DESC LIMIT ?",
+                (int(limit),),
+            ).fetchall()
+        return [
+            {
+                "audit_id": row["audit_id"],
+                "config_id": row["config_id"],
+                "action": row["action"],
+                "actor": row["actor"],
+                "previous_config_id": row["previous_config_id"],
+                "previous_config_hash": row["previous_config_hash"],
+                "new_config_id": row["new_config_id"],
+                "new_config_hash": row["new_config_hash"],
+                "previous_generation": int(row["previous_generation"]),
+                "new_generation": int(row["new_generation"]),
+                "timestamp": _parse_datetime(row["timestamp"]),
+                "detail": _load(row["detail_json"]),
+            }
+            for row in rows
+        ]
+    def _canary_authority_locked(self) -> dict[str, Any]:
+        active = self._conn.execute(
+            "SELECT config_id,generation,config_hash,values_json "
+            "FROM canary_setting_configs WHERE state='ACTIVE' "
+            "ORDER BY generation DESC,created_at DESC,config_id DESC LIMIT 1"
+        ).fetchone()
+        authority: dict[str, Any] = {
+            "config_id": None,
+            "generation": None,
+            "config_hash": None,
+            "limits": {},
+            "control_generation": None,
+            "control_state": None,
+        }
+        if active is not None:
+            authority.update(
+                config_id=str(active["config_id"]),
+                generation=int(active["generation"]),
+                config_hash=str(active["config_hash"]),
+                limits=_load(active["values_json"]),
+            )
+        control_table = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='canary_control'"
+        ).fetchone()
+        if control_table is not None:
+            control = self._conn.execute(
+                "SELECT state,control_generation,settings_config_id,settings_generation "
+                "FROM canary_control WHERE singleton=1"
+            ).fetchone()
+            if control is not None:
+                authority["control_state"] = str(control["state"] or "").upper()
+                authority["control_generation"] = int(control["control_generation"] or 0)
+                control_config = str(control["settings_config_id"] or "").strip()
+                control_generation = control["settings_generation"]
+                if authority["control_generation"] is not None and authority["control_generation"] <= 0:
+                    raise ValueError("canary control generation is invalid")
+                if control_config and authority["config_id"] and control_config != authority["config_id"]:
+                    raise ValueError("canary control settings config is stale")
+                if control_generation is not None and authority["generation"] is not None:
+                    if int(control_generation) != int(authority["generation"]):
+                        raise ValueError("canary control settings generation is stale")
+        return authority
+
+    @staticmethod
+    def _canary_effective_limits(
+        active: Mapping[str, Any],
+        candidate: Mapping[str, Any] | None,
+    ) -> dict[str, Any]:
+        effective: dict[str, Any] = {}
+        for raw_name, value in active.items():
+            name = _CANARY_LIMIT_ALIASES.get(str(raw_name), str(raw_name))
+            effective[name] = value
+        if candidate is not None:
+            for raw_name, value in candidate.items():
+                name = _CANARY_LIMIT_ALIASES.get(str(raw_name), str(raw_name))
+                if name not in effective or value in (None, ""):
+                    continue
+                if name in _CANARY_DECIMAL_LIMITS:
+                    proposed = _risk_decimal(value, name=name, nonnegative=True)
+                    current_raw = effective.get(name)
+                    if current_raw in (None, ""):
+                        effective[name] = _risk_text(proposed)
+                    else:
+                        current = _risk_decimal(current_raw, name=name, nonnegative=True)
+                        effective[name] = _risk_text(min(current, proposed))
+                elif name in {"max_positions", "max_submitted_orders_per_day"}:
+                    if isinstance(value, bool):
+                        raise ValueError(f"{name} must be an integer")
+                    current = int(effective[name])
+                    proposed = int(value)
+                    if proposed < 0:
+                        raise ValueError(f"{name} must be non-negative")
+                    effective[name] = min(current, proposed)
+        return effective
+
+    @staticmethod
+    def _canary_window(stamp: datetime) -> tuple[str, str]:
+        observed = ensure_utc(stamp)
+        local = observed.astimezone(ZoneInfo("Asia/Manila"))
+        start_local = local.replace(hour=0, minute=0, second=0, microsecond=0)
+        return (
+            start_local.astimezone(UTC).isoformat(),
+            (start_local + timedelta(days=1)).astimezone(UTC).isoformat(),
+        )
+
+    @staticmethod
+    def _canary_identity_equal(
+        row: sqlite3.Row,
+        *,
+        reservation_id: str,
+        side: str,
+        market_id: str | None,
+        event_id: str | None,
+        requested: Decimal,
+        fee: Decimal,
+        quantity: Decimal,
+        config_generation: int | None,
+        config_hash: str | None,
+        config_id: str | None,
+        control_generation: int | None,
+        detail_json: str | None = None,
+    ) -> bool:
+        return (
+            str(row["reservation_id"]) == reservation_id
+            and str(row["side"]).upper() == side
+            and (row["market_id"] or None) == (market_id or None)
+            and (row["event_id"] or None) == (event_id or None)
+            and _risk_decimal(row["requested_cost"]) == requested
+            and _risk_decimal(row["fee_reserve"]) == fee
+            and _risk_decimal(row["quantity"]) == quantity
+            and (row["config_generation"] or None) == config_generation
+            and (row["config_hash"] or None) == config_hash
+            and (row["config_id"] or None) == config_id
+            and (row["control_generation"] or None) == control_generation
+            and (detail_json is None or str(row["detail_json"] or "{}") == detail_json)
+        )
+
+
+    def record_canary_submission_attempt(
+        self,
+        *,
+        attempt_id: str,
+        intent_id: str,
+        side: str,
+        attempted_at: datetime | None = None,
+        status: str = "ATTEMPTED",
+        config_generation: int | None = None,
+        config_hash: str | None = None,
+        config_id: str | None = None,
+        control_generation: int | None = None,
+        detail: Mapping[str, Any] | None = None,
+    ) -> str:
+        identifier = str(attempt_id or "").strip()
+        intent = str(intent_id or "").strip()
+        side_value = str(side or "").strip().upper()
+        if not identifier or not intent or side_value not in {"BUY", "SELL"}:
+            raise ValueError("attempt_id, intent_id, and side BUY/SELL are required")
+        stamp = attempted_at or utc_now()
+        attempted_iso = _iso(stamp)
+        status_value = str(status or "ATTEMPTED").strip().upper()
+        detail_json = _dump(detail or {})
+        with self.transaction(immediate=True):
+            authority = self._canary_authority_locked()
+            if authority["config_id"] is None:
+                raise ValueError("active canary settings are unavailable")
+            if authority.get("control_state") == "KILLED":
+                raise ValueError("canary control is killed")
+            if side_value == "BUY" and authority.get("control_state") not in {
+                None, "ARMED", "AUTONOMOUS_MICRO_LIVE",
+            }:
+                raise ValueError("canary entry is not armed")
+            reservation = self._conn.execute(
+                "SELECT * FROM canary_risk_reservations WHERE intent_id=?",
+                (intent,),
+            ).fetchone()
+            if reservation is None:
+                raise ValueError("risk reservation not found")
+            if str(reservation["side"]).upper() != side_value:
+                raise ValueError("submission side conflicts with reservation")
+            bound_generation = int(reservation["config_generation"])
+            bound_hash = str(reservation["config_hash"])
+            bound_config_id = str(reservation["config_id"])
+            bound_control_generation = (
+                int(reservation["control_generation"])
+                if reservation["control_generation"] is not None
+                else None
+            )
+            if (
+                bound_generation != int(authority["generation"])
+                or bound_hash != str(authority["config_hash"])
+                or bound_config_id != str(authority["config_id"])
+                or bound_control_generation != authority["control_generation"]
+            ):
+                raise ValueError("canary settings/control generation changed")
+            if config_generation is not None and int(config_generation) != bound_generation:
+                raise ValueError("config generation conflicts with reservation")
+            if config_hash is not None and str(config_hash) != bound_hash:
+                raise ValueError("config hash conflicts with reservation")
+            if config_id is not None and str(config_id).strip() != bound_config_id:
+                raise ValueError("config id conflicts with reservation")
+            if control_generation is not None and int(control_generation) != bound_control_generation:
+                raise ValueError("control generation conflicts with reservation")
+            prior_by_id = self._conn.execute(
+                "SELECT * FROM canary_submission_attempts WHERE attempt_id=?",
+                (identifier,),
+            ).fetchone()
+            if prior_by_id is not None:
+                if (
+                    str(prior_by_id["intent_id"]) != intent
+                    or str(prior_by_id["side"]).upper() != side_value
+                    or str(prior_by_id["attempted_at"]) != attempted_iso
+                    or str(prior_by_id["status"]).upper() != status_value
+                    or (prior_by_id["config_generation"] or None) != bound_generation
+                    or (prior_by_id["config_hash"] or None) != bound_hash
+                    or (prior_by_id["config_id"] or None) != bound_config_id
+                    or (prior_by_id["control_generation"] or None) != bound_control_generation
+                    or str(prior_by_id["detail_json"] or "{}") != detail_json
+                ):
+                    raise ValueError("submission attempt identity conflict")
+                return identifier
+            reservation_status = str(reservation["status"]).upper()
+            if reservation_status in {"RELEASED", "CANCELLED", "CANCELED", "REJECTED", "SETTLED", "FILLED"}:
+                raise ValueError("submission reservation is terminal")
+            if reservation_status == "UNKNOWN":
+                raise ValueError("submission retry for UNKNOWN is forbidden")
+            prior_for_intent = self._conn.execute(
+                "SELECT attempt_id FROM canary_submission_attempts WHERE intent_id=? LIMIT 1",
+                (intent,),
+            ).fetchone()
+            if prior_for_intent is not None:
+                raise ValueError("submission retry for an intent is forbidden")
+            start, end = self._canary_window(stamp)
+            limits = dict(authority["limits"])
+            max_orders_raw = limits.get(
+                "max_submitted_orders_per_day",
+                limits.get("max_orders_per_day", 0),
+            )
+            max_orders = int(max_orders_raw or 0)
+            if max_orders <= 0:
+                raise ValueError("daily submission limit is unavailable")
+            attempts = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM canary_submission_attempts "
+                "WHERE attempted_at>=? AND attempted_at<?",
+                (start, end),
+            ).fetchone()
+            unsubmitted = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM canary_risk_reservations r "
+                "WHERE r.created_at>=? AND r.created_at<? "
+                "AND r.status IN ('HELD','RESERVED','SUBMITTING','ACKNOWLEDGED','UNKNOWN',"
+                "'PARTIAL','PARTIALLY_FILLED','OPEN') "
+                "AND NOT EXISTS (SELECT 1 FROM canary_submission_attempts a WHERE a.intent_id=r.intent_id)",
+                (start, end),
+            ).fetchone()
+            if int(attempts["n"] or 0) + int(unsubmitted["n"] or 0) > max_orders:
+                raise ValueError("daily submission limit reached")
+            self._conn.execute(
+                "INSERT INTO canary_submission_attempts("
+                "attempt_id,intent_id,side,attempted_at,status,config_generation,config_hash,"
+                "config_id,control_generation,detail_json"
+                ") VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (
+                    identifier,
+                    intent,
+                    side_value,
+                    attempted_iso,
+                    status_value,
+                    bound_generation,
+                    bound_hash,
+                    bound_config_id,
+                    bound_control_generation,
+                    detail_json,
+                ),
+            )
+            self._conn.execute(
+                "UPDATE canary_risk_reservations SET submitted_at=COALESCE(submitted_at,?),"
+                "status=CASE WHEN status='HELD' THEN 'SUBMITTING' ELSE status END,"
+                "updated_at=? WHERE reservation_id=?",
+                (attempted_iso, attempted_iso, reservation["reservation_id"]),
+            )
+        return identifier
+    def record_canary_external_flow(
+        self,
+        *,
+        flow_id: str,
+        amount: Any,
+        kind: str = "EXTERNAL",
+        timestamp: datetime | None = None,
+        detail: Mapping[str, Any] | None = None,
+    ) -> str:
+        """Persist one idempotent cash/equity flow separately from trading."""
+        identifier = str(flow_id or "").strip()
+        kind_value = str(kind or "").strip().upper()
+        if not identifier or kind_value not in {"EXTERNAL", "DEPOSIT", "WITHDRAWAL", "EQUITY_LOSS"}:
+            raise ValueError("flow_id and a supported flow kind are required")
+        value = _risk_decimal(amount, name="flow amount")
+        stamp = timestamp or utc_now()
+        stamp_iso = _iso(stamp)
+        detail_json = _dump(detail or {})
+        with self._write_context():
+            prior = self._conn.execute(
+                "SELECT * FROM canary_risk_cashflows WHERE flow_id=?",
+                (identifier,),
+            ).fetchone()
+            if prior is not None:
+                if (
+                    str(prior["kind"]).upper() != kind_value
+                    or _risk_decimal(prior["amount"]) != value
+                    or str(prior["occurred_at"]) != stamp_iso
+                    or str(prior["detail_json"] or "{}") != detail_json
+                ):
+                    raise ValueError("cashflow identity conflict")
+                return identifier
+            self._conn.execute(
+                "INSERT INTO canary_risk_cashflows(flow_id,kind,amount,occurred_at,detail_json) "
+                "VALUES(?,?,?,?,?)",
+                (identifier, kind_value, _risk_text(value), stamp_iso, detail_json),
+            )
+        return identifier
+    def adopt_canary_legacy_reservation(
+        self,
+        *,
+        event_id: str,
+        intent_id: str | None = None,
+        reservation_id: str | None = None,
+        side: str = "BUY",
+        market_id: str,
+        token_id: str,
+        requested_cost: Any,
+        quantity: Any,
+        timestamp: datetime,
+        evidence: Mapping[str, Any] | None = None,
+        legacy_detail: Mapping[str, Any] | None = None,
+        legacy_status: str | None = None,
+        fee_reserve: Any = "0",
+        venue: str = "polymarket",
+        candidate_id: str = "legacy",
+        config_id: str | None = None,
+        config_generation: int | None = None,
+        config_hash: str | None = None,
+        control_generation: int | None = None,
+    ) -> dict[str, Any]:
+        """Adopt a persisted legacy obligation without inventing a fill.
+
+        Adoption only creates the canonical reservation identity and keeps it
+        active/UNKNOWN until reconciliation records each genuine venue trade
+        through :meth:`record_canary_fill`.  This makes a crash between
+        adoption and trade projection visible as an unresolved obligation while
+        preserving the original legacy evidence for audit and policy review.
+        """
+        event = str(event_id or "").strip()
+        intent = str(intent_id or "").strip() or event
+        reservation = str(reservation_id or "").strip() or event
+        side_value = str(side or "").strip().upper()
+        market = str(market_id or "").strip()
+        token = str(token_id or "").strip()
+        venue_value = str(venue or "").strip() or "polymarket"
+        candidate_value = str(candidate_id or "").strip() or "legacy"
+        if not event or not intent or not reservation or side_value not in {"BUY", "SELL"}:
+            raise ValueError("legacy event, intent, reservation, and side BUY/SELL are required")
+        if not market or not token or not isinstance(timestamp, datetime):
+            raise ValueError("legacy market, token, and timestamp are required")
+        requested_value = _risk_decimal(requested_cost, name="requested_cost", nonnegative=True)
+        expected_quantity = _risk_decimal(quantity, name="quantity", nonnegative=True)
+        fee_value = _risk_decimal(fee_reserve, name="fee_reserve", nonnegative=True)
+        if expected_quantity <= 0:
+            raise ValueError("legacy adoption quantity must be positive")
+
+        # Keep all source material under an auditable namespace.  It is copied
+        # verbatim and is never used as a synthetic canonical fill.
+        reservation_detail: dict[str, Any] = {
+            "legacy_adopted": True,
+            "legacy_event_id": event,
+            "legacy_status": str(legacy_status or "").strip().upper(),
+            "token_id": token,
+            "venue": venue_value,
+            "candidate_id": candidate_value,
+            "legacy_evidence": dict(evidence or {}),
+            "legacy_detail": dict(legacy_detail or {}),
+        }
+        detail_json = _dump(reservation_detail)
+        stamp_iso = _iso(timestamp)
+
+        def optional_generation(value: Any, name: str) -> int | None:
+            if value is None:
+                return None
+            if isinstance(value, bool):
+                raise ValueError(f"{name} must be an integer")
+            number = _risk_decimal(value, name=name, nonnegative=True)
+            if number != number.to_integral_value():
+                raise ValueError(f"{name} must be an integer")
+            return int(number)
+
+        supplied_config_id = str(config_id).strip() if config_id is not None else None
+        supplied_config_hash = str(config_hash).strip() if config_hash is not None else None
+        supplied_generation = optional_generation(config_generation, "config generation")
+        supplied_control_generation = optional_generation(control_generation, "control generation")
+        with self.transaction(immediate=True):
+            # Read only the active settings identity; migration must not be
+            # blocked by a killed/disarmed/stale control row and must not
+            # authorize a new submission.
+            active = self._conn.execute(
+                "SELECT config_id,generation,config_hash FROM canary_setting_configs "
+                "WHERE state='ACTIVE' ORDER BY generation DESC,created_at DESC,config_id DESC LIMIT 1"
+            ).fetchone()
+            bound_config_id = supplied_config_id or (str(active["config_id"]) if active is not None else None)
+            bound_generation = supplied_generation if supplied_generation is not None else (
+                int(active["generation"]) if active is not None else None
+            )
+            bound_config_hash = supplied_config_hash or (str(active["config_hash"]) if active is not None else None)
+            bound_control_generation = supplied_control_generation
+            prior = self._conn.execute(
+                "SELECT * FROM canary_risk_reservations WHERE reservation_id=? OR intent_id=? OR event_id=? "
+                "ORDER BY created_at,reservation_id LIMIT 1",
+                (reservation, intent, event),
+            ).fetchone()
+            if prior is not None:
+                prior_detail = _load(prior["detail_json"]) if prior["detail_json"] else {}
+                prior_identity_detail = dict(prior_detail) if isinstance(prior_detail, Mapping) else {}
+                prior_identity_detail.pop("_terminal_no_fill_proof", None)
+                if (
+                    str(prior["reservation_id"]) != reservation
+                    or str(prior["intent_id"]) != intent
+                    or str(prior["side"]).upper() != side_value
+                    or (str(prior["market_id"]).strip() if prior["market_id"] is not None else None) != market
+                    or (str(prior["event_id"]).strip() if prior["event_id"] is not None else None) != event
+                    or _risk_decimal(prior["requested_cost"]) != requested_value
+                    or _risk_decimal(prior["fee_reserve"]) != fee_value
+                    or _risk_decimal(prior["quantity"]) != expected_quantity
+                    or prior_identity_detail != reservation_detail
+                ):
+                    raise ValueError("legacy adoption identity conflict")
+                row = prior
+            else:
+                remaining = requested_value + fee_value
+                self._conn.execute(
+                    "INSERT INTO canary_risk_reservations("
+                    "reservation_id,intent_id,side,market_id,event_id,requested_cost,filled_cost,remaining_cost,"
+                    "fee_reserve,quantity,filled_quantity,status,config_generation,config_hash,config_id,"
+                    "control_generation,detail_json,created_at,submitted_at,updated_at,released_at"
+                    ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        reservation,
+                        intent,
+                        side_value,
+                        market,
+                        event,
+                        _risk_text(requested_value),
+                        "0",
+                        _risk_text(remaining),
+                        _risk_text(fee_value),
+                        _risk_text(expected_quantity),
+                        "0",
+                        "UNKNOWN",
+                        bound_generation,
+                        bound_config_hash,
+                        bound_config_id,
+                        bound_control_generation,
+                        detail_json,
+                        stamp_iso,
+                        stamp_iso,
+                        stamp_iso,
+                        None,
+                    ),
+                )
+                row = self._conn.execute(
+                    "SELECT * FROM canary_risk_reservations WHERE reservation_id=?",
+                    (reservation,),
+                ).fetchone()
+        return _canary_reservation_record(row)
+    def record_canary_equity_mark(
+        self,
+        *,
+        mark_id: str,
+        observed_at: datetime | None = None,
+        marked_at: datetime | None = None,
+        market_id: str,
+        token_id: str,
+        side: str = "SELL",
+        quantity: Any,
+        mark_price: Any,
+        cost_basis_usd: Any,
+        mark_fee: Any = "0",
+        source: str = "POLYMARKET_ORDER_BOOK",
+        config_id: str | None = None,
+        config_generation: int | None = None,
+        control_generation: int | None = None,
+        detail: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Persist one exact-token, fee-aware mark for owned canary inventory."""
+        identifier = str(mark_id or "").strip()
+        market = str(market_id or "").strip()
+        token = str(token_id or "").strip()
+        side_value = str(side or "").strip().upper()
+        if side_value == "LONG":
+            side_value = "SELL"
+        source_value = str(source or "").strip()
+        if not identifier or not market or not token or side_value != "SELL" or not source_value:
+            raise ValueError("mark_id, market_id, token_id, SELL side, and source are required")
+        mark_time = observed_at if observed_at is not None else marked_at
+        if not isinstance(mark_time, datetime):
+            raise ValueError("observed_at or marked_at must be a datetime")
+        if observed_at is not None and marked_at is not None and _iso(observed_at) != _iso(marked_at):
+            raise ValueError("observed_at and marked_at must agree")
+        quantity_value = _risk_decimal(quantity, name="mark quantity", nonnegative=True)
+        price_value = _risk_decimal(mark_price, name="mark price", nonnegative=True)
+        basis_value = _risk_decimal(cost_basis_usd, name="mark cost basis", nonnegative=True)
+        fee_value = _risk_decimal(mark_fee, name="mark fee", nonnegative=True)
+        if quantity_value <= 0:
+            raise ValueError("mark quantity must be positive")
+        encoded_detail = _dump(detail or {})
+        stamp_iso = _iso(mark_time)
+        def optional_generation(value: Any, name: str) -> int | None:
+            if value is None:
+                return None
+            if isinstance(value, bool):
+                raise ValueError(f"{name} must be an integer")
+            decimal_value = _risk_decimal(value, name=name, nonnegative=True)
+            if decimal_value != decimal_value.to_integral_value():
+                raise ValueError(f"{name} must be an integer")
+            return int(decimal_value)
+        config_generation_value = optional_generation(config_generation, "config generation")
+        control_generation_value = optional_generation(control_generation, "control generation")
+        config_id_value = str(config_id).strip() if config_id is not None else None
+        with self.transaction(immediate=True):
+            prior = self._conn.execute(
+                "SELECT * FROM canary_equity_marks WHERE mark_id=?",
+                (identifier,),
+            ).fetchone()
+            if prior is not None:
+                if (
+                    str(prior["market_id"]) != market
+                    or str(prior["token_id"]) != token
+                    or str(prior["side"]).upper() != side_value
+                    or _risk_decimal(prior["quantity"]) != quantity_value
+                    or _risk_decimal(prior["mark_price"]) != price_value
+                    or _risk_decimal(prior["cost_basis_usd"]) != basis_value
+                    or _risk_decimal(prior["mark_fee"]) != fee_value
+                    or str(prior["observed_at"]) != stamp_iso
+                    or str(prior["source"]) != source_value
+                    or (str(prior["config_id"]).strip() if prior["config_id"] is not None else None) != config_id_value
+                    or prior["config_generation"] != config_generation_value
+                    or prior["control_generation"] != control_generation_value
+                    or str(prior["detail_json"] or "{}") != encoded_detail
+                ):
+                    raise ValueError("equity mark identity conflict")
+                row = prior
+            else:
+                self._conn.execute(
+                    "INSERT INTO canary_equity_marks("
+                    "mark_id,market_id,token_id,side,quantity,mark_price,cost_basis_usd,mark_fee,"
+                    "observed_at,source,config_id,config_generation,control_generation,detail_json,created_at"
+                    ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        identifier,
+                        market,
+                        token,
+                        side_value,
+                        _risk_text(quantity_value),
+                        _risk_text(price_value),
+                        _risk_text(basis_value),
+                        _risk_text(fee_value),
+                        stamp_iso,
+                        source_value,
+                        config_id_value,
+                        config_generation_value,
+                        control_generation_value,
+                        encoded_detail,
+                        _iso(utc_now()),
+                    ),
+                )
+                row = self._conn.execute(
+                    "SELECT * FROM canary_equity_marks WHERE mark_id=?",
+                    (identifier,),
+                ).fetchone()
+        return _canary_equity_mark_record(row)
+
+    def reserve_canary_capacity(
+        self,
+        *,
+        intent_id: str,
+        side: str,
+        requested_cost: Any = "0",
+        fee_reserve: Any = "0",
+        quantity: Any = "0",
+        market_id: str | None = None,
+        event_id: str | None = None,
+        reservation_id: str | None = None,
+        limits: Mapping[str, Any] | None = None,
+        config_generation: int | None = None,
+        config_hash: str | None = None,
+        config_id: str | None = None,
+        control_generation: int | None = None,
+        detail: Mapping[str, Any] | None = None,
+        timestamp: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Atomically reserve a config-fenced intent.
+
+        The ACTIVE settings row and (when present) the persisted canary control
+        row are the authority.  ``limits`` is only a tighter candidate and
+        cannot widen or replace that authority.  A reservation is also the
+        submission-slot commitment; recording an attempt consumes the same
+        slot rather than counting it twice.
+        """
+        intent = str(intent_id or "").strip()
+        side_value = str(side or "").strip().upper()
+        if not intent or side_value not in {"BUY", "SELL"}:
+            raise ValueError("intent_id and side BUY/SELL are required")
+        requested = _risk_decimal(requested_cost, name="requested_cost", nonnegative=True)
+        fee = _risk_decimal(fee_reserve, name="fee_reserve", nonnegative=True)
+        amount = _risk_decimal(quantity, name="quantity", nonnegative=True)
+        stamp = timestamp or utc_now()
+        identifier = str(reservation_id or "reservation:" + intent).strip()
+        market_key = str(market_id).strip() if market_id is not None and str(market_id).strip() else None
+        event_key = str(event_id).strip() if event_id is not None and str(event_id).strip() else None
+        encoded_detail = _dump(detail or {})
+        with self.transaction(immediate=True):
+            authority = self._canary_authority_locked()
+            if authority["config_id"] is None:
+                raise ValueError("active canary settings are unavailable")
+            if authority.get("control_state") == "KILLED":
+                raise ValueError("canary control is killed")
+            if side_value == "BUY" and authority.get("control_state") not in {
+                None, "ARMED", "AUTONOMOUS_MICRO_LIVE",
+            }:
+                raise ValueError("canary entry is not armed")
+            if config_generation is not None and int(config_generation) != int(authority["generation"]):
+                raise ValueError("settings generation changed")
+            if config_hash is not None and str(config_hash) != str(authority["config_hash"]):
+                raise ValueError("settings config hash changed")
+            if config_id is not None and str(config_id).strip() != str(authority["config_id"]):
+                raise ValueError("settings config id changed")
+            if control_generation is not None and authority["control_generation"] is not None:
+                if int(control_generation) != int(authority["control_generation"]):
+                    raise ValueError("canary control generation changed")
+            bound_control_generation = authority["control_generation"]
+            existing = self._conn.execute(
+                "SELECT * FROM canary_risk_reservations WHERE intent_id=?",
+                (intent,),
+            ).fetchone()
+            if existing is not None:
+                if not self._canary_identity_equal(
+                    existing,
+                    reservation_id=identifier,
+                    side=side_value,
+                    market_id=market_key,
+                    event_id=event_key,
+                    requested=requested,
+                    fee=fee,
+                    quantity=amount,
+                    config_generation=int(authority["generation"]),
+                    config_hash=str(authority["config_hash"]),
+                    config_id=str(authority["config_id"]),
+                    control_generation=bound_control_generation,
+                    detail_json=encoded_detail,
+                ):
+                    raise ValueError("reservation identity conflict")
+                return _canary_reservation_record(existing)
+            prior_identifier = self._conn.execute(
+                "SELECT * FROM canary_risk_reservations WHERE reservation_id=?",
+                (identifier,),
+            ).fetchone()
+            if prior_identifier is not None:
+                raise ValueError("reservation id already belongs to another intent")
+            usage = self.canary_risk_accounting(stamp)
+            effective = self._canary_effective_limits(authority["limits"], limits)
+            all_in = requested + fee
+            if side_value == "BUY":
+                risk_breaker = str(usage.get("risk_breaker") or "").strip().upper()
+                if risk_breaker:
+                    raise ValueError(f"canary risk breaker active: {risk_breaker}")
+                equity_status = str(usage.get("equity_status") or "UNKNOWN").strip().upper()
+                if equity_status in {"UNKNOWN", "MISSING", "STALE"}:
+                    raise ValueError("authoritative equity evidence unavailable")
+                all_in_limit = _risk_decimal(
+                    effective.get("max_all_in_buy_usd", "0"),
+                    name="max_all_in_buy_usd",
+                    nonnegative=True,
+                )
+                if all_in > all_in_limit:
+                    raise ValueError("BUY exceeds all-in commitment")
+                fee_limit = effective.get("max_fee_reserve_usd")
+                if fee_limit not in (None, "") and fee > _risk_decimal(
+                    fee_limit, name="max_fee_reserve_usd", nonnegative=True
+                ):
+                    raise ValueError("BUY exceeds fee reserve")
+                gross_limit = _risk_decimal(
+                    effective.get("max_gross_daily_buy_usd", "0"),
+                    name="max_gross_daily_buy_usd",
+                    nonnegative=True,
+                )
+                if gross_limit > 0 and _risk_decimal(usage["gross_daily_buy_usd"]) + all_in > gross_limit:
+                    raise ValueError("BUY exceeds gross daily buy limit")
+                exposure_limit = _risk_decimal(
+                    effective.get("max_aggregate_exposure_usd", "0"),
+                    name="max_aggregate_exposure_usd",
+                    nonnegative=True,
+                )
+                if exposure_limit > 0 and _risk_decimal(usage["aggregate_exposure_usd"]) + all_in > exposure_limit:
+                    raise ValueError("BUY exceeds aggregate exposure limit")
+                open_cost_limit = _risk_decimal(
+                    effective.get("max_aggregate_open_cost_usd", "0"),
+                    name="max_aggregate_open_cost_usd",
+                    nonnegative=True,
+                )
+                if open_cost_limit > 0 and _risk_decimal(usage["aggregate_open_cost_usd"]) + all_in > open_cost_limit:
+                    raise ValueError("BUY exceeds aggregate open cost limit")
+                max_positions = int(effective.get("max_positions", 0) or 0)
+                if max_positions > 0:
+                    existing_market = market_key in set(usage.get("open_market_ids") or ())
+                    if int(usage["open_positions"]) + (0 if existing_market else 1) > max_positions:
+                        raise ValueError("BUY exceeds position limit")
+                realized_stop = effective.get("realized_loss_entry_stop_usd")
+                if realized_stop not in (None, "") and _risk_decimal(usage["realized_loss_usd"]) >= _risk_decimal(
+                    realized_stop, name="realized_loss_entry_stop_usd", nonnegative=True
+                ):
+                    raise ValueError("realized loss entry stop reached")
+                equity_stop = effective.get("equity_loss_entry_stop_usd")
+                if equity_stop not in (None, "") and _risk_decimal(usage["equity_loss_usd"]) >= _risk_decimal(
+                    equity_stop, name="equity_loss_entry_stop_usd", nonnegative=True
+                ):
+                    raise ValueError("equity loss entry stop reached")
+                for cap_name, usage_name, identity in (
+                    ("per_market_buy_cap_usd", "per_market_buy_usd", market_key),
+                    ("per_event_buy_cap_usd", "per_event_buy_usd", event_key),
+                ):
+                    cap = effective.get(cap_name)
+                    if cap not in (None, "") and identity is not None:
+                        cap_value = _risk_decimal(cap, name=cap_name, nonnegative=True)
+                        used_value = _risk_decimal((usage[usage_name] or {}).get(identity, "0"))
+                        if used_value + all_in > cap_value:
+                            raise ValueError(f"BUY exceeds {cap_name}")
+                cumulative_cap = effective.get("cumulative_buy_cap_usd")
+                if cumulative_cap not in (None, "") and _risk_decimal(usage["cumulative_buy_usd"]) + all_in > _risk_decimal(
+                    cumulative_cap, name="cumulative_buy_cap_usd", nonnegative=True
+                ):
+                    raise ValueError("BUY exceeds cumulative buy cap")
+            else:
+                if amount <= 0 or market_key is None:
+                    raise ValueError("SELL requires a positive quantity and market")
+                available = _risk_decimal(
+                    (usage.get("open_quantity_by_market") or {}).get(market_key, "0")
+                )
+                reserved_exits = _risk_decimal(
+                    (usage.get("pending_sell_quantity_by_market") or {}).get(market_key, "0")
+                )
+                if amount + reserved_exits > available:
+                    raise ValueError("SELL exceeds owned inventory")
+            start, end = self._canary_window(stamp)
+            max_orders = int(
+                effective.get(
+                    "max_submitted_orders_per_day",
+                    effective.get("max_orders_per_day", 0),
+                )
+                or 0
+            )
+            if max_orders <= 0:
+                raise ValueError("daily submission limit is unavailable")
+            attempts = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM canary_submission_attempts "
+                "WHERE attempted_at>=? AND attempted_at<?",
+                (start, end),
+            ).fetchone()
+            unsubmitted = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM canary_risk_reservations r "
+                "WHERE r.created_at>=? AND r.created_at<? "
+                "AND r.status IN ('HELD','RESERVED','SUBMITTING','ACKNOWLEDGED','UNKNOWN',"
+                "'PARTIAL','PARTIALLY_FILLED','OPEN') "
+                "AND NOT EXISTS (SELECT 1 FROM canary_submission_attempts a WHERE a.intent_id=r.intent_id)",
+                (start, end),
+            ).fetchone()
+            base_reserved = int(attempts["n"] or 0) + int(unsubmitted["n"] or 0)
+            if side_value == "BUY":
+                exit_slots = int(
+                    usage.get("open_lot_slots", usage.get("open_positions", 0)) or 0
+                )
+                required_slots = base_reserved + 1 + exit_slots + 1
+            else:
+                required_slots = base_reserved + 1
+            if required_slots > max_orders:
+                raise ValueError("daily submission/exit capacity reached")
+            self._conn.execute(
+                "INSERT INTO canary_risk_reservations("
+                "reservation_id,intent_id,side,market_id,event_id,requested_cost,filled_cost,remaining_cost,"
+                "fee_reserve,quantity,filled_quantity,status,config_generation,config_hash,config_id,"
+                "control_generation,detail_json,created_at,submitted_at,updated_at,released_at"
+                ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    identifier,
+                    intent,
+                    side_value,
+                    market_key,
+                    event_key,
+                    _risk_text(requested),
+                    "0",
+                    _risk_text(all_in),
+                    _risk_text(fee),
+                    _risk_text(amount),
+                    "0",
+                    "HELD",
+                    int(authority["generation"]),
+                    str(authority["config_hash"]),
+                    str(authority["config_id"]),
+                    bound_control_generation,
+                    encoded_detail,
+                    _iso(stamp),
+                    None,
+                    _iso(stamp),
+                    None,
+                ),
+            )
+            row = self._conn.execute(
+                "SELECT * FROM canary_risk_reservations WHERE reservation_id=?",
+                (identifier,),
+            ).fetchone()
+        return _canary_reservation_record(row)
+
+    def record_canary_fill(
+        self,
+        *,
+        fill_id: str,
+        reservation_id: str,
+        quantity: Any,
+        price: Any,
+        cost: Any | None = None,
+        fee: Any = "0",
+        filled_at: datetime | None = None,
+        detail: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        fill = str(fill_id or "").strip()
+        reservation = str(reservation_id or "").strip()
+        if not fill or not reservation:
+            raise ValueError("fill_id and reservation_id are required")
+        qty = _risk_decimal(quantity, name="fill quantity", nonnegative=True)
+        px = _risk_decimal(price, name="fill price", nonnegative=True)
+        charge = _risk_decimal(fee, name="fill fee", nonnegative=True)
+        computed = qty * px + charge
+        value = computed if cost is None else _risk_decimal(cost, name="fill cost", nonnegative=True)
+        if value != computed:
+            raise ValueError("fill cost must equal quantity*price+fee")
+        stamp = filled_at or utc_now()
+        stamp_iso = _iso(stamp)
+        detail_json = _dump(detail or {})
+        with self.transaction(immediate=True):
+            reservation_row = self._conn.execute(
+                "SELECT * FROM canary_risk_reservations WHERE reservation_id=?",
+                (reservation,),
+            ).fetchone()
+            if reservation_row is None:
+                raise ValueError("risk reservation not found")
+            prior = self._conn.execute(
+                "SELECT * FROM canary_risk_fills WHERE fill_id=?",
+                (fill,),
+            ).fetchone()
+            if prior is not None:
+                if (
+                    str(prior["reservation_id"]) != reservation
+                    or _risk_decimal(prior["quantity"]) != qty
+                    or _risk_decimal(prior["price"]) != px
+                    or _risk_decimal(prior["cost"]) != value
+                    or _risk_decimal(prior["fee"]) != charge
+                    or str(prior["filled_at"]) != stamp_iso
+                ):
+                    raise ValueError("fill identity conflict")
+                prior_detail = _load(prior["detail_json"]) if prior["detail_json"] else {}
+                current_detail = _load(detail_json) if detail_json else {}
+                if prior_detail != current_detail:
+                    merged_detail = _merge_canary_fill_details(prior_detail, current_detail)
+                    if merged_detail is None:
+                        raise ValueError("fill identity conflict")
+                    detail_json = _dump(merged_detail)
+                    self._conn.execute(
+                        "UPDATE canary_risk_fills SET detail_json=? WHERE fill_id=?",
+                        (detail_json, fill),
+                    )
+            else:
+                self._conn.execute(
+                    "INSERT INTO canary_risk_fills(fill_id,reservation_id,quantity,price,cost,fee,filled_at,detail_json) "
+                    "VALUES(?,?,?,?,?,?,?,?)",
+                    (
+                        fill,
+                        reservation,
+                        _risk_text(qty),
+                        _risk_text(px),
+                        _risk_text(value),
+                        _risk_text(charge),
+                        stamp_iso,
+                        detail_json,
+                    ),
+                )
+            fill_rows = self._conn.execute(
+                "SELECT quantity,cost FROM canary_risk_fills WHERE reservation_id=?",
+                (reservation,),
+            ).fetchall()
+            total_quantity = sum(
+                (_risk_decimal(row["quantity"]) for row in fill_rows),
+                Decimal("0"),
+            )
+            total_cost = sum(
+                (_risk_decimal(row["cost"]) for row in fill_rows),
+                Decimal("0"),
+            )
+            requested = _risk_decimal(reservation_row["requested_cost"]) + _risk_decimal(
+                reservation_row["fee_reserve"]
+            )
+            remaining = max(Decimal("0"), requested - total_cost)
+            side_value = str(reservation_row["side"]).upper()
+            if side_value == "BUY" and total_cost > requested:
+                reservation_detail = _load(reservation_row["detail_json"]) if reservation_row["detail_json"] else {}
+                if not isinstance(reservation_detail, Mapping):
+                    reservation_detail = {}
+                reservation_detail["actual_cost_overrun_usd"] = _risk_text(total_cost - requested)
+                reservation_detail["risk_breaker"] = "ACTUAL_FILL_OVER_PLAN"
+                self._conn.execute(
+                    "UPDATE canary_risk_reservations SET detail_json=? WHERE reservation_id=?",
+                    (_dump(reservation_detail), reservation),
+                )
+            fill_status = str(reservation_row["status"]).upper()
+            settlement = _canary_fill_settlement_status(_load(detail_json) if detail_json else {})
+            if side_value == "BUY":
+                expected_quantity = _risk_decimal(reservation_row["quantity"])
+                if settlement not in _CANARY_CONFIRMED_SETTLEMENT_STATUSES:
+                    fill_status = "UNKNOWN"
+                elif total_quantity >= expected_quantity and expected_quantity > 0:
+                    fill_status = "FILLED"
+                else:
+                    fill_status = "PARTIALLY_FILLED"
+            elif side_value == "SELL":
+                expected_quantity = _risk_decimal(reservation_row["quantity"])
+                if settlement not in _CANARY_CONFIRMED_SETTLEMENT_STATUSES:
+                    fill_status = "OPEN"
+                elif total_quantity > 0 and total_quantity < expected_quantity:
+                    fill_status = "PARTIALLY_FILLED"
+                elif total_quantity >= expected_quantity and expected_quantity > 0:
+                    fill_status = "FILLED"
+            self._conn.execute(
+                "UPDATE canary_risk_reservations SET filled_cost=?,remaining_cost=?,filled_quantity=?,"
+                "status=?,updated_at=? WHERE reservation_id=?",
+                (
+                    _risk_text(total_cost),
+                    _risk_text(remaining),
+                    _risk_text(total_quantity),
+                    fill_status,
+                    stamp_iso,
+                    reservation,
+                ),
+            )
+            row = self._conn.execute(
+                "SELECT * FROM canary_risk_reservations WHERE reservation_id=?",
+                (reservation,),
+            ).fetchone()
+        return _canary_reservation_record(row)
+
+    def release_canary_capacity(
+        self,
+        reservation_id: str,
+        *,
+        status: str = "RELEASED",
+        timestamp: datetime | None = None,
+        detail: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        identifier = str(reservation_id or "").strip()
+        if not identifier:
+            raise ValueError("reservation_id is required")
+        state = str(status or "").strip().upper()
+        if state not in {
+            "RELEASED", "CANCELLED", "CANCELED", "REJECTED", "UNKNOWN",
+            "SETTLED", "FILLED", "PARTIALLY_FILLED", "PARTIAL", "OPEN",
+        }:
+            raise ValueError("invalid risk reservation status")
+        stamp = timestamp or utc_now()
+        release_detail = dict(detail or {})
+        with self._write_context():
+            row = self._conn.execute(
+                "SELECT * FROM canary_risk_reservations WHERE reservation_id=?",
+                (identifier,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("risk reservation not found")
+            remaining = _risk_decimal(row["remaining_cost"])
+            adopted_detail = _load(row["detail_json"]) if row["detail_json"] else {}
+            adopted_legacy = (
+                isinstance(adopted_detail, Mapping)
+                and adopted_detail.get("legacy_adopted") is True
+            )
+            canonical_fill_rows = self._conn.execute(
+                "SELECT detail_json FROM canary_risk_fills WHERE reservation_id=?",
+                (identifier,),
+            ).fetchall()
+            has_confirmed_fill = any(
+                _canary_fill_settlement_status(
+                    _load(fill["detail_json"]) if fill["detail_json"] else {}
+                ) in _CANARY_CONFIRMED_SETTLEMENT_STATUSES
+                for fill in canonical_fill_rows
+            )
+            terminal_no_fill = _canary_terminal_no_fill_proof(release_detail)
+            if (
+                adopted_legacy
+                and not has_confirmed_fill
+                and state not in {"UNKNOWN", "PARTIALLY_FILLED", "PARTIAL", "OPEN"}
+                and not terminal_no_fill
+            ):
+                # A migration crash or a terminal venue response without any
+                # stable trade IDs remains an unresolved active obligation.
+                state = "UNKNOWN"
+            if (
+                adopted_legacy
+                and terminal_no_fill
+                and canonical_fill_rows
+            ):
+                # A no-fill proof cannot override even a provisional stable
+                # trade record.
+                state = "UNKNOWN"
+                terminal_no_fill = False
+            if terminal_no_fill:
+                adopted_detail = dict(adopted_detail)
+                adopted_detail["_terminal_no_fill_proof"] = release_detail
+                self._conn.execute(
+                    "UPDATE canary_risk_reservations SET detail_json=? WHERE reservation_id=?",
+                    (_dump(adopted_detail), identifier),
+                )
+            if state not in {"UNKNOWN", "PARTIALLY_FILLED", "PARTIAL", "OPEN"}:
+                remaining = Decimal("0")
+            released_at = (
+                _iso(stamp)
+                if state not in {"UNKNOWN", "PARTIALLY_FILLED", "PARTIAL", "OPEN"}
+                else None
+            )
+            self._conn.execute(
+                "UPDATE canary_risk_reservations SET status=?,remaining_cost=?,released_at=?,"
+                "updated_at=? WHERE reservation_id=?",
+                (state, _risk_text(remaining), released_at, _iso(stamp), identifier),
+            )
+            row = self._conn.execute(
+                "SELECT * FROM canary_risk_reservations WHERE reservation_id=?",
+                (identifier,),
+            ).fetchone()
+        return _canary_reservation_record(row)
+    def canary_risk_accounting(self, now: datetime | None = None) -> dict[str, Any]:
+        """Return exact Decimal usage while preserving both ledger generations."""
+        observed = ensure_utc(now or utc_now())
+        start, end = self._canary_window(observed)
+        accounting_day_pht = datetime.fromisoformat(start).astimezone(
+            ZoneInfo("Asia/Manila")
+        ).date().isoformat()
+        active_statuses = {
+            "HELD", "RESERVED", "SUBMITTING", "ACKNOWLEDGED", "UNKNOWN",
+            "PARTIALLY_FILLED", "PARTIAL", "OPEN", "SUBMITTED",
+        }
+        result: dict[str, Any] = {
+            "accounting_day_pht": accounting_day_pht,
+            "submitted_orders": 0,
+            "buy_filled_usd": Decimal("0"),
+            "buy_pending_usd": Decimal("0"),
+            "buy_unknown_usd": Decimal("0"),
+            "gross_daily_buy_usd": Decimal("0"),
+            "all_in_buy_reserved_usd": Decimal("0"),
+            "aggregate_open_cost_usd": Decimal("0"),
+            "aggregate_exposure_usd": Decimal("0"),
+            "open_positions": 0,
+            "realized_loss_usd": Decimal("0"),
+            "equity_loss_usd": Decimal("0"),
+            "today_realized_pnl_usd": Decimal("0"),
+            "equity_status": "UNKNOWN",
+            "risk_breaker": None,
+            "external_flow_usd": Decimal("0"),
+            "per_market_buy_usd": {},
+            "per_event_buy_usd": {},
+            "cumulative_buy_usd": Decimal("0"),
+            "open_quantity_by_market": {},
+            "pending_sell_quantity_by_market": {},
+            "open_market_ids": [],
+            "open_lot_slots": 0,
+        }
+
+        def add_map(name: str, key: str | None, value: Decimal) -> None:
+            if key:
+                target = result[name]
+                target[key] = target.get(key, Decimal("0")) + value
+
+        def detail_pnl(detail_value: Any, fallback: Mapping[str, Any] | None = None) -> Decimal:
+            payload = detail_value if isinstance(detail_value, Mapping) else {}
+            source = dict(fallback or {})
+            source.update(payload)
+            for key in ("realized_pnl_usd", "realized_pnl", "pnl_usd", "pnl"):
+                if key in source and source[key] not in (None, ""):
+                    return _risk_decimal(source[key], name=key)
+            for proceeds_key in ("proceeds_usd", "proceeds", "sell_proceeds_usd"):
+                for basis_key in ("entry_cost_usd", "cost_basis_usd", "basis_usd"):
+                    if proceeds_key in source and basis_key in source:
+                        return _risk_decimal(source[proceeds_key], name=proceeds_key) - _risk_decimal(
+                            source[basis_key], name=basis_key
+                        )
+            return Decimal("0")
+
+        def detail_loss(detail_value: Any, fallback: Mapping[str, Any] | None = None) -> Decimal:
+            pnl = detail_pnl(detail_value, fallback)
+            return -pnl if pnl < 0 else Decimal("0")
+        with self._lock:
+            reset_row = self._conn.execute(
+                "SELECT timestamp FROM canary_setting_audit "
+                "WHERE action='CUMULATIVE_USAGE_RESET' "
+                "ORDER BY timestamp DESC,rowid DESC,audit_id DESC LIMIT 1"
+            ).fetchone()
+            cumulative_reset_at = str(reset_row["timestamp"]) if reset_row is not None else None
+            cumulative_fills_by_reservation: dict[str, Decimal] = {}
+            if cumulative_reset_at is not None:
+                for fill in self._conn.execute(
+                    "SELECT reservation_id,cost,filled_at FROM canary_risk_fills"
+                ).fetchall():
+                    if str(fill["filled_at"]) >= cumulative_reset_at:
+                        key = str(fill["reservation_id"])
+                        cumulative_fills_by_reservation[key] = (
+                            cumulative_fills_by_reservation.get(key, Decimal("0"))
+                            + _risk_decimal(fill["cost"])
+                        )
+            attempt_rows = self._conn.execute(
+                "SELECT intent_id FROM canary_submission_attempts "
+                "WHERE attempted_at>=? AND attempted_at<?",
+                (start, end),
+            ).fetchall()
+            result["submitted_orders"] = len(attempt_rows)
+            reservation_rows = self._conn.execute(
+                "SELECT * FROM canary_risk_reservations"
+            ).fetchall()
+            reservation_by_id = {str(row["reservation_id"]): row for row in reservation_rows}
+            new_event_ids = {
+                str(row["event_id"])
+                for row in reservation_rows
+                if row["event_id"] is not None and str(row["event_id"]).strip()
+            }
+            fill_rows = self._conn.execute(
+                "SELECT * FROM canary_risk_fills ORDER BY filled_at,fill_id"
+            ).fetchall()
+            fills_by_reservation: dict[str, list[tuple[sqlite3.Row, bool]]] = {}
+            day_confirmed: dict[str, Decimal] = {}
+            day_provisional: dict[str, Decimal] = {}
+            for fill in fill_rows:
+                reservation_id = str(fill["reservation_id"])
+                settlement = _canary_fill_settlement_status(
+                    _load(fill["detail_json"]) if fill["detail_json"] else {}
+                )
+                confirmed = settlement in _CANARY_CONFIRMED_SETTLEMENT_STATUSES
+                fills_by_reservation.setdefault(reservation_id, []).append((fill, confirmed))
+                stamp = str(fill["filled_at"])
+                if start <= stamp < end:
+                    target = day_confirmed if confirmed else day_provisional
+                    target[reservation_id] = target.get(reservation_id, Decimal("0")) + _risk_decimal(fill["cost"])
+            mark_rows = self._conn.execute(
+                "SELECT * FROM canary_equity_marks ORDER BY observed_at DESC,rowid DESC,mark_id DESC"
+            ).fetchall()
+            latest_marks: dict[tuple[str, str, str, str], sqlite3.Row] = {}
+            authority = self._canary_authority_locked()
+            for mark in mark_rows:
+                if (
+                    mark["config_id"] is not None
+                    and authority["config_id"] is not None
+                    and str(mark["config_id"]) != str(authority["config_id"])
+                ):
+                    continue
+                if (
+                    mark["config_generation"] is not None
+                    and authority["generation"] is not None
+                    and int(mark["config_generation"]) != int(authority["generation"])
+                ):
+                    continue
+                if (
+                    mark["control_generation"] is not None
+                    and authority["control_generation"] is not None
+                    and int(mark["control_generation"]) != int(authority["control_generation"])
+                ):
+                    continue
+                mark_detail = _load(mark["detail_json"]) if mark["detail_json"] else {}
+                position_id = (
+                    str(mark_detail.get("position_id") or "").strip()
+                    if isinstance(mark_detail, Mapping)
+                    else ""
+                )
+                key = (
+                    str(mark["market_id"]),
+                    str(mark["token_id"]),
+                    str(mark["side"]).upper(),
+                    position_id,
+                )
+                if key not in latest_marks:
+                    latest_marks[key] = mark
+            # New reservations are the canonical source for each durable event.
+            # Only final per-trade settlement evidence creates owned inventory.
+            market_qty: dict[str, Decimal] = {}
+            market_pending_sell: dict[str, Decimal] = {}
+            open_lot_counts: dict[str, int] = {}
+            owned_inventory: dict[tuple[str, str], Decimal] = {}
+            unknown_inventory = False
+            unknown_execution = False
+            for row in reservation_rows:
+                side = str(row["side"]).upper()
+                status = str(row["status"]).upper()
+                filled = _risk_decimal(row["filled_cost"])
+                remaining = _risk_decimal(row["remaining_cost"])
+                market = str(row["market_id"]) if row["market_id"] else None
+                event = str(row["event_id"]) if row["event_id"] else None
+                reservation_id = str(row["reservation_id"])
+                reservation_detail = _load(row["detail_json"]) if row["detail_json"] else {}
+                if not isinstance(reservation_detail, Mapping):
+                    reservation_detail = {}
+                breaker = str(reservation_detail.get("risk_breaker") or "").strip().upper()
+                if breaker:
+                    result["risk_breaker"] = breaker
+                fills = fills_by_reservation.get(reservation_id, [])
+                confirmed_cost = sum(
+                    (_risk_decimal(fill["cost"]) for fill, confirmed in fills if confirmed),
+                    Decimal("0"),
+                )
+                confirmed_quantity = sum(
+                    (_risk_decimal(fill["quantity"]) for fill, confirmed in fills if confirmed),
+                    Decimal("0"),
+                )
+                provisional_cost = max(Decimal("0"), filled - confirmed_cost)
+                provisional_quantity = sum(
+                    (_risk_decimal(fill["quantity"]) for fill, confirmed in fills if not confirmed),
+                    Decimal("0"),
+                )
+                if side == "BUY":
+                    day_filled = day_confirmed.get(reservation_id, Decimal("0"))
+                    day_unknown = day_provisional.get(reservation_id, Decimal("0"))
+                    result["buy_filled_usd"] += day_filled
+                    result["buy_pending_usd"] += day_unknown
+                    result["buy_unknown_usd"] += day_unknown
+                    result["gross_daily_buy_usd"] += day_filled + day_unknown
+                    outstanding = remaining if status in active_statuses else Decimal("0")
+                    if status in active_statuses:
+                        result["all_in_buy_reserved_usd"] += filled + outstanding
+                        result["buy_pending_usd"] += outstanding
+                        result["gross_daily_buy_usd"] += outstanding
+                        if status == "UNKNOWN":
+                            result["buy_unknown_usd"] += outstanding
+                    if provisional_cost > 0 or (status == "UNKNOWN" and outstanding > 0):
+                        unknown_execution = True
+                    cumulative_filled = (
+                        cumulative_fills_by_reservation.get(reservation_id, Decimal("0"))
+                        if cumulative_reset_at is not None
+                        else filled
+                    )
+                    result["cumulative_buy_usd"] += cumulative_filled + outstanding
+                    exposure = confirmed_cost + provisional_cost + outstanding
+                    result["aggregate_open_cost_usd"] += confirmed_cost
+                    result["aggregate_exposure_usd"] += exposure
+                    add_map("per_market_buy_usd", market, exposure)
+                    add_map("per_event_buy_usd", event, exposure)
+                    if market:
+                        market_qty[market] = market_qty.get(market, Decimal("0")) + confirmed_quantity
+                        token = str(
+                            reservation_detail.get("token_id")
+                            or reservation_detail.get("asset_id")
+                            or ""
+                        ).strip()
+                        if not token and event:
+                            try:
+                                token_row = self._conn.execute(
+                                    "SELECT token_id FROM canary_ledger WHERE event_id=? LIMIT 1",
+                                    (event,),
+                                ).fetchone()
+                            except sqlite3.OperationalError:
+                                token_row = None
+                            if token_row is not None and token_row["token_id"]:
+                                token = str(token_row["token_id"]).strip()
+                        if confirmed_quantity > 0:
+                            owned_key = (market, token)
+                            owned_inventory[owned_key] = (
+                                owned_inventory.get(owned_key, Decimal("0")) + confirmed_quantity
+                            )
+                            if not token:
+                                unknown_inventory = True
+                        if outstanding > 0:
+                            result.setdefault("_pending_market_keys", set()).add(market)
+                        if confirmed_quantity > 0 or outstanding > 0:
+                            slot_key = market or reservation_id
+                            open_lot_counts[slot_key] = open_lot_counts.get(slot_key, 0) + 1
+                elif side == "SELL":
+                    token = str(
+                        reservation_detail.get("token_id")
+                        or reservation_detail.get("asset_id")
+                        or ""
+                    ).strip()
+                    if not token:
+                        try:
+                            token_row = self._conn.execute(
+                                "SELECT token_id FROM canary_position_requests "
+                                "WHERE reservation_id=? ORDER BY submitted_at DESC,request_id DESC LIMIT 1",
+                                (str(row["reservation_id"]),),
+                            ).fetchone()
+                        except sqlite3.OperationalError:
+                            token_row = None
+                        if token_row is not None and token_row["token_id"]:
+                            token = str(token_row["token_id"]).strip()
+                    if market:
+                        market_qty[market] = market_qty.get(market, Decimal("0")) - confirmed_quantity
+                        pending_qty = max(
+                            Decimal("0"),
+                            _risk_decimal(row["quantity"]) - confirmed_quantity,
+                        )
+                        if status in active_statuses and pending_qty > 0:
+                            market_pending_sell[market] = (
+                                market_pending_sell.get(market, Decimal("0")) + pending_qty
+                            )
+                        if confirmed_quantity > 0:
+                            owned_key = (market, token)
+                            owned_inventory[owned_key] = (
+                                owned_inventory.get(owned_key, Decimal("0")) - confirmed_quantity
+                            )
+                            if not token:
+                                unknown_inventory = True
+                        if provisional_quantity > 0:
+                            unknown_execution = True
+                    for fill, confirmed in fills:
+                        if not confirmed:
+                            continue
+                        fill_detail = _load(fill["detail_json"]) if fill["detail_json"] else {}
+                        pnl = detail_pnl(fill_detail)
+                        fill_stamp = str(fill["filled_at"])
+                        if start <= fill_stamp < end:
+                            result["today_realized_pnl_usd"] += pnl
+                        loss = -pnl if pnl < 0 else Decimal("0")
+                        if loss:
+                            result["realized_loss_usd"] += loss
+
+            legacy_rows: list[sqlite3.Row] = []
+            legacy_table = self._conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='canary_ledger'"
+            ).fetchone()
+            if legacy_table is not None:
+                legacy_rows = self._conn.execute("SELECT * FROM canary_ledger").fetchall()
+            for row in legacy_rows:
+                event_id = str(row["event_id"]) if "event_id" in row.keys() and row["event_id"] else None
+                if event_id and event_id in new_event_ids:
+                    continue
+                side = str(row["side"]).upper()
+                stamp_value = str(row["timestamp"])
+                try:
+                    requested = _risk_decimal(row["requested_notional"])
+                    quantity = _risk_decimal(row["fill_quantity"] or "0")
+                    average = _risk_decimal(row["actual_average_price"] or "0")
+                    fees = _risk_decimal(row["fees"] or "0")
+                except (KeyError, TypeError, ValueError):
+                    continue
+                filled = max(Decimal("0"), quantity * average + fees)
+                remaining = max(Decimal("0"), requested - filled)
+                status = str(row["status"]).upper()
+                market = str(row["market_id"]) if row["market_id"] else None
+                event = str(row["event_id"]) if row["event_id"] else None
+                token = (
+                    str(row["token_id"]).strip()
+                    if "token_id" in row.keys() and row["token_id"]
+                    else ""
+                )
+                evidence = (
+                    _load(row["evidence_json"])
+                    if "evidence_json" in row.keys() and row["evidence_json"]
+                    else {}
+                )
+                settlement = _canary_fill_settlement_status(evidence)
+                if not settlement and "settlement" in row.keys() and row["settlement"]:
+                    settlement = str(row["settlement"]).strip().upper()
+                if not settlement and status in _CANARY_CONFIRMED_SETTLEMENT_STATUSES:
+                    settlement = status
+                confirmed = settlement in _CANARY_CONFIRMED_SETTLEMENT_STATUSES
+                if start <= stamp_value < end:
+                    result["submitted_orders"] += 1
+                    if side == "BUY":
+                        if confirmed:
+                            result["buy_filled_usd"] += filled
+                            result["gross_daily_buy_usd"] += filled
+                        elif filled > 0:
+                            result["buy_pending_usd"] += filled
+                            result["buy_unknown_usd"] += filled
+                            result["gross_daily_buy_usd"] += filled
+                if side == "BUY":
+                    outstanding = remaining if status in active_statuses else Decimal("0")
+                    if not confirmed and filled > 0:
+                        unknown_execution = True
+                    cumulative_filled = (
+                        Decimal("0")
+                        if cumulative_reset_at is not None and stamp_value < cumulative_reset_at
+                        else filled
+                    )
+                    result["cumulative_buy_usd"] += cumulative_filled + outstanding
+                    if status in active_statuses:
+                        result["all_in_buy_reserved_usd"] += filled + outstanding
+                        result["buy_pending_usd"] += outstanding
+                        result["gross_daily_buy_usd"] += outstanding
+                        if status == "UNKNOWN":
+                            result["buy_unknown_usd"] += outstanding
+                    owned_cost = filled if confirmed else Decimal("0")
+                    result["aggregate_open_cost_usd"] += owned_cost
+                    exposure = filled + outstanding
+                    result["aggregate_exposure_usd"] += exposure
+                    add_map("per_market_buy_usd", market, exposure)
+                    add_map("per_event_buy_usd", event, exposure)
+                    if market and confirmed:
+                        market_qty[market] = market_qty.get(market, Decimal("0")) + quantity
+                        owned_key = (market, token)
+                        owned_inventory[owned_key] = (
+                            owned_inventory.get(owned_key, Decimal("0")) + quantity
+                        )
+                        if not token:
+                            unknown_inventory = True
+                        if quantity > 0:
+                            slot_key = market or str(row["event_id"])
+                            open_lot_counts[slot_key] = open_lot_counts.get(slot_key, 0) + 1
+                    if market and outstanding > 0:
+                        result.setdefault("_pending_market_keys", set()).add(market)
+                elif side == "SELL":
+                    if not confirmed:
+                        unknown_execution = unknown_execution or quantity > 0
+                        continue
+                    if market:
+                        market_qty[market] = market_qty.get(market, Decimal("0")) - quantity
+                        owned_key = (market, token)
+                        owned_inventory[owned_key] = (
+                            owned_inventory.get(owned_key, Decimal("0")) - quantity
+                        )
+                        if not token:
+                            unknown_inventory = True
+                    pnl = detail_pnl(
+                        evidence,
+                        {"realized_pnl": row["realized_pnl"] if "realized_pnl" in row.keys() else "0"},
+                    )
+                    if start <= stamp_value < end:
+                        result["today_realized_pnl_usd"] += pnl
+                    result["realized_loss_usd"] += -pnl if pnl < 0 else Decimal("0")
+
+            flow_rows = self._conn.execute(
+                "SELECT kind,amount FROM canary_risk_cashflows"
+            ).fetchall()
+            for flow in flow_rows:
+                kind = str(flow["kind"]).upper()
+                amount = _risk_decimal(flow["amount"])
+                if kind in {"EXTERNAL", "DEPOSIT", "WITHDRAWAL"}:
+                    result["external_flow_usd"] += amount
+                elif kind == "EQUITY_LOSS":
+                    result["equity_status"] = "KNOWN"
+                    if amount > 0:
+                        result["equity_loss_usd"] += amount
+            # Equity evidence is known only for a flat confirmed ledger or
+            # when every open exact-token position has one fresh liquidation
+            # mark.  Repeated mark snapshots are collapsed above by identity.
+            open_inventory = {
+                key: quantity
+                for key, quantity in owned_inventory.items()
+                if quantity > 0
+            }
+            mark_quantities: dict[tuple[str, str], Decimal] = {}
+            mark_loss = Decimal("0")
+            marks_valid = True
+            for mark in latest_marks.values():
+                market = str(mark["market_id"]).strip()
+                token = str(mark["token_id"]).strip()
+                source = str(mark["source"] or "").strip()
+                if not market or not token or str(mark["side"]).upper() != "SELL" or not source:
+                    marks_valid = False
+                    continue
+                stamp = _parse_datetime(mark["observed_at"])
+                if stamp is None:
+                    marks_valid = False
+                    continue
+                age = (observed - ensure_utc(stamp)).total_seconds()
+                if age < 0 or age > _CANARY_EQUITY_MARK_MAX_AGE_SECONDS:
+                    marks_valid = False
+                    continue
+                quantity = _risk_decimal(mark["quantity"], name="mark quantity", nonnegative=True)
+                price = _risk_decimal(mark["mark_price"], name="mark price", nonnegative=True)
+                fee = _risk_decimal(mark["mark_fee"], name="mark fee", nonnegative=True)
+                basis = _risk_decimal(mark["cost_basis_usd"], name="mark cost basis", nonnegative=True)
+                identity = (market, token)
+                mark_quantities[identity] = mark_quantities.get(identity, Decimal("0")) + quantity
+                mark_loss += max(Decimal("0"), basis - (quantity * price - fee))
+            for identity, quantity in open_inventory.items():
+                market, token = identity
+                if not market or not token or mark_quantities.get(identity, Decimal("0")) != quantity:
+                    marks_valid = False
+            if set(mark_quantities) - set(open_inventory):
+                marks_valid = False
+            if not open_inventory:
+                result["equity_status"] = "UNKNOWN" if unknown_execution else "KNOWN"
+            elif marks_valid and not unknown_inventory and not unknown_execution:
+                result["equity_status"] = "KNOWN"
+            else:
+                result["equity_status"] = "UNKNOWN"
+            result["equity_loss_usd"] = max(
+                result["equity_loss_usd"],
+                result["realized_loss_usd"] + mark_loss,
+            )
+            result["open_quantity_by_market"] = {
+                key: max(Decimal("0"), value) for key, value in market_qty.items()
+            }
+            result["pending_sell_quantity_by_market"] = market_pending_sell
+            pending_keys = set(result.pop("_pending_market_keys", set()))
+            open_market_keys = {
+                key for key, value in market_qty.items() if value > 0
+            } | pending_keys
+            result["open_market_ids"] = sorted(open_market_keys)
+            result["open_positions"] = len(open_market_keys)
+            result["open_lot_slots"] = sum(
+                count
+                for key, count in open_lot_counts.items()
+                if key in open_market_keys or key not in market_qty
+            )
+        for name in (
+            "buy_filled_usd", "buy_pending_usd", "buy_unknown_usd", "gross_daily_buy_usd",
+            "all_in_buy_reserved_usd", "aggregate_open_cost_usd", "aggregate_exposure_usd",
+            "realized_loss_usd", "today_realized_pnl_usd", "equity_loss_usd",
+            "external_flow_usd", "cumulative_buy_usd",
+        ):
+            result[name] = _risk_text(result[name])
+        result["per_market_buy_usd"] = {
+            key: _risk_text(value) for key, value in result["per_market_buy_usd"].items()
+        }
+        result["per_event_buy_usd"] = {
+            key: _risk_text(value) for key, value in result["per_event_buy_usd"].items()
+        }
+        result["open_quantity_by_market"] = {
+            key: _risk_text(value) for key, value in result["open_quantity_by_market"].items()
+        }
+        result["pending_sell_quantity_by_market"] = {
+            key: _risk_text(value) for key, value in result["pending_sell_quantity_by_market"].items()
+        }
+        return result
+
 
     def close(self) -> None:
         with self._lock:
@@ -7684,6 +9742,7 @@ class AxiomStore:
             clauses.append("dataset_version=?")
             values.append(str(version))
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        bar_where = " WHERE " + " AND ".join(f"b.{clause}" for clause in clauses) if clauses else ""
         with self._lock:
             count = self._conn.execute("SELECT COUNT(*) AS n FROM bars" + where, values).fetchone()["n"]
             snapshots = self._conn.execute("SELECT COUNT(*) AS n FROM snapshots").fetchone()["n"]
@@ -7695,15 +9754,28 @@ class AxiomStore:
             forward_catalog_count = self._conn.execute(
                 "SELECT COUNT(*) AS n FROM dataset_catalog WHERE source_type='FORWARD_COLLECTED'"
             ).fetchone()["n"]
-        quality = None
-        if dataset_id is not None:
-            record = self.load_dataset_record(dataset_id, version)
-            quality = record.get("quality") if record else None
+            quality_rows = self._conn.execute(
+                "SELECT COALESCE(NULLIF(c.quality,''),NULLIF(d.quality,''),"
+                "NULLIF(CASE WHEN json_valid(b.payload_json) "
+                "THEN json_extract(b.payload_json,'$.quality') END,''),"
+                "NULLIF(CASE WHEN json_valid(b.payload_json) "
+                "THEN json_extract(b.payload_json,'$.research_quality') END,''),"
+                "'UNKNOWN') AS quality,COUNT(*) AS n "
+                "FROM bars AS b "
+                "LEFT JOIN dataset_catalog AS c "
+                "ON c.dataset_id=b.dataset_id AND c.dataset_version=b.dataset_version "
+                "LEFT JOIN datasets AS d "
+                "ON d.dataset_id=b.dataset_id AND d.version=b.dataset_version"
+                + bar_where
+                + " GROUP BY 1",
+                values,
+            ).fetchall()
+            quality = {str(row["quality"] or "UNKNOWN"): int(row["n"]) for row in quality_rows}
         return {
-            "bars": int(count),
+            "count": int(count),
             "snapshots": int(snapshots),
             "datasets": int(datasets),
-            "dataset_catalog": int(catalog_count),
+            "catalog_count": int(catalog_count),
             "historical_catalog": int(historical_catalog_count),
             "forward_catalog": int(forward_catalog_count),
             "quality": quality,
@@ -8217,6 +10289,158 @@ def _storage_bytes(connection: sqlite3.Connection, path: str) -> int:
         return page_count * page_size
     except sqlite3.Error:
         return 0
+
+
+def _risk_decimal(value: Any = "0", *, name: str = "value", nonnegative: bool = False) -> Decimal:
+    if isinstance(value, bool) or value is None:
+        raise ValueError(f"{name} must be a finite decimal")
+    if isinstance(value, float):
+        raise ValueError(f"{name} must be an exact decimal")
+    try:
+        number = value if isinstance(value, Decimal) else Decimal(str(value).strip())
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a finite decimal") from exc
+    if not number.is_finite() or (nonnegative and number < 0):
+        raise ValueError(f"{name} must be finite and non-negative")
+    return number
+
+
+def _risk_text(value: Any) -> str:
+    return format(_risk_decimal(value), "f")
+
+
+def _canary_fill_settlement_status(detail: Any) -> str:
+    if not isinstance(detail, Mapping):
+        return ""
+    for key in ("settlement_status", "settlement", "state", "status"):
+        value = detail.get(key)
+        if value not in (None, ""):
+            return str(value).strip().upper()
+    return ""
+def _canary_terminal_no_fill_proof(detail: Any) -> bool:
+    if not isinstance(detail, Mapping) or detail.get("no_fill_confirmed") is not True:
+        return False
+    status = str(
+        detail.get("terminal_status")
+        or detail.get("settlement_status")
+        or detail.get("state")
+        or detail.get("status")
+        or ""
+    ).strip().upper()
+    if status not in {"CANCELLED", "CANCELED", "REJECTED", "FAILED", "EXPIRED"}:
+        return False
+    source = str(detail.get("source") or detail.get("provenance") or "").strip()
+    if not source:
+        return False
+    try:
+        if _risk_decimal(detail.get("filled_quantity"), name="filled_quantity", nonnegative=True) != 0:
+            return False
+    except ValueError:
+        return False
+    if "trade_count" in detail:
+        try:
+            if _risk_decimal(detail["trade_count"], name="trade_count", nonnegative=True) != 0:
+                return False
+        except ValueError:
+            return False
+    if "trade_ids" in detail:
+        trade_ids = detail["trade_ids"]
+        if not isinstance(trade_ids, Sequence) or isinstance(trade_ids, (str, bytes)) or list(trade_ids):
+            return False
+    return True
+
+
+def _merge_canary_fill_details(previous: Any, current: Any) -> dict[str, Any] | None:
+    if not isinstance(previous, Mapping) or not isinstance(current, Mapping):
+        return None
+    old_status = _canary_fill_settlement_status(previous)
+    new_status = _canary_fill_settlement_status(current)
+    ignored = {
+        "settlement_status", "settlement", "state", "status", "_settlement_history",
+        "order_status", "trade_status", "order_state", "updated_at", "observed_at",
+        "last_updated_at",
+    }
+    if old_status in _CANARY_CONFIRMED_SETTLEMENT_STATUSES:
+        if new_status not in _CANARY_CONFIRMED_SETTLEMENT_STATUSES:
+            return None
+        for key in set(previous) & set(current):
+            if key not in ignored and previous[key] != current[key]:
+                return None
+        merged = dict(previous)
+        merged.update({key: value for key, value in current.items() if key != "_settlement_history"})
+        return merged
+    if not new_status:
+        return None
+    for key in set(previous) & set(current):
+        if key not in ignored and previous[key] != current[key]:
+            return None
+    merged = dict(previous)
+    merged.update({key: value for key, value in current.items() if key != "_settlement_history"})
+    history = merged.get("_settlement_history")
+    history_values = list(history) if isinstance(history, Sequence) and not isinstance(history, (str, bytes)) else []
+    history_values.append({"status": old_status or "UNKNOWN", "detail": dict(previous)})
+    merged["_settlement_history"] = history_values
+    return merged
+
+
+def _canary_equity_mark_record(row: sqlite3.Row | None) -> dict[str, Any]:
+    if row is None:
+        raise ValueError("equity mark not found")
+    quantity = _risk_decimal(row["quantity"])
+    mark_price = _risk_decimal(row["mark_price"])
+    mark_fee = _risk_decimal(row["mark_fee"])
+    cost_basis = _risk_decimal(row["cost_basis_usd"])
+    mark_value = quantity * mark_price - mark_fee
+    unrealized_pnl = mark_value - cost_basis
+    return {
+        "mark_id": row["mark_id"],
+        "market_id": row["market_id"],
+        "token_id": row["token_id"],
+        "side": row["side"],
+        "quantity": _risk_text(quantity),
+        "mark_price": _risk_text(mark_price),
+        "cost_basis_usd": _risk_text(cost_basis),
+        "mark_fee": _risk_text(mark_fee),
+        "mark_value_usd": _risk_text(mark_value),
+        "unrealized_pnl_usd": _risk_text(unrealized_pnl),
+        "equity_loss_usd": _risk_text(max(Decimal("0"), -unrealized_pnl)),
+        "valuation_status": "KNOWN",
+        "observed_at": _parse_datetime(row["observed_at"]),
+        "source": row["source"],
+        "config_id": row["config_id"],
+        "config_generation": row["config_generation"],
+        "control_generation": row["control_generation"],
+        "detail": _load(row["detail_json"]) if row["detail_json"] else {},
+        "created_at": _parse_datetime(row["created_at"]),
+    }
+
+
+def _canary_reservation_record(row: sqlite3.Row | None) -> dict[str, Any]:
+    if row is None:
+        raise ValueError("risk reservation not found")
+    return {
+        "reservation_id": row["reservation_id"],
+        "intent_id": row["intent_id"],
+        "side": row["side"],
+        "market_id": row["market_id"],
+        "event_id": row["event_id"],
+        "requested_cost": _risk_text(row["requested_cost"]),
+        "filled_cost": _risk_text(row["filled_cost"]),
+        "remaining_cost": _risk_text(row["remaining_cost"]),
+        "fee_reserve": _risk_text(row["fee_reserve"]),
+        "quantity": _risk_text(row["quantity"]),
+        "filled_quantity": _risk_text(row["filled_quantity"]),
+        "status": row["status"],
+        "config_generation": row["config_generation"],
+        "config_hash": row["config_hash"],
+        "config_id": row["config_id"],
+        "control_generation": row["control_generation"],
+        "detail": _load(row["detail_json"]) if row["detail_json"] else {},
+        "created_at": _parse_datetime(row["created_at"]),
+        "submitted_at": _parse_datetime(row["submitted_at"]),
+        "updated_at": _parse_datetime(row["updated_at"]),
+        "released_at": _parse_datetime(row["released_at"]),
+    }
 
 
 __all__ = ["AxiomStore"]

@@ -22,8 +22,8 @@ from axiom.domain import (
     PredictionMarketSnapshot,
     SettlementState,
 )
-from axiom.experiment_plan import ExperimentPlan
-from axiom.market_scope import MATCHED, resolve_market_scope
+from axiom.experiment_plan import ExperimentPlan, normalize_market_scope
+from axiom.market_scope import MATCHED
 from axiom.ranker import CandidateCanaryRanker
 from axiom.research_bus import DurableResearchBus, ResearchQueueStatus
 from axiom.storage import AxiomStore
@@ -47,7 +47,15 @@ CANDIDATE_ID = "SYNTHETIC_OFFLINE-scope-candidate"
 PROPOSAL_ID = "SYNTHETIC_OFFLINE-scope-proposal"
 
 
-def _offline_market(stamp: datetime, yes_mid: float) -> tuple[PredictionMarketSnapshot, OrderBookSnapshot]:
+def _offline_market(
+    stamp: datetime,
+    yes_mid: float,
+    *,
+    market_id: str = MARKET_ID,
+    condition_id: str = CONDITION_ID,
+    yes_token_id: str = YES_TOKEN_ID,
+    no_token_id: str = NO_TOKEN_ID,
+) -> tuple[PredictionMarketSnapshot, OrderBookSnapshot]:
     yes_bid = yes_mid - 0.01
     yes_ask = yes_mid + 0.01
     no_mid = 1.0 - yes_mid
@@ -57,8 +65,8 @@ def _offline_market(stamp: datetime, yes_mid: float) -> tuple[PredictionMarketSn
         timestamp=stamp,
         bids=(OrderBookLevel(yes_bid, 100.0),),
         asks=(OrderBookLevel(yes_ask, 100.0),),
-        token_id=YES_TOKEN_ID,
-        condition_id=CONDITION_ID,
+        token_id=yes_token_id,
+        condition_id=condition_id,
         provider_timestamp=stamp,
         source="SYNTHETIC_OFFLINE",
     )
@@ -66,15 +74,27 @@ def _offline_market(stamp: datetime, yes_mid: float) -> tuple[PredictionMarketSn
         timestamp=stamp,
         bids=(OrderBookLevel(no_bid, 100.0),),
         asks=(OrderBookLevel(no_ask, 100.0),),
-        token_id=NO_TOKEN_ID,
-        condition_id=CONDITION_ID,
+        token_id=no_token_id,
+        condition_id=condition_id,
         provider_timestamp=stamp,
         source="SYNTHETIC_OFFLINE",
     )
+    default_fixture = market_id == MARKET_ID
+    question = (
+        "Will the SYNTHETIC_OFFLINE public politics event resolve YES?"
+        if default_fixture
+        else f"Will the {market_id} public politics event resolve YES?"
+    )
+    resolution_criteria = (
+        "SYNTHETIC_OFFLINE: resolve from the public event result."
+        if default_fixture
+        else f"{market_id}: resolve from the public event result."
+    )
+    slug = "synthetic-offline-future-politics" if default_fixture else market_id.lower()
     market = PredictionMarketSnapshot(
         timestamp=stamp,
-        market_id=MARKET_ID,
-        question="Will the SYNTHETIC_OFFLINE public politics event resolve YES?",
+        market_id=market_id,
+        question=question,
         yes_bid=yes_bid,
         yes_ask=yes_ask,
         yes_mid=yes_mid,
@@ -85,15 +105,15 @@ def _offline_market(stamp: datetime, yes_mid: float) -> tuple[PredictionMarketSn
         liquidity=100.0,
         expiry=T0 + timedelta(days=30),
         settlement=SettlementState.OPEN,
-        resolution_criteria="SYNTHETIC_OFFLINE: resolve from the public event result.",
+        resolution_criteria=resolution_criteria,
         category="politics",
         tags=("politics", "SYNTHETIC_OFFLINE"),
         order_book=yes_book,
         source="SYNTHETIC_OFFLINE",
-        yes_token_id=YES_TOKEN_ID,
-        no_token_id=NO_TOKEN_ID,
-        condition_id=CONDITION_ID,
-        slug="synthetic-offline-future-politics",
+        yes_token_id=yes_token_id,
+        no_token_id=no_token_id,
+        condition_id=condition_id,
+        slug=slug,
         provider_timestamp=stamp,
         active=True,
         closed=False,
@@ -106,10 +126,25 @@ def _offline_market(stamp: datetime, yes_mid: float) -> tuple[PredictionMarketSn
 class _SyntheticOfflinePublicProvider(InMemoryPredictionProvider):
     provider_name = "SYNTHETIC_OFFLINE"
 
-    def __init__(self) -> None:
-        market, no_book = _offline_market(T0, 0.50)
-        super().__init__((market,))
-        self._no_book = no_book
+    def __init__(self, market_ids: tuple[str, ...] | None = None, *, stamp: datetime = T0) -> None:
+        configured_ids = tuple(market_ids or (MARKET_ID,))
+        entries: list[PredictionMarketSnapshot] = []
+        self._no_books: dict[str, OrderBookSnapshot] = {}
+        for market_id in configured_ids:
+            condition_id = CONDITION_ID if market_id == MARKET_ID else f"{market_id}-condition"
+            yes_token_id = YES_TOKEN_ID if market_id == MARKET_ID else f"{market_id}-yes"
+            no_token_id = NO_TOKEN_ID if market_id == MARKET_ID else f"{market_id}-no"
+            market, no_book = _offline_market(
+                stamp,
+                0.50,
+                market_id=market_id,
+                condition_id=condition_id,
+                yes_token_id=yes_token_id,
+                no_token_id=no_token_id,
+            )
+            entries.append(market)
+            self._no_books[market_id] = no_book
+        super().__init__(tuple(entries))
         self.markets_calls = 0
         self.market_calls = 0
         self.metadata_calls = 0
@@ -119,7 +154,7 @@ class _SyntheticOfflinePublicProvider(InMemoryPredictionProvider):
     def set_quote(self, stamp: datetime, yes_mid: float) -> None:
         market, no_book = _offline_market(stamp, yes_mid)
         self._markets[MARKET_ID] = market
-        self._no_book = no_book
+        self._no_books[MARKET_ID] = no_book
 
     def markets(self, active: bool = True):
         self.markets_calls += 1
@@ -135,11 +170,11 @@ class _SyntheticOfflinePublicProvider(InMemoryPredictionProvider):
         if snapshot is None:
             return None
         return InstrumentMetadata(
-            symbol=MARKET_ID,
+            symbol=snapshot.market_id,
             market_type=MarketType.PREDICTION,
             provider=self.provider_name,
-            market_id=MARKET_ID,
-            condition_id=CONDITION_ID,
+            market_id=snapshot.market_id,
+            condition_id=snapshot.condition_id,
             question=snapshot.question,
             resolution_criteria=snapshot.resolution_criteria,
             category="politics",
@@ -153,35 +188,38 @@ class _SyntheticOfflinePublicProvider(InMemoryPredictionProvider):
             order_book_available=True,
             extra={
                 "fixture_label": "SYNTHETIC_OFFLINE",
-                "token_ids": {"yes": YES_TOKEN_ID, "no": NO_TOKEN_ID},
+                "token_ids": {"yes": snapshot.yes_token_id, "no": snapshot.no_token_id},
             },
         )
 
     def order_books(self, market_id: str, depth: int = 20):
         self.order_books_calls += 1
         snapshot = self.market(market_id)
-        if snapshot is None or snapshot.order_book is None:
+        no_book = self._no_books.get(str(market_id))
+        if snapshot is None or snapshot.order_book is None or no_book is None:
             return {}
         return {
             "yes": OrderBookSnapshot(
                 snapshot.order_book.timestamp,
                 snapshot.order_book.bids[:depth],
                 snapshot.order_book.asks[:depth],
-                token_id=YES_TOKEN_ID,
-                condition_id=CONDITION_ID,
+                token_id=snapshot.yes_token_id,
+                condition_id=snapshot.condition_id,
                 provider_timestamp=snapshot.order_book.provider_timestamp,
                 source=self.provider_name,
             ),
             "no": OrderBookSnapshot(
-                self._no_book.timestamp,
-                self._no_book.bids[:depth],
-                self._no_book.asks[:depth],
-                token_id=NO_TOKEN_ID,
-                condition_id=CONDITION_ID,
-                provider_timestamp=self._no_book.provider_timestamp,
+                no_book.timestamp,
+                no_book.bids[:depth],
+                no_book.asks[:depth],
+                token_id=snapshot.no_token_id,
+                condition_id=snapshot.condition_id,
+                provider_timestamp=no_book.provider_timestamp,
                 source=self.provider_name,
             ),
         }
+
+
 
 
 class MarketScopeEndToEndTests(unittest.TestCase):
@@ -300,7 +338,7 @@ class MarketScopeEndToEndTests(unittest.TestCase):
                 market_type=MarketType.PREDICTION,
                 timeframe="event",
                 start_timestamp=T0,
-                end_timestamp=T0 + timedelta(hours=19),
+                end_timestamp=T0 + timedelta(hours=20),
                 row_count=len(rows),
                 completeness=1.0,
                 missing_ranges=(),
@@ -347,7 +385,7 @@ class MarketScopeEndToEndTests(unittest.TestCase):
                     "market_type": "prediction",
                     "timeframe": "event",
                     "start_timestamp": T0,
-                    "end_timestamp": T0 + timedelta(hours=19),
+                    "end_timestamp": T0 + timedelta(hours=20),
                     "row_count": len(rows),
                     "completeness": 1.0,
                     "missing_ranges": [],
@@ -402,6 +440,9 @@ class MarketScopeEndToEndTests(unittest.TestCase):
             self.assertEqual(candidate["payload"]["market_scope_version"], "1")
             self.assertEqual(candidate["payload"]["dataset_attestation"]["status"], "CURRENT")
             candidate_id = str(candidate["candidate_id"])
+            forward_test_id = candidate["payload"]["forward_test_id"]
+            frozen_forward = ForwardTestRegistry(store).get(forward_test_id)
+            self.assertIsNotNone(frozen_forward)
 
             provider = _SyntheticOfflinePublicProvider()
             collector = PolymarketCollector(
@@ -421,8 +462,12 @@ class MarketScopeEndToEndTests(unittest.TestCase):
             )
             first_collection = collector.collect_once(now=T0)
             self.assertEqual(first_collection.errors, 0)
-            self.assertEqual(first_collection.candidate_bound_scheduled, (MARKET_ID,))
-            self.assertIn(MARKET_ID, first_collection.candidate_bound_fresh)
+            self.assertEqual(first_collection.candidate_bound_markets, ())
+            self.assertEqual(first_collection.candidate_bound_scheduled, ())
+            self.assertEqual(first_collection.candidate_bound_fresh, ())
+            self.assertEqual(first_collection.candidate_references, {})
+            self.assertEqual(first_collection.paper_forward_markets, (MARKET_ID,))
+            self.assertEqual(first_collection.paper_forward_scheduled, (MARKET_ID,))
             self.assertEqual(first_collection.discovery_scheduled, ())
             self.assertEqual(provider.markets_calls, 1)
             self.assertGreaterEqual(provider.order_books_calls, 1)
@@ -492,7 +537,19 @@ class MarketScopeEndToEndTests(unittest.TestCase):
             collector.clock = lambda: now[0]
             second_collection = collector.collect_once(now=now[0])
             self.assertEqual(second_collection.errors, 0)
+            self.assertEqual(
+                ForwardTestRegistry(store).get(forward_test_id),
+                frozen_forward,
+            )
+            self.assertEqual(second_collection.candidate_bound_markets, (MARKET_ID,))
+            self.assertEqual(second_collection.candidate_bound_scheduled, (MARKET_ID,))
             self.assertIn(MARKET_ID, second_collection.candidate_bound_fresh)
+            self.assertEqual(
+                second_collection.candidate_references,
+                {MARKET_ID: [candidate_id]},
+            )
+            self.assertEqual(second_collection.paper_forward_markets, ())
+            self.assertEqual(second_collection.paper_forward_scheduled, ())
             latest_resolution = store.load_market_scope_resolution(candidate_id)
             self.assertIsNotNone(latest_resolution)
             assert latest_resolution is not None
@@ -639,6 +696,7 @@ def _runtime_plan(proposal_id: str) -> dict[str, object]:
         "min_samples": 30,
         "min_trades": 0,
         "max_variants": 1,
+        "exit_policy": {"type": "fixed_holding_period", "holding_period": 4},
         "model_document": {"probability": SYNTHETIC_MODEL_PROBABILITY},
         "paper_only": True,
     }
@@ -854,10 +912,10 @@ class MarketScopeRuntimeQualificationTests(unittest.TestCase):
             )
 
             queue_cycle = processor.process_pending(worker="ordinary-runtime-test", now=T0)
-            self.assertEqual(queue_cycle.claimed, 2)
-            self.assertEqual(queue_cycle.completed, 2)
-            self.assertEqual(queue_cycle.rejected, 0)
-            self.assertEqual(queue_cycle.failed, 0)
+            self.assertEqual(queue_cycle.claimed, 2, repr(queue_cycle))
+            self.assertEqual(queue_cycle.completed, 2, repr(queue_cycle))
+            self.assertEqual(queue_cycle.rejected, 0, repr(queue_cycle))
+            self.assertEqual(queue_cycle.failed, 0, repr(queue_cycle))
             qualifying_queue_item = bus.get(qualifying_item.item_id)
             rejecting_queue_item = bus.get(rejecting_item.item_id)
             self.assertIsNotNone(qualifying_queue_item)
@@ -916,6 +974,19 @@ class MarketScopeRuntimeQualificationTests(unittest.TestCase):
             self.assertEqual(qualifying_spec.model_hash, rejecting_spec.model_hash)
             self.assertEqual(tuple(qualifying_spec.allowed_markets), market_ids)
             self.assertEqual(len(qualifying_spec.allowed_markets), SYNTHETIC_MARKET_COUNT)
+            self.assertEqual(
+                normalize_market_scope(qualifying_spec.config["market_scope"]).as_dict(),
+                qualifying_payload["market_scope"],
+            )
+            self.assertEqual(qualifying_spec.config["market_scope_hash"], qualifying_payload["market_scope_hash"])
+            self.assertEqual(qualifying_spec.config["market_scope_version"], qualifying_payload["market_scope_version"])
+            self.assertEqual(
+                normalize_market_scope(rejecting_spec.config["market_scope"]).as_dict(),
+                rejecting_payload["market_scope"],
+            )
+            self.assertEqual(rejecting_spec.config["market_scope_hash"], rejecting_payload["market_scope_hash"])
+            self.assertEqual(rejecting_spec.config["market_scope_version"], rejecting_payload["market_scope_version"])
+
             persisted_plans = store.list_experiment_plans(limit=10)
             self.assertEqual(len(persisted_plans), 2)
             for persisted in persisted_plans:
@@ -976,6 +1047,39 @@ class MarketScopeRuntimeQualificationTests(unittest.TestCase):
             self.assertEqual(rejecting_cycle.fills_inserted, 0)
             self.assertEqual(rejecting_cycle.settlements, 5)
             self.assertEqual(rejecting_cycle.errors, ())
+            # Current scope authority is written by the normal collector
+            # stage, not by autonomous queue processing.  Use one provider
+            # inventory for both candidates so the persisted resolution is
+            # the same canonical handoff consumed by canary evaluation.
+            scope_provider = _SyntheticOfflinePublicProvider(
+                market_ids=market_ids,
+                stamp=T0 + timedelta(days=7),
+            )
+            collector = PolymarketCollector(
+                scope_provider,
+                store,
+                CollectorConfig(
+                    collector_name="SYNTHETIC_OFFLINE-runtime-collector",
+                    max_markets=SYNTHETIC_MARKET_COUNT,
+                    discovery_budget_per_cycle=SYNTHETIC_MARKET_COUNT,
+                    max_attempts=1,
+                    backoff_initial_seconds=0.0,
+                    jitter_seconds=0.0,
+                    freshness_sla_seconds=60.0,
+                ),
+                clock=lambda: T0 + timedelta(days=7),
+                sleep=lambda _seconds: None,
+            )
+            collection = collector.collect_once(now=T0 + timedelta(days=7))
+            self.assertEqual(collection.errors, 0, repr(collection))
+            self.assertEqual(collection.candidate_bound_markets, ())
+            self.assertEqual(collection.candidate_bound_scheduled, ())
+            self.assertEqual(collection.candidate_bound_fresh, ())
+            self.assertEqual(collection.candidate_references, {})
+            self.assertEqual(set(collection.paper_forward_markets), set(market_ids))
+            self.assertEqual(set(collection.paper_forward_scheduled), set(market_ids))
+            self.assertEqual(scope_provider.markets_calls, 1)
+            self.assertEqual(scope_provider.order_books_calls, SYNTHETIC_MARKET_COUNT)
 
             reevaluated = processor.reevaluate_forward_candidates(now=T0 + timedelta(days=7))
             outcomes = {item["candidate_id"]: item for item in reevaluated}
@@ -988,29 +1092,25 @@ class MarketScopeRuntimeQualificationTests(unittest.TestCase):
             self.assertEqual(rejecting_payload["hypothesis_id"], rejecting_item.payload["proposal_id"])
             self.assertEqual(rejecting_result["candidate_id"], rejecting_id)
             self.assertEqual(rejecting_result["stage"], CandidateStage.PAPER_FORWARD.value)
-            scope_records = [
-                {
-                    **_forward_metadata(market_id),
-                    "source_type": "CURRENT",
-                    "provider": "polymarket",
-                    "venue": "POLYMARKET",
-                    "open": True,
-                    "accepting_orders": True,
-                    "enable_order_book": True,
-                }
-                for market_id in market_ids
-            ]
-            scope_resolution = resolve_market_scope(
-                qualifying_id,
-                store.load_candidate_lifecycle(qualifying_id)["payload"],
-                scope_records,
-                resolved_at=T0 + timedelta(days=7),
-                max_matches=100,
-                max_markets=100,
-            )
+            # Consume the collector's durable canonical authority rather than
+            # rebuilding a second scope from ad hoc records.  The forward
+            # handoff must preserve the immutable candidate identity and
+            # policy before the canary applies its execution cap.
+            scope_resolution = store.load_market_scope_resolution(qualifying_id)
+            self.assertIsNotNone(scope_resolution)
+            assert scope_resolution is not None
             self.assertEqual(scope_resolution.status, MATCHED)
+            self.assertEqual(scope_resolution.candidate_id, qualifying_id)
+            self.assertEqual(scope_resolution.scope_hash, qualifying_payload["market_scope_hash"])
+            self.assertEqual(scope_resolution.scope_version, qualifying_payload["market_scope_version"])
+            self.assertEqual(scope_resolution.policy, qualifying_payload["market_scope"])
             self.assertEqual(len(scope_resolution.matched_markets), SYNTHETIC_MARKET_COUNT)
-            store.save_market_scope_resolution(scope_resolution)
+            self.assertEqual(scope_resolution.provenance["resolution_source"], "persisted_current_markets")
+            self.assertEqual(
+                tuple(item.market_id for item in scope_resolution.matched_markets),
+                market_ids,
+            )
+
             canary_evaluation = CanaryService(
                 store,
                 clock=lambda: T0 + timedelta(days=7),

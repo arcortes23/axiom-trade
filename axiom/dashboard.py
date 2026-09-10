@@ -13,21 +13,18 @@ import ipaddress
 import json
 import logging
 import math
-import os
 from decimal import Decimal
-from pathlib import Path
 import re
 import secrets
 import sqlite3
 from . import canary as canary_module
 from .canary import CanaryService, _canary_eligibility_is_bound, _canary_has_last_good
-import subprocess
+from .canary_settings import CanarySettingsService
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import parse_qs, unquote, urlparse
 from .operator import CANARY_CONNECTIVITY_CONFIG_KEY, OperatorControlPlane, _stored_connectivity_projection
-
 
 _CLIENT_DISCONNECT_ERRORS = (BrokenPipeError, ConnectionAbortedError, ConnectionResetError)
 _LOGGER = logging.getLogger(__name__)
@@ -35,104 +32,9 @@ _LOGGER = logging.getLogger(__name__)
 from .director import research_summary
 from .domain import ensure_utc, parse_timestamp, to_record
 
+def _reject_json_constant(value: str) -> Any:
+    raise ValueError(f"non-finite JSON constant: {value}")
 
-def _pid_alive(pid: int) -> bool:
-    if pid <= 0:
-        return False
-    if os.name == "nt":
-        try:
-            import ctypes
-
-            handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
-            if handle:
-                ctypes.windll.kernel32.CloseHandle(handle)
-                return True
-        except (AttributeError, OSError):
-            pass
-    try:
-        os.kill(pid, 0)
-        return True
-    except PermissionError:
-        return True
-    except OSError:
-        return False
-def _pid_command_line(pid: int) -> str:
-    if pid <= 0:
-        return ""
-    if os.name == "nt":
-        try:
-            result = subprocess.run(
-                [
-                    "powershell",
-                    "-NoProfile",
-                    "-NonInteractive",
-                    "-Command",
-                    f'(Get-CimInstance Win32_Process -Filter "ProcessId={int(pid)}").CommandLine',
-                ],
-                capture_output=True,
-                text=True,
-                timeout=2.0,
-                check=False,
-            )
-            return result.stdout.strip()
-        except (OSError, subprocess.SubprocessError):
-            return ""
-    try:
-        return Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\x00", " ").decode("utf-8", "replace").strip()
-    except (OSError, UnicodeError):
-        return ""
-
-
-def _node_command_db(raw_command: str) -> str | None:
-    tokens = [
-        match.group(1) or match.group(2) or match.group(3)
-        for match in re.finditer(r'"([^"]*)"|\'([^\']*)\'|([^\s]+)', raw_command)
-    ]
-    if not tokens:
-        return None
-    executable = tokens[0].replace("\\", "/").rsplit("/", 1)[-1].lower()
-    if executable in {"axiom", "axiom.exe"}:
-        command_index = 1
-    elif executable in {"py", "py.exe"} or re.fullmatch(r"pythonw?(?:\d+(?:\.\d+)?)?(?:\.exe)?", executable):
-        if len(tokens) < 4 or tokens[1].lower() != "-m" or tokens[2].lower() != "axiom.cli":
-            return None
-        command_index = 3
-    else:
-        return None
-    if len(tokens) <= command_index or tokens[command_index].lower() not in {"node-run", "run-research-node"}:
-        return None
-    for index in range(command_index + 1, len(tokens)):
-        token = tokens[index]
-        lowered = token.lower()
-        if lowered == "--db" and index + 1 < len(tokens):
-            return tokens[index + 1]
-        if lowered.startswith("--db="):
-            return token[5:]
-    return None
-
-
-def _pid_matches_node(pid: int, db_path: str) -> bool:
-    if not _pid_alive(pid):
-        return False
-    raw_command = _pid_command_line(pid)
-    actual = _node_command_db(raw_command)
-    if not actual:
-        return False
-    try:
-        expected = os.path.normcase(os.path.abspath(db_path))
-        observed = os.path.normcase(os.path.abspath(actual))
-    except (OSError, TypeError, ValueError):
-        return False
-    return expected == observed
-
-
-def _lock_owner_matches(lock_path: str, pid: int) -> bool:
-    if not lock_path or pid <= 0:
-        return False
-    try:
-        return int(Path(lock_path).read_text(encoding="utf-8").splitlines()[0].strip()) == pid
-    except (OSError, TypeError, ValueError):
-        return False
 
 
 def _loopback_host(value: str) -> bool:
@@ -156,7 +58,7 @@ _ENDPOINTS = (
     "polymarket-research",
     "evolution",
     "risk",
-    "paper",
+    "risk-settings",
     "paper-portfolio",
     "opportunities",
     "queue",
@@ -1026,26 +928,102 @@ def _canary_status_report(service: Any) -> tuple[dict[str, Any], dict[str, Any]]
                 control_state = str(
                     authoritative_control.get("state") or "UNKNOWN"
                 ).strip().upper()
-                if control_state in {"ARMED", "AUTONOMOUS_MICRO_LIVE"}:
+                expires_at = authoritative_control.get("expires_at")
+                expiry = parse_timestamp(expires_at)
+                now = None
+                clock = getattr(service, "clock", None)
+                if callable(clock):
+                    try:
+                        now = ensure_utc(clock())
+                    except Exception:
+                        now = None
+                control_expired = (
+                    control_state in {"ARMED", "AUTONOMOUS_MICRO_LIVE"}
+                    and expiry is not None
+                    and now is not None
+                    and expiry <= now
+                )
+                effective_state = "DISARMED" if control_expired else control_state
+                if effective_state in {"ARMED", "AUTONOMOUS_MICRO_LIVE"}:
                     display_state = "ENABLED"
-                elif control_state == "KILLED":
+                elif effective_state == "KILLED":
                     display_state = "KILLED"
-                elif control_state in {"DISABLED", "DISARMED"}:
+                elif effective_state in {"DISABLED", "DISARMED"}:
                     display_state = "DISABLED"
                 else:
                     display_state = "UNKNOWN"
+                # Project the copied status report too, so an expired
+                # authoritative control cannot remain enabled in a nested
+                # dashboard surface.
+                for section_name in ("control", "authoritative_control"):
+                    section = bounded.get(section_name)
+                    if isinstance(section, Mapping):
+                        projected_control = dict(section)
+                        projected_control.update(
+                            {
+                                "state": effective_state,
+                                "control_state": effective_state,
+                                "micro_live_canary": effective_state,
+                                "display_state": display_state,
+                                "expired": control_expired,
+                            }
+                        )
+                        bounded[section_name] = projected_control
+                bounded.update(
+                    {
+                        "micro_live_canary": effective_state,
+                        "control_state": effective_state,
+                        "display_state": display_state,
+                        "production_live_trading": (
+                            "ENABLED" if display_state == "ENABLED" else "DISABLED"
+                        ),
+                        "expired": control_expired,
+                    }
+                )
+                bounded_autonomous = bounded.get("autonomous")
+                if isinstance(bounded_autonomous, Mapping):
+                    bounded_autonomous = dict(bounded_autonomous)
+                    bounded_autonomous.update(
+                        {
+                            "enabled": effective_state
+                            in {"ARMED", "AUTONOMOUS_MICRO_LIVE"},
+                            "control_state": effective_state,
+                            "micro_live_canary": effective_state,
+                            "display_state": display_state,
+                            "expired": control_expired,
+                        }
+                    )
+                    bounded["autonomous"] = bounded_autonomous
                 # Control state is authoritative even when the qualification
                 # projection is stale and still carries an older control view.
                 merged_control = {
-                    "micro_live_canary": control_state,
-                    "control_state": control_state,
+                    "micro_live_canary": effective_state,
+                    "control_state": effective_state,
                     "display_state": display_state,
+                    "production_live_trading": (
+                        "ENABLED" if display_state == "ENABLED" else "DISABLED"
+                    ),
+                    "expired": control_expired,
                     "candidate": authoritative_control.get("candidate"),
                     "venue": authoritative_control.get("venue"),
-                    "expiry": authoritative_control.get("expires_at"),
+                    "expiry": expires_at,
                     "control_generation": authoritative_control.get("generation"),
                 }
                 readiness.update(merged_control)
+                readiness_autonomous = readiness.get("autonomous")
+                if isinstance(readiness_autonomous, Mapping):
+                    readiness_autonomous = dict(readiness_autonomous)
+                    readiness_autonomous.update(
+                        {
+                            "enabled": effective_state
+                            in {"ARMED", "AUTONOMOUS_MICRO_LIVE"},
+                            "control_state": effective_state,
+                            "micro_live_canary": effective_state,
+                            "display_state": display_state,
+                            "expired": control_expired,
+                        }
+                    )
+                    readiness["autonomous"] = readiness_autonomous
                 merged = dict(readiness)
             sections = [
                 section
@@ -1143,8 +1121,11 @@ class DashboardData:
         store: Any | None = None,
         control: OperatorControlPlane | None = None,
         binance_canary: Any | None = None,
+        settings_service: CanarySettingsService | None = None,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._data = dict(data or {})
+        self.clock = clock or (lambda: datetime.now().astimezone())
         self.tracker = tracker
         # Compatibility-only inputs: worker-owned providers are never consulted
         # by dashboard reads, which project persisted storage below.
@@ -1155,6 +1136,64 @@ class DashboardData:
         self.store = store
         self.control = control
         self.binance_canary = binance_canary
+        control_settings = getattr(control, "settings", None) if control is not None else None
+        self.settings = (
+            settings_service
+            if settings_service is not None
+            else control_settings
+            if isinstance(control_settings, CanarySettingsService)
+            else CanarySettingsService(store, initialize=False)
+            if store is not None and hasattr(store, "connection")
+            else None
+        )
+        self._canary_service = None
+        if self.store is not None and hasattr(self.store, "connection"):
+            try:
+                self._canary_service = CanaryService(
+                    self.store,
+                    initialize=False,
+                    settings=self.settings,
+                    clock=self.clock,
+                )
+            except Exception:
+                self._canary_service = None
+
+    def risk_settings_data(self) -> dict[str, Any]:
+        """Return the persisted risk settings snapshot without recomputation."""
+        configured = self._configured("risk-settings")
+        if configured is not None:
+            projected = _bounded_value(configured)
+            return dict(projected) if isinstance(projected, Mapping) else {
+                "status": "ERROR",
+                "error": "RISK_SETTINGS_INVALID",
+                "live_execution": False,
+            }
+        source = self.settings
+        if source is None:
+            return {
+                "status": "UNKNOWN",
+                "error": "RISK_SETTINGS_UNAVAILABLE",
+                "live_execution": False,
+            }
+        try:
+            snapshot = source.snapshot()
+        except Exception as exc:
+            return {
+                "status": "ERROR",
+                "error": type(exc).__name__,
+                "detail": str(exc)[:160],
+                "live_execution": False,
+            }
+        projected = _bounded_value(snapshot)
+        if not isinstance(projected, Mapping):
+            return {
+                "status": "ERROR",
+                "error": "RISK_SETTINGS_INVALID",
+                "live_execution": False,
+            }
+        result = dict(projected)
+        result.setdefault("live_execution", False)
+        return result
     def _configured(self, name: str) -> Any:
         if name in self._data:
             return self._data[name]
@@ -1285,6 +1324,8 @@ class DashboardData:
         if configured is not None:
             return configured
         source = self.risk
+        if source is None and self.settings is not None:
+            return self.risk_settings_data()
         if source is None:
             return {"available": False, "live_execution": False}
         if callable(source):
@@ -2170,7 +2211,10 @@ class DashboardData:
                 values = _pagination_params(params)
                 method = getattr(self.store, "paginate_dataset_missing_ranges", None) if self.store is not None else None
                 if callable(method):
-                    return method(identifier, dataset_version=values.get("dataset_version"), page=values["page"], page_size=values["page_size"], sort=values["sort"] or "range_index", direction=values["direction"], filter=values["filter"])
+                    try:
+                        return method(identifier, dataset_version=values.get("dataset_version"), page=values["page"], page_size=values["page_size"], sort=values["sort"] or "range_index", direction=values["direction"], filter=values["filter"])
+                    except (AttributeError, TypeError, ValueError):
+                        pass
                 catalog = detail.get("catalog", {}) if isinstance(detail, Mapping) else {}
                 ranges = catalog.get("missing_ranges", []) if isinstance(catalog, Mapping) else []
                 start = (values["page"] - 1) * values["page_size"]
@@ -2275,129 +2319,78 @@ class DashboardData:
     def status_data(self) -> Any:
         if self.store is None:
             return {"status": "offline", "live_execution": False}
+        # This endpoint is a storage projection.  Process identity and lock
+        # ownership are verified by the supervisor/action paths, never by a
+        # dashboard refresh.
         workers = self.store.list_worker_states(limit=2048)
-        now = ensure_utc(datetime.now().astimezone())
-        db_path = str(getattr(self.store, "path", ""))
-        default_lock_path = db_path + ".lock"
-        identity_cache: dict[tuple[int, str], bool] = {}
-        lock_cache: dict[tuple[str, int], bool] = {}
+        now = ensure_utc(self.clock())
         statuses: list[str] = []
         normalized_workers: list[dict[str, Any]] = []
         crypto_error = False
-        root_lock_path = default_lock_path
-        stale_after_seconds = 300.0
         for row in workers:
-            payload = row.get("payload") if isinstance(row, Mapping) else None
-            if not isinstance(payload, Mapping):
+            if not isinstance(row, Mapping):
                 continue
-            if isinstance(payload.get("lock_path"), str) and payload["lock_path"]:
-                root_lock_path = str(payload["lock_path"])
-            try:
-                configured_stale_after = float(payload.get("stale_after_seconds"))
-            except (TypeError, ValueError):
-                configured_stale_after = stale_after_seconds
-            if math.isfinite(configured_stale_after) and configured_stale_after > 0:
-                stale_after_seconds = configured_stale_after
-            if root_lock_path != default_lock_path or stale_after_seconds != 300.0:
-                break
-        worker_rows = {
-            str(row.get("worker_name", "")): row
-            for row in workers
-            if isinstance(row, Mapping)
-        }
-        for row in workers:
             item = dict(row)
             worker_name = str(item.get("worker_name", ""))
-            state = str(item.get("status", "unknown")).lower()
             worker_payload = item.get("payload")
+            worker_payload = worker_payload if isinstance(worker_payload, Mapping) else {}
+            state = str(item.get("status", "unknown")).lower()
             if (
-                isinstance(worker_payload, Mapping)
-                and isinstance(worker_payload.get("crypto_paper"), Mapping)
+                isinstance(worker_payload.get("crypto_paper"), Mapping)
                 and worker_payload["crypto_paper"].get("enabled")
                 and worker_payload["crypto_paper"].get("last_error")
             ):
                 crypto_error = True
-            liveness_candidate = state == "running" or (
-                state == "degraded"
-                and isinstance(worker_payload, Mapping)
-                and bool(worker_payload.get("lock_path"))
+            heartbeat = parse_timestamp(item.get("heartbeat_at"))
+            age = (
+                max(0.0, (now - heartbeat).total_seconds())
+                if heartbeat is not None
+                else None
             )
-            if liveness_candidate:
-                pid = worker_payload.get("pid") if isinstance(worker_payload, Mapping) else None
-                try:
-                    worker_pid = int(pid)
-                except (TypeError, ValueError):
-                    worker_pid = 0
-                identity_key = (worker_pid, db_path)
-                if identity_key not in identity_cache:
-                    identity_cache[identity_key] = _pid_matches_node(worker_pid, db_path)
-                identity_valid = identity_cache[identity_key]
-                lock_path = (
-                    str(worker_payload.get("lock_path"))
-                    if isinstance(worker_payload, Mapping) and worker_payload.get("lock_path")
-                    else root_lock_path
-                )
-                lock_key = (lock_path, worker_pid)
-                if lock_key not in lock_cache:
-                    lock_cache[lock_key] = _lock_owner_matches(lock_path, worker_pid)
-                lock_owner_valid = lock_cache[lock_key]
-                alive = _pid_alive(worker_pid)
-                heartbeat = parse_timestamp(item.get("heartbeat_at"))
-                age = (now - heartbeat).total_seconds() if heartbeat is not None else None
-                item["worker_alive"] = alive
-                item["worker_identity_valid"] = identity_valid
-                item["worker_lock_owner_valid"] = lock_owner_valid
-                item["heartbeat_age_seconds"] = age
-                liveness_failure = not alive or not identity_valid or not lock_owner_valid or age is None or age > stale_after_seconds
-                watchdog_fresh = False
-                if liveness_failure and (age is None or age > stale_after_seconds):
-                    watchdog_row = worker_rows.get(f"{worker_name}:watchdog")
-                    watchdog_payload = watchdog_row.get("payload") if isinstance(watchdog_row, Mapping) else None
-                    watchdog_status = str(watchdog_row.get("status", "")).lower() if isinstance(watchdog_row, Mapping) else ""
-                    watchdog_pid_value = watchdog_payload.get("pid") if isinstance(watchdog_payload, Mapping) else None
-                    try:
-                        watchdog_pid = int(watchdog_pid_value)
-                    except (TypeError, ValueError):
-                        watchdog_pid = 0
-                    watchdog_heartbeat = parse_timestamp(watchdog_row.get("heartbeat_at")) if isinstance(watchdog_row, Mapping) else None
-                    watchdog_age = (now - watchdog_heartbeat).total_seconds() if watchdog_heartbeat is not None else None
-                    watchdog_lock_path = (
-                        str(watchdog_payload.get("lock_path"))
-                        if isinstance(watchdog_payload, Mapping) and watchdog_payload.get("lock_path")
-                        else lock_path
-                    )
-                    watchdog_identity_key = (watchdog_pid, db_path)
-                    if watchdog_identity_key not in identity_cache:
-                        identity_cache[watchdog_identity_key] = _pid_matches_node(watchdog_pid, db_path)
-                    watchdog_lock_key = (watchdog_lock_path, watchdog_pid)
-                    if watchdog_lock_key not in lock_cache:
-                        lock_cache[watchdog_lock_key] = _lock_owner_matches(watchdog_lock_path, watchdog_pid)
-                    watchdog_fresh = (
-                        watchdog_status == "running"
-                        and watchdog_pid == worker_pid
-                        and _pid_alive(watchdog_pid)
-                        and identity_cache[watchdog_identity_key]
-                        and lock_cache[watchdog_lock_key]
-                        and watchdog_age is not None
-                        and watchdog_age <= stale_after_seconds
-                    )
-                if liveness_failure:
-                    state = "degraded" if watchdog_fresh and alive and identity_valid and lock_owner_valid else "stale"
-                    item["status"] = state
+            try:
+                stale_after = float(worker_payload.get("stale_after_seconds", 300.0))
+            except (TypeError, ValueError):
+                stale_after = 300.0
+            if not math.isfinite(stale_after) or stale_after <= 0:
+                stale_after = 300.0
+            if state in {"running", "degraded"} and (age is None or age > stale_after):
+                state = "stale"
+                item["status"] = state
+            item["worker_alive"] = None
+            item["worker_identity_valid"] = (
+                worker_payload.get("worker_identity_valid")
+                if isinstance(worker_payload.get("worker_identity_valid"), bool)
+                else None
+            )
+            item["worker_lock_owner_valid"] = None
+            item["heartbeat_age_seconds"] = age
+            item["stale_after_seconds"] = stale_after
+            item["liveness"] = "PERSISTED_ONLY"
             statuses.append(state)
             normalized_workers.append(item)
         health_rows = [
-            row for row in normalized_workers
+            row
+            for row in normalized_workers
             if str(row.get("worker_name", "")) == "health-monitor"
         ]
         health_payload = health_rows[0].get("payload", {}) if health_rows else {}
-        health_grade = str(health_payload.get("grade", "")).upper() if isinstance(health_payload, Mapping) else ""
+        health_grade = (
+            str(health_payload.get("grade", "")).upper()
+            if isinstance(health_payload, Mapping)
+            else ""
+        )
         if "stale" in statuses:
             status = "stale"
-        elif crypto_error or (health_grade and health_grade not in {"A", "OK", "HEALTHY"}) or "degraded" in statuses:
+        elif (
+            crypto_error
+            or (health_grade and health_grade not in {"A", "OK", "HEALTHY"})
+            or "degraded" in statuses
+        ):
             status = "degraded"
         elif "running" in statuses:
             status = "running"
+        elif "unknown" in statuses:
+            status = "unknown"
         elif "stopped" in statuses:
             status = "stopped"
         elif statuses:
@@ -2408,8 +2401,15 @@ class DashboardData:
         try:
             current_health = self.dataset_health()
         except Exception as exc:
-            current_health = {"grade": "F", "reason_code": "HEALTH_UNAVAILABLE", "error": str(exc)}
-        health_fields = self._health_status_fields(normalized_workers, current_health if isinstance(current_health, Mapping) else {})
+            current_health = {
+                "grade": "F",
+                "reason_code": "HEALTH_UNAVAILABLE",
+                "error": str(exc),
+            }
+        health_fields = self._health_status_fields(
+            normalized_workers,
+            current_health if isinstance(current_health, Mapping) else {},
+        )
         return {
             "status": status,
             "summary": self.store.dashboard_summary(),
@@ -2767,11 +2767,8 @@ class DashboardData:
                     if isinstance(candidate, Mapping) and health_keys.intersection(candidate):
                         return dict(candidate)
         evaluations = getattr(self.store, "list_signal_evaluations", None)
-        if not callable(evaluations):
-            try:
-                evaluations = CanaryService(self.store, initialize=False).list_signal_evaluations
-            except (AttributeError, TypeError, ValueError, sqlite3.Error):
-                evaluations = None
+        if not callable(evaluations) and self._canary_service is not None:
+            evaluations = getattr(self._canary_service, "list_signal_evaluations", None)
         if callable(evaluations):
             try:
                 rows = evaluations(limit=64)
@@ -4138,10 +4135,16 @@ class DashboardData:
             if isinstance(catalog.get("historical"), Mapping)
             else False
         )
-        if canary_snapshot is None:
-            canary_service = CanaryService(self.store, initialize=False)
-            raw_canary_status, canary_report = _canary_status_report(canary_service)
+        if canary_snapshot is None and self._canary_service is not None:
+            raw_canary_status, canary_report = _canary_status_report(
+                self._canary_service
+            )
             canary_status = _canary_status_projection(raw_canary_status)
+            if canary_report:
+                canary_status["status_report"] = canary_report
+        elif canary_snapshot is None:
+            canary_report = {}
+            canary_status = _canary_status_projection({})
             if canary_report:
                 canary_status["status_report"] = canary_report
         else:
@@ -4233,9 +4236,25 @@ class DashboardData:
             ),
             candidate_ids=candidate_ids,
         )
+        overview_now = ensure_utc(self.clock())
+
         def worker_state(name: str, default: str = "NOT INITIALIZED") -> str:
             item = worker_map.get(name, {})
             status = str(item.get("status") or "").upper()
+            if status in {"RUNNING", "DEGRADED"}:
+                heartbeat = parse_timestamp(item.get("heartbeat_at"))
+                payload = item.get("payload") if isinstance(item.get("payload"), Mapping) else {}
+                try:
+                    stale_after = float(payload.get("stale_after_seconds", 300.0))
+                except (TypeError, ValueError):
+                    stale_after = 300.0
+                if (
+                    not math.isfinite(stale_after)
+                    or stale_after <= 0
+                    or heartbeat is None
+                    or max(0.0, (overview_now - ensure_utc(heartbeat)).total_seconds()) > stale_after
+                ):
+                    status = "STALE"
             return status or default
 
         latest_queue = aggregate.get("latest_queue_item") if isinstance(aggregate, Mapping) else None
@@ -4386,7 +4405,6 @@ class DashboardData:
                 "reports": [],
                 "bootstrap_progress": bootstrap_progress,
                 "bootstrap_states": bootstrap_progress,
-                "live_execution": False,
             },
             "lifecycle_funnel": stages,
             "activity": aggregate.get("latest_activity", []),
@@ -4420,6 +4438,7 @@ class DashboardData:
         }
 
     def canary_data(self) -> dict[str, Any]:
+        settings_snapshot = self.risk_settings_data()
         canary_report: dict[str, Any] = {}
         if self.store is None:
             canary: Mapping[str, Any] = {
@@ -4452,7 +4471,6 @@ class DashboardData:
                 "current_execution_evidence": "UNKNOWN",
                 "risk_envelope": {},
                 "risk_limits": {},
-                "real_execution_events": None,
                 "execution_event_count": None,
                 "autonomous": {
                     "enabled": False,
@@ -4464,9 +4482,21 @@ class DashboardData:
                 "live_execution": False,
             }
         else:
-            service = CanaryService(self.store, initialize=False)
-            raw_canary, canary_report = _canary_status_report(service)
-            canary = raw_canary
+            service = self._canary_service
+            if service is None:
+                canary = {}
+            else:
+                raw_canary, canary_report = _canary_status_report(service)
+                canary = raw_canary
+        effective_settings = (
+            settings_snapshot.get("effective_limits")
+            if isinstance(settings_snapshot, Mapping)
+            else None
+        )
+        if isinstance(effective_settings, Mapping):
+            canary = dict(canary)
+            canary["risk_limits"] = dict(effective_settings)
+            canary["risk_envelope"] = dict(effective_settings)
         canary = _canary_status_projection(canary)
         if canary_report:
             canary["status_report"] = canary_report
@@ -4485,7 +4515,7 @@ class DashboardData:
             persisted_risk = (
                 readiness.get("risk_envelope")
                 or control.get("risk_envelope")
-                or dict(getattr(canary_module, "AUTONOMOUS_CANARY_LIMITS", {}))
+                or {}
             )
             canary.setdefault("risk_envelope", persisted_risk)
             canary.setdefault(
@@ -4644,19 +4674,6 @@ class DashboardData:
         except BaseException:
             credentials = None
         if not isinstance(credentials, Mapping):
-            try:
-                credential_store = credential_type()
-                credentials = credential_store.cached_projection(
-                    allow_environment=False,
-                    persisted={
-                        "canary": canary,
-                        "status_report": canary_report,
-                        "connectivity": connectivity,
-                    },
-                )
-            except BaseException:
-                credentials = None
-        if not isinstance(credentials, Mapping):
             credentials = {
                 "configured": None,
                 "status": "NOT CHECKED",
@@ -4666,8 +4683,10 @@ class DashboardData:
             credentials = dict(credentials)
         credentials["secret_values_exposed"] = False
         canary["credentials"] = dict(credentials)
+        canary["risk_settings"] = settings_snapshot
         projection = {
             "canary": canary,
+            "risk_settings": settings_snapshot,
             "status_report": canary_report,
             "control": (
                 canary_report.get("control", canary_report.get("authoritative_control", {}))
@@ -4973,9 +4992,7 @@ class DashboardData:
             hermes_label, hermes_reason = "NOT INITIALIZED", "No internal research queue execution state is persisted."
         paper_state_count = int(paper.get("state_count", 0) or 0)
         paper_label = "ACTIVE" if paper_state_count > 0 else "NOT INITIALIZED"
-        canary_service = (
-            CanaryService(self.store, initialize=False) if self.store is not None else None
-        )
+        canary_service = self._canary_service
         if canary_service is not None:
             raw_canary, canary_report = _canary_status_report(canary_service)
             canary_status = _canary_status_projection(raw_canary)
@@ -5154,6 +5171,8 @@ class DashboardData:
             return self.evolution_data()
         if endpoint == "risk":
             return self.risk_data()
+        if endpoint == "risk-settings":
+            return self.risk_settings_data()
         if endpoint == "paper":
             return self.paper_data()
         if endpoint == "paper-portfolio":
@@ -5243,7 +5262,8 @@ def _dashboard_html(
     <section id="view-candidates" class="view"><article class="panel"><div class="section-title"><h2>CANDIDATES</h2><span id="candidate-total" class="muted"></span></div><div class="filters"><input id="candidates-filter" placeholder="Filter strategy, family, market" aria-label="Filter candidates"><select id="candidates-stage"><option value="">All stages</option></select><select id="candidates-size"><option>25</option><option>50</option><option>100</option></select></div><div id="candidates-table" class="scroll"></div><div id="candidates-pager" class="pager"></div></article></section>
     <article id="candidate-detail" class="panel"><div class="section-title"><h2>Candidate detail</h2><span class="muted">historical → forward → lifecycle</span></div><div class="empty">Select a candidate to inspect evidence.</div></article>
     <section id="view-hermes" class="view"><article class="panel"><div class="section-title"><h2>Hermes / research loop</h2><span class="badge">research only · no canary control</span></div><div id="hermes-summary"></div><div class="filters"><input id="hermes-filter" placeholder="Filter queue" aria-label="Filter Hermes queue"><select id="hermes-status"><option value="">All statuses</option><option>PENDING</option><option>TESTING</option><option>COMPLETED</option><option>ACCEPTED</option><option>REJECTED</option><option>FAILED</option><option>ERROR</option></select><select id="hermes-size"><option>25</option><option>50</option><option>100</option></select></div><div id="hermes-table" class="scroll"></div><div id="hermes-pager" class="pager"></div><div id="hermes-detail"></div></article></section>
-    <section id="view-canary" class="view"><article class="panel" style="border-color:var(--red)"><div class="section-title"><h2>REAL CANARY MONEY</h2><span class="badge bad">PRODUCTION LIVE TRADING: DISABLED</span></div><div id="canary-action-result" class="page-note"></div><div id="canary-readiness-snapshot"></div><div id="canary-controls"></div><div id="canary-connectivity"></div><div id="canary-summary"></div><div id="canary-trades" class="scroll"></div><p class="notice">Autonomous canary is independent from paper research. No secrets are stored or displayed. It remains prediction-only, bounded at $1 per order, and killable from this console.</p></article></section>
+    <section id="view-canary" class="view"><article class="panel" style="border-color:var(--red)"><div class="section-title"><h2>REAL CANARY MONEY</h2><span class="badge bad">PRODUCTION LIVE TRADING: DISABLED</span></div><div id="canary-action-result" class="page-note"></div><div id="canary-readiness-snapshot"></div><div id="canary-controls"></div><div id="risk-settings"></div><div id="canary-connectivity"></div><div id="canary-summary"></div><div id="canary-trades" class="scroll"></div><p class="notice">Autonomous canary is independent from paper research. No secrets are stored or displayed. It remains prediction-only, bounded by active settings, and killable from this console.</p></article></section>
+    <article id="canary-recovery-form" class="panel"><div class="section-title"><h2>UNKNOWN ENTRY RECOVERY</h2><span class="badge warn">READ-ONLY · PRODUCTION PROFILE</span></div><p class="page-note">Attach only an operator-supplied canonical exchange order ID. This does not post, retry, activate, or release an entry.</p><div class="three-col"><label>Event ID<input id="canary-recovery-event" autocomplete="off"></label><label>Signal ID<input id="canary-recovery-signal" autocomplete="off"></label><label>Canonical exchange order ID<input id="canary-recovery-order" autocomplete="off"></label></div><label>Exact confirmation<input id="canary-recovery-confirm" placeholder="RECOVER UNKNOWN ENTRY" autocomplete="off"></label><p class="page-note"><button id="canary-recovery-submit" class="link">Recover and reconcile</button> <span id="canary-recovery-result"></span></p></article>
     <section id="view-binance-canary" class="view binance-view"><article class="panel" style="border-color:var(--amber)"><div class="section-title"><h2>BINANCE SPOT CANARY</h2><span class="badge warn">DEVELOPMENT / PAPER|TESTNET</span></div><p class="page-note">Separate from the Polymarket canary. <strong>POLYMARKET TRANSPORT: DISABLED</strong> · Binance Spot only · no implicit control-plane construction.</p><div id="binance-action-result" class="page-note"></div><div id="binance-identity"></div><div id="binance-connectivity"></div><div id="binance-qualification"></div><div id="binance-risk"></div><div id="binance-controls"></div><div id="binance-records" class="scroll"></div><details><summary>Full Binance projection and identifiers</summary><pre id="binance-raw"></pre></details><p class="notice">Credentials are never displayed. Connectivity checks are read-only; order validation is an explicit test action. No browser action can place an order.</p></article></section>
     <div id="binance-testnet-static-labels" hidden>BINANCE SPOT TESTNET · TESTNET CONNECTIVITY · ORDER VALIDATION · TESTNET EXECUTION PROBE · AUTONOMOUS TESTNET · localhost</div>
   </main>
@@ -5255,12 +5275,12 @@ def _dashboard_html(
     let params = new URLSearchParams(location.search); const state = { tab: params.get("tab") || "overview", page: Math.max(1,Number(params.get("page")||1)), page_size: [10,25,50,100].includes(Number(params.get("page_size"))) ? Number(params.get("page_size")) : 25, filter: params.get("filter") || "", sort: params.get("sort") || "", direction: params.get("direction") === "asc" ? "asc" : "desc", selected: params.get("selected") || "", expanded: params.get("expanded") === "1" };
     let operator = {}, current = {}, loadInFlight = false, operatorControlsRendered = false, binanceTestnetMode = false;
     const controlToken = document.querySelector('meta[name="axiom-control-token"]')?.content || "";
-    function controlButton(action,label,target="",confirmation="") { return `<button class="link control-action" data-control-action="${safe(action)}" data-control-target="${safe(target)}" data-control-confirm="${safe(confirmation)}">${safe(label)}</button>`; }
+    function controlButton(action,label,target="",confirmation="",payload=null) { const encodedPayload=payload&&typeof payload==="object"&&!Array.isArray(payload)?JSON.stringify(payload):""; return `<button class="link control-action" data-control-action="${safe(action)}" data-control-target="${safe(target)}" data-control-confirm="${safe(confirmation)}" data-control-payload="${safe(encodedPayload)}">${safe(label)}</button>`; }
     function isCanaryAction(action) { return String(action||"").startsWith("canary."); }
     function actionResultNode(action) { return $(isCanaryAction(action)?"canary-action-result":"control-result"); }
     function actionResultMessage(action,message) { const node=actionResultNode(action); if(node)node.textContent=message||""; }
-    async function controlPost(action,target="",confirmation="") {
-      const payload={action,target}; if(confirmation)payload.confirm=confirmation;
+    async function controlPost(action,target="",confirmation="",extra={}) {
+      const payload={action,target,...(extra&&typeof extra==="object"?{payload:extra}: {})}; if(confirmation)payload.confirm=confirmation;
       try {
         const response=await fetch("/api/control",{method:"POST",headers:{"Content-Type":"application/json","X-Axiom-Control-Token":controlToken},body:JSON.stringify(payload),cache:"no-store"});
         const result=await response.json();
@@ -5269,7 +5289,8 @@ def _dashboard_html(
           if(lastGood.canary&&typeof lastGood.canary==="object"&&!Array.isArray(lastGood.canary)) lastGood.canary={...lastGood.canary,connectivity};
           renderCanaryConnectivity(connectivity);
         }
-        actionResultMessage(action,result.ok?`${action} completed`:`${action} blocked: ${result.reason||"CONTROL_FAILED"}`);
+        const actionIdentity=result?.action_id?` · ${result.action_id}`:"";
+        actionResultMessage(action,result.ok?`${action} completed${actionIdentity}`:`${action} blocked: ${result.reason||"CONTROL_FAILED"}${actionIdentity}`);
         if(activeController)activeController.abort();
         refreshGeneration++;
         activeController=null;
@@ -5413,7 +5434,37 @@ def _dashboard_html(
       _renderBinanceCanaryPaper(data);
     };
 
+    function renderRiskSettings(data) {
+      const snapshot=data?.risk_settings||data?.canary?.risk_settings||{}, active=snapshot.active||snapshot.active_config||{}, draft=snapshot.draft||snapshot.draft_config||{}, source=(draft.values&&typeof draft.values==="object"?draft.values:(draft.limits&&typeof draft.limits==="object"?draft.limits:(active.values&&typeof active.values==="object"?active.values:(active.limits&&typeof active.limits==="object"?active.limits:(snapshot.effective_limits||snapshot.active_limits||{})))));
+      const fields=[
+        ["max_orders_per_day","Submitted orders/day (5 / 10 / 20 / custom)"],
+        ["max_submitted_orders_per_day","All submitted orders/day"],
+        ["max_all_in_buy_usd","All-in per buy"],
+        ["max_gross_daily_buy_usd","Gross daily buy"],
+        ["max_aggregate_open_cost_usd","Open exposure / aggregate cost"],
+        ["max_aggregate_exposure_usd","Aggregate open exposure"],
+        ["max_positions","Max positions"],
+        ["realized_loss_entry_stop_usd","Realized P/L stop"],
+        ["equity_loss_entry_stop_usd","Equity stop"],
+        ["max_slippage_bps","Slippage (bps)"],
+        ["max_fee_reserve_usd","Fee reserve"],
+        ["max_daily_loss_usd","Advanced daily loss"],
+        ["max_drawdown","Advanced drawdown"],
+        ["max_loss","Advanced loss"],
+        ["per_market_buy_cap_usd","Per-market budget"],
+        ["per_event_buy_cap_usd","Per-event budget"],
+        ["cumulative_buy_cap_usd","Cumulative buy budget"]
+      ];
+      const value=(name)=>source?.[name]??active?.[name]??"";
+      const activeGeneration=active.generation??snapshot.generation??"";
+      const draftGeneration=draft.generation??activeGeneration??"";
+      const activeConfigId=active.config_id??active.id??snapshot.config_id??snapshot.active_config_id??"";
+      const draftConfigId=draft.config_id??draft.id??snapshot.draft_config_id??"";
+      $("risk-settings").innerHTML=`<article class="panel"><div class="section-title"><h2>POLYMARKET RISK SETTINGS</h2><span class="badge ${statusClass(snapshot.status||"UNKNOWN")}">${safe(snapshot.status||"UNKNOWN")}</span></div><p class="page-note">Draft edits are persisted but never active until an explicit generation-fenced activation. Decimal values remain exact strings; collateral and fee reserve are shown in venue units.</p><div class="three-col">${fields.map(([name,label])=>`<label class="key-value"><span class="key">${safe(label)}</span><input data-risk-field="${safe(name)}" aria-label="${safe(label)}" value="${safe(value(name))}" inputmode="decimal"></label>`).join("")}</div><div class="filters"><label class="key-value"><span class="key">Draft config ID</span><input id="risk-config-id" aria-label="Draft config ID" value="${safe(draftConfigId)}"></label><label class="key-value"><span class="key">Expected generation</span><input id="risk-generation" aria-label="Expected generation" value="${safe(draftGeneration)}" inputmode="numeric"></label><label class="key-value"><span class="key">Actor</span><input id="risk-actor" aria-label="Risk settings actor" value="operator"></label></div><div class="filters"><label class="key-value"><span class="key">Reviewed ACTIVE config ID</span><input id="risk-active-config-id" aria-label="Reviewed active config ID" value="${safe(activeConfigId)}" readonly></label><label class="key-value"><span class="key">Reviewed ACTIVE generation</span><input id="risk-active-generation" aria-label="Reviewed active generation" value="${safe(activeGeneration)}" readonly></label></div><p class="page-note"><button class="risk-settings-action" data-risk-action="save">Save draft</button> <button class="risk-settings-action" data-risk-action="activate">Activate draft</button></p><p class="page-note">Enable confirmation requires exact <code>ENABLE AUTO CANARY POLYMARKET &lt;config&gt; &lt;generation&gt;</code> for the reviewed ACTIVE settings only.</p><div class="filters"><label class="key-value"><span class="key">Enable confirmation</span><input id="risk-enable-confirm" aria-label="Exact canary enable confirmation"></label><button class="risk-settings-action" data-risk-action="enable">Enable canary</button></div></article>`;
+    }
+
     function renderCanary(data) {
+      renderRiskSettings(data);
       const c=data.canary||{}, auto=data.autonomous_canary||c.autonomous||{}, risk=c.risk_envelope||c.risk_limits||{}, signal=data.canary_signal||null, connectivity=data.connectivity??c.connectivity??null;
       renderCanaryConnectivity(connectivity);
       $("canary-readiness-snapshot").innerHTML=readinessSnapshotMarkup(data);
@@ -5433,13 +5484,19 @@ def _dashboard_html(
       const manualCandidate=backendState==="ARMED"&&c.candidate?`<div class="panel"><div class="metric">${safe(c.candidate)}</div><div class="metric-label">Manual armed candidate</div></div>`:"";
       const connectivityReady=connectivity?.ready===true, connectivityBlocker=connectivityReady?"":arr(connectivity?.failure_codes)[0]||"CONNECTIVITY_BLOCKED";
       const selectionReason=c.selection_invalidation_reason||"", selectionBlocker=selectionValid&&currentCandidate?"":(selectionReason||(selectionStatus==="STALE"?"REEVALUATION_REQUIRED":selectionStatus==="UNKNOWN"?"READINESS_UNKNOWN":selectionStatus==="NONE"?"NO_CURRENT_SELECTION":"SELECTION_INVALID"));
+      const currentRank=selectionValid&&selectionStatus==="CURRENT"?auto.rank:"—", currentScore=selectionValid&&selectionStatus==="CURRENT"?auto.score:"—", selectionReasonLabel=c.selection_reason||"—", historicalMarkup=historicalCandidate?`<div class="panel"><div class="metric">${safe(historicalCandidate)}</div><div class="metric-label">Selected winner · Historical selected ID</div><p class="page-note"><span class="badge ${statusClass(selectionStatus)}">${safe(selectionLabel)}</span></p></div>`:"";
       const autonomousBlocker=enabled?"ENABLED":!connectivity?"CONNECTIVITY_CHECK_REQUIRED":!connectivityReady?connectivityBlocker:backendState==="KILLED"?"CANARY_KILLED":selectionBlocker||String(auto.blocker||"AUTONOMOUS_CANARY_DISABLED");
       const autoReady=connectivityReady&&backendState!=="KILLED"&&!enabled&&selectionValid&&Boolean(currentCandidate);
-      const enable=stateValue==="KILLED"?"":enabled?controlButton("canary.disarm","DISARM","","DISARM"):controlButton("canary.enable_auto","ENABLE AUTO CANARY","","ENABLE AUTO CANARY");
+      const settingsSnapshot=data?.risk_settings||data?.canary?.risk_settings||{}, activeSettings=settingsSnapshot.active||settingsSnapshot.active_config||{};
+      const activeConfigId=activeSettings.config_id??activeSettings.id??settingsSnapshot.config_id??settingsSnapshot.active_config_id??"";
+      const activeGeneration=activeSettings.generation??settingsSnapshot.generation??"";
+      const parsedGeneration=Number(activeGeneration);
+      const enablePayload=activeConfigId&&Number.isInteger(parsedGeneration)&&parsedGeneration>0?{venue:"polymarket",config_id:String(activeConfigId),expected_generation:parsedGeneration}:null;
+      const enableConfirmation=enablePayload?`ENABLE AUTO CANARY POLYMARKET ${enablePayload.config_id} ${enablePayload.expected_generation}`:"";
+      const enable=enabled?controlButton("canary.disarm","DISARM","","DISARM"):autoReady&&enablePayload?controlButton("canary.enable_auto","ENABLE AUTO CANARY","",enableConfirmation,enablePayload):"";
       const riskMarkup=Object.entries(risk).map(([key,value])=>`<div class="key-value"><span class="key">${safe(key.replaceAll("_"," "))}</span><strong>${safe(value)}</strong></div>`).join("")||empty("Risk envelope unavailable","No frozen risk limits are persisted.");
-      const currentRank=selectionValid&&selectionStatus==="CURRENT"?auto.rank:"—", currentScore=selectionValid&&selectionStatus==="CURRENT"?auto.score:"—", selectionReasonLabel=c.selection_reason||"—", historicalMarkup=historicalCandidate?`<div class="panel"><div class="metric">${safe(historicalCandidate)}</div><div class="metric-label">Selected winner · Historical selected ID</div><p class="page-note"><span class="badge ${statusClass(selectionStatus)}">${safe(selectionLabel)}</span></p></div>`:"";
-      $("canary-controls").innerHTML=`<article class="panel"><div class="section-title"><h2>AUTONOMOUS CANARY CONTROL</h2><span class="badge ${statusClass(stateValue)}">${safe(stateValue)}</span></div><p class="page-note"><strong>${safe(enabled?"AUTO CANARY ENABLED":autoReady?"AUTO CANARY READY TO ENABLE":`AUTO CANARY BLOCKED: ${autonomousBlocker}`)}</strong></p><div class="page-note">${controlButton("canary.connectivity_check","Connectivity check")} · ${enable} · ${controlButton("canary.kill","KILL","","KILL")}</div><p class="page-note">One confirmation enables the frozen prediction-only $1 envelope. Research, eligibility, ranking, and submission decisions run in the node worker; Hermes cannot change this envelope.</p></article>`;
-      $("canary-summary").innerHTML=`<div class="card-grid"><div class="panel"><div class="metric">${safe(stateValue)}</div><div class="metric-label">Autonomous canary state</div></div>${currentCandidate?`<div class="panel"><div class="metric">${safe(currentCandidate)}</div><div class="metric-label">Selected winner · Current selection</div><p class="page-note"><span class="badge ${statusClass(selectionStatus)}">${safe(selectionLabel)}</span></p></div>`:historicalMarkup||`<div class="panel"><div class="metric">—</div><div class="metric-label">Current selection</div><p class="page-note"><span class="badge ${statusClass(selectionStatus)}">${safe(selectionLabel)}</span></p></div>`}${manualCandidate}<div class="panel"><div class="metric">${safe(currentRank)} · ${safe(currentScore)}</div><div class="metric-label">Current rank / score</div></div><div class="panel"><div class="metric">${count(rawEligible)}</div><div class="metric-label">Eligible candidates (raw)</div></div><div class="panel"><div class="metric">${count(eligible)}</div><div class="metric-label">Eligible candidates (validated)</div></div><div class="panel"><div class="metric">${count(rawRankable)}</div><div class="metric-label">Rankable candidates (raw)</div></div><div class="panel"><div class="metric">${count(rankable)}</div><div class="metric-label">Rankable candidates (validated)</div></div><div class="panel"><div class="metric">${count(events)}</div><div class="metric-label">Real execution events</div></div></div><article class="panel"><div class="section-title"><h2>Autonomous readiness</h2><span class="badge ${statusClass(autonomousBlocker)}">${safe(autoReady?"READY":autonomousBlocker)}</span></div><div class="three-col"><div class="key-value"><span class="key">Selection status</span><strong>${safe(selectionLabel)}</strong></div><div class="key-value"><span class="key">Selection valid</span><strong>${safe(selectionValid)}</strong></div><div class="key-value"><span class="key">Current selection</span><strong>${safe(currentCandidate||"—")}</strong></div><div class="key-value"><span class="key">Historical selection</span><strong>${safe(historicalCandidate||"—")}</strong></div><div class="key-value"><span class="key">Selection reason</span><strong>${safe(selectionReasonLabel)}</strong></div><div class="key-value"><span class="key">Invalidation reason</span><strong>${safe(selectionReason||"—")}</strong></div><div class="key-value"><span class="key">Last ranking run ID</span><strong>${safe(c.ranking_run_id||"—")}</strong></div><div class="key-value"><span class="key">Last ranking timestamp</span><strong>${safe(dateText(c.ranking_timestamp))}</strong></div><div class="key-value"><span class="key">Historical data integrity</span><strong>${safe(c.historical_data_integrity||"UNKNOWN")}</strong></div><div class="key-value"><span class="key">Historical execution fidelity</span><strong>${safe(c.historical_execution_fidelity||"UNKNOWN")}</strong></div><div class="key-value"><span class="key">Current execution evidence</span><strong>${safe(c.current_execution_evidence||"CURRENT_ORDER_BOOK_REQUIRED")}</strong></div><div class="key-value"><span class="key">Next decision</span><strong>${safe(auto.next_decision||"—")}</strong></div><div class="key-value"><span class="key">Blocker</span><strong>${safe(selectionReason||auto.blocker||"—")}</strong></div></div></article><article class="panel"><div class="section-title"><h2>Risk envelope</h2><span class="badge warn">bounded $1</span></div>${riskMarkup}</article>`;
+      $("canary-controls").innerHTML=`<article class="panel"><div class="section-title"><h2>AUTONOMOUS CANARY CONTROL</h2><span class="badge ${statusClass(stateValue)}">${safe(stateValue)}</span></div><p class="page-note"><strong>${safe(enabled?"AUTO CANARY ENABLED":autoReady?"AUTO CANARY READY TO ENABLE":`AUTO CANARY BLOCKED: ${autonomousBlocker}`)}</strong></p><div class="page-note">${controlButton("canary.connectivity_check","Connectivity check")} · ${enable} · ${controlButton("canary.kill","KILL","","KILL")}</div><p class="page-note">One confirmation enables the prediction-only envelope using the active venue settings. Research, eligibility, ranking, and submission decisions run in the node worker; Hermes cannot change this envelope.</p></article>`;
+      $("canary-summary").innerHTML=`<div class="card-grid"><div class="panel"><div class="metric">${safe(stateValue)}</div><div class="metric-label">Autonomous canary state</div></div>${currentCandidate?`<div class="panel"><div class="metric">${safe(currentCandidate)}</div><div class="metric-label">Selected winner · Current selection</div><p class="page-note"><span class="badge ${statusClass(selectionStatus)}">${safe(selectionLabel)}</span></p></div>`:historicalMarkup||`<div class="panel"><div class="metric">—</div><div class="metric-label">Current selection</div><p class="page-note"><span class="badge ${statusClass(selectionStatus)}">${safe(selectionLabel)}</span></p></div>`}${manualCandidate}<div class="panel"><div class="metric">${safe(currentRank)} · ${safe(currentScore)}</div><div class="metric-label">Current rank / score</div></div><div class="panel"><div class="metric">${count(rawEligible)}</div><div class="metric-label">Eligible candidates (raw)</div></div><div class="panel"><div class="metric">${count(eligible)}</div><div class="metric-label">Eligible candidates (validated)</div></div><div class="panel"><div class="metric">${count(rawRankable)}</div><div class="metric-label">Rankable candidates (raw)</div></div><div class="panel"><div class="metric">${count(rankable)}</div><div class="metric-label">Rankable candidates (validated)</div></div><div class="panel"><div class="metric">${count(events)}</div><div class="metric-label">Real execution events</div></div></div><article class="panel"><div class="section-title"><h2>Autonomous readiness</h2><span class="badge ${statusClass(autonomousBlocker)}">${safe(autoReady?"READY":autonomousBlocker)}</span></div><div class="three-col"><div class="key-value"><span class="key">Selection status</span><strong>${safe(selectionLabel)}</strong></div><div class="key-value"><span class="key">Selection valid</span><strong>${safe(selectionValid)}</strong></div><div class="key-value"><span class="key">Current selection</span><strong>${safe(currentCandidate||"—")}</strong></div><div class="key-value"><span class="key">Historical selection</span><strong>${safe(historicalCandidate||"—")}</strong></div><div class="key-value"><span class="key">Selection reason</span><strong>${safe(selectionReasonLabel)}</strong></div><div class="key-value"><span class="key">Invalidation reason</span><strong>${safe(selectionReason||"—")}</strong></div><div class="key-value"><span class="key">Last ranking run ID</span><strong>${safe(c.ranking_run_id||"—")}</strong></div><div class="key-value"><span class="key">Last ranking timestamp</span><strong>${safe(dateText(c.ranking_timestamp))}</strong></div><div class="key-value"><span class="key">Historical data integrity</span><strong>${safe(c.historical_data_integrity||"UNKNOWN")}</strong></div><div class="key-value"><span class="key">Historical execution fidelity</span><strong>${safe(c.historical_execution_fidelity||"UNKNOWN")}</strong></div><div class="key-value"><span class="key">Current execution evidence</span><strong>${safe(c.current_execution_evidence||"CURRENT_ORDER_BOOK_REQUIRED")}</strong></div><div class="key-value"><span class="key">Next decision</span><strong>${safe(auto.next_decision||"—")}</strong></div><div class="key-value"><span class="key">Blocker</span><strong>${safe(selectionReason||auto.blocker||"—")}</strong></div></div></article><article class="panel"><div class="section-title"><h2>Risk envelope</h2><span class="badge warn">active settings</span></div>${riskMarkup}</article>`;
       const readiness=signal?String(signal.status||"READY"):"NO SIGNAL", detail=signal?`<div class="three-col"><div class="key-value"><span class="key">Signal readiness</span><strong>${safe(readiness)}</strong></div><div class="key-value"><span class="key">Market / outcome</span><strong>${safe(signal.market_id)} / ${safe(signal.outcome)}</strong></div><div class="key-value"><span class="key">Expected price</span><strong>${safe(signal.paper_expected_price)}</strong></div><div class="key-value"><span class="key">Generated</span><strong>${safe(dateText(signal.generated_at))}</strong></div><div class="key-value"><span class="key">Order result</span><strong>${safe(c.last_request_status||"NO ORDER")}</strong></div></div>`:empty("No latest signal","No persisted signal is available.");
       $("canary-summary").insertAdjacentHTML("beforeend",`<article class="panel"><div class="section-title"><h2>Latest signal</h2><span class="badge ${statusClass(readiness)}">${safe(readiness)}</span></div>${detail}<p class="page-note">Kill prevents new submissions; an in-flight request is recorded, in-flight not retracted, and never retried automatically.</p></article>`);
       $("canary-trades").innerHTML=arr(c.trades).length?`<table><thead><tr><th>Time</th><th>Candidate</th><th>Market</th><th>Side</th><th>Status</th><th>Price Δ</th></tr></thead><tbody>${arr(c.trades).map(t=>`<tr><td>${safe(dateText(t.timestamp))}</td><td>${safe(t.candidate_id)}</td><td>${safe(t.market_id)}</td><td>${safe(t.side)}</td><td><span class="badge ${statusClass(t.status)}">${safe(t.status)}</span></td><td>${safe(t.price_difference)}</td></tr>`).join("")}</tbody></table>`:empty("No canary execution evidence","No order has been submitted by the autonomous worker.");
@@ -5719,7 +5776,61 @@ def _dashboard_html(
       return loadPage(state.tab,false);
     };
     document.addEventListener("click",async event=>{const button=event.target.closest?.(".binance-action");if(!button)return;const action=button.dataset.binanceAction||"",payload={};if(!binanceTestnetMode&&(action==="ENABLE"||action==="RESUME"))payload.confirmation=$("binance-confirm")?.value||"";if(action==="ORDER_VALIDATION_TEST"&&!binanceTestnetMode){payload.symbol=$("binance-order-symbol")?.value||"";payload.price=$("binance-order-price")?.value||"";payload.quantity=$("binance-order-quantity")?.value||"";}await binanceControlPost(action,payload);});
-    document.addEventListener("click",async event=>{const button=event.target.closest?.(".control-action");if(!button)return;const action=button.dataset.controlAction||"",target=button.dataset.controlTarget||"",expected=button.dataset.controlConfirm||"";if(expected){const typed=window.prompt(`Type ${expected} to continue`);if(typed!==expected){actionResultMessage(action,`${action} cancelled: exact confirmation required`);return;}}const result=await controlPost(action,target,expected);const local=$("candidate-control-result");if(local&&target===state.selected&&!isCanaryAction(action))local.textContent=result.ok?`${action} completed`:`${action} blocked: ${result.reason||"CONTROL_FAILED"}`;});
+    document.addEventListener("click",async event=>{
+      const button=event.target.closest?.(".control-action");
+      if(!button||button.disabled)return;
+      button.disabled=true;
+      try {
+        const action=button.dataset.controlAction||"",target=button.dataset.controlTarget||"",expected=button.dataset.controlConfirm||"",encodedPayload=button.dataset.controlPayload||"";
+        let actionPayload={};
+        if(encodedPayload){
+          const parsed=JSON.parse(encodedPayload);
+          if(parsed&&typeof parsed==="object"&&!Array.isArray(parsed))actionPayload=parsed;
+        }
+        if(expected){
+          const typed=window.prompt(`Type ${expected} to continue`);
+          if(typed!==expected){
+            actionResultMessage(action,`${action} cancelled: exact confirmation required`);
+            return;
+          }
+        }
+        const result=await controlPost(action,target,expected,actionPayload);
+        const local=$("candidate-control-result");
+        if(local&&target===state.selected&&!isCanaryAction(action))local.textContent=result.ok?`${action} completed`:`${action} blocked: ${result.reason||"CONTROL_FAILED"}`;
+      } finally {
+        button.disabled=false;
+      }
+    });
+    document.addEventListener("click",async event=>{
+      const button=event.target.closest?.(".risk-settings-action");
+      if(!button||button.disabled)return;
+      button.disabled=true;
+      try {
+        const action=button.dataset.riskAction||"",actor=$("risk-actor")?.value||"operator",values={};
+        document.querySelectorAll("[data-risk-field]").forEach(input=>{if(input.value!=="")values[input.dataset.riskField]=input.value;});
+        let result;
+        let confirmation="";
+        if(action==="save"||action==="activate"){
+          confirmation=action==="save"?"SAVE RISK SETTINGS DRAFT":"ACTIVATE RISK SETTINGS DRAFT";
+          const typed=window.prompt(`Type ${confirmation} to continue`);
+          if(typed!==confirmation){
+            actionResultMessage("canary.settings",`Risk settings ${action} cancelled: exact confirmation required`);
+            return;
+          }
+        }
+        if(action==="save")result=await controlPost("canary.settings.save_draft","",confirmation,{values,actor});
+        else if(action==="activate")result=await controlPost("canary.settings.activate_draft","",confirmation,{config_id:$("risk-config-id")?.value||"",expected_generation:$("risk-generation")?.value||"",actor});
+        else if(action==="enable"){
+          const config_id=$("risk-active-config-id")?.value||"",expected_generation=$("risk-active-generation")?.value||"",confirm=$("risk-enable-confirm")?.value||"";
+          result=await controlPost("canary.enable_auto","",confirm,{venue:"polymarket",config_id,expected_generation});
+        } else result={ok:false,reason:"UNKNOWN_RISK_SETTINGS_ACTION"};
+        if(!result?.ok)actionResultMessage("canary.settings",`Risk settings action blocked: ${result?.reason||"CONTROL_FAILED"}`);
+      } finally {
+        button.disabled=false;
+      }
+    });
+    const recoveryForm=$("canary-recovery-form"),canaryView=$("view-canary"); if(recoveryForm&&canaryView)canaryView.appendChild(recoveryForm);
+    document.addEventListener("click",async event=>{const button=event.target.closest?.("#canary-recovery-submit");if(!button)return;const eventId=$("canary-recovery-event")?.value.trim()||"",signalId=$("canary-recovery-signal")?.value.trim()||"",orderId=$("canary-recovery-order")?.value.trim()||"",confirmation=$("canary-recovery-confirm")?.value||"",node=$("canary-recovery-result");if(!eventId||!signalId||!orderId||confirmation!=="RECOVER UNKNOWN ENTRY"){if(node)node.textContent="Recovery blocked: exact event, signal, order, and confirmation are required";return;}const result=await controlPost("canary.recover_entry",eventId,confirmation,{event_id:eventId,signal_id:signalId,exchange_order_id:orderId});if(node)node.textContent=result.ok?"Recovery attached and reconciled":`Recovery blocked: ${result.reason||"CONTROL_FAILED"}`;});
     ensureActivityKind(); if($("crypto-symbol")){const oldSymbol=$("crypto-symbol"),newSymbol=oldSymbol.cloneNode(true);oldSymbol.replaceWith(newSymbol);newSymbol.addEventListener("input",()=>{state.page=1;saveState(true);loadPage("crypto",true);});} document.addEventListener("click",event=>{const button=event.target.closest?.(".copy");if(!button)return;navigator.clipboard?.writeText(button.dataset.copy||"").then(()=>{button.textContent="copied";setTimeout(()=>button.textContent="copy",1200);}).catch(()=>{});}); document.addEventListener("visibilitychange",()=>{if(document.hidden){if(activeController)activeController.abort();}else{nextRefreshAt=0;load();}});
     ensureFacets(); document.querySelectorAll(".tab").forEach(b=>b.addEventListener("click",()=>activate(b.dataset.view))); document.querySelectorAll("[data-link]").forEach(b=>b.addEventListener("click",e=>{e.preventDefault();activate(b.dataset.link)})); document.querySelectorAll(".filters input,.filters select").forEach(el=>el.addEventListener(el.tagName==="INPUT"?"input":"change",()=>{if(el.id.endsWith("-size")){const n=Number(el.value);if([10,25,50,100].includes(n)){state.page_size=n;document.querySelectorAll('select[id$="-size"]').forEach(s=>s.value=String(n));}} else if(el.id.includes("-filter"))state.filter=el.value;state.page=1;saveState(true);loadPage(state.tab)})); window.addEventListener("popstate",()=>{const q=new URLSearchParams(location.search),nextTab=q.get("tab")||"overview",changed=nextTab!==state.tab;params=q;state.tab=nextTab;state.page=Math.max(1,Number(q.get("page")||1));state.page_size=[10,25,50,100].includes(Number(q.get("page_size")))?Number(q.get("page_size")):25;state.filter=changed?"":q.get("filter")||"";state.sort=changed?"":q.get("sort")||"";state.direction=changed?"desc":q.get("direction")==="asc"?"asc":"desc";state.selected=changed?"":q.get("selected")||"";state.expanded=changed?false:q.get("expanded")==="1";restoreFacets();activate(state.tab,false)}); load(); activate(state.tab,false); const refreshHandle=setInterval(load,10000); window.addEventListener("beforeunload",()=>clearInterval(refreshHandle));
     if($("crypto-symbol"))$("crypto-symbol").addEventListener("input",async()=>{const symbol=$("crypto-symbol").value.trim(),q=new URLSearchParams({page:"1",page_size:String(state.page_size),direction:state.direction});if(symbol)q.set("symbol",symbol);const response=await fetch(`/api/v2/crypto-research?${q}`,{cache:"no-store"});if(response.ok)renderCrypto(await response.json());});
@@ -5756,17 +5867,87 @@ class _DashboardHandler(BaseHTTPRequestHandler):
         except ValueError:
             return False
 
+    def _server_authority(self) -> tuple[str, int] | None:
+        address = getattr(self.server, "server_address", None)
+        if not isinstance(address, tuple) or len(address) < 2:
+            return None
+        host = str(address[0]).strip().lower()
+        try:
+            port = int(address[1])
+        except (TypeError, ValueError):
+            return None
+        return (host, port) if host and 0 < port <= 65535 else None
+
+    def _host_allowed(self) -> bool:
+        expected = self._server_authority()
+        supplied = str(self.headers.get("Host", "") or "").strip()
+        if expected is None or not supplied or any(char in supplied for char in "\r\n"):
+            return False
+        try:
+            parsed = urlparse("//" + supplied)
+            supplied_host = parsed.hostname
+            supplied_port = parsed.port
+        except ValueError:
+            return False
+        if (
+            supplied_host is None
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.path
+            or parsed.query
+            or parsed.fragment
+            or supplied_port is None
+        ):
+            return False
+        return (
+            supplied_host.strip().lower() == expected[0]
+            and supplied_port == expected[1]
+        )
+
+    def _same_origin(self, origin: str) -> bool:
+        expected = self._server_authority()
+        if expected is None:
+            return False
+        try:
+            parsed = urlparse(origin)
+            supplied_host = parsed.hostname
+            supplied_port = parsed.port
+        except ValueError:
+            return False
+        if (
+            parsed.scheme.lower() != "http"
+            or supplied_host is None
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.path
+            or parsed.params
+            or parsed.query
+            or parsed.fragment
+            or supplied_port is None
+        ):
+            return False
+        return (
+            supplied_host.strip().lower() == expected[0]
+            and supplied_port == expected[1]
+        )
+
+    def _read_request_allowed(self) -> bool:
+        return self._loopback_client() and self._host_allowed()
+
     def _control_request_allowed(self) -> bool:
         expected = str(getattr(self.server, "control_token", "") or "")
         supplied = str(self.headers.get("X-Axiom-Control-Token", "") or "")
-        if not expected or not self._loopback_client() or not hmac.compare_digest(supplied, expected):
+        if (
+            not expected
+            or not self._read_request_allowed()
+            or not hmac.compare_digest(supplied, expected)
+        ):
             return False
         origin = self.headers.get("Origin")
-        if origin:
-            parsed_origin = urlparse(origin)
-            if parsed_origin.scheme not in {"http", "https"} or not _loopback_host(parsed_origin.hostname or ""):
-                return False
+        if origin and not self._same_origin(str(origin)):
+            return False
         return True
+
 
     def do_POST(self) -> None:  # noqa: N802 - stdlib handler API
         parsed = urlparse(self.path)
@@ -5794,7 +5975,10 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             self._send(415, {"error": "application/json required"})
             return
         try:
-            body = json.loads(self.rfile.read(length).decode("utf-8"))
+            body = json.loads(
+                self.rfile.read(length).decode("utf-8"),
+                parse_constant=_reject_json_constant,
+            )
         except (UnicodeDecodeError, ValueError, json.JSONDecodeError):
             self._send(400, {"error": "invalid JSON"})
             return
@@ -5839,19 +6023,55 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             status = 200 if result.get("ok") is not False else (503 if reason.endswith(("UNAVAILABLE", "TIMEOUT", "FAILED")) else 400)
             self._send(status, result)
             return
-        allowed_fields = {"action", "target", "confirm"}
+        allowed_fields = {
+            "action",
+            "target",
+            "confirm",
+            "payload",
+            "values",
+            "actor",
+            "config_id",
+            "expected_generation",
+            "venue",
+        }
         if set(body) - allowed_fields:
             self._send(400, {"error": "unsupported control fields"})
+            return
+        payload = body.get("payload")
+        flat_payload = {
+            name: body[name]
+            for name in ("values", "actor", "config_id", "expected_generation", "venue")
+            if name in body
+        }
+        if payload is not None and not isinstance(payload, Mapping):
+            self._send(400, {"error": "control payload must be an object"})
+            return
+        if payload is not None and flat_payload:
+            self._send(400, {"error": "control payload must be nested"})
+            return
+        action_payload = dict(payload) if isinstance(payload, Mapping) else flat_payload
+        action_name = str(body.get("action") or "").strip()
+        payload_actions = {
+            "canary.settings.save_draft",
+            "risk.settings.save_draft",
+            "canary.settings.activate_draft",
+            "risk.settings.activate_draft",
+            "canary.enable_auto",
+            "canary.recover_entry",
+        }
+        if action_payload and action_name not in payload_actions:
+            self._send(400, {"error": "action does not accept a payload"})
             return
         result = self.server.dashboard_data.control.execute(
             body.get("action", ""),
             body.get("target", ""),
             confirm=body.get("confirm", ""),
+            payload=action_payload,
         )
         reason = str(result.get("reason", "")) if isinstance(result, Mapping) else ""
         if result.get("ok") if isinstance(result, Mapping) else False:
             status = 200
-        elif reason in {"BOOTSTRAP_ALREADY_RUNNING", "NODE_ALREADY_RUNNING", "NODE_STOP_TIMEOUT", "BOOTSTRAP_NOT_RESUMABLE"}:
+        elif reason in {"BOOTSTRAP_ALREADY_RUNNING", "NODE_ALREADY_RUNNING", "NODE_STOP_TIMEOUT", "BOOTSTRAP_NOT_RESUMABLE"} or "generation" in reason.lower() or "settings conflict" in reason.lower():
             status = 409
         elif reason.endswith("UNAVAILABLE") or reason.endswith("TIMEOUT") or reason.endswith("FAILED"):
             status = 503
@@ -5860,6 +6080,9 @@ class _DashboardHandler(BaseHTTPRequestHandler):
         self._send(status, result)
 
     def do_GET(self) -> None:  # noqa: N802 - stdlib handler API
+        if not self._read_request_allowed():
+            self._send(403, {"error": "localhost dashboard host required"})
+            return
         parsed = urlparse(self.path)
         path = parsed.path.strip("/")
         if path in {"api/control", "api/binance/control"}:
@@ -5912,6 +6135,8 @@ class _DashboardHandler(BaseHTTPRequestHandler):
 
 class _BoundDashboardServer(ThreadingHTTPServer):
     def __init__(self, address: tuple[str, int], data: DashboardData) -> None:
+        if not _loopback_host(str(address[0])):
+            raise ValueError("dashboard server must bind to a loopback address")
         super().__init__(address, _DashboardHandler)
         self.dashboard_data = data
         self.control_token = secrets.token_urlsafe(32)
@@ -5922,7 +6147,16 @@ class _BoundDashboardServer(ThreadingHTTPServer):
 class DashboardServer:
     """Threaded local dashboard server; ``start`` is non-blocking."""
 
-    def __init__(self, host: str = "127.0.0.1", port: int = 0, *, data: DashboardData | None = None, **data_kwargs: Any) -> None:
+    def __init__(
+        self,
+        host: str = "127.0.0.1",
+        port: int = 0,
+        *,
+        data: DashboardData | None = None,
+        **data_kwargs: Any,
+    ) -> None:
+        if not _loopback_host(str(host)):
+            raise ValueError("dashboard server must bind to a loopback address")
         self.host = host
         self.port = int(port)
         self.data = data or DashboardData(**data_kwargs)

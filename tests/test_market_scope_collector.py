@@ -14,6 +14,8 @@ from axiom.domain import (
     OrderBookSnapshot,
     PredictionMarketSnapshot,
     SettlementState,
+    Side,
+    TradePrint,
 )
 from axiom.market_scope import (
     MATCHED,
@@ -118,6 +120,38 @@ class _RecordingProvider(InMemoryPredictionProvider):
         )
 
 
+class _RepeatingTradeProvider(_RecordingProvider):
+    def __init__(self, markets: tuple[PredictionMarketSnapshot, ...]) -> None:
+        super().__init__(markets)
+        self.trade_calls = 0
+        self.last_trades_complete = True
+        self.last_trade_cursor: str | None = None
+
+    def trades(self, market_id: str, start=None, end=None, **kwargs):
+        del start, end, kwargs
+        self.trade_calls += 1
+        return (
+            TradePrint(
+                T0,
+                0.60,
+                2.0,
+                side=Side.BUY,
+                trade_id="stable-public-fill",
+                market_id=market_id,
+                token_id=f"yes-{market_id}",
+            ),
+        )
+
+    def trade_provenance(self, trade: TradePrint):
+        return {
+            "source_type": "FORWARD_COLLECTED",
+            "provider": self.provider_name,
+            "endpoint": "/trades",
+            "condition_id": f"condition-{trade.market_id}",
+            "response_timestamp": trade.timestamp.isoformat(),
+            "query": {"poll": self.trade_calls},
+        }
+
 
 class _PagedProvider(_RecordingProvider):
     def __init__(
@@ -205,6 +239,7 @@ class _ScopeStore:
         self.states: dict[str, dict[str, object]] = {}
         self.errors: list[tuple[object, ...]] = []
         self.requirement_calls: list[tuple[str, ...]] = []
+        self.forward_tests: dict[str, dict[str, object]] = {}
 
     def load_candidate_lifecycle(self, candidate_id: str | None = None, *, limit: int = 1000):
         if candidate_id is not None:
@@ -251,12 +286,41 @@ class _ScopeStore:
 
     def load_polymarket_snapshots(self, *args, **kwargs):
         return []
+    def load_forward_tests(self, *, limit: int = 1000):
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+            raise ValueError("limit must be a non-negative integer")
+        return list(self.forward_tests.values())[:limit]
+
+    def load_forward_test(self, experiment_id: str):
+        if not str(experiment_id).strip():
+            raise ValueError("experiment_id is required")
+        record = self.forward_tests.get(str(experiment_id).strip())
+        return dict(record) if record is not None else None
+
+    def save_forward_test(self, experiment_id: str, spec):
+        self.forward_tests[str(experiment_id).strip()] = dict(spec)
+        return True
+
 
     def save_collection_cycle(self, *args, **kwargs):
         return None
 
     def save_dataset_catalog(self, *args, **kwargs):
         return None
+
+class _ImmutableTradeStore(_ScopeStore):
+    def __init__(self, documents: dict[str, dict[str, object]]) -> None:
+        super().__init__(documents)
+        self.trade_payloads: dict[tuple[str, str], str] = {}
+
+    def save_polymarket_trade(self, market_id, trade):
+        key = (str(market_id), str(trade["trade_id"]))
+        payload = json.dumps(dict(trade), sort_keys=True)
+        previous = self.trade_payloads.get(key)
+        if previous is not None and previous != payload:
+            raise AssertionError("immutable trade payload changed across collection cycles")
+        self.trade_payloads[key] = payload
+        return previous is None
 
 
 class _ScopeCollector(PolymarketCollector):
@@ -276,6 +340,7 @@ class MarketScopeCollectorTests(unittest.TestCase):
         candidate_ids: tuple[str, ...],
         *,
         max_markets: int = 10,
+        market_ids: tuple[str, ...] = (),
     ) -> _ScopeCollector:
         return _ScopeCollector(
             provider,
@@ -286,6 +351,7 @@ class MarketScopeCollectorTests(unittest.TestCase):
                 max_attempts=1,
                 backoff_initial_seconds=0,
                 jitter_seconds=0,
+                market_ids=market_ids,
             ),
             candidate_ids=candidate_ids,
             clock=lambda: T0,
@@ -297,6 +363,7 @@ class MarketScopeCollectorTests(unittest.TestCase):
             market("politics-match", category="politics", tags=("election",)),
             market("exact-match", category="economics"),
             market("title-only", category="economics"),
+
             market("closed-politics", category="politics", settlement=SettlementState.RESOLVED_YES, closed=True),
         )
         store = _ScopeStore(
@@ -316,6 +383,142 @@ class MarketScopeCollectorTests(unittest.TestCase):
         self.assertEqual(len(store.resolutions), 2)
         self.assertEqual({item.status for item in store.resolutions}, {MATCHED})
         self.assertEqual(set(provider.market_calls), {"politics-match", "exact-match"})
+
+    def test_scoped_configured_market_ids_exclude_unauthorized_values_everywhere(self) -> None:
+        authorized = market("authorized")
+        unauthorized = market("unauthorized")
+        store = _ScopeStore(
+            {
+                "candidate": {
+                    "experiment_plan": {
+                        "market_scope": scope(
+                            "EXACT_MARKETS",
+                            market_ids=("authorized",),
+                        )
+                    }
+                }
+            }
+        )
+        provider = _RecordingProvider((authorized, unauthorized))
+        cycle = self._collector(
+            provider,
+            store,
+            ("candidate",),
+            market_ids=("authorized", "unauthorized"),
+        ).collect_once(now=T0)
+
+        self.assertEqual(list(cycle.candidate_bound_markets), ["authorized"])
+        self.assertEqual(list(cycle.candidate_bound_scheduled), ["authorized"])
+        self.assertEqual(list(cycle.paper_forward_markets), [])
+        self.assertEqual(list(cycle.discovery_scheduled), [])
+        self.assertEqual(cycle.candidate_references, {"authorized": ["candidate"]})
+        self.assertNotIn("unauthorized", cycle.candidate_bound_markets)
+        self.assertNotIn("unauthorized", cycle.candidate_bound_missing)
+        self.assertNotIn("unauthorized", provider.market_calls)
+        self.assertTrue(provider.market_calls)
+        self.assertEqual(set(provider.market_calls), {"authorized"})
+
+    def test_scoped_paper_forward_candidate_stays_in_paper_tier(self) -> None:
+        paper_market = market("paper-market")
+        store = _ScopeStore(
+            {
+                "paper-candidate": {
+                    "experiment_plan": {
+                        "market_scope": scope(
+                            "EXACT_MARKETS",
+                            market_ids=("paper-market",),
+                        )
+                    }
+                }
+            }
+        )
+        store.documents["paper-candidate"]["stage"] = "PAPER_FORWARD"
+        provider = _RecordingProvider((paper_market,))
+        cycle = self._collector(
+            provider,
+            store,
+            (),
+            market_ids=("paper-market",),
+        ).collect_once(now=T0)
+
+        self.assertEqual(list(cycle.candidate_bound_markets), [])
+        self.assertEqual(list(cycle.candidate_references or {}), [])
+        self.assertEqual(list(cycle.paper_forward_markets), ["paper-market"])
+        self.assertEqual(list(cycle.paper_forward_scheduled), ["paper-market"])
+        self.assertEqual(cycle.tier_attempts["candidate"], 0)  # type: ignore[index]
+        self.assertEqual(cycle.tier_attempts["paper_forward"], 1)  # type: ignore[index]
+        self.assertTrue(provider.market_calls)
+        self.assertEqual(set(provider.market_calls), {"paper-market"})
+
+    def test_observation_intent_scope_never_enters_candidate_authority(self) -> None:
+        observation_market = market("observation-market")
+        store = _ScopeStore(
+            {
+                "observation-candidate": {
+                    "paper_observation_intent_id": "observation-intent-observation-candidate",
+                    "experiment_plan": {
+                        "market_scope": scope(
+                            "EXACT_MARKETS",
+                            market_ids=("observation-market",),
+                        )
+                    },
+                }
+            }
+        )
+        store.documents["observation-candidate"]["stage"] = "SCHEMA_VALIDATED"
+        store.forward_tests["observation-intent-observation-candidate"] = {
+            "experiment_id": "observation-intent-observation-candidate",
+            "strategy_hash": "sha256:observation-strategy",
+            "model_hash": "sha256:observation-model",
+            "config": {
+                "candidate_id": "observation-candidate",
+                "observation_intent": True,
+                "market_authority_required": False,
+                "strategy_document": {"type": "observation"},
+                "model_document": {"type": "observation"},
+            },
+            "start_timestamp": T0.isoformat(),
+            "registration_timestamp": T0.isoformat(),
+            "bankroll": 10_000.0,
+            "allowed_markets": [],
+            "risk_limits": {},
+            "quality": "PAPER_FORWARD",
+        }
+        provider = _RecordingProvider((observation_market,))
+        cycle = self._collector(provider, store, ()).collect_once(now=T0)
+
+        self.assertEqual(list(cycle.candidate_bound_markets), [])
+        self.assertEqual(cycle.candidate_references, {})
+        self.assertEqual(list(cycle.paper_forward_markets), ["observation-market"])
+        self.assertEqual(list(cycle.paper_forward_scheduled), ["observation-market"])
+        self.assertNotIn("observation-candidate", cycle.candidate_references or {})
+        self.assertTrue(provider.market_calls)
+        self.assertEqual(set(provider.market_calls), {"observation-market"})
+
+    def test_repeated_public_trade_poll_keeps_immutable_evidence_stable(self) -> None:
+        provider = _RepeatingTradeProvider((market("repeat-trade"),))
+        store = _ImmutableTradeStore(
+            {
+                "candidate": {
+                    "experiment_plan": {
+                        "market_scope": scope("EXACT_MARKETS", market_ids=("repeat-trade",))
+                    }
+                }
+            }
+        )
+        collector = self._collector(provider, store, ("candidate",))
+
+        collector.collect_once(now=T0)
+        second = collector.collect_once(now=T0 + timedelta(seconds=61))
+
+        self.assertEqual(provider.trade_calls, 2)
+        self.assertEqual(len(store.trade_payloads), 1)
+        self.assertEqual(second.trade_duplicates, 1)
+        self.assertFalse(any(error[2] == "trades" for error in store.errors))
+        payload = json.loads(next(iter(store.trade_payloads.values())))
+        self.assertEqual(payload["source_type"], "FORWARD_COLLECTED")
+        self.assertEqual(payload["source_timestamp"], T0.isoformat())
+
 
     def test_exact_and_rule_resolution_persist_exclusion_and_defer_taxonomy(self) -> None:
         provider = _RecordingProvider(

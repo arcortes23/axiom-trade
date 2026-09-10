@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import getpass
 import argparse
+import os
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
@@ -25,8 +26,14 @@ from .director import compact_report, research_summary, validate_hermes_proposal
 from .domain import OHLCVBar, utc_now
 from .evaluation import evaluate_scores, split_dataset
 from .forward import ForwardTestRegistry, _content_hash
-from .node import NodeConfig, ResearchNode
 from .paper_engine import historical_replay_id, run_forward_paper, run_historical_replay
+from .node import (
+    EXECUTION_PROFILE_ENV,
+    ISOLATED_EXECUTION_PROFILE,
+    NodeConfig,
+    ResearchNode,
+    normalized_execution_profile,
+)
 from .research import run_crypto_research, run_initial_research, write_report
 from .research import run_multi_symbol_crypto_research
 from .research_bus import DurableResearchBus, ResearchBusPermissionError, _validate_payload
@@ -60,6 +67,88 @@ DEFAULT_DB_PATH = "runtime-data/axiom.sqlite"
 _BINANCE_TESTNET_CREDENTIAL_INSTANCE = "binance-testnet"
 _BINANCE_TESTNET_CREDENTIAL_NAMESPACE = "AXIOM-BINANCE-SPOT-TESTNET"
 
+_CANARY_SUBMIT_SUCCESS_STATUSES = frozenset(
+    {"SUBMITTED", "ACCEPTED", "MATCHED", "PARTIALLY_FILLED", "SETTLED"}
+)
+_CANARY_SUBMIT_FAILURE_STATUSES = frozenset(
+    {
+        "REJECTED",
+        "UNKNOWN",
+        "AMBIGUOUS",
+        "FAILED",
+        "FAILURE",
+        "ERROR",
+        "BLOCKED",
+        "DENIED",
+        "TIMEOUT",
+        "DISCONNECTED",
+        "RATE_LIMIT",
+        "CANCELED",
+        "CANCELLED",
+        "EXPIRED",
+    }
+)
+
+
+def _canary_status_ready(payload: Mapping[str, Any]) -> bool:
+    """Return the storage-only status exit predicate.
+
+    Readiness keeps its existing CURRENT/stale contract.  An expired deadline
+    is additionally rejected even when the read-only report has projected the
+    persisted ARMED row to DISARMED, so a stale arm cannot look submittable.
+    """
+    readiness = payload.get("readiness")
+    if not (
+        isinstance(readiness, Mapping)
+        and readiness.get("status") == "CURRENT"
+        and not bool(readiness.get("stale"))
+    ):
+        return False
+    control = payload.get("control")
+    if not isinstance(control, Mapping):
+        control = payload.get("authoritative_control")
+    if not isinstance(control, Mapping):
+        return True
+    state = str(control.get("state") or "").strip().upper()
+    expires_at = control.get("expires_at")
+    if state in {"ARMED", "DISARMED"} and expires_at:
+        try:
+            parsed_expiry = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
+            parsed_expiry = (
+                parsed_expiry.astimezone(timezone.utc)
+                if parsed_expiry.tzinfo is not None
+                else parsed_expiry.replace(tzinfo=timezone.utc)
+            )
+        except (TypeError, ValueError, OverflowError):
+            return False if state == "ARMED" else True
+        if parsed_expiry <= utc_now():
+            return False
+    return True
+
+
+def _canary_submit_succeeded(payload: Any) -> bool:
+    """Accept only an explicit canonical submit outcome from CanaryService."""
+    if not isinstance(payload, Mapping):
+        return False
+    execution_status = str(payload.get("execution_status") or "").strip().upper()
+    if execution_status not in _CANARY_SUBMIT_SUCCESS_STATUSES:
+        return False
+    status = str(payload.get("status") or "").strip().upper()
+    return not status or status not in _CANARY_SUBMIT_FAILURE_STATUSES
+
+
+class _OperatorPortAction(argparse.Action):
+    """Record explicit operator ports so isolated mode can choose 8187."""
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: Any,
+        option_string: str | None = None,
+    ) -> None:
+        setattr(namespace, self.dest, int(values))
+        setattr(namespace, "_operator_port_explicit", True)
 
 def _binance_testnet_credential_ref() -> BinanceCredentialRef:
     return BinanceCredentialRef(
@@ -225,9 +314,10 @@ def build_parser() -> argparse.ArgumentParser:
     auto_testnet.add_argument("--window-seconds", required=True, type=int)
     auto_testnet.add_argument("--symbol")
     operator.add_argument("--db", default=DEFAULT_DB_PATH, help="canonical SQLite operational database path")
-    operator.add_argument("--port", type=int, default=8080)
-    operator.add_argument("--open-browser", action="store_true")
+    operator.add_argument("--port", type=int, default=8080, action=_OperatorPortAction)
     operator.add_argument("--hermes-job-id")
+    operator.add_argument("--isolated", action="store_true", help="deny production credentials and order/account transports")
+    operator.add_argument("--open-browser", action="store_true", help="open the localhost operator dashboard in the default browser")
     operator.add_argument("--once", action="store_true", help="bind and stop after readiness smoke check")
     historical = commands.add_parser("historical", help="run public Binance and Polymarket research")
     historical.add_argument("--markets", type=int, default=20, help="maximum resolved prediction markets to inspect")
@@ -369,11 +459,13 @@ def build_parser() -> argparse.ArgumentParser:
     node_run = commands.add_parser("node-run", aliases=("run-research-node",), help="run the always-on public-data paper node")
     node_run.add_argument("--db", default=DEFAULT_DB_PATH)
     node_run.add_argument("--cycles", type=int, default=0, help="finite test cycles; 0 runs until stopped")
-    node_run.add_argument("--interval", type=float, default=60.0)
+    node_run.add_argument("--isolated", action="store_true", help="deny production credentials and order/account transports")
+    node_run.add_argument("--interval", type=float, default=60.0, help="collection interval in seconds")
     node_run.add_argument("--depth", type=int, default=20)
     node_run.add_argument("--max-markets", type=int, default=100)
     node_run.add_argument("--log")
     node_run.add_argument("--lock")
+    node_run.add_argument("--pid")
     node_run.add_argument("--crypto-source", choices=("public", "synthetic", "disabled"), default="public")
     node_run.add_argument("--crypto-symbol", default="BTC/USDT")
     node_run.add_argument("--research-items", type=int, default=1, help="bounded queue items per node cycle")
@@ -393,6 +485,8 @@ def build_parser() -> argparse.ArgumentParser:
     node_status.add_argument("--db", default=DEFAULT_DB_PATH)
     node_status.add_argument("--lock")
     node_status.add_argument("--log")
+    node_status.add_argument("--pid")
+    node_status.add_argument("--isolated", action="store_true", help="report the isolated execution profile")
     proposal = commands.add_parser("submit-proposal", help="validate and enqueue a bounded Hermes research proposal")
     proposal.add_argument("--db", default=DEFAULT_DB_PATH)
     proposal.add_argument("--proposal", required=True, help="JSON object or path to a JSON file")
@@ -444,6 +538,8 @@ def build_parser() -> argparse.ArgumentParser:
     arm = commands.add_parser("canary-arm", help="explicitly arm an expiring Polymarket micro-live canary")
     arm.add_argument("--db", default=DEFAULT_DB_PATH)
     arm.add_argument("--venue", choices=("polymarket",), required=True)
+    arm.add_argument("--config-id", required=True, help="exact ACTIVE settings configuration ID under review")
+    arm.add_argument("--expected-generation", required=True, type=int, help="exact ACTIVE settings generation under review")
     arm.add_argument("--candidate", required=True)
     arm.add_argument("--target-notional-usd", type=Decimal, default=Decimal("1.00"))
     arm.add_argument("--expires-hours", type=Decimal, default=Decimal("24"))
@@ -454,6 +550,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="perform strict authenticated read-only checks without placing an order",
     )
     check.add_argument("--db", default=DEFAULT_DB_PATH)
+    check.add_argument("--isolated", action="store_true", help="deny production credentials and order/account transports")
     check.add_argument("--candidate")
     check.add_argument("--market")
     check.add_argument("--market-id", dest="market")
@@ -868,7 +965,6 @@ def _run_binance_testnet(args: argparse.Namespace) -> int:
             payload = runtime.auto(
                 confirmation=args.confirmation,
                 window_seconds=args.window_seconds,
-                symbol=args.symbol,
             )
         else:  # pragma: no cover
             raise ValueError(f"unsupported Binance TESTNET command: {command}")
@@ -878,8 +974,81 @@ def _run_binance_testnet(args: argparse.Namespace) -> int:
         if runtime is not None:
             runtime.stop()
 
+def _validate_cli_node_resource_paths(args: argparse.Namespace) -> None:
+    """Keep CLI node ownership markers canonical to the selected database."""
+    db_value = str(getattr(args, "db", "") or "").strip()
+    if db_value.casefold() == ":memory:" or db_value.casefold().startswith("file:"):
+        if getattr(args, "lock", None) or getattr(args, "pid", None):
+            raise ValueError("node --lock/--pid overrides require a filesystem database")
+        return
+    db_path = os.path.abspath(os.path.expanduser(db_value))
+    for option, suffix in (("lock", ".lock"), ("pid", ".node.pid")):
+        supplied = getattr(args, option, None)
+        if supplied is None or not str(supplied).strip():
+            continue
+        expected = os.path.normcase(os.path.abspath(f"{db_path}{suffix}"))
+        actual = os.path.normcase(os.path.abspath(os.path.expanduser(str(supplied))))
+        if actual != expected:
+            raise ValueError(f"node --{option} must be the canonical database marker {db_path}{suffix}")
+
 def _main_impl(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    isolated = bool(getattr(args, "isolated", False)) or (
+        normalized_execution_profile(os.environ.get(EXECUTION_PROFILE_ENV))
+        == ISOLATED_EXECUTION_PROFILE
+    )
+    if isolated:
+        # Ambient isolation is authoritative for credential and order paths:
+        # copied dashboard controls and --allow-environment cannot re-enable them.
+        os.environ[EXECUTION_PROFILE_ENV] = ISOLATED_EXECUTION_PROFILE
+    isolated_blocked_commands = {
+        "binance-testnet",
+        "binance-dev",
+        "binance-credentials",
+        "credentials",
+        "canary-check",
+        "canary-connectivity-check",
+        "canary-arm",
+        "canary-submit",
+    }
+    operator_port = int(args.port) if args.command == "operator" else None
+    if (
+        isolated
+        and args.command == "operator"
+        and not bool(getattr(args, "_operator_port_explicit", False))
+    ):
+        operator_port = 8187
+    if isolated and args.command == "operator" and operator_port == 8080:
+        print(
+            json.dumps(
+                {
+                    "ready": False,
+                    "blocked": True,
+                    "blocker": "ISOLATED_OPERATOR_PORT_MUST_NOT_BE_8080",
+                    "port": operator_port,
+                    "required_port": 8187,
+                },
+                sort_keys=True,
+                indent=2,
+            )
+        )
+        return 1
+    if isolated and args.command in isolated_blocked_commands:
+        print(
+            json.dumps(
+                {
+                    "ready": False,
+                    "blocked": True,
+                    "blocker": "ISOLATED_EXECUTION_PROFILE",
+                    "command": args.command,
+                    "paper_only": True,
+                    "live_execution": False,
+                },
+                sort_keys=True,
+                indent=2,
+            )
+        )
+        return 1
     if args.command == "binance-testnet":
         return _run_binance_testnet(args)
     if args.command == "binance-dev":
@@ -1008,19 +1177,17 @@ def _main_impl(argv: Sequence[str] | None = None) -> int:
                         payload = service.arm(
                             args.candidate,
                             venue=venue,
+                            config_id=args.config_id,
+                            expected_generation=args.expected_generation,
                             target_notional_usd=args.target_notional_usd,
                             expires_hours=args.expires_hours,
                             credentials_configured=credentials_configured,
                         )
             print(json.dumps(payload, sort_keys=True, indent=2, default=str))
             if args.command == "canary-status":
-                readiness = payload.get("readiness")
-                ready = (
-                    isinstance(readiness, Mapping)
-                    and readiness.get("status") == "CURRENT"
-                    and not bool(readiness.get("stale"))
-                )
-                return 0 if ready else 1
+                return 0 if _canary_status_ready(payload) else 1
+            if args.command == "canary-submit":
+                return 0 if _canary_submit_succeeded(payload) else 1
             return 0 if payload.get("ready", True) else 1
         except CanaryBlocked as exc:
             print(
@@ -1392,7 +1559,10 @@ def _main_impl(argv: Sequence[str] | None = None) -> int:
         print(json.dumps(payload, sort_keys=True, indent=2, default=str))
         return 0
     if args.command in {"node-run", "run-research-node"}:
-        if args.crypto_source == "public":
+        _validate_cli_node_resource_paths(args)
+        if isolated:
+            crypto_provider = None
+        elif args.crypto_source == "public":
             crypto_provider = BinanceAdapter(args.crypto_symbol, timeout=args.crypto_timeout)
         elif args.crypto_source == "synthetic":
             crypto_provider = SyntheticCryptoProvider(args.crypto_symbol, start=_SYNTHETIC_START, periods=1000)
@@ -1402,12 +1572,14 @@ def _main_impl(argv: Sequence[str] | None = None) -> int:
             NodeConfig(
                 db_path=args.db,
                 lock_path=args.lock,
+                pid_path=args.pid,
                 log_path=args.log,
+                execution_profile=ISOLATED_EXECUTION_PROFILE if isolated else None,
                 interval_seconds=args.interval,
                 depth=args.depth,
                 max_markets=args.max_markets,
                 crypto_symbol=args.crypto_symbol,
-                crypto_enabled=args.crypto_source != "disabled",
+                crypto_enabled=(not isolated) and args.crypto_source != "disabled",
                 research_enabled=not args.disable_research,
                 research_max_items_per_cycle=args.research_items,
                 paper_candidates_per_cycle=args.paper_candidates,
@@ -1438,9 +1610,16 @@ def _main_impl(argv: Sequence[str] | None = None) -> int:
         print(json.dumps(payload, sort_keys=True, indent=2, default=str))
         return 0
     if args.command == "node-status":
+        _validate_cli_node_resource_paths(args)
         with AxiomStore(args.db) as store:
             node = ResearchNode(
-                NodeConfig(db_path=args.db, lock_path=args.lock, log_path=args.log),
+                NodeConfig(
+                    db_path=args.db,
+                    lock_path=args.lock,
+                    pid_path=args.pid,
+                    log_path=args.log,
+                    execution_profile=ISOLATED_EXECUTION_PROFILE if isolated else None,
+                ),
                 store=store,
             )
             payload = node.status()
@@ -1478,7 +1657,7 @@ def _main_impl(argv: Sequence[str] | None = None) -> int:
             node_status = control.ensure_node()
             server = DashboardServer(
                 "127.0.0.1",
-                args.port,
+                operator_port,
                 data=DashboardData(store=dashboard_store, control=control),
             )
             server.start()

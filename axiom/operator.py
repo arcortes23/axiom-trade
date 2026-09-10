@@ -17,21 +17,38 @@ import sqlite3
 import sys
 import threading
 import time
+import uuid
 from typing import Any, Callable, Mapping
 
 from .autonomous import AutonomousResearchProcessor
 from .canary import (
-    AUTONOMOUS_CANARY_LIMITS,
+    CANARY_READINESS_SNAPSHOT_MAX_AGE_SECONDS,
     CanaryBlocked,
     CanaryService,
     CredentialStore,
     PolymarketClobV2Venue,
+    credential_fingerprint,
 )
+from .canary_positions import (
+    RECOVERY_ACTION,
+    RECOVERY_CONFIRMATION,
+    RecoveryProfileError,
+    normalize_recovery_profile,
+    recovery_identifier,
+)
+from .canary_settings import CanarySettingsService
 from .bootstrap import BTC_HISTORY_START, HistoricalBootstrapper
 from .crypto_universe import load_crypto_universe
 from .data import BinanceAdapter
 from .domain import utc_now
-from .node import _pid_alive, _pid_matches_node
+from .node import (
+    EXECUTION_PROFILE_ENV,
+    ISOLATED_EXECUTION_PROFILE,
+    PRODUCTION_EXECUTION_PROFILE,
+    _pid_alive,
+    _pid_matches_node,
+    normalized_execution_profile,
+)
 from .storage import AxiomStore
 
 
@@ -40,7 +57,6 @@ BOOTSTRAP_JOB_NAME = "crypto-universe-bootstrap"
 HERMES_STATE_NAME = "hermes-control"
 # The configured Hermes job is an external reference only.  The operator has
 # no local verifier for that process, so scheduler state must never be exposed
-# as the external job's status.
 HERMES_CONTROL_SCOPE = "INTERNAL_RESEARCH_QUEUE_PROCESSOR"
 HERMES_EXTERNAL_STATUS = "UNKNOWN"
 HERMES_EXTERNAL_EVIDENCE = (
@@ -65,6 +81,11 @@ _ALLOWED_ACTIONS = frozenset(
         "canary.enable_auto",
         "canary.disarm",
         "canary.kill",
+        "canary.recover_entry",
+        "canary.settings.save_draft",
+        "canary.settings.activate_draft",
+        "risk.settings.save_draft",
+        "risk.settings.activate_draft",
     }
 )
 _CONFIRMATIONS = {
@@ -73,13 +94,31 @@ _CONFIRMATIONS = {
     "canary.enable_auto": "ENABLE AUTO CANARY",
     "canary.disarm": "DISARM",
     "canary.kill": "KILL",
+    RECOVERY_ACTION: RECOVERY_CONFIRMATION,
+    "canary.settings.save_draft": "SAVE RISK SETTINGS DRAFT",
+    "canary.settings.activate_draft": "ACTIVATE RISK SETTINGS DRAFT",
+    "risk.settings.save_draft": "SAVE RISK SETTINGS DRAFT",
+    "risk.settings.activate_draft": "ACTIVATE RISK SETTINGS DRAFT",
 }
+_ISOLATED_OPERATOR_BLOCKED_ACTIONS = frozenset(
+    {
+        "canary.connectivity_check",
+        "canary.arm",
+        "canary.enable_auto",
+        "canary.settings.activate_draft",
+        "risk.settings.activate_draft",
+    }
+)
 CANARY_CONNECTIVITY_CONFIG_KEY = "canary_connectivity_status"
+
+
 
 _CONNECTIVITY_FAILURE_REASONS = {
     "CONNECTIVITY_CHECK_FAILED": "Connectivity check failed.",
     "CREDENTIALS_NOT_CONFIGURED": "Polymarket credentials are not configured.",
     "VENUE_REQUIRED": "A Polymarket venue is required for the connectivity check.",
+    "CREDENTIAL_BINDING_MISSING": "Credential binding is missing.",
+    "CREDENTIAL_BINDING_MISMATCH": "Credential binding does not match the configured account.",
     "OFFICIAL_POLYMARKET_SDK_NOT_INSTALLED": "The Polymarket SDK is not installed.",
     "UNSUPPORTED_POLYMARKET_SDK": "The installed Polymarket SDK version is unsupported.",
     "OFFICIAL_POLYMARKET_SDK_NOT_READONLY_COMPATIBLE": "The installed Polymarket SDK does not support safe read-only connectivity.",
@@ -87,18 +126,17 @@ _CONNECTIVITY_FAILURE_REASONS = {
     "GEOBLOCK_CHECK_FAILED": "The geographic access check failed.",
     "AUTHENTICATED_CONNECTIVITY_FAILED": "Authenticated connectivity failed.",
     "ACCOUNT_CHECK_FAILED": "The account check failed.",
-    "BALANCE_CHECK_FAILED": "The balance check failed.",
     "BALANCE_RESPONSE_INVALID": "The balance response was invalid.",
-    "INSUFFICIENT_BALANCE": "Available balance is below the $1 canary requirement.",
+    "INSUFFICIENT_BALANCE": "Available balance is below the active canary requirement.",
     "CANARY_ALLOWANCE_UNAVAILABLE": "Allowance information is unavailable.",
-    "CANARY_ALLOWANCE_INSUFFICIENT": "Current allowance is below the amount required for a $1 canary.",
+    "CANARY_ALLOWANCE_INSUFFICIENT": "Current allowance is below the active canary requirement.",
     "CANARY_SPENDER_UNAVAILABLE": "The canary allowance spender is unavailable.",
     "MARKET_CONNECTIVITY_FAILED": "Market connectivity failed.",
     "MARKET_NOT_ACCEPTING_ORDERS": "The market is not accepting orders.",
     "MARKET_OUTCOMES_UNAVAILABLE": "Market outcomes are unavailable.",
     "MARKET_OUTCOME_NOT_ALLOWED": "The requested market outcome is not allowed.",
     "MARKET_OUTCOME_ID_UNAVAILABLE": "The market outcome identifier is unavailable.",
-    "VENUE_MINIMUM_EXCEEDS_CANARY_TARGET": "The venue minimum exceeds the $1 canary target.",
+    "VENUE_MINIMUM_EXCEEDS_CANARY_TARGET": "The venue minimum exceeds the active canary target.",
 }
 _CONNECTIVITY_FAILURE_CODES = frozenset(_CONNECTIVITY_FAILURE_REASONS)
 _CONNECTIVITY_TEXT_LIMIT = 128
@@ -107,6 +145,8 @@ _CONNECTIVITY_SUPPORTED_SDK = "0.9"
 _CONNECTIVITY_CODE = re.compile(r"^[A-Z0-9][A-Z0-9_.:-]{0,63}$")
 _CONNECTIVITY_LABEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _./:-]{0,63}$")
 _CONNECTIVITY_DECIMAL = re.compile(r"^(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$")
+_CREDENTIAL_FINGERPRINT_RE = re.compile(r"^sha256:v1:[0-9a-f]{64}$")
+_CONNECTIVITY_FINGERPRINT_UNSET = object()
 _CONNECTIVITY_VERSION = re.compile(r"^[vV]?[0-9]{1,8}(?:\.[0-9]{1,8}){0,7}(?:[-+][0-9A-Za-z.-]{1,32})?$")
 _CONNECTIVITY_ADDRESS = re.compile(r"0x[0-9a-fA-F]{16,}", re.I)
 _CONNECTIVITY_HEX_ADDRESS = re.compile(r"(?<![A-Za-z0-9])[0-9a-fA-F]{32,}(?![A-Za-z0-9])")
@@ -195,6 +235,19 @@ def _connectivity_checked_at(value: Any) -> str | None:
     return stamp.astimezone(timezone.utc).isoformat()
 
 
+def _connectivity_projection_is_fresh(checked_at: str) -> bool:
+    try:
+        now = _connectivity_checked_at(utc_now())
+        if now is None:
+            return False
+        age_seconds = (
+            datetime.fromisoformat(now) - datetime.fromisoformat(checked_at)
+        ).total_seconds()
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return 0.0 <= age_seconds <= CANARY_READINESS_SNAPSHOT_MAX_AGE_SECONDS
+
+
 def _connectivity_failure_codes(raw: Mapping[str, Any], *, ready: bool) -> list[str]:
     """Return a bounded, deterministic set of canonical failure codes."""
     result: list[str] = []
@@ -276,8 +329,22 @@ def _connectivity_status(value: Any, *, pass_values: frozenset[str], fail_values
     return None
 
 
-def _project_connectivity(value: Any, *, checked_at: Any = None) -> dict[str, Any]:
-    """Project service diagnostics into the deliberately small operator schema."""
+
+
+def _project_connectivity(
+    value: Any,
+    *,
+    checked_at: Any = None,
+    authoritative_credentials_configured: bool | None = None,
+    authoritative_fingerprint: Any = _CONNECTIVITY_FINGERPRINT_UNSET,
+) -> dict[str, Any]:
+    """Project service diagnostics into the deliberately small operator schema.
+
+    The service and venue may obtain credentials through different read paths.
+    When the operator has an authoritative credential read, bind the public
+    account projection to that read rather than persisting an arbitrary
+    fingerprint supplied by a transport.
+    """
     raw = value if isinstance(value, Mapping) else {}
     diagnostics = raw.get("diagnostics") if isinstance(raw.get("diagnostics"), Mapping) else {}
     requested_ready = raw.get("ready") if isinstance(raw.get("ready"), bool) else False
@@ -304,16 +371,25 @@ def _project_connectivity(value: Any, *, checked_at: Any = None) -> dict[str, An
             sdk_installed = False
 
     credentials_raw = raw.get("credentials") if isinstance(raw.get("credentials"), Mapping) else {}
-    credentials_configured = raw.get("credentials_configured")
-    if not isinstance(credentials_configured, bool):
-        credentials_configured = diagnostics.get("credentials_configured")
-    if not isinstance(credentials_configured, bool):
-        credentials_configured = credentials_raw.get("status") == "CONFIGURED"
+    raw_credentials_configured = raw.get("credentials_configured")
+    if not isinstance(raw_credentials_configured, bool):
+        raw_credentials_configured = diagnostics.get("credentials_configured")
+    if not isinstance(raw_credentials_configured, bool):
+        raw_credentials_configured = credentials_raw.get("status") == "CONFIGURED"
     credentials_status = str(credentials_raw.get("status") or "").strip().upper()
     if credentials_status == "NOT CONFIGURED":
-        credentials_configured = False
+        raw_credentials_configured = False
     elif credentials_status == "CONFIGURED" and not isinstance(raw.get("credentials_configured"), bool):
-        credentials_configured = True
+        raw_credentials_configured = True
+    credentials_configured = (
+        authoritative_credentials_configured
+        if isinstance(authoritative_credentials_configured, bool)
+        else bool(raw_credentials_configured)
+    )
+    if not credentials_configured and "VENUE_REQUIRED" in failure_codes:
+        # A venue cannot be constructed before credentials are configured; do
+        # not report that derived prerequisite alongside its root blocker.
+        failure_codes.remove("VENUE_REQUIRED")
 
     def source(name: str, diagnostic_name: str | None = None) -> Mapping[str, Any]:
         candidate = raw.get(name)
@@ -339,6 +415,8 @@ def _project_connectivity(value: Any, *, checked_at: Any = None) -> dict[str, An
         return status
 
     authentication_raw = source("authentication")
+    if not credentials_configured:
+        authentication_raw = {}
     authentication_status = explicit_status(
         authentication_raw,
         pass_values=frozenset({"OK", "PASS", "PASSED", "SUCCESS"}),
@@ -346,11 +424,13 @@ def _project_connectivity(value: Any, *, checked_at: Any = None) -> dict[str, An
     )
     if authentication_status is None and "AUTHENTICATED_CONNECTIVITY_FAILED" in failure_codes:
         authentication_status = "FAIL"
-    if not authentication_status and not credentials_configured:
+    if not credentials_configured:
         authentication_status = "SKIPPED"
     authentication = {"status": authentication_status or "SKIPPED"}
 
     account_raw = source("account")
+    if not credentials_configured:
+        account_raw = {}
     account_status = explicit_status(
         account_raw,
         pass_values=frozenset({"OK", "PASS", "PASSED", "SUCCESS"}),
@@ -360,10 +440,35 @@ def _project_connectivity(value: Any, *, checked_at: Any = None) -> dict[str, An
         account_status = "PASS" if account_raw["authenticated"] else "FAIL"
     if account_status is None and "ACCOUNT_CHECK_FAILED" in failure_codes:
         account_status = "FAIL"
+    raw_fingerprint = account_raw.get("credential_fingerprint")
+    account_fingerprint = (
+        raw_fingerprint
+        if isinstance(raw_fingerprint, str)
+        and _CREDENTIAL_FINGERPRINT_RE.fullmatch(raw_fingerprint)
+        else None
+    )
+    if authoritative_fingerprint is not _CONNECTIVITY_FINGERPRINT_UNSET:
+        bound_fingerprint = (
+            authoritative_fingerprint
+            if isinstance(authoritative_fingerprint, str)
+            and _CREDENTIAL_FINGERPRINT_RE.fullmatch(authoritative_fingerprint)
+            else None
+        )
+        if (
+            credentials_configured
+            and bound_fingerprint is not None
+            and account_fingerprint is not None
+            and account_fingerprint != bound_fingerprint
+        ):
+            add_failure("CREDENTIAL_BINDING_MISMATCH")
+        account_fingerprint = bound_fingerprint
     account = {
         "status": account_status or "SKIPPED",
         "wallet_type": _connectivity_text(account_raw.get("wallet_type")),
+        "credential_fingerprint": account_fingerprint,
     }
+    if credentials_configured and account_fingerprint is None:
+        add_failure("CREDENTIAL_BINDING_MISSING")
 
     geoblock_raw = source("geoblock")
     geoblock_status = explicit_status(
@@ -388,6 +493,8 @@ def _project_connectivity(value: Any, *, checked_at: Any = None) -> dict[str, An
     }
 
     balance_raw = source("balance")
+    if not credentials_configured:
+        balance_raw = {}
     balance_status = explicit_status(
         balance_raw,
         pass_values=frozenset({"OK", "PASS", "PASSED", "SUCCESS"}),
@@ -406,8 +513,12 @@ def _project_connectivity(value: Any, *, checked_at: Any = None) -> dict[str, An
     balance = {"status": balance_status or "SKIPPED", "available_usd": available_usd}
 
     allowance_raw = source("allowance")
+    if not credentials_configured:
+        allowance_raw = {}
     allowance_value = str(allowance_raw.get("status") or "").strip().upper()
-    if "CANARY_ALLOWANCE_INSUFFICIENT" in failure_codes or allowance_value == "INSUFFICIENT":
+    if not credentials_configured:
+        allowance_status = "SKIPPED"
+    elif "CANARY_ALLOWANCE_INSUFFICIENT" in failure_codes or allowance_value == "INSUFFICIENT":
         allowance_status = "INSUFFICIENT"
     elif "CANARY_ALLOWANCE_UNAVAILABLE" in failure_codes or allowance_value in {"FAILED", "FAIL", "ERROR", "UNAVAILABLE"}:
         allowance_status = "UNAVAILABLE"
@@ -564,13 +675,13 @@ _CONNECTIVITY_PROJECTION_KEYS = frozenset(
         "ready",
         "status",
         "checked_at",
+        "allowance",
         "sdk",
         "credentials",
         "authentication",
         "account",
         "geoblock",
         "balance",
-        "allowance",
         "market",
         "order_book",
         "failure_codes",
@@ -582,20 +693,25 @@ _CONNECTIVITY_PROJECTION_NESTED_KEYS = {
     "sdk": frozenset({"installed", "name", "version", "status"}),
     "credentials": frozenset({"status"}),
     "authentication": frozenset({"status"}),
-    "account": frozenset({"status", "wallet_type"}),
     "geoblock": frozenset({"status", "country", "region"}),
-    "balance": frozenset({"status", "available_usd"}),
+    "account": frozenset({"status", "wallet_type", "credential_fingerprint"}),
     "allowance": frozenset({"status"}),
     "market": frozenset({"status"}),
     "order_book": frozenset({"status"}),
 }
 
 
-def _stored_connectivity_projection(value: Any) -> dict[str, Any] | None:
+def _stored_connectivity_projection(
+    value: Any,
+    *,
+    require_fresh: bool = False,
+) -> dict[str, Any] | None:
     if not isinstance(value, Mapping) or set(value) != _CONNECTIVITY_PROJECTION_KEYS:
         return None
     checked_at = _connectivity_checked_at(value.get("checked_at"))
     if checked_at is None or value.get("checked_at") != checked_at:
+        return None
+    if require_fresh and not _connectivity_projection_is_fresh(checked_at):
         return None
     for name, keys in _CONNECTIVITY_PROJECTION_NESTED_KEYS.items():
         child = value.get(name)
@@ -628,10 +744,9 @@ def _stored_connectivity_projection(value: Any) -> dict[str, Any] | None:
             or _connectivity_version(sdk_version) != sdk_version
             or not _connectivity_sdk_supported(sdk_version)
             or value["credentials"]["status"] != "CONFIGURED"
-            or value["authentication"]["status"] != "PASS"
             or value["account"]["status"] != "PASS"
+            or value["account"]["credential_fingerprint"] is None
             or value["geoblock"]["status"] != "PASS"
-            or value["balance"]["status"] != "PASS"
             or available_usd is None
             or Decimal(available_usd) < Decimal("1")
             or value["balance"]["available_usd"] != available_usd
@@ -643,14 +758,19 @@ def _stored_connectivity_projection(value: Any) -> dict[str, Any] | None:
     elif value["status"] != "BLOCKED" or not failure_codes:
         return None
     return dict(value)
-
-
-def _blocked_connectivity_projection(code: Any = None) -> dict[str, Any]:
+def _blocked_connectivity_projection(
+    code: Any = None,
+    *,
+    credentials_configured: bool | None = None,
+    authoritative_fingerprint: Any = _CONNECTIVITY_FINGERPRINT_UNSET,
+) -> dict[str, Any]:
     candidate = code.strip().upper() if isinstance(code, str) else ""
     safe_code = candidate if candidate in _CONNECTIVITY_FAILURE_CODES else "CONNECTIVITY_CHECK_FAILED"
     return _project_connectivity(
         {"ready": False, "failures": [safe_code], "live_execution": False},
         checked_at=utc_now(),
+        authoritative_credentials_configured=credentials_configured,
+        authoritative_fingerprint=authoritative_fingerprint,
     )
 
 
@@ -816,6 +936,23 @@ def _safe_identifier(value: Any, field: str) -> str:
         raise OperatorControlError("INVALID_IDENTIFIER", f"invalid {field}")
     return identifier
 
+_POSITIVE_GENERATION = re.compile(r"^[1-9][0-9]*$")
+
+
+def _positive_generation(value: Any, code: str) -> int:
+    """Accept only an exact positive integer fence, never lossy coercions."""
+    if isinstance(value, bool):
+        raise OperatorControlError(code)
+    if isinstance(value, int):
+        generation = value
+    elif isinstance(value, str) and _POSITIVE_GENERATION.fullmatch(value):
+        generation = int(value)
+    else:
+        raise OperatorControlError(code)
+    if generation < 1:
+        raise OperatorControlError(code)
+    return generation
+
 
 def _loopback_host(value: str) -> bool:
     if str(value).strip().lower() == "localhost":
@@ -939,29 +1076,53 @@ class HermesOperatorAdapter:
         )
         return {**self.state(), "last_result": result}
 
-
 class OperatorControlPlane:
-    """Authoritative action boundary used by the dashboard and launcher."""
+    """Allowlisted, localhost-only operator action control plane."""
 
     def __init__(
         self,
         store: AxiomStore,
         *,
-        db_path: str | os.PathLike[str] | None = None,
+        db_path: str | None = None,
+        node_launcher: Callable[[list[str]], subprocess.Popen[Any]] | None = None,
+        settings_service: CanarySettingsService | None = None,
         hermes_job_id: str | None = None,
-        node_launcher: Callable[[list[str]], Any] | None = None,
+        execution_profile: str | None = None,
+        profile: Any | None = None,
     ) -> None:
         self.store = store
+        ambient_profile = os.environ.get(EXECUTION_PROFILE_ENV)
+        selected_profile = (
+            profile
+            if profile is not None
+            else (
+                ambient_profile
+                if ambient_profile not in {None, ""}
+                else execution_profile
+            )
+        )
+        try:
+            self.execution_profile = normalized_execution_profile(
+                selected_profile,
+                default=PRODUCTION_EXECUTION_PROFILE,
+            )
+        except (TypeError, ValueError):
+            # An invalid ambient profile is an isolation fence, never a
+            # production fallback.  Node start/profile checks still report it
+            # as invalid rather than claiming a canonical profile.
+            self.execution_profile = None
+        self.settings = settings_service or CanarySettingsService(store)
         raw_db = db_path if db_path is not None else getattr(store, "path", "")
         self.db_path = os.path.abspath(os.path.expanduser(str(raw_db))) if str(raw_db) not in {"", ":memory:"} else str(raw_db)
         self._node_launcher = node_launcher or self._spawn_node
         self._lock = threading.RLock()
         self._connectivity_lock = threading.RLock()
+        self._action_lock = threading.RLock()
         self._bootstrap_threads: dict[str, threading.Thread] = {}
         # Windows identity checks can invoke CIM and are disproportionately
         # expensive on a dashboard refresh.  Keep a tiny, short-lived cache so
         # repeated status reads cannot fan out into an unbounded process scan.
-        self._pid_identity_cache: dict[tuple[int, str], tuple[float, bool]] = {}
+        self._pid_identity_cache: dict[tuple[int, str, int], tuple[float, bool]] = {}
         self._pid_identity_cache_ttl = 1.0
         self._pid_identity_cache_limit = 32
         configured = self.store.get_operator_config("hermes_research_job_id", None)
@@ -969,6 +1130,58 @@ class OperatorControlPlane:
         self.hermes_job_id = _safe_identifier(selected, "Hermes job ID")
         if hermes_job_id is not None:
             self.configure_hermes_job_id(hermes_job_id)
+        # Construct read services once during startup. Their constructors may
+        # establish missing schema/defaults, but GET/status paths must never
+        # construct them again.
+        self._canary_service = CanaryService(
+            self.store,
+            initialize=False,
+            settings=self.settings,
+        )
+    def risk_settings_snapshot(self) -> dict[str, Any]:
+        """Return the bounded persisted active/draft risk settings projection."""
+        snapshot = self.settings.snapshot()
+        projected = _safe_value(snapshot)
+        if not isinstance(projected, Mapping):
+            raise OperatorControlError("RISK_SETTINGS_UNAVAILABLE")
+        return dict(projected)
+
+    def save_risk_settings_draft(
+        self,
+        values: Mapping[str, Any],
+        *,
+        actor: str = "operator",
+    ) -> dict[str, Any]:
+        if not isinstance(values, Mapping):
+            raise OperatorControlError("RISK_SETTINGS_VALUES_REQUIRED")
+        actor_value = _safe_identifier(actor, "actor")
+        result = self.settings.save_draft(dict(values), actor_value)
+        projected = _safe_value(result)
+        if not isinstance(projected, Mapping):
+            raise OperatorControlError("RISK_SETTINGS_SAVE_FAILED")
+        return dict(projected)
+
+    def activate_risk_settings_draft(
+        self,
+        config_id: Any,
+        *,
+        actor: str = "operator",
+        expected_generation: Any = None,
+    ) -> dict[str, Any]:
+        if not isinstance(config_id, str):
+            raise OperatorControlError("RISK_SETTINGS_CONFIG_REQUIRED")
+        config_value = _safe_identifier(config_id, "risk settings config ID")
+        actor_value = _safe_identifier(actor, "actor")
+        generation = _positive_generation(
+            expected_generation,
+            "RISK_SETTINGS_GENERATION_REQUIRED",
+        )
+        result = self.settings.activate_draft(config_value, actor_value, generation)
+        projected = _safe_value(result)
+        if not isinstance(projected, Mapping):
+            raise OperatorControlError("RISK_SETTINGS_ACTIVATE_FAILED")
+        return dict(projected)
+
 
     def _cached_pid_matches_node(self, pid: int) -> bool:
         """Bound the Windows CIM/process identity work used by status reads."""
@@ -978,17 +1191,108 @@ class OperatorControlPlane:
             return False
         if pid_value <= 0:
             return False
+        try:
+            marker_lines = Path(self.db_path + ".node.pid").read_text(
+                encoding="ascii"
+            ).splitlines()
+            if len(marker_lines) < 2 or int(marker_lines[0].strip()) != pid_value:
+                return False
+            marker_start_ticks = int(marker_lines[1].strip())
+        except (FileNotFoundError, OSError, UnicodeError, ValueError):
+            return False
         now = time.monotonic()
-        key = (pid_value, self.db_path)
+        key = (pid_value, self.db_path, marker_start_ticks)
         cached = self._pid_identity_cache.get(key)
         if cached is not None and now - cached[0] <= self._pid_identity_cache_ttl:
             return cached[1]
-        result = bool(_pid_matches_node(pid_value, self.db_path))
+        result = bool(
+            _pid_matches_node(
+                pid_value,
+                self.db_path,
+                expected_start_ticks=marker_start_ticks,
+            )
+        )
         self._pid_identity_cache[key] = (now, result)
         if len(self._pid_identity_cache) > self._pid_identity_cache_limit:
             oldest = min(self._pid_identity_cache, key=self._pid_identity_cache.__getitem__)
             self._pid_identity_cache.pop(oldest, None)
         return result
+
+    def _begin_action(self, action: str, target: str) -> tuple[str, dict[str, Any] | None]:
+        """Persist an in-flight action before any side effect is dispatched."""
+        with self._action_lock:
+            raw = self.store.get_operator_config("operator_action_state", {})
+            body = dict(raw) if isinstance(raw, Mapping) else {}
+            entries = body.get("actions")
+            entries = [dict(item) for item in entries if isinstance(item, Mapping)] if isinstance(entries, list) else []
+            for entry in entries:
+                if (
+                    str(entry.get("action")) == action
+                    and str(entry.get("target")) == target
+                    and str(entry.get("status")).upper() == "RUNNING"
+                ):
+                    return str(entry.get("action_id") or ""), entry
+            action_id = "operator-action:" + uuid.uuid4().hex
+            entry = {
+                "action_id": action_id,
+                "action": action,
+                "target": target,
+                "status": "RUNNING",
+                "started_at": utc_now().isoformat(),
+                "pid": os.getpid(),
+            }
+            entries.append(entry)
+            body["actions"] = entries[-32:]
+            self.store.set_operator_config("operator_action_state", body)
+            return action_id, None
+
+    def _finish_action(
+        self,
+        action_id: str | None,
+        *,
+        status: str,
+        result: Mapping[str, Any] | None = None,
+        reason: str = "",
+    ) -> None:
+        if not action_id:
+            return
+        try:
+            with self._action_lock:
+                raw = self.store.get_operator_config("operator_action_state", {})
+                body = dict(raw) if isinstance(raw, Mapping) else {}
+                entries = body.get("actions")
+                if not isinstance(entries, list):
+                    return
+                updated: list[dict[str, Any]] = []
+                for raw_entry in entries:
+                    if not isinstance(raw_entry, Mapping):
+                        continue
+                    entry = dict(raw_entry)
+                    if str(entry.get("action_id")) == action_id:
+                        entry.update(
+                            {
+                                "status": status,
+                                "completed_at": utc_now().isoformat(),
+                                "reason": reason[:160],
+                                "result": _safe_value(result or {}),
+                            }
+                        )
+                    updated.append(entry)
+                body["actions"] = updated[-32:]
+                self.store.set_operator_config("operator_action_state", body)
+        except Exception:
+            return
+
+    def _action_snapshot(self) -> list[dict[str, Any]]:
+        raw = self.store.get_operator_config("operator_action_state", {})
+        entries = raw.get("actions") if isinstance(raw, Mapping) else []
+        if not isinstance(entries, list):
+            return []
+        return [
+            dict(item)
+            for item in entries[-32:]
+            if isinstance(item, Mapping)
+        ]
 
     def configure_hermes_job_id(self, job_id: str) -> str:
         value = _safe_identifier(job_id, "Hermes job ID")
@@ -999,42 +1303,102 @@ class OperatorControlPlane:
     def _node_lock_path(self) -> Path:
         return Path(str(self.db_path) + ".lock")
 
-    def _node_status(self) -> dict[str, Any]:
-        lock_path = self._node_lock_path()
-        lock_pid = 0
-        lock_text = ""
-        try:
-            lock_text = lock_path.read_text(encoding="ascii")
-            lock_pid = int(lock_text.splitlines()[0].strip())
-        except (FileNotFoundError, OSError, ValueError):
-            pass
+    def _node_status(self, *, verify_identity: bool = True) -> dict[str, Any]:
         workers = self.store.list_worker_states(limit=32)
         root = next((item for item in workers if str(item.get("worker_name")) == "axiom-node"), {})
         worker_payload = root.get("payload") if isinstance(root.get("payload"), Mapping) else {}
+        configured_lock = worker_payload.get("lock_path")
+        lock_path = (
+            Path(str(configured_lock))
+            if isinstance(configured_lock, str) and configured_lock.strip()
+            else self._node_lock_path()
+        )
+        lock_pid = 0
+        lock_exists: bool | None = None
+        if verify_identity:
+            lock_text = ""
+            try:
+                lock_text = lock_path.read_text(encoding="ascii")
+                lock_pid = int(lock_text.splitlines()[0].strip())
+            except (FileNotFoundError, OSError, ValueError):
+                pass
+            lock_exists = lock_path.exists()
+        else:
+            persisted_lock_exists = worker_payload.get("lock_exists")
+            if isinstance(persisted_lock_exists, bool):
+                lock_exists = persisted_lock_exists
         persisted_pid = worker_payload.get("pid")
         try:
             pid = int(lock_pid or persisted_pid or 0)
         except (TypeError, ValueError):
             pid = 0
-        identity_valid = bool(pid and self._cached_pid_matches_node(pid))
-        alive = bool(pid and _pid_alive(pid))
         persisted_status = str(root.get("status") or "").lower()
-        if alive and identity_valid:
-            state = "RUNNING"
-        elif persisted_status in {"running", "degraded"} and (pid or lock_path.exists()):
-            state = "STALE"
+        heartbeat = root.get("heartbeat_at")
+        heartbeat_age: float | None = None
+        if heartbeat:
+            try:
+                stamp = datetime.fromisoformat(str(heartbeat).replace("Z", "+00:00"))
+                if stamp.tzinfo is None:
+                    stamp = stamp.replace(tzinfo=timezone.utc)
+                heartbeat_age = max(
+                    0.0,
+                    (datetime.now(timezone.utc) - stamp.astimezone(timezone.utc)).total_seconds(),
+                )
+            except (TypeError, ValueError, OverflowError):
+                heartbeat_age = None
+        try:
+            stale_after = float(worker_payload.get("stale_after_seconds", 300.0))
+        except (TypeError, ValueError):
+            stale_after = 300.0
+        if stale_after <= 0 or stale_after != stale_after:
+            stale_after = 300.0
+        if verify_identity:
+            alive: bool | None = _pid_alive(pid) if pid else False
+            if alive is True:
+                identity_valid: bool | None = self._cached_pid_matches_node(pid)
+            elif alive is None:
+                identity_valid = None
+            else:
+                identity_valid = False
+            if alive is True and identity_valid is True:
+                state = "RUNNING"
+            elif alive is None or identity_valid is None or (alive is True and not identity_valid):
+                state = "UNKNOWN"
+            elif persisted_status in {"running", "degraded"} and (pid or lock_path.exists()):
+                state = "STALE"
+            else:
+                state = "STOPPED"
         else:
-            state = "STOPPED"
+            identity_value = worker_payload.get("worker_identity_valid")
+            identity_valid = identity_value if isinstance(identity_value, bool) else None
+            alive = None
+            if persisted_status in {"running", "degraded"}:
+                state = (
+                    "STALE"
+                    if heartbeat_age is None or heartbeat_age > stale_after
+                    else "UNKNOWN"
+                )
+            elif persisted_status in {"stopped", "closed"}:
+                state = "STOPPED"
+            elif persisted_status:
+                state = persisted_status.upper()
+            else:
+                state = "UNKNOWN"
         return {
             "status": state,
             "pid": pid or None,
             "started_at": root.get("started_at"),
-            "heartbeat_at": root.get("heartbeat_at"),
+            "process_identity": worker_payload.get("process_identity"),
+            "heartbeat_at": heartbeat,
+            "heartbeat_age_seconds": heartbeat_age,
+            "stale_after_seconds": stale_after,
             "lock_path": str(lock_path),
-            "lock_exists": lock_path.exists(),
+            "lock_exists": lock_exists,
             "worker_status": root.get("status"),
             "worker_alive": alive,
             "worker_identity_valid": identity_valid,
+            "revision": worker_payload.get("revision"),
+            "execution_profile": worker_payload.get("execution_profile"),
         }
 
     def _clear_stale_lock(self) -> None:
@@ -1042,15 +1406,21 @@ class OperatorControlPlane:
         try:
             text = path.read_text(encoding="ascii")
             pid = int(text.splitlines()[0].strip())
-        except (FileNotFoundError, OSError, ValueError):
+        except FileNotFoundError:
             return
-        if _pid_alive(pid) and self._cached_pid_matches_node(pid):
-            raise OperatorControlError("NODE_ALREADY_RUNNING")
-        try:
-            if path.read_text(encoding="ascii") == text:
-                path.unlink()
-        except (FileNotFoundError, OSError):
-            pass
+        except (IndexError, OSError, ValueError):
+            raise OperatorControlError("NODE_STATUS_UNKNOWN") from None
+        liveness = _pid_alive(pid)
+        identity_valid = (
+            self._cached_pid_matches_node(pid) if liveness is True else False
+        )
+        if liveness is True:
+            if identity_valid:
+                raise OperatorControlError("NODE_ALREADY_RUNNING")
+            raise OperatorControlError("NODE_STATUS_UNKNOWN")
+        if liveness is None:
+            raise OperatorControlError("NODE_STATUS_UNKNOWN")
+        raise OperatorControlError("NODE_STALE_LOCK_MANUAL_RECOVERY")
 
     def _spawn_node(self, command: list[str]) -> subprocess.Popen[Any]:
         kwargs: dict[str, Any] = {
@@ -1065,13 +1435,57 @@ class OperatorControlPlane:
             kwargs["start_new_session"] = True
         return subprocess.Popen(command, **kwargs)
 
+    def _require_node_profile(self, status: Mapping[str, Any]) -> None:
+        expected_profile = self.execution_profile
+        try:
+            persisted_raw = status.get("execution_profile")
+            persisted_profile = (
+                None
+                if persisted_raw is None or persisted_raw == ""
+                else normalized_execution_profile(persisted_raw)
+            )
+        except (TypeError, ValueError):
+            raise OperatorControlError("NODE_EXECUTION_PROFILE_INVALID") from None
+        if (
+            expected_profile not in {ISOLATED_EXECUTION_PROFILE, PRODUCTION_EXECUTION_PROFILE}
+            or persisted_profile != expected_profile
+        ):
+            raise OperatorControlError("NODE_EXECUTION_PROFILE_MISMATCH")
+
     def ensure_node(self, *, wait_seconds: float = 5.0) -> dict[str, Any]:
+        if self.execution_profile not in {
+            ISOLATED_EXECUTION_PROFILE,
+            PRODUCTION_EXECUTION_PROFILE,
+        }:
+            raise OperatorControlError("INVALID_EXECUTION_PROFILE")
         with self._lock:
             current = self._node_status()
+
             if current["status"] == "RUNNING":
+                self._require_node_profile(current)
                 return current
+            if current["status"] == "UNKNOWN":
+                raise OperatorControlError("NODE_STATUS_UNKNOWN")
             self._clear_stale_lock()
-            command = [sys.executable, "-m", "axiom.cli", "node-run", "--db", self.db_path, "--cycles", "0"]
+            runtime_db = Path(self.db_path)
+            command = [
+                sys.executable,
+                "-m",
+                "axiom.cli",
+                "node-run",
+                "--db",
+                self.db_path,
+                "--lock",
+                f"{runtime_db}.lock",
+                "--log",
+                f"{runtime_db}.log",
+                "--pid",
+                f"{runtime_db}.node.pid",
+                "--cycles",
+                "0",
+            ]
+            if self.execution_profile == ISOLATED_EXECUTION_PROFILE:
+                command.append("--isolated")
             try:
                 process = self._node_launcher(command)
             except (OSError, RuntimeError) as exc:
@@ -1080,6 +1494,7 @@ class OperatorControlPlane:
             while time.monotonic() < deadline:
                 current = self._node_status()
                 if current["status"] == "RUNNING":
+                    self._require_node_profile(current)
                     return current
                 if hasattr(process, "poll") and process.poll() is not None:
                     break
@@ -1089,14 +1504,22 @@ class OperatorControlPlane:
     def restart_node(self) -> dict[str, Any]:
         with self._lock:
             current = self._node_status()
+            previous_pid = int(current.get("pid") or 0)
+            previous_revision = current.get("revision")
             if current["status"] == "RUNNING":
-                pid = int(current.get("pid") or 0)
-                path = self._node_lock_path()
+                self._require_node_profile(current)
+            if current["status"] == "RUNNING":
+                pid = previous_pid
+                path = Path(str(current.get("lock_path") or self._node_lock_path()))
                 try:
                     marker = path.read_text(encoding="ascii")
                 except (FileNotFoundError, OSError) as exc:
                     raise OperatorControlError("NODE_STOP_UNSAFE") from exc
-                if not marker or int(marker.splitlines()[0].strip()) != pid:
+                try:
+                    marker_pid = int(marker.splitlines()[0].strip())
+                except (IndexError, ValueError) as exc:
+                    raise OperatorControlError("NODE_STOP_UNSAFE") from exc
+                if not marker or marker_pid != pid:
                     raise OperatorControlError("NODE_STOP_UNSAFE")
                 stop_path = Path(str(self.db_path) + ".stop")
                 try:
@@ -1105,12 +1528,41 @@ class OperatorControlPlane:
                     raise OperatorControlError("NODE_STOP_REQUEST_FAILED") from exc
                 deadline = time.monotonic() + 15.0
                 while time.monotonic() < deadline:
-                    if self._node_status()["status"] != "RUNNING":
+                    observed = self._node_status()
+                    if observed["status"] in {"STOPPED", "STALE"}:
                         break
                     time.sleep(0.1)
-                if self._node_status()["status"] == "RUNNING":
+                if self._node_status()["status"] not in {"STOPPED", "STALE"}:
                     raise OperatorControlError("NODE_STOP_TIMEOUT")
-            return self.ensure_node()
+            replacement = self.ensure_node()
+            replacement = dict(replacement)
+            replacement["previous_pid"] = previous_pid or None
+            replacement["previous_revision"] = previous_revision
+            replacement_identity = replacement.get("process_identity")
+            previous_identity = current.get("process_identity")
+            run_identity_changed = bool(
+                replacement_identity
+                and (
+                    not previous_identity
+                    or str(replacement_identity) != str(previous_identity)
+                )
+            )
+            started_at_changed = bool(
+                replacement.get("started_at")
+                and (
+                    not current.get("started_at")
+                    or str(replacement["started_at"]) != str(current["started_at"])
+                )
+            )
+            replacement["restart_revision"] = replacement.get("revision")
+            replacement["restart_confirmed"] = bool(
+                replacement.get("pid")
+                and (not previous_pid or int(replacement["pid"]) != previous_pid)
+                and (run_identity_changed or started_at_changed)
+            )
+            if not replacement["restart_confirmed"]:
+                raise OperatorControlError("NODE_RESTART_NOT_CONFIRMED")
+            return replacement
 
     def _bootstrap_status(self) -> dict[str, Any]:
         """Project persisted bootstrap progress using bounded aggregate reads."""
@@ -1292,16 +1744,45 @@ class OperatorControlPlane:
         def worker(name: str) -> dict[str, Any]:
             row = worker_map.get(name, {})
             payload = row.get("payload") if isinstance(row.get("payload"), Mapping) else {}
+            raw_status = str(row.get("status") or "NOT_STARTED").upper()
+            heartbeat = row.get("heartbeat_at")
+            age: float | None = None
+            try:
+                stamp = datetime.fromisoformat(str(heartbeat).replace("Z", "+00:00"))
+                if stamp.tzinfo is None:
+                    stamp = stamp.replace(tzinfo=timezone.utc)
+                age = max(
+                    0.0,
+                    (datetime.now(timezone.utc) - stamp.astimezone(timezone.utc)).total_seconds(),
+                )
+            except (TypeError, ValueError, OverflowError):
+                pass
+            try:
+                stale_after = float(payload.get("stale_after_seconds", 300.0))
+            except (TypeError, ValueError):
+                stale_after = 300.0
+            status = (
+                "STALE"
+                if raw_status == "RUNNING" and (age is None or age > stale_after)
+                else raw_status
+            )
             return {
-                "status": str(row.get("status") or "NOT_STARTED").upper(),
+                "status": status,
                 "pid": payload.get("pid"),
-                "heartbeat_at": row.get("heartbeat_at"),
+                "heartbeat_at": heartbeat,
+                "heartbeat_age_seconds": age,
                 "started_at": row.get("started_at"),
+                "last_error_code": payload.get("last_error_code"),
+                "last_successful_tick": payload.get("last_successful_tick"),
+                "next_retry_at": payload.get("next_retry_at"),
+                "consecutive_failures": payload.get("consecutive_failures"),
+                "revision": payload.get("revision"),
+                "process_identity": payload.get("process_identity"),
             }
 
 
-        canary = CanaryService(self.store, initialize=False)
         report: Mapping[str, Any] = {}
+        canary = self._canary_service
         legacy_readiness: Mapping[str, Any] = {}
         try:
             readiness_method = getattr(canary, "status", None)
@@ -1339,7 +1820,7 @@ class OperatorControlPlane:
             report = {"readiness": dict(legacy_readiness)}
         control_report = report.get("control") or report.get("authoritative_control") or {}
         raw_readiness_report = report.get("readiness") or {}
-        readiness_report = _operator_merge_persisted(
+        readiness_report = _operator_patch_non_missing(
             legacy_readiness if isinstance(legacy_readiness, Mapping) else {},
             raw_readiness_report
             if isinstance(raw_readiness_report, Mapping)
@@ -1354,10 +1835,10 @@ class OperatorControlPlane:
         worker_report = worker_report if isinstance(worker_report, Mapping) else {}
         execution_report = execution_report if isinstance(execution_report, Mapping) else {}
         canary_status = dict(readiness_report)
-        # Fill only absent legacy aliases from bounded report sections.  The
-        # readiness singleton remains authoritative for non-missing display data.
+        # Authoritative report sections override stale cached aliases while
+        # preserving legacy-only readiness metrics.
         for section in (control_report, worker_report, execution_report):
-            canary_status = _operator_merge_persisted(canary_status, section)
+            canary_status = _operator_patch_non_missing(canary_status, section)
         latest_signal = None
         for source in (
             report,
@@ -1469,7 +1950,7 @@ class OperatorControlPlane:
             "risk_envelope",
             readiness_report.get("risk_envelope")
             or control_report.get("risk_envelope")
-            or dict(AUTONOMOUS_CANARY_LIMITS),
+            or {},
         )
         canary_status.setdefault(
             "risk_limits",
@@ -1503,20 +1984,6 @@ class OperatorControlPlane:
             )
         except BaseException:
             projected_credentials = None
-        if not isinstance(projected_credentials, Mapping):
-            try:
-                credential_store = credential_type()
-                projected_credentials = credential_store.cached_projection(
-                    allow_environment=False,
-                    persisted={
-                        "canary": canary_status,
-                        "status_report": report,
-                        "readiness": readiness_report,
-                        "connectivity": latest_connectivity,
-                    },
-                )
-            except BaseException:
-                projected_credentials = None
         credentials = (
             dict(projected_credentials)
             if isinstance(projected_credentials, Mapping)
@@ -1527,11 +1994,36 @@ class OperatorControlPlane:
             }
         )
         credentials["secret_values_exposed"] = False
+        try:
+            settings_snapshot = self.risk_settings_snapshot()
+        except Exception as exc:
+            settings_snapshot = {
+                "status": "ERROR",
+                "error": type(exc).__name__,
+                "detail": str(exc)[:160],
+            }
+        effective_settings = (
+            settings_snapshot.get("effective_limits")
+            if isinstance(settings_snapshot, Mapping)
+            else None
+        )
+        if isinstance(effective_settings, Mapping):
+            canary_status["risk_limits"] = dict(effective_settings)
+            canary_status["risk_envelope"] = dict(effective_settings)
+        canary_submit = (
+            "AUTONOMOUS_WORKER"
+            if autonomous_state.get("enabled")
+            else "DISABLED_UNTIL_OPERATOR_ENABLE"
+        )
+        if self.execution_profile != PRODUCTION_EXECUTION_PROFILE:
+            canary_submit = "DISABLED_ISOLATED_EXECUTION_PROFILE"
         return {
+            "execution_profile": self.execution_profile,
+            "actions": self._action_snapshot(),
+            "risk_settings": settings_snapshot,
             "canary_status_report": dict(report),
             "connectivity": latest_connectivity,
-            "node": self._node_status(),
-            "bootstrap": self._bootstrap_status(),
+            "node": self._node_status(verify_identity=False),
             "hermes": hermes.state(),
             "collector": worker("polymarket-collector"),
             "paper": {**worker("paper-engine"), "read_only": True, "live_execution": False},
@@ -1546,18 +2038,27 @@ class OperatorControlPlane:
                 "readiness": dict(readiness_report),
                 "worker": dict(worker_report),
                 "execution": dict(execution_report),
+                "settings": settings_snapshot,
                 "latest_signal": latest_signal,
                 "autonomous": autonomous_state,
                 "connectivity": latest_connectivity,
-                "submit": "AUTONOMOUS_WORKER" if autonomous_state.get("enabled") else "DISABLED_UNTIL_OPERATOR_ENABLE",
+                "submit": canary_submit,
             },
             "live_execution": False,
             "paper_only": True,
         }
 
-    def _audit(self, action: str, target: str, *, success: bool, reason: str = "", result: Mapping[str, Any] | None = None) -> None:
+    def _audit(
+        self,
+        action: str,
+        target: str,
+        *,
+        success: bool,
+        reason: str = "",
+        result: Mapping[str, Any] | None = None,
+    ) -> str | None:
         try:
-            self.store.record_operator_action(
+            return self.store.record_operator_action(
                 action,
                 target,
                 success=success,
@@ -1565,21 +2066,137 @@ class OperatorControlPlane:
                 result=_safe_value(result or {}),
             )
         except Exception:
-            pass
+            return None
+    def _enforce_action_fence(self, action: str) -> None:
+        """Reject production-boundary actions outside exact production."""
+        if (
+            action in _ISOLATED_OPERATOR_BLOCKED_ACTIONS
+            and self.execution_profile != PRODUCTION_EXECUTION_PROFILE
+        ):
+            raise OperatorControlError("ISOLATED_EXECUTION_PROFILE")
 
-    def execute(self, action: str, target: str = "", *, confirm: str = "") -> dict[str, Any]:
+    def execute(
+        self,
+        action: str,
+        target: str = "",
+        *,
+        confirm: str = "",
+        payload: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
         action_value = str(action or "").strip()
         target_value = str(target or "").strip()
+        if payload is not None and not isinstance(payload, Mapping):
+            return {
+                "ok": False,
+                "action": action_value,
+                "target": target_value,
+                "reason": "INVALID_ACTION_PAYLOAD",
+                "paper_only": True,
+                "live_execution": False,
+            }
+        action_payload = dict(payload or {})
+        action_id: str | None = None
         try:
+            self._enforce_action_fence(action_value)
+            if action_value in _ALLOWED_ACTIONS:
+                action_id, duplicate = self._begin_action(action_value, target_value)
+                if duplicate is not None:
+                    return {
+                        "ok": False,
+                        "action": action_value,
+                        "target": target_value,
+                        "action_id": action_id,
+                        "action_status": "RUNNING",
+                        "reason": "ACTION_ALREADY_RUNNING",
+                        "paper_only": True,
+                        "live_execution": False,
+                    }
+            if action_value not in _ALLOWED_ACTIONS:
+                raise OperatorControlError("ACTION_NOT_ALLOWED")
+            if action_value in {"canary.settings.save_draft", "risk.settings.save_draft"}:
+                allowed = {"values", "actor"}
+                if set(action_payload) - allowed:
+                    raise OperatorControlError("UNSUPPORTED_RISK_SETTINGS_FIELDS")
+                values = action_payload.get("values")
+                if not isinstance(values, Mapping):
+                    raise OperatorControlError("RISK_SETTINGS_VALUES_REQUIRED")
+            elif action_value in {"canary.settings.activate_draft", "risk.settings.activate_draft"}:
+                allowed = {"config_id", "actor", "expected_generation"}
+                if set(action_payload) - allowed:
+                    raise OperatorControlError("UNSUPPORTED_RISK_SETTINGS_FIELDS")
+                if not isinstance(action_payload.get("config_id"), str):
+                    raise OperatorControlError("RISK_SETTINGS_CONFIG_REQUIRED")
+                _safe_identifier(action_payload["config_id"], "risk settings config ID")
+                _positive_generation(
+                    action_payload.get("expected_generation"),
+                    "RISK_SETTINGS_GENERATION_REQUIRED",
+                )
+            if action_value == RECOVERY_ACTION:
+                allowed = {"event_id", "signal_id", "exchange_order_id"}
+                if set(action_payload) - allowed:
+                    raise OperatorControlError("UNSUPPORTED_RECOVERY_FIELDS")
+                if self.execution_profile != PRODUCTION_EXECUTION_PROFILE:
+                    raise OperatorControlError("RECOVERY_PRODUCTION_PROFILE_REQUIRED")
+                try:
+                    event_value = recovery_identifier(
+                        action_payload.get("event_id"), "event ID"
+                    )
+                    signal_value = recovery_identifier(
+                        action_payload.get("signal_id"), "signal ID"
+                    )
+                    order_value = recovery_identifier(
+                        action_payload.get("exchange_order_id"), "exchange order ID"
+                    )
+                    normalize_recovery_profile(
+                        {"environment": PRODUCTION_EXECUTION_PROFILE, "allow_environment": False}
+                    )
+                except RecoveryProfileError as exc:
+                    raise OperatorControlError(exc.code) from exc
+                target_value = event_value
             if action_value not in _ALLOWED_ACTIONS:
                 raise OperatorControlError("ACTION_NOT_ALLOWED")
             expected = _CONFIRMATIONS.get(action_value)
-            if expected is not None and confirm != expected:
+            if (
+                expected is not None
+                and not (action_value == "canary.enable_auto" and action_payload)
+                and confirm != expected
+            ):
                 raise OperatorControlError("EXACT_CONFIRMATION_REQUIRED")
+            if action_value in {"canary.settings.activate_draft", "risk.settings.activate_draft"}:
+                target_value = _safe_identifier(
+                    action_payload.get("config_id"),
+                    "risk settings config ID",
+                )
             if action_value in {"canary.eligibility.verify", "canary.eligibility.mark", "canary.generate_signal", "canary.arm"}:
                 target_value = _safe_identifier(target_value, "candidate ID")
-            elif action_value == "canary.enable_auto" and target_value:
-                raise OperatorControlError("AUTONOMOUS_CANARY_ACCEPTS_NO_TARGET")
+            elif action_value == "canary.enable_auto":
+                if target_value and not action_payload:
+                    raise OperatorControlError("AUTONOMOUS_CANARY_ACCEPTS_NO_TARGET")
+                if action_payload:
+                    allowed = {"venue", "config_id", "expected_generation"}
+                    if set(action_payload) - allowed:
+                        raise OperatorControlError("UNSUPPORTED_CANARY_ENABLE_FIELDS")
+                    if not isinstance(action_payload.get("venue"), str):
+                        raise OperatorControlError("UNSUPPORTED_CANARY_VENUE")
+                    venue_name = action_payload["venue"].strip().lower()
+                    if not isinstance(action_payload.get("config_id"), str):
+                        raise OperatorControlError("RISK_SETTINGS_CONFIG_REQUIRED")
+                    config_id = _safe_identifier(
+                        action_payload["config_id"],
+                        "canary config ID",
+                    )
+                    expected_generation = _positive_generation(
+                        action_payload.get("expected_generation"),
+                        "CANARY_GENERATION_REQUIRED",
+                    )
+                    if venue_name != "polymarket":
+                        raise OperatorControlError("UNSUPPORTED_CANARY_VENUE")
+                    exact_confirmation = (
+                        f"ENABLE AUTO CANARY {venue_name.upper()} {config_id} {expected_generation}"
+                    )
+                    if confirm != exact_confirmation:
+                        raise OperatorControlError("EXACT_CONFIRMATION_REQUIRED")
+                    target_value = f"{venue_name}:{config_id}:{expected_generation}"
             if action_value == "node.restart":
                 result = {"node": self.restart_node()}
             elif action_value == "bootstrap.start":
@@ -1592,23 +2209,108 @@ class OperatorControlPlane:
                 result = {"hermes": self._hermes().set_status("ACTIVE")}
             elif action_value == "hermes.run_now":
                 result = {"hermes": self._hermes().run_now()}
+            elif action_value in {"canary.settings.save_draft", "risk.settings.save_draft"}:
+                result = {
+                    "risk_settings": self.save_risk_settings_draft(
+                        action_payload["values"],
+                        actor=action_payload.get("actor", "operator"),
+                    )
+                }
+            elif action_value in {"canary.settings.activate_draft", "risk.settings.activate_draft"}:
+                result = {
+                    "risk_settings": self.activate_risk_settings_draft(
+                        action_payload["config_id"],
+                        actor=action_payload.get("actor", "operator"),
+                        expected_generation=action_payload.get("expected_generation"),
+                    )
+                }
+            elif action_value == RECOVERY_ACTION:
+                credentials = CredentialStore()
+                if not credentials.configured(allow_environment=False):
+                    raise OperatorControlError("CREDENTIALS_NOT_CONFIGURED")
+                service = CanaryService(
+                    self.store,
+                    credentials=credentials,
+                    initialize=True,
+                    settings=self.settings,
+                    profile={
+                        "environment": PRODUCTION_EXECUTION_PROFILE,
+                        "allow_environment": False,
+                    },
+                )
+                venue = PolymarketClobV2Venue(allow_environment=False)
+                result = {
+                    "recovery": service.recover_entry_intent(
+                        event_value,
+                        order_value,
+                        signal_id=signal_value,
+                        venue=venue,
+                        confirmation=confirm,
+                    )
+                }
             elif action_value == "canary.connectivity_check":
                 with self._connectivity_lock:
+                    credentials: CredentialStore | None = None
+                    configured = False
+                    current_fingerprint: str | None = None
                     try:
                         credentials = CredentialStore()
-                        configured = credentials.configured(allow_environment=False)
-                        venue = PolymarketClobV2Venue(allow_environment=False) if configured else None
-                        service = CanaryService(self.store, credentials=credentials, initialize=False)
+                        configured = bool(
+                            credentials.configured(allow_environment=False)
+                        )
+                        if configured:
+                            try:
+                                current_values = credentials.load(
+                                    allow_environment=False
+                                )
+                            except Exception:
+                                configured = False
+                            else:
+                                if (
+                                    not isinstance(current_values, Mapping)
+                                    or not current_values.get("private_key")
+                                    or not current_values.get("wallet_address")
+                                ):
+                                    configured = False
+                                else:
+                                    current_fingerprint = credential_fingerprint(
+                                        current_values
+                                    )
+                        venue = (
+                            PolymarketClobV2Venue(allow_environment=False)
+                            if configured
+                            else None
+                        )
+                        service = CanaryService(
+                            self.store,
+                            credentials=credentials,
+                            initialize=False,
+                        )
                         raw_connectivity = service.connectivity_check(
                             venue=venue,
                             allow_environment=False,
                         )
-                        connectivity = _project_connectivity(raw_connectivity, checked_at=utc_now())
+                        connectivity = _project_connectivity(
+                            raw_connectivity,
+                            checked_at=utc_now(),
+                            authoritative_credentials_configured=configured,
+                            authoritative_fingerprint=current_fingerprint,
+                        )
                     except CanaryBlocked as exc:
-                        connectivity = _blocked_connectivity_projection(str(exc))
+                        connectivity = _blocked_connectivity_projection(
+                            str(exc),
+                            credentials_configured=configured,
+                            authoritative_fingerprint=current_fingerprint,
+                        )
                     except Exception:
-                        connectivity = _blocked_connectivity_projection()
-                    self.store.set_operator_config(CANARY_CONNECTIVITY_CONFIG_KEY, connectivity)
+                        connectivity = _blocked_connectivity_projection(
+                            credentials_configured=configured,
+                            authoritative_fingerprint=current_fingerprint,
+                        )
+                    self.store.set_operator_config(
+                        CANARY_CONNECTIVITY_CONFIG_KEY,
+                        connectivity,
+                    )
                     result = {"connectivity": connectivity}
             elif action_value == "canary.eligibility.verify":
                 service = CanaryService(self.store, initialize=False)
@@ -1627,18 +2329,35 @@ class OperatorControlPlane:
                 credentials = CredentialStore()
                 if not credentials.configured(allow_environment=False):
                     raise OperatorControlError("CREDENTIALS_NOT_CONFIGURED")
-                service = CanaryService(self.store, credentials=credentials, initialize=True)
+                settings_snapshot = self.settings.snapshot()
+                settings_config_id = settings_snapshot.get("config_id")
+                settings_generation = settings_snapshot.get("generation")
+                if not isinstance(settings_config_id, str):
+                    raise OperatorControlError("RISK_SETTINGS_CONFIG_REQUIRED")
+                settings_generation = _positive_generation(
+                    settings_generation,
+                    "RISK_SETTINGS_GENERATION_REQUIRED",
+                )
+                service = CanaryService(
+                    self.store,
+                    credentials=credentials,
+                    initialize=True,
+                    settings=self.settings,
+                )
                 venue = PolymarketClobV2Venue(allow_environment=False)
                 result = {
                     "canary": service.arm(
                         target_value,
                         venue=venue,
+                        config_id=settings_config_id,
+                        expected_generation=settings_generation,
                     )
                 }
             elif action_value == "canary.enable_auto":
                 with self._connectivity_lock:
                     connectivity = _stored_connectivity_projection(
-                        self.store.get_operator_config(CANARY_CONNECTIVITY_CONFIG_KEY, None)
+                        self.store.get_operator_config(CANARY_CONNECTIVITY_CONFIG_KEY, None),
+                        require_fresh=True,
                     )
                     if connectivity is None:
                         raise OperatorControlError("CONNECTIVITY_CHECK_REQUIRED")
@@ -1650,10 +2369,48 @@ class OperatorControlPlane:
                             else "CONNECTIVITY_BLOCKED"
                         )
                         raise OperatorControlError(blocked_reason)
-                    service = CanaryService(self.store, initialize=True)
+                    credentials = CredentialStore()
+                    try:
+                        values = credentials.load(allow_environment=False)
+                    except Exception as exc:
+                        raise OperatorControlError("CREDENTIALS_NOT_CONFIGURED") from exc
+                    if (
+                        not isinstance(values, Mapping)
+                        or not values.get("private_key")
+                        or not values.get("wallet_address")
+                    ):
+                        raise OperatorControlError("CREDENTIALS_NOT_CONFIGURED")
+                    expected_fingerprint = connectivity["account"].get(
+                        "credential_fingerprint"
+                    )
+                    if (
+                        not isinstance(expected_fingerprint, str)
+                        or credential_fingerprint(values) != expected_fingerprint
+                    ):
+                        raise OperatorControlError("CREDENTIAL_BINDING_MISMATCH")
+                    if not action_payload:
+                        raise OperatorControlError("CANARY_ENABLE_FIELDS")
+                    service = CanaryService(
+                        self.store,
+                        credentials=credentials,
+                        initialize=True,
+                        settings=self.settings,
+                    )
+                    enable_kwargs: dict[str, Any] = {
+                        "venue": action_payload["venue"].strip().lower(),
+                        "config_id": _safe_identifier(
+                            action_payload["config_id"],
+                            "canary config ID",
+                        ),
+                        "expected_generation": _positive_generation(
+                            action_payload["expected_generation"],
+                            "CANARY_GENERATION_REQUIRED",
+                        ),
+                        "expected_credential_fingerprint": expected_fingerprint,
+                    }
                     result = {
-                        "canary": service.enable_autonomous_micro_live(),
-                        "confirmation": "ENABLE AUTO CANARY",
+                        "canary": service.enable_autonomous_micro_live(**enable_kwargs),
+                        "confirmation": confirm,
                     }
             elif action_value == "canary.disarm":
                 service = CanaryService(self.store, initialize=True)
@@ -1669,11 +2426,18 @@ class OperatorControlPlane:
                 public = {"connectivity": connectivity}
             else:
                 public = _safe_value(result)
-            self._audit(action_value, target_value, success=True, result=public)
+            self._finish_action(
+                action_id,
+                status="COMPLETE",
+                result=public if isinstance(public, Mapping) else {},
+            )
+            audit_id = self._audit(action_value, target_value, success=True, result=public)
             response = {
                 "ok": True,
                 "action": action_value,
                 "target": target_value,
+                "action_id": action_id or audit_id,
+                "action_status": "COMPLETE",
                 "result": public,
                 "paper_only": True,
                 "live_execution": False,
@@ -1684,15 +2448,21 @@ class OperatorControlPlane:
         except OperatorControlError as exc:
             reason = exc.code
         except CanaryBlocked as exc:
-            reason = str(exc)[:160] or "CANARY_BLOCKED"
-        except (OSError, RuntimeError, TypeError, ValueError) as exc:
-            reason = type(exc).__name__.upper()
+            reason = str(exc).strip() or "CANARY_BLOCKED"
         except Exception as exc:
             reason = type(exc).__name__.upper()
+        self._finish_action(
+            action_id,
+            status="FAILED",
+            reason=reason,
+            result={"ok": False, "reason": reason},
+        )
         failure = {
             "ok": False,
             "action": action_value,
             "target": target_value,
+            "action_id": action_id,
+            "action_status": "FAILED" if action_id else None,
             "reason": reason,
             "paper_only": True,
             "live_execution": False,
@@ -1713,6 +2483,8 @@ __all__ = [
     "DEFAULT_HERMES_JOB_ID",
     "BOOTSTRAP_JOB_NAME",
     "HERMES_CONTROL_SCOPE",
+    "HERMES_EXTERNAL_STATUS",
+    "HERMES_EXTERNAL_EVIDENCE",
     "CANARY_CONNECTIVITY_CONFIG_KEY",
     "HermesOperatorAdapter",
     "OperatorControlError",

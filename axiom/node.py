@@ -13,6 +13,7 @@ from datetime import datetime, timedelta
 from logging.handlers import RotatingFileHandler
 import logging
 import math
+import errno
 import os
 from pathlib import Path
 import re
@@ -20,8 +21,9 @@ import subprocess
 import threading
 from typing import Any, Callable, Mapping
 import time
+import uuid
 from .collector import CollectionCycle, CollectorConfig, PolymarketCollector
-from .data import PolymarketAdapter
+from .data import PolymarketAdapter, SyntheticPredictionProvider
 from .domain import OrderBookSnapshot, ensure_utc, parse_timestamp, to_record, utc_now
 from .forward import ForwardTestRegistry, _content_hash
 from .opportunity import scan_opportunities
@@ -33,29 +35,167 @@ from .research_bus import DurableResearchBus
 from .lifecycle import PromotionCriteria
 from .strategy import evaluate_signal_record, load_strategy
 from .auto_canary import AutonomousCanaryWorker
-from .canary import CanaryService
+from .canary import CanaryBlocked, CanaryService
 
 
-def _pid_alive(pid: int) -> bool:
+EXECUTION_PROFILE_ENV = "AXIOM_EXECUTION_PROFILE"
+ISOLATED_EXECUTION_PROFILE = "isolated"
+PRODUCTION_EXECUTION_PROFILE = "production"
+_VALID_EXECUTION_PROFILES = frozenset(
+    {ISOLATED_EXECUTION_PROFILE, PRODUCTION_EXECUTION_PROFILE}
+)
+_DOTNET_EPOCH_TICKS = 621355968000000000
+_FILETIME_EPOCH_TICKS = 504911232000000000
+NODE_REVISION = os.environ.get("AXIOM_REVISION", "axiom-node-v1")
+
+
+def normalized_execution_profile(
+    value: Any = None,
+    *,
+    default: str | None = None,
+) -> str | None:
+    """Return an exact execution profile, or the explicit missing default.
+
+    ``None`` and the empty string represent an omitted setting.  Every other
+    value must be exactly one of the two supported lower-case profiles;
+    malformed values raise instead of silently becoming production.  An
+    explicit value does not bypass a malformed ambient profile.
+    """
+    ambient = os.environ.get(EXECUTION_PROFILE_ENV)
+    if value is None:
+        selected = ambient
+    else:
+        if ambient not in {None, ""} and ambient not in _VALID_EXECUTION_PROFILES:
+            raise ValueError(
+                "execution profile must be exactly 'isolated' or 'production'"
+            )
+        selected = value
+    if selected is None or selected == "":
+        selected = default
+    if selected is None:
+        return None
+    if not isinstance(selected, str) or selected not in _VALID_EXECUTION_PROFILES:
+        raise ValueError(
+            "execution profile must be exactly 'isolated' or 'production'"
+        )
+    return selected
+
+
+def _process_start_time_ticks(pid: int | None = None) -> int:
+    """Return a process creation timestamp in .NET ``DateTime.Ticks``."""
+    process_id = int(os.getpid() if pid is None else pid)
+    if process_id <= 0:
+        raise ValueError("process ID must be positive")
+    if os.name == "nt":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.OpenProcess(0x1000, False, process_id)
+            if not handle:
+                raise OSError(ctypes.get_last_error(), "OpenProcess failed")
+            creation = wintypes.FILETIME()
+            exit_time = wintypes.FILETIME()
+            kernel_time = wintypes.FILETIME()
+            user_time = wintypes.FILETIME()
+            try:
+                if not kernel32.GetProcessTimes(
+                    handle,
+                    ctypes.byref(creation),
+                    ctypes.byref(exit_time),
+                    ctypes.byref(kernel_time),
+                    ctypes.byref(user_time),
+                ):
+                    raise OSError(ctypes.get_last_error(), "GetProcessTimes failed")
+            finally:
+                kernel32.CloseHandle(handle)
+            filetime_ticks = (
+                (int(creation.dwHighDateTime) << 32)
+                | int(creation.dwLowDateTime)
+            )
+            result = _FILETIME_EPOCH_TICKS + filetime_ticks
+            if result <= 0:
+                raise OSError("invalid process creation timestamp")
+            return result
+        except (AttributeError, OSError, TypeError, ValueError) as exc:
+            raise RuntimeError("process start time unavailable") from exc
+
+    # Linux provides the process start time as clock ticks since boot.  This
+    # keeps local tests and non-Windows deployments truthful without falling
+    # back to the current wall clock.
+    try:
+        stat_text = Path(f"/proc/{process_id}/stat").read_text(encoding="ascii")
+        closing_comm = stat_text.rfind(")")
+        fields = stat_text[closing_comm + 2 :].split()
+        start_ticks = int(fields[19])
+        clock_ticks = int(os.sysconf("SC_CLK_TCK"))
+        boot_seconds = None
+        for line in Path("/proc/stat").read_text(encoding="ascii").splitlines():
+            if line.startswith("btime "):
+                boot_seconds = int(line.split()[1])
+                break
+        if boot_seconds is None or clock_ticks <= 0 or start_ticks < 0:
+            raise ValueError("missing process start metadata")
+        return (
+            _DOTNET_EPOCH_TICKS
+            + boot_seconds * 10_000_000
+            + (start_ticks * 10_000_000) // clock_ticks
+        )
+    except (OSError, UnicodeError, IndexError, TypeError, ValueError) as exc:
+        raise RuntimeError("process start time unavailable") from exc
+
+
+
+def _is_real_transport(value: Any) -> bool:
+    """Identify repository-owned network adapters while allowing test doubles."""
+    if value is None:
+        return False
+    if isinstance(value, PolymarketAdapter):
+        return True
+    cls = type(value)
+    module = str(getattr(cls, "__module__", "")).casefold()
+    name = str(getattr(cls, "__name__", "")).casefold()
+    return (
+        module in {"axiom.data.polymarket", "axiom.data.binance"}
+        or (module.startswith("axiom.") and name in {"binanceadapter", "polymarketadapter"})
+    )
+
+
+def _isolated_venue_factory() -> Any:
+    raise CanaryBlocked("ISOLATED_EXECUTION_PROFILE")
+
+
+def _pid_alive(pid: int) -> bool | None:
+    """Return process liveness, preserving inaccessible as an unknown state."""
     if pid <= 0:
         return False
     if os.name == "nt":
         try:
             import ctypes
 
-            handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.OpenProcess(0x1000, False, pid)
             if handle:
-                ctypes.windll.kernel32.CloseHandle(handle)
+                kernel32.CloseHandle(handle)
                 return True
+            error_code = int(kernel32.GetLastError())
+            if error_code in {6, 87, 1168}:  # invalid handle/parameter/not found
+                return False
+            return None
         except (AttributeError, OSError):
-            pass
+            return None
     try:
         os.kill(pid, 0)
         return True
     except PermissionError:
-        return True
-    except OSError:
-        return False
+        return None
+    except OSError as exc:
+        if exc.errno == errno.ESRCH:
+            return False
+        if exc.errno in {errno.EACCES, errno.EPERM}:
+            return None
+        return None
 
 
 def _pid_command_line(pid: int) -> str:
@@ -113,9 +253,20 @@ def _node_command_db(raw_command: str) -> str | None:
     return None
 
 
-def _pid_matches_node(pid: int, db_path: str) -> bool:
-    if not _pid_alive(pid):
+def _pid_matches_node(
+    pid: int,
+    db_path: str,
+    *,
+    expected_start_ticks: int | None = None,
+) -> bool:
+    if _pid_alive(pid) is not True:
         return False
+    if expected_start_ticks is not None:
+        try:
+            if expected_start_ticks <= 0 or _process_start_time_ticks(pid) != expected_start_ticks:
+                return False
+        except (RuntimeError, TypeError, ValueError):
+            return False
     raw_command = _pid_command_line(pid)
     actual = _node_command_db(raw_command)
     if not actual:
@@ -148,6 +299,7 @@ def _consume_provider_errors(provider: Any, context: str) -> tuple[list[str], bo
 class NodeConfig:
     db_path: str
     lock_path: str | None = None
+    pid_path: str | None = None
     log_path: str | None = None
     interval_seconds: float = 60.0
     depth: int = 20
@@ -178,6 +330,8 @@ class NodeConfig:
     crypto_symbol: str = "BTC/USDT"
     crypto_enabled: bool = True
     auto_canary_interval_seconds: float = 60.0
+    execution_profile: str | None = None
+    revision: str | None = None
 
     def __post_init__(self) -> None:
         db_text = str(self.db_path).strip()
@@ -185,7 +339,14 @@ class NodeConfig:
             object.__setattr__(self, "db_path", os.path.abspath(os.path.expanduser(db_text)))
         if not str(self.db_path).strip():
             raise ValueError("db_path is required")
-        for field_name in ("lock_path", "log_path"):
+        profile = normalized_execution_profile(
+            self.execution_profile,
+            default=PRODUCTION_EXECUTION_PROFILE,
+        )
+        object.__setattr__(self, "execution_profile", profile)
+        revision = str(self.revision or os.environ.get("AXIOM_REVISION") or NODE_REVISION).strip()
+        object.__setattr__(self, "revision", revision or NODE_REVISION)
+        for field_name in ("lock_path", "log_path", "pid_path"):
             configured = getattr(self, field_name)
             if configured is None:
                 continue
@@ -204,8 +365,9 @@ class NodeConfig:
         db_identity = path_identity(self.db_path)
         lock_identity = path_identity(self.lock_path or f"{self.db_path}.lock")
         log_identity = path_identity(self.log_path or f"{self.db_path}.log")
-        if len({db_identity, lock_identity, log_identity}) != 3:
-            raise ValueError("db_path, lock_path, and log_path must be distinct")
+        pid_identity = path_identity(self.pid_path or f"{self.db_path}.node.pid")
+        if len({db_identity, lock_identity, log_identity, pid_identity}) != 4:
+            raise ValueError("db_path, lock_path, log_path, and pid_path must be distinct")
         if not str(self.worker_name).strip():
             raise ValueError("worker_name is required")
         if not str(self.crypto_symbol).strip():
@@ -332,9 +494,34 @@ class ResearchNode:
         clock: Callable[[], datetime] = utc_now,
     ) -> None:
         self.config = config
+        self.execution_profile = normalized_execution_profile(
+            config.execution_profile,
+            default=PRODUCTION_EXECUTION_PROFILE,
+        )
+        self.revision = str(config.revision or NODE_REVISION)
+        if self.execution_profile == ISOLATED_EXECUTION_PROFILE:
+            # The profile is an inherited process boundary, not a dashboard
+            # preference.  Reassert it before constructing any provider.
+            os.environ[EXECUTION_PROFILE_ENV] = ISOLATED_EXECUTION_PROFILE
         self.store = store if store is not None else AxiomStore(config.db_path)
         self._owns_store = store is None
-        self.provider = provider if provider is not None else PolymarketAdapter()
+        selected_provider = provider
+        if selected_provider is None:
+            selected_provider = (
+                SyntheticPredictionProvider()
+                if self.execution_profile == ISOLATED_EXECUTION_PROFILE
+                else PolymarketAdapter()
+            )
+        if (
+            self.execution_profile == ISOLATED_EXECUTION_PROFILE
+            and _is_real_transport(selected_provider)
+        ):
+            if self._owns_store:
+                self.store.close()
+            raise RuntimeError(
+                "ISOLATED_EXECUTION_PROFILE rejects real prediction transports"
+            )
+        self.provider = selected_provider
         self.opportunity_model = opportunity_model
         self.sleep = sleep
         self.clock = clock
@@ -344,8 +531,14 @@ class ResearchNode:
         self._heartbeat_stop = threading.Event()
         self._heartbeat_thread: threading.Thread | None = None
         self.started_at: datetime | None = None
+        self._run_identity = ""
         self._lock_fd: int | None = None
-        self.crypto_provider = crypto_provider if config.crypto_enabled else None
+        selected_crypto_provider = crypto_provider if config.crypto_enabled else None
+        if self.execution_profile == ISOLATED_EXECUTION_PROFILE and _is_real_transport(selected_crypto_provider):
+            if self._owns_store:
+                self.store.close()
+            raise RuntimeError("ISOLATED_EXECUTION_PROFILE rejects real crypto transports")
+        self.crypto_provider = selected_crypto_provider
         normalized_symbol = str(config.crypto_symbol).replace("/", "").replace("-", "").upper()
         self._crypto_experiment_id = f"crypto-paper-{normalized_symbol}"
         self._crypto_trader = (
@@ -369,18 +562,28 @@ class ResearchNode:
         self._research_thread: threading.Thread | None = None
         self._health_thread: threading.Thread | None = None
         self._auto_canary_thread: threading.Thread | None = None
+        self._worker_runtime_lock = threading.RLock()
+        self._worker_runtime: dict[str, dict[str, Any]] = {}
+        self._worker_restart_counts: dict[str, int] = {}
+        self._worker_fatal: set[str] = set()
+        self._health_passes = 0
+        self._worker_restart_limit = max(1, int(config.max_attempts))
         self._auto_canary_worker = AutonomousCanaryWorker(
             self.store,
             interval_seconds=config.auto_canary_interval_seconds,
             clock=clock,
+            venue_factory=(
+                _isolated_venue_factory
+                if self.execution_profile == ISOLATED_EXECUTION_PROFILE
+                else None
+            ),
         )
         self._collector_error: str | None = None
         self._research_error: str | None = None
         self._run_cycle_base = 0
         self._research_passes = 0
         self._cycles: list[CollectionCycle] = []
-        self._auto_canary_restart_count = 0
-        self._auto_canary_restart_limit = 3
+        self._collection_count = 0
         self._auto_canary_fatal = False
         self._restart_count = 0
         self._last_status: dict[str, Any] | None = None
@@ -430,28 +633,42 @@ class ResearchNode:
     def log_path(self) -> Path:
         return Path(self.config.log_path or (str(self.config.db_path) + ".log"))
     @property
+    def pid_path(self) -> Path:
+        return Path(self.config.pid_path or (str(self.config.db_path) + ".node.pid"))
+
+    @property
+    def process_identity(self) -> str:
+        return f"{self.config.worker_name}:{os.getpid()}:{self.revision}:{self._run_identity or 'not-started'}"
+    @property
     def stop_path(self) -> Path:
         return Path(str(self.config.db_path) + ".stop")
 
     def _external_stop_requested(self) -> bool:
         if self.stop_event.is_set():
             return True
+
         try:
             marker = self.stop_path.read_text(encoding="utf-8").strip()
         except FileNotFoundError:
             return False
         except OSError:
-            marker = "stop"
+            # An unreadable marker cannot authorize this process to stop.
+            return False
         if not marker:
             return False
         marker_lines = marker.splitlines()
         try:
             marker_pid = int(marker_lines[0].strip())
         except (IndexError, ValueError):
-            marker_pid = 0
+            return False
+        if marker_pid <= 0:
+            return False
         if marker_pid > 0:
             if marker_pid != os.getpid():
-                if not _pid_matches_node(marker_pid, str(self.config.db_path)):
+                # A stop marker from another process is stale only when its
+                # owner is proven dead.  Access-denied liveness must not erase
+                # a marker or permit an unsafe ownership decision.
+                if _pid_alive(marker_pid) is False:
                     try:
                         self.stop_path.unlink()
                     except OSError:
@@ -462,18 +679,201 @@ class ResearchNode:
             except (FileNotFoundError, OSError):
                 owner_marker = ""
             if len(marker_lines) < 2 or owner_marker != marker:
-                try:
-                    self.stop_path.unlink()
-                except OSError:
-                    pass
                 return False
         self.stop_event.set()
         return True
+    def _worker_payload(self, worker_name: str) -> dict[str, Any]:
+        with self._worker_runtime_lock:
+            runtime = dict(self._worker_runtime.get(worker_name, {}))
+        runtime.update(
+            {
+                "pid": os.getpid(),
+                "process_identity": self.process_identity,
+                "revision": self.revision,
+                "execution_profile": self.execution_profile,
+                "paper_only": True,
+                "live_execution": False,
+            }
+        )
+        return runtime
+
+    def _persist_worker_runtime(
+        self,
+        worker_name: str,
+        status: str,
+        *,
+        extra: Mapping[str, Any] | None = None,
+    ) -> None:
+        payload = self._worker_payload(worker_name)
+        if extra:
+            payload.update(dict(extra))
+        try:
+            self.store.save_worker_state(
+                worker_name,
+                status,
+                payload,
+                started_at=self.started_at or ensure_utc(self.clock()),
+                heartbeat_at=ensure_utc(self.clock()),
+            )
+        except Exception as exc:
+            self._log(logging.WARNING, "worker state update failed for %s: %s", worker_name, exc)
+
+    def _worker_tick_started(self, worker_name: str, *, next_work: Any = None) -> None:
+        timestamp = ensure_utc(self.clock()).isoformat()
+        with self._worker_runtime_lock:
+            runtime = self._worker_runtime.setdefault(
+                worker_name,
+                {
+                    "started_at": self.started_at.isoformat() if self.started_at else timestamp,
+                    "errors": [],
+                    "successful_decision_candidates": [],
+                    "successful_markets": [],
+                },
+            )
+            runtime.update(
+                {
+                    "last_tick_started_at": timestamp,
+                    "worker_status": "RUNNING",
+                    "next_work": next_work,
+                }
+            )
+        self._persist_worker_runtime(worker_name, "running")
+
+    def _worker_tick_completed(
+        self,
+        worker_name: str,
+        *,
+        successful: bool = True,
+        successful_candidates: Any = (),
+        successful_markets: Any = (),
+        decision: str | None = None,
+        next_work: Any = None,
+        error: BaseException | str | None = None,
+        extra: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Persist a completed tick without turning partial work into success.
+
+        A worker can complete its bounded operation while producing only
+        partial/failed output.  ``last_tick_completed_at`` records that fact;
+        ``last_successful_tick`` changes only for genuinely successful work,
+        while failure counters remain visible for bounded backoff.
+        """
+        timestamp_value = ensure_utc(self.clock())
+        timestamp = timestamp_value.isoformat()
+
+        def bounded_texts(value: Any) -> list[str]:
+            if isinstance(value, str):
+                values = [value]
+            elif isinstance(value, (list, tuple, set, frozenset)):
+                values = list(value)
+            else:
+                values = []
+            return [str(item).strip() for item in values if str(item).strip()][:64]
+
+        candidates = bounded_texts(successful_candidates)
+        markets = bounded_texts(successful_markets)
+        with self._worker_runtime_lock:
+            runtime = self._worker_runtime.setdefault(worker_name, {"errors": []})
+            runtime["last_tick_completed_at"] = timestamp
+            runtime["next_work"] = next_work
+            if decision is not None:
+                runtime["next_decision"] = decision
+            for key, values in (
+                ("successful_decision_candidates", candidates),
+                ("successful_markets", markets),
+            ):
+                if values:
+                    existing = [*runtime.get(key, []), *values]
+                    runtime[key] = list(dict.fromkeys(existing))[-64:]
+            if successful:
+                runtime.update(
+                    {
+                        "last_successful_tick": timestamp,
+                        "worker_status": "IDLE",
+                        "last_error": None,
+                        "last_error_code": None,
+                        "consecutive_failures": 0,
+                        "next_retry_at": None,
+                    }
+                )
+                persisted_status = "idle"
+            else:
+                failures = int(runtime.get("consecutive_failures", 0) or 0) + 1
+                delay = min(30.0, max(0.1, 2.0 ** max(0, failures - 1)))
+                if error is not None:
+                    message = str(error)
+                    runtime["last_error"] = message
+                    runtime["last_error_code"] = (
+                        type(error).__name__.upper()
+                        if not isinstance(error, str)
+                        else "WORKER_TICK_PARTIAL"
+                    )
+                    errors = [*runtime.get("errors", []), message]
+                    runtime["errors"] = errors[-32:]
+                runtime.update(
+                    {
+                        "consecutive_failures": failures,
+                        "next_retry_at": (
+                            timestamp_value + timedelta(seconds=delay)
+                        ).isoformat(),
+                        "worker_status": "DEGRADED",
+                    }
+                )
+                persisted_status = "degraded"
+        self._persist_worker_runtime(worker_name, persisted_status, extra=extra)
+
+    def _worker_tick_failed(
+        self,
+        worker_name: str,
+        exc: BaseException | str,
+        *,
+        fatal: bool = False,
+        next_work: Any = None,
+    ) -> None:
+        timestamp = ensure_utc(self.clock())
+        message = str(exc)
+        with self._worker_runtime_lock:
+            runtime = self._worker_runtime.setdefault(worker_name, {"errors": []})
+            failures = int(runtime.get("consecutive_failures", 0) or 0) + 1
+            delay = min(
+                30.0,
+                max(0.1, 2.0 ** max(0, failures - 1)),
+            )
+            errors = [*runtime.get("errors", []), message]
+            runtime.update(
+                {
+                    "last_tick_completed_at": timestamp.isoformat(),
+                    "last_error": message,
+                    "last_error_code": type(exc).__name__.upper()
+                    if not isinstance(exc, str)
+                    else "WORKER_TICK_FAILED",
+                    "errors": errors[-32:],
+                    "consecutive_failures": failures,
+                    "next_retry_at": (
+                        None
+                        if fatal
+                        else (timestamp + timedelta(seconds=delay)).isoformat()
+                    ),
+                    "next_work": next_work,
+                    "worker_status": "FATAL" if fatal else "DEGRADED",
+                }
+            )
+        self._persist_worker_runtime(worker_name, "fatal" if fatal else "degraded")
     def _publish_autonomous_initializing(self, timestamp: datetime) -> None:
         """Publish a minimal startup state before the first autonomous tick."""
         try:
             service = CanaryService(self.store, clock=self.clock)
             service.upsert_initializing_readiness_snapshot(timestamp=timestamp)
+            if not self.config.mutation_enabled:
+                service.record_autonomous_decision(
+                    next_decision="AUTONOMOUS_CANARY_DISABLED",
+                    blocker="AUTONOMOUS_CANARY_DISABLED",
+                    signal_id=None,
+                    worker_status="DISABLED",
+                    timestamp=timestamp,
+                    publish=False,
+                )
+                return
             service.record_autonomous_decision(
                 next_decision="INITIALIZING",
                 blocker=None,
@@ -494,14 +894,30 @@ class ResearchNode:
         error_type: str | None = None,
         candidate_id: str | None = None,
         signal_id: str | None = None,
+        restart_attempt: int | None = None,
     ) -> None:
         """Persist node-owned autonomous liveness without touching control."""
+        if restart_attempt is not None:
+            with self._worker_runtime_lock:
+                runtime = self._worker_runtime.setdefault(
+                    "autonomous-canary",
+                    {"errors": []},
+                )
+                runtime.update(
+                    {
+                        "restart_count": self._restart_count,
+                        "restart_attempt": restart_attempt,
+                        "restart_reason": "AUTONOMOUS_THREAD_EXITED",
+                    }
+                )
         heartbeat = ensure_utc(self.clock())
         payload: dict[str, Any] = {
+            **self._worker_payload("autonomous-canary"),
             "pid": os.getpid(),
             "configured_interval_seconds": float(self.config.auto_canary_interval_seconds),
             "autonomous": True,
             "production_live_execution": False,
+            "restart_count": self._restart_count,
         }
         if decision is not None:
             payload["decision"] = decision
@@ -513,6 +929,8 @@ class ResearchNode:
             payload["candidate_id"] = candidate_id
         if signal_id is not None:
             payload["signal_id"] = signal_id
+        if restart_attempt is not None:
+            payload["restart_attempt"] = restart_attempt
         if status.lower() == "fatal":
             payload.update({"fatal": True, "requires_attention": True})
         try:
@@ -546,37 +964,10 @@ class ResearchNode:
         except Exception as exc:
             self._log(logging.WARNING, "autonomous fatal state publication failed: %s", exc)
 
-    def _supervise_autonomous_thread(self) -> bool:
-        """Restart a dead autonomous thread a bounded number of times."""
-        thread = self._auto_canary_thread
-        if self.stop_event.is_set() or thread is None or thread.is_alive():
-            return True
-        if self._auto_canary_restart_count >= self._auto_canary_restart_limit:
-            self._persist_autonomous_fatal("AUTONOMOUS_THREAD_EXITED")
-            return False
-        self._auto_canary_restart_count += 1
-        self._restart_count += 1
-        delay = min(2.0, max(0.1, 2.0 ** (self._auto_canary_restart_count - 1) * 0.1))
-        self._save_autonomous_worker_state(
-            "degraded",
-            decision="AUTONOMOUS_THREAD_RESTARTING",
-            blocker="AUTONOMOUS_THREAD_EXITED",
-        )
-        if self.stop_event.wait(delay):
-            return True
-        replacement = threading.Thread(
-            target=self._auto_canary_worker_loop,
-            name=f"{self.config.worker_name}-autonomous-canary",
-            daemon=True,
-        )
-        self._auto_canary_thread = replacement
-        replacement.start()
-        return True
-
-
     def run(self, *, max_cycles: int | None = None) -> list[CollectionCycle]:
         if max_cycles is not None and (isinstance(max_cycles, bool) or max_cycles < 0):
             raise ValueError("max_cycles must be non-negative or None")
+        self._run_identity = uuid.uuid4().hex
         self._acquire_lock()
         try:
             self._configure_logging()
@@ -589,10 +980,15 @@ class ResearchNode:
         self.stop_event.clear()
         self._collector_error = None
         self._research_error = None
+        with self._worker_runtime_lock:
+            self._worker_runtime = {}
+        self._worker_restart_counts = {}
+        self._worker_fatal.clear()
+        self._health_passes = 0
         self._cycles.clear()
+        self._collection_count = 0
         self._run_cycle_base = 0
         self._research_passes = 0
-        self._auto_canary_restart_count = 0
         self._auto_canary_fatal = False
         cycle_failure = False
         status = "degraded"
@@ -602,6 +998,14 @@ class ResearchNode:
                 "running",
                 {
                     "pid": os.getpid(),
+                    "process_identity": self.process_identity,
+                    "revision": self.revision,
+                    "execution_profile": self.execution_profile,
+                    "db_path": str(self.config.db_path),
+                    "lock_path": str(self.lock_path),
+                    "log_path": str(self.log_path),
+                    "pid_path": str(self.pid_path),
+                    "started_at": self.started_at.isoformat(),
                     "paper_only": True,
                     "live_execution": False,
                     "crypto_paper": dict(self._crypto_status),
@@ -612,86 +1016,112 @@ class ResearchNode:
             self._publish_autonomous_initializing(self.started_at)
             worker_start_states = {
                 "polymarket-collector": {
-                    "pid": os.getpid(),
                     "configured_interval_seconds": float(self.config.interval_seconds),
-                    "paper_only": True,
-                    "live_execution": False,
+                    "next_work": "collect_market_cycle",
                 },
                 "paper-engine": {
-                    "pid": os.getpid(),
                     "candidate_count": 0,
                     "processed_candidates": 0,
                     "remaining_candidates": 0,
-                    "paper_only": True,
-                    "live_execution": False,
+                    "next_work": "run_paper_candidates",
                 },
-                "research-engine": {"pid": os.getpid(), "paper_only": True, "live_execution": False},
+                "research-engine": {"next_work": "wait_for_collection"},
                 "health-monitor": {
-                    "pid": os.getpid(),
                     "configured_interval_seconds": float(self.config.interval_seconds),
-                    "paper_only": True,
-                    "live_execution": False,
+                    "next_work": "wait_for_collection",
                 },
                 "autonomous-canary": {
-                    "pid": os.getpid(),
                     "configured_interval_seconds": float(self.config.auto_canary_interval_seconds),
                     "autonomous": True,
+                    "next_work": (
+                        "evaluate_candidates"
+                        if self.config.mutation_enabled
+                        else "disabled"
+                    ),
+                    "decision": (
+                        None
+                        if self.config.mutation_enabled
+                        else "AUTONOMOUS_CANARY_DISABLED"
+                    ),
+                    "blocker": (
+                        None
+                        if self.config.mutation_enabled
+                        else "AUTONOMOUS_CANARY_DISABLED"
+                    ),
                     "production_live_execution": False,
                 },
             }
             for worker_name, payload in worker_start_states.items():
-                self.store.save_worker_state(
+                with self._worker_runtime_lock:
+                    self._worker_runtime[worker_name] = {
+                        "started_at": self.started_at.isoformat(),
+                        "last_tick_started_at": None,
+                        "last_tick_completed_at": None,
+                        "last_successful_tick": None,
+                        "errors": [],
+                        "successful_decision_candidates": [],
+                        "successful_markets": [],
+                        "consecutive_failures": 0,
+                        **payload,
+                    }
+                self._persist_worker_runtime(
                     worker_name,
-                    "idle" if max_cycles == 0 else "running",
-                    payload,
-                    started_at=self.started_at,
-                    heartbeat_at=self.started_at,
+                    (
+                        "disabled"
+                        if (
+                            worker_name == "autonomous-canary"
+                            and not self.config.mutation_enabled
+                        )
+                        else ("idle" if max_cycles == 0 else "running")
+                    ),
                 )
             self._start_heartbeat_watchdog()
             if max_cycles != 0:
                 self._start_worker_threads(max_cycles)
                 while not self.stop_event.is_set():
-                    auto_dead = False
+                    if self._external_stop_requested():
+                        break
                     with self._worker_condition:
-                        cycle_count = len(self._cycles) - self._run_cycle_base
+                        cycle_count = self._collection_count - self._run_cycle_base
                         research_passes = self._research_passes
-                        collector = self._collector_thread
-                        auto_thread = self._auto_canary_thread
-                        if auto_thread is not None and not auto_thread.is_alive():
-                            auto_dead = True
-                        if max_cycles is not None and cycle_count >= max_cycles and research_passes >= 1:
-                            if auto_dead:
-                                cycle_failure = True
-                            else:
-                                break
-                        if collector is not None and not collector.is_alive() and (
-                            max_cycles is None or cycle_count < max_cycles
-                        ):
-                            cycle_failure = True
+                        health_passes = self._health_passes
+                        complete = bool(
+                            max_cycles is not None
+                            and cycle_count >= max_cycles
+                            and research_passes >= 1
+                            and health_passes >= 1
+                        )
+                        if complete:
                             break
-                        if auto_dead:
-                            self._worker_condition.wait(timeout=0.01)
-                        else:
-                            self._worker_condition.wait(timeout=0.5)
-                    if auto_dead:
-                        if not self._supervise_autonomous_thread():
-                            cycle_failure = True
-                            break
+                        self._worker_condition.wait(timeout=0.25)
+                    # Poll the owned marker from the responsive coordinator,
+                    # not only from a collector cycle whose cadence may be 60s.
+                    if self._external_stop_requested():
+                        break
+                    if not self._supervise_workers(max_cycles=max_cycles):
+                        cycle_failure = True
+                        break
             elif max_cycles == 0:
                 # No child was launched; immediately settle the startup
                 # marker so direct bounded invocations cannot leave RUNNING.
-                try:
-                    service = CanaryService(self.store, clock=self.clock)
-                    service.record_autonomous_decision(
-                        next_decision="WAIT_FOR_NEXT_DECISION",
-                        blocker=None,
-                        worker_status="IDLE",
-                        timestamp=ensure_utc(self.clock()),
-                        publish=False,
-                    )
-                except Exception:
-                    pass
-            cycle_failure = cycle_failure or self._auto_canary_fatal or bool(
+                if self.config.mutation_enabled:
+                    try:
+                        service = CanaryService(self.store, clock=self.clock)
+                        service.record_autonomous_decision(
+                            next_decision="WAIT_FOR_NEXT_DECISION",
+                            blocker=None,
+                            worker_status="IDLE",
+                            timestamp=ensure_utc(self.clock()),
+                            publish=False,
+                        )
+                    except Exception:
+                        pass
+            with self._worker_runtime_lock:
+                worker_degraded = any(
+                    str(runtime.get("worker_status", "")).upper() in {"DEGRADED", "FATAL"}
+                    for runtime in self._worker_runtime.values()
+                )
+            cycle_failure = cycle_failure or self._auto_canary_fatal or worker_degraded or bool(
                 self._collector_error or self._research_error
             )
             status = (
@@ -723,8 +1153,8 @@ class ResearchNode:
                 self._heartbeat(
                     status,
                     {
-                        "cycles": len(self._cycles) - self._run_cycle_base,
-                        "attempts": len(self._cycles) - self._run_cycle_base,
+                        "cycles": self._collection_count - self._run_cycle_base,
+                        "attempts": self._collection_count - self._run_cycle_base,
                         "restart_count": self._restart_count,
                         "crypto_paper": dict(self._crypto_status),
                     },
@@ -732,10 +1162,11 @@ class ResearchNode:
             except Exception:
                 pass
             try:
-                self.stop_path.unlink()
-            except FileNotFoundError:
-                pass
-            except OSError:
+                marker = self.stop_path.read_text(encoding="ascii").strip()
+                owner_marker = self.lock_path.read_text(encoding="ascii").strip()
+                if marker and marker == owner_marker:
+                    self.stop_path.unlink()
+            except (FileNotFoundError, OSError):
                 pass
             self._release_lock()
             try:
@@ -774,38 +1205,204 @@ class ResearchNode:
             name=f"{self.config.worker_name}-health",
             daemon=True,
         )
-        self._auto_canary_thread = threading.Thread(
-            target=self._auto_canary_worker_loop,
-            name=f"{self.config.worker_name}-autonomous-canary",
-            daemon=True,
-        )
+        self._auto_canary_thread = None
+        if self.config.mutation_enabled:
+            self._auto_canary_thread = threading.Thread(
+                target=self._auto_canary_worker_loop,
+                name=f"{self.config.worker_name}-autonomous-canary",
+                daemon=True,
+            )
         self._collector_thread.start()
         self._research_thread.start()
         self._health_thread.start()
-        self._auto_canary_thread.start()
+        if self._auto_canary_thread is not None:
+            self._auto_canary_thread.start()
+    def _worker_thread_specs(self, max_cycles: int | None) -> dict[str, tuple[str, Callable[[], None]]]:
+        specs: dict[str, tuple[str, Callable[[], None]]] = {
+            "polymarket-collector": (
+                "_collector_thread",
+                lambda: self._collector_worker_loop(max_cycles),
+            ),
+            "research-engine": ("_research_thread", self._research_worker_loop),
+            "health-monitor": ("_health_thread", self._health_worker_loop),
+        }
+        if self.config.mutation_enabled:
+            specs["autonomous-canary"] = (
+                "_auto_canary_thread",
+                self._auto_canary_worker_loop,
+            )
+        return specs
+    def _supervise_workers(self, *, max_cycles: int | None) -> bool:
+        """Restart unexpectedly exited workers, then fence after bounded retries."""
+        for worker_name, (attribute, target) in self._worker_thread_specs(max_cycles).items():
+            thread = getattr(self, attribute)
+            if thread is not None and thread.is_alive():
+                continue
+            # A bounded collector exits normally once its requested cycles are
+            # complete; it must not be restarted while research/health settle.
+            if (
+                worker_name == "polymarket-collector"
+                and max_cycles is not None
+                and self._collection_count - self._run_cycle_base >= max_cycles
+            ):
+                continue
+            if worker_name == "autonomous-canary" and self._auto_canary_fatal:
+                self._worker_fatal.add(worker_name)
+                return False
+            if worker_name in self._worker_fatal:
+                return False
+            attempts = int(self._worker_restart_counts.get(worker_name, 0))
+            if attempts >= self._worker_restart_limit:
+                self._worker_fatal.add(worker_name)
+                self._worker_tick_failed(
+                    worker_name,
+                    "worker thread exited after bounded restart attempts",
+                    fatal=True,
+                    next_work="operator_review_required",
+                )
+                if worker_name == "autonomous-canary":
+                    self._auto_canary_fatal = True
+                self._log(logging.ERROR, "%s exhausted restart attempts", worker_name)
+                return False
+            attempts += 1
+            self._worker_restart_counts[worker_name] = attempts
+            self._restart_count += 1
+            delay = min(30.0, max(0.1, 2.0 ** (attempts - 1) * 0.1))
+            self._worker_tick_failed(
+                worker_name,
+                "worker thread exited unexpectedly",
+                next_work=f"restart_in_{delay:g}s",
+            )
+            if worker_name == "autonomous-canary":
+                self._save_autonomous_worker_state(
+                    "degraded",
+                    decision="AUTONOMOUS_THREAD_RESTARTING",
+                    blocker="AUTONOMOUS_THREAD_EXITED",
+                    error_type="AUTONOMOUS_THREAD_EXITED",
+                    restart_attempt=attempts,
+                )
+            if self.stop_event.wait(delay):
+                return True
+            replacement = threading.Thread(
+                target=target,
+                name=f"{self.config.worker_name}-{worker_name}",
+                daemon=True,
+            )
+            setattr(self, attribute, replacement)
+            replacement.start()
+        return True
     def _auto_canary_worker_loop(self) -> None:
-        """Run isolated ticks and leave a truthful heartbeat at each boundary."""
+        """Run isolated ticks with bounded recovery and truthful boundaries."""
+        if not self.config.mutation_enabled:
+            self._save_autonomous_worker_state(
+                "disabled",
+                decision="AUTONOMOUS_CANARY_DISABLED",
+                blocker="AUTONOMOUS_CANARY_DISABLED",
+            )
+            try:
+                CanaryService(self.store, clock=self.clock).record_autonomous_decision(
+                    next_decision="AUTONOMOUS_CANARY_DISABLED",
+                    blocker="AUTONOMOUS_CANARY_DISABLED",
+                    worker_status="DISABLED",
+                    timestamp=ensure_utc(self.clock()),
+                    publish=False,
+                )
+            except Exception:
+                pass
+            return
+
         status = "idle"
-        retry_attempts = 0
         try:
             while not self.stop_event.is_set():
-                self._save_autonomous_worker_state(
-                    "running",
-                    decision="EVALUATING_CANDIDATES",
+                result: Mapping[str, Any] | None = None
+                for attempt in range(self.config.max_attempts):
+                    self._worker_tick_started(
+                        "autonomous-canary",
+                        next_work="evaluate_candidates",
+                    )
+                    self._save_autonomous_worker_state(
+                        "running",
+                        decision="EVALUATING_CANDIDATES",
+                    )
+                    try:
+                        candidate_result = self._auto_canary_worker.tick()
+                        result = (
+                            candidate_result
+                            if isinstance(candidate_result, Mapping)
+                            else {"status": "ERROR", "error_type": "INVALID_TICK_RESULT"}
+                        )
+                        if str(result.get("status") or "").upper() == "ERROR":
+                            raise RuntimeError(
+                                str(result.get("error_type") or result.get("blocker") or "tick returned ERROR")
+                            )
+                        break
+                    except BaseException as exc:
+                        self._worker_tick_failed(
+                            "autonomous-canary",
+                            exc,
+                            fatal=attempt + 1 >= self.config.max_attempts,
+                            next_work=(
+                                "operator_review_required"
+                                if attempt + 1 >= self.config.max_attempts
+                                else f"retry_{attempt + 1}"
+                            ),
+                        )
+                        self._log(logging.ERROR, "autonomous worker tick failed: %s", exc)
+                        if attempt + 1 >= self.config.max_attempts:
+                            self._auto_canary_fatal = True
+                            self._persist_autonomous_fatal("AUTONOMOUS_WORKER_TICK_EXHAUSTED")
+                            status = "fatal"
+                            break
+                        delay = min(
+                            float(self.config.auto_canary_interval_seconds),
+                            max(0.1, 2.0**attempt * 0.1),
+                        )
+                        if self.stop_event.wait(delay):
+                            break
+                if self._auto_canary_fatal or self.stop_event.is_set():
+                    break
+                result = result or {}
+                result_status = str(result.get("status") or "").upper()
+                result_decision = str(result.get("decision") or "").upper()
+                result_blocker = str(result.get("blocker") or "").strip()
+                tick_failed = (
+                    result_decision == "UNKNOWN_NO_RETRY"
+                    or result_blocker == "UNKNOWN_NO_RETRY"
+                    or result_status == "ERROR"
+                    or (
+                        result_status == "BLOCKED"
+                        and (
+                            result_decision == "POSITION_RECONCILIATION_BLOCKED"
+                            or result_blocker
+                            in {
+                                "CANARY_RECONCILIATION_PROVIDER_ERROR",
+                                "CANARY_POSITION_RECONCILIATION_FAILED",
+                                "CANARY_SUBMISSION_UNKNOWN",
+                                "AUTONOMOUS_WORKER_EXCEPTION",
+                            }
+                        )
+                    )
                 )
-                try:
-                    result = self._auto_canary_worker.tick()
-                except BaseException as exc:
-                    # A tick failure is local to this iteration.  Do not let
-                    # it silently terminate the supervised autonomous thread.
-                    result = {
-                        "status": "ERROR",
-                        "decision": "AUTONOMOUS_WORKER_EXCEPTION",
-                        "blocker": "AUTONOMOUS_WORKER_EXCEPTION",
-                        "error_type": type(exc).__name__,
-                    }
-                    self._log(logging.ERROR, "autonomous worker tick failed: %s", exc)
-                status = "degraded" if result.get("status") == "ERROR" else "idle"
+                status = "degraded" if tick_failed else "idle"
+                self._worker_tick_completed(
+                    "autonomous-canary",
+                    successful=not tick_failed,
+                    successful_candidates=result.get("candidate_id"),
+                    successful_markets=result.get("market_ids", result.get("markets")),
+                    decision=str(result.get("decision") or "WAIT_FOR_NEXT_DECISION"),
+                    next_work=result.get("next_work"),
+                    error=(
+                        result_blocker
+                        or str(result.get("error_type") or "")
+                        if tick_failed
+                        else None
+                    ),
+                    extra={
+                        "candidate_id": result.get("candidate_id"),
+                        "signal_id": result.get("signal_id"),
+                        "decision": result.get("decision"),
+                    },
+                )
                 self._save_autonomous_worker_state(
                     status,
                     decision=str(result.get("decision") or ""),
@@ -814,30 +1411,19 @@ class ResearchNode:
                     candidate_id=result.get("candidate_id"),
                     signal_id=result.get("signal_id"),
                 )
-                if status == "degraded" and retry_attempts < 1:
-                    retry_attempts += 1
-                    if self.stop_event.wait(
-                        min(
-                            float(self.config.auto_canary_interval_seconds),
-                            max(0.1, 2.0 ** retry_attempts * 0.1),
-                        )
-                    ):
-                        break
-                    continue
-                retry_attempts = 0
                 if self.stop_event.wait(self.config.auto_canary_interval_seconds):
                     break
         except BaseException as exc:
-            # Unexpected loop-level failures are persisted as degraded.  The
-            # node main loop can then restart this thread or fence FATAL.
-            status = "degraded"
-            self._log(logging.ERROR, "autonomous worker loop failed: %s", exc)
-            self._save_autonomous_worker_state(
-                status,
-                decision="AUTONOMOUS_WORKER_EXCEPTION",
-                blocker="AUTONOMOUS_WORKER_EXCEPTION",
-                error_type=type(exc).__name__,
+            status = "fatal"
+            self._auto_canary_fatal = True
+            self._worker_tick_failed(
+                "autonomous-canary",
+                exc,
+                fatal=True,
+                next_work="operator_review_required",
             )
+            self._log(logging.ERROR, "autonomous worker loop failed: %s", exc)
+            self._persist_autonomous_fatal("AUTONOMOUS_WORKER_LOOP_EXCEPTION")
         finally:
             if not self._auto_canary_fatal:
                 self._save_autonomous_worker_state(
@@ -880,6 +1466,7 @@ class ResearchNode:
         error: str | None = None,
     ) -> None:
         payload: dict[str, Any] = {
+            **self._worker_payload("polymarket-collector"),
             "pid": os.getpid(),
             "configured_interval_seconds": float(self.config.interval_seconds),
             "next_scheduled_collection_at": (
@@ -906,6 +1493,7 @@ class ResearchNode:
             )
         if error:
             payload["error"] = error
+            payload["last_error"] = error
         self.store.save_worker_state(
             "polymarket-collector",
             status,
@@ -917,7 +1505,6 @@ class ResearchNode:
     def _collector_worker_loop(self, max_cycles: int | None) -> None:
         collector, owned_store = self._collector_for_worker()
         completed = 0
-        failed_attempts = 0
         next_due = time.monotonic()
         next_scheduled = ensure_utc(self.clock())
         try:
@@ -928,35 +1515,97 @@ class ResearchNode:
                 if self._external_stop_requested():
                     break
                 scheduled_for = next_scheduled
-                try:
-                    cycle = collector.collect_once()
-                except Exception as exc:
-                    failed_attempts += 1
-                    self._collector_error = str(exc)
-                    self._log(logging.ERROR, "collector worker cycle failed: %s", exc)
-                    self._save_collector_worker_state(
-                        "degraded",
-                        next_scheduled=scheduled_for,
-                        error=str(exc),
+                cycle: CollectionCycle | None = None
+                for attempt in range(self.config.max_attempts):
+                    self._worker_tick_started(
+                        "polymarket-collector",
+                        next_work=scheduled_for.isoformat(),
                     )
-                    if max_cycles is not None and failed_attempts >= max_cycles:
+                    try:
+                        candidate_cycle = collector.collect_once()
+                        if not isinstance(candidate_cycle, CollectionCycle):
+                            raise RuntimeError("collector returned an invalid cycle")
+                        cycle = candidate_cycle
                         break
-                else:
-                    failed_attempts = 0
-                    self._collector_error = None
-                    with self._worker_condition:
-                        self._cycles.append(cycle)
-                        if len(self._cycles) > self._run_cycle_base + self.config.retain_cycles:
-                            del self._cycles[: -(self.config.retain_cycles)]
-                        completed += 1
-                        self._worker_condition.notify_all()
-                    next_scheduled = cycle.started_at + timedelta(seconds=float(self.config.interval_seconds))
-                    self._update_collector_schedule(schedule_store, next_scheduled)
-                    self._save_collector_worker_state(
-                        "running",
-                        next_scheduled=next_scheduled,
-                        cycle=cycle,
+                    except BaseException as exc:
+                        self._collector_error = str(exc)
+                        self._worker_tick_failed(
+                            "polymarket-collector",
+                            exc,
+                            fatal=attempt + 1 >= self.config.max_attempts,
+                            next_work=(
+                                "operator_review_required"
+                                if attempt + 1 >= self.config.max_attempts
+                                else f"retry_{attempt + 1}"
+                            ),
+                        )
+                        self._log(logging.ERROR, "collector worker cycle failed: %s", exc)
+                        if attempt + 1 >= self.config.max_attempts:
+                            break
+                        delay = min(
+                            float(self.config.failure_cooldown_seconds),
+                            max(0.1, 2.0**attempt * 0.1),
+                        )
+                        if self.stop_event.wait(delay):
+                            break
+                if cycle is None:
+                    break
+                cycle_record = cycle.as_record()
+                cycle_failures = sum(
+                    int(cycle_record.get(field, 0) or 0)
+                    for field in (
+                        "markets_failed",
+                        "errors",
+                        "provider_failures",
+                        "metadata_failures",
+                        "order_book_failures",
+                        "trade_failures",
                     )
+                )
+                cycle_degraded = cycle_failures > 0
+                cycle_error = (
+                    f"collection cycle completed with {cycle_failures} recorded failures"
+                    if cycle_degraded
+                    else None
+                )
+                self._collector_error = cycle_error
+                with self._worker_condition:
+                    self._cycles.append(cycle)
+                    self._collection_count += 1
+                    if len(self._cycles) > self._run_cycle_base + self.config.retain_cycles:
+                        del self._cycles[: -(self.config.retain_cycles)]
+                    completed += 1
+                    self._worker_condition.notify_all()
+                next_scheduled = cycle.started_at + timedelta(seconds=float(self.config.interval_seconds))
+                self._update_collector_schedule(schedule_store, next_scheduled)
+                self._worker_tick_completed(
+                    "polymarket-collector",
+                    successful=not cycle_degraded,
+                    successful_markets=cycle_record.get("candidate_bound_scheduled", ()),
+                    decision="COLLECTION_COMPLETE",
+                    next_work=next_scheduled.isoformat(),
+                    error=cycle_error,
+                    extra={
+                        "last_cycle": cycle_record,
+                        "last_cycle_started_at": cycle.started_at.isoformat(),
+                        "last_cycle_ended_at": cycle.ended_at.isoformat(),
+                        "last_cycle_duration_seconds": cycle.duration_seconds,
+                        "last_cycle_markets_attempted": cycle.markets_attempted,
+                        "last_cycle_markets_successful": cycle.markets_successful,
+                        "last_cycle_markets_failed": cycle.markets_failed,
+                        "last_successful_collection_at": (
+                            cycle.ended_at.isoformat()
+                            if cycle.markets_successful > 0
+                            else None
+                        ),
+                    },
+                )
+                self._save_collector_worker_state(
+                    "degraded" if cycle_degraded else "running",
+                    next_scheduled=next_scheduled,
+                    cycle=cycle,
+                    error=cycle_error,
+                )
                 if max_cycles is not None and completed >= max_cycles:
                     break
                 next_due += float(self.config.interval_seconds)
@@ -989,80 +1638,125 @@ class ResearchNode:
                 self._worker_condition.notify_all()
 
     def _research_worker_loop(self) -> None:
-        first_cycle = self._run_cycle_base
+        first_cycle = self._collection_count
         try:
-            self.store.save_worker_state(
+            self._persist_worker_runtime(
                 "research-engine",
                 "running",
-                {"pid": os.getpid(), "paper_only": True, "live_execution": False},
-                started_at=ensure_utc(self.clock()),
-                heartbeat_at=ensure_utc(self.clock()),
+                extra={"next_work": "wait_for_collection"},
             )
             while not self.stop_event.is_set():
                 with self._worker_condition:
                     while (
                         not self.stop_event.is_set()
-                        and len(self._cycles) <= first_cycle
+                        and self._collection_count <= first_cycle
                         and (self._collector_thread is None or self._collector_thread.is_alive())
                     ):
                         self._worker_condition.wait(timeout=0.5)
                     if self.stop_event.is_set():
                         break
-                    if len(self._cycles) <= first_cycle and self._collector_thread is not None and not self._collector_thread.is_alive():
+                    if (
+                        self._collection_count <= first_cycle
+                        and self._collector_thread is not None
+                        and not self._collector_thread.is_alive()
+                    ):
                         self._research_error = "collector produced no completed cycle"
+                        self._worker_tick_failed(
+                            "research-engine",
+                            self._research_error,
+                            fatal=True,
+                            next_work="operator_review_required",
+                        )
                         break
                 started = ensure_utc(self.clock())
-                try:
-                    cycle_stats = self._run_research_cycle()
-                    self._research_error = None
-                    status = "idle"
-                except Exception as exc:
-                    self._research_error = str(exc)
-                    self._log(logging.ERROR, "research worker cycle failed: %s", exc)
-                    cycle_stats = {"error": str(exc)}
-                    status = "degraded"
+                cycle_stats: Mapping[str, Any] | None = None
+                for attempt in range(self.config.max_attempts):
+                    self._worker_tick_started(
+                        "research-engine",
+                        next_work="run_deterministic_research",
+                    )
+                    try:
+                        candidate_stats = self._run_research_cycle()
+                        cycle_stats = (
+                            candidate_stats
+                            if isinstance(candidate_stats, Mapping)
+                            else {"result": candidate_stats}
+                        )
+                        break
+                    except BaseException as exc:
+                        self._research_error = str(exc)
+                        self._worker_tick_failed(
+                            "research-engine",
+                            exc,
+                            fatal=attempt + 1 >= self.config.max_attempts,
+                            next_work=(
+                                "operator_review_required"
+                                if attempt + 1 >= self.config.max_attempts
+                                else f"retry_{attempt + 1}"
+                            ),
+                        )
+                        self._log(logging.ERROR, "research worker cycle failed: %s", exc)
+                        if attempt + 1 >= self.config.max_attempts:
+                            break
+                        delay = min(
+                            float(self.config.failure_cooldown_seconds),
+                            max(0.1, 2.0**attempt * 0.1),
+                        )
+                        if self.stop_event.wait(delay):
+                            break
+                if cycle_stats is None:
+                    break
+                research_degraded = bool(cycle_stats.get("degraded"))
+                research_error = (
+                    "; ".join(str(item) for item in cycle_stats.get("errors", ()) if str(item).strip())
+                    if research_degraded and isinstance(cycle_stats.get("errors"), (list, tuple))
+                    else None
+                )
+                self._research_error = research_error if research_degraded else None
                 with self._worker_condition:
                     self._research_passes += 1
                     research_passes = self._research_passes
                     self._worker_condition.notify_all()
-                queue_cycle = cycle_stats.get("research_queue") if isinstance(cycle_stats, Mapping) else None
+                queue_cycle = cycle_stats.get("research_queue")
                 queue_items_processed = (
                     int(queue_cycle.get("claimed", 0))
                     if isinstance(queue_cycle, Mapping)
                     else 0
                 )
-                self.store.save_worker_state(
+                paper_cycle = cycle_stats.get("paper")
+                processed_candidates = (
+                    paper_cycle.get("processed_candidate_ids", ())
+                    if isinstance(paper_cycle, Mapping)
+                    else ()
+                )
+                self._worker_tick_completed(
                     "research-engine",
-                    status,
-                    {
-                        "pid": os.getpid(),
-                        "cycle": cycle_stats,
+                    successful=not research_degraded,
+                    successful_candidates=processed_candidates,
+                    decision="RESEARCH_CYCLE_COMPLETE",
+                    next_work="wait_for_collection",
+                    error=research_error,
+                    extra={
+                        "cycle": dict(cycle_stats),
                         "passes": research_passes,
                         "queue_items_processed": queue_items_processed,
                         "cycle_started_at": started.isoformat(),
                         "cycle_ended_at": ensure_utc(self.clock()).isoformat(),
-                        "paper_only": True,
-                        "live_execution": False,
                     },
-                    started_at=started,
-                    heartbeat_at=ensure_utc(self.clock()),
                 )
                 if self.stop_event.wait(1.0):
                     break
+                first_cycle = self._collection_count
         finally:
             try:
-                self.store.save_worker_state(
+                self._persist_worker_runtime(
                     "research-engine",
                     "stopped" if self.stop_event.is_set() else "degraded",
-                    {
-                        "pid": os.getpid(),
+                    extra={
                         "error": self._research_error,
                         "passes": self._research_passes,
-                        "paper_only": True,
-                        "live_execution": False,
+                        "next_work": "stopped",
                     },
-                    started_at=ensure_utc(self.clock()),
-                    heartbeat_at=ensure_utc(self.clock()),
                 )
             except Exception:
                 pass
@@ -1070,43 +1764,77 @@ class ResearchNode:
                 self._worker_condition.notify_all()
 
     def _health_worker_loop(self) -> None:
-        seen = self._run_cycle_base
+        seen = self._collection_count
         try:
+            self._persist_worker_runtime(
+                "health-monitor",
+                "running",
+                extra={"next_work": "wait_for_collection"},
+            )
             while not self.stop_event.is_set():
                 with self._worker_condition:
                     while (
                         not self.stop_event.is_set()
-                        and len(self._cycles) <= seen
+                        and self._collection_count <= seen
                         and (self._collector_thread is None or self._collector_thread.is_alive())
                     ):
                         self._worker_condition.wait(timeout=0.5)
                     if self.stop_event.is_set():
                         break
-                    if len(self._cycles) <= seen and self._collector_thread is not None and not self._collector_thread.is_alive():
+                    if (
+                        self._collection_count <= seen
+                        and self._collector_thread is not None
+                        and not self._collector_thread.is_alive()
+                    ):
                         break
-                    seen = len(self._cycles)
-                try:
-                    self._run_health_monitor()
-                except Exception as exc:
-                    self._log(logging.ERROR, "health worker cycle failed: %s", exc)
+                    seen = self._collection_count
+                success = False
+                for attempt in range(self.config.max_attempts):
+                    self._worker_tick_started(
+                        "health-monitor",
+                        next_work="evaluate_collection_health",
+                    )
+                    try:
+                        success = self._run_health_monitor() is not False
+                        if success:
+                            break
+                        raise RuntimeError("health monitor returned failure")
+                    except BaseException as exc:
+                        self._worker_tick_failed(
+                            "health-monitor",
+                            exc,
+                            fatal=attempt + 1 >= self.config.max_attempts,
+                            next_work=(
+                                "operator_review_required"
+                                if attempt + 1 >= self.config.max_attempts
+                                else f"retry_{attempt + 1}"
+                            ),
+                        )
+                        self._log(logging.ERROR, "health worker cycle failed: %s", exc)
+                        if attempt + 1 >= self.config.max_attempts:
+                            break
+                        delay = min(
+                            float(self.config.failure_cooldown_seconds),
+                            max(0.1, 2.0**attempt * 0.1),
+                        )
+                        if self.stop_event.wait(delay):
+                            break
+                if not success:
+                    break
+                with self._worker_condition:
+                    self._health_passes += 1
+                    self._worker_condition.notify_all()
+                self._worker_tick_completed(
+                    "health-monitor",
+                    decision="HEALTH_CHECK_COMPLETE",
+                    next_work="wait_for_collection",
+                )
         finally:
             try:
-                health_payload: dict[str, Any] = {
-                    "pid": os.getpid(),
-                    "paper_only": True,
-                    "live_execution": False,
-                }
-                for item in self.store.list_worker_states(limit=2048):
-                    if item.get("worker_name") == "health-monitor" and isinstance(item.get("payload"), Mapping):
-                        health_payload = dict(item["payload"])
-                        health_payload.update({"pid": os.getpid(), "paper_only": True, "live_execution": False})
-                        break
-                self.store.save_worker_state(
+                self._persist_worker_runtime(
                     "health-monitor",
-                    "stopped" if self.stop_event.is_set() or self._collector_error is None else "degraded",
-                    health_payload,
-                    started_at=ensure_utc(self.clock()),
-                    heartbeat_at=ensure_utc(self.clock()),
+                    "stopped" if self.stop_event.is_set() else "degraded",
+                    extra={"next_work": "stopped"},
                 )
             except Exception:
                 pass
@@ -1114,13 +1842,30 @@ class ResearchNode:
                 self._worker_condition.notify_all()
 
     def _run_research_cycle(self) -> dict[str, Any]:
+        errors: list[str] = []
         self._run_crypto_paper()
-        self._run_opportunity_pipeline()
+        if self._crypto_status.get("last_error"):
+            errors.append(f"crypto paper: {self._crypto_status['last_error']}")
+        opportunity_result = self._run_opportunity_pipeline()
+        if opportunity_result is False:
+            errors.append("opportunity pipeline completed with degraded output")
         self.bus.resume_expired(now=ensure_utc(self.clock()))
         paper_stats = self._run_paper_workers()
+        if isinstance(paper_stats, Mapping):
+            processed = int(paper_stats.get("processed_candidates", 0) or 0)
+            successful = int(paper_stats.get("successful_candidates", processed) or 0)
+            if "error" in paper_stats or successful < processed:
+                errors.append("paper engine completed with degraded candidate output")
         self.research_processor.reevaluate_forward_candidates(now=ensure_utc(self.clock()))
         queue_stats = self._run_research_queue()
-        return {"paper": paper_stats, "research_queue": queue_stats}
+        if isinstance(queue_stats, Mapping) and "error" in queue_stats:
+            errors.append("research queue completed with degraded output")
+        return {
+            "paper": paper_stats,
+            "research_queue": queue_stats,
+            "degraded": bool(errors),
+            "errors": errors,
+        }
 
     def _start_heartbeat_watchdog(self) -> None:
         self._heartbeat_stop.clear()
@@ -1131,6 +1876,7 @@ class ResearchNode:
                 watchdog_name,
                 "running",
                 {
+                    **self._worker_payload(watchdog_name),
                     "pid": os.getpid(),
                     "parent_worker": self.config.worker_name,
                     "lock_path": str(self.lock_path),
@@ -1151,25 +1897,19 @@ class ResearchNode:
                         watchdog_name,
                         "running",
                         {
+                            **self._worker_payload(watchdog_name),
                             "pid": os.getpid(),
                             "parent_worker": self.config.worker_name,
                             "lock_path": str(self.lock_path),
+                            "paper_only": True,
                             "live_execution": False,
                         },
                         started_at=self.started_at,
                         heartbeat_at=heartbeat,
                     )
-                    self.store.save_worker_state(
-                        self.config.worker_name,
+                    self._heartbeat(
                         "running",
-                        {
-                            "pid": os.getpid(),
-                            "paper_only": True,
-                            "live_execution": False,
-                            "crypto_paper": dict(self._crypto_status),
-                        },
-                        started_at=self.started_at,
-                        heartbeat_at=heartbeat,
+                        {"crypto_paper": dict(self._crypto_status)},
                     )
                 except Exception as exc:
                     self._log(logging.WARNING, "heartbeat watchdog update failed: %s", exc)
@@ -1192,6 +1932,7 @@ class ResearchNode:
                 f"{self.config.worker_name}:watchdog",
                 "stopped",
                 {
+                    **self._worker_payload(f"{self.config.worker_name}:watchdog"),
                     "pid": os.getpid(),
                     "parent_worker": self.config.worker_name,
                     "lock_path": str(self.lock_path),
@@ -1220,6 +1961,12 @@ class ResearchNode:
             return {
                 "worker_name": self.config.worker_name,
                 "status": "closed",
+                "pid": None,
+                "process_identity": self.process_identity,
+                "revision": self.revision,
+                "execution_profile": self.execution_profile if self._lock_fd is not None else None,
+                "db_path": str(self.config.db_path),
+                "pid_path": str(self.pid_path),
                 "lock_path": str(self.lock_path),
                 "lock_exists": self.lock_path.exists(),
                 "log_path": str(self.log_path),
@@ -1233,8 +1980,23 @@ class ResearchNode:
         rows = {row["worker_name"]: row for row in self.store.list_worker_states(limit=2048)}
         state = rows.get(self.config.worker_name)
         worker_payload = state.get("payload") if state else None
+        persisted_profile = (
+            str(worker_payload.get("execution_profile", "")).strip().casefold()
+            if isinstance(worker_payload, Mapping)
+            else ""
+        )
+        if persisted_profile in {ISOLATED_EXECUTION_PROFILE, PRODUCTION_EXECUTION_PROFILE}:
+            status_execution_profile: str | None = persisted_profile
+        elif state is None:
+            status_execution_profile = self.execution_profile
+        else:
+            # A running row without a canonical profile is not attributable
+            # to this invocation.  Do not infer production from a missing or
+            # malformed persisted value.
+            status_execution_profile = None
         status_lock_path = self.lock_path
         status_log_path = self.log_path
+        status_pid_path = self.pid_path
         if self.config.lock_path is None and isinstance(worker_payload, Mapping):
             persisted_lock_path = str(worker_payload.get("lock_path", "")).strip()
             if persisted_lock_path:
@@ -1243,6 +2005,10 @@ class ResearchNode:
             persisted_log_path = str(worker_payload.get("log_path", "")).strip()
             if persisted_log_path:
                 status_log_path = Path(persisted_log_path)
+        if self.config.pid_path is None and isinstance(worker_payload, Mapping):
+            persisted_pid_path = str(worker_payload.get("pid_path", "")).strip()
+            if persisted_pid_path:
+                status_pid_path = Path(persisted_pid_path)
         lock_exists = status_lock_path.exists()
         lock_owner_pid: int | None = None
         if lock_exists:
@@ -1255,11 +2021,28 @@ class ResearchNode:
             worker_pid = int(persisted_pid)
         except (TypeError, ValueError):
             worker_pid = lock_owner_pid or 0
+        marker_pid: int | None = None
+        marker_start_ticks: int | None = None
+        try:
+            marker_lines = status_pid_path.read_text(encoding="ascii").splitlines()
+            if len(marker_lines) >= 2:
+                marker_pid = int(marker_lines[0].strip())
+                marker_start_ticks = int(marker_lines[1].strip())
+        except (FileNotFoundError, OSError, UnicodeError, ValueError):
+            marker_pid = None
+            marker_start_ticks = None
         worker_alive = _pid_alive(worker_pid)
         worker_identity_valid = (
             self._lock_fd is not None
-            or _pid_matches_node(worker_pid, str(self.config.db_path))
-        ) if worker_alive else False
+            or (
+                marker_pid == worker_pid
+                and _pid_matches_node(
+                    worker_pid,
+                    str(self.config.db_path),
+                    expected_start_ticks=marker_start_ticks,
+                )
+            )
+        ) if worker_alive is True else (None if worker_alive is None else False)
         heartbeat = state.get("heartbeat_at") if state else None
         heartbeat_value = parse_timestamp(heartbeat)
         try:
@@ -1274,6 +2057,13 @@ class ResearchNode:
         child_workers: dict[str, Any] = {}
         child_degraded = False
         child_running = False
+        persisted_stale_after = worker_payload.get("stale_after_seconds") if isinstance(worker_payload, Mapping) else None
+        try:
+            stale_after = float(persisted_stale_after)
+        except (TypeError, ValueError):
+            stale_after = max(float(self.config.interval_seconds) * 3.0, float(self.config.failure_cooldown_seconds))
+        if not math.isfinite(stale_after) or stale_after < 0:
+            stale_after = max(float(self.config.interval_seconds) * 3.0, float(self.config.failure_cooldown_seconds))
         for worker_name, worker_state in rows.items():
             if worker_name == self.config.worker_name:
                 continue
@@ -1285,9 +2075,26 @@ class ResearchNode:
             except (TypeError, ValueError):
                 pass
             child_status = str(worker_state.get("status", "not_started")).lower()
+            child_heartbeat = parse_timestamp(worker_state.get("heartbeat_at"))
+            try:
+                child_age = (
+                    max(0.0, (ensure_utc(self.clock()) - child_heartbeat).total_seconds())
+                    if child_heartbeat is not None
+                    else None
+                )
+            except Exception:
+                child_age = None
+            child_stale = bool(
+                child_status == "running"
+                and (child_age is None or child_age > stale_after)
+            )
+            if child_stale:
+                child_status = "stale"
             child_workers[worker_name] = {
                 "status": child_status,
                 "heartbeat_at": worker_state.get("heartbeat_at"),
+                "heartbeat_age_seconds": child_age,
+                "stale": child_stale,
                 "payload": child_payload,
             }
             child_degraded = child_degraded or child_status in {"degraded", "stale", "fatal"}
@@ -1301,18 +2108,16 @@ class ResearchNode:
                 and persisted_crypto.get("last_error")
             )
         )
-        persisted_stale_after = worker_payload.get("stale_after_seconds") if isinstance(worker_payload, Mapping) else None
-        try:
-            stale_after = float(persisted_stale_after)
-        except (TypeError, ValueError):
-            stale_after = max(float(self.config.interval_seconds) * 3.0, float(self.config.failure_cooldown_seconds))
-        if not math.isfinite(stale_after) or stale_after < 0:
-            stale_after = max(float(self.config.interval_seconds) * 3.0, float(self.config.failure_cooldown_seconds))
-        pid_marker_exists = Path(str(self.config.db_path) + ".node.pid").exists()
+        pid_marker_exists = status_pid_path.exists()
         health_degraded = child_degraded or crypto_error
+        cycles_completed = self._collection_count - self._run_cycle_base
         watchdog_state = rows.get(f"{self.config.worker_name}:watchdog")
-        watchdog_payload = watchdog_state.get("payload") if watchdog_state else None
-        watchdog_pid_value = watchdog_payload.get("pid") if isinstance(watchdog_payload, Mapping) else None
+        watchdog_payload = watchdog_state.get("payload") if isinstance(watchdog_state, Mapping) else None
+        watchdog_pid_value = (
+            watchdog_payload.get("pid")
+            if isinstance(watchdog_payload, Mapping)
+            else None
+        )
         try:
             watchdog_pid = int(watchdog_pid_value)
         except (TypeError, ValueError):
@@ -1330,7 +2135,7 @@ class ResearchNode:
             watchdog_state
             and str(watchdog_state.get("status", "")).lower() == "running"
             and watchdog_pid == worker_pid
-            and _pid_alive(watchdog_pid)
+            and _pid_alive(watchdog_pid) is True
             and _pid_matches_node(watchdog_pid, str(self.config.db_path))
             and lock_owner_pid == watchdog_pid
             and watchdog_age is not None
@@ -1338,16 +2143,21 @@ class ResearchNode:
         )
         if status not in {"stopped", "closed", "stale", "degraded"} and child_running:
             status = "running"
-        liveness_candidate = status == "running" or (status == "degraded" and (lock_exists or pid_marker_exists))
+        liveness_candidate = status == "running" or (
+            status == "degraded" and (lock_exists or pid_marker_exists)
+        )
+        liveness_unknown = worker_alive is None or worker_identity_valid is None
         if liveness_candidate and (
             not lock_exists
             or lock_owner_pid != worker_pid
-            or not worker_alive
-            or not worker_identity_valid
+            or worker_alive is not True
+            or worker_identity_valid is not True
             or heartbeat_age is None
             or heartbeat_age > stale_after
         ):
-            if watchdog_fresh and lock_exists and worker_alive and worker_identity_valid:
+            if liveness_unknown:
+                status = "unknown"
+            elif watchdog_fresh and lock_exists and worker_alive and worker_identity_valid:
                 status = "degraded"
             else:
                 status = "stale" if lock_exists or pid_marker_exists else "stopped"
@@ -1357,6 +2167,19 @@ class ResearchNode:
             "worker_name": self.config.worker_name,
             "status": status,
             "pid": os.getpid() if self._lock_fd is not None else (worker_pid or None),
+            "process_identity": (
+                worker_payload.get("process_identity")
+                if isinstance(worker_payload, Mapping)
+                else self.process_identity
+            ),
+            "revision": (
+                worker_payload.get("revision")
+                if isinstance(worker_payload, Mapping)
+                else self.revision
+            ),
+            "execution_profile": status_execution_profile,
+            "db_path": str(self.config.db_path),
+            "pid_path": str(status_pid_path),
             "lock_path": str(status_lock_path),
             "lock_exists": lock_exists,
             "lock_owner_pid": lock_owner_pid,
@@ -1365,6 +2188,7 @@ class ResearchNode:
             "heartbeat_age_seconds": heartbeat_age,
             "log_path": str(status_log_path),
             "restart_count": self._restart_count,
+            "cycles_completed": cycles_completed,
             "paper_only": True,
             "live_execution": False,
             "crypto_paper": dict(self._crypto_status),
@@ -1647,7 +2471,7 @@ class ResearchNode:
                 started_at=started,
                 heartbeat_at=ensure_utc(self.clock()),
             )
-            return True
+            return False
         probabilities: dict[str, float] = {}
         uncertainties: dict[str, float] = {}
         model_versions: set[str] = set()
@@ -1727,7 +2551,7 @@ class ResearchNode:
         )
         return True
 
-    def _run_opportunity_pipeline(self) -> None:
+    def _run_opportunity_pipeline(self) -> bool:
         worker_name = "opportunity-pipeline"
         started = ensure_utc(self.clock())
         self.store.save_worker_state(
@@ -1737,9 +2561,9 @@ class ResearchNode:
             started_at=started,
             heartbeat_at=started,
         )
-        if self._run_persisted_opportunity_pipeline(started):
-            return
         try:
+            if self._run_persisted_opportunity_pipeline(started):
+                return True
             provider_errors: list[str] = []
             degrading_reasons: list[str] = []
             markets: tuple[Any, ...] = ()
@@ -2010,6 +2834,7 @@ class ResearchNode:
                 started_at=started,
                 heartbeat_at=ensure_utc(self.clock()),
             )
+            return not bool(degrading_reasons)
         except Exception as exc:
             reason = str(exc)
             self.store.save_worker_state(
@@ -2027,6 +2852,7 @@ class ResearchNode:
                 heartbeat_at=ensure_utc(self.clock()),
             )
             self._log(logging.ERROR, "opportunity pipeline failed: %s", exc)
+            return False
 
     def _run_paper_workers(self) -> dict[str, Any]:
         if not self._paper_scheduler_lock.acquire(blocking=False):
@@ -2061,6 +2887,10 @@ class ResearchNode:
                 spec
                 for spec in registry.list()
                 if not bool((spec.config if isinstance(spec.config, Mapping) else {}).get("historical_replay"))
+                and not (
+                    bool((spec.config if isinstance(spec.config, Mapping) else {}).get("observation_intent"))
+                    and not spec.allowed_markets
+                )
             ),
             key=lambda spec: (spec.start_timestamp, spec.experiment_id),
         )
@@ -2102,6 +2932,9 @@ class ResearchNode:
             "candidate_count": len(specs),
             "processed_candidates": len(selected),
             "successful_candidates": 0,
+            "failed_candidates": 0,
+            "failed_candidate_ids": [],
+            "errors": [],
             "observations_processed": 0,
             "fills_inserted": 0,
             "remaining_candidates": max(0, len(specs) - len(selected)),
@@ -2139,11 +2972,17 @@ class ResearchNode:
         for spec in selected:
             result = self._run_single_paper_worker(spec)
             if result is None:
-                continue
-            if "error" not in result:
+                stats["failed_candidates"] += 1
+                stats["failed_candidate_ids"].append(spec.experiment_id)
+                stats["errors"].append("paper worker returned no result")
+            elif "error" not in result:
                 stats["successful_candidates"] += 1
                 stats["observations_processed"] += int(result.get("observations_processed", 0))
                 stats["fills_inserted"] += int(result.get("fills_inserted", 0))
+            else:
+                stats["failed_candidates"] += 1
+                stats["failed_candidate_ids"].append(spec.experiment_id)
+                stats["errors"].append(str(result.get("error") or "paper worker failed"))
             self.sleep(0)
         stats["cycle_ended_at"] = ensure_utc(self.clock()).isoformat()
         self.store.set_scheduler_state(
@@ -2156,8 +2995,14 @@ class ResearchNode:
         )
         self.store.save_worker_state(
             scheduler_name,
-            "idle",
-            {"pid": os.getpid(), **stats, "paper_only": True, "live_execution": False},
+            "degraded" if stats["failed_candidates"] else "idle",
+            {
+                "pid": os.getpid(),
+                **stats,
+                "last_error": stats["errors"][-1] if stats["errors"] else None,
+                "paper_only": True,
+                "live_execution": False,
+            },
             started_at=started,
             heartbeat_at=ensure_utc(self.clock()),
         )
@@ -2372,13 +3217,18 @@ class ResearchNode:
             self._log(logging.ERROR, "research queue processor failed: %s", exc)
             return {"error": str(exc)}
 
-    def _run_health_monitor(self) -> None:
+    def _run_health_monitor(self) -> bool:
         worker_name = "health-monitor"
         started = ensure_utc(self.clock())
         self.store.save_worker_state(
             worker_name,
             "running",
-            {"pid": os.getpid(), "paper_only": True, "live_execution": False},
+            {
+                **self._worker_payload(worker_name),
+                "pid": os.getpid(),
+                "paper_only": True,
+                "live_execution": False,
+            },
             started_at=started,
             heartbeat_at=started,
         )
@@ -2398,7 +3248,10 @@ class ResearchNode:
                 worker_name,
                 "idle" if health_grade in {"A", "OK", "HEALTHY"} else "degraded",
                 {
-                    "grade": health.get("grade"),
+                    **self._worker_payload(worker_name),
+                    "grade": health_grade or "UNKNOWN",
+                    "grade_scope": health.get("grade_scope", "collector_health"),
+                    "source_type": health.get("source_type", "FORWARD_COLLECTED"),
                     "reason_code": health.get("reason_code"),
                     "reasons": list(reasons) if isinstance(reasons, (list, tuple)) else [],
                     "degrading_reason": (
@@ -2434,23 +3287,79 @@ class ResearchNode:
                 started_at=started,
                 heartbeat_at=ensure_utc(self.clock()),
             )
+            return True
         except Exception as exc:
             self.store.save_worker_state(
                 worker_name,
                 "degraded",
-                {"error": str(exc), "paper_only": True, "live_execution": False},
+                {
+                    **self._worker_payload(worker_name),
+                    "error": str(exc),
+                    "paper_only": True,
+                    "live_execution": False,
+                },
                 started_at=started,
                 heartbeat_at=ensure_utc(self.clock()),
             )
             self._log(logging.ERROR, "health monitor failed: %s", exc)
+            return False
     def _acquire_lock(self) -> None:
         path = self.lock_path
         path.parent.mkdir(parents=True, exist_ok=True)
+        self.pid_path.parent.mkdir(parents=True, exist_ok=True)
+        marker_ticks = _process_start_time_ticks()
+        marker = f"{os.getpid()}\n{marker_ticks}\n"
         try:
-            self._lock_fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         except FileExistsError as exc:
             raise RuntimeError(f"another Axiom node holds {path}") from exc
-        os.write(self._lock_fd, f"{os.getpid()}\n{time.time_ns()}\n".encode("ascii"))
+        self._lock_fd = fd
+        try:
+            encoded_marker = marker.encode("ascii")
+            offset = 0
+            while offset < len(encoded_marker):
+                written = os.write(fd, encoded_marker[offset:])
+                if written <= 0:
+                    raise OSError("lock marker write made no progress")
+                offset += written
+            self.pid_path.write_text(
+                f"{os.getpid()}\n{marker_ticks}\n{self.process_identity}\n"
+                f"{self.execution_profile}\n",
+                encoding="ascii",
+            )
+        except BaseException:
+            self._discard_acquired_lock(fd)
+            raise
+
+    def _discard_acquired_lock(self, fd: int) -> None:
+        """Close and remove only the lock inode acquired by this invocation."""
+        should_unlink = False
+        try:
+            try:
+                path_stat = os.stat(self.lock_path)
+                fd_stat = os.fstat(fd)
+                path_inode = getattr(path_stat, "st_ino", 0)
+                fd_inode = getattr(fd_stat, "st_ino", 0)
+                inode_available = path_inode not in (None, 0) and fd_inode not in (None, 0)
+                should_unlink = (
+                    path_stat.st_dev == fd_stat.st_dev and path_inode == fd_inode
+                    if inode_available
+                    else False
+                )
+            except OSError:
+                should_unlink = False
+        finally:
+            if self._lock_fd == fd:
+                self._lock_fd = None
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if should_unlink:
+            try:
+                self.lock_path.unlink()
+            except FileNotFoundError:
+                pass
 
     def _release_lock(self) -> None:
         fd = self._lock_fd
@@ -2487,6 +3396,12 @@ class ResearchNode:
                 self.lock_path.unlink()
             except FileNotFoundError:
                 pass
+            try:
+                marker_lines = self.pid_path.read_text(encoding="ascii").splitlines()
+                if marker_lines and int(marker_lines[0].strip()) == os.getpid():
+                    self.pid_path.unlink()
+            except (FileNotFoundError, OSError, ValueError):
+                pass
 
     def _configure_logging(self) -> None:
         logger = logging.getLogger(f"axiom.node.{self.config.worker_name}")
@@ -2500,25 +3415,30 @@ class ResearchNode:
         self._logger, self._handler = logger, handler
         self._log(logging.INFO, "node started pid=%s db=%s", os.getpid(), self.config.db_path)
 
+    def _log(self, level: int, message: str, *args: Any) -> None:
+        if self._logger is not None:
+            self._logger.log(level, message, *args)
+
     def _close_logging(self) -> None:
         if self._logger is not None and self._handler is not None:
             self._logger.removeHandler(self._handler)
             self._handler.close()
         self._logger, self._handler = None, None
 
-    def _log(self, level: int, message: str, *args: Any) -> None:
-        if self._logger is not None:
-            self._logger.log(level, message, *args)
-
     def _heartbeat(self, status: str, payload: Mapping[str, Any]) -> None:
         body = {
+            **dict(payload),
             "pid": os.getpid(),
+            "process_identity": self.process_identity,
+            "revision": self.revision,
+            "execution_profile": self.execution_profile,
+            "db_path": str(self.config.db_path),
+            "pid_path": str(self.pid_path),
             "lock_path": str(self.lock_path),
             "log_path": str(self.log_path),
             "stale_after_seconds": max(float(self.config.interval_seconds) * 3.0, float(self.config.failure_cooldown_seconds)),
             "paper_only": True,
             "live_execution": False,
-            **dict(payload),
         }
         self.store.save_worker_state(
             self.config.worker_name,

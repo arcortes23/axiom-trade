@@ -301,13 +301,9 @@ class DurableResearchBus:
 
     def submit_hypothesis(self, payload: Mapping[str, Any], **kwargs: Any) -> ResearchQueueItem:
         return self.submit("hypothesis", payload, **kwargs)
-    def submit_proposal(self, payload: Mapping[str, Any], **kwargs: Any) -> ResearchQueueItem:
-        """Validate and enqueue one ordinary hypothesis proposal.
 
-        The bus remains the durable/audited boundary.  Importing the director
-        lazily avoids a module cycle while ensuring callers cannot bypass the
-        same proposal validation used by the queue processor.
-        """
+    def submit_proposal(self, payload: Mapping[str, Any], **kwargs: Any) -> ResearchQueueItem:
+        """Validate and enqueue one ordinary hypothesis proposal."""
         from .director import validate_hermes_proposal
 
         validation = validate_hermes_proposal(payload, store=self._store)
@@ -315,6 +311,54 @@ class DurableResearchBus:
             detail = "; ".join(validation.reasons) or "proposal rejected"
             raise ResearchBusPermissionError(f"INVALID_RESEARCH_PROPOSAL: {detail}")
         return self.submit_hypothesis(validation.normalized or payload, **kwargs)
+
+    def submit_canonical_scope_proposal(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        previous: Mapping[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> ResearchQueueItem:
+        """Validate, freeze, and enqueue one canonical scope handoff.
+
+        Hermes supplies only an untrusted, safe proposal.  The predecessor
+        binding and current resolution are revalidated here, then the node
+        constructs the canonical frozen document before ordinary proposal
+        validation and queue persistence.  No execution authority is granted
+        by this path.
+        """
+        from .legacy_scope import (
+            CANONICAL_VALID,
+            LEGACY_UNAMBIGUOUS,
+            LegacyScopeError,
+            freeze_canonical_scope_proposal,
+            validate_frozen_scope_proposal,
+        )
+
+        assessment = validate_frozen_scope_proposal(payload, previous=previous)
+        if assessment.classification not in {CANONICAL_VALID, LEGACY_UNAMBIGUOUS}:
+            raise ResearchBusPermissionError(
+                f"INVALID_CANONICAL_SCOPE_PROPOSAL: {assessment.reason}"
+            )
+        try:
+            frozen = freeze_canonical_scope_proposal(
+                payload,
+                assumptions=payload.get("assumptions") if isinstance(payload, Mapping) else None,
+                current_resolution=(
+                    payload.get("current_resolution")
+                    if isinstance(payload, Mapping)
+                    else None
+                ),
+                source_candidate_id=assessment.candidate_id,
+                source_frozen_hash=assessment.frozen_hash,
+            )
+        except (LegacyScopeError, TypeError, ValueError) as exc:
+            raise ResearchBusPermissionError(
+                f"INVALID_CANONICAL_SCOPE_PROPOSAL: {getattr(exc, 'reason', str(exc))}"
+            ) from exc
+        proposal_id = str(frozen.get("proposal_id") or "").strip()
+        dedupe = kwargs.pop("dedupe_key", None) or f"canonical-scope:{proposal_id or assessment.scope_hash}"
+        return self.submit_proposal(frozen, dedupe_key=dedupe, **kwargs)
 
     def submit_candidate(self, payload: Mapping[str, Any], **kwargs: Any) -> ResearchQueueItem:
         return self.submit("candidate", payload, **kwargs)
