@@ -13,9 +13,15 @@ from types import SimpleNamespace
 from contextlib import contextmanager
 
 from axiom.autonomous import AutonomousResearchProcessor
+from axiom.backtest.prediction import PredictionMarketBacktester
 from axiom.domain import MarketType
-
 from axiom.storage import AxiomStore
+from axiom.strategy.signals import (
+    INSUFFICIENT_LOOKBACK,
+    SIGNAL_PRODUCED,
+    STRATEGY_EVALUATED_DECLINED,
+    evaluate_signal_evaluation,
+)
 
 from tools.polymarket_market_scope_acceptance import (
     AcceptanceConfig,
@@ -27,8 +33,10 @@ from tools.polymarket_market_scope_acceptance import (
     POLYMARKET_HISTORICAL_DATASET_VERSION,
     POLYMARKET_HISTORICAL_ROW_COUNT,
     _candidate_metric_projection,
-    _queue_demo_evidence,
     _historical_qualification_assessment,
+    _persisted_historical_metrics,
+    _persisted_historical_support_audit,
+    _queue_demo_evidence,
     _runtime_metric_assessment,
     _sha256_json,
     build_offline_fixture_adapter,
@@ -347,6 +355,36 @@ def _historical_records(
             "source_type": "HISTORICAL",
         }
         for index in range(count)
+    ]
+
+
+def _canonical_momentum_strategy() -> dict[str, object]:
+    return {
+        "version": 1,
+        "market_type": "prediction",
+        "family": "momentum",
+        "parameters": {"lookback": 1, "threshold": 0.05},
+        "probability_model": "plan-model-probability",
+        "resolution_aware": True,
+        "resolution_inputs": ["expiry", "settlement"],
+    }
+
+
+def _canonical_momentum_records(
+    prices: tuple[float, ...],
+    *,
+    market_id: str = COMPACT_MARKET_ID,
+) -> list[dict[str, object]]:
+    return [
+        {
+            "market_id": market_id,
+            "token_id": f"yes-{market_id}",
+            "source_timestamp": f"2026-01-01T0{index}:00:00+00:00",
+            "timestamp": f"2026-01-01T0{index}:00:00+00:00",
+            "yes_mid": price,
+            "price": price,
+        }
+        for index, price in enumerate(prices)
     ]
 
 
@@ -1755,6 +1793,346 @@ class MarketScopeAcceptanceToolTests(unittest.TestCase):
             self.assertEqual(metadata["instrument"], "POLYMARKET")
 
 
+    def test_canonical_momentum_buckets_and_execution_transitions_are_observed(self) -> None:
+        records = _canonical_momentum_records((0.40, 0.40, 0.45, 0.50))
+        strategy = _canonical_momentum_strategy()
+        history: list[dict[str, object]] = []
+        evaluations = []
+        for row in records:
+            evaluation = evaluate_signal_evaluation(
+                strategy,
+                {"market_id": COMPACT_MARKET_ID, "observations": [*history, row]},
+            )
+            evaluations.append(evaluation)
+            history.append(row)
+
+        self.assertEqual(evaluations[0].reason_code, INSUFFICIENT_LOOKBACK)
+        self.assertEqual(evaluations[1].reason_code, STRATEGY_EVALUATED_DECLINED)
+        self.assertEqual(evaluations[2].reason_code, SIGNAL_PRODUCED)
+        self.assertEqual(evaluations[3].reason_code, SIGNAL_PRODUCED)
+        self.assertEqual([evaluation.score for evaluation in evaluations[:2]], [0.0, 0.0])
+        self.assertTrue(all(evaluation.score > 0.0 for evaluation in evaluations[2:]))
+
+        metrics = _persisted_historical_metrics(
+            records,
+            family="momentum",
+            threshold=0.05,
+        )
+        canonical = metrics["canonical_signal_evidence"]
+        self.assertEqual(
+            canonical["evaluator"],
+            "axiom.strategy.signals.evaluate_signal_evaluation",
+        )
+        self.assertEqual(canonical["evaluator_invocations"], len(records))
+        self.assertEqual(canonical["insufficient_lookback"], 1)
+        self.assertEqual(canonical["warming_up"], 0)
+        self.assertEqual(canonical["unavailable_inputs"], 0)
+        self.assertEqual(canonical["zero_scores"], 1)
+        self.assertEqual(canonical["nonzero_scores"], 2)
+        self.assertEqual(
+            canonical["evaluator_invocations"],
+            canonical["insufficient_lookback"]
+            + canonical["warming_up"]
+            + canonical["unavailable_inputs"]
+            + canonical["zero_scores"]
+            + canonical["nonzero_scores"],
+        )
+        self.assertEqual(canonical["raw_score_count"], len(records))
+        self.assertEqual(len(canonical["raw_score_samples"]), len(records))
+        self.assertEqual(
+            [sample["timestamp"] for sample in canonical["raw_score_samples"]],
+            [record["source_timestamp"] for record in records],
+        )
+        self.assertTrue(canonical["raw_score_hash"].startswith("sha256:"))
+        self.assertTrue(canonical["raw_score_samples_hash"].startswith("sha256:"))
+
+        simulation = metrics["simulation"]
+        self.assertEqual(simulation["status"], "PERFORMED")
+        self.assertEqual(simulation["fills"], 0)
+        self.assertEqual(simulation["closed_trades"], 0)
+        self.assertEqual(metrics["counts"]["fills"], 0)
+        self.assertEqual(metrics["counts"]["closed_trades"], 0)
+
+        self.assertIsNone(metrics["expectancy"])
+        self.assertIsNone(metrics["profitability"])
+        self.assertEqual(metrics["statuses"]["expectancy"], "NOT_REACHED")
+        self.assertEqual(metrics["statuses"]["profitability"], "NOT_REACHED")
+        self.assertEqual(metrics["backtest_evidence"]["status"], "PERFORMED")
+
+        transition = metrics["execution_transition"]
+        self.assertEqual(transition["nonzero_signals"], 2)
+        self.assertEqual(transition["execution_evaluable"], 0)
+        self.assertNotEqual(transition["status"], "EXECUTABLE")
+        self.assertEqual(
+            transition["blocking_reasons"][
+                "MISSING_HISTORICAL_EXECUTABLE_QUOTE_OR_BOOK"
+            ],
+            2,
+        )
+        self.assertEqual(
+            transition["blocking_reasons"]["HISTORICAL_LIFECYCLE_AS_OF_UNAVAILABLE"],
+            2,
+        )
+
+    def test_canonical_flat_prices_count_evaluations_and_zero_scores(self) -> None:
+        records = _canonical_momentum_records((0.50, 0.50, 0.50, 0.50))
+        metrics = _persisted_historical_metrics(
+            records,
+            family="momentum",
+            threshold=0.05,
+        )
+        canonical = metrics["canonical_signal_evidence"]
+        self.assertEqual(canonical["evaluator_invocations"], 4)
+        self.assertEqual(canonical["insufficient_lookback"], 1)
+        self.assertEqual(canonical["zero_scores"], 3)
+        self.assertEqual(canonical["nonzero_scores"], 0)
+        self.assertEqual(
+            [sample["timestamp"] for sample in canonical["raw_score_samples"]],
+            [record["source_timestamp"] for record in records],
+        )
+        simulation = metrics["simulation"]
+        self.assertEqual(metrics["counts"]["fills"], 0)
+        self.assertEqual(metrics["counts"]["closed_trades"], 0)
+
+        self.assertEqual(simulation["status"], "PERFORMED")
+        self.assertEqual(simulation["fills"], 0)
+        self.assertEqual(simulation["closed_trades"], 0)
+        self.assertIsNone(metrics["expectancy"])
+        self.assertIsNone(metrics["profitability"])
+        self.assertEqual(metrics["statuses"]["expectancy"], "NOT_REACHED")
+        self.assertEqual(metrics["statuses"]["profitability"], "NOT_REACHED")
+        self.assertEqual(metrics["backtest_evidence"]["status"], "PERFORMED")
+        self.assertEqual(metrics["execution_transition"]["nonzero_signals"], 0)
+        self.assertEqual(metrics["execution_transition"]["execution_evaluable"], 0)
+
+    def test_unavailable_backtest_evidence_is_null_not_manufactured_zero(self) -> None:
+        records = _canonical_momentum_records((0.40, 0.40, 0.45, 0.50))
+        with patch(
+            "tools.polymarket_market_scope_acceptance.PredictionMarketBacktester.run",
+            side_effect=RuntimeError("backtest unavailable"),
+        ):
+            metrics = _persisted_historical_metrics(
+                records,
+                family="momentum",
+                threshold=0.05,
+            )
+
+        canonical = metrics["canonical_signal_evidence"]
+        self.assertEqual(
+            [sample["timestamp"] for sample in canonical["raw_score_samples"]],
+            [record["source_timestamp"] for record in records],
+        )
+        self.assertIsNone(metrics["fill_count"])
+        self.assertIsNone(metrics["filled_trades"])
+        self.assertIsNone(metrics["closed_trade_count"])
+        self.assertIsNone(metrics["closed_trades"])
+        self.assertIsNone(metrics["counts"]["fills"])
+        self.assertIsNone(metrics["counts"]["closed_trades"])
+        evidence = metrics["backtest_evidence"]
+        self.assertEqual(evidence["status"], "NOT_EVALUATED")
+        self.assertIsNone(evidence["evidence_source"])
+        self.assertEqual(
+            metrics["research_modes"]["STRICT_EXECUTABLE_SIMULATION"]["status"],
+            "UNAVAILABLE",
+        )
+
+    def test_unavailable_evaluator_does_not_fabricate_invocations_or_buckets(self) -> None:
+        records = _canonical_momentum_records((0.40, 0.40, 0.45, 0.50))
+        with patch(
+            "tools.polymarket_market_scope_acceptance.evaluate_signal_evaluation",
+            None,
+        ):
+            metrics = _persisted_historical_metrics(
+                records,
+                family="momentum",
+                threshold=0.05,
+            )
+
+        canonical = metrics["canonical_signal_evidence"]
+        self.assertEqual(canonical["evaluator_status"], "NOT_EVALUATED")
+        self.assertEqual(canonical["evaluator_invocations"], 0)
+        self.assertEqual(canonical["evaluation_count"], 0)
+        for bucket in (
+            "insufficient_lookback",
+            "insufficient_input_count",
+            "warming_up",
+            "warming_count",
+            "unavailable_inputs",
+            "unavailable_input_count",
+            "zero_scores",
+            "zero_score_count",
+            "nonzero_scores",
+            "nonzero_score_count",
+        ):
+            with self.subTest(bucket=bucket):
+                self.assertEqual(canonical[bucket], 0)
+        self.assertEqual(canonical["reason_counts"], {})
+        self.assertEqual(canonical["raw_score_count"], 0)
+        self.assertEqual(canonical["raw_score_samples"], [])
+        self.assertEqual(metrics["simulation"]["status"], "NOT_EVALUATED")
+
+    def test_processor_zero_trades_override_conflicting_diagnostic_trade_counts(self) -> None:
+        qualification = _historical_qualification_assessment(
+            {
+                "validation": {
+                    "validation": {
+                        "filled_trades": 0,
+                        "closed_trade_count": 0,
+                        "independent_samples": 30,
+                        "max_drawdown": 0.0,
+                        "expectancy": 1.0,
+                        "confidence_interval": {"lower": 1.0},
+                        "regime_count": 3,
+                    },
+                    "validation_stability": 1.0,
+                    "validation_calibration": 1.0,
+                },
+                "robustness": {
+                    "robustness_passed": True,
+                    "minimum_sample_check": {"trades": 0, "min_trades": 20},
+                },
+            },
+            {
+                "status": "pass",
+                "criteria": {"min_trades": 20},
+                "metrics": {
+                    "filled_trades": {"status": "pass"},
+                    "closed_trades": {"status": "pass"},
+                },
+            },
+            {"status": "PASSED", "as_of_lifecycle_status": "AVAILABLE"},
+            processor_selected=True,
+            lifecycle_stage="FROZEN",
+            canonical_pipeline_reason=None,
+            historical_metrics={
+                "filled_trades": 7,
+                "closed_trade_count": 7,
+                "actionable_signal_count": 3,
+            },
+        )
+        comparison = qualification["trade_evidence_comparison"]
+        self.assertEqual(qualification["status"], "REJECTED")
+        self.assertEqual(
+            qualification["decisive_blocker"],
+            "HISTORICAL_MIN_TRADES_NOT_MET",
+        )
+        self.assertEqual(comparison["agreement"], "DISAGREE")
+        self.assertEqual(comparison["authority"], "processor_validation")
+        self.assertEqual(comparison["processor"]["value"], 0)
+        self.assertTrue(comparison["processor"]["available"])
+        self.assertEqual(comparison["diagnostic"]["value"], 7)
+        self.assertTrue(comparison["diagnostic"]["available"])
+        self.assertIsNotNone(comparison["processor"]["source"])
+        self.assertIsNotNone(comparison["diagnostic"]["source"])
+        self.assertEqual(qualification["minimum_trades"]["observed"], 0)
+
+    def test_missing_processor_trade_evidence_is_unavailable_not_helper_zero(self) -> None:
+        qualification = _historical_qualification_assessment(
+            {
+                "robustness": {
+                    "robustness_passed": True,
+                    "minimum_sample_check": {"min_trades": 20},
+                },
+            },
+            {
+                "status": "pass",
+                "criteria": {"min_trades": 20},
+                "metrics": {"filled_trades": {"status": "pass"}},
+            },
+            {"status": "PASSED", "as_of_lifecycle_status": "AVAILABLE"},
+            processor_selected=True,
+            lifecycle_stage="FROZEN",
+            canonical_pipeline_reason=None,
+            historical_metrics={
+                "filled_trades": 0,
+                "closed_trade_count": 0,
+                "actionable_signal_count": 0,
+            },
+        )
+        comparison = qualification["trade_evidence_comparison"]
+        self.assertFalse(comparison["processor"]["available"])
+        self.assertTrue(comparison["diagnostic"]["available"])
+        self.assertEqual(comparison["agreement"], "PROCESSOR_UNAVAILABLE")
+        self.assertEqual(comparison["authority"], "processor_validation")
+        self.assertIn("UNAVAILABLE", qualification["decisive_blocker"])
+        self.assertNotEqual(
+            qualification["decisive_blocker"],
+            "HISTORICAL_MIN_TRADES_NOT_MET",
+        )
+
+
+
+    def test_persisted_funnel_and_research_modes_keep_proxy_simulation_distinct(self) -> None:
+        records = _canonical_momentum_records((0.40, 0.40, 0.45, 0.50))
+        for row in records:
+            row.update({"provider": "polymarket", "source_type": "HISTORICAL"})
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "funnel.sqlite"
+            _build_compact_historical_source(path, records)
+            report = _compact_report(path, expected_row_count=len(records))
+
+        funnel = report["historical_evidence_funnel"]
+        stages = (
+            "evaluations",
+            "nonzero_signals",
+            "execution_evaluable",
+            "simulated_fills",
+            "closed_trades",
+            "qualification",
+        )
+        self.assertEqual(tuple(funnel), stages)
+        for stage in stages:
+            self.assertIn("count", funnel[stage])
+            self.assertIn("status", funnel[stage])
+            self.assertIn("blockers", funnel[stage])
+            if funnel[stage]["count"] == 0:
+                self.assertTrue(funnel[stage]["blockers"])
+        self.assertEqual(funnel["evaluations"]["count"], 4)
+        self.assertEqual(funnel["nonzero_signals"]["count"], 2)
+        self.assertEqual(funnel["execution_evaluable"]["count"], 0)
+        self.assertEqual(funnel["simulated_fills"]["count"], 0)
+        self.assertEqual(funnel["closed_trades"]["count"], 0)
+        self.assertEqual(funnel["simulated_fills"]["status"], "PERFORMED")
+        self.assertEqual(funnel["closed_trades"]["status"], "PERFORMED")
+
+        historical_metrics = report["historical_metrics"]
+        canonical = historical_metrics["canonical_signal_evidence"]
+        self.assertEqual(
+            [sample["timestamp"] for sample in canonical["raw_score_samples"]],
+            [record["source_timestamp"] for record in records],
+        )
+        self.assertIsNone(historical_metrics["expectancy"])
+        self.assertIsNone(historical_metrics["profitability"])
+        self.assertEqual(historical_metrics["statuses"]["expectancy"], "NOT_REACHED")
+        self.assertEqual(historical_metrics["statuses"]["profitability"], "NOT_REACHED")
+        self.assertEqual(historical_metrics["simulation"]["status"], "PERFORMED")
+        self.assertEqual(historical_metrics["simulation"]["fills"], 0)
+        self.assertEqual(historical_metrics["simulation"]["closed_trades"], 0)
+
+        self.assertIsNone(funnel["qualification"]["count"])
+
+        modes = report["historical_metrics"]["research_modes"]
+        strict = modes["STRICT_EXECUTABLE_SIMULATION"]
+        proxy = modes["PRICE_PROXY_SIMULATION"]
+        self.assertEqual(strict["status"], "UNAVAILABLE")
+        self.assertEqual(
+            strict["blocker"],
+            "HISTORICAL_EXECUTABLE_QUOTE_AND_LIFECYCLE_AS_OF_UNAVAILABLE",
+        )
+        self.assertFalse(strict["observed_fills_authorized"])
+        self.assertEqual(proxy["status"], "PERFORMED")
+        self.assertEqual(
+            proxy["evidence_source"],
+            "axiom.backtest.prediction.BacktestResult",
+        )
+        self.assertTrue(proxy["limitations"])
+        self.assertIn("not observed fills", proxy["distinction"])
+        self.assertNotEqual(strict["status"], proxy["status"])
+        self.assertEqual(report["historical_metrics"]["historical_execution_fidelity"], "PRICE_PROXY")
+        self.assertFalse(report["security"]["order_transport_called"])
+        self.assertFalse(report["security"]["submit_order_called"])
+
+
     def test_persisted_shared_report_freezes_momentum_and_excludes_zero_edge_control(self) -> None:
         records = _historical_records(count=4)
         with tempfile.TemporaryDirectory() as directory:
@@ -1825,27 +2203,61 @@ class MarketScopeAcceptanceToolTests(unittest.TestCase):
         self.assertEqual(len(audit["eligible_markets_sample"]), 1)
         self.assertEqual(audit["ineligible_markets_sample"], [])
         self.assertNotIn("markets", audit)
-        self.assertGreater(history_metrics["raw_observations"], 0)
-        self.assertGreater(history_metrics["signal_evaluation_count"], 0)
-        self.assertGreaterEqual(history_metrics["signal_count"], 1)
-        self.assertEqual(history_metrics["actionable_signal_count"], 0)
-        self.assertEqual(history_metrics["model_evaluations"], 0)
-        self.assertEqual(history_metrics["independent_scored_markets"], 0)
-        self.assertEqual(history_metrics["scored_prediction_count"], 0)
-        self.assertEqual(history_metrics["calibration_observation_count"], 0)
-        self.assertEqual(history_metrics["fill_count"], 0)
-        self.assertEqual(history_metrics["fills"], 0)
-        self.assertEqual(history_metrics["closed_trade_count"], 0)
+        canonical = history_metrics["canonical_signal_evidence"]
+        self.assertEqual(canonical["evaluator"], "axiom.strategy.signals.evaluate_signal_evaluation")
+        self.assertEqual(canonical["evaluator_invocations"], len(records))
+        self.assertEqual(canonical["insufficient_lookback"], 1)
+        self.assertEqual(canonical["zero_scores"], 0)
+        self.assertEqual(canonical["nonzero_scores"], 3)
+        self.assertEqual(
+            canonical["evaluator_invocations"],
+            canonical["insufficient_lookback"]
+            + canonical["warming_up"]
+            + canonical["unavailable_inputs"]
+            + canonical["zero_scores"]
+            + canonical["nonzero_scores"],
+        )
+        self.assertEqual(canonical["raw_score_count"], len(records))
+        self.assertEqual(
+            [sample["timestamp"] for sample in canonical["raw_score_samples"]],
+            [record["source_timestamp"] for record in records],
+        )
+        self.assertFalse(canonical["raw_scores_actionable"])
+        self.assertIsNone(history_metrics["expectancy"])
+        self.assertIsNone(history_metrics["profitability"])
+        self.assertEqual(history_metrics["statuses"]["expectancy"], "NOT_REACHED")
+        self.assertEqual(history_metrics["statuses"]["profitability"], "NOT_REACHED")
+        transition = history_metrics["execution_transition"]
+        self.assertEqual(transition["nonzero_signals"], 3)
+        self.assertEqual(transition["execution_evaluable"], 0)
+        self.assertEqual(
+            transition["blocking_reasons"][
+                "MISSING_HISTORICAL_EXECUTABLE_QUOTE_OR_BOOK"
+            ],
+            3,
+        )
+        self.assertEqual(
+            transition["blocking_reasons"]["HISTORICAL_LIFECYCLE_AS_OF_UNAVAILABLE"],
+            3,
+        )
+        simulation = history_metrics["simulation"]
+        self.assertEqual(simulation["status"], "PERFORMED")
+        self.assertEqual(simulation["evidence_source"], "axiom.backtest.prediction.BacktestResult")
+        self.assertEqual(simulation["fills"], 0)
+        self.assertEqual(simulation["closed_trades"], 0)
         self.assertEqual(report["qualification"]["status"], "REJECTED")
-        self.assertEqual(report["qualification"]["blocker"], "HISTORICAL_MIN_TRADES_NOT_MET")
+        self.assertEqual(
+            report["qualification"]["blocker"],
+            "PROCESSOR_VALIDATION_TRADE_EVIDENCE_UNAVAILABLE",
+        )
         self.assertFalse(report["qualification"]["historical_qualified"])
         self.assertFalse(report["qualification"]["current_evaluation_allowed"])
         chain = report["chain"]
-        self.assertEqual(chain["reason_code"], "HISTORICAL_MIN_TRADES_NOT_MET")
-        self.assertEqual(chain["exact_reason"], "HISTORICAL_MIN_TRADES_NOT_MET")
-        self.assertEqual(chain["decision_reason"], "HISTORICAL_MIN_TRADES_NOT_MET")
-        self.assertEqual(chain["reason"], "HISTORICAL_MIN_TRADES_NOT_MET")
-        self.assertEqual(chain["primary_reason"], "HISTORICAL_MIN_TRADES_NOT_MET")
+        self.assertEqual(chain["reason_code"], "PROCESSOR_VALIDATION_TRADE_EVIDENCE_UNAVAILABLE")
+        self.assertEqual(chain["exact_reason"], "PROCESSOR_VALIDATION_TRADE_EVIDENCE_UNAVAILABLE")
+        self.assertEqual(chain["decision_reason"], "PROCESSOR_VALIDATION_TRADE_EVIDENCE_UNAVAILABLE")
+        self.assertEqual(chain["reason"], "PROCESSOR_VALIDATION_TRADE_EVIDENCE_UNAVAILABLE")
+        self.assertEqual(chain["primary_reason"], "PROCESSOR_VALIDATION_TRADE_EVIDENCE_UNAVAILABLE")
         self.assertEqual(
             chain["canonical_pipeline_reason"],
             "INSUFFICIENT_DATA",
@@ -1863,16 +2275,22 @@ class MarketScopeAcceptanceToolTests(unittest.TestCase):
                 "calibration_observations": 0.0,
             },
         )
-        self.assertEqual(runtime["decisive_blocker"], "HISTORICAL_MIN_TRADES_NOT_MET")
+        self.assertEqual(
+            runtime["decisive_blocker"],
+            "PROCESSOR_VALIDATION_TRADE_EVIDENCE_UNAVAILABLE",
+        )
         paper_runtime = report["gate_assessment"]["PAPER_PROMOTABLE"]["evidence"]["runtime_metric_assessment"]
-        self.assertEqual(paper_runtime["decisive_blocker"], "HISTORICAL_MIN_TRADES_NOT_MET")
+        self.assertEqual(
+            paper_runtime["decisive_blocker"],
+            "PROCESSOR_VALIDATION_TRADE_EVIDENCE_UNAVAILABLE",
+        )
         self.assertEqual(
             report["qualification"]["evidence"]["actionable_signal_count"],
-            0.0,
+            transition["execution_evaluable"],
         )
         self.assertEqual(
             report["qualification"]["evidence"]["closed_trade_count"],
-            0.0,
+            None,
         )
         self.assertEqual(
             report["source"]["attestation"]["execution_fidelity"],
@@ -1884,8 +2302,10 @@ class MarketScopeAcceptanceToolTests(unittest.TestCase):
         )
         processor_result = chain["processor"]["results"][0]
         self.assertNotIn("data_quality", processor_result)
-        encoded_report = json.dumps(report, sort_keys=True, separators=(",", ":"))
-        self.assertNotIn("ORDER_BOOK_SIMULATED", encoded_report)
+        modes = history_metrics["research_modes"]
+        self.assertEqual(modes["STRICT_EXECUTABLE_SIMULATION"]["status"], "UNAVAILABLE")
+        self.assertEqual(modes["PRICE_PROXY_SIMULATION"]["status"], "PERFORMED")
+        self.assertFalse(modes["STRICT_EXECUTABLE_SIMULATION"]["observed_fills_authorized"])
         self.assertTrue(report["qualification"]["same_candidate_required"])
         self.assertEqual(
             report["qualification"]["canonical_pipeline_reason"],
@@ -1903,7 +2323,7 @@ class MarketScopeAcceptanceToolTests(unittest.TestCase):
         )
         self.assertEqual(
             report["evaluator"]["qualification_blocker"],
-            "HISTORICAL_MIN_TRADES_NOT_MET",
+            "PROCESSOR_VALIDATION_TRADE_EVIDENCE_UNAVAILABLE",
         )
         self.assertEqual(report["actual_decision"]["status"], "NOT_RUN")
         self.assertEqual(
@@ -1970,7 +2390,10 @@ class MarketScopeAcceptanceToolTests(unittest.TestCase):
         self.assertEqual(metrics["independent_raw_markets"], 3)
         self.assertEqual(metrics["independent_eligible_markets"], 2)
         self.assertEqual(metrics["signal_count"], 1)
-        self.assertEqual(metrics["actionable_signal_count"], 0)
+        self.assertEqual(
+            metrics["actionable_signal_count"],
+            metrics["execution_evaluable_count"],
+        )
 
 
     def test_paper_forward_stage_cannot_override_historical_rejection(self) -> None:
@@ -1998,7 +2421,10 @@ class MarketScopeAcceptanceToolTests(unittest.TestCase):
         self.assertFalse(qualification["processor_selected"])
         self.assertFalse(qualification["historical_qualified"])
         self.assertEqual(qualification["status"], "REJECTED")
-        self.assertEqual(qualification["blocker"], "HISTORICAL_MIN_TRADES_NOT_MET")
+        self.assertEqual(
+            qualification["blocker"],
+            "PROCESSOR_VALIDATION_TRADE_EVIDENCE_UNAVAILABLE",
+        )
         self.assertEqual(
             qualification["canonical_pipeline_reason"],
             "CANDIDATE_FORWARD_MARKET_UNRESOLVED",
@@ -2164,7 +2590,7 @@ class MarketScopeAcceptanceToolTests(unittest.TestCase):
         self.assertEqual(report["evaluator"]["reason"], "HISTORICAL_QUALIFICATION_FAILED")
         self.assertEqual(
             report["evaluator"]["qualification_blocker"],
-            "HISTORICAL_MIN_TRADES_NOT_MET",
+            "PROCESSOR_VALIDATION_TRADE_EVIDENCE_UNAVAILABLE",
         )
         self.assertTrue(report["execution_feasibility"]["current_book_required"] is False)
         self.assertFalse(report["security"]["credentials_used"])
@@ -2415,8 +2841,7 @@ class MarketScopeAcceptanceToolTests(unittest.TestCase):
             report = _compact_report(Path(directory) / "evaluator.sqlite")
             evaluator = report["evaluator"]
             self.assertEqual(evaluator["status"], "SKIPPED")
-            self.assertEqual(evaluator["reason"], "HISTORICAL_QUALIFICATION_FAILED")
-            self.assertEqual(evaluator["qualification_blocker"], "HISTORICAL_MIN_TRADES_NOT_MET")
+            self.assertEqual(evaluator["qualification_blocker"], "PROCESSOR_VALIDATION_TRADE_EVIDENCE_UNAVAILABLE")
             self.assertEqual(evaluator["current_market_resolution"], "NOT_RUN")
             self.assertEqual(evaluator["fresh_identity_and_books"], "NOT_RUN")
             self.assertIsNone(evaluator["decision"])

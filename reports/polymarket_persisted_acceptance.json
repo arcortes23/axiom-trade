@@ -38,8 +38,80 @@
     "family": "momentum",
     "historical_metrics": {
       "actionable_signal_count": 0,
+      "actionable_signal_count_definition": "nonzero canonical signals with historical executable quote/book, lifecycle-as-of, sizing, and cost evidence",
+      "actionable_signal_count_source": "execution_transition.execution_evaluable",
+      "backtest_evidence": {
+        "closed_trades": 0,
+        "evidence_source": "axiom.backtest.prediction.BacktestResult",
+        "fills": 0,
+        "status": "PERFORMED"
+      },
       "calibration_observation_count": 0,
       "calibration_observations": 0,
+      "canonical_signal_evidence": {
+        "evaluation_count": 18141,
+        "evaluator": "axiom.strategy.signals.evaluate_signal_evaluation",
+        "evaluator_invocations": 18141,
+        "evaluator_status": "RECORDED",
+        "insufficient_input_count": 1000,
+        "insufficient_lookback": 1000,
+        "nonzero_score_count": 4786,
+        "nonzero_scores": 4786,
+        "raw_score_count": 18141,
+        "raw_score_hash": "sha256:7ce730845c9cb14f5b0ef9dbdcfabc081ebe5787a4424799260f5c2880656f30",
+        "raw_score_sample_count": 6,
+        "raw_score_samples": [
+          {
+            "market_id": "4199915",
+            "reason_code": "INSUFFICIENT_LOOKBACK",
+            "score": 0.0,
+            "timestamp": "2026-09-03T23:00:36+00:00"
+          },
+          {
+            "market_id": "4199915",
+            "reason_code": "STRATEGY_EVALUATED_DECLINED",
+            "score": 0.0,
+            "timestamp": "2026-09-03T23:10:16+00:00"
+          },
+          {
+            "market_id": "4199915",
+            "reason_code": "STRATEGY_EVALUATED_DECLINED",
+            "score": 0.0,
+            "timestamp": "2026-09-03T23:20:29+00:00"
+          },
+          {
+            "market_id": "4213088",
+            "reason_code": "INSUFFICIENT_LOOKBACK",
+            "score": 0.0,
+            "timestamp": "2026-09-04T13:10:14+00:00"
+          },
+          {
+            "market_id": "4213088",
+            "reason_code": "STRATEGY_EVALUATED_DECLINED",
+            "score": 0.0,
+            "timestamp": "2026-09-04T13:20:14+00:00"
+          },
+          {
+            "market_id": "4213088",
+            "reason_code": "SIGNAL_PRODUCED",
+            "score": -0.09000000000000001,
+            "timestamp": "2026-09-04T13:30:15+00:00"
+          }
+        ],
+        "raw_score_samples_hash": "sha256:0f94e0e6c619d4db777c2022ba6ae294f64af2ce72fc5384d2080c28591c9496",
+        "raw_scores_actionable": false,
+        "reason_counts": {
+          "INSUFFICIENT_LOOKBACK": 1000,
+          "SIGNAL_PRODUCED": 4786,
+          "STRATEGY_EVALUATED_DECLINED": 12355
+        },
+        "unavailable_input_count": 0,
+        "unavailable_inputs": 0,
+        "warming_count": 0,
+        "warming_up": 0,
+        "zero_score_count": 12355,
+        "zero_scores": 12355
+      },
       "closed_trade_count": 0,
       "closed_trades": 0,
       "confidence_lower_bound": null,
@@ -57,6 +129,24 @@
         "scored_predictions": 0
       },
       "evidence_scope": "historical_validation",
+      "execution_blocking_reasons": {
+        "HISTORICAL_LIFECYCLE_AS_OF_UNAVAILABLE": 4786,
+        "MISSING_HISTORICAL_EXECUTABLE_QUOTE_OR_BOOK": 4786
+      },
+      "execution_evaluable_count": 0,
+      "execution_transition": {
+        "blocking_reasons": {
+          "HISTORICAL_LIFECYCLE_AS_OF_UNAVAILABLE": 4786,
+          "MISSING_HISTORICAL_EXECUTABLE_QUOTE_OR_BOOK": 4786
+        },
+        "costs": "NOT_REACHED",
+        "execution_evaluable": 0,
+        "execution_evaluable_count": 0,
+        "nonzero_signals": 4786,
+        "row_evidence_authority": "historical row quote/book, lifecycle-as-of, sizing, and cost fields only",
+        "sizing": "NOT_REACHED",
+        "status": "BLOCKED"
+      },
       "expectancy": null,
       "fill_count": 0,
       "filled_trades": 0,
@@ -64,7 +154,7 @@
       "historical_execution_fidelity": "PRICE_PROXY",
       "independent_eligible_markets": 1000,
       "independent_raw_markets": 1000,
-      "independent_scored_markets": 0,
+      "independent_scored_markets": 976,
       "lookback": 1,
       "model_evaluation_count": 0,
       "model_evaluations": 0,
@@ -72,27 +162,99 @@
       "profitability": null,
       "raw_observations": 18141,
       "realized_pnl_count": 0,
+      "research_modes": {
+        "PRICE_PROXY_SIMULATION": {
+          "assumptions": [
+            "yes_mid price history is used as a research proxy",
+            "no historical order book, lifecycle, settlement, or live quote is synthesized"
+          ],
+          "distinction": "assumption-limited PRICE_PROXY simulated fills are not observed fills or live authorization",
+          "evidence_source": "axiom.backtest.prediction.BacktestResult",
+          "limitations": [
+            "simulated fills are not observed fills",
+            "execution quality and live authorization are not established"
+          ],
+          "status": "PERFORMED"
+        },
+        "STRICT_EXECUTABLE_SIMULATION": {
+          "blocker": "HISTORICAL_EXECUTABLE_QUOTE_AND_LIFECYCLE_AS_OF_UNAVAILABLE",
+          "observed_fills_authorized": false,
+          "requirements": [
+            "historical as-of executable quote or order book",
+            "historical lifecycle state as of each evaluation",
+            "historical sizing and cost evidence"
+          ],
+          "status": "UNAVAILABLE"
+        }
+      },
       "resolved_traded_markets": 0,
       "sample_count": 18141,
       "scored_prediction_count": 0,
       "scored_predictions": 0,
       "signal_count": 4786,
-      "signal_evaluation_count": 4786,
-      "signal_evaluations": 4786,
+      "signal_evaluation_count": 18141,
+      "signal_evaluations": 18141,
+      "simulation": {
+        "closed_trades": 0,
+        "evidence_source": "axiom.backtest.prediction.BacktestResult",
+        "fills": 0,
+        "metrics": {
+          "brier": 0.0,
+          "ece": 0.0,
+          "executable_edge": 0.0,
+          "expected_roi": 0.0,
+          "expected_value": 0.0,
+          "fills": 0.0,
+          "final_equity": 10000.0,
+          "initial_equity": 10000.0,
+          "log_loss": 0.0,
+          "raw_edge": 0.0,
+          "roi": 0.0
+        },
+        "outcomes_count": 0,
+        "research_modes": {
+          "PRICE_PROXY_SIMULATION": {
+            "assumptions": [
+              "yes_mid price history is used as a research proxy",
+              "no historical order book, lifecycle, settlement, or live quote is synthesized"
+            ],
+            "distinction": "assumption-limited PRICE_PROXY simulated fills are not observed fills or live authorization",
+            "evidence_source": "axiom.backtest.prediction.BacktestResult",
+            "limitations": [
+              "simulated fills are not observed fills",
+              "execution quality and live authorization are not established"
+            ],
+            "status": "PERFORMED"
+          },
+          "STRICT_EXECUTABLE_SIMULATION": {
+            "blocker": "HISTORICAL_EXECUTABLE_QUOTE_AND_LIFECYCLE_AS_OF_UNAVAILABLE",
+            "observed_fills_authorized": false,
+            "requirements": [
+              "historical as-of executable quote or order book",
+              "historical lifecycle state as of each evaluation",
+              "historical sizing and cost evidence"
+            ],
+            "status": "UNAVAILABLE"
+          }
+        },
+        "research_quality": "PRICE_PROXY",
+        "status": "PERFORMED",
+        "unresolved_count": 0
+      },
       "status_basis": {
-        "calibration": "scored predictions paired with historical as-of outcomes",
-        "closed_trade": "fills with non-future settlement",
+        "calibration": "canonical scored predictions paired with historical as-of outcomes",
+        "closed_trade": "BacktestResult fills and outcomes only",
         "confidence": "closed-trade return observations",
-        "expectancy": "closed trades with realized PnL",
-        "forecast": "valid model forecast observations with as-of outcomes",
-        "profitability": "closed-trade expectancy after costs"
+        "expectancy": "BacktestResult computed metrics only when closed_trades is positive",
+        "forecast": "canonical evaluator invocations",
+        "profitability": "BacktestResult computed metrics only when closed_trades is positive"
       },
       "statuses": {
-        "calibration": "NOT_REACHED",
-        "closed_trade": "NOT_REACHED",
+        "calibration": "INSUFFICIENT_DATA",
+        "closed_trade": "RECORDED",
         "confidence": "NOT_REACHED",
         "expectancy": "NOT_REACHED",
-        "forecast": "NOT_REACHED",
+        "forecast": "RECORDED",
         "profitability": "NOT_REACHED"
       },
       "threshold": 0.05
@@ -113,18 +275,18 @@
     "assessment_candidate_lifecycle": {
       "candidate_id": "candidate-2857e8dc9bcc76f48e1210e6",
       "events_count": 5,
-      "events_hash": "sha256:aaebfa8c22629aa3b897aac247dabfe65e7c8269dc6f144852a9bcf2ed60c32c",
+      "events_hash": "sha256:a30b17c71fec05cc27ea0e77f9ee77ec187eeea33ee3308daf2e1af73f5e676b",
       "lifecycle_stage": "REJECTED",
       "metrics_hash": "sha256:c0969f5c31fd47ac833ca7c21f4d687d4b8420749534cdb229592f70ac0c753f",
       "payload_hash": "sha256:550278558f091688c70a9fab2233573d2b81e4975655b948e72c63b6ef511caa",
-      "updated_at": "2026-09-10T06:55:09.686135+00:00"
+      "updated_at": "2026-09-10T08:52:31.335554+00:00"
     },
     "assessment_candidate_lifecycle_events": [
       {
         "candidate_id": "candidate-2857e8dc9bcc76f48e1210e6",
-        "created_at": "2026-09-10T06:55:09.680623+00:00",
-        "event_hash": "sha256:4a31a8a6855a37a07ff39774dada062341cdd49ddb8d87cd8520b5f64aa1db9d",
-        "event_id": "lifecycle-event-d71424676a2923b70b7faf1670820e42bb251a4bc1234dbe4edb8fe2d0e7d18e",
+        "created_at": "2026-09-10T08:52:31.329806+00:00",
+        "event_hash": "sha256:02c2c5015f1076f03efe613e792b933655b6f7f96066f84de90d9eb9c23915e2",
+        "event_id": "lifecycle-event-8cf7c83139c97218151201669b88fc25c886ffb3a5c04d387038bf5d36ffecaf",
         "from_stage": null,
         "payload_hash": "sha256:d56e8b5b00affe09681a651a3d8e8d10eb7e0f9bd2b6b9ab3289511f2c81d0f9",
         "payload_keys": [
@@ -196,9 +358,9 @@
       },
       {
         "candidate_id": "candidate-2857e8dc9bcc76f48e1210e6",
-        "created_at": "2026-09-10T06:55:09.681620+00:00",
-        "event_hash": "sha256:a2f2936b21f42979021489225e6029be9b060a0fa5015898e29e62aa310d3b08",
-        "event_id": "lifecycle-event-2eb24669f2d311b585a0746162ca1334a49898015d197a2c389e3d4c832bab5d",
+        "created_at": "2026-09-10T08:52:31.331462+00:00",
+        "event_hash": "sha256:0b36db4cd9d4dfc8f874f9178f6369fbd6b9f052d7a1287299105458edf9677d",
+        "event_id": "lifecycle-event-108e36f28f4a26dd590cb411419e237f5d9d6882fd4837934e5fb8f8d33b2cae",
         "from_stage": "IDEA",
         "payload_hash": "sha256:a1feda00ca36b75913afcbee920303e0618c894be21ee8d18104830e11d63639",
         "payload_keys": [
@@ -282,9 +444,145 @@
       },
       {
         "candidate_id": "candidate-2857e8dc9bcc76f48e1210e6",
-        "created_at": "2026-09-10T06:55:09.682625+00:00",
-        "event_hash": "sha256:7eca80c50fd6c3fd961f72036e92fbb3ab21bfa93ec58fde25b9b03c239a51a9",
-        "event_id": "lifecycle-event-7cdf5d64468fc41b6e55f9fb0cb73f86cb94e9c76513913bff7d87c8383edeaf",
+        "created_at": "2026-09-10T08:52:31.332466+00:00",
+        "event_hash": "sha256:7892a80c7b14df5a0614270054f60accf83dd08971a1da33a5fdda5d4c9f08b8",
+        "event_id": "lifecycle-event-224c2b7ca0c9c76339fe5b31cd89f3ff767d26ec160ee99ea30207669378b9fe",
+        "from_stage": "SCHEMA_VALIDATED",
+        "payload_hash": "sha256:3fcfd4db3de2ea35263b28d39501fa3922d0d3a016aa21495c08c976db27a03b",
+        "payload_keys": [
+          "backtest_complete",
+          "candidate_id",
+          "costs_included",
+          "data_quality",
+          "dataset_id",
+          "dataset_provenance",
+          "dataset_selector",
+          "dataset_version",
+          "experiment_family",
+          "experiment_plan",
+          "generation",
+          "holdout_used",
+          "hypothesis_id",
+          "lineage",
+          "market_scope",
+          "market_scope_hash",
+          "market_scope_version",
+          "market_type",
+          "paper_only",
+          "parameter_ranges_bounded",
+          "parameters",
+          "plan_hash",
+          "plan_id",
+          "raw_observations",
+          "referenced_features",
+          "schema_valid",
+          "scope_hash",
+          "scope_version",
+          "stage",
+          "strategy",
+          "train",
+          "variant_id"
+        ],
+        "payload_metrics": {
+          "backtest": {
+            "backtest_complete": true,
+            "train": {
+              "calibration": 0.0,
+              "confidence_interval": {
+                "count": 10868,
+                "lower": 0.0,
+                "upper": 0.0
+              },
+              "confidence_lower_bound": 0.0,
+              "costs": 0.0,
+              "expectancy": 0.0,
+              "filled_trades": 0,
+              "independent_samples": 595,
+              "liquidity": 0.0,
+              "max_drawdown": 0.0,
+              "metrics": {
+                "brier": 0.0,
+                "ece": 0.0,
+                "executable_edge": 0.0,
+                "expected_roi": 0.0,
+                "expected_value": 0.0,
+                "fills": 0.0,
+                "final_equity": 10000.0,
+                "initial_equity": 10000.0,
+                "log_loss": 0.0,
+                "raw_edge": 0.0,
+                "roi": 0.0
+              },
+              "regime_count": 1
+            }
+          },
+          "observed": {
+            "metric_fields": {
+              "backtest": [
+                "backtest_complete",
+                "train"
+              ],
+              "qualification": [
+                "holdout_used"
+              ],
+              "robustness": [
+                "costs_included",
+                "data_quality"
+              ],
+              "validation": []
+            },
+            "payload_keys": [
+              "backtest_complete",
+              "candidate_id",
+              "costs_included",
+              "data_quality",
+              "dataset_id",
+              "dataset_provenance",
+              "dataset_selector",
+              "dataset_version",
+              "experiment_family",
+              "experiment_plan",
+              "generation",
+              "holdout_used",
+              "hypothesis_id",
+              "lineage",
+              "market_scope",
+              "market_scope_hash",
+              "market_scope_version",
+              "market_type",
+              "paper_only",
+              "parameter_ranges_bounded",
+              "parameters",
+              "plan_hash",
+              "plan_id",
+              "raw_observations",
+              "referenced_features",
+              "schema_valid",
+              "scope_hash",
+              "scope_version",
+              "stage",
+              "strategy",
+              "train",
+              "variant_id"
+            ]
+          },
+          "qualification": {
+            "holdout_used": false
+          },
+          "robustness": {
+            "costs_included": true,
+            "data_quality": "LOW"
+          },
+          "validation": {}
+        },
+        "reason": "bounded historical simulation completed with costs",
+        "to_stage": "BACKTESTED"
+      },
+      {
+        "candidate_id": "candidate-2857e8dc9bcc76f48e1210e6",
+        "created_at": "2026-09-10T08:52:31.333466+00:00",
+        "event_hash": "sha256:f67ba07d793f51f76dab2b6216bca3b9be53f1a9e75e8a9de9b1198c8bb73adc",
+        "event_id": "lifecycle-event-661ddc2029594ec37e2eeb79d422da93019f88c87c3fc6b56ac40c31dccfb3ab",
         "from_stage": "BACKTESTED",
         "payload_hash": "sha256:bf52630f0cbe7f9530241c3386baac92d8a399d24fdae2dbdf4868c4aa20a559",
         "payload_keys": [
@@ -462,145 +760,9 @@
       },
       {
         "candidate_id": "candidate-2857e8dc9bcc76f48e1210e6",
-        "created_at": "2026-09-10T06:55:09.682625+00:00",
-        "event_hash": "sha256:e62efc2c9a1528c1c0f8b8d86758d8e051ef5105550b586502956784a4a1e5fe",
-        "event_id": "lifecycle-event-90b94bc95a41547de07c1fc3704145065394aacb6864754c1eb073b81b000225",
-        "from_stage": "SCHEMA_VALIDATED",
-        "payload_hash": "sha256:3fcfd4db3de2ea35263b28d39501fa3922d0d3a016aa21495c08c976db27a03b",
-        "payload_keys": [
-          "backtest_complete",
-          "candidate_id",
-          "costs_included",
-          "data_quality",
-          "dataset_id",
-          "dataset_provenance",
-          "dataset_selector",
-          "dataset_version",
-          "experiment_family",
-          "experiment_plan",
-          "generation",
-          "holdout_used",
-          "hypothesis_id",
-          "lineage",
-          "market_scope",
-          "market_scope_hash",
-          "market_scope_version",
-          "market_type",
-          "paper_only",
-          "parameter_ranges_bounded",
-          "parameters",
-          "plan_hash",
-          "plan_id",
-          "raw_observations",
-          "referenced_features",
-          "schema_valid",
-          "scope_hash",
-          "scope_version",
-          "stage",
-          "strategy",
-          "train",
-          "variant_id"
-        ],
-        "payload_metrics": {
-          "backtest": {
-            "backtest_complete": true,
-            "train": {
-              "calibration": 0.0,
-              "confidence_interval": {
-                "count": 10868,
-                "lower": 0.0,
-                "upper": 0.0
-              },
-              "confidence_lower_bound": 0.0,
-              "costs": 0.0,
-              "expectancy": 0.0,
-              "filled_trades": 0,
-              "independent_samples": 595,
-              "liquidity": 0.0,
-              "max_drawdown": 0.0,
-              "metrics": {
-                "brier": 0.0,
-                "ece": 0.0,
-                "executable_edge": 0.0,
-                "expected_roi": 0.0,
-                "expected_value": 0.0,
-                "fills": 0.0,
-                "final_equity": 10000.0,
-                "initial_equity": 10000.0,
-                "log_loss": 0.0,
-                "raw_edge": 0.0,
-                "roi": 0.0
-              },
-              "regime_count": 1
-            }
-          },
-          "observed": {
-            "metric_fields": {
-              "backtest": [
-                "backtest_complete",
-                "train"
-              ],
-              "qualification": [
-                "holdout_used"
-              ],
-              "robustness": [
-                "costs_included",
-                "data_quality"
-              ],
-              "validation": []
-            },
-            "payload_keys": [
-              "backtest_complete",
-              "candidate_id",
-              "costs_included",
-              "data_quality",
-              "dataset_id",
-              "dataset_provenance",
-              "dataset_selector",
-              "dataset_version",
-              "experiment_family",
-              "experiment_plan",
-              "generation",
-              "holdout_used",
-              "hypothesis_id",
-              "lineage",
-              "market_scope",
-              "market_scope_hash",
-              "market_scope_version",
-              "market_type",
-              "paper_only",
-              "parameter_ranges_bounded",
-              "parameters",
-              "plan_hash",
-              "plan_id",
-              "raw_observations",
-              "referenced_features",
-              "schema_valid",
-              "scope_hash",
-              "scope_version",
-              "stage",
-              "strategy",
-              "train",
-              "variant_id"
-            ]
-          },
-          "qualification": {
-            "holdout_used": false
-          },
-          "robustness": {
-            "costs_included": true,
-            "data_quality": "LOW"
-          },
-          "validation": {}
-        },
-        "reason": "bounded historical simulation completed with costs",
-        "to_stage": "BACKTESTED"
-      },
-      {
-        "candidate_id": "candidate-2857e8dc9bcc76f48e1210e6",
-        "created_at": "2026-09-10T06:55:09.686135+00:00",
-        "event_hash": "sha256:0f02174d6403a94bdacbdb41563b9b6116866af012261ecfbbfb813c2cae236f",
-        "event_id": "lifecycle-event-3705b698d54538c88a4a7be7d411987869f7480af886fa40a3e2bfa4806f9e5b",
+        "created_at": "2026-09-10T08:52:31.335554+00:00",
+        "event_hash": "sha256:295d8d1a8c5943caef1b75b9475acf6726737a6ccba2c75c3f991af7d9a162d9",
+        "event_id": "lifecycle-event-d67d8b14f67907ffb6af84618206c6ff82c374e455ffdf617380ebbe262090a3",
         "from_stage": "VALIDATED",
         "payload_hash": "sha256:550278558f091688c70a9fab2233573d2b81e4975655b948e72c63b6ef511caa",
         "payload_keys": [
@@ -1002,7 +1164,7 @@
         {
           "candidate_id": "candidate-2857e8dc9bcc76f48e1210e6",
           "events_count": 5,
-          "events_hash": "sha256:aaebfa8c22629aa3b897aac247dabfe65e7c8269dc6f144852a9bcf2ed60c32c",
+          "events_hash": "sha256:a30b17c71fec05cc27ea0e77f9ee77ec187eeea33ee3308daf2e1af73f5e676b",
           "evidence_gap": null,
           "lifecycle_stage": "REJECTED",
           "metrics": {
@@ -1296,7 +1458,7 @@
             "validation_stability_summary",
             "variant_id"
           ],
-          "updated_at": "2026-09-10T06:55:09.686135+00:00"
+          "updated_at": "2026-09-10T08:52:31.335554+00:00"
         }
       ],
       "processor_selected": false
@@ -1561,20 +1723,44 @@
       "evidence": {
         "actionable_signal_count": 0.0,
         "candidate_metrics_status": null,
-        "closed_trade_count": 0.0
+        "closed_trade_count": 0.0,
+        "diagnostic_trade_evidence": 0.0,
+        "diagnostic_trade_evidence_source": "historical_metrics.filled_trades",
+        "processor_trade_evidence": 0.0,
+        "processor_trade_evidence_source": "candidate_metrics.validation.validation.filled_trades"
       },
       "historical_qualified": false,
       "historical_support_status": "PASSED",
       "lifecycle_non_rejected": false,
       "lifecycle_stage": "REJECTED",
       "minimum_trades": {
+        "authority": "processor_validation",
         "met": false,
         "observed": 0.0,
-        "required": 20.0
+        "required": 20.0,
+        "source": "candidate_metrics.validation.validation.filled_trades"
       },
       "processor_selected": false,
       "robustness_passed": false,
-      "status": "REJECTED"
+      "status": "REJECTED",
+      "trade_evidence_comparison": {
+        "agreement": "AGREE",
+        "authority": "processor_validation",
+        "diagnostic": {
+          "available": true,
+          "closed_source": "historical_metrics.closed_trade_count",
+          "closed_value": 0.0,
+          "source": "historical_metrics.filled_trades",
+          "value": 0.0
+        },
+        "processor": {
+          "available": true,
+          "closed_source": null,
+          "closed_value": null,
+          "source": "candidate_metrics.validation.validation.filled_trades",
+          "value": 0.0
+        }
+      }
     },
     "lifecycle_stage": "REJECTED",
     "metrics": {
@@ -2339,13 +2525,13 @@
           "imported": 1000,
           "ineligible": 0
         },
-        "historical_metrics_hash": "sha256:f78398649f9490059f729445f2cf945c1d69b4b4dd8885d08419e29a9c76cf26",
+        "historical_metrics_hash": "sha256:ff94b0e9aa08d195a0911620bf9c68ea7b3bca576afdc9e152abd1f821f656aa",
         "historical_metrics_statuses": {
-          "calibration": "NOT_REACHED",
-          "closed_trade": "NOT_REACHED",
+          "calibration": "INSUFFICIENT_DATA",
+          "closed_trade": "RECORDED",
           "confidence": "NOT_REACHED",
           "expectancy": "NOT_REACHED",
-          "forecast": "NOT_REACHED",
+          "forecast": "RECORDED",
           "profitability": "NOT_REACHED"
         },
         "historical_qualification": {
@@ -2373,20 +2559,44 @@
           "evidence": {
             "actionable_signal_count": 0.0,
             "candidate_metrics_status": null,
-            "closed_trade_count": 0.0
+            "closed_trade_count": 0.0,
+            "diagnostic_trade_evidence": 0.0,
+            "diagnostic_trade_evidence_source": "historical_metrics.filled_trades",
+            "processor_trade_evidence": 0.0,
+            "processor_trade_evidence_source": "candidate_metrics.validation.validation.filled_trades"
           },
           "historical_qualified": false,
           "historical_support_status": "PASSED",
           "lifecycle_non_rejected": false,
           "lifecycle_stage": "REJECTED",
           "minimum_trades": {
+            "authority": "processor_validation",
             "met": false,
             "observed": 0.0,
-            "required": 20.0
+            "required": 20.0,
+            "source": "candidate_metrics.validation.validation.filled_trades"
           },
           "processor_selected": false,
           "robustness_passed": false,
-          "status": "REJECTED"
+          "status": "REJECTED",
+          "trade_evidence_comparison": {
+            "agreement": "AGREE",
+            "authority": "processor_validation",
+            "diagnostic": {
+              "available": true,
+              "closed_source": "historical_metrics.closed_trade_count",
+              "closed_value": 0.0,
+              "source": "historical_metrics.filled_trades",
+              "value": 0.0
+            },
+            "processor": {
+              "available": true,
+              "closed_source": null,
+              "closed_value": null,
+              "source": "candidate_metrics.validation.validation.filled_trades",
+              "value": 0.0
+            }
+          }
         },
         "historical_support_audit_hash": "sha256:56f42d33b2dd24d865e3290568d5f4ea0eed594430e53fe90854f28ec6e45534",
         "historical_support_status": "PASSED"
@@ -2401,11 +2611,129 @@
       "status": "REJECTED"
     }
   },
-  "generated_at": "2026-09-10T06:54:36.748570+00:00",
+  "generated_at": "2026-09-10T08:51:48.092892+00:00",
+  "historical_evidence_funnel": {
+    "closed_trades": {
+      "blockers": [
+        "NO_SIMULATED_FILLS",
+        "HISTORICAL_LIFECYCLE_AS_OF_UNAVAILABLE"
+      ],
+      "count": 0,
+      "status": "PERFORMED"
+    },
+    "evaluations": {
+      "blockers": [],
+      "count": 18141,
+      "status": "RECORDED"
+    },
+    "execution_evaluable": {
+      "blockers": [
+        "NO_EXECUTION_EVALUABLE_CASES",
+        "HISTORICAL_LIFECYCLE_AS_OF_UNAVAILABLE",
+        "MISSING_HISTORICAL_EXECUTABLE_QUOTE_OR_BOOK"
+      ],
+      "count": 0,
+      "status": "BLOCKED"
+    },
+    "nonzero_signals": {
+      "blockers": [],
+      "count": 4786,
+      "status": "RECORDED"
+    },
+    "qualification": {
+      "blockers": [
+        "HISTORICAL_MIN_TRADES_NOT_MET"
+      ],
+      "count": null,
+      "status": "REJECTED"
+    },
+    "simulated_fills": {
+      "blockers": [
+        "NO_SIMULATED_FILLS",
+        "NO_EXECUTION_EVALUABLE_CASES",
+        "HISTORICAL_LIFECYCLE_AS_OF_UNAVAILABLE",
+        "MISSING_HISTORICAL_EXECUTABLE_QUOTE_OR_BOOK"
+      ],
+      "count": 0,
+      "status": "PERFORMED"
+    }
+  },
   "historical_metrics": {
     "actionable_signal_count": 0,
+    "actionable_signal_count_definition": "nonzero canonical signals with historical executable quote/book, lifecycle-as-of, sizing, and cost evidence",
+    "actionable_signal_count_source": "execution_transition.execution_evaluable",
+    "backtest_evidence": {
+      "closed_trades": 0,
+      "evidence_source": "axiom.backtest.prediction.BacktestResult",
+      "fills": 0,
+      "status": "PERFORMED"
+    },
     "calibration_observation_count": 0,
     "calibration_observations": 0,
+    "canonical_signal_evidence": {
+      "evaluation_count": 18141,
+      "evaluator": "axiom.strategy.signals.evaluate_signal_evaluation",
+      "evaluator_invocations": 18141,
+      "evaluator_status": "RECORDED",
+      "insufficient_input_count": 1000,
+      "insufficient_lookback": 1000,
+      "nonzero_score_count": 4786,
+      "nonzero_scores": 4786,
+      "raw_score_count": 18141,
+      "raw_score_hash": "sha256:7ce730845c9cb14f5b0ef9dbdcfabc081ebe5787a4424799260f5c2880656f30",
+      "raw_score_sample_count": 6,
+      "raw_score_samples": [
+        {
+          "market_id": "4199915",
+          "reason_code": "INSUFFICIENT_LOOKBACK",
+          "score": 0.0,
+          "timestamp": "2026-09-03T23:00:36+00:00"
+        },
+        {
+          "market_id": "4199915",
+          "reason_code": "STRATEGY_EVALUATED_DECLINED",
+          "score": 0.0,
+          "timestamp": "2026-09-03T23:10:16+00:00"
+        },
+        {
+          "market_id": "4199915",
+          "reason_code": "STRATEGY_EVALUATED_DECLINED",
+          "score": 0.0,
+          "timestamp": "2026-09-03T23:20:29+00:00"
+        },
+        {
+          "market_id": "4213088",
+          "reason_code": "INSUFFICIENT_LOOKBACK",
+          "score": 0.0,
+          "timestamp": "2026-09-04T13:10:14+00:00"
+        },
+        {
+          "market_id": "4213088",
+          "reason_code": "STRATEGY_EVALUATED_DECLINED",
+          "score": 0.0,
+          "timestamp": "2026-09-04T13:20:14+00:00"
+        },
+        {
+          "market_id": "4213088",
+          "reason_code": "SIGNAL_PRODUCED",
+          "score": -0.09000000000000001,
+          "timestamp": "2026-09-04T13:30:15+00:00"
+        }
+      ],
+      "raw_score_samples_hash": "sha256:0f94e0e6c619d4db777c2022ba6ae294f64af2ce72fc5384d2080c28591c9496",
+      "raw_scores_actionable": false,
+      "reason_counts": {
+        "INSUFFICIENT_LOOKBACK": 1000,
+        "SIGNAL_PRODUCED": 4786,
+        "STRATEGY_EVALUATED_DECLINED": 12355
+      },
+      "unavailable_input_count": 0,
+      "unavailable_inputs": 0,
+      "warming_count": 0,
+      "warming_up": 0,
+      "zero_score_count": 12355,
+      "zero_scores": 12355
+    },
     "closed_trade_count": 0,
     "closed_trades": 0,
     "confidence_lower_bound": null,
@@ -2423,6 +2751,24 @@
       "scored_predictions": 0
     },
     "evidence_scope": "historical_validation",
+    "execution_blocking_reasons": {
+      "HISTORICAL_LIFECYCLE_AS_OF_UNAVAILABLE": 4786,
+      "MISSING_HISTORICAL_EXECUTABLE_QUOTE_OR_BOOK": 4786
+    },
+    "execution_evaluable_count": 0,
+    "execution_transition": {
+      "blocking_reasons": {
+        "HISTORICAL_LIFECYCLE_AS_OF_UNAVAILABLE": 4786,
+        "MISSING_HISTORICAL_EXECUTABLE_QUOTE_OR_BOOK": 4786
+      },
+      "costs": "NOT_REACHED",
+      "execution_evaluable": 0,
+      "execution_evaluable_count": 0,
+      "nonzero_signals": 4786,
+      "row_evidence_authority": "historical row quote/book, lifecycle-as-of, sizing, and cost fields only",
+      "sizing": "NOT_REACHED",
+      "status": "BLOCKED"
+    },
     "expectancy": null,
     "fill_count": 0,
     "filled_trades": 0,
@@ -2430,7 +2776,7 @@
     "historical_execution_fidelity": "PRICE_PROXY",
     "independent_eligible_markets": 1000,
     "independent_raw_markets": 1000,
-    "independent_scored_markets": 0,
+    "independent_scored_markets": 976,
     "lookback": 1,
     "model_evaluation_count": 0,
     "model_evaluations": 0,
@@ -2438,27 +2784,99 @@
     "profitability": null,
     "raw_observations": 18141,
     "realized_pnl_count": 0,
+    "research_modes": {
+      "PRICE_PROXY_SIMULATION": {
+        "assumptions": [
+          "yes_mid price history is used as a research proxy",
+          "no historical order book, lifecycle, settlement, or live quote is synthesized"
+        ],
+        "distinction": "assumption-limited PRICE_PROXY simulated fills are not observed fills or live authorization",
+        "evidence_source": "axiom.backtest.prediction.BacktestResult",
+        "limitations": [
+          "simulated fills are not observed fills",
+          "execution quality and live authorization are not established"
+        ],
+        "status": "PERFORMED"
+      },
+      "STRICT_EXECUTABLE_SIMULATION": {
+        "blocker": "HISTORICAL_EXECUTABLE_QUOTE_AND_LIFECYCLE_AS_OF_UNAVAILABLE",
+        "observed_fills_authorized": false,
+        "requirements": [
+          "historical as-of executable quote or order book",
+          "historical lifecycle state as of each evaluation",
+          "historical sizing and cost evidence"
+        ],
+        "status": "UNAVAILABLE"
+      }
+    },
     "resolved_traded_markets": 0,
     "sample_count": 18141,
     "scored_prediction_count": 0,
     "scored_predictions": 0,
     "signal_count": 4786,
-    "signal_evaluation_count": 4786,
-    "signal_evaluations": 4786,
+    "signal_evaluation_count": 18141,
+    "signal_evaluations": 18141,
+    "simulation": {
+      "closed_trades": 0,
+      "evidence_source": "axiom.backtest.prediction.BacktestResult",
+      "fills": 0,
+      "metrics": {
+        "brier": 0.0,
+        "ece": 0.0,
+        "executable_edge": 0.0,
+        "expected_roi": 0.0,
+        "expected_value": 0.0,
+        "fills": 0.0,
+        "final_equity": 10000.0,
+        "initial_equity": 10000.0,
+        "log_loss": 0.0,
+        "raw_edge": 0.0,
+        "roi": 0.0
+      },
+      "outcomes_count": 0,
+      "research_modes": {
+        "PRICE_PROXY_SIMULATION": {
+          "assumptions": [
+            "yes_mid price history is used as a research proxy",
+            "no historical order book, lifecycle, settlement, or live quote is synthesized"
+          ],
+          "distinction": "assumption-limited PRICE_PROXY simulated fills are not observed fills or live authorization",
+          "evidence_source": "axiom.backtest.prediction.BacktestResult",
+          "limitations": [
+            "simulated fills are not observed fills",
+            "execution quality and live authorization are not established"
+          ],
+          "status": "PERFORMED"
+        },
+        "STRICT_EXECUTABLE_SIMULATION": {
+          "blocker": "HISTORICAL_EXECUTABLE_QUOTE_AND_LIFECYCLE_AS_OF_UNAVAILABLE",
+          "observed_fills_authorized": false,
+          "requirements": [
+            "historical as-of executable quote or order book",
+            "historical lifecycle state as of each evaluation",
+            "historical sizing and cost evidence"
+          ],
+          "status": "UNAVAILABLE"
+        }
+      },
+      "research_quality": "PRICE_PROXY",
+      "status": "PERFORMED",
+      "unresolved_count": 0
+    },
     "status_basis": {
-      "calibration": "scored predictions paired with historical as-of outcomes",
-      "closed_trade": "fills with non-future settlement",
+      "calibration": "canonical scored predictions paired with historical as-of outcomes",
+      "closed_trade": "BacktestResult fills and outcomes only",
       "confidence": "closed-trade return observations",
-      "expectancy": "closed trades with realized PnL",
-      "forecast": "valid model forecast observations with as-of outcomes",
-      "profitability": "closed-trade expectancy after costs"
+      "expectancy": "BacktestResult computed metrics only when closed_trades is positive",
+      "forecast": "canonical evaluator invocations",
+      "profitability": "BacktestResult computed metrics only when closed_trades is positive"
     },
     "statuses": {
-      "calibration": "NOT_REACHED",
-      "closed_trade": "NOT_REACHED",
+      "calibration": "INSUFFICIENT_DATA",
+      "closed_trade": "RECORDED",
       "confidence": "NOT_REACHED",
       "expectancy": "NOT_REACHED",
-      "forecast": "NOT_REACHED",
+      "forecast": "RECORDED",
       "profitability": "NOT_REACHED"
     },
     "threshold": 0.05
@@ -2627,10 +3045,41 @@
     },
     "metrics": {
       "actionable_signal_count": 0,
+      "actionable_signal_count_definition": "nonzero canonical signals with historical executable quote/book, lifecycle-as-of, sizing, and cost evidence",
+      "actionable_signal_count_source": "execution_transition.execution_evaluable",
+      "backtest_evidence": {
+        "closed_trades": null,
+        "evidence_source": null,
+        "fills": null,
+        "status": "NOT_EVALUATED"
+      },
       "calibration_observation_count": 0,
       "calibration_observations": 0,
-      "closed_trade_count": 0,
-      "closed_trades": 0,
+      "canonical_signal_evidence": {
+        "evaluation_count": 0,
+        "evaluator": "axiom.strategy.signals.evaluate_signal_evaluation",
+        "evaluator_invocations": 0,
+        "evaluator_status": "NOT_EVALUATED",
+        "insufficient_input_count": 0,
+        "insufficient_lookback": 0,
+        "nonzero_score_count": 0,
+        "nonzero_scores": 0,
+        "raw_score_count": 0,
+        "raw_score_hash": "sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "raw_score_sample_count": 0,
+        "raw_score_samples": [],
+        "raw_score_samples_hash": "sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "raw_scores_actionable": false,
+        "reason_counts": {},
+        "unavailable_input_count": 0,
+        "unavailable_inputs": 0,
+        "warming_count": 0,
+        "warming_up": 0,
+        "zero_score_count": 0,
+        "zero_scores": 0
+      },
+      "closed_trade_count": null,
+      "closed_trades": null,
       "confidence_lower_bound": null,
       "configured_costs": {
         "allocation": 0.25,
@@ -2640,16 +3089,28 @@
       },
       "counts": {
         "calibration_observations": 0,
-        "closed_trades": 0,
-        "filled_trades": 0,
-        "fills": 0,
+        "closed_trades": null,
+        "filled_trades": null,
+        "fills": null,
         "scored_predictions": 0
       },
       "evidence_scope": "historical_validation",
+      "execution_blocking_reasons": {},
+      "execution_evaluable_count": 0,
+      "execution_transition": {
+        "blocking_reasons": {},
+        "costs": "NOT_REACHED",
+        "execution_evaluable": 0,
+        "execution_evaluable_count": 0,
+        "nonzero_signals": 0,
+        "row_evidence_authority": "historical row quote/book, lifecycle-as-of, sizing, and cost fields only",
+        "sizing": "NOT_REACHED",
+        "status": "NOT_REACHED"
+      },
       "expectancy": null,
-      "fill_count": 0,
-      "filled_trades": 0,
-      "fills": 0,
+      "fill_count": null,
+      "filled_trades": null,
+      "fills": null,
       "historical_execution_fidelity": "PRICE_PROXY",
       "independent_eligible_markets": 1000,
       "independent_raw_markets": 1000,
@@ -2660,29 +3121,89 @@
       "nonzero_edge_count": 0,
       "profitability": null,
       "raw_observations": 18141,
-      "realized_pnl_count": 0,
-      "resolved_traded_markets": 0,
+      "realized_pnl_count": null,
+      "research_modes": {
+        "PRICE_PROXY_SIMULATION": {
+          "assumptions": [
+            "yes_mid price history is used as a research proxy",
+            "no historical order book, lifecycle, settlement, or live quote is synthesized"
+          ],
+          "distinction": "assumption-limited PRICE_PROXY simulated fills are not observed fills or live authorization",
+          "evidence_source": null,
+          "limitations": [
+            "simulated fills are not observed fills",
+            "execution quality and live authorization are not established"
+          ],
+          "status": "NOT_EVALUATED"
+        },
+        "STRICT_EXECUTABLE_SIMULATION": {
+          "blocker": "HISTORICAL_EXECUTABLE_QUOTE_AND_LIFECYCLE_AS_OF_UNAVAILABLE",
+          "observed_fills_authorized": false,
+          "requirements": [
+            "historical as-of executable quote or order book",
+            "historical lifecycle state as of each evaluation",
+            "historical sizing and cost evidence"
+          ],
+          "status": "UNAVAILABLE"
+        }
+      },
+      "resolved_traded_markets": null,
       "sample_count": 18141,
       "scored_prediction_count": 0,
       "scored_predictions": 0,
       "signal_count": 0,
       "signal_evaluation_count": 18141,
       "signal_evaluations": 18141,
+      "simulation": {
+        "closed_trades": null,
+        "evidence_source": null,
+        "fills": null,
+        "metrics": null,
+        "outcomes_count": null,
+        "research_modes": {
+          "PRICE_PROXY_SIMULATION": {
+            "assumptions": [
+              "yes_mid price history is used as a research proxy",
+              "no historical order book, lifecycle, settlement, or live quote is synthesized"
+            ],
+            "distinction": "assumption-limited PRICE_PROXY simulated fills are not observed fills or live authorization",
+            "evidence_source": null,
+            "limitations": [
+              "simulated fills are not observed fills",
+              "execution quality and live authorization are not established"
+            ],
+            "status": "NOT_EVALUATED"
+          },
+          "STRICT_EXECUTABLE_SIMULATION": {
+            "blocker": "HISTORICAL_EXECUTABLE_QUOTE_AND_LIFECYCLE_AS_OF_UNAVAILABLE",
+            "observed_fills_authorized": false,
+            "requirements": [
+              "historical as-of executable quote or order book",
+              "historical lifecycle state as of each evaluation",
+              "historical sizing and cost evidence"
+            ],
+            "status": "UNAVAILABLE"
+          }
+        },
+        "research_quality": "PRICE_PROXY",
+        "status": "NOT_EVALUATED",
+        "unresolved_count": null
+      },
       "status_basis": {
-        "calibration": "scored predictions paired with historical as-of outcomes",
-        "closed_trade": "fills with non-future settlement",
+        "calibration": "canonical scored predictions paired with historical as-of outcomes",
+        "closed_trade": "BacktestResult fills and outcomes only",
         "confidence": "closed-trade return observations",
-        "expectancy": "closed trades with realized PnL",
-        "forecast": "valid model forecast observations with as-of outcomes",
-        "profitability": "closed-trade expectancy after costs"
+        "expectancy": "BacktestResult computed metrics only when closed_trades is positive",
+        "forecast": "canonical evaluator invocations",
+        "profitability": "BacktestResult computed metrics only when closed_trades is positive"
       },
       "statuses": {
         "calibration": "NOT_REACHED",
-        "closed_trade": "NOT_REACHED",
+        "closed_trade": "NOT_EVALUATED",
         "confidence": "NOT_REACHED",
-        "expectancy": "NOT_REACHED",
-        "forecast": "NOT_REACHED",
-        "profitability": "NOT_REACHED"
+        "expectancy": "NOT_EVALUATED",
+        "forecast": "RECORDED",
+        "profitability": "NOT_EVALUATED"
       },
       "threshold": 0.03
     },
@@ -2821,22 +3342,46 @@
     "evidence": {
       "actionable_signal_count": 0.0,
       "candidate_metrics_status": null,
-      "closed_trade_count": 0.0
+      "closed_trade_count": 0.0,
+      "diagnostic_trade_evidence": 0.0,
+      "diagnostic_trade_evidence_source": "historical_metrics.filled_trades",
+      "processor_trade_evidence": 0.0,
+      "processor_trade_evidence_source": "candidate_metrics.validation.validation.filled_trades"
     },
     "historical_qualified": false,
     "historical_support_status": "PASSED",
     "lifecycle_non_rejected": false,
     "lifecycle_stage": "REJECTED",
     "minimum_trades": {
+      "authority": "processor_validation",
       "met": false,
       "observed": 0.0,
-      "required": 20.0
+      "required": 20.0,
+      "source": "candidate_metrics.validation.validation.filled_trades"
     },
     "positive_candidate_id": "candidate-2857e8dc9bcc76f48e1210e6",
     "processor_selected": false,
     "robustness_passed": false,
     "same_candidate_required": true,
-    "status": "REJECTED"
+    "status": "REJECTED",
+    "trade_evidence_comparison": {
+      "agreement": "AGREE",
+      "authority": "processor_validation",
+      "diagnostic": {
+        "available": true,
+        "closed_source": "historical_metrics.closed_trade_count",
+        "closed_value": 0.0,
+        "source": "historical_metrics.filled_trades",
+        "value": 0.0
+      },
+      "processor": {
+        "available": true,
+        "closed_source": null,
+        "closed_value": null,
+        "source": "candidate_metrics.validation.validation.filled_trades",
+        "value": 0.0
+      }
+    }
   },
   "release_plan": {
     "backup_prerequisite": {
@@ -2903,6 +3448,31 @@
     "qualification_required_stage": "PAPER_FORWARD",
     "qualification_stage_observed": "REJECTED",
     "status": "NOT_READY"
+  },
+  "research_modes": {
+    "PRICE_PROXY_SIMULATION": {
+      "assumptions": [
+        "yes_mid price history is used as a research proxy",
+        "no historical order book, lifecycle, settlement, or live quote is synthesized"
+      ],
+      "distinction": "assumption-limited PRICE_PROXY simulated fills are not observed fills or live authorization",
+      "evidence_source": "axiom.backtest.prediction.BacktestResult",
+      "limitations": [
+        "simulated fills are not observed fills",
+        "execution quality and live authorization are not established"
+      ],
+      "status": "PERFORMED"
+    },
+    "STRICT_EXECUTABLE_SIMULATION": {
+      "blocker": "HISTORICAL_EXECUTABLE_QUOTE_AND_LIFECYCLE_AS_OF_UNAVAILABLE",
+      "observed_fills_authorized": false,
+      "requirements": [
+        "historical as-of executable quote or order book",
+        "historical lifecycle state as of each evaluation",
+        "historical sizing and cost evidence"
+      ],
+      "status": "UNAVAILABLE"
+    }
   },
   "runtime_criteria": {
     "max_drawdown": 0.2,
@@ -3559,10 +4129,10 @@
     "validation": "PASSED"
   },
   "timestamps": {
-    "exported_at": "2026-09-10T06:55:03.092665+00:00",
-    "processor_at": "2026-09-10T06:55:04.599890+00:00",
-    "run_started_at": "2026-09-10T06:54:36.748570+00:00",
-    "source_read_at": "2026-09-10T06:55:01.944227+00:00"
+    "exported_at": "2026-09-10T08:52:24.408208+00:00",
+    "processor_at": "2026-09-10T08:52:25.971837+00:00",
+    "run_started_at": "2026-09-10T08:51:48.092892+00:00",
+    "source_read_at": "2026-09-10T08:52:23.236413+00:00"
   },
   "validation": {
     "aggregate_catalog_hash": "sha256:2c809fce934fd0bab128beca1d9c1bdbcd210d37de7e3348d03704b015f77fad",
