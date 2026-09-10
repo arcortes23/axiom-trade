@@ -468,6 +468,7 @@ class Phase3CollectionTests(unittest.TestCase):
                 super().__init__([base])
                 self.last_trades_complete = True
                 self.last_trade_cursor: str | None = None
+                self.seen_cursors: list[str | None] = []
 
             def trades(
                 self,
@@ -478,6 +479,7 @@ class Phase3CollectionTests(unittest.TestCase):
                 max_pages: int = 1,
                 cursor: str | None = None,
             ):
+                self.seen_cursors.append(cursor)
                 page = int(cursor or "0")
                 self.last_trade_cursor = str(page + 1) if page == 0 else None
                 self.last_trades_complete = page != 0
@@ -495,6 +497,9 @@ class Phase3CollectionTests(unittest.TestCase):
             self.assertEqual(store.get_collector_state(state_key)["last_trade_cursor"], "1")
             collector.collect_once(now=T0 + timedelta(seconds=1))
             self.assertIsNone(store.get_collector_state(state_key)["last_trade_cursor"])
+            third = collector.collect_once(now=T0 + timedelta(seconds=2))
+            self.assertEqual(provider.seen_cursors, [None, "1", None])
+            self.assertEqual(third.trade_failures, 0)
             self.assertEqual(len(store.load_polymarket_trades("m")), 2)
 
     def test_candidate_paper_discovery_priority_keeps_required_markets_inside_total_cap(self) -> None:

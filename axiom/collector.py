@@ -2547,7 +2547,12 @@ class PolymarketCollector:
         else:
             counters["snapshot_duplicates"] += 1
         last_trade = _parse_iso(state.get("last_trade_timestamp"))
-        last_trade_cursor = str(state.get("last_trade_cursor", "")).strip() or None
+        raw_trade_cursor = state.get("last_trade_cursor")
+        last_trade_cursor = (
+            str(raw_trade_cursor).strip()
+            if raw_trade_cursor not in (None, "")
+            else None
+        )
         trade_fetch_failed = False
         try:
             trades = self._fetch_trades(
