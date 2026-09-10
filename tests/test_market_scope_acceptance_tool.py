@@ -2,23 +2,439 @@ from __future__ import annotations
 
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
+import hashlib
 import json
+import os
+import sqlite3
 import tempfile
 import unittest
+from unittest.mock import patch
 from types import SimpleNamespace
+from contextlib import contextmanager
+
+from axiom.autonomous import AutonomousResearchProcessor
+from axiom.domain import MarketType
+
+from axiom.storage import AxiomStore
 
 from tools.polymarket_market_scope_acceptance import (
     AcceptanceConfig,
     OfflineDiscoveryPage,
     OfflineFixtureAdapter,
+    POLYMARKET_HISTORICAL_ATTESTATION_HASH,
+    POLYMARKET_HISTORICAL_CONSTITUENT_COUNT,
+    POLYMARKET_HISTORICAL_DATASET_ID,
+    POLYMARKET_HISTORICAL_DATASET_VERSION,
+    POLYMARKET_HISTORICAL_ROW_COUNT,
+    _candidate_metric_projection,
+    _runtime_metric_assessment,
+    _queue_demo_evidence,
+    _sha256_json,
     build_offline_fixture_adapter,
+    compute_dollar_limit_buy_feasibility,
     enqueue_legacy_successor,
     main,
     run_acceptance,
+    run_persisted_acceptance,
 )
 
 
+PINNED_SOURCE = (
+    Path(__file__).resolve().parents[2]
+    / "runtime-data"
+    / "axiom-forward-proof-20260908T141804Z.sqlite"
+)
+LIVE_SOURCE = Path(__file__).resolve().parents[2] / "runtime-data" / "axiom.sqlite"
+COMPACT_DATASET_ID = "compact-persisted-historical"
+COMPACT_MARKET_ID = "compact-market-1"
+COMPACT_TIMESTAMP = "2026-01-01T00:00:00+00:00"
+
+
+def _compact_version(record: dict[str, object]) -> str:
+    identity = [{
+        "timestamp": record["source_timestamp"],
+        "price": record["price"],
+        "token_id": record["token_id"],
+    }]
+    payload = json.dumps(identity, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _build_compact_persisted_source(
+    path: Path,
+    *,
+    include_record_source_type: bool = True,
+    include_record_market_id: bool = True,
+) -> tuple[str, str, str]:
+    token_id = f"yes-{COMPACT_MARKET_ID}"
+    record = {
+        "source_timestamp": COMPACT_TIMESTAMP,
+        "timestamp": COMPACT_TIMESTAMP,
+        "observed_at": COMPACT_TIMESTAMP,
+        "price": 0.5,
+        "token_id": token_id,
+        "provider": "polymarket",
+    }
+    if include_record_market_id:
+        record["market_id"] = COMPACT_MARKET_ID
+    if include_record_source_type:
+        record["source_type"] = "HISTORICAL"
+    constituent_id = f"prediction:{COMPACT_MARKET_ID}"
+    constituent_version = _compact_version(record)
+    start = datetime.fromisoformat(COMPACT_TIMESTAMP)
+    metadata = {
+        "market_id": COMPACT_MARKET_ID,
+        "token_ids": {"yes": token_id, "no": f"no-{COMPACT_MARKET_ID}"},
+        "source_type": "HISTORICAL",
+        "provider": "polymarket",
+        "instrument": "POLYMARKET",
+    }
+    aggregate_metadata = {
+        "source_type": "HISTORICAL",
+        "provider": "polymarket",
+        "instrument": "POLYMARKET",
+        "markets_discovered": 1,
+        "markets_imported": 1,
+        "price_points": 1,
+        "category_counts": {"other": 1},
+        "market_versions": [{
+            "market_id": COMPACT_MARKET_ID,
+            "dataset_id": constituent_id,
+            "dataset_version": constituent_version,
+            "row_count": 1,
+        }],
+    }
+    with AxiomStore(path) as store:
+        store.save_dataset(constituent_id, constituent_version, [record], metadata=metadata, quality="PRICE_PROXY")
+        store.save_dataset_catalog(
+            constituent_id,
+            constituent_version,
+            provider="polymarket",
+            instrument="POLYMARKET",
+            market_type="prediction",
+            timeframe="event",
+            start_timestamp=start,
+            end_timestamp=start,
+            row_count=1,
+            completeness=1.0,
+            missing_ranges=(),
+            quality="PRICE_PROXY",
+            source_type="HISTORICAL",
+            snapshot_id=f"{constituent_id}:{constituent_version}",
+            metadata=metadata,
+            created_at=start,
+            updated_at=start,
+        )
+        store.save_dataset_catalog(
+            COMPACT_DATASET_ID,
+            "compact-v1",
+            provider="polymarket",
+            instrument="POLYMARKET",
+            market_type="prediction",
+            timeframe="event",
+            start_timestamp=start,
+            end_timestamp=start,
+            row_count=1,
+            completeness=1.0,
+            missing_ranges=(),
+            quality="PRICE_PROXY",
+            source_type="HISTORICAL",
+            snapshot_id=f"{COMPACT_DATASET_ID}:compact-v1",
+            metadata=aggregate_metadata,
+            created_at=start,
+            updated_at=start,
+        )
+        attestation = store.verify_dataset_integrity_attestation(
+            COMPACT_DATASET_ID,
+            "compact-v1",
+            force=True,
+        )
+        attestation_hash = str(attestation["attestation_hash"])
+    return COMPACT_DATASET_ID, "compact-v1", attestation_hash
+
+
+@contextmanager
+def _compact_contract(path: Path):
+    if not path.exists():
+        dataset_id, dataset_version, attestation_hash = _build_compact_persisted_source(path)
+    else:
+        dataset_id, dataset_version, attestation_hash = (
+            COMPACT_DATASET_ID,
+            "compact-v1",
+            "",
+        )
+        connection = sqlite3.connect(path)
+        try:
+            row = connection.execute(
+                "SELECT attestation_hash FROM dataset_integrity_attestation WHERE dataset_id=? AND dataset_version=?",
+                (dataset_id, dataset_version),
+            ).fetchone()
+            if row is None:
+                raise AssertionError("compact source is missing its aggregate attestation")
+            attestation_hash = str(row[0])
+        finally:
+            connection.close()
+    replacements = {
+        "tools.polymarket_market_scope_acceptance._PINNED_PERSISTED_DATASET_ID": dataset_id,
+        "tools.polymarket_market_scope_acceptance._PINNED_PERSISTED_DATASET_VERSION": dataset_version,
+        "tools.polymarket_market_scope_acceptance._PINNED_PERSISTED_ATTESTATION_HASH": attestation_hash,
+        "tools.polymarket_market_scope_acceptance._PINNED_PERSISTED_ROW_COUNT": 1,
+        "tools.polymarket_market_scope_acceptance._PINNED_PERSISTED_CONSTITUENT_COUNT": 1,
+    }
+    patches = []
+    try:
+        for name, value in replacements.items():
+            item = patch(name, value)
+            patches.append(item)
+            item.start()
+        yield dataset_id, dataset_version, attestation_hash
+    finally:
+        for item in reversed(patches):
+            item.stop()
+
+
+def _compact_report(path: Path, **config_values: object) -> dict[str, object]:
+    with _compact_contract(path) as (dataset_id, dataset_version, _):
+        values = {
+            "mode": "persisted",
+            "source_backup": path,
+            "dataset_id": dataset_id,
+            "dataset_version": dataset_version,
+            "max_books": 0,
+            "sample_limit": 1,
+        }
+        values.update(config_values)
+        config = AcceptanceConfig(**values)
+        return run_persisted_acceptance(
+            path,
+            dataset_id,
+            dataset_version,
+            config=config,
+            generated_at=COMPACT_TIMESTAMP,
+        )
+
+
+def _compact_mutate(path: Path, statement: str, parameters: tuple[object, ...] = ()) -> None:
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute(statement, parameters)
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def _rewrite_compact_record(path: Path, **changes: object) -> None:
+    connection = sqlite3.connect(path)
+    try:
+        row = connection.execute(
+            "SELECT payload_json FROM datasets WHERE dataset_id=?",
+            (f"prediction:{COMPACT_MARKET_ID}",),
+        ).fetchone()
+        assert row is not None
+        records = json.loads(row[0])
+        for key, value in changes.items():
+            if value is _MISSING:
+                records[0].pop(key, None)
+            else:
+                records[0][key] = value
+        connection.execute(
+            "UPDATE datasets SET payload_json=? WHERE dataset_id=?",
+            (json.dumps(records, sort_keys=True, separators=(",", ":")), f"prediction:{COMPACT_MARKET_ID}"),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def _rewrite_compact_aggregate_metadata(
+    path: Path,
+    *,
+    dataset_id: str = COMPACT_DATASET_ID,
+    **changes: object,
+) -> None:
+    connection = sqlite3.connect(path)
+    try:
+        row = connection.execute(
+            "SELECT metadata_json FROM dataset_catalog WHERE dataset_id=?",
+            (dataset_id,),
+        ).fetchone()
+        assert row is not None
+        metadata = json.loads(row[0])
+        for key, value in changes.items():
+            if value is _MISSING:
+                metadata.pop(key, None)
+            else:
+                metadata[key] = value
+        connection.execute(
+            "UPDATE dataset_catalog SET metadata_json=? WHERE dataset_id=?",
+            (json.dumps(metadata, sort_keys=True, separators=(",", ":")), dataset_id),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def _rewrite_compact_catalog_source_type(
+    path: Path,
+    *,
+    dataset_id: str = COMPACT_DATASET_ID,
+    source_type: str = "",
+) -> None:
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute(
+            "UPDATE dataset_catalog SET source_type=? WHERE dataset_id=?",
+            (source_type, dataset_id),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+_MISSING = object()
+
+
+
 class MarketScopeAcceptanceToolTests(unittest.TestCase):
+    def test_reason_precedence_keeps_processor_and_candidate_outcomes_distinct(self) -> None:
+        class EvidenceStore:
+            def load_candidate_lifecycle(self, candidate_id: str) -> dict[str, object]:
+                return {
+                    "candidate_id": candidate_id,
+                    "stage": "FROZEN",
+                    "payload": {"validation_expectancy": 0.12},
+                }
+
+            def list_candidate_lifecycle_events(self, candidate_id: str, *, limit: int) -> list[dict[str, object]]:
+                return [{"candidate_id": candidate_id, "to_stage": "FROZEN"}]
+
+            def candidate_forward_requirements(self, **kwargs: object) -> dict[str, object]:
+                return {
+                    "candidates": [
+                        {
+                            "candidate_id": "candidate-1",
+                            "reason_code": "QUALIFICATION_CODE",
+                        }
+                    ]
+                }
+
+        processor = {
+            "reason_code": "PROCESSOR_CODE",
+            "reason": "processor text",
+            "accepted": False,
+            "status": "unsupported_by_validation",
+            "candidate_results": [
+                {
+                    "candidate_id": "candidate-1",
+                    "reason_code": "CANDIDATE_CODE",
+                    "reason": "candidate text",
+                    "accepted": False,
+                    "status": "FROZEN",
+                }
+            ],
+        }
+        evidence = _queue_demo_evidence(
+            SimpleNamespace(status="REJECTED", last_error="queue text"),
+            processor,
+            EvidenceStore(),
+            now=datetime.fromisoformat(COMPACT_TIMESTAMP),
+            authority_cap=30,
+        )
+        self.assertEqual(evidence["reason_code"], "CANDIDATE_CODE")
+        self.assertEqual(evidence["reason"], "candidate text")
+        self.assertEqual(evidence["exact_reason"], "CANDIDATE_CODE")
+        self.assertEqual(evidence["processor"], {
+            "reason_code": "PROCESSOR_CODE",
+            "reason": "processor text",
+            "accepted": False,
+            "status": "unsupported_by_validation",
+        })
+        self.assertEqual(evidence["candidate"]["status"], "FROZEN")
+
+        processor_without_candidate_code = dict(processor)
+        processor_without_candidate_code["reason_code"] = None
+        processor_without_candidate_code["candidate_results"] = [
+            {key: value for key, value in processor["candidate_results"][0].items() if key != "reason_code"}
+        ]
+        fallback = _queue_demo_evidence(
+            SimpleNamespace(status="REJECTED", last_error="queue text"),
+            processor_without_candidate_code,
+            EvidenceStore(),
+            now=datetime.fromisoformat(COMPACT_TIMESTAMP),
+            authority_cap=30,
+        )
+        self.assertEqual(fallback["reason_code"], "QUALIFICATION_CODE")
+        self.assertEqual(fallback["reason"], "QUALIFICATION_CODE")
+        self.assertNotEqual(fallback["exact_reason"], "unsupported_by_validation")
+    def test_lifecycle_event_reason_precedes_processor_status(self) -> None:
+        class EventStore:
+            def load_candidate_lifecycle(self, candidate_id: str) -> dict[str, object]:
+                return {
+                    "candidate_id": candidate_id,
+                    "stage": "FROZEN",
+                    "payload": {"status": "FROZEN"},
+                }
+
+            def list_candidate_lifecycle_events(
+                self,
+                candidate_id: str,
+                *,
+                limit: int,
+            ) -> list[dict[str, object]]:
+                return [
+                    {
+                        "candidate_id": candidate_id,
+                        "to_stage": "FROZEN",
+                        "reason_code": "LIFECYCLE_EVENT_CODE",
+                        "reason": "lifecycle event text",
+                    }
+                ]
+
+            def candidate_forward_requirements(self, **kwargs: object) -> dict[str, object]:
+                return {"candidates": [{"candidate_id": "candidate-1"}]}
+
+        evidence = _queue_demo_evidence(
+            SimpleNamespace(status="REJECTED", last_error=None),
+            {
+                "status": "unsupported_by_validation",
+                "candidate_results": [
+                    {"candidate_id": "candidate-1", "status": "FROZEN"}
+                ],
+            },
+            EventStore(),
+            now=datetime.fromisoformat(COMPACT_TIMESTAMP),
+            authority_cap=30,
+        )
+        self.assertEqual(evidence["reason_code"], "LIFECYCLE_EVENT_CODE")
+        self.assertEqual(evidence["reason"], "lifecycle event text")
+        self.assertEqual(evidence["exact_reason"], "LIFECYCLE_EVENT_CODE")
+        self.assertEqual(evidence["processor"]["status"], "unsupported_by_validation")
+        self.assertIsNone(evidence["processor"]["reason"])
+
+
+
+    def test_candidate_metric_projection_preserves_observed_stage_evidence(self) -> None:
+        payload = {
+            "train": {"expectancy": 0.20, "sample_count": 100},
+            "validation": {"expectancy": -0.05, "sample_count": 20},
+            "robustness_passed": False,
+            "minimum_sample_check": {"passed": False, "required": 30},
+            "validation_stability": 0.40,
+            "forward_expectancy": None,
+        }
+        projected = _candidate_metric_projection(
+            payload,
+            {"candidate_id": "candidate-1", "reason_code": "CANDIDATE_FORWARD_MARKET_UNRESOLVED"},
+        )
+        self.assertEqual(projected["backtest"]["train"], payload["train"])
+        self.assertEqual(projected["validation"]["validation"], payload["validation"])
+        self.assertEqual(projected["robustness"]["minimum_sample_check"], payload["minimum_sample_check"])
+        self.assertEqual(projected["qualification"]["forward_expectancy"], None)
+        self.assertEqual(
+            projected["qualification"]["authority"]["reason_code"],
+            "CANDIDATE_FORWARD_MARKET_UNRESOLVED",
+        )
+
     def test_metadata_and_book_budgets_are_independent_and_finite(self) -> None:
         adapter = build_offline_fixture_adapter()
         report = run_acceptance(
@@ -219,7 +635,8 @@ class MarketScopeAcceptanceToolTests(unittest.TestCase):
         self.assertEqual(result["resulting_stage"], "FROZEN")
         self.assertEqual(result["reason"], "CANDIDATE_FORWARD_MARKET_UNRESOLVED")
         self.assertEqual(result["exact_reason"], "CANDIDATE_FORWARD_MARKET_UNRESOLVED")
-        self.assertEqual(result["processor_reason"], "unsupported_by_validation")
+        self.assertIsNone(result["processor_reason"])
+        self.assertEqual(result["processor_status"], "unsupported_by_validation")
         self.assertFalse(result["promotable"])
         self.assertTrue(result["runtime_reasons"])
         self.assertTrue(result["dataset_attestation"]["computed"])
@@ -385,6 +802,67 @@ class MarketScopeAcceptanceToolTests(unittest.TestCase):
         self.assertEqual(queue["market_scope_hash"], report["scope_hash"])
         self.assertEqual(queue["market_scope_version"], "1")
         self.assertNotIn("scope_hash", queue)
+
+    def test_filter_policy_match_matches_canonical_processor_for_scalar_and_list_values(self) -> None:
+        base_policy = {
+            "schema_version": "1",
+            "mode": "RULE_BASED_MARKETS",
+            "instrument": "POLYMARKET",
+            "categories": ["sports"],
+            "market_ids": [],
+            "regime_restrictions": {},
+            "provenance": "canonical",
+        }
+        market = dict(build_offline_fixture_adapter().pages[0].snapshots[1])
+        canonical_market = dict(market)
+        canonical_market["market_id"] = canonical_market["id"]
+        if "spread" not in canonical_market:
+            canonical_market["spread"] = canonical_market["yes_ask"] - canonical_market["yes_bid"]
+        canonical_plan = SimpleNamespace(
+            filters=None,
+            regime_restrictions={},
+            target_markets=(),
+            target_instrument="POLYMARKET",
+            market_type=MarketType.PREDICTION,
+        )
+        cases = (
+            ("category", "category_tags", "sports", True),
+            ("category", "category_tags", ["sports"], True),
+            ("min_liquidity", "liquidity", 1_500.0, True),
+            ("min_liquidity", "liquidity", [1_500.0], False),
+            ("max_spread", "spread", 0.05, True),
+            ("max_spread", "spread", [0.05], False),
+            ("minimum_hours_to_resolution", "expiry", 24.0, True),
+            ("minimum_hours_to_resolution", "expiry", [24.0], True),
+            ("maximum_hours_to_resolution", "expiry", 168.0, True),
+            ("maximum_hours_to_resolution", "expiry", [168.0], True),
+        )
+
+        with AxiomStore(":memory:") as store:
+            processor = AutonomousResearchProcessor(store)
+            for filter_name, condition_name, filter_value, expected_match in cases:
+                with self.subTest(filter_name=filter_name, filter_value=filter_value):
+                    filters = {"category": ["sports"], filter_name: filter_value}
+                    policy = dict(base_policy, filters=filters)
+                    canonical_plan.filters = filters
+                    canonical_match = bool(processor._apply_plan_filters(canonical_plan, [canonical_market]))
+                    self.assertEqual(canonical_match, expected_match)
+                    report = run_acceptance(
+                        build_offline_fixture_adapter(),
+                        AcceptanceConfig(page_limit=3, max_pages=1, max_seconds=30, max_books=0, book_depth=1),
+                        policy=policy,
+                        generated_at="2026-01-01T00:00:00+00:00",
+                        include_queue_demo=False,
+                    )
+                    evaluation = next(
+                        item
+                        for item in report["bounded_samples"]["evaluations"]
+                        if item["market_id"] == "m-002"
+                    )
+                    self.assertEqual(evaluation["policy_match"], canonical_match)
+                    if isinstance(filter_value, list) and filter_name in {"min_liquidity", "max_spread"}:
+                        self.assertEqual(evaluation["conditions"][condition_name], "fail")
+
 
 
     def test_page_error_cursor_type_and_provider_duplicates_are_honest(self) -> None:
@@ -786,6 +1264,686 @@ class MarketScopeAcceptanceToolTests(unittest.TestCase):
             payload = json.loads(output.read_text(encoding="utf-8"))
             self.assertEqual(payload["config"]["max_pages"], 1)
             self.assertLessEqual(payload["pagination"]["pages_observed"], 1)
+
+    def test_persisted_pinned_identity_counts_and_attestation_are_public_contract(self) -> None:
+        self.assertEqual(POLYMARKET_HISTORICAL_DATASET_ID, "Polymarket-historical")
+        self.assertEqual(
+            POLYMARKET_HISTORICAL_DATASET_VERSION,
+            "sha256:9a831357e3f4016ad2c4f05d9bb11a98583ad94a2da36873b56e2b7db786a9ea",
+        )
+        self.assertEqual(POLYMARKET_HISTORICAL_ROW_COUNT, 18_141)
+        self.assertEqual(POLYMARKET_HISTORICAL_CONSTITUENT_COUNT, 1_000)
+        self.assertEqual(
+            POLYMARKET_HISTORICAL_ATTESTATION_HASH,
+            "sha256:24e279b36735f5c6fb97a6115281d681fbaa3afd08a64c982c36cd929b9d93a3",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "missing-source.json"
+            result = main(
+                [
+                    "--mode",
+                    "persisted",
+                    "--source-backup",
+                    str(Path(directory) / "does-not-exist.sqlite"),
+                    "--output",
+                    str(output),
+                ]
+            )
+            payload = json.loads(output.read_text(encoding="utf-8"))
+            self.assertNotEqual(result, 0)
+            self.assertEqual(payload["config"]["dataset_id"], POLYMARKET_HISTORICAL_DATASET_ID)
+            self.assertEqual(payload["config"]["dataset_version"], POLYMARKET_HISTORICAL_DATASET_VERSION)
+            self.assertEqual(payload["config"]["expected_row_count"], POLYMARKET_HISTORICAL_ROW_COUNT)
+            self.assertEqual(
+                payload["config"]["expected_constituent_count"],
+                POLYMARKET_HISTORICAL_CONSTITUENT_COUNT,
+            )
+            self.assertIn("SOURCE_BACKUP_NOT_FOUND", payload["validation"]["reasons"])
+
+
+
+    def test_persisted_config_and_cli_refuse_alternate_identity_or_counts(self) -> None:
+        with self.assertRaises(ValueError):
+            AcceptanceConfig(
+                mode="persisted",
+                source_backup=PINNED_SOURCE,
+                dataset_id="alternate-dataset",
+                dataset_version=POLYMARKET_HISTORICAL_DATASET_VERSION,
+            )
+        with self.assertRaises(ValueError):
+            AcceptanceConfig(
+                mode="persisted",
+                source_backup=PINNED_SOURCE,
+                dataset_id=POLYMARKET_HISTORICAL_DATASET_ID,
+                dataset_version=POLYMARKET_HISTORICAL_DATASET_VERSION,
+                expected_row_count=1,
+            )
+        with self.assertRaises(ValueError):
+            main(
+                [
+                    "--mode",
+                    "persisted",
+                    "--source-backup",
+                    str(PINNED_SOURCE),
+                    "--dataset-id",
+                    "alternate-dataset",
+                    "--dataset-version",
+                    POLYMARKET_HISTORICAL_DATASET_VERSION,
+                ]
+            )
+
+    def test_persisted_live_path_symlink_and_hardlink_are_rejected(self) -> None:
+        if not LIVE_SOURCE.exists():
+            self.skipTest("live runtime database is not present")
+        candidates: list[Path] = [LIVE_SOURCE]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            symlink = root / "live-symlink.sqlite"
+            try:
+                os.symlink(LIVE_SOURCE, symlink)
+            except (OSError, NotImplementedError):
+                pass
+            else:
+                candidates.append(symlink)
+            hardlink = root / "live-hardlink.sqlite"
+            try:
+                os.link(LIVE_SOURCE, hardlink)
+            except (OSError, NotImplementedError):
+                pass
+            else:
+                candidates.append(hardlink)
+            for candidate in candidates:
+                with self.subTest(source=candidate.name):
+                    report = run_persisted_acceptance(
+                        candidate,
+                        POLYMARKET_HISTORICAL_DATASET_ID,
+                        POLYMARKET_HISTORICAL_DATASET_VERSION,
+                        generated_at=COMPACT_TIMESTAMP,
+                    )
+                    self.assertFalse(report["validation"]["passed"])
+                    self.assertTrue(report["security"]["source_live_database_rejected"])
+                    self.assertIn("SOURCE_IS_LIVE_DATABASE", report["validation"]["reasons"])
+                    self.assertEqual(report["chain"]["queue_status"], "NOT_RUN")
+
+    def test_persisted_source_pre_post_hash_change_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "source.sqlite"
+            calls: list[Path] = []
+
+            def changing_hash(candidate: Path) -> str:
+                digest = "sha256:" + hashlib.sha256(candidate.read_bytes()).hexdigest()
+                if calls:
+                    return digest + "-changed"
+                calls.append(candidate)
+                return digest
+
+            with patch(
+                "tools.polymarket_market_scope_acceptance._persisted_hash_file",
+                side_effect=changing_hash,
+            ):
+                report = _compact_report(path)
+            source = report["source"]
+            self.assertEqual(report["validation"]["status"], "FAILED")
+            self.assertIn("SOURCE_CHANGED_DURING_READ_TRANSACTION", report["validation"]["reasons"])
+            self.assertIsNotNone(source["source_stat_pre"])
+            self.assertIsNotNone(source["source_stat_post"])
+            self.assertNotEqual(source["source_hash_pre"], source["source_hash_post"])
+
+    def test_persisted_alias_conflict_and_missing_fields_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            alias_path = Path(directory) / "alias.sqlite"
+            _build_compact_persisted_source(alias_path)
+            _rewrite_compact_record(alias_path, yes_mid=0.6)
+            alias_report = _compact_report(alias_path)
+            self.assertFalse(alias_report["validation"]["passed"])
+            self.assertIn("RECORD_ALIAS_CONFLICT:yes_mid", alias_report["validation"]["reasons"])
+
+            provenance_path = Path(directory) / "provenance.sqlite"
+            _build_compact_persisted_source(provenance_path)
+            _rewrite_compact_aggregate_metadata(provenance_path, provider=_MISSING)
+            provenance_report = _compact_report(provenance_path)
+            self.assertFalse(provenance_report["validation"]["passed"])
+            self.assertIn("DATASET_PROVENANCE_INVALID", provenance_report["validation"]["reasons"])
+
+            field_path = Path(directory) / "field.sqlite"
+            _build_compact_persisted_source(field_path)
+            connection = sqlite3.connect(field_path)
+            try:
+                row = connection.execute(
+                    "SELECT payload_json FROM datasets WHERE dataset_id=?",
+                    (f"prediction:{COMPACT_MARKET_ID}",),
+                ).fetchone()
+                assert row is not None
+                records = json.loads(row[0])
+                records[0].pop("token_id", None)
+                connection.execute(
+                    "UPDATE datasets SET payload_json=? WHERE dataset_id=?",
+                    (
+                        json.dumps(records, sort_keys=True, separators=(",", ":")),
+                        f"prediction:{COMPACT_MARKET_ID}",
+                    ),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+            field_report = _compact_report(field_path)
+            self.assertFalse(field_report["validation"]["passed"])
+            self.assertIn("TOKEN_ID_INVALID", field_report["validation"]["reasons"])
+
+    def test_persisted_missing_source_type_on_catalogs_fails_closed(self) -> None:
+        mutations = {
+            "aggregate": lambda path: _rewrite_compact_catalog_source_type(path),
+            "constituent_catalog": lambda path: _rewrite_compact_catalog_source_type(
+                path,
+                dataset_id=f"prediction:{COMPACT_MARKET_ID}",
+            ),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for boundary, mutate in mutations.items():
+                with self.subTest(boundary=boundary):
+                    path = root / f"missing-{boundary}.sqlite"
+                    _build_compact_persisted_source(path)
+                    mutate(path)
+                    report = _compact_report(path)
+                    self.assertFalse(report["validation"]["passed"])
+                    self.assertIn("DATASET_PROVENANCE_INVALID", report["validation"]["reasons"])
+                    self.assertEqual(report["export"]["status"], "NOT_RUN")
+
+    def test_persisted_missing_record_source_type_binds_to_exact_attested_catalog(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "missing-record-source.sqlite"
+            _build_compact_persisted_source(path, include_record_source_type=False)
+            report = _compact_report(path)
+        self.assertTrue(report["validation"]["passed"])
+        provenance = report["validation"]["record_provenance"]
+        self.assertEqual(provenance["explicit_source_type_rows"], 0)
+        self.assertEqual(provenance["catalog_bound_source_type_rows"], 1)
+        self.assertTrue(provenance["attestation_valid"])
+        authority = report["source"]["constituent_evidence"]["sample"][0]["provenance_authority"]
+        self.assertEqual(authority["source"], "constituent_catalog")
+        self.assertEqual(authority["source_type"], "HISTORICAL")
+        self.assertEqual(authority["attestation_status"], "CURRENT")
+        self.assertEqual(authority["attestation_contamination_result"], "PASS")
+
+    def test_persisted_missing_record_market_id_inherits_exact_attested_catalog_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "missing-record-market-id.sqlite"
+            _build_compact_persisted_source(path, include_record_market_id=False)
+            report = _compact_report(path)
+
+        self.assertTrue(report["validation"]["passed"])
+        source_record = report["source"]["constituent_evidence"]["sample"][0]["record_sample"][0]
+        exported_record = report["export"]["evaluated_record_sample"][0]
+        self.assertEqual(source_record["market_id"], COMPACT_MARKET_ID)
+        self.assertEqual(exported_record["market_id"], COMPACT_MARKET_ID)
+        processor_result = report["chain"]["processor"]["results"][0]
+        self.assertEqual(processor_result["reason_code"], "INSUFFICIENT_DATA")
+        self.assertNotIn("resolved contract market_id is required", str(processor_result.get("reason", "")))
+
+    def test_persisted_explicit_matching_market_id_is_retained_in_export_and_hash(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            report = _compact_report(Path(directory) / "explicit-record-market-id.sqlite")
+
+        exported_record = report["export"]["evaluated_record_sample"][0]
+        self.assertEqual(exported_record["market_id"], COMPACT_MARKET_ID)
+        self.assertEqual(report["export"]["evaluated_records_hash"], _sha256_json([exported_record]))
+        constituent_record = report["source"]["constituent_evidence"]["sample"][0]["record_sample"][0]
+        self.assertEqual(constituent_record["market_id"], COMPACT_MARKET_ID)
+
+    def test_persisted_conflicting_record_market_id_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "conflicting-record-market-id.sqlite"
+            _build_compact_persisted_source(path)
+            _rewrite_compact_record(path, market_id="different-market")
+            report = _compact_report(path)
+
+        self.assertFalse(report["validation"]["passed"])
+        self.assertIn("MARKET_ID_INVALID", report["validation"]["reasons"])
+        self.assertEqual(report["export"]["status"], "NOT_RUN")
+
+    def test_persisted_missing_record_source_without_current_attestation_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "missing-record-attestation.sqlite"
+            _build_compact_persisted_source(path, include_record_source_type=False)
+            _compact_mutate(
+                path,
+                "UPDATE dataset_integrity_attestation SET status=?",
+                ("STALE",),
+            )
+            report = _compact_report(path)
+        self.assertFalse(report["validation"]["passed"])
+        self.assertIn("ATTESTATION_INVALID", report["validation"]["reasons"])
+        self.assertEqual(report["export"]["status"], "NOT_RUN")
+
+    def test_persisted_forward_source_is_rejected_not_relabelled(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "forward.sqlite"
+            _build_compact_persisted_source(path)
+            _rewrite_compact_record(path, source_type="FORWARD_COLLECTED")
+            report = _compact_report(path)
+            self.assertFalse(report["validation"]["passed"])
+            self.assertIn("FORWARD_CURRENT_RELABEL_REJECTED", report["validation"]["reasons"])
+            self.assertTrue(report["security"]["forward_relabel_rejected"])
+            self.assertEqual(report["export"]["status"], "NOT_RUN")
+
+    def test_persisted_attestation_revalidation_and_isolated_export_are_faithful(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "valid.sqlite"
+            report = _compact_report(path)
+            validation = report["validation"]
+            source = report["source"]
+            self.assertEqual(validation["status"], "PASSED")
+            self.assertTrue(validation["passed"])
+            self.assertEqual(source["dataset_id"], COMPACT_DATASET_ID)
+            self.assertEqual(source["dataset_version"], "compact-v1")
+            self.assertEqual(source["constituents"], {"catalog_count": 1, "binding_count": 1, "row_count": 1})
+            self.assertEqual(source["source_hash_pre"], source["source_hash_post"])
+            self.assertEqual(
+                validation["attestation"]["attestation_hash"],
+                source["attestation"]["attestation_hash"],
+            )
+            self.assertEqual(validation["attestation"]["status"], "CURRENT")
+            self.assertEqual(validation["attestation"]["contamination_result"], "PASS")
+            self.assertEqual(report["export"]["status"], "PASSED")
+            self.assertTrue(report["export"]["isolated"])
+            self.assertTrue(report["export"]["temporary_store"])
+            self.assertTrue(report["export"]["controls"]["disabled_or_absent"])
+            self.assertTrue(report["security"]["controls_disabled_or_absent"])
+            self.assertFalse(report["security"]["credentials_used"])
+            self.assertFalse(report["security"]["network_calls"])
+            self.assertFalse(report["security"]["order_transport_called"])
+            self.assertFalse(report["security"]["submit_order_called"])
+            self.assertIsNotNone(report["export_hash"])
+            self.assertIsNotNone(report["export"]["evaluated_records_hash"])
+            self.assertEqual(
+                report["export"]["core_integrity_verification"]["attestation_hash"],
+                validation["attestation"]["attestation_hash"],
+            )
+            self.assertEqual(report["export"]["evaluated_records_hash"], report["export"]["evaluated_records_hash"])
+            self.assertEqual(report["proposal"]["dataset_id"], COMPACT_DATASET_ID)
+            self.assertEqual(report["proposal"]["dataset_version"], "compact-v1")
+
+            stale_path = Path(directory) / "stale.sqlite"
+            _build_compact_persisted_source(stale_path)
+            _compact_mutate(
+                stale_path,
+                "UPDATE dataset_integrity_attestation SET status=?, attestation_hash=?",
+                ("CURRENT", "sha256:stale"),
+            )
+            stale_report = _compact_report(stale_path)
+            self.assertFalse(stale_report["validation"]["passed"])
+            self.assertIn("ATTESTATION_INVALID", stale_report["validation"]["reasons"])
+
+    def test_persisted_unknown_metadata_is_rejected_without_export_but_provenance_remains(self) -> None:
+        sentinels = {
+            "control_payload": "CONTROL-METADATA-SENTINEL",
+            "order_payload": "ORDER-METADATA-SENTINEL",
+            "wallet_payload": "WALLET-METADATA-SENTINEL",
+            "balance_payload": "BALANCE-METADATA-SENTINEL",
+            "credential_payload": "CREDENTIAL-METADATA-SENTINEL",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "metadata.sqlite"
+            _build_compact_persisted_source(path)
+            _rewrite_compact_aggregate_metadata(path, **sentinels)
+            _rewrite_compact_aggregate_metadata(
+                path,
+                dataset_id=f"prediction:{COMPACT_MARKET_ID}",
+                **sentinels,
+            )
+            report = _compact_report(path)
+
+        self.assertEqual(report["validation"]["status"], "FAILED")
+        self.assertFalse(report["validation"]["passed"])
+        self.assertIn("ATTESTATION_INVALID", report["validation"]["reasons"])
+        self.assertEqual(report["export"]["status"], "NOT_RUN")
+        final_report_json = json.dumps(report, sort_keys=True, separators=(",", ":"))
+        for sentinel in sentinels.values():
+            self.assertNotIn(sentinel, final_report_json)
+
+        metadata_sections = (
+            report["source"]["catalog"]["metadata"],
+            report["source"]["constituent_evidence"]["sample"][0]["catalog"]["metadata"],
+            report["validation"]["catalog"]["metadata"],
+        )
+        for metadata in metadata_sections:
+            self.assertEqual(metadata["source_type"], "HISTORICAL")
+            self.assertEqual(metadata["provider"], "polymarket")
+            self.assertEqual(metadata["instrument"], "POLYMARKET")
+
+
+    def test_persisted_default_criteria_costs_and_no_synthetic_model_are_observable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            report = _compact_report(Path(directory) / "criteria.sqlite")
+            self.assertFalse(report["security"]["synthetic_probability_model"])
+            self.assertEqual(report["source"]["attestation"]["execution_fidelity"], "PRICE_PROXY")
+            self.assertEqual(report["runtime_criteria"]["min_independent_samples"], 30)
+            self.assertEqual(report["runtime_criteria"]["min_trades"], 20)
+            methodology = report["proposal"]["experiment_plan"]["methodology"]
+            self.assertEqual(methodology["initial_cash"], 10_000.0)
+            self.assertEqual(methodology["fee_bps"], 10.0)
+            self.assertEqual(methodology["slippage_bps"], 5.0)
+            self.assertEqual(methodology["allocation"], 0.25)
+            self.assertEqual(report["proposal"]["experiment_plan"]["model_document"], {"field": "yes_mid"})
+            self.assertEqual(report["chain"]["queue_status"], "REJECTED")
+            self.assertEqual(report["acceptance_status"], "RESULT_RECORDED")
+            processor_result = report["chain"]["processor"]["results"][0]
+            self.assertFalse(processor_result["accepted"])
+            self.assertEqual(processor_result["reason_code"], "INSUFFICIENT_DATA")
+            self.assertEqual(processor_result["reason"], "dataset contains no rows after plan filters")
+            self.assertEqual(processor_result["paper_only"], True)
+
+    def test_persisted_report_is_compact_and_samples_are_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            report = _compact_report(Path(directory) / "compact-artifact.sqlite")
+        encoded = json.dumps(report, sort_keys=True, separators=(",", ":"))
+        self.assertLess(len(encoded), 1_000_000)
+        source = report["source"]
+        self.assertEqual(source["constituents"]["catalog_count"], 1)
+        self.assertEqual(source["constituents"]["row_count"], 1)
+        self.assertNotIsInstance(source["attestation_row"].get("constituent_bindings"), list)
+        self.assertLessEqual(len(source["constituent_evidence"]["sample"]), 3)
+        self.assertNotIsInstance(source["catalog"]["metadata"].get("market_versions"), list)
+        self.assertEqual(source["catalog"]["metadata"]["market_versions_count"], 1)
+        export = report["export"]
+        self.assertEqual(export["constituent_catalogs_count"], 1)
+        self.assertLessEqual(len(export["constituent_catalog_sample"]), 3)
+        self.assertEqual(export["evaluated_records_count"], 1)
+        self.assertLessEqual(len(export["evaluated_record_sample"]), 2)
+        self.assertNotIn("constituent_catalogs", export)
+        chain = report["chain"]
+        self.assertNotIn("experiment_plan", chain.get("selected_candidate_payload", {}))
+        self.assertLessEqual(len(chain["selected_candidate_lifecycle_events"]), 100)
+        for event in chain["selected_candidate_lifecycle_events"]:
+            self.assertNotIn("payload", event)
+            self.assertIn("payload_hash", event)
+            self.assertIn("payload_metrics", event)
+
+    def test_runtime_metric_assessment_compares_validation_to_unmodified_defaults(self) -> None:
+        criteria = {
+            "min_independent_samples": 30,
+            "min_trades": 20,
+            "max_drawdown": 0.20,
+            "min_expectancy": 0.0,
+            "min_confidence_lower_bound": 0.0,
+            "min_stability": 0.60,
+            "min_calibration": 0.80,
+            "min_liquidity": 0.0,
+            "min_forward_duration_seconds": 7.0 * 86400.0,
+            "min_regimes": 3,
+            "min_order_attempts_for_execution_rejection": 5,
+        }
+        assessment = _runtime_metric_assessment(
+            {
+                "validation": {
+                    "validation": {
+                        "independent_samples": 434,
+                        "filled_trades": 0,
+                        "max_drawdown": 0.0,
+                        "expectancy": 0.0,
+                        "confidence_interval": {"lower": 0.0},
+                        "regime_count": 1,
+                    },
+                    "validation_stability": 1.0,
+                    "validation_calibration": 1.0,
+                }
+            },
+            criteria,
+            current_market_blocker="CANDIDATE_FORWARD_MARKET_UNRESOLVED",
+        )
+        metrics = assessment["metrics"]
+        self.assertEqual(metrics["independent_samples"]["observed"], 434.0)
+        self.assertEqual(metrics["independent_samples"]["status"], "pass")
+        self.assertEqual(metrics["filled_trades"]["status"], "fail")
+        self.assertEqual(metrics["drawdown"]["status"], "pass")
+        self.assertEqual(metrics["expectancy"]["status"], "pass")
+        self.assertEqual(metrics["confidence_interval_lower"]["status"], "pass")
+        self.assertEqual(metrics["stability"]["status"], "pass")
+        self.assertEqual(metrics["calibration"]["status"], "pass")
+        self.assertEqual(metrics["liquidity"]["status"], "not_reached")
+        self.assertEqual(metrics["regimes"]["status"], "fail")
+        self.assertEqual(metrics["forward_duration_seconds"]["status"], "not_reached")
+        self.assertEqual(metrics["forward_order_attempts"]["status"], "not_reached")
+        self.assertEqual(
+            assessment["decisive_current_market_blocker"]["reason_code"],
+            "CANDIDATE_FORWARD_MARKET_UNRESOLVED",
+        )
+        self.assertEqual(assessment["status"], "fail")
+
+    def test_release_plan_is_prepared_only_and_uses_consistent_explicit_database(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            report = _compact_report(Path(directory) / "release.sqlite")
+        plan = report["release_plan"]
+        self.assertTrue(plan["prepared_not_executed"])
+        self.assertFalse(plan["merge_executed"])
+        self.assertFalse(plan["deploy_executed"])
+        self.assertFalse(plan["controls_altered"])
+        self.assertTrue(plan["merge_gates"]["clean_review_required"])
+        self.assertTrue(plan["merge_gates"]["fast_forward_only"])
+        self.assertTrue(plan["merge_gates"]["exact_reviewed_commit_required"])
+        self.assertFalse(plan["merge_gates"]["commands_executed"])
+        self.assertIn("git rev-parse feature/polymarket-market-scope", plan["merge_gates"]["reviewed_commit_precondition"])
+        self.assertIn("git ls-remote origin refs/heads/feature/polymarket-market-scope", plan["merge_gates"]["reviewed_commit_precondition"])
+        self.assertEqual(
+            plan["merge_gates"]["commands"],
+            [
+                "git status --short --branch",
+                "git diff --check",
+                "git fetch origin",
+                "git switch main",
+                "git pull --ff-only origin main",
+                "git merge --ff-only feature/polymarket-market-scope",
+                "git push origin main",
+            ],
+        )
+        self.assertIn("python -m unittest tests.test_market_scope_acceptance_tool -v", plan["focused_unittest_command"])
+        self.assertIn("python -m unittest discover", plan["full_unittest_command"])
+        deployment = plan["deployment"]
+        self.assertTrue(deployment["same_explicit_db_for_all_commands"])
+        self.assertTrue(deployment["never_alter_controls"])
+        self.assertFalse(deployment["commands_executed"])
+        db_path = deployment["explicit_db"]
+        self.assertIn(f'--db "{db_path}"', deployment["canary_status_before"])
+        self.assertIn(f'--db "{db_path}"', deployment["canary_status_after_start"])
+        for name in (
+            "node_status_before",
+            "stop",
+            "node_status_after_stop",
+            "start",
+            "node_status_after_start",
+        ):
+            self.assertIn(f'-DbPath "{db_path}"', deployment[name])
+        self.assertIn("canary-status", deployment["canary_status_before"])
+        self.assertIn("canary-status", deployment["canary_status_after_start"])
+        self.assertIn("restart_axiom_node.ps1", plan["warning"])
+        self.assertIn("parameter mismatch", plan["warning"])
+    def test_persisted_rejected_qualification_is_success_and_infrastructure_is_error(self) -> None:
+        from axiom.research_bus import DurableResearchBus
+
+        with tempfile.TemporaryDirectory() as directory:
+            rejected_path = Path(directory) / "rejected.sqlite"
+            rejected_output = Path(directory) / "rejected.json"
+            with _compact_contract(rejected_path) as (dataset_id, dataset_version, _):
+                result = main(
+                    [
+                        "--mode",
+                        "persisted",
+                        "--source-backup",
+                        str(rejected_path),
+                        "--dataset-id",
+                        dataset_id,
+                        "--dataset-version",
+                        dataset_version,
+                        "--output",
+                        str(rejected_output),
+                    ]
+                )
+            self.assertEqual(result, 0)
+            rejected = json.loads(rejected_output.read_text(encoding="utf-8"))
+            self.assertEqual(rejected["validation"]["status"], "PASSED")
+            self.assertEqual(rejected["chain"]["queue_status"], "REJECTED")
+            self.assertEqual(rejected["status_categories"]["queue"], "REJECTED")
+            self.assertEqual(rejected["evaluator"]["status"], "SKIPPED")
+
+            error_path = Path(directory) / "error.sqlite"
+            error_output = Path(directory) / "error.json"
+            with patch.object(DurableResearchBus, "__init__", side_effect=RuntimeError("bus unavailable")):
+                with _compact_contract(error_path) as (dataset_id, dataset_version, _):
+                    result = main(
+                        [
+                            "--mode",
+                            "persisted",
+                            "--source-backup",
+                            str(error_path),
+                            "--dataset-id",
+                            dataset_id,
+                            "--dataset-version",
+                            dataset_version,
+                            "--output",
+                            str(error_output),
+                        ]
+                    )
+            self.assertNotEqual(result, 0)
+            error = json.loads(error_output.read_text(encoding="utf-8"))
+            self.assertEqual(error["chain"]["queue_status"], "ERROR")
+            self.assertEqual(error["status_categories"]["queue"], "ERROR")
+            self.assertEqual(error["evaluator"]["status"], "SKIPPED")
+            self.assertTrue(error["chain"]["reasons"][0].startswith("PIPELINE_ERROR:"))
+
+    def test_sanitized_persisted_no_book_report_preserves_null_and_redacts_token(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "sanitized.sqlite"
+            report = _compact_report(path)
+            self.assertIsNone(
+                report["dollar_limit_buy_feasibility"]["selected_token_id"]
+            )
+            with patch(
+                "tools.polymarket_market_scope_acceptance.compute_dollar_limit_buy_feasibility",
+                return_value={"selected_token_id": "TOKEN-SENTINEL"},
+            ):
+                redacted_report = _compact_report(path)
+        self.assertEqual(
+            redacted_report["dollar_limit_buy_feasibility"]["selected_token_id"],
+            "[REDACTED]",
+        )
+
+    def test_persisted_evaluator_is_gated_without_same_candidate_order(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            report = _compact_report(Path(directory) / "evaluator.sqlite")
+            evaluator = report["evaluator"]
+            self.assertEqual(evaluator["status"], "SKIPPED")
+            self.assertEqual(evaluator["current_market_resolution"], "NOT_RUN")
+            self.assertEqual(evaluator["fresh_identity_and_books"], "NOT_RUN")
+            self.assertIsNone(evaluator["decision"])
+            self.assertEqual(report["release_readiness"]["status"], "NOT_READY")
+            self.assertFalse(report["release_readiness"]["place_order_called"])
+
+    def test_dollar_limit_buy_worst_case_price_quantity_minimum_fees_and_zero_quantity(self) -> None:
+        no_book = compute_dollar_limit_buy_feasibility(None)
+        self.assertEqual(no_book["selected_market"], None)
+        self.assertEqual(no_book["selected_market_id"], None)
+        self.assertEqual(no_book["selected_token_id"], None)
+        self.assertEqual(
+            no_book["selected_order"],
+            {
+                "side": "BUY",
+                "order_type": "LIMIT",
+                "budget": 1.0,
+                "status": "not_reached",
+                "submit_called": False,
+            },
+        )
+        self.assertEqual(no_book["order_type"], "LIMIT")
+        self.assertEqual(no_book["budget"], 1.0)
+        self.assertFalse(no_book["feasible"])
+        self.assertEqual(no_book["reason"], "NO_PERMITTED_PUBLIC_BOOK")
+        self.assertFalse(no_book["submit_called"])
+        self.assertEqual(no_book["fee"], "not_evaluated")
+        for field in (
+            "min_quantity",
+            "min_notional",
+            "fee_rate",
+            "quantity_step",
+            "quantity_rounding",
+            "quantity_increment",
+            "book_depth",
+        ):
+            self.assertIsNone(no_book[field])
+        self.assertIsNone(no_book["quantity"])
+        self.assertIsNone(no_book["notional"])
+        self.assertIsNone(no_book["total"])
+        self.assertEqual(
+            no_book["checks"],
+            {
+                "min_quantity": "not_reached",
+                "min_notional": "not_reached",
+                "fee_rate": "not_reached",
+                "quantity_rounding": "not_reached",
+                "quantity_increment": "not_reached",
+                "book_depth": "not_reached",
+            },
+        )
+
+        feasible = compute_dollar_limit_buy_feasibility(
+            {"asks": [{"price": "0.99", "size": "10"}]},
+            budget=1.0,
+            slippage_bps=100.0,
+            quantity_step="0.01",
+            min_quantity="1.00",
+            min_notional="0.99",
+            fee_bps=100.0,
+        )
+        self.assertTrue(feasible["feasible"])
+        self.assertEqual(feasible["side"], "BUY")
+        self.assertEqual(feasible["order_type"], "LIMIT")
+        self.assertEqual(feasible["best_ask"], 0.99)
+        self.assertEqual(feasible["limit_price"], 0.9999)
+        self.assertEqual(feasible["quantity"], 1.0)
+        self.assertEqual(feasible["notional"], 0.99)
+        self.assertEqual(feasible["fee"], 0.0099)
+        self.assertEqual(feasible["total"], 0.9999)
+        self.assertFalse(feasible["submit_called"])
+
+        minimum_quantity = compute_dollar_limit_buy_feasibility(
+            {"asks": [["0.50", "10"]]},
+            quantity_step="0.10",
+            min_quantity="2.10",
+        )
+        self.assertFalse(minimum_quantity["feasible"])
+        self.assertEqual(minimum_quantity["reason"], "VENUE_MINIMUM_QUANTITY")
+
+        minimum_notional = compute_dollar_limit_buy_feasibility(
+            {"asks": [["0.50", "10"]]},
+            quantity_step="0.10",
+            min_notional="1.01",
+        )
+        self.assertFalse(minimum_notional["feasible"])
+        self.assertEqual(minimum_notional["reason"], "VENUE_MINIMUM_NOTIONAL")
+
+        zero_quantity = compute_dollar_limit_buy_feasibility(
+            {"asks": [["0.50", "0.001"]]},
+            quantity_step="0.01",
+        )
+        self.assertEqual(zero_quantity["quantity"], 0.0)
+        self.assertFalse(zero_quantity["feasible"])
+        self.assertFalse(zero_quantity["submit_called"])
+
+    def test_public_nonexistent_dataset_negative_section_remains_unchanged(self) -> None:
+        report = run_acceptance(
+            build_offline_fixture_adapter(),
+            AcceptanceConfig(page_limit=1, max_pages=1, max_seconds=30, max_books=0, book_depth=1),
+            generated_at="2026-01-01T00:00:00+00:00",
+            include_queue_demo=False,
+        )
+        self.assertEqual(
+            report["missing_dataset_public_queue_negative"],
+            {
+                "preserved": True,
+                "executed": False,
+                "note": "The existing public missing-dataset negative section is unchanged.",
+            },
+        )
 
 
 if __name__ == "__main__":  # pragma: no cover

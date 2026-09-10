@@ -1,0 +1,3555 @@
+{
+  "acceptance_status": "RESULT_RECORDED",
+  "chain": {
+    "backtest_metrics": {
+      "backtest_complete": true,
+      "train": {
+        "calibration": 1.0,
+        "confidence_interval": {
+          "count": 10609,
+          "lower": 0.0,
+          "upper": 0.0
+        },
+        "confidence_lower_bound": 0.0,
+        "costs": 0.0,
+        "expectancy": 0.0,
+        "filled_trades": 0,
+        "independent_samples": 553,
+        "liquidity": 0.0,
+        "max_drawdown": 0.0,
+        "metrics": {
+          "brier": 0.0,
+          "ece": 0.0,
+          "executable_edge": 0.0,
+          "expected_roi": 0.0,
+          "expected_value": 0.0,
+          "fills": 0.0,
+          "final_equity": 10000.0,
+          "initial_equity": 10000.0,
+          "log_loss": 0.0,
+          "raw_edge": 0.0,
+          "roi": 0.0
+        },
+        "regime_count": 1
+      }
+    },
+    "candidate_evidence": {
+      "candidates": [
+        {
+          "candidate_id": "candidate-1bab05cfab9ff1dc06f1fb81",
+          "events_count": 6,
+          "events_hash": "sha256:5b693ad5a6c668b59b9226d9ae27f8f2bb2761439d80253087841b7e04f90c89",
+          "evidence_gap": null,
+          "metrics": {
+            "backtest": {
+              "backtest_complete": true,
+              "train": {
+                "calibration": 1.0,
+                "confidence_interval": {
+                  "count": 10609,
+                  "lower": 0.0,
+                  "upper": 0.0
+                },
+                "confidence_lower_bound": 0.0,
+                "costs": 0.0,
+                "expectancy": 0.0,
+                "filled_trades": 0,
+                "independent_samples": 553,
+                "liquidity": 0.0,
+                "max_drawdown": 0.0,
+                "metrics": {
+                  "brier": 0.0,
+                  "ece": 0.0,
+                  "executable_edge": 0.0,
+                  "expected_roi": 0.0,
+                  "expected_value": 0.0,
+                  "fills": 0.0,
+                  "final_equity": 10000.0,
+                  "initial_equity": 10000.0,
+                  "log_loss": 0.0,
+                  "raw_edge": 0.0,
+                  "roi": 0.0
+                },
+                "regime_count": 1
+              }
+            },
+            "observed": {
+              "metric_fields": {
+                "backtest": [
+                  "backtest_complete",
+                  "train"
+                ],
+                "qualification": [
+                  "authority",
+                  "holdout_used"
+                ],
+                "robustness": [
+                  "costs_included",
+                  "data_quality",
+                  "data_quality_passed",
+                  "minimum_sample_check",
+                  "multiple_testing",
+                  "robustness_passed"
+                ],
+                "validation": [
+                  "validation",
+                  "validation_calibration",
+                  "validation_complete",
+                  "validation_confidence_interval",
+                  "validation_confidence_lower_bound",
+                  "validation_execution_quality",
+                  "validation_expectancy",
+                  "validation_regime_behavior",
+                  "validation_stability",
+                  "validation_stability_summary"
+                ]
+              },
+              "payload_keys": [
+                "backtest_complete",
+                "benchmark_comparison",
+                "canary_data_quality_acceptable",
+                "canary_data_quality_status",
+                "candidate_id",
+                "config_hash",
+                "costs_included",
+                "current_execution_evidence",
+                "data_quality",
+                "data_quality_passed",
+                "dataset_attestation",
+                "dataset_id",
+                "dataset_integrity_attestation_hash",
+                "dataset_integrity_attestation_status",
+                "dataset_provenance",
+                "dataset_selector",
+                "dataset_version",
+                "experiment_budget_lineage",
+                "experiment_family",
+                "experiment_plan",
+                "frozen",
+                "frozen_hash",
+                "generation",
+                "historical_data_integrity",
+                "historical_data_integrity_passed",
+                "historical_dataset_row_count",
+                "historical_execution_fidelity",
+                "historical_execution_fidelity_score",
+                "historical_no_forward_contamination",
+                "historical_provenance_complete",
+                "historical_rows_nonempty",
+                "holdout_used",
+                "hypothesis_id",
+                "lineage",
+                "market_scope",
+                "market_scope_hash",
+                "market_scope_version",
+                "market_type",
+                "minimum_sample_check",
+                "model_hash",
+                "multiple_testing",
+                "paper_only",
+                "parameter_ranges_bounded",
+                "parameters",
+                "plan_hash",
+                "plan_id",
+                "production_evidence_status",
+                "raw_observations",
+                "referenced_features",
+                "risk_snapshot",
+                "robustness_passed",
+                "schema_valid",
+                "scope_hash",
+                "scope_version",
+                "stage",
+                "strategy",
+                "strategy_hash",
+                "train",
+                "validation",
+                "validation_calibration",
+                "validation_complete",
+                "validation_confidence_interval",
+                "validation_confidence_lower_bound",
+                "validation_execution_quality",
+                "validation_expectancy",
+                "validation_regime_behavior",
+                "validation_stability",
+                "validation_stability_summary",
+                "variant_id"
+              ]
+            },
+            "qualification": {
+              "authority": {
+                "candidate_id": "candidate-1bab05cfab9ff1dc06f1fb81",
+                "capacity_excluded_market_ids": [],
+                "declared_market_ids": [],
+                "frozen_filters": {
+                  "category": [
+                    "crypto",
+                    "other",
+                    "sports"
+                  ]
+                },
+                "historical_market_ids_ignored": [],
+                "market_ids": [],
+                "normalized_filters": {
+                  "category": [
+                    "crypto",
+                    "other",
+                    "sports"
+                  ]
+                },
+                "normalized_frozen_filters": {
+                  "category": [
+                    "crypto",
+                    "other",
+                    "sports"
+                  ]
+                },
+                "permitted_market_ids": [],
+                "reason_code": "CANDIDATE_FORWARD_MARKET_UNRESOLVED",
+                "resolution": "UNRESOLVED",
+                "stage": "FROZEN"
+              },
+              "holdout_used": false
+            },
+            "robustness": {
+              "costs_included": true,
+              "data_quality": "LOW",
+              "data_quality_passed": true,
+              "minimum_sample_check": {
+                "checks": {
+                  "observations": true,
+                  "trades": true
+                },
+                "count": 3564,
+                "min_observations": 30,
+                "min_trades": 0,
+                "passed": true,
+                "trades": 0
+              },
+              "multiple_testing": {
+                "locked_partition_used_for_selection": false,
+                "selected_from_variants": 1,
+                "selection_metric": "validation_expectancy",
+                "variants_tested": 1
+              },
+              "robustness_passed": true
+            },
+            "validation": {
+              "validation": {
+                "calibration": 1.0,
+                "confidence_interval": {
+                  "count": 3563,
+                  "lower": 0.0,
+                  "upper": 0.0
+                },
+                "confidence_lower_bound": 0.0,
+                "costs": 0.0,
+                "expectancy": 0.0,
+                "filled_trades": 0,
+                "independent_samples": 434,
+                "liquidity": 0.0,
+                "max_drawdown": 0.0,
+                "metrics": {
+                  "brier": 0.0,
+                  "ece": 0.0,
+                  "executable_edge": 0.0,
+                  "expected_roi": 0.0,
+                  "expected_value": 0.0,
+                  "fills": 0.0,
+                  "final_equity": 10000.0,
+                  "initial_equity": 10000.0,
+                  "log_loss": 0.0,
+                  "raw_edge": 0.0,
+                  "roi": 0.0
+                },
+                "regime_count": 1
+              },
+              "validation_calibration": 1.0,
+              "validation_complete": true,
+              "validation_confidence_interval": {
+                "count": 3563,
+                "lower": 0.0,
+                "upper": 0.0
+              },
+              "validation_confidence_lower_bound": 0.0,
+              "validation_execution_quality": "LOW",
+              "validation_expectancy": 0.0,
+              "validation_regime_behavior": {
+                "regimes": 1
+              },
+              "validation_stability": 1.0,
+              "validation_stability_summary": {
+                "count": 1,
+                "max": 0.0,
+                "mean": 0.0,
+                "min": 0.0,
+                "stable": true,
+                "stable_fraction": 1.0,
+                "stdev": 0.0
+              }
+            }
+          },
+          "payload_hash": "sha256:330547213cae58d98daf3d03cf7ab641ea2bbb7d22b6b558b194ce5ae005f3cc",
+          "payload_keys": [
+            "backtest_complete",
+            "benchmark_comparison",
+            "canary_data_quality_acceptable",
+            "canary_data_quality_status",
+            "candidate_id",
+            "config_hash",
+            "costs_included",
+            "current_execution_evidence",
+            "data_quality",
+            "data_quality_passed",
+            "dataset_attestation",
+            "dataset_id",
+            "dataset_integrity_attestation_hash",
+            "dataset_integrity_attestation_status",
+            "dataset_provenance",
+            "dataset_selector",
+            "dataset_version",
+            "experiment_budget_lineage",
+            "experiment_family",
+            "experiment_plan",
+            "frozen",
+            "frozen_hash",
+            "generation",
+            "historical_data_integrity",
+            "historical_data_integrity_passed",
+            "historical_dataset_row_count",
+            "historical_execution_fidelity",
+            "historical_execution_fidelity_score",
+            "historical_no_forward_contamination",
+            "historical_provenance_complete",
+            "historical_rows_nonempty",
+            "holdout_used",
+            "hypothesis_id",
+            "lineage",
+            "market_scope",
+            "market_scope_hash",
+            "market_scope_version",
+            "market_type",
+            "minimum_sample_check",
+            "model_hash",
+            "multiple_testing",
+            "paper_only",
+            "parameter_ranges_bounded",
+            "parameters",
+            "plan_hash",
+            "plan_id",
+            "production_evidence_status",
+            "raw_observations",
+            "referenced_features",
+            "risk_snapshot",
+            "robustness_passed",
+            "schema_valid",
+            "scope_hash",
+            "scope_version",
+            "stage",
+            "strategy",
+            "strategy_hash",
+            "train",
+            "validation",
+            "validation_calibration",
+            "validation_complete",
+            "validation_confidence_interval",
+            "validation_confidence_lower_bound",
+            "validation_execution_quality",
+            "validation_expectancy",
+            "validation_regime_behavior",
+            "validation_stability",
+            "validation_stability_summary",
+            "variant_id"
+          ],
+          "stage": "FROZEN",
+          "updated_at": "2026-09-10T04:15:00.301345+00:00"
+        }
+      ],
+      "selected": {
+        "candidate_id": "candidate-1bab05cfab9ff1dc06f1fb81",
+        "events_count": 6,
+        "metrics_hash": "sha256:c561871b1de026788108b3aae6512031e3a6dbd36a51a8a212eb7f0f1ea6f840",
+        "payload_hash": "sha256:330547213cae58d98daf3d03cf7ab641ea2bbb7d22b6b558b194ce5ae005f3cc",
+        "stage": "FROZEN"
+      },
+      "selected_by_processor": false,
+      "selected_candidate_id": "candidate-1bab05cfab9ff1dc06f1fb81"
+    },
+    "candidate_ids": [
+      "candidate-1bab05cfab9ff1dc06f1fb81"
+    ],
+    "candidate_metrics": {
+      "backtest": {
+        "backtest_complete": true,
+        "train": {
+          "calibration": 1.0,
+          "confidence_interval": {
+            "count": 10609,
+            "lower": 0.0,
+            "upper": 0.0
+          },
+          "confidence_lower_bound": 0.0,
+          "costs": 0.0,
+          "expectancy": 0.0,
+          "filled_trades": 0,
+          "independent_samples": 553,
+          "liquidity": 0.0,
+          "max_drawdown": 0.0,
+          "metrics": {
+            "brier": 0.0,
+            "ece": 0.0,
+            "executable_edge": 0.0,
+            "expected_roi": 0.0,
+            "expected_value": 0.0,
+            "fills": 0.0,
+            "final_equity": 10000.0,
+            "initial_equity": 10000.0,
+            "log_loss": 0.0,
+            "raw_edge": 0.0,
+            "roi": 0.0
+          },
+          "regime_count": 1
+        }
+      },
+      "observed": {
+        "metric_fields": {
+          "backtest": [
+            "backtest_complete",
+            "train"
+          ],
+          "qualification": [
+            "authority",
+            "holdout_used"
+          ],
+          "robustness": [
+            "costs_included",
+            "data_quality",
+            "data_quality_passed",
+            "minimum_sample_check",
+            "multiple_testing",
+            "robustness_passed"
+          ],
+          "validation": [
+            "validation",
+            "validation_calibration",
+            "validation_complete",
+            "validation_confidence_interval",
+            "validation_confidence_lower_bound",
+            "validation_execution_quality",
+            "validation_expectancy",
+            "validation_regime_behavior",
+            "validation_stability",
+            "validation_stability_summary"
+          ]
+        },
+        "payload_keys": [
+          "backtest_complete",
+          "benchmark_comparison",
+          "canary_data_quality_acceptable",
+          "canary_data_quality_status",
+          "candidate_id",
+          "config_hash",
+          "costs_included",
+          "current_execution_evidence",
+          "data_quality",
+          "data_quality_passed",
+          "dataset_attestation",
+          "dataset_id",
+          "dataset_integrity_attestation_hash",
+          "dataset_integrity_attestation_status",
+          "dataset_provenance",
+          "dataset_selector",
+          "dataset_version",
+          "experiment_budget_lineage",
+          "experiment_family",
+          "experiment_plan",
+          "frozen",
+          "frozen_hash",
+          "generation",
+          "historical_data_integrity",
+          "historical_data_integrity_passed",
+          "historical_dataset_row_count",
+          "historical_execution_fidelity",
+          "historical_execution_fidelity_score",
+          "historical_no_forward_contamination",
+          "historical_provenance_complete",
+          "historical_rows_nonempty",
+          "holdout_used",
+          "hypothesis_id",
+          "lineage",
+          "market_scope",
+          "market_scope_hash",
+          "market_scope_version",
+          "market_type",
+          "minimum_sample_check",
+          "model_hash",
+          "multiple_testing",
+          "paper_only",
+          "parameter_ranges_bounded",
+          "parameters",
+          "plan_hash",
+          "plan_id",
+          "production_evidence_status",
+          "raw_observations",
+          "referenced_features",
+          "risk_snapshot",
+          "robustness_passed",
+          "schema_valid",
+          "scope_hash",
+          "scope_version",
+          "stage",
+          "strategy",
+          "strategy_hash",
+          "train",
+          "validation",
+          "validation_calibration",
+          "validation_complete",
+          "validation_confidence_interval",
+          "validation_confidence_lower_bound",
+          "validation_execution_quality",
+          "validation_expectancy",
+          "validation_regime_behavior",
+          "validation_stability",
+          "validation_stability_summary",
+          "variant_id"
+        ]
+      },
+      "qualification": {
+        "authority": {
+          "candidate_id": "candidate-1bab05cfab9ff1dc06f1fb81",
+          "capacity_excluded_market_ids": [],
+          "declared_market_ids": [],
+          "frozen_filters": {
+            "category": [
+              "crypto",
+              "other",
+              "sports"
+            ]
+          },
+          "historical_market_ids_ignored": [],
+          "market_ids": [],
+          "normalized_filters": {
+            "category": [
+              "crypto",
+              "other",
+              "sports"
+            ]
+          },
+          "normalized_frozen_filters": {
+            "category": [
+              "crypto",
+              "other",
+              "sports"
+            ]
+          },
+          "permitted_market_ids": [],
+          "reason_code": "CANDIDATE_FORWARD_MARKET_UNRESOLVED",
+          "resolution": "UNRESOLVED",
+          "stage": "FROZEN"
+        },
+        "holdout_used": false
+      },
+      "robustness": {
+        "costs_included": true,
+        "data_quality": "LOW",
+        "data_quality_passed": true,
+        "minimum_sample_check": {
+          "checks": {
+            "observations": true,
+            "trades": true
+          },
+          "count": 3564,
+          "min_observations": 30,
+          "min_trades": 0,
+          "passed": true,
+          "trades": 0
+        },
+        "multiple_testing": {
+          "locked_partition_used_for_selection": false,
+          "selected_from_variants": 1,
+          "selection_metric": "validation_expectancy",
+          "variants_tested": 1
+        },
+        "robustness_passed": true
+      },
+      "validation": {
+        "validation": {
+          "calibration": 1.0,
+          "confidence_interval": {
+            "count": 3563,
+            "lower": 0.0,
+            "upper": 0.0
+          },
+          "confidence_lower_bound": 0.0,
+          "costs": 0.0,
+          "expectancy": 0.0,
+          "filled_trades": 0,
+          "independent_samples": 434,
+          "liquidity": 0.0,
+          "max_drawdown": 0.0,
+          "metrics": {
+            "brier": 0.0,
+            "ece": 0.0,
+            "executable_edge": 0.0,
+            "expected_roi": 0.0,
+            "expected_value": 0.0,
+            "fills": 0.0,
+            "final_equity": 10000.0,
+            "initial_equity": 10000.0,
+            "log_loss": 0.0,
+            "raw_edge": 0.0,
+            "roi": 0.0
+          },
+          "regime_count": 1
+        },
+        "validation_calibration": 1.0,
+        "validation_complete": true,
+        "validation_confidence_interval": {
+          "count": 3563,
+          "lower": 0.0,
+          "upper": 0.0
+        },
+        "validation_confidence_lower_bound": 0.0,
+        "validation_execution_quality": "LOW",
+        "validation_expectancy": 0.0,
+        "validation_regime_behavior": {
+          "regimes": 1
+        },
+        "validation_stability": 1.0,
+        "validation_stability_summary": {
+          "count": 1,
+          "max": 0.0,
+          "mean": 0.0,
+          "min": 0.0,
+          "stable": true,
+          "stable_fraction": 1.0,
+          "stdev": 0.0
+        }
+      }
+    },
+    "decision_reason": "CANDIDATE_FORWARD_MARKET_UNRESOLVED",
+    "decision_reason_source": "qualification",
+    "diagnostics": [],
+    "exact_reason": "CANDIDATE_FORWARD_MARKET_UNRESOLVED",
+    "frozen_hashes": [
+      "77b780459c05faa60da4e31825ad904ea2c015ad3228cc2226a8fed9ad969fd6"
+    ],
+    "lifecycle_stage": "FROZEN",
+    "metrics": {
+      "rejected_reasons": {},
+      "selected_from_variants": 0,
+      "variants_tested": 1
+    },
+    "observed_outcomes": {
+      "candidate": {
+        "accepted": null,
+        "reason": null,
+        "reason_code": null,
+        "status": null
+      },
+      "candidate_lifecycle": {
+        "accepted": null,
+        "reason": "exact strategy, model, configuration, risk, and provenance frozen",
+        "reason_code": null,
+        "status": null
+      },
+      "candidate_lifecycle_events": {
+        "accepted": null,
+        "reason": "exact strategy, model, configuration, risk, and provenance frozen",
+        "reason_code": null,
+        "status": null
+      },
+      "processor": {
+        "accepted": false,
+        "reason": null,
+        "reason_code": null,
+        "status": "unsupported_by_validation"
+      },
+      "qualification": {
+        "accepted": null,
+        "reason": null,
+        "reason_code": "CANDIDATE_FORWARD_MARKET_UNRESOLVED",
+        "status": null
+      },
+      "queue": {
+        "accepted": null,
+        "reason": "unsupported_by_validation",
+        "reason_code": null,
+        "status": "REJECTED"
+      }
+    },
+    "plan_hash": "sha256:7ee3a312668fb8d0295a6892056cf97b89adc9a897d602aef14778703338dc04",
+    "plan_id": "plan-e0fe32d56e568f1f2c9aaff5",
+    "processor": {
+      "claimed": 1,
+      "completed": 0,
+      "failed": 0,
+      "paper_only": true,
+      "rejected": 1,
+      "released": 0,
+      "results": [
+        {
+          "accepted": false,
+          "candidate_results": [
+            {
+              "candidate_id": "candidate-1bab05cfab9ff1dc06f1fb81",
+              "forward_test_id": null,
+              "reason": null,
+              "stage": "FROZEN"
+            }
+          ],
+          "data_quality": "ORDER_BOOK_SIMULATED",
+          "dataset_selector": {
+            "dataset_id": "Polymarket-historical",
+            "dataset_version": "sha256:9a831357e3f4016ad2c4f05d9bb11a98583ad94a2da36873b56e2b7db786a9ea",
+            "provider": "polymarket",
+            "source": "polymarket",
+            "source_type": "HISTORICAL"
+          },
+          "dataset_version": "sha256:9a831357e3f4016ad2c4f05d9bb11a98583ad94a2da36873b56e2b7db786a9ea",
+          "experiment_family": "probability_mispricing",
+          "hypothesis_id": "polymarket-historical-acceptance-9a831357e3f4016a",
+          "kind": "hypothesis",
+          "market_scope": {
+            "categories": [
+              "crypto",
+              "other",
+              "sports"
+            ],
+            "filters": {
+              "category": [
+                "<truncated>",
+                "<truncated>",
+                "<truncated>"
+              ]
+            },
+            "instrument": "POLYMARKET",
+            "market_ids": [],
+            "mode": "RULE_BASED_MARKETS",
+            "provenance": "canonical",
+            "regime_restrictions": {},
+            "schema_version": "1"
+          },
+          "market_scope_hash": "sha256:a3696e7f132293a0a85511be7c8a16a4e108abba2a286e5bc6822af1f2835b39",
+          "market_scope_version": "1",
+          "mutation_candidates": [
+            "mutation-3c9268e7a091e9d42b9a7292",
+            "mutation-39df0d41e03b606ac298fac9"
+          ],
+          "paper_only": true,
+          "plan_hash": "sha256:7ee3a312668fb8d0295a6892056cf97b89adc9a897d602aef14778703338dc04",
+          "plan_id": "plan-e0fe32d56e568f1f2c9aaff5",
+          "rejected_reasons": {},
+          "research_only": false,
+          "scope_hash": "sha256:a3696e7f132293a0a85511be7c8a16a4e108abba2a286e5bc6822af1f2835b39",
+          "scope_version": "1",
+          "selected_candidate_ids": [],
+          "selected_from_variants": 0,
+          "status": "unsupported_by_validation",
+          "variants_tested": 1
+        }
+      ]
+    },
+    "proposal_id": "polymarket-historical-acceptance-9a831357e3f4016a",
+    "qualification_metrics": {
+      "authority": {
+        "candidate_id": "candidate-1bab05cfab9ff1dc06f1fb81",
+        "capacity_excluded_market_ids": [],
+        "declared_market_ids": [],
+        "frozen_filters": {
+          "category": [
+            "crypto",
+            "other",
+            "sports"
+          ]
+        },
+        "historical_market_ids_ignored": [],
+        "market_ids": [],
+        "normalized_filters": {
+          "category": [
+            "crypto",
+            "other",
+            "sports"
+          ]
+        },
+        "normalized_frozen_filters": {
+          "category": [
+            "crypto",
+            "other",
+            "sports"
+          ]
+        },
+        "permitted_market_ids": [],
+        "reason_code": "CANDIDATE_FORWARD_MARKET_UNRESOLVED",
+        "resolution": "UNRESOLVED",
+        "stage": "FROZEN"
+      },
+      "holdout_used": false
+    },
+    "queue_item_id": "queue-ef4b693fbaa059842c2f6fc09d78689d195e1a3179f64aaf07e38a773fdb31e8",
+    "queue_status": "REJECTED",
+    "reason": "CANDIDATE_FORWARD_MARKET_UNRESOLVED",
+    "reason_code": "CANDIDATE_FORWARD_MARKET_UNRESOLVED",
+    "reasons": [
+      "CANDIDATE_FORWARD_MARKET_UNRESOLVED"
+    ],
+    "robustness_metrics": {
+      "costs_included": true,
+      "data_quality": "LOW",
+      "data_quality_passed": true,
+      "minimum_sample_check": {
+        "checks": {
+          "observations": true,
+          "trades": true
+        },
+        "count": 3564,
+        "min_observations": 30,
+        "min_trades": 0,
+        "passed": true,
+        "trades": 0
+      },
+      "multiple_testing": {
+        "locked_partition_used_for_selection": false,
+        "selected_from_variants": 1,
+        "selection_metric": "validation_expectancy",
+        "variants_tested": 1
+      },
+      "robustness_passed": true
+    },
+    "selected_by_processor": false,
+    "selected_candidate_id": "candidate-1bab05cfab9ff1dc06f1fb81",
+    "selected_candidate_lifecycle": {
+      "candidate_id": "candidate-1bab05cfab9ff1dc06f1fb81",
+      "events_count": 6,
+      "events_hash": "sha256:5b693ad5a6c668b59b9226d9ae27f8f2bb2761439d80253087841b7e04f90c89",
+      "metrics_hash": "sha256:c561871b1de026788108b3aae6512031e3a6dbd36a51a8a212eb7f0f1ea6f840",
+      "payload_hash": "sha256:330547213cae58d98daf3d03cf7ab641ea2bbb7d22b6b558b194ce5ae005f3cc",
+      "stage": "FROZEN",
+      "updated_at": "2026-09-10T04:15:00.301345+00:00"
+    },
+    "selected_candidate_lifecycle_events": [
+      {
+        "candidate_id": "candidate-1bab05cfab9ff1dc06f1fb81",
+        "created_at": "2026-09-10T04:15:00.293526+00:00",
+        "event_hash": "sha256:3a0486875f8e840a3037f71663e2260068ab603378db58ed7f10d7246ec541ce",
+        "event_id": "lifecycle-event-76b8155e87cd98ae33ef6740b7e35f79521e5e0cefcb4bc77e46cdccbce69c87",
+        "from_stage": null,
+        "payload_hash": "sha256:ca623de6a5c8184cbbb4ffb429b0efa14d7cc9d2983c310c0e32c0ba1cbe59aa",
+        "payload_keys": [
+          "candidate_id",
+          "dataset_id",
+          "dataset_selector",
+          "dataset_version",
+          "experiment_family",
+          "experiment_plan",
+          "generation",
+          "holdout_used",
+          "hypothesis_id",
+          "lineage",
+          "market_scope",
+          "market_scope_hash",
+          "market_scope_version",
+          "paper_only",
+          "parameters",
+          "plan_id",
+          "scope_hash",
+          "scope_version",
+          "stage",
+          "strategy",
+          "variant_id"
+        ],
+        "payload_metrics": {
+          "backtest": {},
+          "observed": {
+            "metric_fields": {
+              "backtest": [],
+              "qualification": [
+                "holdout_used"
+              ],
+              "robustness": [],
+              "validation": []
+            },
+            "payload_keys": [
+              "candidate_id",
+              "dataset_id",
+              "dataset_selector",
+              "dataset_version",
+              "experiment_family",
+              "experiment_plan",
+              "generation",
+              "holdout_used",
+              "hypothesis_id",
+              "lineage",
+              "market_scope",
+              "market_scope_hash",
+              "market_scope_version",
+              "paper_only",
+              "parameters",
+              "plan_id",
+              "scope_hash",
+              "scope_version",
+              "stage",
+              "strategy",
+              "variant_id"
+            ]
+          },
+          "qualification": {
+            "holdout_used": false
+          },
+          "robustness": {},
+          "validation": {}
+        },
+        "reason": "candidate registered",
+        "to_stage": "IDEA"
+      },
+      {
+        "candidate_id": "candidate-1bab05cfab9ff1dc06f1fb81",
+        "created_at": "2026-09-10T04:15:00.294804+00:00",
+        "event_hash": "sha256:bc52885b0e77cecb6dec6329ccff1946e75cb85919971823378a2db463f6581a",
+        "event_id": "lifecycle-event-ef6b5dc487ddce22c65c63c64de6cf770d6ed651b6b4dde724a5797c58e3f481",
+        "from_stage": "IDEA",
+        "payload_hash": "sha256:e8a665022c58139acf2ca069ee355f4f502efc2358de93c5c6df5f2382868094",
+        "payload_keys": [
+          "candidate_id",
+          "dataset_id",
+          "dataset_provenance",
+          "dataset_selector",
+          "dataset_version",
+          "experiment_family",
+          "experiment_plan",
+          "generation",
+          "holdout_used",
+          "hypothesis_id",
+          "lineage",
+          "market_scope",
+          "market_scope_hash",
+          "market_scope_version",
+          "market_type",
+          "paper_only",
+          "parameter_ranges_bounded",
+          "parameters",
+          "plan_hash",
+          "plan_id",
+          "referenced_features",
+          "schema_valid",
+          "scope_hash",
+          "scope_version",
+          "stage",
+          "strategy",
+          "variant_id"
+        ],
+        "payload_metrics": {
+          "backtest": {},
+          "observed": {
+            "metric_fields": {
+              "backtest": [],
+              "qualification": [
+                "holdout_used"
+              ],
+              "robustness": [],
+              "validation": []
+            },
+            "payload_keys": [
+              "candidate_id",
+              "dataset_id",
+              "dataset_provenance",
+              "dataset_selector",
+              "dataset_version",
+              "experiment_family",
+              "experiment_plan",
+              "generation",
+              "holdout_used",
+              "hypothesis_id",
+              "lineage",
+              "market_scope",
+              "market_scope_hash",
+              "market_scope_version",
+              "market_type",
+              "paper_only",
+              "parameter_ranges_bounded",
+              "parameters",
+              "plan_hash",
+              "plan_id",
+              "referenced_features",
+              "schema_valid",
+              "scope_hash",
+              "scope_version",
+              "stage",
+              "strategy",
+              "variant_id"
+            ]
+          },
+          "qualification": {
+            "holdout_used": false
+          },
+          "robustness": {},
+          "validation": {}
+        },
+        "reason": "declarative experiment schema validated",
+        "to_stage": "SCHEMA_VALIDATED"
+      },
+      {
+        "candidate_id": "candidate-1bab05cfab9ff1dc06f1fb81",
+        "created_at": "2026-09-10T04:15:00.296308+00:00",
+        "event_hash": "sha256:ca3947aafd2da6c20e3081a11288353b84d705f0fbfb3214f535af58eb41ce0d",
+        "event_id": "lifecycle-event-75de7a9b15bd9d5fc7d88b6e79cb2c9f9f0b648ed1680d7216a371c4bef9ab98",
+        "from_stage": "SCHEMA_VALIDATED",
+        "payload_hash": "sha256:ac7beff8dbd5f9f0af954acf8d4d9b53c1904e0a07665a5a40ac3d9853903550",
+        "payload_keys": [
+          "backtest_complete",
+          "candidate_id",
+          "costs_included",
+          "data_quality",
+          "dataset_id",
+          "dataset_provenance",
+          "dataset_selector",
+          "dataset_version",
+          "experiment_family",
+          "experiment_plan",
+          "generation",
+          "holdout_used",
+          "hypothesis_id",
+          "lineage",
+          "market_scope",
+          "market_scope_hash",
+          "market_scope_version",
+          "market_type",
+          "paper_only",
+          "parameter_ranges_bounded",
+          "parameters",
+          "plan_hash",
+          "plan_id",
+          "raw_observations",
+          "referenced_features",
+          "schema_valid",
+          "scope_hash",
+          "scope_version",
+          "stage",
+          "strategy",
+          "train",
+          "variant_id"
+        ],
+        "payload_metrics": {
+          "backtest": {
+            "backtest_complete": true,
+            "train": {
+              "calibration": 1.0,
+              "confidence_interval": {
+                "count": 10609,
+                "lower": 0.0,
+                "upper": 0.0
+              },
+              "confidence_lower_bound": 0.0,
+              "costs": 0.0,
+              "expectancy": 0.0,
+              "filled_trades": 0,
+              "independent_samples": 553,
+              "liquidity": 0.0,
+              "max_drawdown": 0.0,
+              "metrics": {
+                "brier": 0.0,
+                "ece": 0.0,
+                "executable_edge": 0.0,
+                "expected_roi": 0.0,
+                "expected_value": 0.0,
+                "fills": 0.0,
+                "final_equity": 10000.0,
+                "initial_equity": 10000.0,
+                "log_loss": 0.0,
+                "raw_edge": 0.0,
+                "roi": 0.0
+              },
+              "regime_count": 1
+            }
+          },
+          "observed": {
+            "metric_fields": {
+              "backtest": [
+                "backtest_complete",
+                "train"
+              ],
+              "qualification": [
+                "holdout_used"
+              ],
+              "robustness": [
+                "costs_included",
+                "data_quality"
+              ],
+              "validation": []
+            },
+            "payload_keys": [
+              "backtest_complete",
+              "candidate_id",
+              "costs_included",
+              "data_quality",
+              "dataset_id",
+              "dataset_provenance",
+              "dataset_selector",
+              "dataset_version",
+              "experiment_family",
+              "experiment_plan",
+              "generation",
+              "holdout_used",
+              "hypothesis_id",
+              "lineage",
+              "market_scope",
+              "market_scope_hash",
+              "market_scope_version",
+              "market_type",
+              "paper_only",
+              "parameter_ranges_bounded",
+              "parameters",
+              "plan_hash",
+              "plan_id",
+              "raw_observations",
+              "referenced_features",
+              "schema_valid",
+              "scope_hash",
+              "scope_version",
+              "stage",
+              "strategy",
+              "train",
+              "variant_id"
+            ]
+          },
+          "qualification": {
+            "holdout_used": false
+          },
+          "robustness": {
+            "costs_included": true,
+            "data_quality": "LOW"
+          },
+          "validation": {}
+        },
+        "reason": "bounded historical simulation completed with costs",
+        "to_stage": "BACKTESTED"
+      },
+      {
+        "candidate_id": "candidate-1bab05cfab9ff1dc06f1fb81",
+        "created_at": "2026-09-10T04:15:00.296811+00:00",
+        "event_hash": "sha256:c62e94ec160c763ae7c1c203b24a525d1cc981e6f229c780938f6c8a63ad9d89",
+        "event_id": "lifecycle-event-34ea07ee445a42130ce00d8cd1bc23d64445f017c41fb43df678d35db3e0923c",
+        "from_stage": "BACKTESTED",
+        "payload_hash": "sha256:08e0d71b654ed31e5738deb7dd983f3ff72c63c16f34e91f2fb3cee66da5d3a6",
+        "payload_keys": [
+          "backtest_complete",
+          "benchmark_comparison",
+          "candidate_id",
+          "costs_included",
+          "data_quality",
+          "dataset_id",
+          "dataset_provenance",
+          "dataset_selector",
+          "dataset_version",
+          "experiment_family",
+          "experiment_plan",
+          "generation",
+          "holdout_used",
+          "hypothesis_id",
+          "lineage",
+          "market_scope",
+          "market_scope_hash",
+          "market_scope_version",
+          "market_type",
+          "paper_only",
+          "parameter_ranges_bounded",
+          "parameters",
+          "plan_hash",
+          "plan_id",
+          "raw_observations",
+          "referenced_features",
+          "schema_valid",
+          "scope_hash",
+          "scope_version",
+          "stage",
+          "strategy",
+          "train",
+          "validation",
+          "validation_complete",
+          "validation_expectancy",
+          "variant_id"
+        ],
+        "payload_metrics": {
+          "backtest": {
+            "backtest_complete": true,
+            "train": {
+              "calibration": 1.0,
+              "confidence_interval": {
+                "count": 10609,
+                "lower": 0.0,
+                "upper": 0.0
+              },
+              "confidence_lower_bound": 0.0,
+              "costs": 0.0,
+              "expectancy": 0.0,
+              "filled_trades": 0,
+              "independent_samples": 553,
+              "liquidity": 0.0,
+              "max_drawdown": 0.0,
+              "metrics": {
+                "brier": 0.0,
+                "ece": 0.0,
+                "executable_edge": 0.0,
+                "expected_roi": 0.0,
+                "expected_value": 0.0,
+                "fills": 0.0,
+                "final_equity": 10000.0,
+                "initial_equity": 10000.0,
+                "log_loss": 0.0,
+                "raw_edge": 0.0,
+                "roi": 0.0
+              },
+              "regime_count": 1
+            }
+          },
+          "observed": {
+            "metric_fields": {
+              "backtest": [
+                "backtest_complete",
+                "train"
+              ],
+              "qualification": [
+                "holdout_used"
+              ],
+              "robustness": [
+                "costs_included",
+                "data_quality"
+              ],
+              "validation": [
+                "validation",
+                "validation_complete",
+                "validation_expectancy"
+              ]
+            },
+            "payload_keys": [
+              "backtest_complete",
+              "benchmark_comparison",
+              "candidate_id",
+              "costs_included",
+              "data_quality",
+              "dataset_id",
+              "dataset_provenance",
+              "dataset_selector",
+              "dataset_version",
+              "experiment_family",
+              "experiment_plan",
+              "generation",
+              "holdout_used",
+              "hypothesis_id",
+              "lineage",
+              "market_scope",
+              "market_scope_hash",
+              "market_scope_version",
+              "market_type",
+              "paper_only",
+              "parameter_ranges_bounded",
+              "parameters",
+              "plan_hash",
+              "plan_id",
+              "raw_observations",
+              "referenced_features",
+              "schema_valid",
+              "scope_hash",
+              "scope_version",
+              "stage",
+              "strategy",
+              "train",
+              "validation",
+              "validation_complete",
+              "validation_expectancy",
+              "variant_id"
+            ]
+          },
+          "qualification": {
+            "holdout_used": false
+          },
+          "robustness": {
+            "costs_included": true,
+            "data_quality": "LOW"
+          },
+          "validation": {
+            "validation": {
+              "calibration": 1.0,
+              "confidence_interval": {
+                "count": 3563,
+                "lower": 0.0,
+                "upper": 0.0
+              },
+              "confidence_lower_bound": 0.0,
+              "costs": 0.0,
+              "expectancy": 0.0,
+              "filled_trades": 0,
+              "independent_samples": 434,
+              "liquidity": 0.0,
+              "max_drawdown": 0.0,
+              "metrics": {
+                "brier": 0.0,
+                "ece": 0.0,
+                "executable_edge": 0.0,
+                "expected_roi": 0.0,
+                "expected_value": 0.0,
+                "fills": 0.0,
+                "final_equity": 10000.0,
+                "initial_equity": 10000.0,
+                "log_loss": 0.0,
+                "raw_edge": 0.0,
+                "roi": 0.0
+              },
+              "regime_count": 1
+            },
+            "validation_complete": true,
+            "validation_expectancy": 0.0
+          }
+        },
+        "reason": "chronological validation completed without locked feedback",
+        "to_stage": "VALIDATED"
+      },
+      {
+        "candidate_id": "candidate-1bab05cfab9ff1dc06f1fb81",
+        "created_at": "2026-09-10T04:15:00.299839+00:00",
+        "event_hash": "sha256:ef1900920513fc77e45dfac68f6dffef8a3b3722eabb5c8f20dced353b5dcca3",
+        "event_id": "lifecycle-event-c911f110ea8453e53ce7d4f4c2f565d2abf9015f8f993bb2a74349afc22e67f5",
+        "from_stage": "VALIDATED",
+        "payload_hash": "sha256:8927cd07acc06aba75ccdd62c51c4e7fc4bd1af65fc530e58503a9ab34af098f",
+        "payload_keys": [
+          "backtest_complete",
+          "benchmark_comparison",
+          "canary_data_quality_acceptable",
+          "canary_data_quality_status",
+          "candidate_id",
+          "costs_included",
+          "current_execution_evidence",
+          "data_quality",
+          "data_quality_passed",
+          "dataset_id",
+          "dataset_integrity_attestation_hash",
+          "dataset_integrity_attestation_status",
+          "dataset_provenance",
+          "dataset_selector",
+          "dataset_version",
+          "experiment_family",
+          "experiment_plan",
+          "generation",
+          "historical_data_integrity",
+          "historical_data_integrity_passed",
+          "historical_dataset_row_count",
+          "historical_execution_fidelity",
+          "historical_execution_fidelity_score",
+          "historical_no_forward_contamination",
+          "historical_provenance_complete",
+          "historical_rows_nonempty",
+          "holdout_used",
+          "hypothesis_id",
+          "lineage",
+          "market_scope",
+          "market_scope_hash",
+          "market_scope_version",
+          "market_type",
+          "minimum_sample_check",
+          "multiple_testing",
+          "paper_only",
+          "parameter_ranges_bounded",
+          "parameters",
+          "plan_hash",
+          "plan_id",
+          "production_evidence_status",
+          "raw_observations",
+          "referenced_features",
+          "robustness_passed",
+          "schema_valid",
+          "scope_hash",
+          "scope_version",
+          "stage",
+          "strategy",
+          "train",
+          "validation",
+          "validation_calibration",
+          "validation_complete",
+          "validation_confidence_interval",
+          "validation_confidence_lower_bound",
+          "validation_execution_quality",
+          "validation_expectancy",
+          "validation_regime_behavior",
+          "validation_stability",
+          "validation_stability_summary",
+          "variant_id"
+        ],
+        "payload_metrics": {
+          "backtest": {
+            "backtest_complete": true,
+            "train": {
+              "calibration": 1.0,
+              "confidence_interval": {
+                "count": 10609,
+                "lower": 0.0,
+                "upper": 0.0
+              },
+              "confidence_lower_bound": 0.0,
+              "costs": 0.0,
+              "expectancy": 0.0,
+              "filled_trades": 0,
+              "independent_samples": 553,
+              "liquidity": 0.0,
+              "max_drawdown": 0.0,
+              "metrics": {
+                "brier": 0.0,
+                "ece": 0.0,
+                "executable_edge": 0.0,
+                "expected_roi": 0.0,
+                "expected_value": 0.0,
+                "fills": 0.0,
+                "final_equity": 10000.0,
+                "initial_equity": 10000.0,
+                "log_loss": 0.0,
+                "raw_edge": 0.0,
+                "roi": 0.0
+              },
+              "regime_count": 1
+            }
+          },
+          "observed": {
+            "metric_fields": {
+              "backtest": [
+                "backtest_complete",
+                "train"
+              ],
+              "qualification": [
+                "holdout_used"
+              ],
+              "robustness": [
+                "costs_included",
+                "data_quality",
+                "data_quality_passed",
+                "minimum_sample_check",
+                "multiple_testing",
+                "robustness_passed"
+              ],
+              "validation": [
+                "validation",
+                "validation_calibration",
+                "validation_complete",
+                "validation_confidence_interval",
+                "validation_confidence_lower_bound",
+                "validation_execution_quality",
+                "validation_expectancy",
+                "validation_regime_behavior",
+                "validation_stability",
+                "validation_stability_summary"
+              ]
+            },
+            "payload_keys": [
+              "backtest_complete",
+              "benchmark_comparison",
+              "canary_data_quality_acceptable",
+              "canary_data_quality_status",
+              "candidate_id",
+              "costs_included",
+              "current_execution_evidence",
+              "data_quality",
+              "data_quality_passed",
+              "dataset_id",
+              "dataset_integrity_attestation_hash",
+              "dataset_integrity_attestation_status",
+              "dataset_provenance",
+              "dataset_selector",
+              "dataset_version",
+              "experiment_family",
+              "experiment_plan",
+              "generation",
+              "historical_data_integrity",
+              "historical_data_integrity_passed",
+              "historical_dataset_row_count",
+              "historical_execution_fidelity",
+              "historical_execution_fidelity_score",
+              "historical_no_forward_contamination",
+              "historical_provenance_complete",
+              "historical_rows_nonempty",
+              "holdout_used",
+              "hypothesis_id",
+              "lineage",
+              "market_scope",
+              "market_scope_hash",
+              "market_scope_version",
+              "market_type",
+              "minimum_sample_check",
+              "multiple_testing",
+              "paper_only",
+              "parameter_ranges_bounded",
+              "parameters",
+              "plan_hash",
+              "plan_id",
+              "production_evidence_status",
+              "raw_observations",
+              "referenced_features",
+              "robustness_passed",
+              "schema_valid",
+              "scope_hash",
+              "scope_version",
+              "stage",
+              "strategy",
+              "train",
+              "validation",
+              "validation_calibration",
+              "validation_complete",
+              "validation_confidence_interval",
+              "validation_confidence_lower_bound",
+              "validation_execution_quality",
+              "validation_expectancy",
+              "validation_regime_behavior",
+              "validation_stability",
+              "validation_stability_summary",
+              "variant_id"
+            ]
+          },
+          "qualification": {
+            "holdout_used": false
+          },
+          "robustness": {
+            "costs_included": true,
+            "data_quality": "LOW",
+            "data_quality_passed": true,
+            "minimum_sample_check": {
+              "checks": {
+                "observations": true,
+                "trades": true
+              },
+              "count": 3564,
+              "min_observations": 30,
+              "min_trades": 0,
+              "passed": true,
+              "trades": 0
+            },
+            "multiple_testing": {
+              "locked_partition_used_for_selection": false,
+              "selected_from_variants": 1,
+              "selection_metric": "validation_expectancy",
+              "variants_tested": 1
+            },
+            "robustness_passed": true
+          },
+          "validation": {
+            "validation": {
+              "calibration": 1.0,
+              "confidence_interval": {
+                "count": 3563,
+                "lower": 0.0,
+                "upper": 0.0
+              },
+              "confidence_lower_bound": 0.0,
+              "costs": 0.0,
+              "expectancy": 0.0,
+              "filled_trades": 0,
+              "independent_samples": 434,
+              "liquidity": 0.0,
+              "max_drawdown": 0.0,
+              "metrics": {
+                "brier": 0.0,
+                "ece": 0.0,
+                "executable_edge": 0.0,
+                "expected_roi": 0.0,
+                "expected_value": 0.0,
+                "fills": 0.0,
+                "final_equity": 10000.0,
+                "initial_equity": 10000.0,
+                "log_loss": 0.0,
+                "raw_edge": 0.0,
+                "roi": 0.0
+              },
+              "regime_count": 1
+            },
+            "validation_calibration": 1.0,
+            "validation_complete": true,
+            "validation_confidence_interval": {
+              "count": 3563,
+              "lower": 0.0,
+              "upper": 0.0
+            },
+            "validation_confidence_lower_bound": 0.0,
+            "validation_execution_quality": "LOW",
+            "validation_expectancy": 0.0,
+            "validation_regime_behavior": {
+              "regimes": 1
+            },
+            "validation_stability": 1.0,
+            "validation_stability_summary": {
+              "count": 1,
+              "max": 0.0,
+              "mean": 0.0,
+              "min": 0.0,
+              "stable": true,
+              "stable_fraction": 1.0,
+              "stdev": 0.0
+            }
+          }
+        },
+        "reason": "sample, neighboring-parameter, regime, and cost checks passed",
+        "to_stage": "ROBUSTNESS_CHECKED"
+      },
+      {
+        "candidate_id": "candidate-1bab05cfab9ff1dc06f1fb81",
+        "created_at": "2026-09-10T04:15:00.301345+00:00",
+        "event_hash": "sha256:aab7c10c6e3bf8a4d3dceb8139ab460eac99887db00fc06110928e29712a7380",
+        "event_id": "lifecycle-event-437c57cfef24898db343bd89918d7c54ac3a2d37805f8bb5dda432a72d4090a3",
+        "from_stage": "ROBUSTNESS_CHECKED",
+        "payload_hash": "sha256:330547213cae58d98daf3d03cf7ab641ea2bbb7d22b6b558b194ce5ae005f3cc",
+        "payload_keys": [
+          "backtest_complete",
+          "benchmark_comparison",
+          "canary_data_quality_acceptable",
+          "canary_data_quality_status",
+          "candidate_id",
+          "config_hash",
+          "costs_included",
+          "current_execution_evidence",
+          "data_quality",
+          "data_quality_passed",
+          "dataset_attestation",
+          "dataset_id",
+          "dataset_integrity_attestation_hash",
+          "dataset_integrity_attestation_status",
+          "dataset_provenance",
+          "dataset_selector",
+          "dataset_version",
+          "experiment_budget_lineage",
+          "experiment_family",
+          "experiment_plan",
+          "frozen",
+          "frozen_hash",
+          "generation",
+          "historical_data_integrity",
+          "historical_data_integrity_passed",
+          "historical_dataset_row_count",
+          "historical_execution_fidelity",
+          "historical_execution_fidelity_score",
+          "historical_no_forward_contamination",
+          "historical_provenance_complete",
+          "historical_rows_nonempty",
+          "holdout_used",
+          "hypothesis_id",
+          "lineage",
+          "market_scope",
+          "market_scope_hash",
+          "market_scope_version",
+          "market_type",
+          "minimum_sample_check",
+          "model_hash",
+          "multiple_testing",
+          "paper_only",
+          "parameter_ranges_bounded",
+          "parameters",
+          "plan_hash",
+          "plan_id",
+          "production_evidence_status",
+          "raw_observations",
+          "referenced_features",
+          "risk_snapshot",
+          "robustness_passed",
+          "schema_valid",
+          "scope_hash",
+          "scope_version",
+          "stage",
+          "strategy",
+          "strategy_hash",
+          "train",
+          "validation",
+          "validation_calibration",
+          "validation_complete",
+          "validation_confidence_interval",
+          "validation_confidence_lower_bound",
+          "validation_execution_quality",
+          "validation_expectancy",
+          "validation_regime_behavior",
+          "validation_stability",
+          "validation_stability_summary",
+          "variant_id"
+        ],
+        "payload_metrics": {
+          "backtest": {
+            "backtest_complete": true,
+            "train": {
+              "calibration": 1.0,
+              "confidence_interval": {
+                "count": 10609,
+                "lower": 0.0,
+                "upper": 0.0
+              },
+              "confidence_lower_bound": 0.0,
+              "costs": 0.0,
+              "expectancy": 0.0,
+              "filled_trades": 0,
+              "independent_samples": 553,
+              "liquidity": 0.0,
+              "max_drawdown": 0.0,
+              "metrics": {
+                "brier": 0.0,
+                "ece": 0.0,
+                "executable_edge": 0.0,
+                "expected_roi": 0.0,
+                "expected_value": 0.0,
+                "fills": 0.0,
+                "final_equity": 10000.0,
+                "initial_equity": 10000.0,
+                "log_loss": 0.0,
+                "raw_edge": 0.0,
+                "roi": 0.0
+              },
+              "regime_count": 1
+            }
+          },
+          "observed": {
+            "metric_fields": {
+              "backtest": [
+                "backtest_complete",
+                "train"
+              ],
+              "qualification": [
+                "holdout_used"
+              ],
+              "robustness": [
+                "costs_included",
+                "data_quality",
+                "data_quality_passed",
+                "minimum_sample_check",
+                "multiple_testing",
+                "robustness_passed"
+              ],
+              "validation": [
+                "validation",
+                "validation_calibration",
+                "validation_complete",
+                "validation_confidence_interval",
+                "validation_confidence_lower_bound",
+                "validation_execution_quality",
+                "validation_expectancy",
+                "validation_regime_behavior",
+                "validation_stability",
+                "validation_stability_summary"
+              ]
+            },
+            "payload_keys": [
+              "backtest_complete",
+              "benchmark_comparison",
+              "canary_data_quality_acceptable",
+              "canary_data_quality_status",
+              "candidate_id",
+              "config_hash",
+              "costs_included",
+              "current_execution_evidence",
+              "data_quality",
+              "data_quality_passed",
+              "dataset_attestation",
+              "dataset_id",
+              "dataset_integrity_attestation_hash",
+              "dataset_integrity_attestation_status",
+              "dataset_provenance",
+              "dataset_selector",
+              "dataset_version",
+              "experiment_budget_lineage",
+              "experiment_family",
+              "experiment_plan",
+              "frozen",
+              "frozen_hash",
+              "generation",
+              "historical_data_integrity",
+              "historical_data_integrity_passed",
+              "historical_dataset_row_count",
+              "historical_execution_fidelity",
+              "historical_execution_fidelity_score",
+              "historical_no_forward_contamination",
+              "historical_provenance_complete",
+              "historical_rows_nonempty",
+              "holdout_used",
+              "hypothesis_id",
+              "lineage",
+              "market_scope",
+              "market_scope_hash",
+              "market_scope_version",
+              "market_type",
+              "minimum_sample_check",
+              "model_hash",
+              "multiple_testing",
+              "paper_only",
+              "parameter_ranges_bounded",
+              "parameters",
+              "plan_hash",
+              "plan_id",
+              "production_evidence_status",
+              "raw_observations",
+              "referenced_features",
+              "risk_snapshot",
+              "robustness_passed",
+              "schema_valid",
+              "scope_hash",
+              "scope_version",
+              "stage",
+              "strategy",
+              "strategy_hash",
+              "train",
+              "validation",
+              "validation_calibration",
+              "validation_complete",
+              "validation_confidence_interval",
+              "validation_confidence_lower_bound",
+              "validation_execution_quality",
+              "validation_expectancy",
+              "validation_regime_behavior",
+              "validation_stability",
+              "validation_stability_summary",
+              "variant_id"
+            ]
+          },
+          "qualification": {
+            "holdout_used": false
+          },
+          "robustness": {
+            "costs_included": true,
+            "data_quality": "LOW",
+            "data_quality_passed": true,
+            "minimum_sample_check": {
+              "checks": {
+                "observations": true,
+                "trades": true
+              },
+              "count": 3564,
+              "min_observations": 30,
+              "min_trades": 0,
+              "passed": true,
+              "trades": 0
+            },
+            "multiple_testing": {
+              "locked_partition_used_for_selection": false,
+              "selected_from_variants": 1,
+              "selection_metric": "validation_expectancy",
+              "variants_tested": 1
+            },
+            "robustness_passed": true
+          },
+          "validation": {
+            "validation": {
+              "calibration": 1.0,
+              "confidence_interval": {
+                "count": 3563,
+                "lower": 0.0,
+                "upper": 0.0
+              },
+              "confidence_lower_bound": 0.0,
+              "costs": 0.0,
+              "expectancy": 0.0,
+              "filled_trades": 0,
+              "independent_samples": 434,
+              "liquidity": 0.0,
+              "max_drawdown": 0.0,
+              "metrics": {
+                "brier": 0.0,
+                "ece": 0.0,
+                "executable_edge": 0.0,
+                "expected_roi": 0.0,
+                "expected_value": 0.0,
+                "fills": 0.0,
+                "final_equity": 10000.0,
+                "initial_equity": 10000.0,
+                "log_loss": 0.0,
+                "raw_edge": 0.0,
+                "roi": 0.0
+              },
+              "regime_count": 1
+            },
+            "validation_calibration": 1.0,
+            "validation_complete": true,
+            "validation_confidence_interval": {
+              "count": 3563,
+              "lower": 0.0,
+              "upper": 0.0
+            },
+            "validation_confidence_lower_bound": 0.0,
+            "validation_execution_quality": "LOW",
+            "validation_expectancy": 0.0,
+            "validation_regime_behavior": {
+              "regimes": 1
+            },
+            "validation_stability": 1.0,
+            "validation_stability_summary": {
+              "count": 1,
+              "max": 0.0,
+              "mean": 0.0,
+              "min": 0.0,
+              "stable": true,
+              "stable_fraction": 1.0,
+              "stdev": 0.0
+            }
+          }
+        },
+        "reason": "exact strategy, model, configuration, risk, and provenance frozen",
+        "to_stage": "FROZEN"
+      }
+    ],
+    "selected_candidate_payload": {
+      "candidate_id": "candidate-1bab05cfab9ff1dc06f1fb81",
+      "frozen_hash": "77b780459c05faa60da4e31825ad904ea2c015ad3228cc2226a8fed9ad969fd6",
+      "metrics_hash": "sha256:c561871b1de026788108b3aae6512031e3a6dbd36a51a8a212eb7f0f1ea6f840",
+      "payload_hash": "sha256:330547213cae58d98daf3d03cf7ab641ea2bbb7d22b6b558b194ce5ae005f3cc",
+      "payload_keys": [
+        "backtest_complete",
+        "benchmark_comparison",
+        "canary_data_quality_acceptable",
+        "canary_data_quality_status",
+        "candidate_id",
+        "config_hash",
+        "costs_included",
+        "current_execution_evidence",
+        "data_quality",
+        "data_quality_passed",
+        "dataset_attestation",
+        "dataset_id",
+        "dataset_integrity_attestation_hash",
+        "dataset_integrity_attestation_status",
+        "dataset_provenance",
+        "dataset_selector",
+        "dataset_version",
+        "experiment_budget_lineage",
+        "experiment_family",
+        "experiment_plan",
+        "frozen",
+        "frozen_hash",
+        "generation",
+        "historical_data_integrity",
+        "historical_data_integrity_passed",
+        "historical_dataset_row_count",
+        "historical_execution_fidelity",
+        "historical_execution_fidelity_score",
+        "historical_no_forward_contamination",
+        "historical_provenance_complete",
+        "historical_rows_nonempty",
+        "holdout_used",
+        "hypothesis_id",
+        "lineage",
+        "market_scope",
+        "market_scope_hash",
+        "market_scope_version",
+        "market_type",
+        "minimum_sample_check",
+        "model_hash",
+        "multiple_testing",
+        "paper_only",
+        "parameter_ranges_bounded",
+        "parameters",
+        "plan_hash",
+        "plan_id",
+        "production_evidence_status",
+        "raw_observations",
+        "referenced_features",
+        "risk_snapshot",
+        "robustness_passed",
+        "schema_valid",
+        "scope_hash",
+        "scope_version",
+        "stage",
+        "strategy",
+        "strategy_hash",
+        "train",
+        "validation",
+        "validation_calibration",
+        "validation_complete",
+        "validation_confidence_interval",
+        "validation_confidence_lower_bound",
+        "validation_execution_quality",
+        "validation_expectancy",
+        "validation_regime_behavior",
+        "validation_stability",
+        "validation_stability_summary",
+        "variant_id"
+      ],
+      "reason": null,
+      "reason_code": null,
+      "stage": "IDEA"
+    },
+    "validation_metrics": {
+      "validation": {
+        "calibration": 1.0,
+        "confidence_interval": {
+          "count": 3563,
+          "lower": 0.0,
+          "upper": 0.0
+        },
+        "confidence_lower_bound": 0.0,
+        "costs": 0.0,
+        "expectancy": 0.0,
+        "filled_trades": 0,
+        "independent_samples": 434,
+        "liquidity": 0.0,
+        "max_drawdown": 0.0,
+        "metrics": {
+          "brier": 0.0,
+          "ece": 0.0,
+          "executable_edge": 0.0,
+          "expected_roi": 0.0,
+          "expected_value": 0.0,
+          "fills": 0.0,
+          "final_equity": 10000.0,
+          "initial_equity": 10000.0,
+          "log_loss": 0.0,
+          "raw_edge": 0.0,
+          "roi": 0.0
+        },
+        "regime_count": 1
+      },
+      "validation_calibration": 1.0,
+      "validation_complete": true,
+      "validation_confidence_interval": {
+        "count": 3563,
+        "lower": 0.0,
+        "upper": 0.0
+      },
+      "validation_confidence_lower_bound": 0.0,
+      "validation_execution_quality": "LOW",
+      "validation_expectancy": 0.0,
+      "validation_regime_behavior": {
+        "regimes": 1
+      },
+      "validation_stability": 1.0,
+      "validation_stability_summary": {
+        "count": 1,
+        "max": 0.0,
+        "mean": 0.0,
+        "min": 0.0,
+        "stable": true,
+        "stable_fraction": 1.0,
+        "stdev": 0.0
+      }
+    }
+  },
+  "config": {
+    "book_depth": 5,
+    "dataset_id": "Polymarket-historical",
+    "dataset_version": "sha256:9a831357e3f4016ad2c4f05d9bb11a98583ad94a2da36873b56e2b7db786a9ea",
+    "expected_constituent_count": 1000,
+    "expected_row_count": 18141,
+    "max_books": 2,
+    "max_pages": 4,
+    "max_seconds": 60.0,
+    "mode": "persisted",
+    "page_limit": 100,
+    "sample_limit": 8,
+    "source_backup": "C:\\Users\\User\\projects\\axiom\\runtime-data\\axiom-forward-proof-20260908T141804Z.sqlite"
+  },
+  "config_hash": "sha256:a0e558dc26047e07a8ed07393b6f97a51b6ef495efaa80cb5af21434790f0397",
+  "dollar_limit_buy_feasibility": {
+    "available_quantity": null,
+    "best_ask": null,
+    "book_depth": null,
+    "budget": 1.0,
+    "checks": {
+      "book_depth": "not_reached",
+      "fee_rate": "not_reached",
+      "min_notional": "not_reached",
+      "min_quantity": "not_reached",
+      "quantity_increment": "not_reached",
+      "quantity_rounding": "not_reached"
+    },
+    "feasible": false,
+    "fee": "not_evaluated",
+    "fee_bps": null,
+    "fee_rate": null,
+    "limit_price": null,
+    "min_notional": null,
+    "min_quantity": null,
+    "notional": null,
+    "order_type": "LIMIT",
+    "quantity": null,
+    "quantity_increment": null,
+    "quantity_rounding": null,
+    "quantity_step": null,
+    "reason": "NO_PERMITTED_PUBLIC_BOOK",
+    "selected_market": null,
+    "selected_market_id": null,
+    "selected_order": {
+      "budget": 1.0,
+      "order_type": "LIMIT",
+      "side": "BUY",
+      "status": "not_reached",
+      "submit_called": false
+    },
+    "selected_token_id": null,
+    "side": "BUY",
+    "submit_called": false,
+    "total": null
+  },
+  "evaluated_records_hash": "sha256:817ef2b404039f73b010dcde1db381ca3b70cabe10120019ca7cddde9dd56d9b",
+  "evaluator": {
+    "current_market_resolution": "NOT_RUN",
+    "decision": null,
+    "fresh_identity_and_books": "NOT_RUN",
+    "qualification_blocker": "CANDIDATE_FORWARD_MARKET_UNRESOLVED",
+    "reason": "CANDIDATE_FORWARD_MARKET_UNRESOLVED",
+    "status": "SKIPPED"
+  },
+  "export": {
+    "aggregate_catalog_hash": "sha256:2c809fce934fd0bab128beca1d9c1bdbcd210d37de7e3348d03704b015f77fad",
+    "aggregate_catalog_projection_hash": "sha256:2c809fce934fd0bab128beca1d9c1bdbcd210d37de7e3348d03704b015f77fad",
+    "attestation_hash": "sha256:24e279b36735f5c6fb97a6115281d681fbaa3afd08a64c982c36cd929b9d93a3",
+    "constituent_catalog_sample": [
+      {
+        "catalog": {
+          "catalog_hash": "sha256:02971a9c8c29a5b6bf36d92857dfa86efc6a2ecadc9146609e3bb45b9d9f335a",
+          "completeness": 1.0,
+          "created_at": "2026-09-04T13:50:24.421013+00:00",
+          "dataset_id": "prediction:4213088",
+          "dataset_version": "sha256:15ca0415bea5c8b53d85b51c7ccccd13b5a649c7a755652017666c6af7bb3939",
+          "end_timestamp": "2026-09-04T13:30:15+00:00",
+          "instrument": "val-var-t1-2026-09-04-map-handicap-away-1pt5",
+          "market_type": "prediction",
+          "metadata": {
+            "historical_order_book_available": false,
+            "market_id": "4213088",
+            "polymarket_key": "[REDACTED]",
+            "research_quality": "PRICE_PROXY",
+            "token_ids": {
+              "no": "71718044860440927017336717291468775568247364611929549098313609865906129402712",
+              "yes": "699478871188270165839906195190197033119475660967935110829681280039168627906"
+            }
+          },
+          "missing_ranges": [],
+          "provider": "polymarket",
+          "quality": "PRICE_PROXY",
+          "row_count": 3,
+          "snapshot_id": "pmhist:4213088:sha256:15ca0415bea5c8b53d85b51c7ccccd13b5a649c7a755652017666c6af7bb3939",
+          "source_type": "HISTORICAL",
+          "start_timestamp": "2026-09-04T13:10:14+00:00",
+          "timeframe": "event",
+          "updated_at": "2026-09-04T13:50:24.421013+00:00"
+        },
+        "catalog_hash": "sha256:02971a9c8c29a5b6bf36d92857dfa86efc6a2ecadc9146609e3bb45b9d9f335a",
+        "dataset_id": "prediction:4213088",
+        "dataset_version": "sha256:15ca0415bea5c8b53d85b51c7ccccd13b5a649c7a755652017666c6af7bb3939",
+        "market_id": "4213088",
+        "provenance_authority": {
+          "attestation_contamination_result": "PASS",
+          "attestation_hash": "sha256:24e279b36735f5c6fb97a6115281d681fbaa3afd08a64c982c36cd929b9d93a3",
+          "attestation_status": "CURRENT",
+          "catalog_bound_source_type_rows": 0,
+          "dataset_id": "prediction:4213088",
+          "dataset_version": "sha256:15ca0415bea5c8b53d85b51c7ccccd13b5a649c7a755652017666c6af7bb3939",
+          "explicit_source_type_rows": 3,
+          "source": "constituent_catalog",
+          "source_type": "HISTORICAL"
+        },
+        "record_sample": [
+          {
+            "category": "other",
+            "expiry": "2026-09-04T17:00:00+00:00",
+            "liquidity": null,
+            "market_id": "4213088",
+            "observed_at": "2026-09-04T13:10:14+00:00",
+            "order_book": null,
+            "provider": "polymarket",
+            "question": "Map Handicap: VARREL (-1.5) vs T1 (+1.5)",
+            "resolution_criteria": "This market refers to the Valorant Lower bracket semifinal match between VARREL and T1 in the VCT Pacific Playoffs, initially scheduled for September 4, 2026 at 7:00 AM ET.\n\nThis market will resolve to \"VARREL\" if VARREL wins 2 or more maps than T1 in this match.\n\nOtherwise, this market will resolve to \"T1\". \n\nMaps won by forfeit, disqualification, walkover, or default are counted towards the handicap, provided that the match is completed.\n\nIf the match is canceled (not played at all for any reason) or ends in a tie, this market will resolve to 50-50.\n\nIf the match is postponed, it must be rescheduled to a start time on or before September 18, 2026 at 11:59 PM ET (14 calendar days after the originally scheduled start of September 4, 2026 at 7:00 AM ET). If, by that deadline, the most recently announced rescheduled start time is on or before the deadline, this market resolves based on the result of the match as played. Otherwise, this market resolves 50-50, regardless of whether the match is subsequently played.\n\nIf the match begins but is not completed, and one team wins due to the opponent's match forfeiture, disqualification, or walkover, this market will resolve to 50-50. \n\nIf the match ends due to the clinching map being forfeited this will count as a completed match.\n\nThe resolution source for this market will be official information from https://vlr.gg. However, if https://vlr.gg has not published final results within 2 hours after the event\u2019s conclusion, a consensus of credible reporting may be used instead including video evidence.",
+            "settlement": "resolved_no",
+            "snapshot_id": "pmhist:4213088:699478871188270165839906195190197033119475660967935110829681280039168627906:2026-09-04T13:10:14+00:00",
+            "source_timestamp": "2026-09-04T13:10:14+00:00",
+            "source_type": "HISTORICAL",
+            "timestamp": "2026-09-04T13:10:14+00:00",
+            "token_id": "699478871188270165839906195190197033119475660967935110829681280039168627906",
+            "volume": 10.0,
+            "yes_mid": 0.005
+          },
+          {
+            "category": "other",
+            "expiry": "2026-09-04T17:00:00+00:00",
+            "liquidity": null,
+            "market_id": "4213088",
+            "observed_at": "2026-09-04T13:30:15+00:00",
+            "order_book": null,
+            "provider": "polymarket",
+            "question": "Map Handicap: VARREL (-1.5) vs T1 (+1.5)",
+            "resolution_criteria": "This market refers to the Valorant Lower bracket semifinal match between VARREL and T1 in the VCT Pacific Playoffs, initially scheduled for September 4, 2026 at 7:00 AM ET.\n\nThis market will resolve to \"VARREL\" if VARREL wins 2 or more maps than T1 in this match.\n\nOtherwise, this market will resolve to \"T1\". \n\nMaps won by forfeit, disqualification, walkover, or default are counted towards the handicap, provided that the match is completed.\n\nIf the match is canceled (not played at all for any reason) or ends in a tie, this market will resolve to 50-50.\n\nIf the match is postponed, it must be rescheduled to a start time on or before September 18, 2026 at 11:59 PM ET (14 calendar days after the originally scheduled start of September 4, 2026 at 7:00 AM ET). If, by that deadline, the most recently announced rescheduled start time is on or before the deadline, this market resolves based on the result of the match as played. Otherwise, this market resolves 50-50, regardless of whether the match is subsequently played.\n\nIf the match begins but is not completed, and one team wins due to the opponent's match forfeiture, disqualification, or walkover, this market will resolve to 50-50. \n\nIf the match ends due to the clinching map being forfeited this will count as a completed match.\n\nThe resolution source for this market will be official information from https://vlr.gg. However, if https://vlr.gg has not published final results within 2 hours after the event\u2019s conclusion, a consensus of credible reporting may be used instead including video evidence.",
+            "settlement": "resolved_no",
+            "snapshot_id": "pmhist:4213088:699478871188270165839906195190197033119475660967935110829681280039168627906:2026-09-04T13:30:15+00:00",
+            "source_timestamp": "2026-09-04T13:30:15+00:00",
+            "source_type": "HISTORICAL",
+            "timestamp": "2026-09-04T13:30:15+00:00",
+            "token_id": "699478871188270165839906195190197033119475660967935110829681280039168627906",
+            "volume": 10.0,
+            "yes_mid": 0.0005
+          }
+        ],
+        "records_count": 3,
+        "records_hash": "sha256:fccb2ea15fdc93868f0bfed98bd21c65020ad01994e354326011a927d60c0866",
+        "row_count": 3,
+        "source_identity_hash": "sha256:15ca0415bea5c8b53d85b51c7ccccd13b5a649c7a755652017666c6af7bb3939"
+      },
+      {
+        "catalog": {
+          "catalog_hash": "sha256:8da8a1b58b9c8e68efdbe07705106881e6b71b3ae04e1c8cc2e5c86a1b32798f",
+          "completeness": 1.0,
+          "created_at": "2026-09-04T14:07:36.189600+00:00",
+          "dataset_id": "prediction:4199929",
+          "dataset_version": "sha256:9f63446433378378d2b20485ac1247c0c63812d4451c838057656590c4d89771",
+          "end_timestamp": "2026-09-04T11:20:12+00:00",
+          "instrument": "atp-doubles-luquroc-gornwal-2026-09-04-set-2-winner-Luque-Rocha-vs-Gornes-Walkow",
+          "market_type": "prediction",
+          "metadata": {
+            "historical_order_book_available": false,
+            "market_id": "4199929",
+            "polymarket_key": "[REDACTED]",
+            "research_quality": "PRICE_PROXY",
+            "token_ids": {
+              "no": "112694757835661108769979902738288766210459957538931491039784311501517862208857",
+              "yes": "59336053475689066673279314010576679346053281710216526978594530202474318150214"
+            }
+          },
+          "missing_ranges": [],
+          "provider": "polymarket",
+          "quality": "PRICE_PROXY",
+          "row_count": 75,
+          "snapshot_id": "pmhist:4199929:sha256:9f63446433378378d2b20485ac1247c0c63812d4451c838057656590c4d89771",
+          "source_type": "HISTORICAL",
+          "start_timestamp": "2026-09-03T23:00:34+00:00",
+          "timeframe": "event",
+          "updated_at": "2026-09-04T14:07:36.189600+00:00"
+        },
+        "catalog_hash": "sha256:8da8a1b58b9c8e68efdbe07705106881e6b71b3ae04e1c8cc2e5c86a1b32798f",
+        "dataset_id": "prediction:4199929",
+        "dataset_version": "sha256:9f63446433378378d2b20485ac1247c0c63812d4451c838057656590c4d89771",
+        "market_id": "4199929",
+        "provenance_authority": {
+          "attestation_contamination_result": "PASS",
+          "attestation_hash": "sha256:24e279b36735f5c6fb97a6115281d681fbaa3afd08a64c982c36cd929b9d93a3",
+          "attestation_status": "CURRENT",
+          "catalog_bound_source_type_rows": 0,
+          "dataset_id": "prediction:4199929",
+          "dataset_version": "sha256:9f63446433378378d2b20485ac1247c0c63812d4451c838057656590c4d89771",
+          "explicit_source_type_rows": 75,
+          "source": "constituent_catalog",
+          "source_type": "HISTORICAL"
+        },
+        "record_sample": [
+          {
+            "category": "other",
+            "expiry": "2026-09-11T09:30:00+00:00",
+            "liquidity": 0.0,
+            "market_id": "4199929",
+            "observed_at": "2026-09-03T23:00:34+00:00",
+            "order_book": null,
+            "provider": "polymarket",
+            "question": "Set 2 Winner: Luque/Rocha vs Gornes/Walkow",
+            "resolution_criteria": "This market refers to the tennis match between Luque/Rocha and Gornes/Walkow in the Porto, originally scheduled for September 4, 2026 at 5:30AM ET.\nThis market will resolve to \u201cLuque/Rocha\u201d if Luque/Rocha wins set 2. It will resolve to \u201cGornes/Walkow\u201d if Gornes/Walkow wins set 2.\nIf the match begins but set 2 is not completed with a winner determined (including the match ending before set 2 is reached), this market will resolve 50-50.\nIf the match is canceled (not played at all) or play has not begun by September 18, 2026, 11:59 PM ET (14 days after the scheduled start), this market will resolve 50-50.\nResolution will be based on official Challenger match statistics.",
+            "settlement": "resolved_yes",
+            "snapshot_id": "pmhist:4199929:59336053475689066673279314010576679346053281710216526978594530202474318150214:2026-09-03T23:00:34+00:00",
+            "source_timestamp": "2026-09-03T23:00:34+00:00",
+            "source_type": "HISTORICAL",
+            "timestamp": "2026-09-03T23:00:34+00:00",
+            "token_id": "59336053475689066673279314010576679346053281710216526978594530202474318150214",
+            "volume": null,
+            "yes_mid": 0.5
+          },
+          {
+            "category": "other",
+            "expiry": "2026-09-11T09:30:00+00:00",
+            "liquidity": 0.0,
+            "market_id": "4199929",
+            "observed_at": "2026-09-04T11:20:12+00:00",
+            "order_book": null,
+            "provider": "polymarket",
+            "question": "Set 2 Winner: Luque/Rocha vs Gornes/Walkow",
+            "resolution_criteria": "This market refers to the tennis match between Luque/Rocha and Gornes/Walkow in the Porto, originally scheduled for September 4, 2026 at 5:30AM ET.\nThis market will resolve to \u201cLuque/Rocha\u201d if Luque/Rocha wins set 2. It will resolve to \u201cGornes/Walkow\u201d if Gornes/Walkow wins set 2.\nIf the match begins but set 2 is not completed with a winner determined (including the match ending before set 2 is reached), this market will resolve 50-50.\nIf the match is canceled (not played at all) or play has not begun by September 18, 2026, 11:59 PM ET (14 days after the scheduled start), this market will resolve 50-50.\nResolution will be based on official Challenger match statistics.",
+            "settlement": "resolved_yes",
+            "snapshot_id": "pmhist:4199929:59336053475689066673279314010576679346053281710216526978594530202474318150214:2026-09-04T11:20:12+00:00",
+            "source_timestamp": "2026-09-04T11:20:12+00:00",
+            "source_type": "HISTORICAL",
+            "timestamp": "2026-09-04T11:20:12+00:00",
+            "token_id": "59336053475689066673279314010576679346053281710216526978594530202474318150214",
+            "volume": null,
+            "yes_mid": 0.9995
+          }
+        ],
+        "records_count": 75,
+        "records_hash": "sha256:b4f20f15a37caccb564c18ffc3b80f2fa6dcf2b2413b1918d3ff6ae9577a18f1",
+        "row_count": 75,
+        "source_identity_hash": "sha256:9f63446433378378d2b20485ac1247c0c63812d4451c838057656590c4d89771"
+      },
+      {
+        "catalog": {
+          "catalog_hash": "sha256:221d681f9a2182f4f88f98b116c1b891732be97b33650b32e5b1e0056ab0b176",
+          "completeness": 1.0,
+          "created_at": "2026-09-04T14:07:37.120693+00:00",
+          "dataset_id": "prediction:4199915",
+          "dataset_version": "sha256:ccf43fae88bcd589663d0cac5eb6483fe4605884a416b119706078e235063954",
+          "end_timestamp": "2026-09-04T13:40:20+00:00",
+          "instrument": "atp-doubles-ingipou-bertkym-2026-09-04-first-set-total-10pt5",
+          "market_type": "prediction",
+          "metadata": {
+            "historical_order_book_available": false,
+            "market_id": "4199915",
+            "polymarket_key": "[REDACTED]",
+            "research_quality": "PRICE_PROXY",
+            "token_ids": {
+              "no": "40173292949205424535055093552567039175132555888356528639884807442905650374419",
+              "yes": "88608252620175011298996305279040870467574945235876152867874683017523215883338"
+            }
+          },
+          "missing_ranges": [],
+          "provider": "polymarket",
+          "quality": "PRICE_PROXY",
+          "row_count": 89,
+          "snapshot_id": "pmhist:4199915:sha256:ccf43fae88bcd589663d0cac5eb6483fe4605884a416b119706078e235063954",
+          "source_type": "HISTORICAL",
+          "start_timestamp": "2026-09-03T23:00:36+00:00",
+          "timeframe": "event",
+          "updated_at": "2026-09-04T14:07:37.120693+00:00"
+        },
+        "catalog_hash": "sha256:221d681f9a2182f4f88f98b116c1b891732be97b33650b32e5b1e0056ab0b176",
+        "dataset_id": "prediction:4199915",
+        "dataset_version": "sha256:ccf43fae88bcd589663d0cac5eb6483fe4605884a416b119706078e235063954",
+        "market_id": "4199915",
+        "provenance_authority": {
+          "attestation_contamination_result": "PASS",
+          "attestation_hash": "sha256:24e279b36735f5c6fb97a6115281d681fbaa3afd08a64c982c36cd929b9d93a3",
+          "attestation_status": "CURRENT",
+          "catalog_bound_source_type_rows": 0,
+          "dataset_id": "prediction:4199915",
+          "dataset_version": "sha256:ccf43fae88bcd589663d0cac5eb6483fe4605884a416b119706078e235063954",
+          "explicit_source_type_rows": 89,
+          "source": "constituent_catalog",
+          "source_type": "HISTORICAL"
+        },
+        "record_sample": [
+          {
+            "category": "sports",
+            "expiry": "2026-09-11T12:30:00+00:00",
+            "liquidity": 0.0,
+            "market_id": "4199915",
+            "observed_at": "2026-09-03T23:00:36+00:00",
+            "order_book": null,
+            "provider": "polymarket",
+            "question": "Ingildsen/Poulsen vs. Bertola/Kym: Set 1 Games O/U 10.5",
+            "resolution_criteria": "This market refers to the tennis match between Ingildsen/Poulsen and Bertola/Kym in the Manacor, originally scheduled for September 4, 2026 at 8:30AM ET.\nThis market will resolve to \"Over\" if the total number of games completed in the first set equals or exceeds 11. Otherwise, it will resolve to \"Under.\" Any first-set tiebreak counts as one (1) game.\nIf the match is postponed or suspended, this market will remain open until the first set has been completed. A postponement alone will not trigger a 50-50 resolution.\nIf the match is permanently abandoned before the first set is completed, or if the first set has not been completed by September 18, 2026, 11:59 PM ET, this market will resolve 50-50, unless the outcome has already been unconditionally determined based on completed play. An outcome is considered determined if it would have been guaranteed had the set been played to completion using the minimum number of additional games required. For example, for a line of 9.5, if play stops with the first set at 5-4, completing the set would have required at least 1 additional game, resulting in at least 10 games played, so \"Over\" would resolve as the winning outcome.\nThe primary resolution source for this market will be official Challenger statistics; however, a consensus of credible reporting may also be used.",
+            "settlement": "resolved_no",
+            "snapshot_id": "pmhist:4199915:88608252620175011298996305279040870467574945235876152867874683017523215883338:2026-09-03T23:00:36+00:00",
+            "source_timestamp": "2026-09-03T23:00:36+00:00",
+            "source_type": "HISTORICAL",
+            "timestamp": "2026-09-03T23:00:36+00:00",
+            "token_id": "88608252620175011298996305279040870467574945235876152867874683017523215883338",
+            "volume": null,
+            "yes_mid": 0.5
+          },
+          {
+            "category": "sports",
+            "expiry": "2026-09-11T12:30:00+00:00",
+            "liquidity": 0.0,
+            "market_id": "4199915",
+            "observed_at": "2026-09-04T13:40:20+00:00",
+            "order_book": null,
+            "provider": "polymarket",
+            "question": "Ingildsen/Poulsen vs. Bertola/Kym: Set 1 Games O/U 10.5",
+            "resolution_criteria": "This market refers to the tennis match between Ingildsen/Poulsen and Bertola/Kym in the Manacor, originally scheduled for September 4, 2026 at 8:30AM ET.\nThis market will resolve to \"Over\" if the total number of games completed in the first set equals or exceeds 11. Otherwise, it will resolve to \"Under.\" Any first-set tiebreak counts as one (1) game.\nIf the match is postponed or suspended, this market will remain open until the first set has been completed. A postponement alone will not trigger a 50-50 resolution.\nIf the match is permanently abandoned before the first set is completed, or if the first set has not been completed by September 18, 2026, 11:59 PM ET, this market will resolve 50-50, unless the outcome has already been unconditionally determined based on completed play. An outcome is considered determined if it would have been guaranteed had the set been played to completion using the minimum number of additional games required. For example, for a line of 9.5, if play stops with the first set at 5-4, completing the set would have required at least 1 additional game, resulting in at least 10 games played, so \"Over\" would resolve as the winning outcome.\nThe primary resolution source for this market will be official Challenger statistics; however, a consensus of credible reporting may also be used.",
+            "settlement": "resolved_no",
+            "snapshot_id": "pmhist:4199915:88608252620175011298996305279040870467574945235876152867874683017523215883338:2026-09-04T13:40:20+00:00",
+            "source_timestamp": "2026-09-04T13:40:20+00:00",
+            "source_type": "HISTORICAL",
+            "timestamp": "2026-09-04T13:40:20+00:00",
+            "token_id": "88608252620175011298996305279040870467574945235876152867874683017523215883338",
+            "volume": null,
+            "yes_mid": 0.0005
+          }
+        ],
+        "records_count": 89,
+        "records_hash": "sha256:7122625f7fbc4a438ed49530f06e30c411975081f8db818c1f12c9228a6a8fac",
+        "row_count": 89,
+        "source_identity_hash": "sha256:ccf43fae88bcd589663d0cac5eb6483fe4605884a416b119706078e235063954"
+      }
+    ],
+    "constituent_catalogs_count": 1000,
+    "constituent_catalogs_hash": "sha256:8b63272a45702d81671e18ae4cf2a6a01dc74124dd8925f86ce4b85b235a48ec",
+    "controls": {
+      "counts": {
+        "canary_autonomous_state": 0,
+        "canary_control": 0,
+        "canary_eligibility": 0,
+        "canary_readiness_snapshot": 0,
+        "canary_selection": 0,
+        "collector_state": 0,
+        "operator_actions": 0,
+        "operator_config": 0,
+        "operator_jobs": 0,
+        "scheduler_state": 0,
+        "worker_state": 0
+      },
+      "credential_state_exported": "[REDACTED]",
+      "disabled_or_absent": true
+    },
+    "core_integrity_verification": {
+      "attestation_hash": "sha256:24e279b36735f5c6fb97a6115281d681fbaa3afd08a64c982c36cd929b9d93a3",
+      "reason": null,
+      "row_count": 18141,
+      "status": "CURRENT"
+    },
+    "dataset_id": "Polymarket-historical",
+    "dataset_version": "sha256:9a831357e3f4016ad2c4f05d9bb11a98583ad94a2da36873b56e2b7db786a9ea",
+    "evaluated_record_sample": [
+      {
+        "category": "other",
+        "expiry": "2026-09-04T17:00:00+00:00",
+        "liquidity": null,
+        "market_id": "4213088",
+        "observed_at": "2026-09-04T13:10:14+00:00",
+        "order_book": null,
+        "provider": "polymarket",
+        "question": "Map Handicap: VARREL (-1.5) vs T1 (+1.5)",
+        "resolution_criteria": "This market refers to the Valorant Lower bracket semifinal match between VARREL and T1 in the VCT Pacific Playoffs, initially scheduled for September 4, 2026 at 7:00 AM ET.\n\nThis market will resolve to \"VARREL\" if VARREL wins 2 or more maps than T1 in this match.\n\nOtherwise, this market will resolve to \"T1\". \n\nMaps won by forfeit, disqualification, walkover, or default are counted towards the handicap, provided that the match is completed.\n\nIf the match is canceled (not played at all for any reason) or ends in a tie, this market will resolve to 50-50.\n\nIf the match is postponed, it must be rescheduled to a start time on or before September 18, 2026 at 11:59 PM ET (14 calendar days after the originally scheduled start of September 4, 2026 at 7:00 AM ET). If, by that deadline, the most recently announced rescheduled start time is on or before the deadline, this market resolves based on the result of the match as played. Otherwise, this market resolves 50-50, regardless of whether the match is subsequently played.\n\nIf the match begins but is not completed, and one team wins due to the opponent's match forfeiture, disqualification, or walkover, this market will resolve to 50-50. \n\nIf the match ends due to the clinching map being forfeited this will count as a completed match.\n\nThe resolution source for this market will be official information from https://vlr.gg. However, if https://vlr.gg has not published final results within 2 hours after the event\u2019s conclusion, a consensus of credible reporting may be used instead including video evidence.",
+        "settlement": "resolved_no",
+        "snapshot_id": "pmhist:4213088:699478871188270165839906195190197033119475660967935110829681280039168627906:2026-09-04T13:10:14+00:00",
+        "source_timestamp": "2026-09-04T13:10:14+00:00",
+        "source_type": "HISTORICAL",
+        "timestamp": "2026-09-04T13:10:14+00:00",
+        "token_id": "699478871188270165839906195190197033119475660967935110829681280039168627906",
+        "volume": 10.0,
+        "yes_mid": 0.005
+      },
+      {
+        "category": "sports",
+        "expiry": "2026-09-11T12:30:00+00:00",
+        "liquidity": 0.0,
+        "market_id": "4199915",
+        "observed_at": "2026-09-04T13:40:20+00:00",
+        "order_book": null,
+        "provider": "polymarket",
+        "question": "Ingildsen/Poulsen vs. Bertola/Kym: Set 1 Games O/U 10.5",
+        "resolution_criteria": "This market refers to the tennis match between Ingildsen/Poulsen and Bertola/Kym in the Manacor, originally scheduled for September 4, 2026 at 8:30AM ET.\nThis market will resolve to \"Over\" if the total number of games completed in the first set equals or exceeds 11. Otherwise, it will resolve to \"Under.\" Any first-set tiebreak counts as one (1) game.\nIf the match is postponed or suspended, this market will remain open until the first set has been completed. A postponement alone will not trigger a 50-50 resolution.\nIf the match is permanently abandoned before the first set is completed, or if the first set has not been completed by September 18, 2026, 11:59 PM ET, this market will resolve 50-50, unless the outcome has already been unconditionally determined based on completed play. An outcome is considered determined if it would have been guaranteed had the set been played to completion using the minimum number of additional games required. For example, for a line of 9.5, if play stops with the first set at 5-4, completing the set would have required at least 1 additional game, resulting in at least 10 games played, so \"Over\" would resolve as the winning outcome.\nThe primary resolution source for this market will be official Challenger statistics; however, a consensus of credible reporting may also be used.",
+        "settlement": "resolved_no",
+        "snapshot_id": "pmhist:4199915:88608252620175011298996305279040870467574945235876152867874683017523215883338:2026-09-04T13:40:20+00:00",
+        "source_timestamp": "2026-09-04T13:40:20+00:00",
+        "source_type": "HISTORICAL",
+        "timestamp": "2026-09-04T13:40:20+00:00",
+        "token_id": "88608252620175011298996305279040870467574945235876152867874683017523215883338",
+        "volume": null,
+        "yes_mid": 0.0005
+      }
+    ],
+    "evaluated_records_count": 18141,
+    "evaluated_records_hash": "sha256:817ef2b404039f73b010dcde1db381ca3b70cabe10120019ca7cddde9dd56d9b",
+    "isolated": true,
+    "status": "PASSED",
+    "temporary_store": true
+  },
+  "export_hash": "sha256:d5359917bdecf53004099997cfb894b393c59daaba2d395c7db893efb4426524",
+  "generated_at": "2026-09-10T04:14:17.638542+00:00",
+  "missing_dataset_public_queue_negative": {
+    "executed": false,
+    "note": "The existing public missing-dataset negative section is unchanged.",
+    "preserved": true
+  },
+  "mode": "persisted",
+  "proposal": {
+    "dataset_id": "Polymarket-historical",
+    "dataset_version": "sha256:9a831357e3f4016ad2c4f05d9bb11a98583ad94a2da36873b56e2b7db786a9ea",
+    "experiment_plan": {
+      "dataset_id": "Polymarket-historical",
+      "dataset_selector": {
+        "dataset_id": "Polymarket-historical",
+        "dataset_version": "sha256:9a831357e3f4016ad2c4f05d9bb11a98583ad94a2da36873b56e2b7db786a9ea",
+        "provider": "polymarket",
+        "source_type": "HISTORICAL"
+      },
+      "dataset_version": "sha256:9a831357e3f4016ad2c4f05d9bb11a98583ad94a2da36873b56e2b7db786a9ea",
+      "filters": {
+        "category": [
+          "crypto",
+          "other",
+          "sports"
+        ]
+      },
+      "market_scope": {
+        "categories": [
+          "crypto",
+          "other",
+          "sports"
+        ],
+        "filters": {
+          "category": [
+            "crypto",
+            "other",
+            "sports"
+          ]
+        },
+        "instrument": "POLYMARKET",
+        "market_ids": [],
+        "mode": "RULE_BASED_MARKETS",
+        "provenance": "canonical",
+        "regime_restrictions": {},
+        "schema_version": "1"
+      },
+      "market_type": "prediction",
+      "max_variants": 1,
+      "methodology": {
+        "allocation": 0.25,
+        "fee_bps": 10.0,
+        "initial_cash": 10000.0,
+        "slippage_bps": 5.0,
+        "time_split": "train-validation-holdout"
+      },
+      "metrics": [
+        "expectancy",
+        "drawdown",
+        "trade_count",
+        "sample_count"
+      ],
+      "min_samples": 30,
+      "min_trades": 0,
+      "model_document": {
+        "field": "yes_mid"
+      },
+      "paper_only": true,
+      "parameters": {
+        "threshold": [
+          0.03
+        ]
+      },
+      "target": {
+        "categories": [
+          "crypto",
+          "other",
+          "sports"
+        ],
+        "instrument": "POLYMARKET"
+      },
+      "template": "probability_mispricing"
+    },
+    "paper_only": true,
+    "proposal_id": "polymarket-historical-acceptance-9a831357e3f4016a",
+    "source": "Polymarket-historical persisted acceptance dataset",
+    "statement": "A probability-mispricing strategy is evaluated against the immutable Polymarket historical price proxy.",
+    "tests": [
+      "chronological train-validation-holdout",
+      "bounded robustness checks",
+      "exact historical provenance"
+    ],
+    "time_split": "train-validation-holdout"
+  },
+  "release_plan": {
+    "backup_prerequisite": {
+      "attestation_hash": "sha256:24e279b36735f5c6fb97a6115281d681fbaa3afd08a64c982c36cd929b9d93a3",
+      "dataset_id": "Polymarket-historical",
+      "dataset_version": "sha256:9a831357e3f4016ad2c4f05d9bb11a98583ad94a2da36873b56e2b7db786a9ea",
+      "read_only_immutable": true,
+      "required": true,
+      "same_backup_for_validation_and_export": true,
+      "source_backup": "C:\\Users\\User\\projects\\axiom\\runtime-data\\axiom-forward-proof-20260908T141804Z.sqlite"
+    },
+    "controls_altered": false,
+    "deploy_executed": false,
+    "deployment": {
+      "canary_controls_unchanged_requires_comparison": true,
+      "canary_status_after_start": "python -m axiom.cli canary-status --db \"runtime-data/axiom.sqlite\"",
+      "canary_status_before": "python -m axiom.cli canary-status --db \"runtime-data/axiom.sqlite\"",
+      "commands_are_separate": true,
+      "commands_executed": false,
+      "explicit_db": "runtime-data/axiom.sqlite",
+      "never_alter_controls": true,
+      "node_status_after_start": "powershell -NoProfile -ExecutionPolicy Bypass -File ops/status_axiom_node.ps1 -DbPath \"runtime-data/axiom.sqlite\"",
+      "node_status_after_stop": "powershell -NoProfile -ExecutionPolicy Bypass -File ops/status_axiom_node.ps1 -DbPath \"runtime-data/axiom.sqlite\"",
+      "node_status_before": "powershell -NoProfile -ExecutionPolicy Bypass -File ops/status_axiom_node.ps1 -DbPath \"runtime-data/axiom.sqlite\"",
+      "same_explicit_db_for_all_commands": true,
+      "start": "powershell -NoProfile -ExecutionPolicy Bypass -File ops/start_axiom_node.ps1 -DbPath \"runtime-data/axiom.sqlite\" -IntervalSeconds 60 -CryptoSource public -Depth 20 -MaxMarkets 100",
+      "stop": "powershell -NoProfile -ExecutionPolicy Bypass -File ops/stop_axiom_node.ps1 -DbPath \"runtime-data/axiom.sqlite\""
+    },
+    "focused_unittest_command": "python -m unittest tests.test_market_scope_acceptance_tool -v",
+    "full_unittest_command": "python -m unittest discover -s tests -p \"test_*.py\" -v",
+    "merge_executed": false,
+    "merge_gates": {
+      "clean_review_required": true,
+      "commands": [
+        "git status --short --branch",
+        "git diff --check",
+        "git fetch origin",
+        "git switch main",
+        "git pull --ff-only origin main",
+        "git merge --ff-only feature/polymarket-market-scope",
+        "git push origin main"
+      ],
+      "commands_executed": false,
+      "exact_reviewed_commit_required": true,
+      "fast_forward_only": true,
+      "prohibited": [
+        "git merge --no-ff",
+        "git push --force",
+        "git reset --hard"
+      ],
+      "reviewed_commit_precondition": "At execution time, set EXACT_REVIEWED_COMMIT to the reviewed/pushed tip and require local `git rev-parse feature/polymarket-market-scope` and the matching `git ls-remote origin refs/heads/feature/polymarket-market-scope` to equal it; abort on any mismatch."
+    },
+    "orders_allowed": false,
+    "prepared_not_executed": true,
+    "warning": "Do not use ops/restart_axiom_node.ps1: parameter mismatch prevents the required explicit DB/control-status sequence."
+  },
+  "release_readiness": {
+    "canary": null,
+    "current_public_book_required": true,
+    "operator_review": null,
+    "place_order_called": false,
+    "qualification_blocker": "CANDIDATE_FORWARD_MARKET_UNRESOLVED",
+    "qualification_required_stage": "PAPER_FORWARD",
+    "qualification_stage_observed": "FROZEN",
+    "status": "NOT_READY"
+  },
+  "runtime_criteria": {
+    "max_drawdown": 0.2,
+    "min_calibration": 0.8,
+    "min_confidence_lower_bound": 0.0,
+    "min_expectancy": 0.0,
+    "min_forward_duration_seconds": 604800.0,
+    "min_forward_duration_seconds_for_performance_rejection": 0.0,
+    "min_independent_samples": 30,
+    "min_liquidity": 0.0,
+    "min_order_attempts_for_execution_rejection": 5,
+    "min_regimes": 3,
+    "min_resolved_bets_for_performance_rejection": 5,
+    "min_stability": 0.6,
+    "min_trades": 20
+  },
+  "runtime_metric_assessment": {
+    "criteria": {
+      "max_drawdown": 0.2,
+      "min_calibration": 0.8,
+      "min_confidence_lower_bound": 0.0,
+      "min_expectancy": 0.0,
+      "min_forward_duration_seconds": 604800.0,
+      "min_forward_duration_seconds_for_performance_rejection": 0.0,
+      "min_independent_samples": 30,
+      "min_liquidity": 0.0,
+      "min_order_attempts_for_execution_rejection": 5,
+      "min_regimes": 3,
+      "min_resolved_bets_for_performance_rejection": 5,
+      "min_stability": 0.6,
+      "min_trades": 20
+    },
+    "criteria_hash": "sha256:914d8bc85b4addb93d9292dd04b28159aedd2671027be74fe314b49ff7164783",
+    "decisive_current_market_blocker": {
+      "reason_code": "CANDIDATE_FORWARD_MARKET_UNRESOLVED",
+      "source": "queue/candidate lifecycle",
+      "status": "blocking"
+    },
+    "metrics": {
+      "calibration": {
+        "observed": 1.0,
+        "operator": ">=",
+        "required": 0.8,
+        "source": "validation.validation_calibration",
+        "status": "pass"
+      },
+      "confidence_interval_lower": {
+        "observed": 0.0,
+        "operator": ">=",
+        "required": 0.0,
+        "source": "validation.validation.confidence_interval.lower",
+        "status": "pass"
+      },
+      "drawdown": {
+        "observed": 0.0,
+        "operator": "<=",
+        "required": 0.2,
+        "source": "validation.validation.max_drawdown",
+        "status": "pass"
+      },
+      "expectancy": {
+        "observed": 0.0,
+        "operator": ">=",
+        "required": 0.0,
+        "source": "validation.validation.expectancy",
+        "status": "pass"
+      },
+      "filled_trades": {
+        "observed": 0.0,
+        "operator": ">=",
+        "required": 20.0,
+        "source": "validation.validation.filled_trades",
+        "status": "fail"
+      },
+      "forward_duration_seconds": {
+        "observed": null,
+        "operator": ">=",
+        "required": 604800.0,
+        "source": null,
+        "status": "not_reached"
+      },
+      "forward_order_attempts": {
+        "observed": null,
+        "operator": ">=",
+        "required": 5.0,
+        "source": null,
+        "status": "not_reached"
+      },
+      "independent_samples": {
+        "observed": 434.0,
+        "operator": ">=",
+        "required": 30.0,
+        "source": "validation.validation.independent_samples",
+        "status": "pass"
+      },
+      "liquidity": {
+        "observed": 0.0,
+        "operator": ">=",
+        "required": 0.0,
+        "source": "validation.validation.liquidity",
+        "status": "pass"
+      },
+      "regimes": {
+        "observed": 1.0,
+        "operator": ">=",
+        "required": 3.0,
+        "source": "validation.validation.regime_count",
+        "status": "fail"
+      },
+      "stability": {
+        "observed": 1.0,
+        "operator": ">=",
+        "required": 0.6,
+        "source": "validation.validation_stability",
+        "status": "pass"
+      }
+    },
+    "observed_basis": "validation",
+    "status": "fail"
+  },
+  "schema_version": "polymarket-market-scope-acceptance-v3",
+  "scope": {
+    "dataset_id": "Polymarket-historical",
+    "dataset_version": "sha256:9a831357e3f4016ad2c4f05d9bb11a98583ad94a2da36873b56e2b7db786a9ea",
+    "policy": {
+      "categories": [
+        "crypto",
+        "other",
+        "sports"
+      ],
+      "filters": {
+        "category": [
+          "crypto",
+          "other",
+          "sports"
+        ]
+      },
+      "instrument": "POLYMARKET",
+      "market_ids": [],
+      "mode": "RULE_BASED_MARKETS",
+      "provenance": "canonical",
+      "regime_restrictions": {},
+      "schema_version": "1"
+    },
+    "policy_authority": "canonical local MarketScopePolicy"
+  },
+  "scope_hash": "sha256:b95a5bed882c8feceff46428d2c085c19973f9fbf89b0382171f833cec3e310d",
+  "security": {
+    "authenticated_calls": false,
+    "controls_disabled_or_absent": true,
+    "credentials_used": false,
+    "forward_relabel_rejected": false,
+    "network_calls": false,
+    "order_transport_called": false,
+    "source_live_database_rejected": false,
+    "source_opened_read_only": true,
+    "source_uri_immutable": true,
+    "submit_order_called": false,
+    "synthetic_probability_model": false
+  },
+  "source": {
+    "aggregate_catalog_hash": "sha256:2c809fce934fd0bab128beca1d9c1bdbcd210d37de7e3348d03704b015f77fad",
+    "aggregate_catalog_projection_hash": "sha256:2c809fce934fd0bab128beca1d9c1bdbcd210d37de7e3348d03704b015f77fad",
+    "attestation": {
+      "attestation_hash": "sha256:24e279b36735f5c6fb97a6115281d681fbaa3afd08a64c982c36cd929b9d93a3",
+      "attestation_row_hash": "sha256:264e3db6282ebb9bf48ae092f88ece56434b2508a5b50a8d3b89c8e02e5428f3",
+      "completeness": 1.0,
+      "contamination_result": "PASS",
+      "dataset_id": "Polymarket-historical",
+      "dataset_version": "sha256:9a831357e3f4016ad2c4f05d9bb11a98583ad94a2da36873b56e2b7db786a9ea",
+      "execution_fidelity": "PRICE_PROXY",
+      "market_type": "prediction",
+      "policy_version": "prediction-integrity-v1",
+      "provenance_version": "dataset-provenance-v1",
+      "row_count": 18141,
+      "source_type": "HISTORICAL",
+      "status": "CURRENT",
+      "verified_at": "2026-09-08T01:33:49.982877+00:00"
+    },
+    "attestation_row": {
+      "attestation_hash": "sha256:24e279b36735f5c6fb97a6115281d681fbaa3afd08a64c982c36cd929b9d93a3",
+      "attestation_row_hash": "sha256:c93c7cfbfd742998d5298d1a09aab3c3e274e63c288441374a0ed7d211b3acf5",
+      "completeness": 1.0,
+      "constituent_bindings_count": 1000,
+      "constituent_bindings_hash": "sha256:96b1ccb92d0bf6c573e501f97d7b20a34fc4102db6c1d068ff4c8ff895cf5b76",
+      "constituent_bindings_sample": [
+        {
+          "dataset_id": "prediction:4213088",
+          "dataset_version": "sha256:15ca0415bea5c8b53d85b51c7ccccd13b5a649c7a755652017666c6af7bb3939",
+          "row_count": 3
+        },
+        {
+          "dataset_id": "prediction:4199929",
+          "dataset_version": "sha256:9f63446433378378d2b20485ac1247c0c63812d4451c838057656590c4d89771",
+          "row_count": 75
+        },
+        {
+          "dataset_id": "prediction:4199915",
+          "dataset_version": "sha256:ccf43fae88bcd589663d0cac5eb6483fe4605884a416b119706078e235063954",
+          "row_count": 89
+        }
+      ],
+      "contamination_result": "PASS",
+      "dataset_id": "Polymarket-historical",
+      "dataset_version": "sha256:9a831357e3f4016ad2c4f05d9bb11a98583ad94a2da36873b56e2b7db786a9ea",
+      "end_timestamp": "2026-09-04T13:40:22+00:00",
+      "execution_fidelity": "PRICE_PROXY",
+      "market_type": "prediction",
+      "policy_version": "prediction-integrity-v1",
+      "provenance_version": "dataset-provenance-v1",
+      "reason": "",
+      "row_count": 18141,
+      "source_type": "HISTORICAL",
+      "start_timestamp": "2026-09-03T23:00:28+00:00",
+      "status": "CURRENT",
+      "verified_at": "2026-09-08T01:33:49.982877+00:00"
+    },
+    "catalog": {
+      "catalog_hash": "sha256:2c809fce934fd0bab128beca1d9c1bdbcd210d37de7e3348d03704b015f77fad",
+      "completeness": 1.0,
+      "created_at": "2026-09-04T14:07:37.140797+00:00",
+      "dataset_id": "Polymarket-historical",
+      "dataset_version": "sha256:9a831357e3f4016ad2c4f05d9bb11a98583ad94a2da36873b56e2b7db786a9ea",
+      "end_timestamp": "2026-09-04T13:40:22+00:00",
+      "instrument": "POLYMARKET",
+      "market_type": "prediction",
+      "metadata": {
+        "category_counts": {
+          "crypto": 472,
+          "other": 482,
+          "sports": 46
+        },
+        "historical_order_book_available": false,
+        "instrument": "POLYMARKET",
+        "market_versions_count": 1000,
+        "market_versions_hash": "sha256:24d374d03a4c0a2665fd7178079a2e8d82efbfbb9428b39adec98943b7e8ca81",
+        "market_versions_sample": [
+          {
+            "market_id": "4213088",
+            "records": 3,
+            "version": "sha256:15ca0415bea5c8b53d85b51c7ccccd13b5a649c7a755652017666c6af7bb3939"
+          },
+          {
+            "market_id": "4199929",
+            "records": 75,
+            "version": "sha256:9f63446433378378d2b20485ac1247c0c63812d4451c838057656590c4d89771"
+          },
+          {
+            "market_id": "4199915",
+            "records": 89,
+            "version": "sha256:ccf43fae88bcd589663d0cac5eb6483fe4605884a416b119706078e235063954"
+          }
+        ],
+        "markets_discovered": 1000,
+        "markets_imported": 1000,
+        "price_points": 18141,
+        "provider": "polymarket",
+        "research_quality": "PRICE_PROXY",
+        "source_type": "HISTORICAL"
+      },
+      "missing_ranges": [],
+      "provider": "polymarket",
+      "quality": "PRICE_PROXY",
+      "row_count": 18141,
+      "snapshot_id": "Polymarket-historical:sha256:9a831357e3f4016ad2c4f05d9bb11a98583ad94a2da36873b56e2b7db786a9ea",
+      "source_type": "HISTORICAL",
+      "start_timestamp": "2026-09-03T23:00:28+00:00",
+      "timeframe": "event",
+      "updated_at": "2026-09-04T14:07:37.140797+00:00"
+    },
+    "constituent_evidence": {
+      "catalogs_hash": "sha256:8b63272a45702d81671e18ae4cf2a6a01dc74124dd8925f86ce4b85b235a48ec",
+      "count": 1000,
+      "records_count": 18141,
+      "records_hash": "sha256:817ef2b404039f73b010dcde1db381ca3b70cabe10120019ca7cddde9dd56d9b",
+      "sample": [
+        {
+          "catalog": {
+            "catalog_hash": "sha256:02971a9c8c29a5b6bf36d92857dfa86efc6a2ecadc9146609e3bb45b9d9f335a",
+            "completeness": 1.0,
+            "created_at": "2026-09-04T13:50:24.421013+00:00",
+            "dataset_id": "prediction:4213088",
+            "dataset_version": "sha256:15ca0415bea5c8b53d85b51c7ccccd13b5a649c7a755652017666c6af7bb3939",
+            "end_timestamp": "2026-09-04T13:30:15+00:00",
+            "instrument": "val-var-t1-2026-09-04-map-handicap-away-1pt5",
+            "market_type": "prediction",
+            "metadata": {
+              "historical_order_book_available": false,
+              "market_id": "4213088",
+              "polymarket_key": "[REDACTED]",
+              "research_quality": "PRICE_PROXY",
+              "token_ids": {
+                "no": "71718044860440927017336717291468775568247364611929549098313609865906129402712",
+                "yes": "699478871188270165839906195190197033119475660967935110829681280039168627906"
+              }
+            },
+            "missing_ranges": [],
+            "provider": "polymarket",
+            "quality": "PRICE_PROXY",
+            "row_count": 3,
+            "snapshot_id": "pmhist:4213088:sha256:15ca0415bea5c8b53d85b51c7ccccd13b5a649c7a755652017666c6af7bb3939",
+            "source_type": "HISTORICAL",
+            "start_timestamp": "2026-09-04T13:10:14+00:00",
+            "timeframe": "event",
+            "updated_at": "2026-09-04T13:50:24.421013+00:00"
+          },
+          "catalog_hash": "sha256:02971a9c8c29a5b6bf36d92857dfa86efc6a2ecadc9146609e3bb45b9d9f335a",
+          "dataset_id": "prediction:4213088",
+          "dataset_version": "sha256:15ca0415bea5c8b53d85b51c7ccccd13b5a649c7a755652017666c6af7bb3939",
+          "market_id": "4213088",
+          "provenance_authority": {
+            "attestation_contamination_result": "PASS",
+            "attestation_hash": "sha256:24e279b36735f5c6fb97a6115281d681fbaa3afd08a64c982c36cd929b9d93a3",
+            "attestation_status": "CURRENT",
+            "catalog_bound_source_type_rows": 0,
+            "dataset_id": "prediction:4213088",
+            "dataset_version": "sha256:15ca0415bea5c8b53d85b51c7ccccd13b5a649c7a755652017666c6af7bb3939",
+            "explicit_source_type_rows": 3,
+            "source": "constituent_catalog",
+            "source_type": "HISTORICAL"
+          },
+          "record_sample": [
+            {
+              "category": "other",
+              "expiry": "2026-09-04T17:00:00+00:00",
+              "liquidity": null,
+              "market_id": "4213088",
+              "observed_at": "2026-09-04T13:10:14+00:00",
+              "order_book": null,
+              "provider": "polymarket",
+              "question": "Map Handicap: VARREL (-1.5) vs T1 (+1.5)",
+              "resolution_criteria": "This market refers to the Valorant Lower bracket semifinal match between VARREL and T1 in the VCT Pacific Playoffs, initially scheduled for September 4, 2026 at 7:00 AM ET.\n\nThis market will resolve to \"VARREL\" if VARREL wins 2 or more maps than T1 in this match.\n\nOtherwise, this market will resolve to \"T1\". \n\nMaps won by forfeit, disqualification, walkover, or default are counted towards the handicap, provided that the match is completed.\n\nIf the match is canceled (not played at all for any reason) or ends in a tie, this market will resolve to 50-50.\n\nIf the match is postponed, it must be rescheduled to a start time on or before September 18, 2026 at 11:59 PM ET (14 calendar days after the originally scheduled start of September 4, 2026 at 7:00 AM ET). If, by that deadline, the most recently announced rescheduled start time is on or before the deadline, this market resolves based on the result of the match as played. Otherwise, this market resolves 50-50, regardless of whether the match is subsequently played.\n\nIf the match begins but is not completed, and one team wins due to the opponent's match forfeiture, disqualification, or walkover, this market will resolve to 50-50. \n\nIf the match ends due to the clinching map being forfeited this will count as a completed match.\n\nThe resolution source for this market will be official information from https://vlr.gg. However, if https://vlr.gg has not published final results within 2 hours after the event\u2019s conclusion, a consensus of credible reporting may be used instead including video evidence.",
+              "settlement": "resolved_no",
+              "snapshot_id": "pmhist:4213088:699478871188270165839906195190197033119475660967935110829681280039168627906:2026-09-04T13:10:14+00:00",
+              "source_timestamp": "2026-09-04T13:10:14+00:00",
+              "source_type": "HISTORICAL",
+              "timestamp": "2026-09-04T13:10:14+00:00",
+              "token_id": "699478871188270165839906195190197033119475660967935110829681280039168627906",
+              "volume": 10.0,
+              "yes_mid": 0.005
+            },
+            {
+              "category": "other",
+              "expiry": "2026-09-04T17:00:00+00:00",
+              "liquidity": null,
+              "market_id": "4213088",
+              "observed_at": "2026-09-04T13:30:15+00:00",
+              "order_book": null,
+              "provider": "polymarket",
+              "question": "Map Handicap: VARREL (-1.5) vs T1 (+1.5)",
+              "resolution_criteria": "This market refers to the Valorant Lower bracket semifinal match between VARREL and T1 in the VCT Pacific Playoffs, initially scheduled for September 4, 2026 at 7:00 AM ET.\n\nThis market will resolve to \"VARREL\" if VARREL wins 2 or more maps than T1 in this match.\n\nOtherwise, this market will resolve to \"T1\". \n\nMaps won by forfeit, disqualification, walkover, or default are counted towards the handicap, provided that the match is completed.\n\nIf the match is canceled (not played at all for any reason) or ends in a tie, this market will resolve to 50-50.\n\nIf the match is postponed, it must be rescheduled to a start time on or before September 18, 2026 at 11:59 PM ET (14 calendar days after the originally scheduled start of September 4, 2026 at 7:00 AM ET). If, by that deadline, the most recently announced rescheduled start time is on or before the deadline, this market resolves based on the result of the match as played. Otherwise, this market resolves 50-50, regardless of whether the match is subsequently played.\n\nIf the match begins but is not completed, and one team wins due to the opponent's match forfeiture, disqualification, or walkover, this market will resolve to 50-50. \n\nIf the match ends due to the clinching map being forfeited this will count as a completed match.\n\nThe resolution source for this market will be official information from https://vlr.gg. However, if https://vlr.gg has not published final results within 2 hours after the event\u2019s conclusion, a consensus of credible reporting may be used instead including video evidence.",
+              "settlement": "resolved_no",
+              "snapshot_id": "pmhist:4213088:699478871188270165839906195190197033119475660967935110829681280039168627906:2026-09-04T13:30:15+00:00",
+              "source_timestamp": "2026-09-04T13:30:15+00:00",
+              "source_type": "HISTORICAL",
+              "timestamp": "2026-09-04T13:30:15+00:00",
+              "token_id": "699478871188270165839906195190197033119475660967935110829681280039168627906",
+              "volume": 10.0,
+              "yes_mid": 0.0005
+            }
+          ],
+          "records_count": 3,
+          "records_hash": "sha256:fccb2ea15fdc93868f0bfed98bd21c65020ad01994e354326011a927d60c0866",
+          "row_count": 3,
+          "source_identity_hash": "sha256:15ca0415bea5c8b53d85b51c7ccccd13b5a649c7a755652017666c6af7bb3939"
+        },
+        {
+          "catalog": {
+            "catalog_hash": "sha256:8da8a1b58b9c8e68efdbe07705106881e6b71b3ae04e1c8cc2e5c86a1b32798f",
+            "completeness": 1.0,
+            "created_at": "2026-09-04T14:07:36.189600+00:00",
+            "dataset_id": "prediction:4199929",
+            "dataset_version": "sha256:9f63446433378378d2b20485ac1247c0c63812d4451c838057656590c4d89771",
+            "end_timestamp": "2026-09-04T11:20:12+00:00",
+            "instrument": "atp-doubles-luquroc-gornwal-2026-09-04-set-2-winner-Luque-Rocha-vs-Gornes-Walkow",
+            "market_type": "prediction",
+            "metadata": {
+              "historical_order_book_available": false,
+              "market_id": "4199929",
+              "polymarket_key": "[REDACTED]",
+              "research_quality": "PRICE_PROXY",
+              "token_ids": {
+                "no": "112694757835661108769979902738288766210459957538931491039784311501517862208857",
+                "yes": "59336053475689066673279314010576679346053281710216526978594530202474318150214"
+              }
+            },
+            "missing_ranges": [],
+            "provider": "polymarket",
+            "quality": "PRICE_PROXY",
+            "row_count": 75,
+            "snapshot_id": "pmhist:4199929:sha256:9f63446433378378d2b20485ac1247c0c63812d4451c838057656590c4d89771",
+            "source_type": "HISTORICAL",
+            "start_timestamp": "2026-09-03T23:00:34+00:00",
+            "timeframe": "event",
+            "updated_at": "2026-09-04T14:07:36.189600+00:00"
+          },
+          "catalog_hash": "sha256:8da8a1b58b9c8e68efdbe07705106881e6b71b3ae04e1c8cc2e5c86a1b32798f",
+          "dataset_id": "prediction:4199929",
+          "dataset_version": "sha256:9f63446433378378d2b20485ac1247c0c63812d4451c838057656590c4d89771",
+          "market_id": "4199929",
+          "provenance_authority": {
+            "attestation_contamination_result": "PASS",
+            "attestation_hash": "sha256:24e279b36735f5c6fb97a6115281d681fbaa3afd08a64c982c36cd929b9d93a3",
+            "attestation_status": "CURRENT",
+            "catalog_bound_source_type_rows": 0,
+            "dataset_id": "prediction:4199929",
+            "dataset_version": "sha256:9f63446433378378d2b20485ac1247c0c63812d4451c838057656590c4d89771",
+            "explicit_source_type_rows": 75,
+            "source": "constituent_catalog",
+            "source_type": "HISTORICAL"
+          },
+          "record_sample": [
+            {
+              "category": "other",
+              "expiry": "2026-09-11T09:30:00+00:00",
+              "liquidity": 0.0,
+              "market_id": "4199929",
+              "observed_at": "2026-09-03T23:00:34+00:00",
+              "order_book": null,
+              "provider": "polymarket",
+              "question": "Set 2 Winner: Luque/Rocha vs Gornes/Walkow",
+              "resolution_criteria": "This market refers to the tennis match between Luque/Rocha and Gornes/Walkow in the Porto, originally scheduled for September 4, 2026 at 5:30AM ET.\nThis market will resolve to \u201cLuque/Rocha\u201d if Luque/Rocha wins set 2. It will resolve to \u201cGornes/Walkow\u201d if Gornes/Walkow wins set 2.\nIf the match begins but set 2 is not completed with a winner determined (including the match ending before set 2 is reached), this market will resolve 50-50.\nIf the match is canceled (not played at all) or play has not begun by September 18, 2026, 11:59 PM ET (14 days after the scheduled start), this market will resolve 50-50.\nResolution will be based on official Challenger match statistics.",
+              "settlement": "resolved_yes",
+              "snapshot_id": "pmhist:4199929:59336053475689066673279314010576679346053281710216526978594530202474318150214:2026-09-03T23:00:34+00:00",
+              "source_timestamp": "2026-09-03T23:00:34+00:00",
+              "source_type": "HISTORICAL",
+              "timestamp": "2026-09-03T23:00:34+00:00",
+              "token_id": "59336053475689066673279314010576679346053281710216526978594530202474318150214",
+              "volume": null,
+              "yes_mid": 0.5
+            },
+            {
+              "category": "other",
+              "expiry": "2026-09-11T09:30:00+00:00",
+              "liquidity": 0.0,
+              "market_id": "4199929",
+              "observed_at": "2026-09-04T11:20:12+00:00",
+              "order_book": null,
+              "provider": "polymarket",
+              "question": "Set 2 Winner: Luque/Rocha vs Gornes/Walkow",
+              "resolution_criteria": "This market refers to the tennis match between Luque/Rocha and Gornes/Walkow in the Porto, originally scheduled for September 4, 2026 at 5:30AM ET.\nThis market will resolve to \u201cLuque/Rocha\u201d if Luque/Rocha wins set 2. It will resolve to \u201cGornes/Walkow\u201d if Gornes/Walkow wins set 2.\nIf the match begins but set 2 is not completed with a winner determined (including the match ending before set 2 is reached), this market will resolve 50-50.\nIf the match is canceled (not played at all) or play has not begun by September 18, 2026, 11:59 PM ET (14 days after the scheduled start), this market will resolve 50-50.\nResolution will be based on official Challenger match statistics.",
+              "settlement": "resolved_yes",
+              "snapshot_id": "pmhist:4199929:59336053475689066673279314010576679346053281710216526978594530202474318150214:2026-09-04T11:20:12+00:00",
+              "source_timestamp": "2026-09-04T11:20:12+00:00",
+              "source_type": "HISTORICAL",
+              "timestamp": "2026-09-04T11:20:12+00:00",
+              "token_id": "59336053475689066673279314010576679346053281710216526978594530202474318150214",
+              "volume": null,
+              "yes_mid": 0.9995
+            }
+          ],
+          "records_count": 75,
+          "records_hash": "sha256:b4f20f15a37caccb564c18ffc3b80f2fa6dcf2b2413b1918d3ff6ae9577a18f1",
+          "row_count": 75,
+          "source_identity_hash": "sha256:9f63446433378378d2b20485ac1247c0c63812d4451c838057656590c4d89771"
+        },
+        {
+          "catalog": {
+            "catalog_hash": "sha256:221d681f9a2182f4f88f98b116c1b891732be97b33650b32e5b1e0056ab0b176",
+            "completeness": 1.0,
+            "created_at": "2026-09-04T14:07:37.120693+00:00",
+            "dataset_id": "prediction:4199915",
+            "dataset_version": "sha256:ccf43fae88bcd589663d0cac5eb6483fe4605884a416b119706078e235063954",
+            "end_timestamp": "2026-09-04T13:40:20+00:00",
+            "instrument": "atp-doubles-ingipou-bertkym-2026-09-04-first-set-total-10pt5",
+            "market_type": "prediction",
+            "metadata": {
+              "historical_order_book_available": false,
+              "market_id": "4199915",
+              "polymarket_key": "[REDACTED]",
+              "research_quality": "PRICE_PROXY",
+              "token_ids": {
+                "no": "40173292949205424535055093552567039175132555888356528639884807442905650374419",
+                "yes": "88608252620175011298996305279040870467574945235876152867874683017523215883338"
+              }
+            },
+            "missing_ranges": [],
+            "provider": "polymarket",
+            "quality": "PRICE_PROXY",
+            "row_count": 89,
+            "snapshot_id": "pmhist:4199915:sha256:ccf43fae88bcd589663d0cac5eb6483fe4605884a416b119706078e235063954",
+            "source_type": "HISTORICAL",
+            "start_timestamp": "2026-09-03T23:00:36+00:00",
+            "timeframe": "event",
+            "updated_at": "2026-09-04T14:07:37.120693+00:00"
+          },
+          "catalog_hash": "sha256:221d681f9a2182f4f88f98b116c1b891732be97b33650b32e5b1e0056ab0b176",
+          "dataset_id": "prediction:4199915",
+          "dataset_version": "sha256:ccf43fae88bcd589663d0cac5eb6483fe4605884a416b119706078e235063954",
+          "market_id": "4199915",
+          "provenance_authority": {
+            "attestation_contamination_result": "PASS",
+            "attestation_hash": "sha256:24e279b36735f5c6fb97a6115281d681fbaa3afd08a64c982c36cd929b9d93a3",
+            "attestation_status": "CURRENT",
+            "catalog_bound_source_type_rows": 0,
+            "dataset_id": "prediction:4199915",
+            "dataset_version": "sha256:ccf43fae88bcd589663d0cac5eb6483fe4605884a416b119706078e235063954",
+            "explicit_source_type_rows": 89,
+            "source": "constituent_catalog",
+            "source_type": "HISTORICAL"
+          },
+          "record_sample": [
+            {
+              "category": "sports",
+              "expiry": "2026-09-11T12:30:00+00:00",
+              "liquidity": 0.0,
+              "market_id": "4199915",
+              "observed_at": "2026-09-03T23:00:36+00:00",
+              "order_book": null,
+              "provider": "polymarket",
+              "question": "Ingildsen/Poulsen vs. Bertola/Kym: Set 1 Games O/U 10.5",
+              "resolution_criteria": "This market refers to the tennis match between Ingildsen/Poulsen and Bertola/Kym in the Manacor, originally scheduled for September 4, 2026 at 8:30AM ET.\nThis market will resolve to \"Over\" if the total number of games completed in the first set equals or exceeds 11. Otherwise, it will resolve to \"Under.\" Any first-set tiebreak counts as one (1) game.\nIf the match is postponed or suspended, this market will remain open until the first set has been completed. A postponement alone will not trigger a 50-50 resolution.\nIf the match is permanently abandoned before the first set is completed, or if the first set has not been completed by September 18, 2026, 11:59 PM ET, this market will resolve 50-50, unless the outcome has already been unconditionally determined based on completed play. An outcome is considered determined if it would have been guaranteed had the set been played to completion using the minimum number of additional games required. For example, for a line of 9.5, if play stops with the first set at 5-4, completing the set would have required at least 1 additional game, resulting in at least 10 games played, so \"Over\" would resolve as the winning outcome.\nThe primary resolution source for this market will be official Challenger statistics; however, a consensus of credible reporting may also be used.",
+              "settlement": "resolved_no",
+              "snapshot_id": "pmhist:4199915:88608252620175011298996305279040870467574945235876152867874683017523215883338:2026-09-03T23:00:36+00:00",
+              "source_timestamp": "2026-09-03T23:00:36+00:00",
+              "source_type": "HISTORICAL",
+              "timestamp": "2026-09-03T23:00:36+00:00",
+              "token_id": "88608252620175011298996305279040870467574945235876152867874683017523215883338",
+              "volume": null,
+              "yes_mid": 0.5
+            },
+            {
+              "category": "sports",
+              "expiry": "2026-09-11T12:30:00+00:00",
+              "liquidity": 0.0,
+              "market_id": "4199915",
+              "observed_at": "2026-09-04T13:40:20+00:00",
+              "order_book": null,
+              "provider": "polymarket",
+              "question": "Ingildsen/Poulsen vs. Bertola/Kym: Set 1 Games O/U 10.5",
+              "resolution_criteria": "This market refers to the tennis match between Ingildsen/Poulsen and Bertola/Kym in the Manacor, originally scheduled for September 4, 2026 at 8:30AM ET.\nThis market will resolve to \"Over\" if the total number of games completed in the first set equals or exceeds 11. Otherwise, it will resolve to \"Under.\" Any first-set tiebreak counts as one (1) game.\nIf the match is postponed or suspended, this market will remain open until the first set has been completed. A postponement alone will not trigger a 50-50 resolution.\nIf the match is permanently abandoned before the first set is completed, or if the first set has not been completed by September 18, 2026, 11:59 PM ET, this market will resolve 50-50, unless the outcome has already been unconditionally determined based on completed play. An outcome is considered determined if it would have been guaranteed had the set been played to completion using the minimum number of additional games required. For example, for a line of 9.5, if play stops with the first set at 5-4, completing the set would have required at least 1 additional game, resulting in at least 10 games played, so \"Over\" would resolve as the winning outcome.\nThe primary resolution source for this market will be official Challenger statistics; however, a consensus of credible reporting may also be used.",
+              "settlement": "resolved_no",
+              "snapshot_id": "pmhist:4199915:88608252620175011298996305279040870467574945235876152867874683017523215883338:2026-09-04T13:40:20+00:00",
+              "source_timestamp": "2026-09-04T13:40:20+00:00",
+              "source_type": "HISTORICAL",
+              "timestamp": "2026-09-04T13:40:20+00:00",
+              "token_id": "88608252620175011298996305279040870467574945235876152867874683017523215883338",
+              "volume": null,
+              "yes_mid": 0.0005
+            }
+          ],
+          "records_count": 89,
+          "records_hash": "sha256:7122625f7fbc4a438ed49530f06e30c411975081f8db818c1f12c9228a6a8fac",
+          "row_count": 89,
+          "source_identity_hash": "sha256:ccf43fae88bcd589663d0cac5eb6483fe4605884a416b119706078e235063954"
+        }
+      ]
+    },
+    "constituents": {
+      "binding_count": 1000,
+      "catalog_count": 1000,
+      "row_count": 18141
+    },
+    "dataset_id": "Polymarket-historical",
+    "dataset_version": "sha256:9a831357e3f4016ad2c4f05d9bb11a98583ad94a2da36873b56e2b7db786a9ea",
+    "evaluated_records_count": 18141,
+    "evaluated_records_hash": "sha256:817ef2b404039f73b010dcde1db381ca3b70cabe10120019ca7cddde9dd56d9b",
+    "immutable": true,
+    "live_database_rejected": false,
+    "one_consistent_read_transaction": true,
+    "passed": true,
+    "read_only": true,
+    "reasons": [],
+    "record_provenance": {
+      "authority": "validated constituent catalog and exact CURRENT/PASS attestation",
+      "catalog_bound_source_type_rows": 408,
+      "explicit_source_type_rows": 17733
+    },
+    "source_hash": "sha256:138003719841f07cd162ee4046ee50265580c91b9bbc0d20fdda36acd95ce35d",
+    "source_hash_post": "sha256:138003719841f07cd162ee4046ee50265580c91b9bbc0d20fdda36acd95ce35d",
+    "source_hash_pre": "sha256:138003719841f07cd162ee4046ee50265580c91b9bbc0d20fdda36acd95ce35d",
+    "source_path": "C:\\Users\\User\\projects\\axiom\\runtime-data\\axiom-forward-proof-20260908T141804Z.sqlite",
+    "source_stat_post": {
+      "device": 17058033832660249346,
+      "inode": 38843546786269421,
+      "mtime_ns": 1788891735490128000,
+      "size": 11213832192
+    },
+    "source_stat_pre": {
+      "device": 17058033832660249346,
+      "inode": 38843546786269421,
+      "mtime_ns": 1788891735490128000,
+      "size": 11213832192
+    },
+    "source_uri": "file:C:/Users/User/projects/axiom/runtime-data/axiom-forward-proof-20260908T141804Z.sqlite?mode=ro&immutable=1",
+    "status": "PASSED"
+  },
+  "status": "QUALIFICATION_REJECTED",
+  "status_categories": {
+    "evaluator": "SKIPPED",
+    "export": "PASSED",
+    "qualification": "FROZEN",
+    "queue": "REJECTED",
+    "validation": "PASSED"
+  },
+  "timestamps": {
+    "exported_at": "2026-09-10T04:14:49.819762+00:00",
+    "processor_at": "2026-09-10T04:14:54.090624+00:00",
+    "run_started_at": "2026-09-10T04:14:17.638542+00:00",
+    "source_read_at": "2026-09-10T04:14:48.330923+00:00"
+  },
+  "validation": {
+    "aggregate_catalog_hash": "sha256:2c809fce934fd0bab128beca1d9c1bdbcd210d37de7e3348d03704b015f77fad",
+    "aggregate_catalog_projection_hash": "sha256:2c809fce934fd0bab128beca1d9c1bdbcd210d37de7e3348d03704b015f77fad",
+    "attestation": {
+      "attestation_hash": "sha256:24e279b36735f5c6fb97a6115281d681fbaa3afd08a64c982c36cd929b9d93a3",
+      "completeness": 1.0,
+      "contamination_result": "PASS",
+      "dataset_id": "Polymarket-historical",
+      "dataset_version": "sha256:9a831357e3f4016ad2c4f05d9bb11a98583ad94a2da36873b56e2b7db786a9ea",
+      "execution_fidelity": "PRICE_PROXY",
+      "market_type": "prediction",
+      "policy_version": "prediction-integrity-v1",
+      "provenance_version": "dataset-provenance-v1",
+      "row_count": 18141,
+      "source_type": "HISTORICAL",
+      "status": "CURRENT",
+      "verified_at": "2026-09-08T01:33:49.982877+00:00"
+    },
+    "attestation_hash": "sha256:24e279b36735f5c6fb97a6115281d681fbaa3afd08a64c982c36cd929b9d93a3",
+    "catalog": {
+      "catalog_hash": "sha256:2c809fce934fd0bab128beca1d9c1bdbcd210d37de7e3348d03704b015f77fad",
+      "completeness": 1.0,
+      "created_at": "2026-09-04T14:07:37.140797+00:00",
+      "dataset_id": "Polymarket-historical",
+      "dataset_version": "sha256:9a831357e3f4016ad2c4f05d9bb11a98583ad94a2da36873b56e2b7db786a9ea",
+      "end_timestamp": "2026-09-04T13:40:22+00:00",
+      "instrument": "POLYMARKET",
+      "market_type": "prediction",
+      "metadata": {
+        "category_counts": {
+          "crypto": 472,
+          "other": 482,
+          "sports": 46
+        },
+        "historical_order_book_available": false,
+        "instrument": "POLYMARKET",
+        "market_versions_count": 1000,
+        "market_versions_hash": "sha256:24d374d03a4c0a2665fd7178079a2e8d82efbfbb9428b39adec98943b7e8ca81",
+        "market_versions_sample": [
+          {
+            "market_id": "4213088",
+            "records": 3,
+            "version": "sha256:15ca0415bea5c8b53d85b51c7ccccd13b5a649c7a755652017666c6af7bb3939"
+          },
+          {
+            "market_id": "4199929",
+            "records": 75,
+            "version": "sha256:9f63446433378378d2b20485ac1247c0c63812d4451c838057656590c4d89771"
+          },
+          {
+            "market_id": "4199915",
+            "records": 89,
+            "version": "sha256:ccf43fae88bcd589663d0cac5eb6483fe4605884a416b119706078e235063954"
+          }
+        ],
+        "markets_discovered": 1000,
+        "markets_imported": 1000,
+        "price_points": 18141,
+        "provider": "polymarket",
+        "research_quality": "PRICE_PROXY",
+        "source_type": "HISTORICAL"
+      },
+      "missing_ranges": [],
+      "provider": "polymarket",
+      "quality": "PRICE_PROXY",
+      "row_count": 18141,
+      "snapshot_id": "Polymarket-historical:sha256:9a831357e3f4016ad2c4f05d9bb11a98583ad94a2da36873b56e2b7db786a9ea",
+      "source_type": "HISTORICAL",
+      "start_timestamp": "2026-09-03T23:00:28+00:00",
+      "timeframe": "event",
+      "updated_at": "2026-09-04T14:07:37.140797+00:00"
+    },
+    "constituents": {
+      "catalogs_hash": "sha256:8b63272a45702d81671e18ae4cf2a6a01dc74124dd8925f86ce4b85b235a48ec",
+      "count": 1000,
+      "records_count": 18141,
+      "records_hash": "sha256:817ef2b404039f73b010dcde1db381ca3b70cabe10120019ca7cddde9dd56d9b",
+      "sample": [
+        {
+          "catalog": {
+            "catalog_hash": "sha256:02971a9c8c29a5b6bf36d92857dfa86efc6a2ecadc9146609e3bb45b9d9f335a",
+            "completeness": 1.0,
+            "created_at": "2026-09-04T13:50:24.421013+00:00",
+            "dataset_id": "prediction:4213088",
+            "dataset_version": "sha256:15ca0415bea5c8b53d85b51c7ccccd13b5a649c7a755652017666c6af7bb3939",
+            "end_timestamp": "2026-09-04T13:30:15+00:00",
+            "instrument": "val-var-t1-2026-09-04-map-handicap-away-1pt5",
+            "market_type": "prediction",
+            "metadata": {
+              "historical_order_book_available": false,
+              "market_id": "4213088",
+              "polymarket_key": "[REDACTED]",
+              "research_quality": "PRICE_PROXY",
+              "token_ids": {
+                "no": "71718044860440927017336717291468775568247364611929549098313609865906129402712",
+                "yes": "699478871188270165839906195190197033119475660967935110829681280039168627906"
+              }
+            },
+            "missing_ranges": [],
+            "provider": "polymarket",
+            "quality": "PRICE_PROXY",
+            "row_count": 3,
+            "snapshot_id": "pmhist:4213088:sha256:15ca0415bea5c8b53d85b51c7ccccd13b5a649c7a755652017666c6af7bb3939",
+            "source_type": "HISTORICAL",
+            "start_timestamp": "2026-09-04T13:10:14+00:00",
+            "timeframe": "event",
+            "updated_at": "2026-09-04T13:50:24.421013+00:00"
+          },
+          "catalog_hash": "sha256:02971a9c8c29a5b6bf36d92857dfa86efc6a2ecadc9146609e3bb45b9d9f335a",
+          "dataset_id": "prediction:4213088",
+          "dataset_version": "sha256:15ca0415bea5c8b53d85b51c7ccccd13b5a649c7a755652017666c6af7bb3939",
+          "market_id": "4213088",
+          "provenance_authority": {
+            "attestation_contamination_result": "PASS",
+            "attestation_hash": "sha256:24e279b36735f5c6fb97a6115281d681fbaa3afd08a64c982c36cd929b9d93a3",
+            "attestation_status": "CURRENT",
+            "catalog_bound_source_type_rows": 0,
+            "dataset_id": "prediction:4213088",
+            "dataset_version": "sha256:15ca0415bea5c8b53d85b51c7ccccd13b5a649c7a755652017666c6af7bb3939",
+            "explicit_source_type_rows": 3,
+            "source": "constituent_catalog",
+            "source_type": "HISTORICAL"
+          },
+          "record_sample": [
+            {
+              "category": "other",
+              "expiry": "2026-09-04T17:00:00+00:00",
+              "liquidity": null,
+              "market_id": "4213088",
+              "observed_at": "2026-09-04T13:10:14+00:00",
+              "order_book": null,
+              "provider": "polymarket",
+              "question": "Map Handicap: VARREL (-1.5) vs T1 (+1.5)",
+              "resolution_criteria": "This market refers to the Valorant Lower bracket semifinal match between VARREL and T1 in the VCT Pacific Playoffs, initially scheduled for September 4, 2026 at 7:00 AM ET.\n\nThis market will resolve to \"VARREL\" if VARREL wins 2 or more maps than T1 in this match.\n\nOtherwise, this market will resolve to \"T1\". \n\nMaps won by forfeit, disqualification, walkover, or default are counted towards the handicap, provided that the match is completed.\n\nIf the match is canceled (not played at all for any reason) or ends in a tie, this market will resolve to 50-50.\n\nIf the match is postponed, it must be rescheduled to a start time on or before September 18, 2026 at 11:59 PM ET (14 calendar days after the originally scheduled start of September 4, 2026 at 7:00 AM ET). If, by that deadline, the most recently announced rescheduled start time is on or before the deadline, this market resolves based on the result of the match as played. Otherwise, this market resolves 50-50, regardless of whether the match is subsequently played.\n\nIf the match begins but is not completed, and one team wins due to the opponent's match forfeiture, disqualification, or walkover, this market will resolve to 50-50. \n\nIf the match ends due to the clinching map being forfeited this will count as a completed match.\n\nThe resolution source for this market will be official information from https://vlr.gg. However, if https://vlr.gg has not published final results within 2 hours after the event\u2019s conclusion, a consensus of credible reporting may be used instead including video evidence.",
+              "settlement": "resolved_no",
+              "snapshot_id": "pmhist:4213088:699478871188270165839906195190197033119475660967935110829681280039168627906:2026-09-04T13:10:14+00:00",
+              "source_timestamp": "2026-09-04T13:10:14+00:00",
+              "source_type": "HISTORICAL",
+              "timestamp": "2026-09-04T13:10:14+00:00",
+              "token_id": "699478871188270165839906195190197033119475660967935110829681280039168627906",
+              "volume": 10.0,
+              "yes_mid": 0.005
+            },
+            {
+              "category": "other",
+              "expiry": "2026-09-04T17:00:00+00:00",
+              "liquidity": null,
+              "market_id": "4213088",
+              "observed_at": "2026-09-04T13:30:15+00:00",
+              "order_book": null,
+              "provider": "polymarket",
+              "question": "Map Handicap: VARREL (-1.5) vs T1 (+1.5)",
+              "resolution_criteria": "This market refers to the Valorant Lower bracket semifinal match between VARREL and T1 in the VCT Pacific Playoffs, initially scheduled for September 4, 2026 at 7:00 AM ET.\n\nThis market will resolve to \"VARREL\" if VARREL wins 2 or more maps than T1 in this match.\n\nOtherwise, this market will resolve to \"T1\". \n\nMaps won by forfeit, disqualification, walkover, or default are counted towards the handicap, provided that the match is completed.\n\nIf the match is canceled (not played at all for any reason) or ends in a tie, this market will resolve to 50-50.\n\nIf the match is postponed, it must be rescheduled to a start time on or before September 18, 2026 at 11:59 PM ET (14 calendar days after the originally scheduled start of September 4, 2026 at 7:00 AM ET). If, by that deadline, the most recently announced rescheduled start time is on or before the deadline, this market resolves based on the result of the match as played. Otherwise, this market resolves 50-50, regardless of whether the match is subsequently played.\n\nIf the match begins but is not completed, and one team wins due to the opponent's match forfeiture, disqualification, or walkover, this market will resolve to 50-50. \n\nIf the match ends due to the clinching map being forfeited this will count as a completed match.\n\nThe resolution source for this market will be official information from https://vlr.gg. However, if https://vlr.gg has not published final results within 2 hours after the event\u2019s conclusion, a consensus of credible reporting may be used instead including video evidence.",
+              "settlement": "resolved_no",
+              "snapshot_id": "pmhist:4213088:699478871188270165839906195190197033119475660967935110829681280039168627906:2026-09-04T13:30:15+00:00",
+              "source_timestamp": "2026-09-04T13:30:15+00:00",
+              "source_type": "HISTORICAL",
+              "timestamp": "2026-09-04T13:30:15+00:00",
+              "token_id": "699478871188270165839906195190197033119475660967935110829681280039168627906",
+              "volume": 10.0,
+              "yes_mid": 0.0005
+            }
+          ],
+          "records_count": 3,
+          "records_hash": "sha256:fccb2ea15fdc93868f0bfed98bd21c65020ad01994e354326011a927d60c0866",
+          "row_count": 3,
+          "source_identity_hash": "sha256:15ca0415bea5c8b53d85b51c7ccccd13b5a649c7a755652017666c6af7bb3939"
+        },
+        {
+          "catalog": {
+            "catalog_hash": "sha256:8da8a1b58b9c8e68efdbe07705106881e6b71b3ae04e1c8cc2e5c86a1b32798f",
+            "completeness": 1.0,
+            "created_at": "2026-09-04T14:07:36.189600+00:00",
+            "dataset_id": "prediction:4199929",
+            "dataset_version": "sha256:9f63446433378378d2b20485ac1247c0c63812d4451c838057656590c4d89771",
+            "end_timestamp": "2026-09-04T11:20:12+00:00",
+            "instrument": "atp-doubles-luquroc-gornwal-2026-09-04-set-2-winner-Luque-Rocha-vs-Gornes-Walkow",
+            "market_type": "prediction",
+            "metadata": {
+              "historical_order_book_available": false,
+              "market_id": "4199929",
+              "polymarket_key": "[REDACTED]",
+              "research_quality": "PRICE_PROXY",
+              "token_ids": {
+                "no": "112694757835661108769979902738288766210459957538931491039784311501517862208857",
+                "yes": "59336053475689066673279314010576679346053281710216526978594530202474318150214"
+              }
+            },
+            "missing_ranges": [],
+            "provider": "polymarket",
+            "quality": "PRICE_PROXY",
+            "row_count": 75,
+            "snapshot_id": "pmhist:4199929:sha256:9f63446433378378d2b20485ac1247c0c63812d4451c838057656590c4d89771",
+            "source_type": "HISTORICAL",
+            "start_timestamp": "2026-09-03T23:00:34+00:00",
+            "timeframe": "event",
+            "updated_at": "2026-09-04T14:07:36.189600+00:00"
+          },
+          "catalog_hash": "sha256:8da8a1b58b9c8e68efdbe07705106881e6b71b3ae04e1c8cc2e5c86a1b32798f",
+          "dataset_id": "prediction:4199929",
+          "dataset_version": "sha256:9f63446433378378d2b20485ac1247c0c63812d4451c838057656590c4d89771",
+          "market_id": "4199929",
+          "provenance_authority": {
+            "attestation_contamination_result": "PASS",
+            "attestation_hash": "sha256:24e279b36735f5c6fb97a6115281d681fbaa3afd08a64c982c36cd929b9d93a3",
+            "attestation_status": "CURRENT",
+            "catalog_bound_source_type_rows": 0,
+            "dataset_id": "prediction:4199929",
+            "dataset_version": "sha256:9f63446433378378d2b20485ac1247c0c63812d4451c838057656590c4d89771",
+            "explicit_source_type_rows": 75,
+            "source": "constituent_catalog",
+            "source_type": "HISTORICAL"
+          },
+          "record_sample": [
+            {
+              "category": "other",
+              "expiry": "2026-09-11T09:30:00+00:00",
+              "liquidity": 0.0,
+              "market_id": "4199929",
+              "observed_at": "2026-09-03T23:00:34+00:00",
+              "order_book": null,
+              "provider": "polymarket",
+              "question": "Set 2 Winner: Luque/Rocha vs Gornes/Walkow",
+              "resolution_criteria": "This market refers to the tennis match between Luque/Rocha and Gornes/Walkow in the Porto, originally scheduled for September 4, 2026 at 5:30AM ET.\nThis market will resolve to \u201cLuque/Rocha\u201d if Luque/Rocha wins set 2. It will resolve to \u201cGornes/Walkow\u201d if Gornes/Walkow wins set 2.\nIf the match begins but set 2 is not completed with a winner determined (including the match ending before set 2 is reached), this market will resolve 50-50.\nIf the match is canceled (not played at all) or play has not begun by September 18, 2026, 11:59 PM ET (14 days after the scheduled start), this market will resolve 50-50.\nResolution will be based on official Challenger match statistics.",
+              "settlement": "resolved_yes",
+              "snapshot_id": "pmhist:4199929:59336053475689066673279314010576679346053281710216526978594530202474318150214:2026-09-03T23:00:34+00:00",
+              "source_timestamp": "2026-09-03T23:00:34+00:00",
+              "source_type": "HISTORICAL",
+              "timestamp": "2026-09-03T23:00:34+00:00",
+              "token_id": "59336053475689066673279314010576679346053281710216526978594530202474318150214",
+              "volume": null,
+              "yes_mid": 0.5
+            },
+            {
+              "category": "other",
+              "expiry": "2026-09-11T09:30:00+00:00",
+              "liquidity": 0.0,
+              "market_id": "4199929",
+              "observed_at": "2026-09-04T11:20:12+00:00",
+              "order_book": null,
+              "provider": "polymarket",
+              "question": "Set 2 Winner: Luque/Rocha vs Gornes/Walkow",
+              "resolution_criteria": "This market refers to the tennis match between Luque/Rocha and Gornes/Walkow in the Porto, originally scheduled for September 4, 2026 at 5:30AM ET.\nThis market will resolve to \u201cLuque/Rocha\u201d if Luque/Rocha wins set 2. It will resolve to \u201cGornes/Walkow\u201d if Gornes/Walkow wins set 2.\nIf the match begins but set 2 is not completed with a winner determined (including the match ending before set 2 is reached), this market will resolve 50-50.\nIf the match is canceled (not played at all) or play has not begun by September 18, 2026, 11:59 PM ET (14 days after the scheduled start), this market will resolve 50-50.\nResolution will be based on official Challenger match statistics.",
+              "settlement": "resolved_yes",
+              "snapshot_id": "pmhist:4199929:59336053475689066673279314010576679346053281710216526978594530202474318150214:2026-09-04T11:20:12+00:00",
+              "source_timestamp": "2026-09-04T11:20:12+00:00",
+              "source_type": "HISTORICAL",
+              "timestamp": "2026-09-04T11:20:12+00:00",
+              "token_id": "59336053475689066673279314010576679346053281710216526978594530202474318150214",
+              "volume": null,
+              "yes_mid": 0.9995
+            }
+          ],
+          "records_count": 75,
+          "records_hash": "sha256:b4f20f15a37caccb564c18ffc3b80f2fa6dcf2b2413b1918d3ff6ae9577a18f1",
+          "row_count": 75,
+          "source_identity_hash": "sha256:9f63446433378378d2b20485ac1247c0c63812d4451c838057656590c4d89771"
+        },
+        {
+          "catalog": {
+            "catalog_hash": "sha256:221d681f9a2182f4f88f98b116c1b891732be97b33650b32e5b1e0056ab0b176",
+            "completeness": 1.0,
+            "created_at": "2026-09-04T14:07:37.120693+00:00",
+            "dataset_id": "prediction:4199915",
+            "dataset_version": "sha256:ccf43fae88bcd589663d0cac5eb6483fe4605884a416b119706078e235063954",
+            "end_timestamp": "2026-09-04T13:40:20+00:00",
+            "instrument": "atp-doubles-ingipou-bertkym-2026-09-04-first-set-total-10pt5",
+            "market_type": "prediction",
+            "metadata": {
+              "historical_order_book_available": false,
+              "market_id": "4199915",
+              "polymarket_key": "[REDACTED]",
+              "research_quality": "PRICE_PROXY",
+              "token_ids": {
+                "no": "40173292949205424535055093552567039175132555888356528639884807442905650374419",
+                "yes": "88608252620175011298996305279040870467574945235876152867874683017523215883338"
+              }
+            },
+            "missing_ranges": [],
+            "provider": "polymarket",
+            "quality": "PRICE_PROXY",
+            "row_count": 89,
+            "snapshot_id": "pmhist:4199915:sha256:ccf43fae88bcd589663d0cac5eb6483fe4605884a416b119706078e235063954",
+            "source_type": "HISTORICAL",
+            "start_timestamp": "2026-09-03T23:00:36+00:00",
+            "timeframe": "event",
+            "updated_at": "2026-09-04T14:07:37.120693+00:00"
+          },
+          "catalog_hash": "sha256:221d681f9a2182f4f88f98b116c1b891732be97b33650b32e5b1e0056ab0b176",
+          "dataset_id": "prediction:4199915",
+          "dataset_version": "sha256:ccf43fae88bcd589663d0cac5eb6483fe4605884a416b119706078e235063954",
+          "market_id": "4199915",
+          "provenance_authority": {
+            "attestation_contamination_result": "PASS",
+            "attestation_hash": "sha256:24e279b36735f5c6fb97a6115281d681fbaa3afd08a64c982c36cd929b9d93a3",
+            "attestation_status": "CURRENT",
+            "catalog_bound_source_type_rows": 0,
+            "dataset_id": "prediction:4199915",
+            "dataset_version": "sha256:ccf43fae88bcd589663d0cac5eb6483fe4605884a416b119706078e235063954",
+            "explicit_source_type_rows": 89,
+            "source": "constituent_catalog",
+            "source_type": "HISTORICAL"
+          },
+          "record_sample": [
+            {
+              "category": "sports",
+              "expiry": "2026-09-11T12:30:00+00:00",
+              "liquidity": 0.0,
+              "market_id": "4199915",
+              "observed_at": "2026-09-03T23:00:36+00:00",
+              "order_book": null,
+              "provider": "polymarket",
+              "question": "Ingildsen/Poulsen vs. Bertola/Kym: Set 1 Games O/U 10.5",
+              "resolution_criteria": "This market refers to the tennis match between Ingildsen/Poulsen and Bertola/Kym in the Manacor, originally scheduled for September 4, 2026 at 8:30AM ET.\nThis market will resolve to \"Over\" if the total number of games completed in the first set equals or exceeds 11. Otherwise, it will resolve to \"Under.\" Any first-set tiebreak counts as one (1) game.\nIf the match is postponed or suspended, this market will remain open until the first set has been completed. A postponement alone will not trigger a 50-50 resolution.\nIf the match is permanently abandoned before the first set is completed, or if the first set has not been completed by September 18, 2026, 11:59 PM ET, this market will resolve 50-50, unless the outcome has already been unconditionally determined based on completed play. An outcome is considered determined if it would have been guaranteed had the set been played to completion using the minimum number of additional games required. For example, for a line of 9.5, if play stops with the first set at 5-4, completing the set would have required at least 1 additional game, resulting in at least 10 games played, so \"Over\" would resolve as the winning outcome.\nThe primary resolution source for this market will be official Challenger statistics; however, a consensus of credible reporting may also be used.",
+              "settlement": "resolved_no",
+              "snapshot_id": "pmhist:4199915:88608252620175011298996305279040870467574945235876152867874683017523215883338:2026-09-03T23:00:36+00:00",
+              "source_timestamp": "2026-09-03T23:00:36+00:00",
+              "source_type": "HISTORICAL",
+              "timestamp": "2026-09-03T23:00:36+00:00",
+              "token_id": "88608252620175011298996305279040870467574945235876152867874683017523215883338",
+              "volume": null,
+              "yes_mid": 0.5
+            },
+            {
+              "category": "sports",
+              "expiry": "2026-09-11T12:30:00+00:00",
+              "liquidity": 0.0,
+              "market_id": "4199915",
+              "observed_at": "2026-09-04T13:40:20+00:00",
+              "order_book": null,
+              "provider": "polymarket",
+              "question": "Ingildsen/Poulsen vs. Bertola/Kym: Set 1 Games O/U 10.5",
+              "resolution_criteria": "This market refers to the tennis match between Ingildsen/Poulsen and Bertola/Kym in the Manacor, originally scheduled for September 4, 2026 at 8:30AM ET.\nThis market will resolve to \"Over\" if the total number of games completed in the first set equals or exceeds 11. Otherwise, it will resolve to \"Under.\" Any first-set tiebreak counts as one (1) game.\nIf the match is postponed or suspended, this market will remain open until the first set has been completed. A postponement alone will not trigger a 50-50 resolution.\nIf the match is permanently abandoned before the first set is completed, or if the first set has not been completed by September 18, 2026, 11:59 PM ET, this market will resolve 50-50, unless the outcome has already been unconditionally determined based on completed play. An outcome is considered determined if it would have been guaranteed had the set been played to completion using the minimum number of additional games required. For example, for a line of 9.5, if play stops with the first set at 5-4, completing the set would have required at least 1 additional game, resulting in at least 10 games played, so \"Over\" would resolve as the winning outcome.\nThe primary resolution source for this market will be official Challenger statistics; however, a consensus of credible reporting may also be used.",
+              "settlement": "resolved_no",
+              "snapshot_id": "pmhist:4199915:88608252620175011298996305279040870467574945235876152867874683017523215883338:2026-09-04T13:40:20+00:00",
+              "source_timestamp": "2026-09-04T13:40:20+00:00",
+              "source_type": "HISTORICAL",
+              "timestamp": "2026-09-04T13:40:20+00:00",
+              "token_id": "88608252620175011298996305279040870467574945235876152867874683017523215883338",
+              "volume": null,
+              "yes_mid": 0.0005
+            }
+          ],
+          "records_count": 89,
+          "records_hash": "sha256:7122625f7fbc4a438ed49530f06e30c411975081f8db818c1f12c9228a6a8fac",
+          "row_count": 89,
+          "source_identity_hash": "sha256:ccf43fae88bcd589663d0cac5eb6483fe4605884a416b119706078e235063954"
+        }
+      ]
+    },
+    "evaluated_records_hash": "sha256:817ef2b404039f73b010dcde1db381ca3b70cabe10120019ca7cddde9dd56d9b",
+    "passed": true,
+    "reasons": [],
+    "record_provenance": {
+      "attestation_valid": true,
+      "authority": "validated constituent catalog and exact CURRENT/PASS attestation",
+      "catalog_bound_source_type_rows": 408,
+      "explicit_source_type_rows": 17733
+    },
+    "status": "PASSED"
+  }
+}
