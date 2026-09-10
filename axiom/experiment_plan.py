@@ -5,7 +5,7 @@ only contract that converts that intent into executable deterministic strategy
 variants; it never accepts Python, callbacks, credentials, or live controls.
 """
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 import hashlib
 import json
@@ -183,8 +183,10 @@ class MarketScopePolicy:
     instrument: str | None = None
     categories: tuple[str, ...] = ()
     market_ids: tuple[str, ...] = ()
-    filters: Mapping[str, Any] = MappingProxyType({})
-    regime_restrictions: Mapping[str, Any] = MappingProxyType({})
+    filters: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
+    regime_restrictions: Mapping[str, Any] = field(
+        default_factory=lambda: MappingProxyType({})
+    )
     provenance: str = "canonical"
 
     def __post_init__(self) -> None:
@@ -1023,9 +1025,17 @@ class ExperimentPlan:
     model_document: Mapping[str, Any] | None = None
     universe: Mapping[str, Any] | None = None
     research_mode: str = "PRICE_PROXY_RESEARCH"
-    assumptions: Mapping[str, Any] = MappingProxyType({})
-    exit_policy: Mapping[str, Any] = MappingProxyType({"type": "fixed_holding_period", "holding_period": 1})
-    trial_budget: Mapping[str, Any] = MappingProxyType({"limit": 1, "locked": True})
+    assumptions: Mapping[str, Any] = field(
+        default_factory=lambda: MappingProxyType({})
+    )
+    exit_policy: Mapping[str, Any] = field(
+        default_factory=lambda: MappingProxyType(
+            {"type": "fixed_holding_period", "holding_period": 1}
+        )
+    )
+    trial_budget: Mapping[str, Any] = field(
+        default_factory=lambda: MappingProxyType({"limit": 1, "locked": True})
+    )
 
     @classmethod
     def from_mapping(cls, document: Mapping[str, Any], *, hypothesis_id: str | None = None) -> "ExperimentPlan":
