@@ -1,12 +1,25 @@
 {
-  "status": "DEPLOYED_DISARMED",
+  "status": "DEPLOYED_DISARMED_RESEARCH_ACTIVE",
+  "deployment_state": {
+    "deployment": "DEPLOYED",
+    "live_control": "DISARMED",
+    "research": "ACTIVE"
+  },
   "baseline": "c2a08f7bf468be20271a0b074a1ed6e0e12c2b94",
   "branch": "main",
   "published_branches": [
     "main",
     "feature/polymarket-one-click-canary"
   ],
-  "deployed_revision": "72330e0bc87135e1f22836b9643e601ad533200f",
+  "deployed_revision": "6b9faffdf45f85e9ea885d0d9c805174f38f5838",
+  "source_revision": "6b9faffdf45f85e9ea885d0d9c805174f38f5838",
+  "superseded_revisions": [
+    {
+      "revision": "72330e0bc87135e1f22836b9643e601ad533200f",
+      "superseded_by": "6b9faffdf45f85e9ea885d0d9c805174f38f5838",
+      "reason": "Prior reported deployment revision superseded by the final deployed source revision."
+    }
+  ],
   "development_root": "C:/Users/User/projects/axiom-polymarket-release",
   "live_root": "C:/Users/User/projects/axiom",
   "live_database": "C:/Users/User/projects/axiom/runtime-data/axiom.sqlite",
@@ -411,7 +424,7 @@
     {
       "stage": "publication",
       "result": "PASS",
-      "deployed_revision": "72330e0bc87135e1f22836b9643e601ad533200f",
+      "deployed_revision": "6b9faffdf45f85e9ea885d0d9c805174f38f5838",
       "published_branches": [
         "main",
         "feature/polymarket-one-click-canary"
@@ -454,10 +467,220 @@
       "canary_execution": 0,
       "canary_fills": 0,
       "paper_execution": 0,
-      "live_fills_scope": "post-deploy canary execution/fill absence only",
+      "live_fills_scope": "No live fills are claimed or verified; post-deploy live execution remained disarmed and all observed paper events/fills were isolated non-live evidence.",
       "public_historical_fills_validated": false
     }
   ],
-  "live_fills_verified": true,
-  "live_fills_verification_scope": "post-deploy canary execution/fill absence only; public historical fills not validated"
+  "live_fills_verified": false,
+  "no_unintended_orders_verified": true,
+  "no_unintended_order_counts": {
+    "eligible_candidates": 0,
+    "submissions": 0,
+    "execution_events": 0,
+    "risk_fills": 0,
+    "canary_ledger_rows": 0
+  },
+  "live_fills_verification_scope": "No live fills verified because live execution was DISARMED; zero live submissions, execution events, risk fills, and canary ledger rows were observed.",
+  "final_acceptance": {
+    "source_revision": "6b9faffdf45f85e9ea885d0d9c805174f38f5838",
+    "status": {
+      "deployment": "DEPLOYED",
+      "live_control": "DISARMED",
+      "research": "ACTIVE"
+    },
+    "historical_trace": {
+      "raw_price_proxy_rows": 4096,
+      "normalized_price_proxy_rows": 4096,
+      "legacy_min_liquidity_threshold": 1.0,
+      "legacy_rows_after_min_liquidity": 0,
+      "legacy_rows_lacking_liquidity": 4096,
+      "finite_legitimate_mismatches": 0,
+      "spread_filter_reached": false,
+      "legacy_split": {
+        "historical": 0,
+        "forward_candidate": 0,
+        "forward_market": 0
+      }
+    },
+    "corrected_fixed_starter": {
+      "filters": {},
+      "rows": 4096,
+      "markets_or_token_ids": 91,
+      "split": {
+        "historical": 2445,
+        "forward_candidate": 830,
+        "forward_market": 821
+      },
+      "minimums": {
+        "samples": 30,
+        "trades": 20,
+        "lookback": 1
+      }
+    },
+    "strategy_validation": {
+      "momentum": {
+        "samples": 830,
+        "nonzero_signals": 138,
+        "positive_signals": 31,
+        "negative_signals": 107,
+        "entries": 3,
+        "exits": 3,
+        "fills": 6,
+        "roi": -0.003439,
+        "blocker": "INSUFFICIENT_DATA",
+        "blocker_detail": "6<20"
+      },
+      "mean_reversion": {
+        "samples": 830,
+        "signals": 138,
+        "entries": 27,
+        "exits": 13,
+        "fills": 40,
+        "roi": -0.0035367,
+        "historical_status": "FROZEN",
+        "current_scope": [
+          "ZERO_MATCHES",
+          "CANDIDATE_FORWARD_MARKET_UNRESOLVED"
+        ]
+      },
+      "negative_control": {
+        "signals": 0,
+        "entries": 0,
+        "exits": 0,
+        "fills": 0,
+        "excluded": true
+      }
+    },
+    "automatic_isolated_proof": {
+      "node_invocations": 5,
+      "cycles_per_invocation": 2,
+      "total_tick_cycles": 10,
+      "ticks": [
+        "collection",
+        "research",
+        "paper",
+        "reassessment",
+        "queue"
+      ],
+      "candidate_transitions": [
+        "SCHEMA_VALIDATED->PAPER_FORWARD",
+        "SCHEMA_VALIDATED->PAPER_FORWARD"
+      ],
+      "unchanged_later_cycles_repeated": false,
+      "paper_observations": 21,
+      "paper_execution_events": 21,
+      "paper_fills": 6,
+      "isolated_only": true,
+      "real_orders": 0,
+      "live_fills": 0
+    },
+    "current_evaluator_isolated_proof": {
+      "fixture": "exact FROZEN eligible fixture with exact scope and token IDs",
+      "fresh_chronological_snapshots": 2,
+      "canonical_evaluator_invocations": 1,
+      "features": 17,
+      "ready_signal": "READY_SIGNAL",
+      "missing_model_blocker": "MODEL_INPUT_MISSING",
+      "market_cap_blocker": {
+        "markets": 9,
+        "reason": "EXECUTION_FEASIBILITY_MARKET_CAP"
+      },
+      "yes": {
+        "price": 0.19,
+        "quantity": 5,
+        "notional": 0.95,
+        "result": "READY_SIGNAL"
+      },
+      "no": {
+        "price": 0.963,
+        "quantity": 5,
+        "notional": 4.815,
+        "result": "VENUE_MINIMUM_BLOCKER"
+      },
+      "disarmed_submit": {
+        "control_state": "DISARMED",
+        "blocker": "CANARY_NOT_ARMED",
+        "submissions": 0
+      }
+    },
+    "live_runtime": {
+      "dashboard_job": "ACTIVE",
+      "research_worker_last_completion_heartbeat": "2026-09-11 17:59:03.287601+00:00",
+      "selected_candidate": {
+        "dataset": "Polymarket-historical",
+        "version": "sha256:9a831357e3f4016ad2c4f05d9bb11a98583ad94a2da36873b56e2b7db786a9ea",
+        "stage": "SCHEMA_VALIDATED",
+        "samples": {
+          "observed": 308,
+          "minimum": 30
+        },
+        "trades": {
+          "observed": 0,
+          "minimum": 1
+        },
+        "forward_observations": 0,
+        "blocker": "INSUFFICIENT_DATA",
+        "gates_are_separate_from_fixed_starter": true
+      },
+      "completed_collection_cycles": [
+        {
+          "time": "17:57",
+          "attempted": 0,
+          "successful": 0,
+          "errors": 1
+        },
+        {
+          "time": "17:58",
+          "attempted": 0,
+          "successful": 0,
+          "errors": 1
+        },
+        {
+          "time": "17:59",
+          "attempted": 0,
+          "successful": 0,
+          "errors": 1
+        }
+      ],
+      "provider_error_note": "Current public-provider errors; scheduling and research ticks continue."
+    },
+    "processes": {
+      "live_operator": {
+        "pid": 28852,
+        "ready": true,
+        "persistent": true
+      },
+      "node_supervisor": {
+        "pid": 1516,
+        "running": true,
+        "persistent": true
+      }
+    },
+    "live_safety": {
+      "live_fills_verified": false,
+      "no_unintended_orders_verified": true,
+      "control_state": "DISARMED",
+      "autonomous_canary_enabled": false,
+      "eligible_candidates": 0,
+      "submissions": 0,
+      "execution_events": 0,
+      "risk_fills": 0,
+      "canary_ledger_rows": 0,
+      "paper_events_and_fills_are_non_live": true
+    },
+    "tests": {
+      "full_suite": {
+        "result": "PASS",
+        "passed_percent": 100,
+        "skipped": 3,
+        "existing_pytest_collection_warnings": 2,
+        "seconds": 183.81
+      },
+      "exact_worker_regression": {
+        "result": "PASS",
+        "passed": 12,
+        "total": 12
+      }
+    }
+  }
 }
