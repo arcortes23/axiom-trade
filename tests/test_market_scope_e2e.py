@@ -256,7 +256,18 @@ class MarketScopeEndToEndTests(unittest.TestCase):
     def _seed_predeclared_history(store: AxiomStore, *, attested: bool = True) -> None:
         rows = [
             {
-                "timestamp": (T0 + timedelta(minutes=index)).isoformat(),
+                "timestamp": (
+                    T0
+                    + timedelta(
+                        minutes=(
+                            2457
+                            if 2445 <= index <= 2457
+                            else 3276
+                            if 3275 <= index <= 3276
+                            else index
+                        )
+                    )
+                ).isoformat(),
                 "market_id": f"seed-market-{index % 64:02d}",
                 "yes_mid": 0.50,
                 "source_type": "HISTORICAL",
@@ -330,6 +341,38 @@ class MarketScopeEndToEndTests(unittest.TestCase):
                 {("Polymarket-historical", "e2e-4096-v1", "HISTORICAL")},
             )
             self.assertEqual(store.list_reports(), [])
+
+    def test_4096_row_history_preserves_exact_chronological_split_counts(self) -> None:
+        with AxiomStore(":memory:") as store:
+            self._seed_predeclared_history(store)
+            processor = AutonomousResearchProcessor(store, clock=lambda: T0)
+            document = experiment_plan(
+                dataset_id="Polymarket-historical",
+                dataset_version="e2e-4096-v1",
+            )
+            # Keep explicit and legacy scope authorities equivalent while
+            # avoiding a category filter absent from the synthetic rows.
+            document["target"] = {"instrument": "POLYMARKET"}
+            document["filters"] = {}
+            document["allowed_features"] = ["timestamp", "market_id", "yes_mid"]
+            document["model_document"] = {"field": "yes_mid"}
+            document["market_scope"] = {
+                "schema_version": "1",
+                "mode": "RULE_BASED_MARKETS",
+                "instrument": "POLYMARKET",
+                "categories": [],
+                "market_ids": [],
+                "filters": {},
+                "regime_restrictions": {},
+                "provenance": "canonical",
+            }
+            plan = ExperimentPlan.from_mapping(document, hypothesis_id="split-counts")
+            rows, split = processor._load_split(plan)
+            self.assertEqual(len(rows), 4096)
+            self.assertEqual(
+                (len(split.train), len(split.validation), len(split.holdout)),
+                (2445, 830, 821),
+            )
 
     def test_predeclared_seed_persists_missing_attestation_prerequisite_without_queue_rows(self) -> None:
         with AxiomStore(":memory:") as store:

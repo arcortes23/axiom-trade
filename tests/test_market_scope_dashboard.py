@@ -10,6 +10,17 @@ from axiom.storage import AxiomStore
 from axiom.dashboard import DashboardData, _dashboard_html
 
 
+class _CountingCandidateResults(list):
+    def __init__(self, values):
+        super().__init__(values)
+        self.visited = 0
+
+    def __iter__(self):
+        for value in super().__iter__():
+            self.visited += 1
+            yield value
+
+
 class _PersistedScopeStore:
     def __init__(self) -> None:
         self.calls = 0
@@ -80,6 +91,124 @@ class _PersistedScopeStore:
         raise AssertionError("dashboard must not scan current markets")
 
 
+class _ResearchProgressStore:
+    def __init__(self, *, with_candidate: bool = True) -> None:
+        self.with_candidate = with_candidate
+        candidate_id = "candidate-progress"
+        self.queue_item = {
+            "item_id": "queue-progress",
+            "item_type": "hypothesis",
+            "status": "REJECTED",
+            "created_at": "2026-09-11T00:00:00+00:00",
+            "updated_at": "2026-09-11T01:00:00+00:00",
+            "payload": {
+                "dataset_id": "Polymarket-historical",
+                "dataset_version": "sha256:dataset-v1",
+            },
+            "result": {
+                "accepted": False,
+                "blocker": "NO_SUPPORTED_EDGE",
+                "reason_code": "INSUFFICIENT_DATA",
+                "dataset_selector": {
+                    "dataset_id": "Polymarket-historical",
+                    "dataset_version": "sha256:dataset-v1",
+                },
+                "candidate_results": [
+                    {
+                        "candidate_id": candidate_id,
+                        "stage": None,
+                        "reason_code": "INSUFFICIENT_DATA",
+                    }
+                ],
+            },
+        }
+        self.lifecycle = {
+            "candidate_id": candidate_id,
+            "stage": "SCHEMA_VALIDATED",
+            "updated_at": "2026-09-11T01:00:00+00:00",
+            "payload": {
+                "dataset_id": "Polymarket-historical",
+                "dataset_version": "sha256:dataset-v1",
+                "experiment_plan": {"min_samples": 30, "min_trades": 20},
+                "minimum_sample_check": {
+                    "count": 830,
+                    "min_observations": 30,
+                    "trades": 6,
+                    "min_trades": 20,
+                    "passed": False,
+                },
+            },
+        }
+
+    def market_scope_resolution_funnel(self, *, limit: int = 1000):
+        return {"available": False, "stage_counts": {}, "stages": {}, "blocker_counts": {}}
+
+    def dashboard_overview_summary(self, *, activity_limit: int = 8):
+        return {
+            "counts": {},
+            "catalog": {},
+            "candidate_stages": {"SCHEMA_VALIDATED": 1} if self.with_candidate else {},
+            "queue_statuses": {"REJECTED": 1} if self.with_candidate else {},
+            "bootstrap_statuses": {},
+            "workers": [],
+            "latest_queue_item": self.queue_item if self.with_candidate else None,
+            "latest_activity": [],
+            "logical_rows": {},
+        }
+
+    def list_research_items(self, *, limit: int = 50):
+        return [self.queue_item] if self.with_candidate else []
+
+    def load_candidate_lifecycle(self, candidate_id=None, *, limit=50):
+        if not self.with_candidate:
+            return []
+        return [self.lifecycle] if candidate_id is None else self.lifecycle if candidate_id == self.lifecycle["candidate_id"] else None
+
+    def load_forward_tests(self, *, limit: int = 100):
+        return [
+            {
+                "experiment_id": "forward-candidate-progress",
+                "config": {"candidate_id": "candidate-progress"},
+            }
+        ] if self.with_candidate else []
+
+    def paper_history_counts(self, experiment_id: str):
+        return {"observations": 4, "fills": 0} if experiment_id == "forward-candidate-progress" else {"observations": 0, "fills": 0}
+
+    def get_scheduler_state(self, name: str):
+        return {
+            "status": "ACTIVE",
+            "schedule": "after_each_collection",
+            "last_run_at": "2026-09-11T01:00:00+00:00",
+            "next_run_at": "2026-09-11T02:00:00+00:00",
+        }
+
+    def list_worker_states(self, *, limit: int = 32):
+        return [{"worker_name": "research-queue", "status": "idle", "payload": {}}]
+
+    def get_collector_state(self, name: str):
+        return {
+            "last_cycle_ended_at": "2026-09-11T00:59:00+00:00",
+            "next_scheduled_collection_at": "2026-09-11T01:05:00+00:00",
+        }
+
+    def list_collection_cycles(self, *, collector_name: str = "polymarket", limit: int = 4):
+        return []
+
+
+class _LifecycleHistoryStore(_ResearchProgressStore):
+    def load_candidate_lifecycle(self, candidate_id=None, *, limit=50):
+        if candidate_id is not None:
+            return None
+        older = dict(self.lifecycle)
+        older["stage"] = "IDEA"
+        older["updated_at"] = "2026-09-11T00:00:00+00:00"
+        newer = dict(self.lifecycle)
+        newer["stage"] = "PAPER_FORWARD"
+        newer["updated_at"] = "2026-09-11T01:00:00+00:00"
+        return [older, newer]
+
+
 class MarketScopeDashboardTests(unittest.TestCase):
     def test_overview_reads_only_persisted_bounded_funnel(self) -> None:
         store = _PersistedScopeStore()
@@ -90,6 +219,68 @@ class MarketScopeDashboardTests(unittest.TestCase):
         self.assertEqual(funnel["stages"]["fresh_complete_inputs"]["blocker_counts"], {"STALE_INPUT": 1, "INCOMPLETE_INPUT": 2})
         self.assertEqual(funnel["timestamps"]["latest"], "2026-09-09T11:59:04+00:00")
         self.assertEqual(snapshot["forward_evidence"]["grade_scope"], "persisted_market_scope_resolution")
+
+    def test_research_progress_joins_compact_queue_stage_and_reports_persisted_validation(self) -> None:
+        snapshot = DashboardData(store=_ResearchProgressStore()).overview_summary()
+        progress = snapshot["research_progress"]
+        self.assertEqual(progress["candidate_count"], 1)
+        self.assertEqual(progress["candidate_stage"], "SCHEMA_VALIDATED")
+        self.assertEqual(progress["dataset_id"], "Polymarket-historical")
+        self.assertEqual(progress["dataset_version"], "sha256:dataset-v1")
+        self.assertEqual(progress["samples_available"], 830)
+        self.assertEqual(progress["samples_required"], 30)
+        self.assertEqual(progress["trades_available"], 6)
+        self.assertEqual(progress["trades_required"], 20)
+        self.assertEqual(progress["forward_observations"], 4)
+        self.assertEqual(progress["blocker"], "INSUFFICIENT_DATA")
+        self.assertEqual(progress["job_status"], "ACTIVE")
+        self.assertEqual(progress["next_run_at"], "2026-09-11T02:00:00+00:00")
+
+    def test_research_progress_bounds_oversized_nested_candidate_results(self) -> None:
+        store = _ResearchProgressStore()
+        candidate_results = _CountingCandidateResults(
+            [
+                {"candidate_id": "candidate-progress", "stage": None, "reason_code": "INSUFFICIENT_DATA"},
+                *[
+                    {
+                        "candidate_id": f"candidate-extra-{index:03d}",
+                        "stage": "SCHEMA_VALIDATED",
+                    }
+                    for index in range(200)
+                ],
+            ]
+        )
+        store.queue_item["result"]["candidate_results"] = candidate_results
+        store.queue_item["status"] = "PENDING"
+
+        progress = DashboardData(store=store).overview_summary()["research_progress"]
+
+        self.assertEqual(candidate_results.visited, 50)
+        self.assertEqual(progress["candidate_count"], 50)
+        self.assertEqual(progress["candidate_stage"], "SCHEMA_VALIDATED")
+        self.assertEqual(progress["samples_available"], 830)
+        self.assertEqual(progress["trades_available"], 6)
+        self.assertEqual(progress["forward_observations"], 4)
+
+    def test_research_progress_fallback_uses_latest_lifecycle_record(self) -> None:
+        store = _LifecycleHistoryStore()
+        store.queue_item["result"]["candidate_results"] = []
+
+        progress = DashboardData(store=store).overview_summary()["research_progress"]
+
+        self.assertEqual(progress["candidate_count"], 1)
+        self.assertEqual(progress["candidate_stage"], "PAPER_FORWARD")
+        self.assertEqual(progress["samples_available"], 830)
+
+    def test_research_progress_does_not_invent_candidate_or_blocker_when_queue_is_empty(self) -> None:
+        progress = DashboardData(store=_ResearchProgressStore(with_candidate=False)).overview_summary()[
+            "research_progress"
+        ]
+        self.assertEqual(progress["candidate_count"], 0)
+        self.assertIsNone(progress["candidate_stage"])
+        self.assertIsNone(progress["blocker"])
+        self.assertEqual(progress["forward_observations"], 0)
+
     def test_real_store_resolution_is_exposed_without_market_catalog_scan(self) -> None:
         store = AxiomStore(":memory:")
         self.addCleanup(store.close)
@@ -149,6 +340,12 @@ class MarketScopeDashboardTests(unittest.TestCase):
         self.assertIn("Qualification is historical evidence only", html)
         self.assertIn("blocker_counts", html)
         self.assertIn("market-scope-funnel", html)
+        self.assertIn("AUTOMATIC RESEARCH", html)
+        self.assertIn("Samples available / required", html)
+        self.assertIn("Trades available / required", html)
+        self.assertIn("Forward observations", html)
+        self.assertIn("Last completion", html)
+        self.assertIn("Next run", html)
 
     def test_settings_review_surface_hides_machine_fences_and_duplicate_inputs(self) -> None:
         html = _dashboard_html()

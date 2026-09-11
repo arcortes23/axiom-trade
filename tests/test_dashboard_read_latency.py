@@ -469,13 +469,26 @@ class DashboardReadLatencyFixture(unittest.TestCase):
                 self.assertIsInstance(payload, dict)
                 self.assertLess(elapsed, 1.0)
                 assert isinstance(payload, dict)
+                progress = payload.get("research_progress")
+                if endpoint.endswith("/overview-summary"):
+                    self.assertIsInstance(progress, dict)
+                    assert isinstance(progress, dict)
+                    self.assertEqual(progress["candidate_count"], CANDIDATE_COUNT)
+                    self.assertEqual(progress["candidate_stage"], "PAPER_FORWARD")
+                    self.assertIn("forward_observations", progress)
+                    candidate_status = payload["candidate_status"]
+                    self.assertEqual(candidate_status["paper_forward"], CANDIDATE_COUNT)
+                    self.assertEqual(len(payload["latest_candidates"]), CANDIDATE_COUNT)
+                elif isinstance(progress, dict):
+                    self.assertLessEqual(progress["candidate_count"], 50)
+                    self.assertIn("job_status", progress)
+                    self.assertIn("forward_observations", progress)
                 if endpoint.endswith("/canary"):
                     canary = payload["canary"]
                     self.assertEqual(canary["eligibility_raw_count"], CANDIDATE_COUNT)
                     self.assertEqual(canary["eligible_count"], CANDIDATE_COUNT)
                     self.assertEqual(canary["rankable_raw_count"], CANDIDATE_COUNT)
                     self.assertEqual(canary["rankable_count"], CANDIDATE_COUNT)
-                else:
                     candidate_status = payload["candidate_status"]
                     self.assertEqual(candidate_status["canary_eligible"], CANDIDATE_COUNT)
                     self.assertEqual(candidate_status["rankable"], CANDIDATE_COUNT)
@@ -514,7 +527,7 @@ class DashboardReadLatencyFixture(unittest.TestCase):
                     self.assertEqual(status, 200)
         self.assertEqual(self.service.readiness_snapshot(), before)
 
-    def test_dashboard_sql_call_count_is_bounded_for_28_candidates(self) -> None:
+    def test_dashboard_sql_call_count_and_projection_are_bounded_for_oversized_results(self) -> None:
         reader = AxiomStore(str(self.database_path))
         self.addCleanup(reader.close)
         server = DashboardServer(
@@ -522,12 +535,45 @@ class DashboardReadLatencyFixture(unittest.TestCase):
             data=DashboardData(store=reader, control=OperatorControlPlane(reader), clock=lambda: T0),
         ).start()
         self.addCleanup(server.stop)
+        result = {
+            "accepted": False,
+            "reason_code": "INSUFFICIENT_DATA",
+            "candidate_results": [
+                {"candidate_id": "candidate-00", "stage": None},
+                *[
+                    {"candidate_id": f"candidate-extra-{index:04d}", "stage": "SCHEMA_VALIDATED"}
+                    for index in range(2000)
+                ],
+            ],
+        }
+        queue_item = reader.enqueue_research_item(
+            "hypothesis",
+            {"dataset_id": "Polymarket-historical"},
+            dedupe_key="oversized-dashboard-candidate-results",
+            item_id="queue-oversized-dashboard-candidate-results",
+            priority=99,
+        )
+        with reader.transaction(immediate=True):
+            reader.connection.execute(
+                "UPDATE research_queue SET status=?,result_json=?,updated_at=? WHERE item_id=?",
+                ("COMPLETED", json.dumps(result, separators=(",", ":")), T0.isoformat(), queue_item["item_id"]),
+            )
         statements: list[str] = []
         reader.connection.set_trace_callback(statements.append)
-        status, payload, _body = self._request(server, "api/v2/canary")
-        self.assertEqual(status, 200)
-        self.assertIsInstance(payload, dict)
-        self.assertLessEqual(len(statements), 96)
+        for endpoint in ("api/v2/overview-summary", "api/v2/canary"):
+            statements.clear()
+            with self.subTest(endpoint=endpoint):
+                status, payload, body = self._request(server, endpoint)
+                self.assertEqual(status, 200)
+                self.assertIsInstance(payload, dict)
+                self.assertLessEqual(len(statements), 96)
+                if endpoint.endswith("overview-summary"):
+                    assert isinstance(payload, dict)
+                    progress = payload["research_progress"]
+                    self.assertEqual(progress["candidate_count"], 50)
+                    self.assertEqual(progress["candidate_stage"], "PAPER_FORWARD")
+                    self.assertLessEqual(len(payload["latest_candidates"]), 50)
+                    self.assertNotIn("candidate-extra-1999", body)
 
     def test_readiness_snapshot_current_stale_and_timestamp_semantics(self) -> None:
         initial = self.service.readiness_snapshot()

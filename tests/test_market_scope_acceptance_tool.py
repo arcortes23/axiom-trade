@@ -2248,16 +2248,16 @@ class MarketScopeAcceptanceToolTests(unittest.TestCase):
         self.assertEqual(report["qualification"]["status"], "REJECTED")
         self.assertEqual(
             report["qualification"]["blocker"],
-            "PROCESSOR_VALIDATION_TRADE_EVIDENCE_UNAVAILABLE",
+            "HISTORICAL_MIN_TRADES_NOT_MET",
         )
         self.assertFalse(report["qualification"]["historical_qualified"])
         self.assertFalse(report["qualification"]["current_evaluation_allowed"])
         chain = report["chain"]
-        self.assertEqual(chain["reason_code"], "PROCESSOR_VALIDATION_TRADE_EVIDENCE_UNAVAILABLE")
-        self.assertEqual(chain["exact_reason"], "PROCESSOR_VALIDATION_TRADE_EVIDENCE_UNAVAILABLE")
-        self.assertEqual(chain["decision_reason"], "PROCESSOR_VALIDATION_TRADE_EVIDENCE_UNAVAILABLE")
-        self.assertEqual(chain["reason"], "PROCESSOR_VALIDATION_TRADE_EVIDENCE_UNAVAILABLE")
-        self.assertEqual(chain["primary_reason"], "PROCESSOR_VALIDATION_TRADE_EVIDENCE_UNAVAILABLE")
+        self.assertEqual(chain["reason_code"], "HISTORICAL_MIN_TRADES_NOT_MET")
+        self.assertEqual(chain["exact_reason"], "HISTORICAL_MIN_TRADES_NOT_MET")
+        self.assertEqual(chain["decision_reason"], "HISTORICAL_MIN_TRADES_NOT_MET")
+        self.assertEqual(chain["reason"], "HISTORICAL_MIN_TRADES_NOT_MET")
+        self.assertEqual(chain["primary_reason"], "HISTORICAL_MIN_TRADES_NOT_MET")
         self.assertEqual(
             chain["canonical_pipeline_reason"],
             "INSUFFICIENT_DATA",
@@ -2277,12 +2277,12 @@ class MarketScopeAcceptanceToolTests(unittest.TestCase):
         )
         self.assertEqual(
             runtime["decisive_blocker"],
-            "PROCESSOR_VALIDATION_TRADE_EVIDENCE_UNAVAILABLE",
+            "HISTORICAL_MIN_TRADES_NOT_MET",
         )
         paper_runtime = report["gate_assessment"]["PAPER_PROMOTABLE"]["evidence"]["runtime_metric_assessment"]
         self.assertEqual(
             paper_runtime["decisive_blocker"],
-            "PROCESSOR_VALIDATION_TRADE_EVIDENCE_UNAVAILABLE",
+            "HISTORICAL_MIN_TRADES_NOT_MET",
         )
         self.assertEqual(
             report["qualification"]["evidence"]["actionable_signal_count"],
@@ -2290,7 +2290,7 @@ class MarketScopeAcceptanceToolTests(unittest.TestCase):
         )
         self.assertEqual(
             report["qualification"]["evidence"]["closed_trade_count"],
-            None,
+            0.0,
         )
         self.assertEqual(
             report["source"]["attestation"]["execution_fidelity"],
@@ -2322,7 +2322,7 @@ class MarketScopeAcceptanceToolTests(unittest.TestCase):
         )
         self.assertEqual(
             report["evaluator"]["qualification_blocker"],
-            "PROCESSOR_VALIDATION_TRADE_EVIDENCE_UNAVAILABLE",
+            "HISTORICAL_MIN_TRADES_NOT_MET",
         )
         self.assertEqual(report["actual_decision"]["status"], "NOT_RUN")
         self.assertEqual(
@@ -2589,7 +2589,7 @@ class MarketScopeAcceptanceToolTests(unittest.TestCase):
         self.assertEqual(report["evaluator"]["reason"], "HISTORICAL_QUALIFICATION_FAILED")
         self.assertEqual(
             report["evaluator"]["qualification_blocker"],
-            "PROCESSOR_VALIDATION_TRADE_EVIDENCE_UNAVAILABLE",
+            "HISTORICAL_MIN_TRADES_NOT_MET",
         )
         self.assertTrue(report["execution_feasibility"]["current_book_required"] is False)
         self.assertFalse(report["security"]["credentials_used"])
@@ -2840,7 +2840,7 @@ class MarketScopeAcceptanceToolTests(unittest.TestCase):
             report = _compact_report(Path(directory) / "evaluator.sqlite")
             evaluator = report["evaluator"]
             self.assertEqual(evaluator["status"], "SKIPPED")
-            self.assertEqual(evaluator["qualification_blocker"], "PROCESSOR_VALIDATION_TRADE_EVIDENCE_UNAVAILABLE")
+            self.assertEqual(evaluator["qualification_blocker"], "HISTORICAL_MIN_TRADES_NOT_MET")
             self.assertEqual(evaluator["current_market_resolution"], "NOT_RUN")
             self.assertEqual(evaluator["fresh_identity_and_books"], "NOT_RUN")
             self.assertIsNone(evaluator["decision"])

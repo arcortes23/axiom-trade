@@ -9,6 +9,7 @@ from unittest.mock import patch
 from axiom.autonomous import (
     AutonomousResearchConfig,
     AutonomousResearchProcessor,
+    _canonical_binding,
     _proposal_identity,
 )
 from axiom.experiment_plan import ExperimentPlan
@@ -17,7 +18,7 @@ from axiom.lifecycle import CandidateStage
 from axiom.storage import AxiomStore
 from axiom.collector import CollectorConfig, PolymarketCollector
 from axiom.data import InMemoryPredictionProvider
-from axiom.domain import OrderBookLevel, OrderBookSnapshot, PredictionMarketSnapshot, SettlementState
+from axiom.domain import Fill, MarketType, OrderBookLevel, OrderBookSnapshot, PredictionMarketSnapshot, SettlementState, Side
 from axiom.forward import ForwardTestRegistry
 from axiom.paper_engine import run_forward_paper
 from axiom.research_bus import DurableResearchBus
@@ -339,8 +340,14 @@ class PolymarketResearchOrchestrationTests(unittest.TestCase):
             self.assertEqual(cycle.claimed, 1)
             # The fixture intentionally has too few qualifying trades for the
             # starter's research gate; marker validation must still succeed
-            # and leave the ordinary insufficiency decision intact.
+            # and leave the candidate schema-valid with an explicit
+            # insufficiency result rather than PROCESSING_FAILED.
             self.assertEqual(cycle.rejected, 1)
+            self.assertEqual(cycle.failed, 0)
+            self.assertEqual(
+                cycle.results[0]["candidate_results"][0]["stage"],
+                CandidateStage.SCHEMA_VALIDATED.value,
+            )
             self.assertEqual(cycle.results[0]["reason_code"], "INSUFFICIENT_DATA")
 
     def test_sparse_predeclared_generated_payload_normalizes_before_marker(self) -> None:
@@ -396,6 +403,104 @@ class PolymarketResearchOrchestrationTests(unittest.TestCase):
             self.assertEqual(cycle.claimed, 1)
             self.assertEqual(cycle.rejected, 1)
             self.assertEqual(cycle.results[0]["reason_code"], "GENERATED_PROVENANCE_INVALID")
+
+    def test_generated_mutation_requires_exact_provenance_manual_hypothesis_stays_compatible(self) -> None:
+        with AxiomStore(":memory:") as store:
+            _seed_predeclared_historical_dataset(store)
+            predecessor = _legacy_prediction_predecessor(candidate_id="mutation-parent")
+            plan_document = dict(predecessor["experiment_plan"])
+            plan_document["target"] = {
+                "instrument": "POLYMARKET",
+                "market_ids": ["market-0"],
+            }
+            plan_document["market_scope"] = {
+                "schema_version": "1",
+                "mode": "EXACT_MARKETS",
+                "instrument": "POLYMARKET",
+                "market_ids": ["market-0"],
+                "categories": [],
+                "filters": {},
+                "regime_restrictions": {},
+                "provenance": "canonical",
+            }
+            plan = ExperimentPlan.from_mapping(
+                plan_document,
+                hypothesis_id="mutation-parent-hypothesis",
+            )
+            store.save_experiment_plan(
+                plan.plan_id,
+                plan.as_dict(),
+                hypothesis_id=plan.hypothesis_id,
+                plan_hash=plan.plan_hash,
+                status="ACCEPTED",
+                timestamp=T0,
+            )
+            parent_id = "mutation-parent"
+            parameters = plan.variants()[0]
+            strategy = plan.strategy_for(parameters, parent_id)
+            parent_payload = {
+                "candidate_id": parent_id,
+                "plan_id": plan.plan_id,
+                "plan_hash": plan.plan_hash,
+                "dataset_id": plan.dataset_id,
+                "dataset_version": plan.dataset_version,
+                "generation": 0,
+            }
+            store.save_candidate_lifecycle(parent_id, CandidateStage.IDEA.value, parent_payload)
+            store.save_candidate_lifecycle(
+                parent_id,
+                CandidateStage.ROBUSTNESS_CHECKED.value,
+                {**parent_payload, "robustness_passed": True, "holdout_used": False},
+                from_stage=CandidateStage.IDEA.value,
+                timestamp=T0,
+            )
+            processor = AutonomousResearchProcessor(
+                store,
+                config=AutonomousResearchConfig(max_items_per_cycle=1, max_children_per_parent=1),
+                clock=lambda: T0,
+            )
+            children = processor._generate_mutations(
+                plan,
+                [{"candidate_id": parent_id, "strategy": strategy}],
+                {parent_id: 1.0},
+                T0,
+            )
+            self.assertEqual(len(children), 1)
+            child_item = store.list_research_items(limit=1)[0]
+            self.assertTrue(child_item["payload"]["provenance"]["internal"]["generated"])
+            self.assertEqual(child_item["payload"]["provenance"]["internal"]["kind"], "mutation_child")
+
+            store.connection.execute(
+                "DELETE FROM dataset_catalog WHERE dataset_id=? AND dataset_version=?",
+                (plan.dataset_id, plan.dataset_version),
+            )
+            store.connection.commit()
+            blocked = processor.process_pending(now=T0)
+            self.assertEqual(blocked.failed, 0, repr(blocked))
+            self.assertEqual(blocked.rejected, 1, repr(blocked))
+            self.assertEqual(blocked.results[0]["reason_code"], "DATASET_PROVENANCE_INVALID")
+
+            manual = {
+                "proposal_id": plan.hypothesis_id,
+                "statement": "An ordinary manually submitted proposal remains compatible.",
+                "source": "offline legacy fixture",
+                "tests": ["chronological validation"],
+                "dataset_version": plan.dataset_version,
+                "time_split": "train-validation-holdout",
+                "paper_only": True,
+                "experiment_plan": plan.as_dict(),
+            }
+            processor.bus.submit_hypothesis(
+                manual,
+                dedupe_key="manual-compatible",
+                available_at=T0,
+            )
+            compatible = processor.process_pending(now=T0)
+            self.assertEqual(compatible.failed, 0, repr(compatible))
+            self.assertNotIn(
+                compatible.results[0].get("reason_code"),
+                {"DATASET_PROVENANCE_INVALID", "DATASET_ATTESTATION_MISSING", "DATASET_ATTESTATION_STALE"},
+            )
 
     def test_predeclared_seed_missing_attestation_blocks_without_enqueue(self) -> None:
         with AxiomStore(":memory:") as store:
@@ -743,6 +848,40 @@ class PolymarketResearchOrchestrationTests(unittest.TestCase):
                         "settlement": "resolved_yes",
                     }
                 ],
+                metadata={
+                    "source_type": "HISTORICAL",
+                    "provider": "SYNTHETIC_OFFLINE",
+                    "instrument": "POLYMARKET",
+                    "research_quality": "PRICE_PROXY",
+                },
+                quality="PRICE_PROXY",
+            )
+            store.save_dataset_catalog(
+                "insufficient-history",
+                "v1",
+                provider="SYNTHETIC_OFFLINE",
+                instrument="POLYMARKET",
+                market_type=MarketType.PREDICTION,
+                timeframe="event",
+                start_timestamp=T0,
+                end_timestamp=T0,
+                row_count=1,
+                completeness=1.0,
+                missing_ranges=(),
+                quality="PRICE_PROXY",
+                source_type="HISTORICAL",
+                snapshot_id="SYNTHETIC_OFFLINE-insufficient-history-v1",
+                metadata={
+                    "provider": "SYNTHETIC_OFFLINE",
+                    "source_type": "HISTORICAL",
+                    "instrument": "POLYMARKET",
+                    "research_quality": "PRICE_PROXY",
+                },
+            )
+            store.verify_dataset_integrity_attestation(
+                "insufficient-history",
+                "v1",
+                force=True,
             )
             bus = DurableResearchBus(store)
             plan = {
@@ -789,11 +928,13 @@ class PolymarketResearchOrchestrationTests(unittest.TestCase):
                 clock=lambda: T0,
             )
             cycle = processor.process_pending(now=T0)
+            self.assertEqual(cycle.failed, 0, repr(cycle))
             lifecycle = store.load_candidate_lifecycle(limit=None)
             self.assertEqual(len(lifecycle), 1, repr(cycle))
             candidate = lifecycle[0]
             self.assertEqual(candidate["stage"], "SCHEMA_VALIDATED")
             self.assertNotIn("forward_test_id", candidate["payload"])
+            self.assertIn("dataset_attestation", candidate["payload"])
 
             market = PredictionMarketSnapshot(
                 timestamp=T0,
@@ -840,6 +981,7 @@ class PolymarketResearchOrchestrationTests(unittest.TestCase):
             candidate_id = str(candidate["candidate_id"])
             spec = ForwardTestRegistry(store).get("forward-" + candidate_id)
             self.assertIsNotNone(spec)
+            self.assertNotIn("dataset_attestation", spec.config)
             self.assertEqual(spec.experiment_id, "forward-" + candidate_id)
             self.assertEqual(tuple(spec.allowed_markets), ("market-1",))
             self.assertTrue(spec.config["market_authority_required"])
@@ -867,7 +1009,84 @@ class PolymarketResearchOrchestrationTests(unittest.TestCase):
             )
             self.assertGreaterEqual(cycle.observations_processed, 1)
             self.assertTrue(store.list_paper_observations(spec.experiment_id))
-            self.assertEqual(store.load_candidate_lifecycle(candidate_id)["stage"], "SCHEMA_VALIDATED")
+            first = processor.reevaluate_forward_candidates(now=T0 + timedelta(minutes=1))
+            self.assertEqual(len(first), 1, repr(first))
+            self.assertTrue(first[0]["reassessed"])
+            reassessed = store.load_candidate_lifecycle(candidate_id)
+            self.assertEqual(reassessed["stage"], CandidateStage.PAPER_FORWARD.value)
+            self.assertIn("dataset_attestation", reassessed["payload"])
+            self.assertEqual(
+                _canonical_binding(reassessed["payload"]["dataset_attestation"]),
+                _canonical_binding(
+                    store.load_dataset_integrity_attestation("insufficient-history", "v1")
+                ),
+            )
+            self.assertNotIn("dataset_attestation", reassessed["payload"]["forward_config"])
+            first_identity = reassessed["payload"]["forward_evidence_identity"]
+            unchanged = processor.reevaluate_forward_candidates(now=T0 + timedelta(minutes=1))
+            self.assertFalse(any(item.get("reassessed") for item in unchanged))
+            self.assertEqual(
+                store.load_candidate_lifecycle(candidate_id)["payload"]["forward_evidence_identity"],
+                first_identity,
+            )
+            fill_before = len(store.list_candidate_lifecycle_events(candidate_id))
+            store.save_fill(
+                Fill(
+                    timestamp=T0 + timedelta(minutes=2),
+                    market_type=MarketType.PREDICTION,
+                    symbol="market-1",
+                    side=Side.BUY,
+                    quantity=1.0,
+                    price=0.51,
+                    fees=0.001,
+                    slippage=0.001,
+                    strategy_id=spec.strategy_hash,
+                    order_id="manual-fill",
+                    market_id="market-1",
+                    expected_probability=0.80,
+                    metadata={
+                        "paper_experiment_id": spec.experiment_id,
+                        "execution_status": "FULL_FILL",
+                        "requested_quantity": 1.0,
+                    },
+                ),
+                fill_id="paper-fill-manual-fill",
+            )
+            fill_changed = processor.reevaluate_forward_candidates(now=T0 + timedelta(minutes=2))
+            self.assertEqual(len(fill_changed), 1, repr(fill_changed))
+            fill_identity = store.load_candidate_lifecycle(candidate_id)["payload"]["forward_evidence_identity"]
+            self.assertNotEqual(fill_identity, first_identity)
+            fill_events = len(store.list_candidate_lifecycle_events(candidate_id))
+            self.assertEqual(fill_events, fill_before + 1)
+            fill_unchanged = processor.reevaluate_forward_candidates(now=T0 + timedelta(minutes=2))
+            self.assertFalse(any(item.get("reassessed") for item in fill_unchanged))
+            self.assertEqual(
+                len(store.list_candidate_lifecycle_events(candidate_id)),
+                fill_events,
+            )
+            self.assertEqual(
+                store.load_candidate_lifecycle(candidate_id)["payload"]["forward_evidence_identity"],
+                fill_identity,
+            )
+            store.save_paper_observation(
+                "manual-new-observation",
+                spec.experiment_id,
+                "market-1",
+                T0 + timedelta(minutes=2),
+                {
+                    "market_id": "market-1",
+                    "timestamp": (T0 + timedelta(minutes=2)).isoformat(),
+                    "yes_mid": 0.50,
+                    "model_probability": 0.80,
+                    "settlement": "open",
+                },
+            )
+            changed = processor.reevaluate_forward_candidates(now=T0 + timedelta(minutes=2))
+            self.assertEqual(len(changed), 1, repr(changed))
+            self.assertNotEqual(
+                store.load_candidate_lifecycle(candidate_id)["payload"]["forward_evidence_identity"],
+                first_identity,
+            )
 
     def test_recorded_replay_partitions_rows_by_each_candidate_scope(self) -> None:
         plan_a = _recorded_replay_plan("plan-replay-a", "market-a")

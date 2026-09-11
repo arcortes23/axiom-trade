@@ -138,6 +138,8 @@ def _pagination_error(query: Mapping[str, Any]) -> str | None:
 _MAX_SIZE_FALLBACK = 1000
 _LATEST_CANDIDATE_LIMIT = 50
 
+_RESEARCH_PROGRESS_LIMIT = 50
+_RESEARCH_FORWARD_TEST_LIMIT = 100
 
 
 def _pagination_params(query: Mapping[str, Any] | None = None) -> dict[str, Any]:
@@ -235,7 +237,7 @@ def _bounded_value(value: Any, *, depth: int = 0) -> Any:
             for key, child in islice(value.items(), 32)
         }
     if isinstance(value, (list, tuple, set, frozenset)):
-        return [_bounded_value(child, depth=depth + 1) for child in list(value)[:32]]
+        return [_bounded_value(child, depth=depth + 1) for child in islice(value, 32)]
     if isinstance(value, (datetime, date)):
         return _jsonable(value)
     if isinstance(value, str):
@@ -2684,21 +2686,47 @@ class DashboardData:
         }
 
     def _bounded_candidate_lifecycle(self, *, limit: int = _LATEST_CANDIDATE_LIMIT) -> list[Mapping[str, Any]]:
-        """Read only the bounded candidate history needed by legacy cards."""
+        """Read the globally newest bounded candidate history for dashboard cards."""
         if self.store is None:
             return []
+        try:
+            bounded_limit = max(0, min(int(limit), _LATEST_CANDIDATE_LIMIT))
+        except (TypeError, ValueError, OverflowError):
+            return []
+        if bounded_limit == 0:
+            return []
+
+        def bounded_records(records: Any) -> list[Mapping[str, Any]]:
+            source = records if isinstance(records, (list, tuple)) else ()
+            return list(
+                islice(
+                    (item for item in source if isinstance(item, Mapping)),
+                    bounded_limit,
+                )
+            )
+
+        paginator = getattr(self.store, "paginate_candidate_lifecycle", None)
+        if callable(paginator):
+            try:
+                page = paginator(
+                    page=1,
+                    page_size=min(_LATEST_CANDIDATE_LIMIT, max(10, bounded_limit)),
+                    sort="updated_at",
+                    direction="desc",
+                )
+            except (AttributeError, TypeError, ValueError, sqlite3.Error):
+                page = None
+            if isinstance(page, Mapping):
+                return bounded_records(page.get("items"))
+
         loader = getattr(self.store, "load_candidate_lifecycle", None)
         if not callable(loader):
             return []
         try:
-            records = loader(limit=max(0, min(int(limit), _LATEST_CANDIDATE_LIMIT)))
+            records = loader(limit=bounded_limit)
         except (AttributeError, TypeError, ValueError, sqlite3.Error):
             return []
-        return [
-            item
-            for item in (records if isinstance(records, (list, tuple)) else ())
-            if isinstance(item, Mapping)
-        ][:_LATEST_CANDIDATE_LIMIT]
+        return bounded_records(records)
 
     def _candidate_rows(self) -> list[dict[str, Any]]:
         """Return the bounded legacy candidate table without authority scans."""
@@ -3487,6 +3515,474 @@ class DashboardData:
             "live_execution": False,
         }
 
+    def _research_progress_projection(
+        self,
+        *,
+        aggregate: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Project the bounded automatic-research handoff from persisted rows.
+
+        Queue results intentionally contain a compact candidate summary.  The
+        lifecycle row remains authoritative for the current stage, so a
+        compact ``null`` stage never erases a persisted ``SCHEMA_VALIDATED``
+        stage.  This method only reads bounded queue/lifecycle/worker pages and
+        persisted forward-test and paper-history projections.
+        """
+        empty: dict[str, Any] = {
+            "available": False,
+            "candidate_count": 0,
+            "dataset_id": None,
+            "dataset_version": None,
+            "job_status": "NOT_INITIALIZED",
+            "last_completion_at": None,
+            "next_run_at": None,
+            "candidate_stage": None,
+            "samples_available": None,
+            "samples_required": None,
+            "trades_available": None,
+            "trades_required": None,
+            "forward_observations": 0,
+            "blocker": None,
+            "available_samples": None,
+            "required_samples": None,
+            "available_trades": None,
+            "required_trades": None,
+            "forward_observation_count": 0,
+            "automatic_research_job": {
+                "status": "NOT_INITIALIZED",
+                "last_completion_at": None,
+                "next_run_at": None,
+                "schedule": None,
+            },
+            "dataset": {"id": None, "version": None},
+            "status": None,
+            "job": {
+                "status": "NOT_INITIALIZED",
+                "last_completion_at": None,
+                "next_run_at": None,
+                "schedule": None,
+            },
+            "candidate": {
+                "stage": None,
+                "samples": {"available": None, "required": None},
+                "trades": {"available": None, "required": None},
+                "forward_observations": 0,
+                "blocker": None,
+            },
+            "collector": {
+                "status": None,
+                "last_completion_at": None,
+                "next_run_at": None,
+            },
+            "live_execution": False,
+        }
+        if self.store is None:
+            return empty
+
+        aggregate = aggregate if isinstance(aggregate, Mapping) else {}
+
+        def records(method_name: str, **kwargs: Any) -> list[Mapping[str, Any]]:
+            method = getattr(self.store, method_name, None)
+            if not callable(method):
+                return []
+            try:
+                raw = method(**kwargs)
+            except (AttributeError, TypeError, ValueError, sqlite3.Error):
+                return []
+            return [
+                item
+                for item in (raw if isinstance(raw, (list, tuple)) else ())
+                if isinstance(item, Mapping)
+            ]
+
+        def mapping_call(method_name: str, *args: Any, **kwargs: Any) -> Mapping[str, Any]:
+            method = getattr(self.store, method_name, None)
+            if not callable(method):
+                return {}
+            try:
+                raw = method(*args, **kwargs)
+            except (AttributeError, TypeError, ValueError, sqlite3.Error):
+                return {}
+            return dict(raw) if isinstance(raw, Mapping) else {}
+
+        def text(value: Any) -> str | None:
+            if value is None:
+                return None
+            result = str(value).strip()
+            return result or None
+
+        def integer(value: Any) -> int | None:
+            if isinstance(value, bool):
+                return None
+            try:
+                result = int(value)
+            except (TypeError, ValueError, OverflowError):
+                return None
+            return max(0, result)
+
+        def first_text(sources: Sequence[Mapping[str, Any]], keys: Sequence[str]) -> str | None:
+            for source in sources:
+                for key in keys:
+                    value = text(source.get(key))
+                    if value is not None:
+                        return value
+            return None
+
+        def first_integer(sources: Sequence[Mapping[str, Any]], keys: Sequence[str]) -> int | None:
+            for source in sources:
+                for key in keys:
+                    value = integer(source.get(key))
+                    if value is not None:
+                        return value
+            return None
+
+        queue_items = records("list_research_items", limit=_RESEARCH_PROGRESS_LIMIT)
+        latest_queue = aggregate.get("latest_queue_item")
+        if isinstance(latest_queue, Mapping):
+            latest_id = text(latest_queue.get("item_id"))
+            if latest_id and not any(text(item.get("item_id")) == latest_id for item in queue_items):
+                queue_items.append(latest_queue)
+        queue_items.sort(
+            key=lambda item: parse_timestamp(item.get("updated_at") or item.get("created_at"))
+            or datetime.min.replace(tzinfo=datetime.now().astimezone().tzinfo),
+            reverse=True,
+        )
+        lifecycle_records = self._bounded_candidate_lifecycle(limit=_RESEARCH_PROGRESS_LIMIT)
+        lifecycle_records.sort(key=lambda item: text(item.get("candidate_id")) or "")
+        lifecycle_records.sort(
+            key=lambda item: parse_timestamp(item.get("updated_at"))
+            or datetime.min.replace(tzinfo=datetime.now().astimezone().tzinfo),
+            reverse=True,
+        )
+        lifecycle_by_id: dict[str, Mapping[str, Any]] = {}
+        for item in lifecycle_records:
+            identifier = text(item.get("candidate_id"))
+            if identifier and identifier not in lifecycle_by_id:
+                lifecycle_by_id[identifier] = item
+
+        first_queue_candidate: (
+            tuple[Mapping[str, Any], Mapping[str, Any], Mapping[str, Any]] | None
+        ) = None
+        queue_candidate_ids: set[str] = set()
+        candidate_work = 0
+        for queue_item in queue_items:
+            queue_result = queue_item.get("result")
+            queue_result = queue_result if isinstance(queue_result, Mapping) else {}
+            compact = queue_result.get("candidate_results")
+            compact_rows = compact if isinstance(compact, (list, tuple)) else ()
+            if not compact_rows and text(queue_result.get("candidate_id")):
+                compact_rows = (queue_result,)
+            remaining = _RESEARCH_PROGRESS_LIMIT - candidate_work
+            if remaining <= 0:
+                break
+            for compact_row in islice(compact_rows, remaining):
+                candidate_work += 1
+                if not isinstance(compact_row, Mapping):
+                    continue
+                candidate_id = text(compact_row.get("candidate_id"))
+                if not candidate_id:
+                    continue
+                if first_queue_candidate is None:
+                    first_queue_candidate = (queue_item, queue_result, compact_row)
+                queue_candidate_ids.add(candidate_id)
+
+        candidate_id: str | None = None
+        queue_item: Mapping[str, Any] = {}
+        queue_result: Mapping[str, Any] = {}
+        compact_candidate: Mapping[str, Any] = {}
+        if first_queue_candidate is not None:
+            queue_item, queue_result, compact_candidate = first_queue_candidate
+            candidate_id = text(compact_candidate.get("candidate_id"))
+        elif lifecycle_records:
+            candidate_id = next(iter(lifecycle_by_id), None)
+        lifecycle = lifecycle_by_id.get(candidate_id or "", {})
+        lifecycle_payload = lifecycle.get("payload")
+        lifecycle_payload = lifecycle_payload if isinstance(lifecycle_payload, Mapping) else {}
+        queue_payload = queue_item.get("payload")
+        queue_payload = queue_payload if isinstance(queue_payload, Mapping) else {}
+        compact_result = compact_candidate if isinstance(compact_candidate, Mapping) else {}
+        result_sources = [compact_result, queue_result, lifecycle_payload, queue_payload]
+        plans = [
+            source.get("experiment_plan")
+            for source in result_sources
+            if isinstance(source.get("experiment_plan"), Mapping)
+        ]
+        plan = plans[0] if plans else {}
+        minimum_checks: list[Mapping[str, Any]] = []
+        evidence_sources: list[Mapping[str, Any]] = []
+        for source in (*result_sources, plan):
+            if not isinstance(source, Mapping):
+                continue
+            evidence_sources.append(source)
+            for key in (
+                "minimum_sample_check",
+                "minimum_samples",
+                "validation",
+                "forward_validation",
+                "forward_evidence",
+                "historical_evidence",
+            ):
+                nested = source.get(key)
+                if isinstance(nested, Mapping):
+                    minimum_checks.append(nested)
+                    evidence_sources.append(nested)
+        evidence_sources.extend(minimum_checks)
+        samples_available = first_integer(
+            evidence_sources,
+            (
+                "count",
+                "sample_count",
+                "samples",
+                "independent_samples",
+                "validation_sample_count",
+                "forward_sample_count",
+                "raw_observations",
+            ),
+        )
+        samples_required = first_integer(
+            [*minimum_checks, plan, *result_sources],
+            (
+                "min_observations",
+                "min_independent_samples",
+                "required_samples",
+                "min_samples",
+                "minimum_samples",
+                "required_validation_samples",
+            ),
+        )
+        trades_available = first_integer(
+            evidence_sources,
+            (
+                "trades",
+                "trade_count",
+                "filled_trades",
+                "validation_filled_trades",
+                "validation_trade_count",
+                "validation_trades",
+                "forward_trade_count",
+            ),
+        )
+        trades_required = first_integer(
+            [*minimum_checks, plan, *result_sources],
+            (
+                "min_trades",
+                "required_trades",
+                "minimum_trades",
+                "required_validation_trades",
+            ),
+        )
+
+        forward_tests = records("load_forward_tests", limit=_RESEARCH_FORWARD_TEST_LIMIT)
+        forward_ids: list[str] = []
+        for source in result_sources:
+            for key in ("forward_test_id", "forward_test", "paper_observation_intent_id"):
+                value = source.get(key)
+                if isinstance(value, Mapping):
+                    value = value.get("experiment_id") or value.get("id")
+                value = text(value)
+                if value and value not in forward_ids:
+                    forward_ids.append(value)
+        if candidate_id:
+            for item in forward_tests:
+                config = item.get("config")
+                config = config if isinstance(config, Mapping) else {}
+                if text(config.get("candidate_id")) == candidate_id:
+                    identifier = text(item.get("experiment_id"))
+                    if identifier and identifier not in forward_ids:
+                        forward_ids.append(identifier)
+            for identifier in (
+                f"forward-candidate-{candidate_id}",
+                f"observation-intent-{candidate_id}",
+            ):
+                if identifier not in forward_ids:
+                    forward_ids.append(identifier)
+        forward_observations: int | None = None
+        history_method = getattr(self.store, "paper_history_counts", None)
+        if callable(history_method):
+            for experiment_id in forward_ids[:8]:
+                history = mapping_call("paper_history_counts", experiment_id)
+                if history:
+                    count = integer(history.get("observations"))
+                    if count is not None:
+                        forward_observations = (
+                            (forward_observations or 0) + count
+                        )
+        if forward_observations is None:
+            observation_method = getattr(self.store, "list_paper_observations", None)
+            if callable(observation_method):
+                for experiment_id in forward_ids[:8]:
+                    rows = records(
+                        "list_paper_observations",
+                        experiment_id=experiment_id,
+                        limit=1000,
+                    )
+                    forward_observations = (forward_observations or 0) + len(rows)
+        if forward_observations is None:
+            forward_observations = first_integer(
+                evidence_sources,
+                ("forward_observations", "forward_observation_count", "observations"),
+            )
+        forward_observations = max(0, int(forward_observations or 0))
+
+        lifecycle_stage = text(lifecycle.get("stage"))
+        candidate_stage = lifecycle_stage or first_text(
+            [compact_result, queue_result],
+            ("stage", "candidate_stage"),
+        )
+        dataset_sources: list[Mapping[str, Any]] = []
+        for source in result_sources:
+            dataset_selector = source.get("dataset_selector")
+            if isinstance(dataset_selector, Mapping):
+                dataset_sources.append(dataset_selector)
+            dataset_sources.append(source)
+        dataset_id = first_text(dataset_sources, ("dataset_id", "dataset", "data_id"))
+        dataset_version = first_text(
+            dataset_sources,
+            ("dataset_version", "data_version", "version"),
+        )
+
+        scheduler = mapping_call("get_scheduler_state", "hermes-control")
+        worker_rows = records("list_worker_states", limit=32)
+        worker_map = {
+            text(item.get("worker_name")): item
+            for item in worker_rows
+            if text(item.get("worker_name"))
+        }
+        research_worker = worker_map.get("research-queue", {})
+        if not research_worker:
+            research_worker = worker_map.get("research-engine", {})
+        research_payload = research_worker.get("payload")
+        research_payload = research_payload if isinstance(research_payload, Mapping) else {}
+        worker_cycle = research_payload.get("last_cycle")
+        worker_cycle = worker_cycle if isinstance(worker_cycle, Mapping) else {}
+        job_status = text(scheduler.get("status"))
+        if job_status is None:
+            job_status = text(research_worker.get("status"))
+        job_status = (job_status or "NOT_INITIALIZED").upper()
+        last_completion = first_text(
+            [scheduler, worker_cycle, research_payload, compact_result, queue_item],
+            (
+                "last_completion_at",
+                "last_completed_at",
+                "cycle_ended_at",
+                "ended_at",
+                "last_run_at",
+                "updated_at",
+            ),
+        )
+        # A queue item's updated_at is a completion only when it is terminal.
+        # Do not manufacture completion from a worker heartbeat/update.
+        if queue_item and not _is_terminal_hermes_status(queue_item.get("status")):
+            last_completion = first_text(
+                [scheduler, worker_cycle, research_payload],
+                (
+                    "last_completion_at",
+                    "last_completed_at",
+                    "cycle_ended_at",
+                    "ended_at",
+                    "last_run_at",
+                ),
+            )
+        collector_state = mapping_call("get_collector_state", "polymarket")
+        collector_worker = worker_map.get("polymarket-collector", {})
+        collector_payload = collector_worker.get("payload")
+        collector_payload = collector_payload if isinstance(collector_payload, Mapping) else {}
+        cycles = records("list_collection_cycles", collector_name="polymarket", limit=4)
+        latest_cycle = cycles[0] if cycles else {}
+        latest_cycle_payload = latest_cycle.get("payload")
+        latest_cycle_payload = latest_cycle_payload if isinstance(latest_cycle_payload, Mapping) else {}
+        collector_completion = first_text(
+            [
+                collector_state,
+                collector_payload,
+                latest_cycle,
+                latest_cycle_payload,
+            ],
+            ("last_cycle_ended_at", "last_successful_cycle", "ended_at"),
+        )
+        collector_next = first_text(
+            [collector_state, collector_payload],
+            ("next_scheduled_collection_at", "next_run_at"),
+        )
+        next_run = first_text(
+            [scheduler, research_payload, collector_state, collector_payload],
+            ("next_run_at", "next_scheduled_collection_at"),
+        )
+        schedule = first_text([scheduler], ("trigger", "schedule"))
+        if schedule is None:
+            schedule = "after_each_collection" if scheduler else None
+        candidate_count = min(
+            _RESEARCH_PROGRESS_LIMIT,
+            len(queue_candidate_ids | set(lifecycle_by_id)),
+        )
+        blocker = first_text(
+            [compact_result, queue_result, lifecycle_payload],
+            ("reason_code", "blocker"),
+        )
+        if blocker and blocker.upper() == "NO_SUPPORTED_EDGE":
+            blocker = None
+        has_candidate = candidate_id is not None
+        candidate_blocker = blocker if has_candidate else None
+        candidate_status = candidate_blocker if candidate_blocker else None
+        result = {
+            "available": has_candidate,
+            "candidate_count": candidate_count,
+            "dataset_id": dataset_id,
+            "dataset_version": dataset_version,
+            "job_status": job_status,
+            "last_completion_at": last_completion,
+            "next_run_at": next_run,
+            "candidate_stage": candidate_stage,
+            "samples_available": samples_available,
+            "samples_required": samples_required,
+            "trades_available": trades_available,
+            "trades_required": trades_required,
+            "forward_observations": forward_observations,
+            "blocker": candidate_blocker,
+            "available_samples": samples_available,
+            "required_samples": samples_required,
+            "available_trades": trades_available,
+            "required_trades": trades_required,
+            "forward_observation_count": forward_observations,
+            "automatic_research_job": {
+                "status": job_status,
+                "last_completion_at": last_completion,
+                "next_run_at": next_run,
+                "schedule": schedule,
+            },
+            "dataset": {
+                "id": dataset_id,
+                "version": dataset_version,
+            },
+            "status": candidate_status,
+            "job": {
+                "status": job_status,
+                "last_completion_at": last_completion,
+                "next_run_at": next_run,
+                "schedule": schedule,
+            },
+            "candidate": {
+                "stage": candidate_stage,
+                "samples": {
+                    "available": samples_available,
+                    "required": samples_required,
+                },
+                "trades": {
+                    "available": trades_available,
+                    "required": trades_required,
+                },
+                "forward_observations": forward_observations,
+                "blocker": candidate_blocker,
+            },
+            "collector": {
+                "status": text(collector_worker.get("status")) if collector_worker else None,
+                "last_completion_at": collector_completion,
+                "next_run_at": collector_next,
+            },
+            "live_execution": False,
+        }
+        return result
+
     def market_scope_funnel_data(self) -> dict[str, Any]:
         """Project the persisted market-scope handoff without recomputation.
 
@@ -3959,6 +4455,7 @@ class DashboardData:
                 {},
                 {},
             )
+            research_progress = self._research_progress_projection(aggregate={})
             latest_candidates = [
                 self._latest_candidate_projection(item)
                 for item in candidate_records[:_LATEST_CANDIDATE_LIMIT]
@@ -3975,11 +4472,13 @@ class DashboardData:
                     market_scope_funnel,
                     candidate_ids=candidate_ids,
                 ),
+                "research_progress": research_progress,
                 "market_scope_funnel": market_scope_funnel,
                 "signal_scan_reason_counts": {},
                 "live_execution": False,
             }
         aggregate = self.store.dashboard_overview_summary(activity_limit=8)
+        research_progress = self._research_progress_projection(aggregate=aggregate)
         research_feed = (
             self.store.research_feed_status()
             if callable(getattr(self.store, "research_feed_status", None))
@@ -4407,6 +4906,7 @@ class DashboardData:
             "canary": canary_status,
             "canary_signal": latest_signal,
             "forward_evidence": forward_evidence,
+            "research_progress": research_progress,
             "market_scope_funnel": market_scope_funnel,
             "signal_scan_reason_counts": signal_scan_reason_counts,
             "candidate_status": {
@@ -5238,6 +5738,7 @@ def _dashboard_html(
   </header>
   <main>
     <section id="view-overview" class="view active"><div id="component-grid" class="status-grid"></div><div id="overview-readiness-snapshot"></div><div id="research-cards" class="card-grid"></div>
+      <article id="research-progress" class="panel"><div class="section-title"><h2>AUTOMATIC RESEARCH</h2><span class="badge warn">persisted · paper-only</span></div><div id="research-progress-content" class="three-col"></div></article>
       <article id="research-feed" class="panel"><div class="section-title"><h2>RESEARCH FEED</h2><span class="badge warn">observability · paper-only</span></div><div id="research-feed-content"><section class="panel"><div class="section-title"><h3>External Hermes feed</h3><span class="badge warn">External status UNKNOWN</span></div><p class="page-note">Waiting for live external feed evidence.</p></section></div></article>
       <article class="panel"><div class="section-title"><h2>SYSTEM CONTROL</h2><span class="badge good">localhost + token</span></div><div id="operator-controls" class="three-col"></div><div id="control-result" class="page-note"></div></article>
       <div class="two-col"><div><article class="panel"><div class="section-title"><h2>Historical / forward coverage</h2><a class="link" href="#datasets" data-link="datasets">View all</a></div><div id="coverage"></div></article>
@@ -5658,6 +6159,30 @@ def _dashboard_html(
     function researchFeedValue(value) { if(value==null||value==="")return "UNKNOWN"; return typeof value==="object"?json(value):String(value); }
     function researchFeedTimestamp(value) { if(value==null||value==="")return "UNKNOWN"; const formatted=dateText(value); return formatted==="—"?String(value):formatted; }
     function researchFeedField(key,label,value,timestamp=false) { return `<div class="key-value" data-field="${safe(key)}"><span class="key">${safe(label)}</span><strong>${safe(timestamp?researchFeedTimestamp(value):researchFeedValue(value))}</strong></div>`; }
+    function renderResearchProgress(data) {
+      const progress=data?.research_progress&&typeof data.research_progress==="object"?data.research_progress:{};
+      const candidate=progress.candidate&&typeof progress.candidate==="object"?progress.candidate:{};
+      const job=progress.job&&typeof progress.job==="object"?progress.job:{};
+      const samples=candidate.samples&&typeof candidate.samples==="object"?candidate.samples:{};
+      const trades=candidate.trades&&typeof candidate.trades==="object"?candidate.trades:{};
+      const pair=(value,required)=>value==null&&required==null?"UNKNOWN":`${value==null?"UNKNOWN":value} / ${required==null?"UNKNOWN":required}`;
+      const dataset=progress.dataset_id||"UNKNOWN",version=progress.dataset_version||"UNKNOWN";
+      const blocker=progress.blocker||"—",status=String(progress.job_status||job.status||"NOT_INITIALIZED").toUpperCase();
+      const candidateStatus=progress.status||"—";
+      $("research-progress-content").innerHTML=[
+        researchFeedField("dataset","Dataset",dataset),
+        researchFeedField("dataset_version","Dataset version",version),
+        researchFeedField("job_status","Automatic research job",status),
+        researchFeedField("last_completion_at","Last completion",job.last_completion_at||progress.last_completion_at,true),
+        researchFeedField("next_run_at","Next run",job.next_run_at||progress.next_run_at,true),
+        researchFeedField("candidate_stage","Candidate stage",candidate.stage||progress.candidate_stage),
+        researchFeedField("samples","Samples available / required",pair(samples.available??progress.samples_available,samples.required??progress.samples_required)),
+        researchFeedField("trades","Trades available / required",pair(trades.available??progress.trades_available,trades.required??progress.trades_required)),
+        researchFeedField("forward_observations","Forward observations",candidate.forward_observations??progress.forward_observations),
+        researchFeedField("blocker","Blocker",blocker),
+        researchFeedField("status","Validation status",candidateStatus)
+      ].join("");
+    }
     function renderResearchFeed(data) {
       const feed=data?.research_feed&&typeof data.research_feed==="object"?data.research_feed:{},external=feed.external_hermes||{},internal=feed.internal_queue||{},proposals=feed.proposals||{},candidates=feed.candidates||{},budgets=feed.budgets||{};
       const externalStatus=String(external.status??"UNKNOWN").toUpperCase(),internalStatus=String(internal.status??"UNKNOWN").toUpperCase();
@@ -5692,6 +6217,7 @@ def _dashboard_html(
     const _renderOverviewScheduling = renderOverview;
     renderOverview = (data) => {
       _renderOverviewScheduling(data);
+      renderResearchProgress(data);
       renderResearchFeed(data);
       renderMarketScopeFunnel(data);
       $("overview-readiness-snapshot").innerHTML=readinessSnapshotMarkup(data);

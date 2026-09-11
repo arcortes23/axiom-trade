@@ -734,7 +734,83 @@ class CanaryTests(unittest.TestCase):
     def assertBlocked(self, code, fn):
         with self.assertRaisesRegex(CanaryBlocked,code): fn()
 
-    def test_default_startup_cannot_trade(self): self.assertBlocked("CANARY_NOT_ARMED",self.submit)
+    def test_default_startup_cannot_trade(self):
+        self.assertBlocked("CANARY_NOT_ARMED", self.submit)
+        self.assertFalse(self.venue.submissions)
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM canary_ledger"
+            ).fetchone()[0],
+            0,
+        )
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM canary_execution_events"
+            ).fetchone()[0],
+            0,
+        )
+    def test_check_and_submit_enforce_one_dollar_minimum_with_side_quotes(self):
+        class SideQuoteVenue(FakeVenue):
+            def market_context(self, market_id, token_id):
+                quote = "0.19" if str(token_id) == "yes" else "0.963"
+                return {
+                    **super().market_context(market_id, token_id),
+                    "min_order_size": "5",
+                    "asks": [{"price": quote, "size": "100"}],
+                    "fee_bps": "0",
+                }
+
+        venue = SideQuoteVenue(balance="10")
+        self.arm(venue=venue)
+        yes_readiness = self.service.check(
+            candidate_id="C123",
+            venue=venue,
+            market_id="m",
+            token_id="yes",
+        )
+        self.assertTrue(yes_readiness["ready"], yes_readiness)
+        no_readiness = self.service.check(
+            candidate_id="C123",
+            venue=venue,
+            market_id="m",
+            token_id="no",
+        )
+        self.assertFalse(no_readiness["ready"], no_readiness)
+        self.assertIn(
+            "VENUE_MINIMUM_EXCEEDS_CANARY_TARGET",
+            no_readiness["failures"],
+        )
+
+        def retarget_signal(
+            signal_id, *, token_id, outcome, paper_expected_price
+        ):
+            self._ensure_direct_signal(signal_id)
+            with self.store.connection:
+                self.store.connection.execute(
+                    "UPDATE canary_signals SET token_id=?,outcome=?,"
+                    "paper_expected_price=? WHERE signal_id=?",
+                    (token_id, outcome, paper_expected_price, signal_id),
+                )
+
+        yes_signal = "minimum-yes"
+        retarget_signal(
+            yes_signal,
+            token_id="yes",
+            outcome="yes",
+            paper_expected_price="0.19",
+        )
+        self.service.submit(
+            signal_id=yes_signal,
+            candidate_id="C123",
+            market_id="m",
+            token_id="yes",
+            side="BUY",
+            paper_expected_price=Decimal("0.19"),
+            venue=venue,
+            allow_test_venue=True,
+        )
+        self.assertEqual(len(venue.submissions), 1)
+
     def test_direct_submit_requires_persisted_ready_signal(self):
         self.arm()
         with self.assertRaisesRegex(CanaryBlocked, "CANARY_SIGNAL_NOT_FOUND"):
@@ -4111,6 +4187,141 @@ class CanarySignalTests(unittest.TestCase):
         rows = self.service.list_signal_evaluations(candidate_id="C", limit=10)
         self.assertGreaterEqual(len(rows), 2)
         self.assertEqual(rows[0]["candidate_id"], "C")
+    def test_qualified_current_market_reports_insufficient_lookback(self):
+        candidate_id = "qualified-momentum-warming"
+        market_id = "qualified-warming-market"
+        strategy = {
+            **self.strategy,
+            "family": "momentum",
+            "parameters": {"lookback": 1, "threshold": 0.05},
+        }
+        self._add_candidate(
+            candidate_id,
+            market_ids=(market_id,),
+            strategy=strategy,
+        )
+        self._save_snapshot(
+            "qualified-warming-snapshot",
+            market_id=market_id,
+            price="0.50",
+            source_timestamp=T0,
+            observed_at=T0,
+        )
+        from axiom.strategy import evaluate_signal_record
+
+        with patch(
+            "axiom.strategy.evaluate_signal_record",
+            wraps=evaluate_signal_record,
+        ) as canonical_evaluator:
+            result = self._assert_evaluation(
+                candidate_id,
+                "INSUFFICIENT_LOOKBACK",
+                market_id=market_id,
+                cycle_id="qualified-warming-cycle",
+                assert_market_id=True,
+            )
+        canonical_evaluator.assert_called_once()
+        self.assertEqual(
+            len(canonical_evaluator.call_args.args[1]["snapshots"]),
+            1,
+        )
+        self.assertEqual(
+            result["evidence"]["evaluation_reason"],
+            "INSUFFICIENT_LOOKBACK",
+        )
+
+    def test_qualified_current_market_uses_canonical_evaluator_after_lookback(self):
+        candidate_id = "qualified-momentum"
+        market_id = "qualified-current-market"
+        strategy = {
+            **self.strategy,
+            "family": "momentum",
+            "parameters": {"lookback": 1, "threshold": 0.05},
+        }
+        self._add_candidate(
+            candidate_id,
+            market_ids=(market_id,),
+            strategy=strategy,
+            model={"probability": 0.80},
+        )
+        prior = T0 - timedelta(seconds=1)
+        self._save_snapshot(
+            "qualified-prior-snapshot",
+            market_id=market_id,
+            price="0.40",
+            source_timestamp=prior,
+            observed_at=prior,
+        )
+        self._save_snapshot(
+            "qualified-current-snapshot",
+            market_id=market_id,
+            price="0.50",
+            source_timestamp=T0,
+            observed_at=T0,
+        )
+        lifecycle = self.store.load_candidate_lifecycle(candidate_id)
+        self.assertIsInstance(lifecycle, dict)
+        self.assertEqual(lifecycle["stage"], "FROZEN")
+        self.assertTrue(self.service.validate_eligibility(candidate_id)["eligible"])
+
+        from axiom.strategy import evaluate_signal_record
+
+        with patch(
+            "axiom.strategy.evaluate_signal_record",
+            wraps=evaluate_signal_record,
+        ) as canonical_evaluator:
+            result = self.service.evaluate_signal(
+                candidate_id,
+                cycle_id="qualified-momentum-cycle",
+            )
+
+        self.assertEqual(result["reason_code"], "READY_SIGNAL")
+        self.assertEqual(result["market_id"], market_id)
+        signal = result["signal"]
+        self.assertIsInstance(signal, dict)
+        assert signal is not None
+        self.assertEqual(signal["market_id"], market_id)
+        self.assertEqual(signal["outcome"], "yes")
+        self.assertEqual(signal["token_id"], "yes")
+        self.assertEqual(signal["source_snapshot_id"], "qualified-current-snapshot")
+        canonical_evaluator.assert_called_once()
+        evaluated_snapshots = canonical_evaluator.call_args.args[1]["snapshots"]
+        self.assertEqual(len(evaluated_snapshots), 2)
+        self.assertEqual(
+            [item["source_timestamp"] for item in evaluated_snapshots],
+            [prior, T0],
+        )
+        self.assertEqual(
+            [item["observed_at"] for item in evaluated_snapshots],
+            [prior, T0],
+        )
+
+    def test_missing_model_input_is_not_recorded_as_strategy_decline(self):
+        candidate_id = "missing-model-input"
+        market_id = "missing-model-market"
+        self._add_candidate(
+            candidate_id,
+            market_ids=(market_id,),
+            model={"field": "unavailable_probability"},
+        )
+        self._save_snapshot(
+            "missing-model-snapshot",
+            market_id=market_id,
+            price="0.50",
+        )
+        result = self._assert_evaluation(
+            candidate_id,
+            "MODEL_INPUT_MISSING",
+            market_id=market_id,
+            cycle_id="missing-model-cycle",
+            assert_market_id=True,
+        )
+        self.assertNotEqual(result["reason_code"], "STRATEGY_EVALUATED_DECLINED")
+        self.assertEqual(
+            result["evidence"]["signal_blocker"],
+            "MODEL_INPUT_MISSING",
+        )
+
 
     def test_no_strategy_signal_is_a_persisted_non_actionable_outcome(self):
         self._add_candidate(

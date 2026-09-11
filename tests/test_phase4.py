@@ -64,6 +64,38 @@ def prediction_rows(*, version: str = "v1", model_probability: float = 0.8) -> l
         )
     return rows
 
+def seed_prediction_provenance(
+    store: AxiomStore,
+    rows: list[dict[str, object]],
+    *,
+    dataset_id: str = "dataset",
+    dataset_version: str = "v1",
+) -> None:
+    store.save_dataset_catalog(
+        dataset_id,
+        dataset_version,
+        provider="SYNTHETIC_OFFLINE",
+        instrument="POLYMARKET",
+        market_type="prediction",
+        timeframe="event",
+        start_timestamp=T0,
+        end_timestamp=T0 + timedelta(hours=20),
+        row_count=len(rows),
+        completeness=1.0,
+        missing_ranges=(),
+        quality="PRICE_PROXY",
+        source_type="HISTORICAL",
+        snapshot_id=f"SYNTHETIC_OFFLINE-{dataset_id}-{dataset_version}",
+        metadata={
+            "provider": "SYNTHETIC_OFFLINE",
+            "instrument": "POLYMARKET",
+            "market_type": "prediction",
+            "source_type": "HISTORICAL",
+            "research_quality": "PRICE_PROXY",
+        },
+    )
+    store.verify_dataset_integrity_attestation(dataset_id, dataset_version, force=True)
+
 
 def experiment_plan(
     *,
@@ -1329,7 +1361,9 @@ class Phase4AutonomousLoopTests(unittest.TestCase):
     def test_mutation_limits_daily_budget_and_queue_types_are_deterministic(self) -> None:
         with AxiomStore(":memory:") as store:
             target_market_ids = ("mutation-forward-market",)
-            store.save_dataset("dataset", "v1", prediction_rows())
+            rows = prediction_rows()
+            store.save_dataset("dataset", "v1", rows)
+            seed_prediction_provenance(store, rows)
             _seed_forward_metadata(store, target_market_ids)
             bus = DurableResearchBus(store)
             root = bus.submit_hypothesis(
@@ -1382,7 +1416,9 @@ class Phase4AutonomousLoopTests(unittest.TestCase):
     def test_forged_candidate_parameters_and_identity_are_rejected(self) -> None:
         with AxiomStore(":memory:") as store:
             target_market_ids = ("candidate-binding-market",)
-            store.save_dataset("dataset", "v1", prediction_rows())
+            rows = prediction_rows()
+            store.save_dataset("dataset", "v1", rows)
+            seed_prediction_provenance(store, rows)
             _seed_forward_metadata(store, target_market_ids)
             bus = DurableResearchBus(store)
             root = bus.submit_hypothesis(
@@ -1412,7 +1448,7 @@ class Phase4AutonomousLoopTests(unittest.TestCase):
             )
             rejected_parameters = active.process_pending(now=T0)
             self.assertEqual(rejected_parameters.rejected, 1)
-            self.assertEqual(rejected_parameters.results[0]["reason_code"], "CANDIDATE_BINDING_MISMATCH")
+            self.assertEqual(rejected_parameters.results[0]["reason_code"], "GENERATED_PROVENANCE_INVALID")
             self.assertEqual(store.load_candidate_lifecycle(candidate_id), baseline)
             self.assertEqual(bus.get(forged.item_id).status, ResearchQueueStatus.REJECTED)
 
