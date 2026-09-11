@@ -398,6 +398,36 @@ class MarketScopeDashboardTests(unittest.TestCase):
         self.assertIsNone(progress["candidate_stage"])
         self.assertIsNone(progress["blocker"])
         self.assertEqual(progress["forward_observations"], 0)
+    def test_research_progress_uses_exact_worker_lookup_beyond_bounded_page(self) -> None:
+        store = AxiomStore(":memory:")
+        self.addCleanup(store.close)
+        heartbeat = datetime(2026, 9, 11, 16, 47, 5, tzinfo=timezone.utc)
+        payload = {"last_cycle": {"status": "idle", "claimed": 0}}
+        for index in range(33):
+            store.save_worker_state(f"research-{index:03d}", "IDLE", {})
+        store.save_worker_state("research-queue", "IDLE", payload, heartbeat_at=heartbeat)
+        store.set_scheduler_state(
+            "hermes-control",
+            {"status": "ACTIVE", "last_run_at": "2026-09-01T00:00:00+00:00"},
+        )
+
+        worker = store.get_worker_state("research-queue")
+        self.assertIsNotNone(worker)
+        assert worker is not None
+        self.assertEqual(
+            set(worker),
+            {"worker_name", "status", "payload", "started_at", "heartbeat_at", "updated_at"},
+        )
+        self.assertEqual(worker["worker_name"], "research-queue")
+        self.assertEqual(worker["status"], "IDLE")
+        self.assertEqual(worker["payload"], payload)
+        self.assertIsNone(worker["started_at"])
+        self.assertEqual(worker["heartbeat_at"], heartbeat)
+        self.assertIsInstance(worker["updated_at"], datetime)
+
+        progress = DashboardData(store=store).overview_summary()["research_progress"]
+        self.assertEqual(progress["job_status"], "ACTIVE")
+        self.assertEqual(progress["last_completion_at"], str(heartbeat))
 
     def test_real_store_resolution_is_exposed_without_market_catalog_scan(self) -> None:
         store = AxiomStore(":memory:")

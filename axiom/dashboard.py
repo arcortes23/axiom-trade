@@ -4006,18 +4006,27 @@ class DashboardData:
         )
 
         scheduler = mapping_call("get_scheduler_state", "hermes-control")
+        exact_worker_method = getattr(self.store, "get_worker_state", None)
+        research_worker: Mapping[str, Any] = {}
+        if callable(exact_worker_method):
+            # Prefer the durable queue boundary, retaining the local engine
+            # name for stores written before the queue worker was introduced.
+            research_worker = mapping_call("get_worker_state", "research-queue")
+            if not research_worker:
+                research_worker = mapping_call("get_worker_state", "research-engine")
+
+        # This bounded page remains necessary for the other worker projections
+        # (notably the collector) and for stores that predate get_worker_state.
         worker_rows = records("list_worker_states", limit=32)
         worker_map = {
             text(item.get("worker_name")): item
             for item in worker_rows
             if text(item.get("worker_name"))
         }
-        # ``research-queue`` is the durable worker boundary.  The local
-        # ``research-engine`` name is retained only as a compatibility
-        # fallback for older node records.
-        research_worker = worker_map.get("research-queue", {})
         if not research_worker:
-            research_worker = worker_map.get("research-engine", {})
+            research_worker = worker_map.get("research-queue", {})
+            if not research_worker:
+                research_worker = worker_map.get("research-engine", {})
         research_payload = research_worker.get("payload")
         research_payload = research_payload if isinstance(research_payload, Mapping) else {}
         worker_cycle = research_payload.get("last_cycle")

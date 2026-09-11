@@ -7969,6 +7969,26 @@ class AxiomStore:
                 )
 
         sqlite_retry(operation, operation_name=f"save worker state {worker}")
+    def get_worker_state(self, worker_name: str) -> dict[str, Any] | None:
+        """Return one persisted worker row by its exact name."""
+        worker = str(worker_name).strip()
+        if not worker:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM worker_state WHERE worker_name=? LIMIT 1", (worker,)
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "worker_name": row["worker_name"],
+            "status": row["status"],
+            "payload": _load(row["payload_json"]),
+            "started_at": _parse_datetime(row["started_at"]),
+            "heartbeat_at": _parse_datetime(row["heartbeat_at"]),
+            "updated_at": _parse_datetime(row["updated_at"]),
+        }
+
 
     def list_worker_states(self, *, limit: int = 256) -> list[dict[str, Any]]:
         if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
