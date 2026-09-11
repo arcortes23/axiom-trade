@@ -1089,13 +1089,9 @@ class LargeVersionCanaryReadLatencyTests(unittest.TestCase):
         first_evidence = payload["forward_evidence"]
         self.assertEqual(first_evidence["candidate_bound_markets"], [])
         self.assertEqual(first_evidence["required_market_count"], 0)
-        self.assertEqual(
-            set(first_evidence["unresolved_candidates"]),
-            {
-                f"candidate-validation-{index:02d}"
-                for index in range(LARGE_CANDIDATE_COUNT)
-            },
-        )
+        self.assertEqual(first_evidence["unresolved_candidates"], [])
+        self.assertEqual(first_evidence["reason_code"], "NO_PERSISTED_SCOPE_RESOLUTION")
+        self.assertEqual(first_evidence["reason_display"], "NO_PERSISTED_SCOPE_RESOLUTION")
 
         started = time.perf_counter()
         status, payload, _body = self._request("api/v2/canary")
@@ -1108,7 +1104,9 @@ class LargeVersionCanaryReadLatencyTests(unittest.TestCase):
         evidence = payload["forward_evidence"]
         self.assertEqual(evidence["candidate_bound_markets"], [])
         self.assertEqual(evidence["required_market_count"], 0)
-        self.assertEqual(evidence["reason_code"], "CANDIDATE_FORWARD_MARKET_UNRESOLVED")
+        self.assertEqual(evidence["reason_code"], "NO_PERSISTED_SCOPE_RESOLUTION")
+        self.assertEqual(evidence["unresolved_candidates"], [])
+        self.assertEqual(evidence["reason_display"], "NO_PERSISTED_SCOPE_RESOLUTION")
         self.assertEqual(evidence["market_diagnostics"], [])
 
 

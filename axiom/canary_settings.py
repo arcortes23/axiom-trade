@@ -278,6 +278,18 @@ class CanarySettingsService:
                 supplied[expanded] = supplied[legacy]
             elif expanded in supplied and legacy not in supplied:
                 supplied[legacy] = supplied[expanded]
+        # The dashboard intentionally exposes one Open exposure control.  Keep
+        # the persisted open-cost fence coupled to that control when callers
+        # edit exposure without also submitting the hidden invariant.  Direct
+        # callers may still provide both fields, in which case validation below
+        # rejects an unsafe mismatch instead of silently choosing one.
+        if (
+            "max_aggregate_exposure_usd" in supplied
+            and "max_aggregate_open_cost_usd" not in supplied
+        ):
+            supplied["max_aggregate_open_cost_usd"] = supplied[
+                "max_aggregate_exposure_usd"
+            ]
         source.update(supplied)
         normalized: dict[str, Any] = {}
         for name in DEFAULT_CANARY_SETTINGS:
@@ -692,6 +704,17 @@ class CanarySettingsService:
                 detail={
                     "changed_fields": changed_fields,
                     "counting_review_required": counting_review_required,
+                    # Bind the draft to the exact active/control snapshot that
+                    # was shown to the operator.  Activation recovers these
+                    # fences from this immutable audit event.
+                    "reviewed_active_generation": int(active.get("generation", 1)),
+                    "reviewed_active_config_hash": active.get("config_hash"),
+                    # Presence is intentional: ``None`` means the operator
+                    # reviewed a database with no control row, not that the
+                    # control fence was omitted.  If a row is created before
+                    # activation, that review is stale and must be redone.
+                    "reviewed_control_present": bool(control),
+                    "reviewed_control_generation": control.get("control_generation"),
                     "control_generation": control.get("control_generation"),
                 },
             )
@@ -741,6 +764,88 @@ class CanarySettingsService:
                         raise CanarySettingsConflict("draft settings generation changed")
                 except (TypeError, ValueError) as exc:
                     raise CanarySettingsConflict("draft settings generation is invalid") from exc
+                # OperatorControlPlane carries the legacy config/generation
+                # payload. Recover the immutable review fences from the
+                # DRAFT_CREATED audit event so control-generation and active
+                # hash races cannot silently activate stale edits.
+                draft_audit = self.store.connection.execute(
+                    "SELECT detail_json,previous_config_hash,previous_generation "
+                    "FROM canary_setting_audit "
+                    "WHERE config_id=? AND action='DRAFT_CREATED' "
+                    "ORDER BY timestamp DESC,audit_id DESC LIMIT 1",
+                    (identifier,),
+                ).fetchone()
+                if draft_audit is None:
+                    raise CanarySettingsConflict("draft review fence is missing")
+                try:
+                    review_detail = json.loads(draft_audit["detail_json"] or "{}")
+                except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                    raise CanarySettingsConflict("draft review fence is invalid") from exc
+                if not isinstance(review_detail, Mapping):
+                    raise CanarySettingsConflict("draft review fence is invalid")
+                reviewed_hash = review_detail.get(
+                    "reviewed_active_config_hash",
+                    draft_audit["previous_config_hash"],
+                )
+                if str(reviewed_hash or "") != str(active.get("config_hash") or ""):
+                    raise CanarySettingsConflict("active settings hash changed")
+                reviewed_generation = review_detail.get(
+                    "reviewed_active_generation",
+                    draft_audit["previous_generation"],
+                )
+                try:
+                    if int(reviewed_generation) != int(active.get("generation", 0)):
+                        raise CanarySettingsConflict("settings generation changed")
+                except (TypeError, ValueError) as exc:
+                    raise CanarySettingsConflict("draft review generation is invalid") from exc
+                reviewed_control_present = review_detail.get(
+                    "reviewed_control_present"
+                )
+                reviewed_control_generation = review_detail.get(
+                    "reviewed_control_generation",
+                    review_detail.get("control_generation"),
+                )
+                # Older DRAFT_CREATED records predate the explicit presence
+                # fence but persisted ``control_generation``.  A null value
+                # is an intentional review of no control row; preserve that
+                # meaning instead of treating it as an omitted fence.
+                legacy_no_control_review = (
+                    reviewed_control_present is None
+                    and reviewed_control_generation is None
+                    and (
+                        "reviewed_control_generation" in review_detail
+                        or "control_generation" in review_detail
+                    )
+                )
+                current_control = self._control_record()
+                if reviewed_control_present is False or legacy_no_control_review:
+                    if current_control:
+                        raise CanarySettingsConflict("canary control generation changed")
+                elif reviewed_control_present is True:
+                    if not current_control:
+                        raise CanarySettingsConflict("canary control generation changed")
+                    try:
+                        current_control_generation = int(
+                            current_control.get("control_generation")
+                        )
+                    except (TypeError, ValueError):
+                        raise CanarySettingsConflict("canary control generation changed") from None
+                    if (
+                        reviewed_control_generation is None
+                        or current_control_generation != int(reviewed_control_generation)
+                    ):
+                        raise CanarySettingsConflict("canary control generation changed")
+                elif reviewed_control_generation is not None:
+                    # Compatibility for pre-presence-fence drafts: retain the
+                    # old generation check when an explicit generation exists.
+                    try:
+                        current_control_generation = int(
+                            current_control.get("control_generation")
+                        )
+                    except (TypeError, ValueError):
+                        raise CanarySettingsConflict("canary control generation changed") from None
+                    if current_control_generation != int(reviewed_control_generation):
+                        raise CanarySettingsConflict("canary control generation changed")
                 draft_values = dict(draft.get("values") or {})
                 try:
                     draft_digest = self._hash(self._normalize(draft_values))
@@ -954,6 +1059,8 @@ class CanarySettingsService:
         if equity_status in {"UNKNOWN", "MISSING", "STALE"}:
             entry_block_reasons.append("authoritative equity evidence is unavailable or stale")
         return {
+            "status": "CURRENT",
+            "settings_available": True,
             "observed_at": observed.isoformat(),
             "config_id": active.get("config_id"),
             "config_hash": active.get("config_hash"),

@@ -2,12 +2,18 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 import hashlib
+import json
 import unittest
 from unittest.mock import patch
 
-from axiom.autonomous import AutonomousResearchConfig, AutonomousResearchProcessor
+from axiom.autonomous import (
+    AutonomousResearchConfig,
+    AutonomousResearchProcessor,
+    _proposal_identity,
+)
 from axiom.experiment_plan import ExperimentPlan
 from axiom.legacy_scope import LegacyScopeError, create_legacy_successor
+from axiom.lifecycle import CandidateStage
 from axiom.storage import AxiomStore
 from axiom.collector import CollectorConfig, PolymarketCollector
 from axiom.data import InMemoryPredictionProvider
@@ -157,25 +163,88 @@ def _recorded_replay_resolution(
         "matched_markets": [{"market_id": market_id} for market_id in selected_ids],
         "resolution_id": f"resolution-{candidate_id}",
     }
+def _seed_predeclared_historical_dataset(store: AxiomStore, *, attested: bool = True) -> None:
+    rows = [
+        {
+            "timestamp": (T0 + timedelta(minutes=index)).isoformat(),
+            "market_id": f"market-{index // 3}",
+            "yes_mid": 0.40 + ((index % 10) * 0.01),
+            "yes_bid": 0.39 + ((index % 10) * 0.01),
+            "yes_ask": 0.41 + ((index % 10) * 0.01),
+            "no_mid": 0.60 - ((index % 10) * 0.01),
+            "no_bid": 0.59 - ((index % 10) * 0.01),
+            "no_ask": 0.61 - ((index % 10) * 0.01),
+            "expiry": (T0 + timedelta(days=1)).isoformat(),
+            "settlement": "resolved_yes" if index % 3 == 2 else "open",
+            "source_type": "HISTORICAL",
+        }
+        for index in range(100)
+    ]
+    store.save_dataset("Polymarket-historical", "history-v1", rows)
+    store.save_dataset_catalog(
+        "Polymarket-historical",
+        "history-v1",
+        provider="fixture",
+        instrument="POLYMARKET",
+        market_type="prediction",
+        timeframe="event",
+        start_timestamp=T0,
+        end_timestamp=T0 + timedelta(minutes=99),
+        row_count=len(rows),
+        completeness=1.0,
+        missing_ranges=(),
+        quality="PRICE_PROXY",
+        source_type="HISTORICAL",
+        snapshot_id="snapshot-v1",
+        metadata={
+            "research_quality": "PRICE_PROXY",
+            "provenance_version": "dataset-provenance-v1",
+            "policy_version": "prediction-integrity-v1",
+        },
+    )
+    if attested:
+        attestation = store.verify_dataset_integrity_attestation("Polymarket-historical", "history-v1")
+        assert attestation["status"] == "CURRENT"
+        assert attestation["contamination_result"] == "PASS"
 
+def _legacy_prediction_predecessor(
+    *,
+    selector: dict[str, object] | None = None,
+    candidate_id: str = "legacy-selector-predecessor",
+) -> dict[str, object]:
+    plan: dict[str, object] = {
+        "market_type": "prediction",
+        "template": "momentum",
+        "parameters": {"lookback": [1], "threshold": [0.05]},
+        "target": {"market_ids": ["market-0"]},
+        "dataset_id": "Polymarket-historical",
+        "dataset_version": "history-v1",
+        "allowed_features": ["timestamp", "market_id", "yes_mid"],
+        "time_split": "train-validation-holdout",
+        "min_samples": 1,
+        "min_trades": 0,
+        "max_variants": 1,
+        "methodology": {"initial_cash": 1_000.0, "allocation": 0.25},
+        "paper_only": True,
+    }
+    if selector is not None:
+        plan["dataset_selector"] = selector
+    return {
+        "candidate_id": candidate_id,
+        "frozen_hash": f"sha256:{candidate_id}-frozen",
+        "hypothesis_id": f"{candidate_id}-hypothesis",
+        "statement": "A legacy selector must remain bound to its exact catalog.",
+        "source": "offline legacy fixture",
+        "market_type": "prediction",
+        "experiment_plan": plan,
+        "paper_only": True,
+    }
 
 
 class PolymarketResearchOrchestrationTests(unittest.TestCase):
     def test_process_pending_seeds_bounded_starting_set_idempotently(self) -> None:
         with AxiomStore(":memory:") as store:
-            store.save_dataset_catalog(
-                "Polymarket-historical",
-                "history-v1",
-                provider="fixture",
-                instrument="POLYMARKET",
-                market_type="prediction",
-                timeframe="event",
-                row_count=100,
-                completeness=1.0,
-                missing_ranges=(),
-                source_type="HISTORICAL",
-                snapshot_id="snapshot-v1",
-            )
+            _seed_predeclared_historical_dataset(store)
             processor = AutonomousResearchProcessor(
                 store,
                 config=AutonomousResearchConfig(max_items_per_cycle=1),
@@ -190,6 +259,161 @@ class PolymarketResearchOrchestrationTests(unittest.TestCase):
             queued = store.list_research_items(limit=10)
             self.assertEqual(len(queued), 3)
             self.assertTrue(all(item["payload"].get("predeclared_starting_set") for item in queued))
+
+    def test_predeclared_attestation_rotation_versions_queue_once(self) -> None:
+        with AxiomStore(":memory:") as store:
+            _seed_predeclared_historical_dataset(store)
+            processor = AutonomousResearchProcessor(
+                store,
+                config=AutonomousResearchConfig(max_items_per_cycle=1),
+                clock=lambda: T0,
+            )
+            first = processor._enqueue_predeclared_from_persisted_scope(T0)
+            self.assertEqual(len(first), 3)
+            old_payloads = {item.item_id: item.payload for item in first}
+            old_hashes = {
+                item.payload["provenance"]["internal"]["attestation_hash"]
+                for item in first
+            }
+            self.assertEqual(len(old_hashes), 1)
+            rotated_hash = "sha256:rotated-predeclared-attestation"
+            store.connection.execute(
+                "UPDATE dataset_integrity_attestation "
+                "SET status='CURRENT', contamination_result='PASS', "
+                "attestation_hash=?, reason='ATTESTATION_ROTATED' "
+                "WHERE dataset_id=? AND dataset_version=?",
+                (rotated_hash, "Polymarket-historical", "history-v1"),
+            )
+            store.connection.commit()
+
+            second = processor._enqueue_predeclared_from_persisted_scope(T0)
+            self.assertEqual(len(second), 3)
+            self.assertEqual(store.research_queue_stats()["total"], 6)
+            self.assertEqual(
+                {item.payload["provenance"]["internal"]["attestation_hash"] for item in second},
+                {rotated_hash},
+            )
+            self.assertTrue(
+                {item.item_id for item in first}.isdisjoint(
+                    item.item_id for item in second
+                )
+            )
+            self.assertEqual(
+                {_proposal_identity(item.payload) for item in first},
+                {_proposal_identity(item.payload) for item in second},
+            )
+            rows = {
+                item["item_id"]: item["payload"]
+                for item in store.list_research_items(limit=10)
+            }
+            self.assertEqual(
+                {item_id: rows[item_id] for item_id in old_payloads},
+                old_payloads,
+            )
+
+            retry = processor._enqueue_predeclared_from_persisted_scope(T0)
+            self.assertEqual(
+                tuple(item.item_id for item in retry),
+                tuple(item.item_id for item in second),
+            )
+            self.assertEqual(store.research_queue_stats()["total"], 6)
+
+
+    def test_unchanged_predeclared_generated_identity_processes(self) -> None:
+        with AxiomStore(":memory:") as store:
+            _seed_predeclared_historical_dataset(store)
+            processor = AutonomousResearchProcessor(
+                store,
+                config=AutonomousResearchConfig(max_items_per_cycle=1),
+                clock=lambda: T0,
+            )
+            processor._enqueue_predeclared_from_persisted_scope(T0)
+            queued = store.list_research_items(limit=10)
+            self.assertEqual(len(queued), 3)
+            for item in queued:
+                payload = item["payload"]
+                internal = payload["provenance"]["internal"]
+                self.assertEqual(internal["proposal_identity"], _proposal_identity(payload))
+
+            cycle = processor.process_pending(now=T0)
+            self.assertEqual(cycle.claimed, 1)
+            # The fixture intentionally has too few qualifying trades for the
+            # starter's research gate; marker validation must still succeed
+            # and leave the ordinary insufficiency decision intact.
+            self.assertEqual(cycle.rejected, 1)
+            self.assertEqual(cycle.results[0]["reason_code"], "INSUFFICIENT_DATA")
+
+    def test_sparse_predeclared_generated_payload_normalizes_before_marker(self) -> None:
+        with AxiomStore(":memory:") as store:
+            _seed_predeclared_historical_dataset(store)
+            processor = AutonomousResearchProcessor(
+                store,
+                config=AutonomousResearchConfig(max_items_per_cycle=1),
+                clock=lambda: T0,
+            )
+            sparse = _legacy_prediction_predecessor(candidate_id="sparse-generated-proposal")
+            for field in ("source", "tests", "time_split", "paper_only", "candidate_id", "frozen_hash"):
+                sparse.pop(field, None)
+            queued = processor.enqueue_predeclared_starting_set(
+                sparse,
+                strategies=(
+                    {"template": "momentum", "parameters": {"lookback": (1,), "threshold": (0.05,)}},
+                ),
+                available_at=T0,
+            )
+            self.assertEqual(len(queued), 1)
+            item = queued[0]
+            internal = item.payload["provenance"]["internal"]
+            self.assertEqual(internal["proposal_identity"], _proposal_identity(item.payload))
+
+            cycle = processor.process_pending(now=T0)
+            self.assertEqual(cycle.claimed, 1)
+            self.assertNotEqual(cycle.results[0]["reason_code"], "GENERATED_PROVENANCE_INVALID")
+
+    def test_tampered_generated_marker_rejects_before_processing(self) -> None:
+        with AxiomStore(":memory:") as store:
+            _seed_predeclared_historical_dataset(store)
+            processor = AutonomousResearchProcessor(
+                store,
+                config=AutonomousResearchConfig(max_items_per_cycle=1),
+                clock=lambda: T0,
+            )
+            processor._enqueue_predeclared_from_persisted_scope(T0)
+            item = store.list_research_items(limit=1)[0]
+            payload = dict(item["payload"])
+            provenance = dict(payload["provenance"])
+            internal = dict(provenance["internal"])
+            internal["proposal_identity"] = "sha256:tampered-generated-identity"
+            provenance["internal"] = internal
+            payload["provenance"] = provenance
+            store.connection.execute(
+                "UPDATE research_queue SET payload_json=? WHERE item_id=?",
+                (json.dumps(payload, sort_keys=True, separators=(",", ":")), item["item_id"]),
+            )
+            store.connection.commit()
+
+            cycle = processor.process_pending(now=T0)
+            self.assertEqual(cycle.claimed, 1)
+            self.assertEqual(cycle.rejected, 1)
+            self.assertEqual(cycle.results[0]["reason_code"], "GENERATED_PROVENANCE_INVALID")
+
+    def test_predeclared_seed_missing_attestation_blocks_without_enqueue(self) -> None:
+        with AxiomStore(":memory:") as store:
+            _seed_predeclared_historical_dataset(store, attested=False)
+            processor = AutonomousResearchProcessor(store, clock=lambda: T0)
+
+            self.assertEqual(processor._enqueue_predeclared_from_persisted_scope(T0), ())
+            self.assertEqual(store.research_queue_stats().get("total"), 0)
+            reports = store.list_reports()
+            self.assertEqual(len(reports), 1)
+            evidence = reports[0]["report"]
+            self.assertEqual(evidence["report_type"], "autonomous_predeclared_seed_blocked")
+            self.assertEqual(evidence["blocker"], "DATASET_ATTESTATION_MISSING")
+            self.assertEqual(evidence["queue_items_enqueued"], 0)
+            self.assertEqual(
+                evidence["next_action"],
+                "PERSIST_CURRENT_HISTORICAL_DATASET_ATTESTATION",
+            )
 
     def test_predeclared_seed_does_not_fall_back_to_unrelated_prediction_dataset(self) -> None:
         with AxiomStore(":memory:") as store:
@@ -210,6 +434,122 @@ class PolymarketResearchOrchestrationTests(unittest.TestCase):
             cycle = processor.process_pending(now=T0)
             self.assertEqual(cycle.claimed, 0)
             self.assertEqual(store.research_queue_stats().get("total"), 0)
+    def test_legacy_recovery_rejects_forward_source_selector_without_enqueue(self) -> None:
+        with AxiomStore(":memory:") as store:
+            _seed_predeclared_historical_dataset(store)
+            predecessor = _legacy_prediction_predecessor(
+                selector={"source_type": "FORWARD_COLLECTED"},
+                candidate_id="legacy-forward-selector",
+            )
+            store.save_candidate_lifecycle("legacy-forward-selector", CandidateStage.IDEA.value, predecessor)
+            store.save_candidate_lifecycle("legacy-forward-selector", CandidateStage.FROZEN.value, predecessor)
+            processor = AutonomousResearchProcessor(store, clock=lambda: T0)
+
+            recovery = processor._recover_legacy_predecessors(T0)
+            self.assertEqual(len(recovery), 1)
+            self.assertEqual(recovery[0]["progress"], "BLOCKED")
+            self.assertEqual(recovery[0]["blocker"], "DATASET_PROVENANCE_INVALID")
+            self.assertEqual(store.research_queue_stats().get("total"), 0)
+            self.assertTrue(recovery[0]["provenance_state_digest"].startswith("sha256:"))
+            self.assertEqual(
+                len(store.list_reports(experiment_id="legacy-forward-selector")),
+                1,
+            )
+    def test_legacy_recovery_rule_only_nested_target_is_not_unambiguous(self) -> None:
+        with AxiomStore(":memory:") as store:
+            _seed_predeclared_historical_dataset(store)
+            predecessor = _legacy_prediction_predecessor(candidate_id="legacy-rule-only-target")
+            plan = dict(predecessor["experiment_plan"])
+            plan["target"] = {"filters": {"category": ["politics"]}}
+            predecessor["experiment_plan"] = plan
+            store.save_candidate_lifecycle("legacy-rule-only-target", CandidateStage.IDEA.value, predecessor)
+            store.save_candidate_lifecycle("legacy-rule-only-target", CandidateStage.FROZEN.value, predecessor)
+            processor = AutonomousResearchProcessor(store, clock=lambda: T0)
+
+            recovery = processor._recover_legacy_predecessors(T0)
+            self.assertEqual(len(recovery), 1)
+            self.assertEqual(recovery[0]["classification"], "INVALID")
+            self.assertEqual(recovery[0]["reason_code"], "MISSING_NESTED_TARGET_MARKET_IDS")
+            self.assertEqual(recovery[0]["progress"], "BLOCKED")
+            self.assertEqual(store.research_queue_stats().get("total"), 0)
+
+
+    def test_legacy_recovery_state_changes_append_and_identical_retry_dedupes(self) -> None:
+        with AxiomStore(":memory:") as store:
+            _seed_predeclared_historical_dataset(store)
+            predecessor = _legacy_prediction_predecessor(candidate_id="legacy-state-transition")
+            store.save_candidate_lifecycle("legacy-state-transition", CandidateStage.IDEA.value, predecessor)
+            store.save_candidate_lifecycle("legacy-state-transition", CandidateStage.FROZEN.value, predecessor)
+            store.connection.execute(
+                "UPDATE dataset_integrity_attestation "
+                "SET status='STALE', reason='BOUNDS_MISMATCH' "
+                "WHERE dataset_id=? AND dataset_version=?",
+                ("Polymarket-historical", "history-v1"),
+            )
+            processor = AutonomousResearchProcessor(store, clock=lambda: T0)
+
+            first = processor._recover_legacy_predecessors(T0)[0]
+            self.assertEqual(first["blocker"], "DATASET_ATTESTATION_STALE")
+            first_digest = first["provenance_state_digest"]
+            self.assertEqual(
+                len(store.list_reports(experiment_id="legacy-state-transition")),
+                1,
+            )
+            repeat = processor._recover_legacy_predecessors(T0)[0]
+            self.assertEqual(repeat["provenance_state_digest"], first_digest)
+            self.assertEqual(
+                len(store.list_reports(experiment_id="legacy-state-transition")),
+                1,
+            )
+
+            store.connection.execute(
+                "UPDATE dataset_integrity_attestation "
+                "SET status='CURRENT', contamination_result='FAIL', reason='FORWARD_CONTAMINATION' "
+                "WHERE dataset_id=? AND dataset_version=?",
+                ("Polymarket-historical", "history-v1"),
+            )
+            changed = processor._recover_legacy_predecessors(T0)[0]
+            self.assertEqual(changed["blocker"], "DATASET_PROVENANCE_INVALID")
+            self.assertNotEqual(changed["provenance_state_digest"], first_digest)
+            history = store.list_reports(
+                experiment_id="legacy-state-transition",
+                newest_first=True,
+            )
+            self.assertEqual(len(history), 2)
+            self.assertEqual(history[0]["report"]["blocker"], "DATASET_PROVENANCE_INVALID")
+            self.assertEqual(history[1]["report"]["blocker"], "DATASET_ATTESTATION_STALE")
+
+    def test_predeclared_seed_rejects_non_polymarket_catalog_instrument(self) -> None:
+        with AxiomStore(":memory:") as store:
+            _seed_predeclared_historical_dataset(store)
+            store.connection.execute(
+                "UPDATE dataset_catalog SET instrument=? "
+                "WHERE dataset_id=? AND dataset_version=?",
+                ("BINANCE", "Polymarket-historical", "history-v1"),
+            )
+            processor = AutonomousResearchProcessor(store, clock=lambda: T0)
+
+            self.assertEqual(processor._enqueue_predeclared_from_persisted_scope(T0), ())
+            self.assertEqual(store.research_queue_stats().get("total"), 0)
+            evidence = store.list_reports()[0]["report"]
+            self.assertEqual(evidence["blocker"], "DATASET_CATALOG_INVALID")
+            self.assertIn("instrument", evidence["reason"])
+
+    def test_predeclared_seed_rejects_mutable_catalog_version_alias(self) -> None:
+        with AxiomStore(":memory:") as store:
+            _seed_predeclared_historical_dataset(store)
+            store.connection.execute(
+                "UPDATE dataset_catalog SET dataset_version=? "
+                "WHERE dataset_id=? AND dataset_version=?",
+                ("latest", "Polymarket-historical", "history-v1"),
+            )
+            processor = AutonomousResearchProcessor(store, clock=lambda: T0)
+
+            self.assertEqual(processor._enqueue_predeclared_from_persisted_scope(T0), ())
+            self.assertEqual(store.research_queue_stats().get("total"), 0)
+            evidence = store.list_reports()[0]["report"]
+            self.assertEqual(evidence["blocker"], "DATASET_CATALOG_INVALID")
+            self.assertIn("mutable alias", evidence["reason"])
 
     def test_predeclared_starting_set_uses_price_causal_trials_and_excludes_control(self) -> None:
         starters = AutonomousResearchProcessor.predeclared_starting_set()

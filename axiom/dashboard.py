@@ -1192,6 +1192,9 @@ class DashboardData:
                 "live_execution": False,
             }
         result = dict(projected)
+        if result.get("active") is not None or result.get("effective_limits") is not None:
+            result["status"] = "CURRENT"
+            result["settings_available"] = True
         result.setdefault("live_execution", False)
         return result
     def _configured(self, name: str) -> Any:
@@ -3889,16 +3892,6 @@ class DashboardData:
         closed = bounded_list(health.get("closed_candidates"))
         if "closed_candidates" not in health:
             closed = bounded_list(funnel.get("closed_candidates"))
-        if not unresolved and not health and not funnel.get("resolution_items"):
-            ids = candidate_ids
-            if ids is None:
-                ids = [
-                    str(item.get("candidate_id") or "").strip()
-                    for item in self._bounded_candidate_lifecycle()
-                ]
-            unresolved = list(dict.fromkeys(str(item).strip() for item in ids if str(item).strip()))[
-                :_LATEST_CANDIDATE_LIMIT
-            ]
         reason_code = first_health("reason_code")
         if reason_code is None:
             reason_code = (
@@ -5274,6 +5267,7 @@ def _dashboard_html(
     function readinessSnapshotMarkup(data) { const snapshot=data?.canary&&typeof data.canary==="object"?data.canary:(data||{}),status=String(snapshot.readiness_snapshot_status||"STALE").toUpperCase(),stale=snapshot.readiness_snapshot_stale===true||status==="STALE",label=stale?"READINESS SNAPSHOT STALE":"READINESS SNAPSHOT CURRENT",updated=snapshot.readiness_snapshot_updated_at||data?.readiness_snapshot_updated_at; return `<p class="page-note readiness-snapshot"><span class="badge ${statusClass(stale?"STALE":"CURRENT")}">${label}</span> · Updated ${safe(dateText(updated))}</p>`; }
     let params = new URLSearchParams(location.search); const state = { tab: params.get("tab") || "overview", page: Math.max(1,Number(params.get("page")||1)), page_size: [10,25,50,100].includes(Number(params.get("page_size"))) ? Number(params.get("page_size")) : 25, filter: params.get("filter") || "", sort: params.get("sort") || "", direction: params.get("direction") === "asc" ? "asc" : "desc", selected: params.get("selected") || "", expanded: params.get("expanded") === "1" };
     let operator = {}, current = {}, loadInFlight = false, operatorControlsRendered = false, binanceTestnetMode = false;
+    let riskReview = {active:null,draft:null};
     const controlToken = document.querySelector('meta[name="axiom-control-token"]')?.content || "";
     function controlButton(action,label,target="",confirmation="",payload=null) { const encodedPayload=payload&&typeof payload==="object"&&!Array.isArray(payload)?JSON.stringify(payload):""; return `<button class="link control-action" data-control-action="${safe(action)}" data-control-target="${safe(target)}" data-control-confirm="${safe(confirmation)}" data-control-payload="${safe(encodedPayload)}">${safe(label)}</button>`; }
     function isCanaryAction(action) { return String(action||"").startsWith("canary."); }
@@ -5351,12 +5345,12 @@ def _dashboard_html(
     async function loadCandidate(id,eventPage=1,persist=true) { state.selected=id; state.expanded=true; if(persist)saveState(true); try { const q=new URLSearchParams({page:String(eventPage),page_size:String(state.page_size)}),candidateResponse=await fetch(`/api/v2/candidates/${encodeURIComponent(id)}`,{cache:"no-store"}),r=await fetch(`/api/v2/candidates/${encodeURIComponent(id)}/events?${q}`,{cache:"no-store"}),candidate=candidateResponse.ok?await candidateResponse.json():{},d=await r.json(); const checks=[["Historical gates",candidate.historical_gates||"NOT_PASSED"],["Historical data integrity",candidate.historical_data_integrity||"FAIL"],["Historical execution fidelity",candidate.historical_execution_fidelity||"UNKNOWN"],["Canary data quality",candidate.canary_data_quality_gate||"NOT PASSED"],["Production evidence",candidate.production_evidence||"INSUFFICIENT"],["Micro-live canary",candidate.canary_status||"NOT_ELIGIBLE"],["Paper forward status",candidate.paper_forward_status||"NOT_STARTED"],["Paper promotable",candidate.paper_promotable_status||"NOT_YET"]]; const markup=`<div class="key-value"><span class="key">Candidate</span><strong>${safe(candidate.candidate_id||id)}</strong></div><div class="three-col">${checks.map(([label,value])=>`<div class="key-value"><span class="key">${safe(label)}</span><strong><span class="badge ${statusClass(value)}">${safe(value)}</span></strong></div>`).join("")}</div>${arr(d.items).length?`<table><thead><tr><th>Time</th><th>Stage</th><th>Reason</th></tr></thead><tbody>${arr(d.items).map(i=>`<tr><td>${safe(dateText(i.created_at||i.timestamp))}</td><td><span class="badge">${safe(i.stage||i.to_stage)}</span></td><td>${safe(i.reason||i.message)}</td></tr>`).join("")}</tbody></table>`:empty("No lifecycle events","No persisted lifecycle evidence exists for this candidate.")}<div id="candidate-events-pager" class="pager"></div>`; $("detail").innerHTML=markup; if(state.tab==="candidates")$("dataset-detail").innerHTML=markup; if($("candidate-events-pager")){const total=Number(d.total)||0,page=Number(d.page)||1,size=Number(d.page_size)||state.page_size,pages=Number(d.pages)||0,start=total?(page-1)*size+1:0,end=Math.min(page*size,total); $("candidate-events-pager").innerHTML=`<span>Showing ${start}–${end} of ${total}</span><span><button data-page="${page-1}" ${page<=1?"disabled":""}>Previous</button> <button data-page="${page+1}" ${!pages||page>=pages?"disabled":""}>Next</button></span>`; $("candidate-events-pager").querySelectorAll("button").forEach(b=>b.addEventListener("click",()=>loadCandidate(id,Number(b.dataset.page),false)));} } catch(e) { $("detail").innerHTML=empty("Candidate detail unavailable",e.message); } }
     function renderPaper(data) { const p=operator.paper_portfolio||{}; $("portfolio-summary").innerHTML=`<div class="card-grid"><div class="panel"><div class="metric">${p.state_count?Number(p.total_equity||0).toFixed(2):"—"}</div><div class="metric-label">paper equity</div></div><div class="panel"><div class="metric">${p.state_count?Number(p.total_pnl||0).toFixed(2):"—"}</div><div class="metric-label">paper P/L</div></div><div class="panel"><div class="metric">${count(data.total)}</div><div class="metric-label">paper records</div></div><div class="panel"><div class="metric">${p.state_count?`${(Number(p.win_rate||0)*100).toFixed(1)}%`:"—"}</div><div class="metric-label">win rate</div></div></div>`; $("portfolio-states").innerHTML=arr(data.items).length?`<table><thead><tr><th>${sortButton("timestamp","Time")}</th><th>${sortButton("record_type","Type")}</th><th>Experiment</th><th>Market</th><th>Status</th><th>Details</th></tr></thead><tbody>${arr(data.items).map(i=>`<tr><td>${safe(dateText(i.timestamp||i.created_at||i.updated_at))}</td><td>${safe(i.record_type)}</td><td>${safe(i.experiment_id)}</td><td>${safe(i.market_id||i.symbol)}</td><td><span class="badge ${statusClass(i.status)}">${safe(i.status)}</span></td><td><details><summary>view</summary><pre>${safe(json(i))}</pre></details></td></tr>`).join("")}</tbody></table>`:empty("Waiting for PAPER_FORWARD","Paper portfolio initializes only after a candidate enters PAPER_FORWARD and observations are persisted."); pager("paper",data); bindTable(); }
     function renderCanaryConnectivity(value) {
-      const c=value||{}, checkedAt=c.checked_at, checkedPht=dateText(checkedAt), sdk=c.sdk||{}, credentials=c.credentials||{}, authentication=c.authentication||{}, account=c.account||{}, geo=c.geoblock||{}, balance=c.balance||{}, allowance=c.allowance||{}, market=c.market||{}, book=c.order_book||{};
+      const c=value||{}, checkedAt=c.checked_at, checkedPht=dateText(checkedAt), checkedMs=checkedAt?Date.parse(checkedAt):NaN, ageMs=Number.isFinite(checkedMs)?Date.now()-checkedMs:NaN, fresh=Number.isFinite(ageMs)&&ageMs>=0&&ageMs<=60000, displayedStatus=c.status==="READY"&&!fresh?"STALE":c.status, sdk=c.sdk||{}, credentials=c.credentials||{}, authentication=c.authentication||{}, account=c.account||{}, geo=c.geoblock||{}, balance=c.balance||{}, allowance=c.allowance||{}, market=c.market||{}, book=c.order_book||{};
       if(!value){ $("canary-connectivity").innerHTML=empty("No connectivity check persisted","Run Connectivity check to perform a read-only pre-arming check."); return; }
       const failures=arr(c.failure_reasons), failureMarkup=failures.length?`<div class="key-value"><span class="key">Failure codes</span><strong>${safe(arr(c.failure_codes).join(", ")||"—")}</strong></div><div class="key-value"><span class="key">Failure reasons</span><strong>${failures.map(item=>`${safe(item.code)}: ${safe(item.reason)}`).join("<br>")}</strong></div>`:"";
       const marketMarkup=String(market.status||"SKIPPED").toUpperCase()!=="SKIPPED"?`<div class="key-value"><span class="key">Market</span><strong>${safe(market.status)}</strong></div>`:"";
       const bookMarkup=String(book.status||"SKIPPED").toUpperCase()!=="SKIPPED"?`<div class="key-value"><span class="key">Order book</span><strong>${safe(book.status)}</strong></div>`:"";
-      $("canary-connectivity").innerHTML=`<article class="panel"><div class="section-title"><h2>CONNECTIVITY</h2><span class="badge ${statusClass(c.status)}">${safe(c.status||"BLOCKED")}</span></div><div class="three-col"><div class="key-value"><span class="key">SDK</span><strong>${safe(sdk.status)} · ${safe(sdk.name)} · ${safe(sdk.version)}</strong></div><div class="key-value"><span class="key">Credentials</span><strong>${safe(credentials.status)}</strong></div><div class="key-value"><span class="key">Authentication</span><strong>${safe(authentication.status)}</strong></div><div class="key-value"><span class="key">Account</span><strong>${safe(account.status)}${account.wallet_type?` · ${safe(account.wallet_type)}`:""}</strong></div><div class="key-value"><span class="key">Geoblock</span><strong>${safe(geo.status)}${geo.country?` · ${safe(geo.country)}`:""}${geo.region?` / ${safe(geo.region)}`:""}</strong></div><div class="key-value"><span class="key">Balance</span><strong>${safe(balance.status)}${balance.available_usd!=null?` · ${usd(balance.available_usd)}`:""}</strong></div><div class="key-value"><span class="key">Allowance</span><strong>${safe(allowance.status)}</strong></div>${marketMarkup}${bookMarkup}<div class="key-value"><span class="key">Checked</span><strong>${safe(dateText(c.checked_at))}</strong></div></div>${failureMarkup?`<p class="page-note">${failureMarkup}</p>`:""}</article>`;
+      $("canary-connectivity").innerHTML=`<article class="panel"><div class="section-title"><h2>CONNECTIVITY</h2><span class="badge ${statusClass(displayedStatus)}">${safe(displayedStatus||"BLOCKED")}</span></div><div class="three-col"><div class="key-value"><span class="key">SDK</span><strong>${safe(sdk.status)} · ${safe(sdk.name)} · ${safe(sdk.version)}</strong></div><div class="key-value"><span class="key">Credentials</span><strong>${safe(credentials.status)}</strong></div><div class="key-value"><span class="key">Authentication</span><strong>${safe(authentication.status)}</strong></div><div class="key-value"><span class="key">Account</span><strong>${safe(account.status)}${account.wallet_type?` · ${safe(account.wallet_type)}`:""}</strong></div><div class="key-value"><span class="key">Geoblock</span><strong>${safe(geo.status)}${geo.country?` · ${safe(geo.country)}`:""}${geo.region?` / ${safe(geo.region)}`:""}</strong></div><div class="key-value"><span class="key">Balance</span><strong>${safe(balance.status)}${balance.available_usd!=null?` · ${usd(balance.available_usd)}`:""}</strong></div><div class="key-value"><span class="key">Allowance</span><strong>${safe(allowance.status)}</strong></div>${marketMarkup}${bookMarkup}<div class="key-value"><span class="key">Checked</span><strong>${safe(dateText(c.checked_at))}</strong></div></div>${failureMarkup?`<p class="page-note">${failureMarkup}</p>`:""}</article>`;
     }
     async function binanceControlPost(action,payload={}) {
       const node=$("binance-action-result");
@@ -5434,66 +5428,104 @@ def _dashboard_html(
       _renderBinanceCanaryPaper(data);
     };
 
-    function renderRiskSettings(data) {
-      const snapshot=data?.risk_settings||data?.canary?.risk_settings||{}, active=snapshot.active||snapshot.active_config||{}, draft=snapshot.draft||snapshot.draft_config||{}, source=(draft.values&&typeof draft.values==="object"?draft.values:(draft.limits&&typeof draft.limits==="object"?draft.limits:(active.values&&typeof active.values==="object"?active.values:(active.limits&&typeof active.limits==="object"?active.limits:(snapshot.effective_limits||snapshot.active_limits||{})))));
-      const fields=[
-        ["max_orders_per_day","Submitted orders/day (5 / 10 / 20 / custom)"],
-        ["max_submitted_orders_per_day","All submitted orders/day"],
-        ["max_all_in_buy_usd","All-in per buy"],
-        ["max_gross_daily_buy_usd","Gross daily buy"],
-        ["max_aggregate_open_cost_usd","Open exposure / aggregate cost"],
-        ["max_aggregate_exposure_usd","Aggregate open exposure"],
-        ["max_positions","Max positions"],
-        ["realized_loss_entry_stop_usd","Realized P/L stop"],
-        ["equity_loss_entry_stop_usd","Equity stop"],
-        ["max_slippage_bps","Slippage (bps)"],
-        ["max_fee_reserve_usd","Fee reserve"],
-        ["max_daily_loss_usd","Advanced daily loss"],
-        ["max_drawdown","Advanced drawdown"],
-        ["max_loss","Advanced loss"],
-        ["per_market_buy_cap_usd","Per-market budget"],
-        ["per_event_buy_cap_usd","Per-event budget"],
-        ["cumulative_buy_cap_usd","Cumulative buy budget"]
-      ];
-      const value=(name)=>source?.[name]??active?.[name]??"";
-      const activeGeneration=active.generation??snapshot.generation??"";
-      const draftGeneration=draft.generation??activeGeneration??"";
-      const activeConfigId=active.config_id??active.id??snapshot.config_id??snapshot.active_config_id??"";
-      const draftConfigId=draft.config_id??draft.id??snapshot.draft_config_id??"";
-      $("risk-settings").innerHTML=`<article class="panel"><div class="section-title"><h2>POLYMARKET RISK SETTINGS</h2><span class="badge ${statusClass(snapshot.status||"UNKNOWN")}">${safe(snapshot.status||"UNKNOWN")}</span></div><p class="page-note">Draft edits are persisted but never active until an explicit generation-fenced activation. Decimal values remain exact strings; collateral and fee reserve are shown in venue units.</p><div class="three-col">${fields.map(([name,label])=>`<label class="key-value"><span class="key">${safe(label)}</span><input data-risk-field="${safe(name)}" aria-label="${safe(label)}" value="${safe(value(name))}" inputmode="decimal"></label>`).join("")}</div><div class="filters"><label class="key-value"><span class="key">Draft config ID</span><input id="risk-config-id" aria-label="Draft config ID" value="${safe(draftConfigId)}"></label><label class="key-value"><span class="key">Expected generation</span><input id="risk-generation" aria-label="Expected generation" value="${safe(draftGeneration)}" inputmode="numeric"></label><label class="key-value"><span class="key">Actor</span><input id="risk-actor" aria-label="Risk settings actor" value="operator"></label></div><div class="filters"><label class="key-value"><span class="key">Reviewed ACTIVE config ID</span><input id="risk-active-config-id" aria-label="Reviewed active config ID" value="${safe(activeConfigId)}" readonly></label><label class="key-value"><span class="key">Reviewed ACTIVE generation</span><input id="risk-active-generation" aria-label="Reviewed active generation" value="${safe(activeGeneration)}" readonly></label></div><p class="page-note"><button class="risk-settings-action" data-risk-action="save">Save draft</button> <button class="risk-settings-action" data-risk-action="activate">Activate draft</button></p><p class="page-note">Enable confirmation requires exact <code>ENABLE AUTO CANARY POLYMARKET &lt;config&gt; &lt;generation&gt;</code> for the reviewed ACTIVE settings only.</p><div class="filters"><label class="key-value"><span class="key">Enable confirmation</span><input id="risk-enable-confirm" aria-label="Exact canary enable confirmation"></label><button class="risk-settings-action" data-risk-action="enable">Enable canary</button></div></article>`;
+    function renderCanarySetup(data) {
+      const payload=data&&typeof data==="object"?data:{}, canary=payload.canary&&typeof payload.canary==="object"?payload.canary:{};
+      // Keep this setup boundary explicit: the canary view owns the
+      // connectivity/settings sub-surfaces, while the autonomous renderer
+      // below owns the bounded readiness and execution summary.
+      renderCanaryConnectivity(payload.connectivity??canary.connectivity??null);
+      renderRiskSettings(payload);
+      const readiness=payload.readiness&&typeof payload.readiness==="object"?payload.readiness:{};
+      const updated=payload.readiness_snapshot_updated_at??canary.readiness_snapshot_updated_at??readiness.updated_at;
+      if($("canary-readiness-snapshot"))$("canary-readiness-snapshot").innerHTML=readinessSnapshotMarkup({...payload,canary:{...canary,readiness_snapshot_updated_at:updated}});
     }
-
+    function renderRiskSettings(data) {
+      const snapshot=data?.risk_settings||data?.canary?.risk_settings||{},
+        active=snapshot.active||snapshot.active_config||{},
+        rawDraft=snapshot.draft||snapshot.draft_config||null,
+        draft=rawDraft&&typeof rawDraft==="object"&&rawDraft.config_id?rawDraft:null,
+        source=(draft?.values&&typeof draft.values==="object"?draft.values:(draft?.limits&&typeof draft.limits==="object"?draft.limits:(active.values&&typeof active.values==="object"?active.values:(active.limits&&typeof active.limits==="object"?active.limits:(snapshot.effective_limits||snapshot.active_limits||{})))));
+      const value=(name,fallback="")=>source?.[name]??active?.[name]??fallback;
+      const submissionValue=Number(value("max_submitted_orders_per_day",value("max_orders_per_day","5")));
+      const submissionPreset=[5,10,20].includes(submissionValue)?String(submissionValue):"custom";
+      const fields=[
+        ["max_all_in_buy_usd","Maximum all-in buy","decimal"],
+        ["max_gross_daily_buy_usd","Gross daily buy budget","decimal"],
+        ["max_aggregate_exposure_usd","Open exposure","decimal"],
+        ["max_positions","Maximum positions","number"],
+        ["realized_loss_entry_stop_usd","Realized loss stop","decimal"],
+        ["equity_loss_entry_stop_usd","Equity loss stop","decimal"],
+        ["max_slippage_bps","Slippage (bps)","number"]
+      ];
+      const advanced=[
+        ["max_fee_reserve_usd","Fee reserve","decimal"],
+        ["per_market_buy_cap_usd","Per-market buy limit","decimal"],
+        ["per_event_buy_cap_usd","Per-event buy limit","decimal"],
+        ["cumulative_buy_cap_usd","Cumulative buy limit","decimal"]
+      ];
+      riskReview={
+        active:{
+          values:active.values||active.settings||snapshot.effective_limits||snapshot.active_limits||{},
+          configId:active.config_id??active.id??snapshot.config_id??snapshot.active_config_id??null,
+          generation:active.generation??snapshot.generation??null,
+          hash:active.config_hash??snapshot.config_hash??null,
+          controlGeneration:snapshot.control_generation??active.control_generation??null
+        },
+        draft:draft&&draft.config_id?{
+          values:draft.values||draft.settings||{},
+          configId:draft.config_id??draft.id??null,
+          generation:draft.generation??null,
+          hash:draft.config_hash??null
+        }:null
+      };
+      const optionalAdvanced=new Set(["per_market_buy_cap_usd","per_event_buy_cap_usd","cumulative_buy_cap_usd"]);
+      const input=(name,label,type="decimal",current="")=>{const display=current==null?"":String(current),optional=optionalAdvanced.has(name),marker=optional?' data-risk-optional="clearable"':"";return `<label class="key-value"><span class="key">${safe(label)}</span><input data-risk-field="${safe(name)}"${marker} aria-label="${safe(label)}" value="${safe(display)}" inputmode="${type==="number"?"numeric":"decimal"}"></label>`;};
+      const reviewFields=[["max_submitted_orders_per_day","Submissions/day","number"],...fields,...advanced];
+      riskReview.labels=Object.fromEntries(reviewFields.map(([name,label])=>[name,label]));
+      const reviewValues=riskReview.draft?.values||{};
+      const activeValues=riskReview.active.values||{};
+      const diff=riskReview.draft?reviewFields.map(([name,label])=>({name,label,before:activeValues[name],after:reviewValues[name]})).filter(item=>JSON.stringify(item.before??null)!==JSON.stringify(item.after??null)):[];
+      const diffMarkup=diff.length
+        ? `<ul>${diff.map(item=>`<li>${safe(item.label)}: ${safe(item.before??"")} → <strong>${safe(item.after??"")}</strong></li>`).join("")}</ul>`
+        : `<p class="page-note">No saved changes are waiting for activation.</p>`;
+      const status=String(snapshot.status||"CURRENT").toUpperCase();
+      $("risk-settings").innerHTML=`<article class="panel"><div class="section-title"><h2>POLYMARKET RISK SETTINGS</h2><span class="badge ${statusClass(status)}">${safe(status)}</span></div><p class="page-note">Edit one bounded setting at a time, review the exact changes, then confirm activation. Active limits remain authoritative until activation succeeds.</p><div class="three-col"><label class="key-value"><span class="key">Submissions/day</span><select data-risk-field="max_submitted_orders_per_day" aria-label="Submissions per day"><option value="5"${submissionPreset==="5"?" selected":""}>5</option><option value="10"${submissionPreset==="10"?" selected":""}>10</option><option value="20"${submissionPreset==="20"?" selected":""}>20</option><option value="custom"${submissionPreset==="custom"?" selected":""}>Custom</option></select><input data-risk-submissions-custom aria-label="Custom submissions per day" value="${submissionPreset==="custom"?safe(submissionValue):""}" inputmode="numeric"${submissionPreset==="custom"?"":" hidden"}></label>${fields.map(([name,label,type])=>input(name,label,type,value(name))).join("")}</div><details><summary>Optional advanced limits</summary><div class="three-col">${advanced.map(([name,label,type])=>input(name,label,type,value(name))).join("")}</div></details><div class="filters"><label class="key-value"><span class="key">Operator</span><strong>Authenticated operator</strong></label><button class="risk-settings-action" data-risk-action="save">Review changes</button></div><div id="risk-review" class="page-note"><strong>Activation review</strong>${diffMarkup}</div>${riskReview.draft?`<p class="page-note"><button class="risk-settings-action" data-risk-action="activate">Confirm activation</button></p>`:""}</article>`;
+      const submissions=$("[data-risk-field='max_submitted_orders_per_day']"),custom=$("[data-risk-submissions-custom]");
+      submissions?.addEventListener("change",()=>{if(custom){custom.hidden=submissions.value!=="custom";if(submissions.value!=="custom")custom.value="";}});
+    }
     function renderCanary(data) {
-      renderRiskSettings(data);
-      const c=data.canary||{}, auto=data.autonomous_canary||c.autonomous||{}, risk=c.risk_envelope||c.risk_limits||{}, signal=data.canary_signal||null, connectivity=data.connectivity??c.connectivity??null;
-      renderCanaryConnectivity(connectivity);
-      $("canary-readiness-snapshot").innerHTML=readinessSnapshotMarkup(data);
-      const backendState=String(c.micro_live_canary||"UNKNOWN"), stateValue=backendState==="KILLED"?"KILLED":backendState==="UNKNOWN"?"UNKNOWN":Boolean(auto.enabled)?"ENABLED":"DISABLED";
-      const enabled=Boolean(auto.enabled);
-      const selectionStatus=String(c.selection_status||"UNKNOWN").toUpperCase();
+      renderCanarySetup(data);
+      const payload=data&&typeof data==="object"?data:{}, c=payload.canary&&typeof payload.canary==="object"?payload.canary:{}, auto=payload.autonomous_canary&&typeof payload.autonomous_canary==="object"?payload.autonomous_canary:(c.autonomous&&typeof c.autonomous==="object"?c.autonomous:{});
+      const control=payload.control&&typeof payload.control==="object"?payload.control:(c.control&&typeof c.control==="object"?c.control:{});
+      const connectivity=payload.connectivity&&typeof payload.connectivity==="object"?payload.connectivity:(c.connectivity&&typeof c.connectivity==="object"?c.connectivity:null);
+      const risk=c.risk_envelope&&typeof c.risk_envelope==="object"?c.risk_envelope:(c.risk_limits&&typeof c.risk_limits==="object"?c.risk_limits:{});
+      const stateValue=String(c.control_state??control.state??c.micro_live_canary??"UNKNOWN").toUpperCase();
+      const backendState=stateValue, enabled=stateValue==="AUTONOMOUS_MICRO_LIVE"||stateValue==="ENABLED";
+      const selectionStatus=String(c.selection_status??control.selection_status??"UNKNOWN").toUpperCase();
       const selectionValid=c.selection_valid===true&&selectionStatus==="CURRENT";
+      const signal=payload.canary_signal??c.latest_signal??null;
       const currentCandidate=selectionValid?c.selected_candidate||"": "";
       const currentWinnerId=selectionValid?c.winner_id||"": "";
       const historicalCandidate=c.last_selected_candidate||"";
-      const selectionLabel=selectionStatus==="STALE"?"STALE · REEVALUATION REQUIRED":selectionStatus==="CURRENT"?"CURRENT":"UNKNOWN";
+      const selectionLabel=selectionStatus==="STALE"?"STALE · REEVALUATION REQUIRED":selectionStatus==="CURRENT"?"CURRENT":c.selection_invalidation_reason==="NO_ELIGIBLE_CANDIDATES"?"NO_ELIGIBLE_CANDIDATES":"UNKNOWN";
       const rawEligible=c.eligibility_raw_count==null?null:Number(c.eligibility_raw_count);
       const eligible=c.eligible_count==null?null:Number(c.eligible_count);
       const rawRankable=c.rankable_raw_count==null?null:Number(c.rankable_raw_count);
       const rankable=c.rankable_count==null?null:Number(c.rankable_count);
       const events=data.real_execution_events??c.real_execution_events??c.execution_event_count??null;
       const manualCandidate=backendState==="ARMED"&&c.candidate?`<div class="panel"><div class="metric">${safe(c.candidate)}</div><div class="metric-label">Manual armed candidate</div></div>`:"";
-      const connectivityReady=connectivity?.ready===true, connectivityBlocker=connectivityReady?"":arr(connectivity?.failure_codes)[0]||"CONNECTIVITY_BLOCKED";
+      const connectivityCheckedAt=connectivity?.checked_at?Date.parse(connectivity.checked_at):NaN;
+      const connectivityAgeMs=Number.isFinite(connectivityCheckedAt)?Date.now()-connectivityCheckedAt:NaN;
+      const connectivityFresh=Number.isFinite(connectivityAgeMs)&&connectivityAgeMs>=0&&connectivityAgeMs<=60000;
+      const connectivityReady=connectivity?.ready===true&&connectivity?.status==="READY"&&connectivityFresh;
+      const connectivityBlocker=connectivityReady?"":connectivity?.ready===true&&!connectivityFresh?"CONNECTIVITY_CHECK_STALE":arr(connectivity?.failure_codes)[0]||"CONNECTIVITY_BLOCKED";
       const selectionReason=c.selection_invalidation_reason||"", selectionBlocker=selectionValid&&currentCandidate?"":(selectionReason||(selectionStatus==="STALE"?"REEVALUATION_REQUIRED":selectionStatus==="UNKNOWN"?"READINESS_UNKNOWN":selectionStatus==="NONE"?"NO_CURRENT_SELECTION":"SELECTION_INVALID"));
       const currentRank=selectionValid&&selectionStatus==="CURRENT"?auto.rank:"—", currentScore=selectionValid&&selectionStatus==="CURRENT"?auto.score:"—", selectionReasonLabel=c.selection_reason||"—", historicalMarkup=historicalCandidate?`<div class="panel"><div class="metric">${safe(historicalCandidate)}</div><div class="metric-label">Selected winner · Historical selected ID</div><p class="page-note"><span class="badge ${statusClass(selectionStatus)}">${safe(selectionLabel)}</span></p></div>`:"";
       const autonomousBlocker=enabled?"ENABLED":!connectivity?"CONNECTIVITY_CHECK_REQUIRED":!connectivityReady?connectivityBlocker:backendState==="KILLED"?"CANARY_KILLED":selectionBlocker||String(auto.blocker||"AUTONOMOUS_CANARY_DISABLED");
       const autoReady=connectivityReady&&backendState!=="KILLED"&&!enabled&&selectionValid&&Boolean(currentCandidate);
-      const settingsSnapshot=data?.risk_settings||data?.canary?.risk_settings||{}, activeSettings=settingsSnapshot.active||settingsSnapshot.active_config||{};
-      const activeConfigId=activeSettings.config_id??activeSettings.id??settingsSnapshot.config_id??settingsSnapshot.active_config_id??"";
-      const activeGeneration=activeSettings.generation??settingsSnapshot.generation??"";
-      const parsedGeneration=Number(activeGeneration);
-      const enablePayload=activeConfigId&&Number.isInteger(parsedGeneration)&&parsedGeneration>0?{venue:"polymarket",config_id:String(activeConfigId),expected_generation:parsedGeneration}:null;
-      const enableConfirmation=enablePayload?`ENABLE AUTO CANARY POLYMARKET ${enablePayload.config_id} ${enablePayload.expected_generation}`:"";
-      const enable=enabled?controlButton("canary.disarm","DISARM","","DISARM"):autoReady&&enablePayload?controlButton("canary.enable_auto","ENABLE AUTO CANARY","",enableConfirmation,enablePayload):"";
+      const activeBinding=riskReview.active||{};
+      const bindingReady=Boolean(activeBinding.configId)&&Number.isInteger(Number(activeBinding.generation))&&Number(activeBinding.generation)>0;
+      const enable=enabled?controlButton("canary.disarm","DISARM","","DISARM"):autoReady&&bindingReady?`<button class="risk-settings-action" data-risk-action="enable">Review active limits and enable</button>`:"";
       const riskMarkup=Object.entries(risk).map(([key,value])=>`<div class="key-value"><span class="key">${safe(key.replaceAll("_"," "))}</span><strong>${safe(value)}</strong></div>`).join("")||empty("Risk envelope unavailable","No frozen risk limits are persisted.");
       $("canary-controls").innerHTML=`<article class="panel"><div class="section-title"><h2>AUTONOMOUS CANARY CONTROL</h2><span class="badge ${statusClass(stateValue)}">${safe(stateValue)}</span></div><p class="page-note"><strong>${safe(enabled?"AUTO CANARY ENABLED":autoReady?"AUTO CANARY READY TO ENABLE":`AUTO CANARY BLOCKED: ${autonomousBlocker}`)}</strong></p><div class="page-note">${controlButton("canary.connectivity_check","Connectivity check")} · ${enable} · ${controlButton("canary.kill","KILL","","KILL")}</div><p class="page-note">One confirmation enables the prediction-only envelope using the active venue settings. Research, eligibility, ranking, and submission decisions run in the node worker; Hermes cannot change this envelope.</p></article>`;
       $("canary-summary").innerHTML=`<div class="card-grid"><div class="panel"><div class="metric">${safe(stateValue)}</div><div class="metric-label">Autonomous canary state</div></div>${currentCandidate?`<div class="panel"><div class="metric">${safe(currentCandidate)}</div><div class="metric-label">Selected winner · Current selection</div><p class="page-note"><span class="badge ${statusClass(selectionStatus)}">${safe(selectionLabel)}</span></p></div>`:historicalMarkup||`<div class="panel"><div class="metric">—</div><div class="metric-label">Current selection</div><p class="page-note"><span class="badge ${statusClass(selectionStatus)}">${safe(selectionLabel)}</span></p></div>`}${manualCandidate}<div class="panel"><div class="metric">${safe(currentRank)} · ${safe(currentScore)}</div><div class="metric-label">Current rank / score</div></div><div class="panel"><div class="metric">${count(rawEligible)}</div><div class="metric-label">Eligible candidates (raw)</div></div><div class="panel"><div class="metric">${count(eligible)}</div><div class="metric-label">Eligible candidates (validated)</div></div><div class="panel"><div class="metric">${count(rawRankable)}</div><div class="metric-label">Rankable candidates (raw)</div></div><div class="panel"><div class="metric">${count(rankable)}</div><div class="metric-label">Rankable candidates (validated)</div></div><div class="panel"><div class="metric">${count(events)}</div><div class="metric-label">Real execution events</div></div></div><article class="panel"><div class="section-title"><h2>Autonomous readiness</h2><span class="badge ${statusClass(autonomousBlocker)}">${safe(autoReady?"READY":autonomousBlocker)}</span></div><div class="three-col"><div class="key-value"><span class="key">Selection status</span><strong>${safe(selectionLabel)}</strong></div><div class="key-value"><span class="key">Selection valid</span><strong>${safe(selectionValid)}</strong></div><div class="key-value"><span class="key">Current selection</span><strong>${safe(currentCandidate||"—")}</strong></div><div class="key-value"><span class="key">Historical selection</span><strong>${safe(historicalCandidate||"—")}</strong></div><div class="key-value"><span class="key">Selection reason</span><strong>${safe(selectionReasonLabel)}</strong></div><div class="key-value"><span class="key">Invalidation reason</span><strong>${safe(selectionReason||"—")}</strong></div><div class="key-value"><span class="key">Last ranking run ID</span><strong>${safe(c.ranking_run_id||"—")}</strong></div><div class="key-value"><span class="key">Last ranking timestamp</span><strong>${safe(dateText(c.ranking_timestamp))}</strong></div><div class="key-value"><span class="key">Historical data integrity</span><strong>${safe(c.historical_data_integrity||"UNKNOWN")}</strong></div><div class="key-value"><span class="key">Historical execution fidelity</span><strong>${safe(c.historical_execution_fidelity||"UNKNOWN")}</strong></div><div class="key-value"><span class="key">Current execution evidence</span><strong>${safe(c.current_execution_evidence||"CURRENT_ORDER_BOOK_REQUIRED")}</strong></div><div class="key-value"><span class="key">Next decision</span><strong>${safe(auto.next_decision||"—")}</strong></div><div class="key-value"><span class="key">Blocker</span><strong>${safe(selectionReason||auto.blocker||"—")}</strong></div></div></article><article class="panel"><div class="section-title"><h2>Risk envelope</h2><span class="badge warn">active settings</span></div>${riskMarkup}</article>`;
@@ -5504,19 +5536,26 @@ def _dashboard_html(
     function renderCanaryAutonomousState(data) {
       const c=data?.canary||{}, auto=data?.autonomous_canary||c.autonomous||{};
       const read=(name)=>auto[name]??c[name]??null;
-      const researchCandidate=c.selected_candidate??c.last_selected_candidate??auto.selected_candidate??auto.last_selected_candidate??null;
-      const researchRank=c.winner_rank??auto.rank??null;
+      const selectionStatus=String(c.selection_status??auto.selection_status??"UNKNOWN").toUpperCase();
+      const selectionValid=(c.selection_valid??auto.selection_valid)===true;
+      const boundResearchCandidate=c.selected_candidate??auto.selected_candidate??null;
+      const currentSelectionBinding=selectionValid&&selectionStatus==="CURRENT"&&boundResearchCandidate!=null&&String(boundResearchCandidate).trim()!=="";
+      const researchCandidate=currentSelectionBinding?boundResearchCandidate:null;
+      const researchRank=currentSelectionBinding?(c.winner_rank??auto.winner_rank??auto.rank??null):null;
       const actionableCandidate=read("selected_actionable_candidate");
       const actionableFound=read("actionable_candidates_found");
       const signalChecked=read("candidates_signal_checked");
       const noSignal=read("candidates_no_signal");
       const observed=actionableFound!=null||signalChecked!=null||noSignal!=null;
       const hasActionable=actionableCandidate!=null&&String(actionableCandidate).trim()!=="";
+      const eligibleCount=c.eligible_count??auto.eligible_count,rankableCount=c.rankable_count??auto.rankable_count;
+      const noEligible=eligibleCount!=null&&rankableCount!=null&&Number(eligibleCount)===0&&Number(rankableCount)===0;
       const noAction=!hasActionable&&observed&&(
         (actionableFound!=null&&Number(actionableFound)===0)||
         (actionableFound==null&&noSignal!=null&&Number(noSignal)>0)
       );
-      const status=noAction?"NO ACTIONABLE SIGNAL":hasActionable?"ACTIONABLE SIGNAL":"UNKNOWN";
+      const scanStatus=String(read("signal_scan_status")||"").toUpperCase();
+      const status=noEligible?"NO_ELIGIBLE_CANDIDATES":scanStatus==="IN_PROGRESS"?"IN_PROGRESS":noAction?"NO ACTIONABLE SIGNAL":hasActionable?"ACTIONABLE SIGNAL":scanStatus==="UNKNOWN"?"DATA MISSING":"UNKNOWN";
       const currentCandidate=hasActionable?actionableCandidate:noAction?"NONE":null;
       const scanWindow=`${safe(read("next_signal_scan_start_rank"))}–${safe(read("next_signal_scan_end_rank"))}`;
       const existing=$("canary-actionable-opportunity");
@@ -5526,7 +5565,9 @@ def _dashboard_html(
       const displayReason=(value)=>String(value||"").toUpperCase()==="CANDIDATE_FORWARD_MARKET_UNRESOLVED"?"UNRESOLVED_MARKET":value;
       const evidenceRows=[["Candidate-bound markets",arr(forwardEvidence.candidate_bound_markets).length],["Scheduled",arr(forwardEvidence.scheduled).length],["Fresh",arr(forwardEvidence.fresh).length],["Stale",arr(forwardEvidence.stale).length],["Missing",arr(forwardEvidence.missing).length],["Grade",forwardEvidence.grade],["Reason",displayReason(forwardEvidence.reason_display||forwardEvidence.reason_code)],["Newest source",dateText(forwardEvidence.newest_required_source_timestamp)],["Oldest source",dateText(forwardEvidence.oldest_required_source_timestamp)],["Newest observed",dateText(forwardEvidence.newest_required_observed_at)],["Oldest observed",dateText(forwardEvidence.oldest_required_observed_at)]];
       $("canary-summary")?.insertAdjacentHTML("beforeend",`<article id="canary-forward-evidence" class="panel"><div class="section-title"><h2>FORWARD EVIDENCE</h2><span class="badge ${statusClass(forwardEvidence.grade)}">${safe(forwardEvidence.grade||"UNKNOWN")}</span></div><div class="three-col">${evidenceRows.map(([label,value])=>`<div class="key-value"><span class="key">${safe(label)}</span><strong>${safe(value??"—")}</strong></div>`).join("")}</div><p class="page-note">Signal scan reason counts: ${safe(Object.entries(reasonCounts).map(([key,value])=>`${key}=${value}`).join(", ")||"—")}</p>${c.last_cycle_blocker?`<p class="page-note">Last-cycle blocker: ${safe(c.last_cycle_blocker)} (control state ${safe(c.control_state||"UNKNOWN")})</p>`:""}</article>`);
-      $("canary-summary")?.insertAdjacentHTML("beforeend",`<p class="page-note signal-scan-coverage">Signal scan coverage: ${safe(read("signal_scan_coverage_percentage"))}% · checked ${safe(read("signal_scan_checked_this_cycle"))} · remaining ${safe(read("signal_scan_remaining_this_cycle"))} · cycle ${safe(read("signal_scan_cycle_id"))} · status ${safe(read("signal_scan_status"))}</p>`);
+      const universeHash=read("signal_scan_candidate_universe_hash");
+      const coverage=noEligible?0:universeHash==null||String(universeHash).trim()===""?0:Number(read("signal_scan_coverage_percentage")??0);
+      $("canary-summary")?.insertAdjacentHTML("beforeend",`<p class="page-note signal-scan-coverage">Signal scan coverage: ${safe(Number.isFinite(coverage)?coverage:0)}% · checked ${safe(read("signal_scan_checked_this_cycle")??0)} · remaining ${safe(read("signal_scan_remaining_this_cycle")??0)} · cycle ${safe(read("signal_scan_cycle_id"))} · status ${safe(read("signal_scan_status")||"UNKNOWN")}</p>`);
     }
     const _renderCanaryResearchAndAction = renderCanary;
     renderCanary = (data) => { _renderCanaryResearchAndAction(data); renderCanaryAutonomousState(data); };
@@ -5806,30 +5847,74 @@ def _dashboard_html(
       if(!button||button.disabled)return;
       button.disabled=true;
       try {
-        const action=button.dataset.riskAction||"",actor=$("risk-actor")?.value||"operator",values={};
-        document.querySelectorAll("[data-risk-field]").forEach(input=>{if(input.value!=="")values[input.dataset.riskField]=input.value;});
+        const action=button.dataset.riskAction||"",values={};
+        document.querySelectorAll("[data-risk-field]").forEach(input=>{
+          if(input.dataset.riskField==="max_submitted_orders_per_day"){
+            if(input.value==="custom"){
+              const custom=$("[data-risk-submissions-custom]");
+              if(!custom||custom.value==="")throw new Error("CUSTOM_ORDER_SUBMISSIONS_REQUIRED");
+              values.max_submitted_orders_per_day=custom.value;
+            } else values.max_submitted_orders_per_day=input.value;
+          } else if(input.dataset.riskField==="max_aggregate_exposure_usd"){
+            if(input.value!==""){
+              values.max_aggregate_exposure_usd=input.value;
+              values.max_aggregate_open_cost_usd=input.value;
+            }
+          } else if(input.value!=="" || input.dataset.riskOptional==="clearable") values[input.dataset.riskField]=input.value===""?null:input.value;
+        });
         let result;
         let confirmation="";
-        if(action==="save"||action==="activate"){
-          confirmation=action==="save"?"SAVE RISK SETTINGS DRAFT":"ACTIVATE RISK SETTINGS DRAFT";
-          const typed=window.prompt(`Type ${confirmation} to continue`);
+        if(action==="save"){
+          confirmation="SAVE RISK SETTINGS DRAFT";
+          const typed=window.prompt("Type SAVE RISK SETTINGS DRAFT to review the changes");
           if(typed!==confirmation){
-            actionResultMessage("canary.settings",`Risk settings ${action} cancelled: exact confirmation required`);
+            actionResultMessage("canary.settings","Risk settings save cancelled: exact confirmation required");
             return;
           }
-        }
-        if(action==="save")result=await controlPost("canary.settings.save_draft","",confirmation,{values,actor});
-        else if(action==="activate")result=await controlPost("canary.settings.activate_draft","",confirmation,{config_id:$("risk-config-id")?.value||"",expected_generation:$("risk-generation")?.value||"",actor});
-        else if(action==="enable"){
-          const config_id=$("risk-active-config-id")?.value||"",expected_generation=$("risk-active-generation")?.value||"",confirm=$("risk-enable-confirm")?.value||"";
-          result=await controlPost("canary.enable_auto","",confirm,{venue:"polymarket",config_id,expected_generation});
+          result=await controlPost("canary.settings.save_draft","",confirmation,{values});
+          if(result?.ok&&result?.result&&typeof result.result==="object"){
+            const saved=result.result.risk_settings||result.result;
+            const draft=saved.draft||saved;
+            if(draft.config_id)riskReview.draft={values:draft.values||draft.settings||{},configId:draft.config_id,generation:draft.generation,hash:draft.config_hash};
+          }
+        } else if(action==="activate"){
+          const draft=riskReview.draft,active=riskReview.active;
+          if(!draft?.configId||!active?.generation){
+            actionResultMessage("canary.settings","Activation blocked: review the changes again after refreshing active settings");
+            return;
+          }
+          confirmation="ACTIVATE RISK SETTINGS DRAFT";
+          const typed=window.prompt("Type ACTIVATE RISK SETTINGS DRAFT to confirm the reviewed changes");
+          if(typed!==confirmation){
+            actionResultMessage("canary.settings","Risk settings activation cancelled: exact confirmation required");
+            return;
+          }
+          result=await controlPost("canary.settings.activate_draft","",confirmation,{config_id:draft.configId,expected_generation:Number(active.generation)});
+        } else if(action==="enable"){
+          const active=riskReview.active;
+          if(!active?.configId||!Number.isInteger(Number(active.generation))||Number(active.generation)<1){
+            actionResultMessage("canary.settings","Enable blocked: active settings review is unavailable; refresh and review again");
+            return;
+          }
+          const summary=Object.entries(active.values||{}).filter(([name])=>riskReview.labels?.[name]).map(([name,value])=>`${riskReview.labels[name]}=${value}`).join(", ");
+          if(!window.confirm(`Review active limits before enabling:\n${summary||"No active limits available"}`)){
+            actionResultMessage("canary.settings","Enable cancelled: active limits were not confirmed");
+            return;
+          }
+          confirmation=`ENABLE AUTO CANARY POLYMARKET ${active.configId} ${Number(active.generation)}`;
+          result=await controlPost("canary.enable_auto","",confirmation,{venue:"polymarket",config_id:active.configId,expected_generation:Number(active.generation)});
         } else result={ok:false,reason:"UNKNOWN_RISK_SETTINGS_ACTION"};
-        if(!result?.ok)actionResultMessage("canary.settings",`Risk settings action blocked: ${result?.reason||"CONTROL_FAILED"}`);
+        if(!result?.ok){
+          const reason=String(result?.reason||"CONTROL_FAILED"),detail=[result?.detail,result?.details,result?.error,result?.message,result?.result?.detail,result?.result?.reason].filter(value=>typeof value==="string").join(" ");
+          const conflict=reason.trim().toUpperCase()==="CANARYSETTINGSCONFLICT"||/settings (?:hash|generation)|control generation|draft review|reviewed settings/i.test(detail);
+          const stale=conflict||/generation|hash|stale|review/i.test(reason);
+          actionResultMessage("canary.settings",conflict?"Risk settings activation blocked: the reviewed settings or control generation changed. Refresh and review the settings again before activating.":`Risk settings action blocked: ${reason}${stale?" · refreshed active settings and review differences":""}`);
+        }
       } finally {
         button.disabled=false;
       }
     });
-    const recoveryForm=$("canary-recovery-form"),canaryView=$("view-canary"); if(recoveryForm&&canaryView)canaryView.appendChild(recoveryForm);
+    const recoveryForm=$("canary-recovery-form"),canaryView=$("view-canary"); if(recoveryForm&&canaryView){const wrapper=document.createElement("details");wrapper.className="panel";wrapper.innerHTML="<summary>Advanced entry recovery (operator-required only)</summary>";canaryView.appendChild(wrapper);wrapper.appendChild(recoveryForm);recoveryForm.classList.remove("panel");}
     document.addEventListener("click",async event=>{const button=event.target.closest?.("#canary-recovery-submit");if(!button)return;const eventId=$("canary-recovery-event")?.value.trim()||"",signalId=$("canary-recovery-signal")?.value.trim()||"",orderId=$("canary-recovery-order")?.value.trim()||"",confirmation=$("canary-recovery-confirm")?.value||"",node=$("canary-recovery-result");if(!eventId||!signalId||!orderId||confirmation!=="RECOVER UNKNOWN ENTRY"){if(node)node.textContent="Recovery blocked: exact event, signal, order, and confirmation are required";return;}const result=await controlPost("canary.recover_entry",eventId,confirmation,{event_id:eventId,signal_id:signalId,exchange_order_id:orderId});if(node)node.textContent=result.ok?"Recovery attached and reconciled":`Recovery blocked: ${result.reason||"CONTROL_FAILED"}`;});
     ensureActivityKind(); if($("crypto-symbol")){const oldSymbol=$("crypto-symbol"),newSymbol=oldSymbol.cloneNode(true);oldSymbol.replaceWith(newSymbol);newSymbol.addEventListener("input",()=>{state.page=1;saveState(true);loadPage("crypto",true);});} document.addEventListener("click",event=>{const button=event.target.closest?.(".copy");if(!button)return;navigator.clipboard?.writeText(button.dataset.copy||"").then(()=>{button.textContent="copied";setTimeout(()=>button.textContent="copy",1200);}).catch(()=>{});}); document.addEventListener("visibilitychange",()=>{if(document.hidden){if(activeController)activeController.abort();}else{nextRefreshAt=0;load();}});
     ensureFacets(); document.querySelectorAll(".tab").forEach(b=>b.addEventListener("click",()=>activate(b.dataset.view))); document.querySelectorAll("[data-link]").forEach(b=>b.addEventListener("click",e=>{e.preventDefault();activate(b.dataset.link)})); document.querySelectorAll(".filters input,.filters select").forEach(el=>el.addEventListener(el.tagName==="INPUT"?"input":"change",()=>{if(el.id.endsWith("-size")){const n=Number(el.value);if([10,25,50,100].includes(n)){state.page_size=n;document.querySelectorAll('select[id$="-size"]').forEach(s=>s.value=String(n));}} else if(el.id.includes("-filter"))state.filter=el.value;state.page=1;saveState(true);loadPage(state.tab)})); window.addEventListener("popstate",()=>{const q=new URLSearchParams(location.search),nextTab=q.get("tab")||"overview",changed=nextTab!==state.tab;params=q;state.tab=nextTab;state.page=Math.max(1,Number(q.get("page")||1));state.page_size=[10,25,50,100].includes(Number(q.get("page_size")))?Number(q.get("page_size")):25;state.filter=changed?"":q.get("filter")||"";state.sort=changed?"":q.get("sort")||"";state.direction=changed?"desc":q.get("direction")==="asc"?"asc":"desc";state.selected=changed?"":q.get("selected")||"";state.expanded=changed?false:q.get("expanded")==="1";restoreFacets();activate(state.tab,false)}); load(); activate(state.tab,false); const refreshHandle=setInterval(load,10000); window.addEventListener("beforeunload",()=>clearInterval(refreshHandle));

@@ -38,6 +38,9 @@ from .experiment_plan import AUTONOMOUS_BUDGET_ID, ExperimentPlan, ExperimentPla
 _MAX_QUEUE_RESULT_ITEMS = 64
 _MAX_DATASET_ROWS = 100_000
 _MAX_FORWARD_ROWS = 100_000
+_MAX_LEGACY_RECOVERY_ITEMS = 64
+_MUTABLE_DATASET_VERSION_ALIASES = frozenset({"latest", "current", "default", "unversioned"})
+
 PAPER_MARKET_AUTHORITY_CAP = 100
 
 PREDECLARED_STRATEGY_STARTING_SET: tuple[Mapping[str, Any], ...] = (
@@ -115,6 +118,104 @@ def _canonical_binding(value: Any) -> str:
             return [plain(child) for child in sorted(item, key=str)]
         return item
     return json.dumps(plain(value), sort_keys=True, separators=(",", ":"), allow_nan=False, default=str)
+_GENERATED_QUEUE_PROVENANCE_SCHEMA = "axiom-generated-queue-v1"
+_GENERATED_QUEUE_KINDS = frozenset({"predeclared_starting_set", "legacy_scope_successor"})
+
+
+def _payload_without_generated_provenance(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the proposal identity material without its internal marker."""
+    result = dict(payload)
+    provenance = result.get("provenance")
+    if isinstance(provenance, Mapping) and isinstance(provenance.get("internal"), Mapping):
+        clean_provenance = dict(provenance)
+        clean_provenance.pop("internal", None)
+        if clean_provenance:
+            result["provenance"] = clean_provenance
+        else:
+            # A marker is added to otherwise unprovenanced proposals.  Do not
+            # leave behind the empty container created solely by removing it;
+            # the pre-marker and post-marker identities must be identical.
+            result.pop("provenance", None)
+    return result
+
+
+def _proposal_identity(payload: Mapping[str, Any]) -> str:
+    return "sha256:" + hashlib.sha256(
+        _canonical_binding(_payload_without_generated_provenance(payload)).encode("utf-8")
+    ).hexdigest()
+
+
+def _mark_generated_queue_payload(
+    payload: Mapping[str, Any],
+    *,
+    kind: str,
+    dataset_id: str | None,
+    dataset_version: str | None,
+    attestation_hash: str | None,
+) -> dict[str, Any]:
+    """Attach a self-authenticating marker to worker-generated proposals."""
+    clean = dict(payload)
+    provenance = dict(clean.get("provenance")) if isinstance(clean.get("provenance"), Mapping) else {}
+    provenance["internal"] = {
+        "schema": _GENERATED_QUEUE_PROVENANCE_SCHEMA,
+        "generated": True,
+        "kind": str(kind).strip(),
+        "proposal_identity": _proposal_identity(clean),
+        "dataset_id": str(dataset_id or "").strip() or None,
+        "dataset_version": str(dataset_version or "").strip() or None,
+        "attestation_hash": str(attestation_hash or "").strip() or None,
+    }
+    clean["provenance"] = provenance
+    return clean
+
+
+def _generated_queue_provenance(payload: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    provenance = payload.get("provenance")
+    if not isinstance(provenance, Mapping):
+        return None
+    internal = provenance.get("internal")
+    if not isinstance(internal, Mapping):
+        return None
+    if not (
+        internal.get("schema") == _GENERATED_QUEUE_PROVENANCE_SCHEMA
+        or internal.get("generated") is True
+        or str(internal.get("kind", "")).strip() in _GENERATED_QUEUE_KINDS
+    ):
+        return None
+    return internal
+
+
+def _legacy_dataset_selector_conflict(document: Mapping[str, Any]) -> str | None:
+    """Reject contradictory outer/nested dataset selectors before handoff."""
+    nested = document.get("experiment_plan")
+    nested = nested if isinstance(nested, Mapping) else None
+    contexts = (("outer", document), ("nested", nested)) if nested is not None else (("outer", document),)
+    values: dict[str, list[tuple[str, str]]] = {"dataset_id": [], "dataset_version": []}
+    for label, source in contexts:
+        if not isinstance(source, Mapping):
+            continue
+        selector = source.get("dataset_selector")
+        selector = selector if isinstance(selector, Mapping) else {}
+        for name, aliases in (
+            ("dataset_id", ("dataset_id",)),
+            ("dataset_version", ("dataset_version", "version")),
+        ):
+            for alias in aliases:
+                value = selector.get(alias)
+                if value is not None and str(value).strip():
+                    values[name].append((f"{label}.dataset_selector.{alias}", str(value).strip()))
+                value = source.get(alias)
+                if value is not None and str(value).strip():
+                    values[name].append((f"{label}.{alias}", str(value).strip()))
+    for name, entries in values.items():
+        distinct = {value for _, value in entries}
+        if len(distinct) > 1:
+            return "CONFLICTING_DATASET_SELECTOR"
+        if name == "dataset_version" and any(
+            value.casefold() in _MUTABLE_DATASET_VERSION_ALIASES for value in distinct
+        ):
+            return "DATASET_VERSION_ALIAS"
+    return None
 class AutonomousResearchError(ValueError):
     """A deterministic, auditable queue rejection or unsupported operation."""
 
@@ -175,6 +276,7 @@ class AutonomousQueueCycle:
     rejected: int
     failed: int
     results: tuple[Mapping[str, Any], ...] = ()
+    legacy_recovery: tuple[Mapping[str, Any], ...] = ()
 
     def as_record(self) -> dict[str, Any]:
         return {
@@ -184,6 +286,7 @@ class AutonomousQueueCycle:
             "rejected": self.rejected,
             "failed": self.failed,
             "results": [dict(item) for item in self.results],
+            "legacy_recovery": [dict(item) for item in self.legacy_recovery],
             "paper_only": True,
         }
 
@@ -307,9 +410,52 @@ class AutonomousResearchProcessor:
                 "paper_only": True,
                 "predeclared_starting_set": True,
             }
+            # Keep the attestation binding sourced from the plan before
+            # compatibility defaults are added to the stored payload.
+            selector = item_payload.get("dataset_selector")
+            selector = selector if isinstance(selector, Mapping) else plan_document.get("dataset_selector")
+            selector = selector if isinstance(selector, Mapping) else plan_document
+            dataset_id = str(
+                selector.get("dataset_id") or item_payload.get("dataset_id") or plan_document.get("dataset_id") or ""
+            ).strip() or None
+            dataset_version = str(
+                selector.get("dataset_version")
+                or selector.get("version")
+                or item_payload.get("dataset_version")
+                or plan_document.get("dataset_version")
+                or ""
+            ).strip() or None
+            attestation_hash = None
+            attestation_loader = getattr(self.store, "load_dataset_integrity_attestation", None)
+            if callable(attestation_loader) and dataset_id and dataset_version:
+                try:
+                    attestation = attestation_loader(dataset_id, dataset_version)
+                except Exception:
+                    attestation = None
+                if isinstance(attestation, Mapping):
+                    attestation_hash = str(attestation.get("attestation_hash", "")).strip() or None
+            # Processing normalizes worker payloads before checking the
+            # self-authenticating marker. Store that same canonical shape so a
+            # sparse predeclared proposal does not reject itself at claim time.
+            item_payload = _normalize_hypothesis_payload(
+                item_payload,
+                source_fallback=str(
+                    getattr(self.bus, "author", "")
+                    or getattr(self.bus, "source", "")
+                    or "hermes"
+                ).strip()
+                or "hermes",
+            )
+            item_payload = _mark_generated_queue_payload(
+                item_payload,
+                kind="predeclared_starting_set",
+                dataset_id=dataset_id,
+                dataset_version=dataset_version,
+                attestation_hash=attestation_hash,
+            )
             item = self.bus.submit_hypothesis(
                 item_payload,
-                dedupe_key=f"predeclared:{proposal_id}",
+                dedupe_key=f"predeclared:{proposal_id}:{attestation_hash or 'unattested'}",
                 priority=priority,
                 available_at=available_at,
             )
@@ -318,64 +464,259 @@ class AutonomousResearchProcessor:
 
     submit_predeclared_starting_set = enqueue_predeclared_starting_set
 
+    def _persist_predeclared_seed_evidence(
+        self,
+        evidence: Mapping[str, Any],
+        *,
+        dataset_id: str,
+        dataset_version: str | None,
+    ) -> bool:
+        """Persist one blocked seed decision as immutable research evidence.
+
+        A dataset binding can produce different blocked decisions as its
+        persisted provenance changes.  The binding is the experiment
+        namespace, while the canonical evidence digest identifies one
+        append-only decision attempt within that namespace.  This keeps
+        retries of an identical observation idempotent without allowing a
+        later blocker to collide with, or overwrite, its predecessor.
+        """
+        saver = getattr(self.store, "save_report_if_absent", None)
+        if not callable(saver):
+            return False
+        version = str(dataset_version or "").strip()
+        binding_id = "autonomous-predeclared-seed:" + str(dataset_id).strip()
+        if version:
+            binding_id += ":" + version
+        evidence_id = hashlib.sha256(
+            _canonical_binding(dict(evidence)).encode("utf-8")
+        ).hexdigest()[:24]
+        report_id = f"{binding_id}:{evidence_id}"
+        try:
+            return bool(
+                saver(
+                    report_id,
+                    dict(evidence),
+                    experiment_id=binding_id,
+                )
+            )
+        except Exception:
+            # A failed evidence write must never turn a fail-closed seed gate
+            # into an untrusted queue submission.
+            return False
+
+    def _predeclared_seed_blocker(
+        self,
+        *,
+        blocker: str,
+        detail: str,
+        dataset_id: str,
+        dataset_version: str | None,
+        catalog: Mapping[str, Any] | None = None,
+        attestation: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Build the exact prerequisite projection for a blocked seed."""
+        normalized_blocker = str(blocker).strip().upper() or "DATASET_PROVENANCE_INVALID"
+        normalized_detail = str(detail).strip() or normalized_blocker
+        if normalized_blocker == "DATASET_ATTESTATION_MISSING":
+            next_action = "PERSIST_CURRENT_HISTORICAL_DATASET_ATTESTATION"
+        elif normalized_blocker == "DATASET_ATTESTATION_STALE":
+            next_action = "REFRESH_CURRENT_HISTORICAL_DATASET_ATTESTATION"
+        elif "CONTAMIN" in normalized_detail.upper():
+            next_action = "REMOVE_FORWARD_CONTAMINATION_AND_REATTEST_HISTORICAL_DATASET"
+        else:
+            next_action = "REPAIR_HISTORICAL_DATASET_PROVENANCE_AND_REATTEST"
+        catalog_map = catalog if isinstance(catalog, Mapping) else {}
+        attestation_map = attestation if isinstance(attestation, Mapping) else {}
+        return {
+            "report_type": "autonomous_predeclared_seed_blocked",
+            "progress": "BLOCKED",
+            "blocker": normalized_blocker,
+            "reason": normalized_detail,
+            "next_action": next_action,
+            "required_dataset": {
+                "dataset_id": str(dataset_id).strip() or None,
+                "dataset_version": str(dataset_version or "").strip() or None,
+                "source_type": "HISTORICAL",
+                "market_type": MarketType.PREDICTION.value,
+                "attestation_status": "CURRENT",
+                "contamination_result": "PASS",
+            },
+            "catalog_identity": {
+                "dataset_id": str(catalog_map.get("dataset_id", "")).strip() or None,
+                "dataset_version": str(
+                    catalog_map.get("dataset_version", catalog_map.get("version", ""))
+                ).strip()
+                or None,
+                "instrument": str(catalog_map.get("instrument", "")).strip() or None,
+                "row_count": catalog_map.get("row_count"),
+                "completeness": catalog_map.get("completeness"),
+            },
+            "attestation": {
+                "status": str(attestation_map.get("status", "")).strip().upper() or None,
+                "contamination_result": attestation_map.get("contamination_result"),
+                "attestation_hash": attestation_map.get("attestation_hash"),
+                "reason": attestation_map.get("reason"),
+            },
+            "queue_items_enqueued": 0,
+            "variants_tested": 0,
+            "paper_only": True,
+            "research_only": True,
+        }
+
     def _enqueue_predeclared_from_persisted_scope(self, now: datetime) -> tuple[ResearchQueueItem, ...]:
         """Seed bounded prediction research from the persisted historical catalog.
 
         The seed is deterministic and policy-bound: the aggregate historical
         dataset and canonical POLYMARKET forward rules are selected before any
-        candidate performance is inspected.  Queue deduplication makes this
-        safe to invoke on every normal worker tick.
+        candidate performance is inspected.  The exact dataset catalog and
+        current integrity attestation are validated through the same
+        provenance contract used by ordinary hypothesis processing before a
+        queue row can be created. Queue deduplication makes this safe to invoke
+        on every normal worker tick.
         """
+        expected_dataset_id = "Polymarket-historical"
         list_catalog = getattr(self.store, "list_dataset_catalog", None)
         if not callable(list_catalog):
+            evidence = self._predeclared_seed_blocker(
+                blocker="DATASET_CATALOG_MISSING",
+                detail="store has no persisted historical dataset catalog",
+                dataset_id=expected_dataset_id,
+                dataset_version=None,
+            )
+            self._persist_predeclared_seed_evidence(
+                evidence,
+                dataset_id=expected_dataset_id,
+                dataset_version=None,
+            )
             return ()
         try:
-            catalogs = list_catalog(source_type="HISTORICAL", market_type="prediction", limit=128)
-        except (TypeError, ValueError, RuntimeError):
+            catalogs = list_catalog(market_type="prediction", limit=128)
+        except Exception as exc:
+            evidence = self._predeclared_seed_blocker(
+                blocker="DATASET_CATALOG_UNAVAILABLE",
+                detail=f"historical dataset catalog could not be loaded: {exc}",
+                dataset_id=expected_dataset_id,
+                dataset_version=None,
+            )
+            self._persist_predeclared_seed_evidence(
+                evidence,
+                dataset_id=expected_dataset_id,
+                dataset_version=None,
+            )
             return ()
         if not isinstance(catalogs, Sequence):
+            evidence = self._predeclared_seed_blocker(
+                blocker="DATASET_CATALOG_INVALID",
+                detail="historical dataset catalog result is not a sequence",
+                dataset_id=expected_dataset_id,
+                dataset_version=None,
+            )
+            self._persist_predeclared_seed_evidence(
+                evidence,
+                dataset_id=expected_dataset_id,
+                dataset_version=None,
+            )
             return ()
+        def catalog_instrument(item: Mapping[str, Any]) -> str:
+            return str(item.get("instrument", "")).strip().upper()
+
+        def catalog_version(item: Mapping[str, Any]) -> str:
+            return str(item.get("dataset_version") or item.get("version") or "").strip()
+
         def complete(item: Any) -> bool:
             if not isinstance(item, Mapping):
                 return False
             try:
+                metadata = item.get("metadata")
+                metadata = metadata if isinstance(metadata, Mapping) else {}
+                metadata_instrument = str(metadata.get("instrument", "")).strip().upper()
                 return (
                     bool(str(item.get("dataset_id", "")).strip())
-                    and bool(str(item.get("dataset_version", item.get("version", ""))).strip())
+                    and bool(catalog_version(item))
+                    and catalog_version(item).casefold() not in _MUTABLE_DATASET_VERSION_ALIASES
                     and str(item.get("source_type", "")).strip().upper() == "HISTORICAL"
+                    and str(item.get("market_type", "")).strip().lower() == MarketType.PREDICTION.value
+                    and catalog_instrument(item) == "POLYMARKET"
+                    and (not metadata_instrument or metadata_instrument == catalog_instrument(item))
                     and _finite(item.get("completeness"), 0.0) >= 1.0
                     and int(item.get("row_count", 0) or 0) > 0
                     and not item.get("missing_ranges")
                 )
             except (TypeError, ValueError, OverflowError):
                 return False
-
-        eligible = [item for item in catalogs if complete(item)]
-        if not eligible:
-            return ()
         catalog = next(
             (
                 item
-                for item in eligible
-                if str(item.get("dataset_id", "")).strip() == "Polymarket-historical"
-                and str(item.get("instrument", "")).strip().upper() == "POLYMARKET"
+                for item in catalogs
+                if isinstance(item, Mapping)
+                and str(item.get("dataset_id", "")).strip() == expected_dataset_id
             ),
             None,
         )
         if catalog is None:
+            evidence = self._predeclared_seed_blocker(
+                blocker="DATASET_CATALOG_MISSING",
+                detail=f"no historical Polymarket catalog for {expected_dataset_id}",
+                dataset_id=expected_dataset_id,
+                dataset_version=None,
+            )
+            self._persist_predeclared_seed_evidence(
+                evidence,
+                dataset_id=expected_dataset_id,
+                dataset_version=None,
+            )
+            return ()
+        dataset_version = catalog_version(catalog)
+        instrument = catalog_instrument(catalog)
+        if not complete(catalog):
+            source_type = str(catalog.get("source_type", "")).strip().upper()
+            market_type = str(catalog.get("market_type", "")).strip().lower()
+            if instrument != "POLYMARKET":
+                detail = (
+                    f"historical dataset catalog instrument {instrument or '<missing>'} "
+                    f"does not normalize to POLYMARKET for {expected_dataset_id}"
+                )
+            elif dataset_version.casefold() in _MUTABLE_DATASET_VERSION_ALIASES:
+                detail = (
+                    f"historical dataset catalog version {dataset_version!r} is a mutable alias; "
+                    "an immutable dataset version is required"
+                )
+            elif source_type != "HISTORICAL":
+                detail = (
+                    f"dataset catalog source_type {source_type or '<missing>'} "
+                    f"is not HISTORICAL for {expected_dataset_id}"
+                )
+            elif market_type != MarketType.PREDICTION.value:
+                detail = (
+                    f"dataset catalog market_type {market_type or '<missing>'} "
+                    f"is not prediction for {expected_dataset_id}"
+                )
+            else:
+                detail = f"historical dataset catalog is incomplete for {expected_dataset_id}"
+            evidence = self._predeclared_seed_blocker(
+                blocker="DATASET_CATALOG_INVALID",
+                detail=detail,
+                dataset_id=expected_dataset_id,
+                dataset_version=dataset_version or None,
+                catalog=catalog,
+            )
+            self._persist_predeclared_seed_evidence(
+                evidence,
+                dataset_id=expected_dataset_id,
+                dataset_version=dataset_version or None,
+            )
             return ()
         dataset_id = str(catalog.get("dataset_id", "")).strip()
-        dataset_version = str(catalog.get("dataset_version", catalog.get("version", ""))).strip()
-        if not dataset_id or not dataset_version:
-            return ()
+        instrument = catalog_instrument(catalog)
         market_scope = {
             "schema_version": "1",
             "mode": "RULE_BASED_MARKETS",
-            "instrument": "POLYMARKET",
-            "categories": [],
-            # Keep discovery bounded and explicit; these are policy inputs,
-            # not a shortcut around current-market authority resolution.
-            "filters": {"min_liquidity": 1.0, "max_spread": 0.50},
+            # PRICE_PROXY rows are intentionally compact.  The bounded scope
+            # uses the catalog's attested instrument identity; liquidity and
+            # spread are current-book evidence, not historical price-path
+            # inputs.
+            "instrument": instrument,
+            "filters": {},
             "regime_restrictions": {},
             "provenance": "canonical",
         }
@@ -399,16 +740,23 @@ class AutonomousResearchProcessor:
         exit_policy = {"type": "fixed_holding_period", "holding_period": 1}
         allowed_features = ["timestamp", "market_id", "yes_mid"]
         proposal = {
+            "proposal_id": f"predeclared-seed:{dataset_id}:{dataset_version}",
             "statement": "Evaluate bounded Polymarket price-path momentum and mean reversion.",
+            "dataset_selector": {
+                "dataset_id": dataset_id,
+                "dataset_version": dataset_version,
+                "source_type": "HISTORICAL",
+            },
             "source": "axiom-autonomous-predeclared",
             "tests": ["bounded chronological price-proxy backtest and validation"],
             "market_type": MarketType.PREDICTION.value,
-            "market_scope": market_scope,
             "dataset_id": dataset_id,
             "dataset_version": dataset_version,
+            "market_scope": market_scope,
             "allowed_features": allowed_features,
             "time_split": "train-validation-holdout",
             "min_samples": 30,
+            "min_trades": 20,
             "max_variants": 1,
             "paper_only": True,
             "assumptions": assumptions,
@@ -422,14 +770,57 @@ class AutonomousResearchProcessor:
                 "allowed_features": allowed_features,
                 "time_split": "train-validation-holdout",
                 "min_samples": 30,
+                "min_trades": 20,
                 "assumptions": assumptions,
                 "exit_policy": exit_policy,
                 "methodology": methodology,
             },
         }
         try:
+            plan = ExperimentPlan.from_proposal(proposal)
+            self._validate_persisted_dataset_provenance(plan)
+        except (AutonomousResearchError, ExperimentPlanError, TypeError, ValueError, RuntimeError) as exc:
+            attestation_loader = getattr(self.store, "load_dataset_integrity_attestation", None)
+            try:
+                attestation = (
+                    attestation_loader(dataset_id, dataset_version)
+                    if callable(attestation_loader)
+                    else None
+                )
+            except Exception:
+                attestation = None
+            blocker = str(getattr(exc, "reason", "")).strip().upper() or "DATASET_PROVENANCE_INVALID"
+            detail = str(getattr(exc, "detail", "")).strip() or str(exc)
+            evidence = self._predeclared_seed_blocker(
+                blocker=blocker,
+                detail=detail,
+                dataset_id=dataset_id,
+                dataset_version=dataset_version,
+                catalog=catalog,
+                attestation=attestation if isinstance(attestation, Mapping) else None,
+            )
+            self._persist_predeclared_seed_evidence(
+                evidence,
+                dataset_id=dataset_id,
+                dataset_version=dataset_version,
+            )
+            return ()
+        try:
             return self.enqueue_predeclared_starting_set(proposal, priority=0, available_at=now)
-        except (AutonomousResearchError, ResearchBusPermissionError, TypeError, ValueError, RuntimeError):
+        except (AutonomousResearchError, ResearchBusPermissionError, TypeError, ValueError, RuntimeError) as exc:
+            blocker = str(getattr(exc, "reason", "")).strip().upper() or "PREDECLARED_SEED_ENQUEUE_FAILED"
+            evidence = self._predeclared_seed_blocker(
+                blocker=blocker,
+                detail=str(getattr(exc, "detail", "")).strip() or str(exc),
+                dataset_id=dataset_id,
+                dataset_version=dataset_version,
+                catalog=catalog,
+            )
+            self._persist_predeclared_seed_evidence(
+                evidence,
+                dataset_id=dataset_id,
+                dataset_version=dataset_version,
+            )
             return ()
 
     def __init__(
@@ -446,6 +837,391 @@ class AutonomousResearchProcessor:
         self.clock = clock
         self.lifecycle = CandidateLifecycleManager(store, criteria=self.config.promotion_criteria)
 
+    def _legacy_provenance_state(
+        self,
+        plan: ExperimentPlan | None,
+        document: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Return a bounded, canonical snapshot of successor provenance state."""
+        if plan is not None:
+            dataset_id = str(plan.dataset_id or "").strip()
+            dataset_version = str(plan.dataset_version or "").strip()
+            selector = plan.dataset_selector
+        else:
+            source = document.get("experiment_plan")
+            source = source if isinstance(source, Mapping) else document
+            raw_selector = source.get("dataset_selector")
+            selector = raw_selector if isinstance(raw_selector, Mapping) else source
+            dataset_id = str(selector.get("dataset_id") or source.get("dataset_id") or "").strip()
+            dataset_version = str(
+                selector.get("dataset_version")
+                or selector.get("version")
+                or source.get("dataset_version")
+                or source.get("version")
+                or ""
+            ).strip()
+        declared: dict[str, Any] = {}
+        for name in ("source_type", "source", "provider", "timeframe", "interval"):
+            value = selector.get(name)
+            if value is not None and str(value).strip():
+                declared[name] = str(value).strip()
+        state: dict[str, Any] = {
+            "dataset_id": dataset_id or None,
+            "dataset_version": dataset_version or None,
+            "declared_selectors": declared,
+            "catalog": None,
+            "attestation": None,
+        }
+        if not dataset_id or not dataset_version:
+            return state
+        catalog_loader = getattr(self.store, "load_dataset_catalog", None)
+        if callable(catalog_loader):
+            try:
+                catalog = catalog_loader(dataset_id, dataset_version)
+            except Exception:
+                catalog = None
+            if isinstance(catalog, Mapping):
+                metadata = catalog.get("metadata")
+                metadata = metadata if isinstance(metadata, Mapping) else {}
+                state["catalog"] = {
+                    name: catalog.get(name)
+                    for name in (
+                        "dataset_id",
+                        "dataset_version",
+                        "version",
+                        "provider",
+                        "source",
+                        "instrument",
+                        "market_type",
+                        "timeframe",
+                        "source_type",
+                        "snapshot_id",
+                        "row_count",
+                        "completeness",
+                        "missing_ranges",
+                    )
+                    if catalog.get(name) is not None
+                }
+                state["catalog"]["metadata"] = {
+                    name: metadata.get(name)
+                    for name in (
+                        "provider",
+                        "source",
+                        "instrument",
+                        "market_type",
+                        "timeframe",
+                        "source_type",
+                        "research_quality",
+                        "historical_order_book_available",
+                        "contamination_result",
+                        "provenance_version",
+                        "policy_version",
+                    )
+                    if metadata.get(name) is not None
+                }
+        attestation_loader = getattr(self.store, "load_dataset_integrity_attestation", None)
+        if callable(attestation_loader):
+            try:
+                attestation = attestation_loader(dataset_id, dataset_version)
+            except Exception:
+                attestation = None
+            if isinstance(attestation, Mapping):
+                state["attestation"] = {
+                    name: attestation.get(name)
+                    for name in (
+                        "dataset_id",
+                        "dataset_version",
+                        "status",
+                        "reason",
+                        "reasons",
+                        "contamination_result",
+                        "attestation_hash",
+                        "row_count",
+                        "completeness",
+                        "source_type",
+                        "market_type",
+                        "execution_fidelity",
+                    )
+                    if attestation.get(name) is not None
+                }
+        return state
+
+    def _persist_legacy_recovery_evidence(
+        self,
+        evidence: Mapping[str, Any],
+        *,
+        queue_item: ResearchQueueItem | None = None,
+        now: datetime,
+    ) -> bool:
+        """Persist one recovery decision without mutating its predecessor.
+
+        A queued successor gets a queue event so the ordinary activity
+        projection can show the handoff before the item is claimed.  A blocked
+        predecessor has no queue item to attach to, so it gets one stable
+        report per canonical blocker/provenance state.  Both paths remain
+        idempotent on the recovery key.
+        """
+        recovery_key = str(evidence.get("recovery_key", "")).strip()
+        detail = dict(evidence)
+        state_digest = _legacy_recovery_state_digest(detail)
+        detail["provenance_state_digest"] = state_digest
+        if isinstance(evidence, dict):
+            evidence["provenance_state_digest"] = state_digest
+        if queue_item is not None:
+            item_id = str(queue_item.item_id).strip()
+            if not item_id:
+                return False
+            try:
+                events = self.store.list_research_queue_events(item_id, limit=256)
+                if any(
+                    isinstance(event, Mapping)
+                    and isinstance(event.get("detail"), Mapping)
+                    and str(event["detail"].get("recovery_key", "")).strip() == recovery_key
+                    for event in events
+                ):
+                    return True
+                self.store.record_research_queue_event(
+                    item_id,
+                    "LEGACY_SCOPE_RECOVERY",
+                    detail,
+                    timestamp=now,
+                )
+                return True
+            except (KeyError, RuntimeError, TypeError, ValueError):
+                return False
+
+        report_id = (
+            "legacy-recovery-"
+            + hashlib.sha256(recovery_key.encode("utf-8")).hexdigest()[:24]
+            + "-"
+            + state_digest.removeprefix("sha256:")
+        )
+        try:
+            if self.store.load_report(report_id) is not None:
+                return True
+            self.store.save_report_if_absent(
+                report_id,
+                {"report_type": "legacy_scope_recovery", **detail},
+                experiment_id=detail.get("predecessor_candidate_id"),
+            )
+            return True
+        except (RuntimeError, TypeError, ValueError):
+            return False
+
+    def _recover_legacy_predecessors(self, now: datetime) -> tuple[Mapping[str, Any], ...]:
+        """Run a bounded, deterministic legacy-scope handoff before claiming.
+
+        Only persisted prediction predecessors with a nested target market
+        list are eligible for conversion.  Classification and failure
+        evidence are durable, while the old lifecycle row is deliberately
+        never rewritten.
+        """
+        loader = getattr(self.store, "load_candidate_lifecycle", None)
+        if not callable(loader):
+            return ()
+        try:
+            records = loader(limit=_MAX_LEGACY_RECOVERY_ITEMS)
+        except (RuntimeError, TypeError, ValueError):
+            return ()
+        if not isinstance(records, list):
+            return ()
+
+        candidates: list[tuple[str, str, Mapping[str, Any]]] = []
+        for record in records:
+            if not isinstance(record, Mapping):
+                continue
+            payload = record.get("payload")
+            if not isinstance(payload, Mapping):
+                continue
+            plan = payload.get("experiment_plan")
+            plan = plan if isinstance(plan, Mapping) else {}
+            market_type = plan.get("market_type", payload.get("market_type"))
+            if str(market_type or "").strip().lower() != MarketType.PREDICTION.value:
+                continue
+            if str(payload.get("successor_relation", "")).strip().upper() == "LEGACY_SCOPE_SUCCESSOR":
+                continue
+            candidate_id = str(record.get("candidate_id") or payload.get("candidate_id") or "").strip()
+            candidates.append(
+                (
+                    candidate_id,
+                    str(record.get("stage", "")).strip(),
+                    record,
+                )
+            )
+        candidates.sort(key=lambda item: (item[0], item[1], _canonical_binding(item[2])))
+
+        output: list[Mapping[str, Any]] = []
+        from .legacy_scope import (
+            CANONICAL_VALID,
+            LEGACY_UNAMBIGUOUS,
+            LegacyScopeError,
+            classify_legacy_scope,
+            create_legacy_successor,
+        )
+
+        inspected = 0
+        for _, _, record in candidates:
+            if inspected >= self.config.max_items_per_cycle:
+                break
+            payload = record.get("payload")
+            assert isinstance(payload, Mapping)
+            document = _legacy_recovery_document(record)
+            if document is None:
+                continue
+            selector_reason = _legacy_dataset_selector_conflict(document)
+            assessment = classify_legacy_scope(document)
+            if assessment.classification == CANONICAL_VALID and selector_reason is None:
+                continue
+            inspected += 1
+            candidate_id = assessment.candidate_id or str(
+                document.get("candidate_id") or record.get("candidate_id") or ""
+            ).strip() or None
+            nested_target = _nested_legacy_target_market_ids(document)
+            plan_document = document.get("experiment_plan")
+            target_document = (
+                plan_document.get("target")
+                if isinstance(plan_document, Mapping)
+                else None
+            )
+            nested_target_unrecognized = nested_target is None and not (
+                isinstance(target_document, Mapping) and not target_document
+            )
+            if selector_reason is not None:
+                classification = "INVALID"
+                reason = selector_reason
+            elif nested_target_unrecognized:
+                classification = "INVALID"
+                reason = "MISSING_NESTED_TARGET_MARKET_IDS"
+            else:
+                classification = assessment.classification
+                reason = assessment.reason
+            frozen_hash = assessment.frozen_hash
+            recovery_key = _legacy_recovery_key(record, candidate_id, frozen_hash)
+            evidence: dict[str, Any] = {
+                "recovery_key": recovery_key,
+                "attempt": "LEGACY_SCOPE_RECOVERY",
+                "attempted": True,
+                "attempted_at": ensure_utc(now).isoformat(),
+                "predecessor_candidate_id": candidate_id,
+                "predecessor_frozen_hash": frozen_hash,
+                "classification": classification,
+                "reason_code": reason,
+                "scope_hash": assessment.scope_hash,
+                "scope_version": assessment.scope_version,
+                "progress": "BLOCKED",
+                "blocker": reason,
+                "next_action": "RETAIN_LEGACY_PREDECESSOR",
+                "successor_id": None,
+                "queue_item_id": None,
+                "queue_status": None,
+                "provenance_state": self._legacy_provenance_state(None, document),
+                "paper_only": True,
+            }
+            successor = None
+            if classification == LEGACY_UNAMBIGUOUS and assessment.scope is not None:
+                try:
+                    # The successor is immutable and plan-validated, but its
+                    # exact historical dataset binding must also be present in
+                    # the store with a current attestation before enqueue.
+                    successor = create_legacy_successor(
+                        document,
+                        source_candidate_id=candidate_id,
+                        source_frozen_hash=frozen_hash,
+                    )
+                    evidence["provenance_state"] = self._legacy_provenance_state(successor.plan, document)
+                    validation = validate_hermes_proposal(successor.proposal)
+                    if not validation.accepted:
+                        detail = "; ".join(validation.reasons) or "proposal rejected"
+                        raise LegacyScopeError("PROPOSAL_REJECTED", detail)
+                    self._validate_persisted_dataset_provenance(
+                        successor.plan,
+                        legacy_document=document,
+                    )
+                    queued_payload = _normalize_hypothesis_payload(
+                        dict(validation.normalized or successor.proposal),
+                        source_fallback=str(
+                            getattr(self.bus, "author", "")
+                            or getattr(self.bus, "source", "")
+                            or "hermes"
+                        ).strip()
+                        or "hermes",
+                    )
+                    attestation_loader = getattr(self.store, "load_dataset_integrity_attestation", None)
+                    attestation_hash = None
+                    if callable(attestation_loader) and successor.plan.dataset_id and successor.plan.dataset_version:
+                        try:
+                            attestation = attestation_loader(
+                                successor.plan.dataset_id,
+                                successor.plan.dataset_version,
+                            )
+                        except Exception:
+                            attestation = None
+                        if isinstance(attestation, Mapping):
+                            attestation_hash = str(attestation.get("attestation_hash", "")).strip() or None
+                    queued_payload = _mark_generated_queue_payload(
+                        queued_payload,
+                        kind="legacy_scope_successor",
+                        dataset_id=successor.plan.dataset_id,
+                        dataset_version=successor.plan.dataset_version,
+                        attestation_hash=attestation_hash,
+                    )
+                    dedupe_key = (
+                        f"legacy-successor:{successor.successor_id}:"
+                        f"{attestation_hash or 'unattested'}"
+                    )
+                    # Storage derives queue ids from the versioned dedupe key.
+                    # Reuse an existing row so identical attestation retries
+                    # cannot replace its immutable payload or queue history.
+                    queue_item = self.bus.get(
+                        "queue-" + hashlib.sha256(dedupe_key.encode("utf-8")).hexdigest()
+                    )
+                    if queue_item is None:
+                        queue_item = self.bus.submit_hypothesis(
+                            queued_payload,
+                            dedupe_key=dedupe_key,
+                            lineage=(successor.predecessor_candidate_id, successor.predecessor_frozen_hash),
+                            available_at=now,
+                        )
+                    evidence.update(
+                        {
+                            "classification": successor.assessment.classification,
+                            "reason_code": "LEGACY_SCOPE_NORMALIZED",
+                            "scope_hash": successor.plan.market_scope_hash,
+                            "scope_version": successor.plan.market_scope_version,
+                            "progress": "ENQUEUED",
+                            "blocker": None,
+                            "next_action": "CLAIM_AND_PROCESS_CANONICAL_SUCCESSOR",
+                            "successor_id": successor.successor_id,
+                            "queue_item_id": queue_item.item_id if queue_item is not None else None,
+                            "queue_status": queue_item.status.value if queue_item is not None else None,
+                        }
+                    )
+                    persisted = self._persist_legacy_recovery_evidence(
+                        evidence,
+                        queue_item=queue_item,
+                        now=now,
+                    )
+                except (AutonomousResearchError, LegacyScopeError, ResearchBusPermissionError, RuntimeError, TypeError, ValueError) as exc:
+                    blocker = str(getattr(exc, "reason", "")).strip().upper() or "LEGACY_SCOPE_RECOVERY_FAILED"
+                    evidence.update(
+                        {
+                            "reason_code": blocker,
+                            "progress": "BLOCKED",
+                            "blocker": blocker,
+                            "next_action": "RETAIN_LEGACY_PREDECESSOR",
+                            "provenance_state": self._legacy_provenance_state(
+                                getattr(successor, "plan", None),
+                                document,
+                            ),
+                        }
+                    )
+                    persisted = self._persist_legacy_recovery_evidence(evidence, now=now)
+            else:
+                persisted = self._persist_legacy_recovery_evidence(evidence, now=now)
+            evidence["evidence_persisted"] = persisted
+            output.append(evidence)
+        return tuple(output)
+
     def process_pending(self, *, worker: str = "research-queue", now: datetime | None = None) -> AutonomousQueueCycle:
         """Claim at most the configured bounded number of items.
 
@@ -455,6 +1231,7 @@ class AutonomousResearchProcessor:
         duplicate experiments or lifecycle transitions.
         """
         current = ensure_utc(now or self.clock())
+        legacy_recovery = self._recover_legacy_predecessors(current)
         self._enqueue_predeclared_from_persisted_scope(current)
         released = self.bus.resume_expired(now=current)
         results: list[Mapping[str, Any]] = []
@@ -569,7 +1346,15 @@ class AutonomousResearchProcessor:
                     results.append(result)
                 except RuntimeError:
                     continue
-        return AutonomousQueueCycle(released, claimed, completed, rejected, failed, tuple(results))
+        return AutonomousQueueCycle(
+            released,
+            claimed,
+            completed,
+            rejected,
+            failed,
+            tuple(results),
+            tuple(legacy_recovery),
+        )
 
     def reevaluate_forward_candidates(self, *, now: datetime | None = None) -> tuple[Mapping[str, Any], ...]:
         """Update active forward evidence and apply configured promotion gates."""
@@ -643,6 +1428,40 @@ class AutonomousResearchProcessor:
 
     def _process_hypothesis(self, item: ResearchQueueItem, now: datetime) -> Mapping[str, Any]:
         proposal = _normalize_hypothesis_payload(item.payload, item)
+        generated_scope_binding: tuple[str | None, str | None, str | None, str | None, str | None, str | None] | None = None
+        generated_provenance = _generated_queue_provenance(proposal)
+        generated_kind_hint = bool(proposal.get("predeclared_starting_set")) or (
+            str(proposal.get("successor_relation", "")).strip().upper() == "LEGACY_SCOPE_SUCCESSOR"
+        )
+        if generated_provenance is None and generated_kind_hint:
+            raise AutonomousResearchError(
+                "GENERATED_PROVENANCE_INVALID",
+                "generated queue item is missing its internal provenance marker",
+            )
+        if generated_provenance is not None:
+            try:
+                original_plan = ExperimentPlan.from_proposal(proposal)
+            except ExperimentPlanError as exc:
+                raise AutonomousResearchError(exc.reason, exc.detail) from exc
+            # This is deliberately the first scope-dependent operation.  A
+            # generated successor must reject a rotated attestation before
+            # legacy scope classification, freezing, or lifecycle resolution
+            # can produce a less authoritative forward-market reason.
+            self._revalidate_generated_queue_item(item, original_plan, proposal)
+            if any(
+                key in proposal
+                for key in ("predecessor_candidate_id", "predecessor_frozen_hash", "frozen_hash")
+            ):
+                generated_scope_binding = (
+                    _binding_value(proposal.get("predecessor_candidate_id")),
+                    _binding_value(
+                        proposal.get("predecessor_frozen_hash", proposal.get("frozen_hash"))
+                    ),
+                    _binding_value(original_plan.market_scope_hash),
+                    _binding_value(original_plan.market_scope_version),
+                    _binding_value(original_plan.dataset_id),
+                    _binding_value(original_plan.dataset_version),
+                )
         scope_declared = "market_scope" in proposal or any(
             key in proposal
             for key in ("predecessor_candidate_id", "predecessor_frozen_hash", "frozen_hash")
@@ -695,6 +1514,28 @@ class AutonomousResearchProcessor:
             plan = ExperimentPlan.from_proposal(validation.normalized or proposal)
         except ExperimentPlanError as exc:
             raise AutonomousResearchError(exc.reason, exc.detail) from exc
+        if generated_scope_binding is None:
+            self._revalidate_generated_queue_item(item, plan, proposal)
+        else:
+            # The frozen successor may not carry the internal marker, but it
+            # must remain bound to the exact authenticated predecessor scope
+            # and dataset that were checked above.
+            frozen_scope_binding = (
+                _binding_value(proposal.get("predecessor_candidate_id")),
+                _binding_value(
+                    proposal.get("predecessor_frozen_hash", proposal.get("frozen_hash"))
+                ),
+                _binding_value(plan.market_scope_hash),
+                _binding_value(plan.market_scope_version),
+                _binding_value(plan.dataset_id),
+                _binding_value(plan.dataset_version),
+            )
+            if frozen_scope_binding != generated_scope_binding:
+                raise AutonomousResearchError(
+                    "GENERATED_PROVENANCE_INVALID",
+                    "generated legacy scope freeze changed its authenticated binding",
+                )
+
         if plan.max_variants > self.config.max_plan_variants:
             raise AutonomousResearchError(
                 "EXPERIMENT_BUDGET_EXCEEDED",
@@ -1728,6 +2569,266 @@ class AutonomousResearchProcessor:
                 f"no immutable dataset attestation for {dataset_id}/{dataset_version}",
             )
         return dict(attestation)
+
+    def _validate_persisted_dataset_provenance(
+        self,
+        plan: ExperimentPlan,
+        *,
+        legacy_document: Mapping[str, Any] | None = None,
+    ) -> Mapping[str, Any]:
+        """Require an exact, current store attestation before prediction research."""
+        if plan.market_type is not MarketType.PREDICTION:
+            return {}
+        dataset_id = str(plan.dataset_id or "").strip()
+        dataset_version = str(plan.dataset_version or "").strip()
+        if not dataset_id or not dataset_version:
+            raise AutonomousResearchError(
+                "DATASET_PROVENANCE_INVALID",
+                "prediction research requires an exact persisted dataset id and version",
+            )
+        if dataset_version.casefold() in _MUTABLE_DATASET_VERSION_ALIASES:
+            raise AutonomousResearchError(
+                "DATASET_PROVENANCE_INVALID",
+                f"dataset version {dataset_version!r} is a mutable alias; an immutable dataset version is required",
+            )
+
+        catalog_loader = getattr(self.store, "load_dataset_catalog", None)
+        if not callable(catalog_loader):
+            raise AutonomousResearchError(
+                "DATASET_PROVENANCE_INVALID",
+                f"store has no exact persisted dataset catalog for {dataset_id}/{dataset_version}",
+            )
+        try:
+            catalog = catalog_loader(dataset_id, dataset_version)
+        except Exception as exc:
+            raise AutonomousResearchError(
+                "DATASET_PROVENANCE_INVALID",
+                f"persisted dataset catalog could not be loaded for {dataset_id}/{dataset_version}",
+            ) from exc
+        if not isinstance(catalog, Mapping):
+            raise AutonomousResearchError(
+                "DATASET_PROVENANCE_INVALID",
+                f"no exact persisted dataset catalog for {dataset_id}/{dataset_version}",
+            )
+        catalog_id = str(catalog.get("dataset_id", "")).strip()
+        catalog_version = str(catalog.get("dataset_version", catalog.get("version", ""))).strip()
+        if (
+            catalog_id != dataset_id
+            or catalog_version != dataset_version
+            or catalog_version.casefold() in _MUTABLE_DATASET_VERSION_ALIASES
+        ):
+            raise AutonomousResearchError(
+                "DATASET_PROVENANCE_INVALID",
+                "dataset catalog identity does not match the exact plan binding",
+            )
+        if str(catalog.get("market_type", "")).strip().lower() != MarketType.PREDICTION.value:
+            raise AutonomousResearchError(
+                "DATASET_PROVENANCE_INVALID",
+                "dataset catalog market_type is not prediction",
+            )
+        catalog_source_type = str(catalog.get("source_type", "")).strip().upper()
+        if catalog_source_type != "HISTORICAL":
+            raise AutonomousResearchError(
+                "DATASET_PROVENANCE_INVALID",
+                f"dataset catalog source_type {catalog_source_type or '<missing>'} is not HISTORICAL",
+            )
+        catalog_instrument = str(catalog.get("instrument", "")).strip()
+        scope_instrument = str(plan.market_scope.instrument or "").strip()
+        if scope_instrument and catalog_instrument != scope_instrument:
+            raise AutonomousResearchError(
+                "DATASET_PROVENANCE_INVALID",
+                "dataset catalog instrument does not match the exact plan market-scope instrument",
+            )
+        catalog_metadata = catalog.get("metadata")
+        if isinstance(catalog_metadata, Mapping):
+            metadata_instrument = str(catalog_metadata.get("instrument", "")).strip()
+            if metadata_instrument and metadata_instrument != catalog_instrument:
+                raise AutonomousResearchError(
+                    "DATASET_PROVENANCE_INVALID",
+                    "dataset catalog instrument metadata conflicts with its canonical instrument",
+                )
+
+        selector = plan.dataset_selector
+        declared_selectors: dict[str, list[Any]] = {
+            name: [selector.get(name)]
+            for name in ("provider", "source", "timeframe", "interval", "source_type")
+            if selector.get(name) is not None and str(selector.get(name)).strip()
+        }
+        if legacy_document is not None:
+            nested = legacy_document.get("experiment_plan")
+            nested = nested if isinstance(nested, Mapping) else {}
+            for source in (legacy_document, nested):
+                raw_selector = source.get("dataset_selector")
+                if isinstance(raw_selector, Mapping):
+                    for name in ("provider", "source", "timeframe", "interval", "source_type"):
+                        value = raw_selector.get(name)
+                        if value is not None and str(value).strip():
+                            declared_selectors.setdefault(name, []).append(value)
+                for raw_name, name in (
+                    ("dataset_source", "source"),
+                    ("dataset_source_type", "source_type"),
+                    ("dataset_timeframe", "timeframe"),
+                ):
+                    value = source.get(raw_name)
+                    if value is not None and str(value).strip():
+                        declared_selectors.setdefault(name, []).append(value)
+        catalog_sources = [
+            str(catalog.get(name)).strip()
+            for name in ("provider", "source")
+            if catalog.get(name) is not None and str(catalog.get(name)).strip()
+        ]
+        if len(set(catalog_sources)) > 1:
+            raise AutonomousResearchError(
+                "DATASET_PROVENANCE_INVALID",
+                "dataset catalog provider and source selectors disagree",
+            )
+        catalog_source = catalog_sources[0] if catalog_sources else ""
+        for name in ("provider", "source"):
+            for declared in declared_selectors.get(name, ()):
+                if str(declared).strip() != catalog_source:
+                    raise AutonomousResearchError(
+                        "DATASET_PROVENANCE_INVALID",
+                        f"dataset selector {name} does not match the exact catalog provider/source",
+                    )
+        catalog_timeframe = str(catalog.get("timeframe", "")).strip()
+        for name in ("timeframe", "interval"):
+            for declared in declared_selectors.get(name, ()):
+                if str(declared).strip() != catalog_timeframe:
+                    raise AutonomousResearchError(
+                        "DATASET_PROVENANCE_INVALID",
+                        f"dataset selector {name} does not match the exact catalog timeframe",
+                    )
+        for declared_source_type in declared_selectors.get("source_type", ()):
+            if str(declared_source_type).strip().upper() != catalog_source_type:
+                raise AutonomousResearchError(
+                    "DATASET_PROVENANCE_INVALID",
+                    "dataset selector source_type does not match the exact catalog",
+                )
+
+        attestation_loader = getattr(self.store, "load_dataset_integrity_attestation", None)
+        if not callable(attestation_loader):
+            raise AutonomousResearchError(
+                "DATASET_ATTESTATION_MISSING",
+                f"store has no persisted dataset attestation for {dataset_id}/{dataset_version}",
+            )
+        try:
+            attestation = attestation_loader(dataset_id, dataset_version)
+        except Exception as exc:
+            raise AutonomousResearchError(
+                "DATASET_ATTESTATION_MISSING",
+                f"persisted dataset attestation could not be loaded for {dataset_id}/{dataset_version}",
+            ) from exc
+        if not isinstance(attestation, Mapping):
+            raise AutonomousResearchError(
+                "DATASET_ATTESTATION_MISSING",
+                f"no persisted dataset attestation for {dataset_id}/{dataset_version}",
+            )
+        if (
+            str(attestation.get("dataset_id", "")).strip() != dataset_id
+            or str(attestation.get("dataset_version", "")).strip() != dataset_version
+            or not str(attestation.get("attestation_hash", "")).strip()
+        ):
+            raise AutonomousResearchError(
+                "DATASET_PROVENANCE_INVALID",
+                "persisted dataset attestation identity or hash does not match the exact plan binding",
+            )
+        status = str(attestation.get("status", "")).strip().upper()
+        if status != "CURRENT":
+            reason = str(attestation.get("reason") or status or "UNKNOWN").strip().upper()
+            raise AutonomousResearchError(
+                "DATASET_ATTESTATION_STALE",
+                f"persisted dataset attestation is not CURRENT ({reason})",
+            )
+        provenance_payload = {
+            "market_type": MarketType.PREDICTION.value,
+            "dataset_id": dataset_id,
+            "dataset_version": dataset_version,
+            "dataset_provenance": {
+                "dataset_id": dataset_id,
+                "dataset_version": dataset_version,
+                "source_type": catalog_source_type,
+                "time_split": plan.methodology.get("time_split"),
+            },
+        }
+        quality = evaluate_prediction_data_quality(
+            self.store,
+            provenance_payload,
+            verify_attestation=False,
+        )
+
+        reasons = quality.get("reasons", ())
+        if (
+            quality.get("historical_data_integrity_passed") is not True
+            or quality.get("historical_provenance_complete") is not True
+            or quality.get("historical_rows_nonempty") is not True
+            or quality.get("historical_no_forward_contamination") is not True
+        ):
+            detail = "; ".join(str(reason) for reason in reasons if str(reason).strip())
+            raise AutonomousResearchError(
+                "DATASET_PROVENANCE_INVALID",
+                detail or f"persisted dataset provenance is invalid for {dataset_id}/{dataset_version}",
+            )
+        return quality
+    def _revalidate_generated_queue_item(
+        self,
+        item: ResearchQueueItem,
+        plan: ExperimentPlan,
+        payload: Mapping[str, Any],
+    ) -> None:
+        """Revalidate attestation only for self-authenticating worker items."""
+        internal = _generated_queue_provenance(payload)
+        if internal is None:
+            return
+        if (
+            internal.get("schema") != _GENERATED_QUEUE_PROVENANCE_SCHEMA
+            or internal.get("generated") is not True
+            or str(internal.get("kind", "")).strip() not in _GENERATED_QUEUE_KINDS
+        ):
+            raise AutonomousResearchError(
+                "GENERATED_PROVENANCE_INVALID",
+                "generated queue provenance marker is malformed",
+            )
+        expected_identity = str(internal.get("proposal_identity", "")).strip()
+        if not expected_identity or expected_identity != _proposal_identity(payload):
+            raise AutonomousResearchError(
+                "GENERATED_PROVENANCE_INVALID",
+                "generated queue provenance does not match the canonical proposal identity",
+            )
+        dataset_id = str(plan.dataset_id or "").strip()
+        dataset_version = str(plan.dataset_version or "").strip()
+        if (
+            str(internal.get("dataset_id", "")).strip() != dataset_id
+            or str(internal.get("dataset_version", "")).strip() != dataset_version
+        ):
+            raise AutonomousResearchError(
+                "GENERATED_PROVENANCE_INVALID",
+                "generated queue provenance dataset binding does not match the canonical plan",
+            )
+        self._validate_persisted_dataset_provenance(plan)
+        attestation_loader = getattr(self.store, "load_dataset_integrity_attestation", None)
+        if not callable(attestation_loader):
+            raise AutonomousResearchError(
+                "DATASET_ATTESTATION_MISSING",
+                f"generated queue item has no persisted dataset attestation for {dataset_id}/{dataset_version}",
+            )
+        try:
+            attestation = attestation_loader(dataset_id, dataset_version)
+        except Exception as exc:
+            raise AutonomousResearchError(
+                "DATASET_ATTESTATION_MISSING",
+                f"generated queue item attestation could not be loaded for {dataset_id}/{dataset_version}",
+            ) from exc
+        current_hash = (
+            str(attestation.get("attestation_hash", "")).strip()
+            if isinstance(attestation, Mapping)
+            else ""
+        )
+        expected_hash = str(internal.get("attestation_hash", "")).strip()
+        if not expected_hash or current_hash != expected_hash:
+            raise AutonomousResearchError(
+                "DATASET_ATTESTATION_CHANGED",
+                "generated queue item attestation changed after enqueue",
+            )
 
     def _load_prediction_dataset_by_version(self, version: str) -> Any | None:
         """Load a datasetless prediction plan only when its version is unambiguous."""
@@ -3181,6 +4282,87 @@ class AutonomousResearchProcessor:
                 reason="paper-forward criteria passed; human review required",
             )
         return updated
+def _legacy_recovery_document(record: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    """Extract JSON evidence before handing a lifecycle row to legacy logic.
+
+    ``load_candidate_lifecycle`` adds metadata such as ``updated_at`` to the
+    outer row.  That metadata is useful for ordering but is not part of the
+    persisted candidate document and cannot be inspected by the bounded legacy
+    classifier.  Keep the document authoritative, using row metadata only
+    when the payload omitted its candidate identity.
+    """
+    payload = record.get("payload")
+    if not isinstance(payload, Mapping):
+        return None
+    document = dict(payload)
+    for name in (
+        "candidate_id",
+        "frozen_hash",
+        "predecessor_candidate_id",
+        "predecessor_frozen_hash",
+        "stage",
+    ):
+        if name not in document and record.get(name) is not None:
+            document[name] = record[name]
+    return document
+
+
+def _nested_legacy_target_market_ids(payload: Mapping[str, Any]) -> tuple[Any, ...] | str | None:
+    """Return the nested legacy target binding, if one was persisted."""
+    plan = payload.get("experiment_plan")
+    if not isinstance(plan, Mapping):
+        return None
+    target = plan.get("target")
+    if not isinstance(target, Mapping):
+        return None
+    for name in ("market_ids", "exact_market_ids", "markets"):
+        if name in target:
+            value = target[name]
+            if isinstance(value, str):
+                return value
+            if isinstance(value, (list, tuple, set, frozenset)):
+                return tuple(value)
+            return (value,)
+    return None
+
+
+def _legacy_recovery_state_digest(evidence: Mapping[str, Any]) -> str:
+    """Digest only stable blocker/provenance state, not retry telemetry."""
+    material = {
+        name: evidence.get(name)
+        for name in (
+            "predecessor_candidate_id",
+            "predecessor_frozen_hash",
+            "classification",
+            "reason_code",
+            "progress",
+            "blocker",
+            "next_action",
+            "scope_hash",
+            "scope_version",
+            "successor_id",
+            "provenance_state",
+        )
+    }
+    return "sha256:" + hashlib.sha256(_canonical_binding(material).encode("utf-8")).hexdigest()
+
+
+def _legacy_recovery_key(
+    record: Mapping[str, Any],
+    candidate_id: str | None,
+    frozen_hash: str | None,
+) -> str:
+    """Build a stable identity for one predecessor recovery attempt."""
+    material = {
+        "candidate_id": candidate_id,
+        "frozen_hash": frozen_hash,
+        "record": record,
+    }
+    return "legacy-scope-recovery:" + hashlib.sha256(
+        _canonical_binding(material).encode("utf-8")
+    ).hexdigest()[:32]
+
+
 def _candidate_id(plan: ExperimentPlan, parameters: Mapping[str, Any], *, generation: int) -> str:
     token = json.dumps(
         {"plan_id": plan.plan_id, "plan_hash": plan.plan_hash, "parameters": dict(parameters), "generation": generation},
@@ -3201,14 +4383,24 @@ def _mutation_candidate_id(parent_id: str, generation: int, strategy: StrategyDe
     )
     return "mutation-" + hashlib.sha256(token.encode("utf-8")).hexdigest()[:24]
 
-
-def _normalize_hypothesis_payload(payload: Mapping[str, Any], item: ResearchQueueItem) -> dict[str, Any]:
+def _normalize_hypothesis_payload(
+    payload: Mapping[str, Any],
+    item: ResearchQueueItem | None = None,
+    *,
+    source_fallback: str | None = None,
+) -> dict[str, Any]:
     result = dict(payload)
-    hypothesis_id = str(result.get("proposal_id", result.get("hypothesis_id", ""))).strip() or item.item_id
+    item_id = item.item_id if item is not None else ""
+    hypothesis_id = str(result.get("proposal_id", result.get("hypothesis_id", ""))).strip() or item_id
     assumptions = result.get("assumptions", {})
     assumptions = assumptions if isinstance(assumptions, Mapping) else {}
-    result.setdefault("proposal_id", hypothesis_id)
-    result.setdefault("source", str(result.get("author", item.author or item.source or "hermes")) or "hermes")
+    if hypothesis_id or "proposal_id" in result:
+        result.setdefault("proposal_id", hypothesis_id)
+    if item is not None:
+        default_source = item.author or item.source or "hermes"
+    else:
+        default_source = source_fallback or "hermes"
+    result.setdefault("source", str(result.get("author", default_source)) or "hermes")
     result.setdefault("tests", ["bounded chronological backtest and validation"])
     market_type = result.get("market_type")
     plan_value = result.get("experiment_plan")

@@ -41,6 +41,105 @@ class CanarySettingsTests(unittest.TestCase):
         self.assertEqual(draft["values"]["target_notional_usd"], "2.00")
         self.assertEqual(self.service.active_limits()["max_orders_per_day"], 5)
 
+    def test_active_snapshot_is_current_and_draft_review_is_fenced(self) -> None:
+        snapshot = self.service.snapshot(now=T0)
+        self.assertEqual(snapshot["status"], "CURRENT")
+        self.assertTrue(snapshot["settings_available"])
+        draft = self.service.save_draft({"max_submitted_orders_per_day": 20}, "operator-a")
+        audit = self.store.list_canary_setting_audit(limit=1)[0]
+        detail = audit["detail"]
+        self.assertEqual(detail["reviewed_active_generation"], snapshot["generation"])
+        self.assertEqual(detail["reviewed_active_config_hash"], snapshot["config_hash"])
+        self.assertEqual(detail["reviewed_control_generation"], snapshot["control_generation"])
+        self.assertEqual(self.service.activate_draft(draft["config_id"], "operator-a", 1)["generation"], 2)
+
+    def test_control_row_created_after_no_row_review_invalidates_activation(self) -> None:
+        self.store.connection.execute(
+            "CREATE TABLE canary_control ("
+            "singleton INTEGER PRIMARY KEY, state TEXT NOT NULL, "
+            "control_generation INTEGER NOT NULL)"
+        )
+        self.store.connection.commit()
+        draft = self.service.save_draft(
+            {"max_submitted_orders_per_day": 20},
+            "operator-a",
+        )
+        self.store.connection.execute(
+            "INSERT INTO canary_control(singleton,state,control_generation) "
+            "VALUES(1,'DISARMED',1)"
+        )
+        self.store.connection.commit()
+        with self.assertRaises(CanarySettingsConflict):
+            self.service.activate_draft(
+                draft["config_id"],
+                "operator-a",
+                expected_generation=1,
+            )
+
+    def test_legacy_null_control_generation_review_rejects_late_control_row(self) -> None:
+        self.store.connection.execute(
+            "CREATE TABLE canary_control ("
+            "singleton INTEGER PRIMARY KEY, state TEXT NOT NULL, "
+            "control_generation INTEGER NOT NULL)"
+        )
+        self.store.connection.commit()
+        draft = self.service.save_draft({"max_submitted_orders_per_day": 20}, "operator-a")
+        audit = self.store.connection.execute(
+            "SELECT audit_id, detail_json FROM canary_setting_audit "
+            "WHERE config_id=? AND action='DRAFT_CREATED'",
+            (draft["config_id"],),
+        ).fetchone()
+        self.assertIsNotNone(audit)
+        detail = json.loads(audit["detail_json"])
+        detail.pop("reviewed_control_present", None)
+        self.assertIsNone(detail["control_generation"])
+        self.store.connection.execute(
+            "UPDATE canary_setting_audit SET detail_json=? WHERE audit_id=?",
+            (json.dumps(detail), audit["audit_id"]),
+        )
+        self.store.connection.execute(
+            "INSERT INTO canary_control(singleton,state,control_generation) "
+            "VALUES(1,'DISARMED',1)"
+        )
+        self.store.connection.commit()
+        with self.assertRaises(CanarySettingsConflict):
+            self.service.activate_draft(
+                draft["config_id"],
+                "operator-a",
+                expected_generation=1,
+            )
+
+    def test_optional_caps_can_be_cleared_through_review_and_activation(self) -> None:
+        fields = (
+            "per_market_buy_cap_usd",
+            "per_event_buy_cap_usd",
+            "cumulative_buy_cap_usd",
+        )
+        initial = self.service.save_draft(
+            {field: "3.00" for field in fields},
+            "operator-a",
+        )
+        self.service.activate_draft(initial["config_id"], "operator-a", expected_generation=1)
+        self.assertEqual(
+            {field: self.service.active_limits()[field] for field in fields},
+            {field: "3.00" for field in fields},
+        )
+
+        cleared = self.service.save_draft(
+            {field: None for field in fields},
+            "operator-a",
+        )
+        self.assertEqual(
+            {field: cleared["values"][field] for field in fields},
+            {field: None for field in fields},
+        )
+        self.assertEqual(self.service.active_limits()["per_market_buy_cap_usd"], "3.00")
+        self.service.activate_draft(cleared["config_id"], "operator-a", expected_generation=2)
+        self.assertEqual(
+            {field: self.service.active_limits()[field] for field in fields},
+            {field: None for field in fields},
+        )
+
     def test_active_reads_join_existing_transaction_without_mutation(self) -> None:
         before_changes = self.store.connection.total_changes
         self.store.connection.execute("BEGIN IMMEDIATE")
@@ -51,6 +150,7 @@ class CanarySettingsTests(unittest.TestCase):
             self.assertTrue(self.store.connection.in_transaction)
         finally:
             self.store.connection.rollback()
+
 
     def test_missing_active_does_not_reset_established_settings(self) -> None:
         self.store.connection.execute("DELETE FROM canary_setting_configs WHERE state='ACTIVE'")

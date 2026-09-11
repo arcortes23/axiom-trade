@@ -1023,8 +1023,12 @@ class AutonomousWorkflowTests(unittest.TestCase):
         self._enable_worker()
 
         blocked = worker.tick(now=T0)
-        self.assertEqual(blocked["blocker"], "NO_ELIGIBLE_RANKABLE_CANDIDATE")
+        self.assertEqual(blocked["blocker"], "NO_ELIGIBLE_CANDIDATES")
+        self.assertEqual(blocked["signal_scan_status"], "NO_ELIGIBLE_CANDIDATES")
+        self.assertEqual(blocked["signal_scan_checked_this_cycle"], 0)
+        self.assertEqual(blocked["signal_scan_coverage_percentage"], 0.0)
         self.assertEqual(calls, [])
+
 
     def test_disabled_startup_reconstructs_confirmed_inventory_without_exit_submission(self):
         self._enable_worker()
@@ -2547,9 +2551,18 @@ class AutonomousWorkflowTests(unittest.TestCase):
         results = [worker.tick(now=T0) for _ in range(3)]
         self.assertEqual([result["status"] for result in results], ["DISABLED"] * 3)
         self.assertEqual(venue.submissions, [])
-        for table in ("canary_signals", "canary_ledger", "canary_execution_events"):
-            count = self.store.connection.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()["n"]
+        for table in (
+            "canary_signals",
+            "canary_ledger",
+            "canary_execution_events",
+            "canary_submission_attempts",
+        ):
+            count = self.store.connection.execute(
+                f"SELECT COUNT(*) AS n FROM {table}"
+            ).fetchone()["n"]
             self.assertEqual(count, 0, table)
+        autonomous = self.service.status_report()["autonomous"]
+        self.assertEqual(autonomous["orders_attempted"], 0)
     def test_hermes_cannot_change_autonomous_risk_controls(self):
         self._enable_worker()
         before = self.service.status()
@@ -3500,7 +3513,7 @@ class AutonomousWorkflowTests(unittest.TestCase):
             first = worker.tick(now=T0)
             failed = worker.tick(now=T0)
 
-            self.assertEqual(first["status"], "NO_SIGNAL")
+            self.assertEqual(first["status"], "IN_PROGRESS")
             self.assertEqual(first["candidates_signal_checked"], 10)
             self.assertEqual(first["signal_scan_checked_this_cycle"], 10)
             self.assertEqual(first["signal_scan_remaining_this_cycle"], 10)
@@ -4549,7 +4562,7 @@ class AutonomousWorkflowTests(unittest.TestCase):
             ) as bind, \
             patch.object(CredentialStore, "configured", return_value=True):
             first = worker.tick(now=T0)
-            self.assertEqual(first["status"], "NO_SIGNAL")
+            self.assertEqual(first["status"], "IN_PROGRESS")
             first_state = self.store.connection.execute(
                 "SELECT * FROM canary_autonomous_state WHERE singleton=1"
             ).fetchone()
@@ -5024,6 +5037,271 @@ class AutonomousWorkflowTests(unittest.TestCase):
         self.assertEqual(evidence["paper_expected_price"], "0.50")
         self.assertEqual(evidence["actual_average_price"], "0.51")
         self.assertIn("slippage_difference_bps", evidence)
+    def test_empty_scan_persists_no_eligible_candidates_with_zero_progress(self):
+        self._enable_worker()
+        venue_calls: list[bool] = []
+        worker = AutonomousCanaryWorker(
+            self.store,
+            clock=lambda: T0,
+            venue_factory=lambda: venue_calls.append(True),
+        )
+
+        result = worker.tick(now=T0)
+
+        self.assertEqual(result["status"], "BLOCKED")
+        self.assertEqual(result["blocker"], "NO_ELIGIBLE_CANDIDATES")
+        self.assertEqual(result["signal_scan_status"], "NO_ELIGIBLE_CANDIDATES")
+        self.assertEqual(result["signal_scan_checked_this_cycle"], 0)
+        self.assertEqual(result["signal_scan_remaining_this_cycle"], 0)
+        self.assertEqual(result["signal_scan_coverage_percentage"], 0.0)
+        self.assertEqual(result["candidates_signal_checked"], 0)
+        self.assertEqual(result["orders_attempted"], 0)
+        self.assertEqual(venue_calls, [])
+        state = self.store.connection.execute(
+            "SELECT next_decision,blocker,signal_scan_status,"
+            "signal_scan_checked_this_cycle,signal_scan_coverage_percentage "
+            "FROM canary_autonomous_state WHERE singleton=1"
+        ).fetchone()
+        self.assertEqual(state["next_decision"], "WAIT_FOR_RANKABLE_CANDIDATE")
+        self.assertEqual(state["blocker"], "NO_ELIGIBLE_CANDIDATES")
+        self.assertEqual(state["signal_scan_status"], "NO_ELIGIBLE_CANDIDATES")
+        self.assertEqual(state["signal_scan_checked_this_cycle"], 0)
+        self.assertEqual(state["signal_scan_coverage_percentage"], 0.0)
+    def test_nonempty_eligible_unrankable_scan_is_no_signal_without_coverage(self):
+        self._seed_durable_candidates(12, prefix="unrankable")
+        self._enable_worker()
+        venue_calls: list[bool] = []
+        worker = AutonomousCanaryWorker(
+            self.store,
+            clock=lambda: T0,
+            venue_factory=lambda: venue_calls.append(True),
+        )
+        ranking = {
+            "ranking_run_id": None,
+            "eligible_count": 12,
+            "rankable_count": 0,
+            "rankings": [],
+        }
+        with patch.object(
+            CandidateCanaryRanker,
+            "evaluate_and_select",
+            return_value=ranking,
+        ), patch.object(
+            CandidateCanaryRanker,
+            "eligible_scan_rows",
+            return_value=[],
+        ), patch.object(
+            CanaryService,
+            "evaluate_signal",
+            side_effect=AssertionError("unrankable universe must not be signal-scanned"),
+        ):
+            result = worker.tick(now=T0)
+
+        self.assertEqual(result["status"], "NO_SIGNAL", result)
+        self.assertEqual(result["decision"], "NO_ACTIONABLE_SIGNAL")
+        self.assertEqual(result["blocker"], "NO_ACTIONABLE_SIGNAL")
+        self.assertEqual(result["ranking"]["eligible_count"], 12)
+        self.assertEqual(result["ranking"]["rankable_count"], 0)
+        self.assertEqual(result["candidates_ranked"], 0)
+        self.assertEqual(result["signal_scan_status"], "COMPLETE_NO_SIGNAL")
+        self.assertEqual(result["signal_scan_checked_this_cycle"], 0)
+        self.assertEqual(result["signal_scan_remaining_this_cycle"], 0)
+        self.assertTrue(result["signal_scan_cycle_complete"])
+        self.assertEqual(venue_calls, [])
+        state = self.store.connection.execute(
+            "SELECT next_decision,blocker,signal_scan_status,"
+            "signal_scan_checked_this_cycle,signal_scan_coverage_percentage "
+            "FROM canary_autonomous_state WHERE singleton=1"
+        ).fetchone()
+        self.assertEqual(state["next_decision"], "WAIT_FOR_RANKABLE_CANDIDATE")
+        self.assertEqual(state["blocker"], "NO_ACTIONABLE_SIGNAL")
+        self.assertEqual(state["signal_scan_status"], "COMPLETE_NO_SIGNAL")
+        self.assertEqual(state["signal_scan_checked_this_cycle"], 0)
+        self.assertEqual(state["signal_scan_coverage_percentage"], 0.0)
+    def test_unrankable_fallback_scan_without_persisted_ranking_is_no_signal(self):
+        candidate_ids: list[str] = []
+        for index in range(12):
+            candidate_id = f"fallback-unrankable-{index:02d}"
+            self.seed_candidate(
+                candidate_id,
+                executable=True,
+                cluster=(
+                    "fallback-cluster-a"
+                    if index < 6
+                    else f"fallback-cluster-{index:02d}"
+                ),
+                score=0.90 - index / 100,
+            )
+            self.service.mark_eligible(candidate_id)
+            candidate_ids.append(candidate_id)
+        self._enable_worker()
+
+        before = self.store.connection.execute(
+            "SELECT COUNT(*) FROM canary_rankings"
+        ).fetchone()[0]
+        self.assertEqual(before, 0)
+        checked: list[str] = []
+        venue_calls: list[bool] = []
+
+        def evaluate(service, candidate_id, **kwargs):
+            checked.append(candidate_id)
+            return self._signal_evaluation(candidate_id, "NO_FORWARD_SNAPSHOT")
+
+        worker = AutonomousCanaryWorker(
+            self.store,
+            clock=lambda: T0,
+            venue_factory=lambda: venue_calls.append(True),
+        )
+        with patch.object(
+            CandidateCanaryRanker,
+            "evaluate_and_select",
+            return_value={
+                "candidates_evaluated": len(candidate_ids),
+                "eligible_count": len(candidate_ids),
+                "rankable_count": 0,
+                "rankings": [],
+                "ranking_run_id": None,
+            },
+        ), patch.object(
+            CanaryService,
+            "evaluate_signal",
+            autospec=True,
+            side_effect=evaluate,
+        ):
+            result = worker.tick(now=T0)
+
+        self.assertEqual(result["status"], "NO_SIGNAL", result)
+        self.assertEqual(result["decision"], "NO_ACTIONABLE_SIGNAL")
+        self.assertEqual(result["blocker"], "NO_ACTIONABLE_SIGNAL")
+        self.assertEqual(result["candidates_ranked"], 0)
+        self.assertEqual(result["candidates_signal_checked"], worker._SCAN_CAP)
+        self.assertEqual(result["candidates_no_signal"], worker._SCAN_CAP)
+        self.assertEqual(result["signal_scan_status"], "IN_PROGRESS")
+        self.assertEqual(result["signal_scan_checked_this_cycle"], worker._SCAN_CAP)
+        self.assertEqual(result["signal_scan_remaining_this_cycle"], 2)
+        self.assertEqual(result["signal_scan_coverage_percentage"], 100 * worker._SCAN_CAP / 12)
+        self.assertEqual(checked, candidate_ids[: worker._SCAN_CAP])
+        self.assertEqual(
+            result["signal_scan_reason_counts_json"]["NO_FORWARD_SNAPSHOT"],
+            worker._SCAN_CAP,
+        )
+        self.assertEqual(venue_calls, [])
+        after = self.store.connection.execute(
+            "SELECT COUNT(*) FROM canary_rankings"
+        ).fetchone()[0]
+        self.assertEqual(after, 0)
+
+
+
+
+    def test_incomplete_bounded_scan_persists_progress_until_next_tick(self):
+        candidate_ids = self._seed_durable_candidates(11, prefix="progress")
+        self._enable_worker()
+        checked: list[str] = []
+        patches = self._durable_scan_patches(
+            candidate_ids,
+            ["progress-run"] * 2,
+            checked,
+        )
+        worker = AutonomousCanaryWorker(self.store, clock=lambda: T0)
+
+        with patches[0], patches[1], patches[2]:
+            first = worker.tick(now=T0)
+            self.assertEqual(first["status"], "IN_PROGRESS")
+            self.assertEqual(first["decision"], "SCAN_IN_PROGRESS")
+            self.assertEqual(first["blocker"], "SCAN_IN_PROGRESS")
+            self.assertEqual(first["signal_scan_status"], "IN_PROGRESS")
+            self.assertEqual(first["signal_scan_checked_this_cycle"], 10)
+            self.assertEqual(first["signal_scan_remaining_this_cycle"], 1)
+            self.assertAlmostEqual(first["signal_scan_coverage_percentage"], 1000 / 11)
+            state = self.store.connection.execute(
+                "SELECT next_decision,blocker,orders_attempted "
+                "FROM canary_autonomous_state WHERE singleton=1"
+            ).fetchone()
+            self.assertEqual(state["next_decision"], "CONTINUE_SIGNAL_SCAN")
+            self.assertEqual(state["blocker"], "SCAN_IN_PROGRESS")
+            self.assertEqual(state["orders_attempted"], 0)
+            second = worker.tick(now=T0)
+
+        self.assertEqual(second["signal_scan_status"], "COMPLETE_NO_SIGNAL")
+        self.assertEqual(second["signal_scan_checked_this_cycle"], 11)
+        self.assertEqual(second["signal_scan_remaining_this_cycle"], 0)
+        self.assertEqual(second["signal_scan_coverage_percentage"], 100.0)
+        self.assertEqual(second["status"], "NO_SIGNAL")
+        self.assertEqual(second["blocker"], "NO_ACTIONABLE_SIGNAL")
+
+    def test_fully_checked_strategy_decline_emits_no_edge_only_after_completion(self):
+        candidate_ids = self._seed_durable_candidates(1, prefix="decline")
+        self._enable_worker()
+        patches = self._durable_ranking_patch(candidate_ids, ["decline-run"])
+        worker = AutonomousCanaryWorker(self.store, clock=lambda: T0)
+
+        with patches, patch.object(
+            CandidateCanaryRanker,
+            "validate_persisted_ranking",
+            return_value=True,
+        ), patch.object(
+            CanaryService,
+            "evaluate_signal",
+            autospec=True,
+            side_effect=lambda service, candidate_id, **kwargs: self._signal_evaluation(
+                candidate_id,
+                "STRATEGY_EVALUATED_DECLINED",
+            ),
+        ):
+            result = worker.tick(now=T0)
+
+        self.assertEqual(result["status"], "NO_SIGNAL")
+        self.assertEqual(result["blocker"], "NO_ACTIONABLE_SIGNAL")
+        self.assertEqual(result["signal_scan_status"], "COMPLETE_NO_SIGNAL")
+        self.assertEqual(result["signal_scan_checked_this_cycle"], 1)
+        self.assertEqual(result["signal_scan_remaining_this_cycle"], 0)
+        self.assertEqual(result["signal_scan_coverage_percentage"], 100.0)
+        self.assertEqual(result["next_signal_scan_start_rank"], 0)
+
+    def test_missing_data_evaluator_reasons_are_durable_exact_blockers(self):
+        candidate_ids = self._seed_durable_candidates(1, prefix="data-blocker")
+        self._enable_worker()
+        reasons = (
+            "NO_FORWARD_SNAPSHOT",
+            "STALE_FORWARD_EVIDENCE",
+            "MODEL_INPUT_MISSING",
+            "WARMING_UP",
+            "INSUFFICIENT_LOOKBACK",
+        )
+        ranking_patch = self._durable_ranking_patch(
+            candidate_ids,
+            ["data-run"] * len(reasons),
+        )
+        worker = AutonomousCanaryWorker(self.store, clock=lambda: T0)
+        current_reason = {"value": reasons[0]}
+
+        def evaluate(service, candidate_id, **kwargs):
+            return self._signal_evaluation(candidate_id, current_reason["value"])
+
+        with ranking_patch, patch.object(
+            CandidateCanaryRanker,
+            "validate_persisted_ranking",
+            return_value=True,
+        ), patch.object(
+            CanaryService,
+            "evaluate_signal",
+            autospec=True,
+            side_effect=evaluate,
+        ):
+            for reason in reasons:
+                with self.subTest(reason=reason):
+                    current_reason["value"] = reason
+                    result = worker.tick(now=T0)
+                    self.assertEqual(result["status"], "BLOCKED")
+                    self.assertEqual(result["blocker"], reason)
+                    self.assertEqual(result["decision"], reason)
+                    self.assertEqual(result["signal_scan_status"], "COMPLETE_NO_SIGNAL")
+                    self.assertEqual(result["signal_scan_checked_this_cycle"], 1)
+                    self.assertEqual(result["signal_scan_coverage_percentage"], 100.0)
+                    self.assertEqual(result["orders_attempted"], 0)
+
+
 
 
 if __name__ == "__main__":

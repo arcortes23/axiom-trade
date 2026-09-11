@@ -215,6 +215,26 @@ class AutonomousCanaryWorker:
         "COLLECTOR_CANDIDATE_HEALTH_BLOCKED",
     )
     _REASON_COUNT_CAP = 10_000
+    _EXACT_DATA_BLOCKER_REASONS = frozenset(
+        {
+            "NO_FORWARD_SNAPSHOT",
+            "STALE_FORWARD_EVIDENCE",
+            "MODEL_INPUT_MISSING",
+            "WARMING_UP",
+            "INSUFFICIENT_LOOKBACK",
+            "COLLECTOR_CANDIDATE_HEALTH_BLOCKED",
+            "CANDIDATE_FORWARD_MARKET_UNRESOLVED",
+            "MARKET_CLOSED",
+            "MARKET_FILTER_MISMATCH",
+            "DEFERRED_MARKETS",
+            "SCOPE_RESOLUTION_MISSING",
+            "SCOPE_RESOLUTION_SCOPE_MISMATCH",
+            "SCOPE_RESOLUTION_STALE",
+            "SCOPE_RESOLUTION_ZERO_MATCHES",
+            "SCOPE_RESOLUTION_TOKEN_MISMATCH",
+        }
+    )
+
 
     @classmethod
     def _normalize_reason_counts(cls, value: Any) -> dict[str, int]:
@@ -237,22 +257,52 @@ class AutonomousCanaryWorker:
 
     @classmethod
     def _evaluation_reason(cls, evaluation: Any, signal: Any) -> str:
-        if isinstance(evaluation, Mapping):
-            reason = str(evaluation.get("reason_code") or "").strip().upper()
-            if reason in cls._SIGNAL_REASON_CODES:
-                return reason
+        fallback: str | None = None
+        for source in (evaluation, signal):
+            if isinstance(source, Mapping):
+                reason = str(source.get("reason_code") or "").strip().upper()
+                if reason not in cls._SIGNAL_REASON_CODES:
+                    continue
+                if reason in cls._EXACT_DATA_BLOCKER_REASONS:
+                    return reason
+                fallback = fallback or reason
+        if fallback:
+            return fallback
         if isinstance(signal, Mapping) and str(signal.get("status") or "").upper() == "READY":
             return "READY_SIGNAL"
         return "NO_STRATEGY_SIGNAL"
 
-    @staticmethod
-    def _evaluation_blocker(evaluation: Any) -> str | None:
+
+    @classmethod
+    def _evaluation_blocker(
+        cls,
+        evaluation: Any,
+        signal: Any = None,
+    ) -> str | None:
         if not isinstance(evaluation, Mapping):
-            return None
+            evaluation = {}
+        evaluation_reason = str(evaluation.get("reason_code") or "").strip().upper()
+        if not evaluation_reason and isinstance(signal, Mapping):
+            evaluation_reason = str(signal.get("reason_code") or "").strip().upper()
         evidence = evaluation.get("evidence")
         if not isinstance(evidence, Mapping):
+            evidence = {}
+        # A binding failure is more specific than the collector-health
+        # projection that surrounds it.  Preserve the executable-document
+        # blocker instead of masking it with the generic health outcome.
+        binding_reason = str(evidence.get("binding_reason") or "").strip().upper()
+        if (
+            evaluation_reason == "COLLECTOR_CANDIDATE_HEALTH_BLOCKED"
+            and binding_reason == "CANDIDATE_EXECUTABLE_DOCUMENTS_UNAVAILABLE"
+        ):
+            return binding_reason
+        # The evaluator's reason is the authoritative data prerequisite.  Do
+        # not replace a precise missing/stale/warming/model/lookback outcome
+        # with an evidence detail (or the generic no-edge result).
+        if evaluation_reason in cls._EXACT_DATA_BLOCKER_REASONS:
+            return evaluation_reason
+        if not evidence:
             return None
-        evaluation_reason = str(evaluation.get("reason_code") or "").strip().upper()
         authority_error = str(evidence.get("authority_error") or "").strip()
         required_health_reason = str(
             evidence.get("required_health_reason_code") or ""
@@ -292,6 +342,7 @@ class AutonomousCanaryWorker:
         ):
             return required_health_reason
         return None
+
 
     @classmethod
     def _increment_reason_count(
@@ -1024,12 +1075,39 @@ class AutonomousCanaryWorker:
             ordered = self._diversity_order(rows)
             try:
                 candidates_ranked = max(0, int(ranking.get("rankable_count")))
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 candidates_ranked = len(
                     ranking.get("rankings")
                     if isinstance(ranking.get("rankings"), list)
                     else []
                 )
+            try:
+                authoritative_eligible_count = max(
+                    0,
+                    int(ranking.get("eligible_count")),
+                )
+            except (TypeError, ValueError, OverflowError):
+                # Older ranking payloads may omit the count.  A non-empty
+                # independently scanable universe still proves eligibility;
+                # an empty one preserves the true-empty behavior.
+                authoritative_eligible_count = len(ordered)
+            try:
+                authoritative_rankable_count = max(
+                    0,
+                    int(ranking.get("rankable_count")),
+                )
+            except (TypeError, ValueError, OverflowError):
+                authoritative_rankable_count = candidates_ranked
+            no_persisted_ranking_fallback = (
+                authoritative_eligible_count > 0
+                and authoritative_rankable_count == 0
+                and not signal_scan_ranking_run_id
+                and not ranking.get("rankings")
+            )
+            # When ranking has no persisted rows, retain the fallback scan's
+            # compatibility no-signal outcome.  The durable projection still
+            # records any remaining candidates for the next tick.
+
             previous = self._scan_state()
             previous_cycle_id = str(previous.get("signal_scan_cycle_id") or "").strip()
             try:
@@ -1139,8 +1217,11 @@ class AutonomousCanaryWorker:
                 signal_scan_checked_this_cycle = len(scan_checked_set)
                 signal_scan_remaining_this_cycle = len(remaining_now)
                 total = len(scan_universe_keys)
+                # An empty universe is not a successfully checked universe.
+                # Keep its prerequisite progress measurable as 0/0 and
+                # distinguish it from a completed no-edge scan.
                 signal_scan_coverage_percentage = (
-                    100.0 * signal_scan_checked_this_cycle / total if total else 100.0
+                    100.0 * signal_scan_checked_this_cycle / total if total else 0.0
                 )
                 complete = force_complete or not remaining_now
                 signal_scan_cycle_complete = int(complete)
@@ -1180,7 +1261,9 @@ class AutonomousCanaryWorker:
                     skips, sort_keys=True, separators=(",", ":")
                 )
                 signal_scan_status = (
-                    "COMPLETE_NO_SIGNAL"
+                    "NO_ELIGIBLE_CANDIDATES"
+                    if authoritative_eligible_count == 0
+                    else "COMPLETE_NO_SIGNAL"
                     if complete and not actionable
                     else "COMPLETE_ACTIONABLE"
                     if complete
@@ -1253,6 +1336,7 @@ class AutonomousCanaryWorker:
                 return {
                     **extra,
                     "position_reconciliation": dict(position_reconciliation),
+                    "orders_attempted": orders_attempted,
                     "position_management": dict(position_management),
                     "position_blocker": position_blocker,
                     **scan_payload(),
@@ -1293,15 +1377,34 @@ class AutonomousCanaryWorker:
                     decision="POSITION_RECONCILIATION_BLOCKED",
                     blocker=position_blocker,
                 )
-            if not ordered:
-                blocker = "NO_ELIGIBLE_RANKABLE_CANDIDATE"
+            if authoritative_eligible_count == 0 or not ordered:
                 update_scan_projection(force_complete=True)
+                if authoritative_eligible_count == 0:
+                    blocker = "NO_ELIGIBLE_CANDIDATES"
+                    finish(
+                        next_decision="WAIT_FOR_RANKABLE_CANDIDATE",
+                        blocker=blocker,
+                    )
+                    return result(
+                        status="BLOCKED",
+                        decision=blocker,
+                        blocker=blocker,
+                    )
+
+                # Eligibility is authoritative and independent from ranking
+                # evidence.  An eligible universe with no rankable rows is
+                # a truthful no-signal outcome, not an empty universe.
+                blocker = "NO_ACTIONABLE_SIGNAL"
                 finish(
-                    next_decision="WAIT_FOR_RANKABLE_CANDIDATE",
+                    next_decision=(
+                        "WAIT_FOR_RANKABLE_CANDIDATE"
+                        if authoritative_rankable_count == 0
+                        else "WAIT_FOR_FRESH_ACTIONABLE_SIGNAL"
+                    ),
                     blocker=blocker,
                 )
                 return result(
-                    status="BLOCKED",
+                    status="NO_SIGNAL",
                     decision=blocker,
                     blocker=blocker,
                 )
@@ -1324,9 +1427,15 @@ class AutonomousCanaryWorker:
                 )
                 candidates_evaluated += 1
                 reason = self._evaluation_reason(evaluation, signal)
-                evaluation_blocker = evaluation_blocker or self._evaluation_blocker(
-                    evaluation
-                )
+                candidate_blocker = self._evaluation_blocker(evaluation, signal)
+                if (
+                    evaluation_blocker is None
+                    or (
+                        candidate_blocker in self._EXACT_DATA_BLOCKER_REASONS
+                        and evaluation_blocker not in self._EXACT_DATA_BLOCKER_REASONS
+                    )
+                ):
+                    evaluation_blocker = candidate_blocker or evaluation_blocker
                 self._increment_reason_count(signal_scan_reason_counts, reason)
                 candidates_signal_checked += 1
                 scan_checked_set.add((candidate_id, qualification_hash))
@@ -1370,6 +1479,7 @@ class AutonomousCanaryWorker:
                     continue
                 candidates_no_signal += 1
 
+
             actionable_candidates_found = len(ready)
             if actionable_candidates_found:
                 row, signal = min(
@@ -1386,19 +1496,35 @@ class AutonomousCanaryWorker:
                 update_scan_projection(actionable=True)
             else:
                 signal_id = unknown_signal_id
-                blocker = (
-                    "UNKNOWN_NO_RETRY"
-                    if unknown_seen
-                    else evaluation_blocker or "NO_ACTIONABLE_SIGNAL"
-                )
-                decision = (
-                    "UNKNOWN_NO_RETRY"
-                    if unknown_seen
-                    else blocker
-                )
+                # Projection must be updated before interpreting the outcome:
+                # a bounded window with work left is not a genuine no-edge
+                # decision.
                 update_scan_projection()
+                if unknown_seen:
+                    blocker = "UNKNOWN_NO_RETRY"
+                    decision = blocker
+                    next_decision = "WAIT_FOR_FRESH_ACTIONABLE_SIGNAL"
+                    result_status = "BLOCKED"
+                elif (
+                    signal_scan_status == "IN_PROGRESS"
+                    and not no_persisted_ranking_fallback
+                ):
+                    blocker = evaluation_blocker or "SCAN_IN_PROGRESS"
+                    decision = blocker
+                    next_decision = "CONTINUE_SIGNAL_SCAN"
+                    result_status = "BLOCKED" if evaluation_blocker else "IN_PROGRESS"
+                elif evaluation_blocker and not no_persisted_ranking_fallback:
+                    blocker = evaluation_blocker
+                    decision = blocker
+                    next_decision = "WAIT_FOR_DATA_REFRESH"
+                    result_status = "BLOCKED"
+                else:
+                    blocker = "NO_ACTIONABLE_SIGNAL"
+                    decision = blocker
+                    next_decision = "WAIT_FOR_FRESH_ACTIONABLE_SIGNAL"
+                    result_status = "NO_SIGNAL"
                 finish(
-                    next_decision="WAIT_FOR_FRESH_ACTIONABLE_SIGNAL",
+                    next_decision=next_decision,
                     blocker=blocker,
                     signal_id=signal_id,
                     worker_status="DEGRADED" if unknown_seen else "IDLE",
@@ -1409,7 +1535,7 @@ class AutonomousCanaryWorker:
                     ),
                 )
                 return result(
-                    status="BLOCKED" if unknown_seen or evaluation_blocker else "NO_SIGNAL",
+                    status=result_status,
                     decision=decision,
                     blocker=blocker,
                     candidate_id=(

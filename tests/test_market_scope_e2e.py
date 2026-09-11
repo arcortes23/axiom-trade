@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 import unittest
 
@@ -30,6 +31,11 @@ from axiom.storage import AxiomStore
 from axiom.strategy.signals import CONSTANT_BASELINE, evaluate_model_document
 
 from tests.test_phase4 import experiment_plan, prediction_rows, processor, proposal, relaxed_criteria
+from tests.test_polymarket_research_orchestration import (
+    _legacy_prediction_predecessor,
+    _seed_predeclared_historical_dataset,
+)
+
 
 
 UTC = timezone.utc
@@ -246,6 +252,193 @@ class MarketScopeEndToEndTests(unittest.TestCase):
             }
         )
         return plan
+    @staticmethod
+    def _seed_predeclared_history(store: AxiomStore, *, attested: bool = True) -> None:
+        rows = [
+            {
+                "timestamp": (T0 + timedelta(minutes=index)).isoformat(),
+                "market_id": f"seed-market-{index % 64:02d}",
+                "yes_mid": 0.50,
+                "source_type": "HISTORICAL",
+            }
+            for index in range(4096)
+        ]
+        store.save_dataset(
+            "Polymarket-historical",
+            "e2e-4096-v1",
+            rows,
+            metadata={
+                "source_type": "HISTORICAL",
+                "provider": "SYNTHETIC_OFFLINE",
+                "research_quality": "PRICE_PROXY",
+            },
+            quality="PRICE_PROXY",
+        )
+        store.save_dataset_catalog(
+            "Polymarket-historical",
+            "e2e-4096-v1",
+            provider="SYNTHETIC_OFFLINE",
+            instrument="POLYMARKET",
+            market_type=MarketType.PREDICTION,
+            timeframe="event",
+            start_timestamp=T0,
+            end_timestamp=T0 + timedelta(minutes=4095),
+            row_count=4096,
+            completeness=1.0,
+            missing_ranges=(),
+            quality="PRICE_PROXY",
+            source_type="HISTORICAL",
+            snapshot_id="SYNTHETIC_OFFLINE-e2e-4096-v1",
+            metadata={
+                "provider": "SYNTHETIC_OFFLINE",
+                "source_type": "HISTORICAL",
+                "research_quality": "PRICE_PROXY",
+            },
+        )
+        if attested:
+            attestation = store.verify_dataset_integrity_attestation(
+                "Polymarket-historical",
+                "e2e-4096-v1",
+                force=True,
+            )
+            assert attestation["status"] == "CURRENT"
+            assert attestation["row_count"] == 4096
+
+    def test_predeclared_seed_enqueues_only_exact_currently_attested_4096_row_history(self) -> None:
+        with AxiomStore(":memory:") as store:
+            self._seed_predeclared_history(store)
+            bus = DurableResearchBus(store)
+            processor = AutonomousResearchProcessor(
+                store,
+                bus=bus,
+                clock=lambda: T0,
+            )
+
+            queued = processor._enqueue_predeclared_from_persisted_scope(T0)
+
+            self.assertEqual(len(queued), 3)
+            self.assertEqual(store.research_queue_stats()["total"], 3)
+            self.assertEqual(
+                {
+                    (
+                        item.payload["dataset_id"],
+                        item.payload["dataset_version"],
+                        item.payload["dataset_selector"]["source_type"],
+                    )
+                    for item in queued
+                },
+                {("Polymarket-historical", "e2e-4096-v1", "HISTORICAL")},
+            )
+            self.assertEqual(store.list_reports(), [])
+
+    def test_predeclared_seed_persists_missing_attestation_prerequisite_without_queue_rows(self) -> None:
+        with AxiomStore(":memory:") as store:
+            self._seed_predeclared_history(store, attested=False)
+            processor = AutonomousResearchProcessor(store, clock=lambda: T0)
+
+            self.assertEqual(processor._enqueue_predeclared_from_persisted_scope(T0), ())
+            self.assertEqual(store.research_queue_stats()["total"], 0)
+            reports = store.list_reports()
+            self.assertEqual(len(reports), 1)
+            evidence = reports[0]["report"]
+            self.assertEqual(evidence["report_type"], "autonomous_predeclared_seed_blocked")
+            self.assertEqual(evidence["blocker"], "DATASET_ATTESTATION_MISSING")
+            self.assertEqual(evidence["next_action"], "PERSIST_CURRENT_HISTORICAL_DATASET_ATTESTATION")
+            self.assertEqual(
+                evidence["required_dataset"],
+                {
+                    "dataset_id": "Polymarket-historical",
+                    "dataset_version": "e2e-4096-v1",
+                    "source_type": "HISTORICAL",
+                    "market_type": "prediction",
+                    "attestation_status": "CURRENT",
+                    "contamination_result": "PASS",
+                },
+            )
+
+    def test_predeclared_seed_persists_stale_attestation_prerequisite_without_queue_rows(self) -> None:
+        with AxiomStore(":memory:") as store:
+            self._seed_predeclared_history(store)
+            store.connection.execute(
+                "UPDATE dataset_integrity_attestation "
+                "SET status='STALE', reason='BOUNDS_MISMATCH' "
+                "WHERE dataset_id=? AND dataset_version=?",
+                ("Polymarket-historical", "e2e-4096-v1"),
+            )
+            processor = AutonomousResearchProcessor(store, clock=lambda: T0)
+
+            self.assertEqual(processor._enqueue_predeclared_from_persisted_scope(T0), ())
+            self.assertEqual(store.research_queue_stats()["total"], 0)
+            evidence = store.list_reports()[0]["report"]
+            self.assertEqual(evidence["blocker"], "DATASET_ATTESTATION_STALE")
+            self.assertEqual(evidence["next_action"], "REFRESH_CURRENT_HISTORICAL_DATASET_ATTESTATION")
+            self.assertEqual(evidence["attestation"]["status"], "STALE")
+            self.assertEqual(evidence["attestation"]["reason"], "BOUNDS_MISMATCH")
+    def test_predeclared_seed_persists_contamination_blocker_without_queue_rows(self) -> None:
+        with AxiomStore(":memory:") as store:
+            self._seed_predeclared_history(store)
+            store.connection.execute(
+                "UPDATE dataset_integrity_attestation "
+                "SET contamination_result='FAIL', reason='FORWARD_CONTAMINATION', status='CURRENT' "
+                "WHERE dataset_id=? AND dataset_version=?",
+                ("Polymarket-historical", "e2e-4096-v1"),
+            )
+            processor = AutonomousResearchProcessor(store, clock=lambda: T0)
+
+            self.assertEqual(processor._enqueue_predeclared_from_persisted_scope(T0), ())
+            self.assertEqual(store.research_queue_stats()["total"], 0)
+            evidence = store.list_reports()[0]["report"]
+            self.assertEqual(evidence["blocker"], "DATASET_PROVENANCE_INVALID")
+            self.assertEqual(
+                evidence["next_action"],
+                "REMOVE_FORWARD_CONTAMINATION_AND_REATTEST_HISTORICAL_DATASET",
+            )
+            self.assertEqual(evidence["attestation"]["contamination_result"], "FAIL")
+
+    def test_predeclared_seed_evidence_history_keeps_latest_blocker_and_next_action(self) -> None:
+        with AxiomStore(":memory:") as store:
+            self._seed_predeclared_history(store)
+            binding = "autonomous-predeclared-seed:Polymarket-historical:e2e-4096-v1"
+            store.connection.execute(
+                "UPDATE dataset_integrity_attestation "
+                "SET status='STALE', reason='BOUNDS_MISMATCH' "
+                "WHERE dataset_id=? AND dataset_version=?",
+                ("Polymarket-historical", "e2e-4096-v1"),
+            )
+            processor = AutonomousResearchProcessor(store, clock=lambda: T0)
+
+            self.assertEqual(processor._enqueue_predeclared_from_persisted_scope(T0), ())
+            stale_history = store.list_reports(experiment_id=binding, newest_first=True)
+            self.assertEqual(len(stale_history), 1)
+            stale_evidence = deepcopy(stale_history[0]["report"])
+            self.assertEqual(stale_evidence["blocker"], "DATASET_ATTESTATION_STALE")
+            self.assertEqual(
+                stale_evidence["next_action"],
+                "REFRESH_CURRENT_HISTORICAL_DATASET_ATTESTATION",
+            )
+
+            store.connection.execute(
+                "UPDATE dataset_integrity_attestation "
+                "SET contamination_result='FAIL', reason='FORWARD_CONTAMINATION', status='CURRENT' "
+                "WHERE dataset_id=? AND dataset_version=?",
+                ("Polymarket-historical", "e2e-4096-v1"),
+            )
+            self.assertEqual(processor._enqueue_predeclared_from_persisted_scope(T0), ())
+            self.assertEqual(processor._enqueue_predeclared_from_persisted_scope(T0), ())
+
+            history = store.list_reports(experiment_id=binding, newest_first=True)
+            self.assertEqual(len(history), 2)
+            self.assertEqual(history[0]["report"]["blocker"], "DATASET_PROVENANCE_INVALID")
+            self.assertEqual(history[0]["report"]["progress"], "BLOCKED")
+            self.assertEqual(
+                history[0]["report"]["next_action"],
+                "REMOVE_FORWARD_CONTAMINATION_AND_REATTEST_HISTORICAL_DATASET",
+            )
+            self.assertEqual(history[0]["report"]["attestation"]["status"], "CURRENT")
+            self.assertEqual(history[0]["report"]["attestation"]["contamination_result"], "FAIL")
+            self.assertEqual(history[1]["report"]["blocker"], "DATASET_ATTESTATION_STALE")
+            self.assertEqual(history[1]["report"]["attestation"]["status"], "STALE")
+
 
     @staticmethod
     def _seed_forward_metadata(store: AxiomStore) -> None:
@@ -1184,6 +1377,256 @@ class MarketScopeRuntimeQualificationTests(unittest.TestCase):
                 if item["payload"].get("live_execution") is True
             ]
             self.assertEqual(live_submission_events, [])
+    def test_ordinary_worker_recovers_legacy_predecessor_without_live_events(self) -> None:
+        legacy_dataset_id = "prediction:legacy-market"
+        legacy_dataset_version = "legacy-v1"
+        legacy_plan = {
+            "market_type": "prediction",
+            "template": "momentum",
+            "parameters": {"lookback": [1], "threshold": [0.05]},
+            "target": {"market_ids": ["legacy-market"]},
+            "dataset_id": legacy_dataset_id,
+            "dataset_version": legacy_dataset_version,
+            "allowed_features": ["timestamp", "market_id", "yes_mid"],
+            "time_split": "train-validation-holdout",
+            "min_samples": 1,
+            "min_trades": 0,
+            "max_variants": 1,
+            "methodology": {"initial_cash": 1_000.0, "allocation": 0.25},
+            "exit_policy": {"type": "fixed_holding_period", "holding_period": 1},
+            "paper_only": True,
+        }
+        predecessor = {
+            "candidate_id": "legacy-predecessor-e2e",
+            "frozen_hash": "sha256:legacy-e2e-frozen",
+            "hypothesis_id": "legacy-e2e-hypothesis",
+            "statement": "A persisted legacy scope remains researchable.",
+            "source": "offline legacy fixture",
+            "market_type": "prediction",
+            "experiment_plan": legacy_plan,
+            "paper_only": True,
+        }
+        rows = [
+            {
+                "timestamp": (T0 + timedelta(hours=index)).isoformat(),
+                "market_id": "legacy-market",
+                "yes_mid": 0.40 + 0.02 * index,
+                "settlement": "open",
+                "source_type": "HISTORICAL",
+            }
+            for index in range(6)
+        ]
+        before = deepcopy(predecessor)
+        with AxiomStore(":memory:") as store:
+            store.save_dataset(
+                legacy_dataset_id,
+                legacy_dataset_version,
+                rows,
+                metadata={
+                    "source_type": "HISTORICAL",
+                    "provider": "polymarket",
+                    "instrument": "POLYMARKET",
+                    "market_type": "prediction",
+                },
+                quality="PRICE_PROXY",
+            )
+            store.save_dataset_catalog(
+                legacy_dataset_id,
+                legacy_dataset_version,
+                provider="polymarket",
+                instrument="POLYMARKET",
+                market_type="prediction",
+                timeframe="event",
+                start_timestamp=T0,
+                end_timestamp=T0 + timedelta(hours=5),
+                row_count=len(rows),
+                completeness=1.0,
+                missing_ranges=(),
+                quality="PRICE_PROXY",
+                source_type="HISTORICAL",
+                snapshot_id="legacy-history-snapshot",
+                metadata={
+                    "source_type": "HISTORICAL",
+                    "provider": "polymarket",
+                    "instrument": "POLYMARKET",
+                    "market_type": "prediction",
+                    "market_id": "legacy-market",
+                    "research_quality": "PRICE_PROXY",
+                    "historical_order_book_available": False,
+                },
+            )
+            store.verify_dataset_integrity_attestation(
+                legacy_dataset_id,
+                legacy_dataset_version,
+                force=True,
+            )
+            store.save_candidate_lifecycle("legacy-predecessor-e2e", CandidateStage.IDEA.value, predecessor)
+            store.save_candidate_lifecycle("legacy-predecessor-e2e", CandidateStage.FROZEN.value, predecessor)
+            bus = DurableResearchBus(store)
+            processor = AutonomousResearchProcessor(
+                store,
+                bus=bus,
+                config=AutonomousResearchConfig(max_items_per_cycle=1),
+                clock=lambda: T0,
+            )
+            cycle = processor.process_pending(worker="ordinary-research", now=T0)
+            self.assertEqual(cycle.claimed, 1, repr(cycle))
+            self.assertEqual(len(cycle.legacy_recovery), 1)
+            recovery = cycle.legacy_recovery[0]
+            self.assertEqual(recovery["classification"], "LEGACY_UNAMBIGUOUS")
+            self.assertEqual(recovery["progress"], "ENQUEUED")
+            self.assertTrue(recovery["evidence_persisted"])
+            successor_item = bus.get(str(recovery["queue_item_id"]))
+            self.assertIsNotNone(successor_item)
+            assert successor_item is not None
+            self.assertIn(successor_item.status, {ResearchQueueStatus.COMPLETED, ResearchQueueStatus.REJECTED})
+            self.assertEqual(successor_item.payload["successor_relation"], "LEGACY_SCOPE_SUCCESSOR")
+            self.assertEqual(successor_item.payload["predecessor_candidate_id"], "legacy-predecessor-e2e")
+            self.assertEqual(store.load_candidate_lifecycle("legacy-predecessor-e2e")["payload"], before)
+            self.assertEqual(
+                store.connection.execute("SELECT COUNT(*) AS n FROM canary_submission_attempts").fetchone()["n"],
+                0,
+            )
+            self.assertEqual(
+                store.connection.execute("SELECT COUNT(*) AS n FROM paper_execution_events").fetchone()["n"],
+                0,
+            )
+
+    def test_generated_legacy_successor_rejects_stale_attestation_before_freeze(self) -> None:
+        with AxiomStore(":memory:") as store:
+            _seed_predeclared_historical_dataset(store)
+            predecessor = _legacy_prediction_predecessor(candidate_id="legacy-stale-generated")
+            store.save_candidate_lifecycle(
+                "legacy-stale-generated",
+                CandidateStage.IDEA.value,
+                predecessor,
+            )
+            store.save_candidate_lifecycle(
+                "legacy-stale-generated",
+                CandidateStage.FROZEN.value,
+                predecessor,
+            )
+            bus = DurableResearchBus(store)
+            processor = AutonomousResearchProcessor(
+                store,
+                bus=bus,
+                config=AutonomousResearchConfig(max_items_per_cycle=1),
+                clock=lambda: T0,
+            )
+            recovery = processor._recover_legacy_predecessors(T0)
+            self.assertEqual(recovery[0]["progress"], "ENQUEUED")
+            successor_item = bus.get(str(recovery[0]["queue_item_id"]))
+            self.assertIsNotNone(successor_item)
+            assert successor_item is not None
+            internal = successor_item.payload["provenance"]["internal"]
+            self.assertEqual(internal["schema"], "axiom-generated-queue-v1")
+            self.assertTrue(internal["generated"])
+            self.assertEqual(internal["kind"], "legacy_scope_successor")
+            self.assertEqual(internal["dataset_id"], "Polymarket-historical")
+            self.assertEqual(internal["dataset_version"], "history-v1")
+            self.assertTrue(str(internal["attestation_hash"]).startswith("sha256:"))
+
+            store.connection.execute(
+                "UPDATE dataset_integrity_attestation "
+                "SET status='CURRENT', attestation_hash='sha256:stale-legacy-attestation', "
+                "reason='ATTESTATION_ROTATED' "
+                "WHERE dataset_id=? AND dataset_version=?",
+                ("Polymarket-historical", "history-v1"),
+            )
+            cycle = processor.process_pending(worker="ordinary-research", now=T0)
+            self.assertEqual(cycle.claimed, 1)
+            self.assertEqual(cycle.rejected, 1)
+            self.assertEqual(cycle.results[0]["reason_code"], "DATASET_ATTESTATION_CHANGED")
+
+            old_item_id = successor_item.item_id
+            old_payload = deepcopy(successor_item.payload)
+            generated_successors = [
+                item
+                for item in store.list_research_items(limit=20)
+                if item["payload"].get("successor_relation") == "LEGACY_SCOPE_SUCCESSOR"
+            ]
+            self.assertEqual(len(generated_successors), 2)
+            old_item = next(item for item in generated_successors if item["item_id"] == old_item_id)
+            new_items = [item for item in generated_successors if item["item_id"] != old_item_id]
+            self.assertEqual(len(new_items), 1)
+            new_item = new_items[0]
+            self.assertEqual(old_item["payload"], old_payload)
+            self.assertNotEqual(new_item["item_id"], old_item_id)
+            self.assertEqual(
+                new_item["payload"]["proposal_id"],
+                old_payload["proposal_id"],
+            )
+            self.assertEqual(
+                new_item["payload"]["provenance"]["internal"]["attestation_hash"],
+                "sha256:stale-legacy-attestation",
+            )
+            self.assertEqual(new_item["status"], ResearchQueueStatus.PENDING.value)
+
+            retry_cycle = processor.process_pending(worker="ordinary-research", now=T0)
+            self.assertEqual(retry_cycle.claimed, 1)
+            self.assertEqual(len(retry_cycle.legacy_recovery), 1)
+            self.assertEqual(
+                retry_cycle.legacy_recovery[0]["queue_item_id"],
+                new_item["item_id"],
+            )
+            self.assertEqual(
+                retry_cycle.legacy_recovery[0]["next_action"],
+                "CLAIM_AND_PROCESS_CANONICAL_SUCCESSOR",
+            )
+            generated_after_retry = [
+                item
+                for item in store.list_research_items(limit=20)
+                if item["payload"].get("successor_relation") == "LEGACY_SCOPE_SUCCESSOR"
+            ]
+            self.assertEqual(len(generated_after_retry), 2)
+
+    def test_ordinary_worker_leaves_malformed_legacy_scope_untouched(self) -> None:
+        predecessor = {
+            "candidate_id": "legacy-malformed-e2e",
+            "frozen_hash": "sha256:legacy-malformed-frozen",
+            "hypothesis_id": "legacy-malformed-hypothesis",
+            "statement": "Malformed legacy scope must remain blocked.",
+            "source": "offline legacy fixture",
+            "market_type": "prediction",
+            "experiment_plan": {
+                "market_type": "prediction",
+                "template": "momentum",
+                "parameters": {"lookback": [1], "threshold": [0.05]},
+                "target": {},
+                "dataset_id": "missing-history",
+                "dataset_version": "missing-v1",
+                "paper_only": True,
+            },
+            "paper_only": True,
+        }
+        before = deepcopy(predecessor)
+        with AxiomStore(":memory:") as store:
+            store.save_candidate_lifecycle("legacy-malformed-e2e", CandidateStage.IDEA.value, predecessor)
+            store.save_candidate_lifecycle("legacy-malformed-e2e", CandidateStage.FROZEN.value, predecessor)
+            processor = AutonomousResearchProcessor(store, clock=lambda: T0)
+            cycle = processor.process_pending(worker="ordinary-research", now=T0)
+            self.assertEqual(cycle.claimed, 0)
+            self.assertEqual(store.research_queue_stats()["total"], 0)
+            self.assertEqual(store.load_candidate_lifecycle("legacy-malformed-e2e")["payload"], before)
+            self.assertEqual(len(cycle.legacy_recovery), 1)
+            recovery = cycle.legacy_recovery[0]
+            self.assertEqual(recovery["classification"], "INVALID")
+            self.assertEqual(recovery["reason_code"], "MISSING_MARKET_SCOPE")
+            self.assertEqual(recovery["progress"], "BLOCKED")
+            self.assertEqual(recovery["blocker"], "MISSING_MARKET_SCOPE")
+            self.assertTrue(recovery["provenance_state_digest"].startswith("sha256:"))
+            processor.process_pending(worker="ordinary-research", now=T0)
+            history = store.list_reports(
+                experiment_id="legacy-malformed-e2e",
+                newest_first=True,
+            )
+            self.assertEqual(len(history), 1)
+            self.assertEqual(
+                history[0]["report"]["provenance_state_digest"],
+                recovery["provenance_state_digest"],
+            )
+
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -150,6 +150,55 @@ class MarketScopeDashboardTests(unittest.TestCase):
         self.assertIn("blocker_counts", html)
         self.assertIn("market-scope-funnel", html)
 
+    def test_settings_review_surface_hides_machine_fences_and_duplicate_inputs(self) -> None:
+        html = _dashboard_html()
+        self.assertIn("Submissions/day", html)
+        self.assertIn("Maximum all-in buy", html)
+        self.assertIn("Gross daily buy budget", html)
+        self.assertIn("Open exposure", html)
+        self.assertIn("Review changes", html)
+        self.assertIn("Confirm activation", html)
+        self.assertIn("Review active limits and enable", html)
+        self.assertNotIn("Draft config ID", html)
+        self.assertNotIn("Reviewed ACTIVE config ID", html)
+        self.assertNotIn("risk-config-id", html)
+        self.assertNotIn("risk-active-config-id", html)
+        self.assertNotIn("max_aggregate_open_cost_usd\",\"Open exposure", html)
+        self.assertNotIn("Advanced drawdown", html)
+        self.assertIn("NO_ELIGIBLE_CANDIDATES", html)
+        self.assertIn("CONNECTIVITY_CHECK_STALE", html)
+        self.assertIn("function renderCanary(data)", html)
+        self.assertIn("connectivityAgeMs>=0", html)
+        self.assertIn("values.max_aggregate_open_cost_usd=input.value", html)
+        self.assertIn('data-risk-optional="clearable"', html)
+        self.assertIn('input.dataset.riskOptional==="clearable"', html)
+        self.assertIn('input.value===""?null:input.value', html)
+        self.assertIn('displayedStatus=c.status==="READY"&&!fresh?"STALE":c.status', html)
+        self.assertIn('throw new Error("CUSTOM_ORDER_SUBMISSIONS_REQUIRED")', html)
+        self.assertIn('["max_submitted_orders_per_day","Submissions/day","number"]', html)
+
+    def test_rendered_autonomous_scan_does_not_promote_historical_winner(self) -> None:
+        html = _dashboard_html()
+        start = html.index("function renderCanaryAutonomousState(data)")
+        end = html.index("const _renderCanaryResearchAndAction", start)
+        renderer = html[start:end]
+        self.assertIn(
+            'const currentSelectionBinding=selectionValid&&selectionStatus==="CURRENT"',
+            renderer,
+        )
+        self.assertIn(
+            "const researchCandidate=currentSelectionBinding?boundResearchCandidate:null",
+            renderer,
+        )
+        self.assertIn(
+            "Number(eligibleCount)===0&&Number(rankableCount)===0;",
+            renderer,
+        )
+        self.assertIn("const coverage=noEligible?0:", renderer)
+        self.assertIn('scanStatus==="IN_PROGRESS"?"IN_PROGRESS"', renderer)
+        self.assertIn("NO_ELIGIBLE_CANDIDATES", renderer)
+        self.assertIn("Selected winner · Historical selected ID", html)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -22,6 +22,7 @@ import hmac
 import queue
 import threading
 import time
+import uuid
 from urllib.request import Request, urlopen
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
@@ -5627,6 +5628,24 @@ class CanaryService:
                     "settings_config_id,settings_generation,credential_fingerprint "
                     "FROM canary_control WHERE singleton=1"
                 ).fetchone()
+                # Re-read the active settings identity while holding the same
+                # write lock used for authorization.  The earlier snapshot is
+                # only a review hint; this closes the active-settings-to-enable
+                # race instead of arming against a stale reviewed envelope.
+                active_current = connection.execute(
+                    "SELECT config_id,generation,config_hash,state "
+                    "FROM canary_setting_configs WHERE state='ACTIVE' "
+                    "ORDER BY generation DESC,created_at DESC,config_id DESC LIMIT 1"
+                ).fetchone()
+                if (
+                    active_current is None
+                    or str(active_current["config_id"] or "").strip() != requested_config
+                    or int(active_current["generation"]) != expected_generation
+                    or str(active_current["config_hash"] or "").strip() != str(settings_hash or "").strip()
+                ):
+                    raise CanaryBlocked("CANARY_SETTINGS_GENERATION_CHANGED")
+                if str(active_current["state"] or "").upper() != "ACTIVE":
+                    raise CanaryBlocked("CANARY_SETTINGS_GENERATION_CHANGED")
                 if current is not None and str(current["state"]).upper() == "KILLED":
                     raise CanaryBlocked("CANARY_KILLED")
                 if current is not None and str(current["state"]).upper() == AUTONOMOUS_MICRO_LIVE:
@@ -6283,15 +6302,7 @@ class CanaryService:
         evidence_json = json.dumps(
             dict(evidence), sort_keys=True, separators=(",", ":"), allow_nan=False
         )
-        evaluation_id = "canary-evaluation-" + hashlib.sha256(
-            (
-                candidate_id
-                + "|"
-                + evaluated_at
-                + "|"
-                + str(time.time_ns())
-            ).encode("utf-8")
-        ).hexdigest()[:32]
+        evaluation_id = "canary-evaluation-" + uuid.uuid4().hex
         with self.store._lock:
             self.store.connection.execute(
                 "INSERT INTO canary_signal_evaluations("
