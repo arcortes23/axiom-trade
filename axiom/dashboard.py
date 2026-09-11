@@ -3660,9 +3660,9 @@ class DashboardData:
             if identifier and identifier not in lifecycle_by_id:
                 lifecycle_by_id[identifier] = item
 
-        first_queue_candidate: (
-            tuple[Mapping[str, Any], Mapping[str, Any], Mapping[str, Any]] | None
-        ) = None
+        queue_candidate_rows: list[
+            tuple[Mapping[str, Any], Mapping[str, Any], Mapping[str, Any]]
+        ] = []
         queue_candidate_ids: set[str] = set()
         candidate_work = 0
         for queue_item in queue_items:
@@ -3682,26 +3682,191 @@ class DashboardData:
                 candidate_id = text(compact_row.get("candidate_id"))
                 if not candidate_id:
                     continue
-                if first_queue_candidate is None:
-                    first_queue_candidate = (queue_item, queue_result, compact_row)
                 queue_candidate_ids.add(candidate_id)
+                queue_candidate_rows.append((queue_item, queue_result, compact_row))
 
-        candidate_id: str | None = None
-        queue_item: Mapping[str, Any] = {}
-        queue_result: Mapping[str, Any] = {}
-        compact_candidate: Mapping[str, Any] = {}
-        if first_queue_candidate is not None:
-            queue_item, queue_result, compact_candidate = first_queue_candidate
-            candidate_id = text(compact_candidate.get("candidate_id"))
-        elif lifecycle_records:
-            candidate_id = next(iter(lifecycle_by_id), None)
+        # A queue result can contain several candidates, while a lifecycle
+        # record is the durable current stage for one candidate.  Keep one
+        # newest queue row per candidate, then rank the resulting identities
+        # by authenticated current worker provenance before recency.
+        queue_candidates_by_id: dict[
+            str, tuple[Mapping[str, Any], Mapping[str, Any], Mapping[str, Any]]
+        ] = {}
+        for candidate_row in queue_candidate_rows:
+            queue_item = candidate_row[0]
+            candidate_id = text(candidate_row[2].get("candidate_id"))
+            if not candidate_id:
+                continue
+            previous = queue_candidates_by_id.get(candidate_id)
+            if previous is None:
+                queue_candidates_by_id[candidate_id] = candidate_row
+                continue
+            previous_stamp = parse_timestamp(
+                previous[0].get("updated_at") or previous[0].get("created_at")
+            )
+            current_stamp = parse_timestamp(
+                queue_item.get("updated_at") or queue_item.get("created_at")
+            )
+            if current_stamp is not None and (
+                previous_stamp is None
+                or current_stamp > previous_stamp
+                or (
+                    current_stamp == previous_stamp
+                    and (text(queue_item.get("item_id")) or "")
+                    < (text(previous[0].get("item_id")) or "")
+                )
+            ):
+                queue_candidates_by_id[candidate_id] = candidate_row
+
+        candidate_entries: dict[str, dict[str, Any]] = {}
+        for ordinal, (candidate_id, candidate_row) in enumerate(
+            queue_candidates_by_id.items()
+        ):
+            candidate_entries[candidate_id] = {
+                "candidate_id": candidate_id,
+                "queue_item": candidate_row[0],
+                "queue_result": candidate_row[1],
+                "compact": candidate_row[2],
+                "lifecycle": lifecycle_by_id.get(candidate_id, {}),
+                "_ordinal": ordinal,
+            }
+        for candidate_id, lifecycle in lifecycle_by_id.items():
+            candidate_entries.setdefault(
+                candidate_id,
+                {
+                    "candidate_id": candidate_id,
+                    "queue_item": {},
+                    "queue_result": {},
+                    "compact": {},
+                    "lifecycle": lifecycle,
+                    "_ordinal": len(candidate_entries),
+                },
+            )
+
+        generated_kinds = frozenset(
+            {"predeclared_starting_set", "legacy_scope_successor", "mutation_child"}
+        )
+        generated_schema = "axiom-generated-queue-v1"
+        canonical_dataset_id = "Polymarket-historical"
+
+        def generated_marker(source: Mapping[str, Any]) -> Mapping[str, Any] | None:
+            provenance = source.get("provenance")
+            if not isinstance(provenance, Mapping):
+                return None
+            internal = provenance.get("internal")
+            if not isinstance(internal, Mapping):
+                return None
+            kind = text(internal.get("kind"))
+            identity = text(internal.get("proposal_identity"))
+            if (
+                internal.get("schema") != generated_schema
+                or internal.get("generated") is not True
+                or kind not in generated_kinds
+                or not identity
+                or not identity.startswith("sha256:")
+            ):
+                return None
+            return internal
+
+        def candidate_sources(entry: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+            queue_item = entry.get("queue_item")
+            queue_item = queue_item if isinstance(queue_item, Mapping) else {}
+            queue_payload = queue_item.get("payload")
+            queue_payload = queue_payload if isinstance(queue_payload, Mapping) else {}
+            queue_result = entry.get("queue_result")
+            queue_result = queue_result if isinstance(queue_result, Mapping) else {}
+            compact = entry.get("compact")
+            compact = compact if isinstance(compact, Mapping) else {}
+            lifecycle = entry.get("lifecycle")
+            lifecycle = lifecycle if isinstance(lifecycle, Mapping) else {}
+            lifecycle_payload = lifecycle.get("payload")
+            lifecycle_payload = (
+                lifecycle_payload if isinstance(lifecycle_payload, Mapping) else {}
+            )
+            return [compact, lifecycle_payload, queue_payload, queue_result]
+
+        def candidate_priority(entry: Mapping[str, Any]) -> int:
+            sources = candidate_sources(entry)
+            for source in sources:
+                marker = generated_marker(source)
+                if marker is None:
+                    continue
+                marker_dataset = text(marker.get("dataset_id"))
+                dataset_id = marker_dataset
+                if dataset_id is None:
+                    dataset_id = first_text(
+                        sources,
+                        ("dataset_id", "dataset", "data_id"),
+                    )
+                if dataset_id and dataset_id.casefold() == canonical_dataset_id.casefold():
+                    return 2
+                return 1
+            return 0
+
+        def candidate_recency(entry: Mapping[str, Any]) -> datetime:
+            values: list[datetime] = []
+            queue_item = entry.get("queue_item")
+            if isinstance(queue_item, Mapping):
+                for key in ("updated_at", "created_at"):
+                    stamp = parse_timestamp(queue_item.get(key))
+                    if stamp is not None:
+                        values.append(stamp)
+            lifecycle = entry.get("lifecycle")
+            if isinstance(lifecycle, Mapping):
+                stamp = parse_timestamp(lifecycle.get("updated_at"))
+                if stamp is not None:
+                    values.append(stamp)
+            return max(
+                values,
+                default=datetime.min.replace(tzinfo=datetime.now().astimezone().tzinfo),
+            )
+
+        ranked_candidates = sorted(
+            candidate_entries.values(),
+            key=lambda entry: (
+                candidate_priority(entry),
+                candidate_recency(entry),
+                -int(entry.get("_ordinal", 0)),
+            ),
+            reverse=True,
+        )
+        selected_entry = ranked_candidates[0] if ranked_candidates else None
+        candidate_id: str | None = (
+            text(selected_entry.get("candidate_id")) if selected_entry else None
+        )
+        queue_item: Mapping[str, Any] = (
+            selected_entry.get("queue_item", {}) if selected_entry else {}
+        )
+        queue_item = queue_item if isinstance(queue_item, Mapping) else {}
+        queue_result: Mapping[str, Any] = (
+            selected_entry.get("queue_result", {}) if selected_entry else {}
+        )
+        queue_result = queue_result if isinstance(queue_result, Mapping) else {}
+        compact_candidate: Mapping[str, Any] = (
+            selected_entry.get("compact", {}) if selected_entry else {}
+        )
+        compact_candidate = (
+            compact_candidate if isinstance(compact_candidate, Mapping) else {}
+        )
         lifecycle = lifecycle_by_id.get(candidate_id or "", {})
         lifecycle_payload = lifecycle.get("payload")
-        lifecycle_payload = lifecycle_payload if isinstance(lifecycle_payload, Mapping) else {}
+        lifecycle_payload = (
+            lifecycle_payload if isinstance(lifecycle_payload, Mapping) else {}
+        )
         queue_payload = queue_item.get("payload")
         queue_payload = queue_payload if isinstance(queue_payload, Mapping) else {}
-        compact_result = compact_candidate if isinstance(compact_candidate, Mapping) else {}
-        result_sources = [compact_result, queue_result, lifecycle_payload, queue_payload]
+        compact_result = compact_candidate
+        selected_priority = candidate_priority(selected_entry) if selected_entry else 0
+        selected_sources = (
+            [lifecycle_payload, queue_payload, compact_result]
+            if selected_priority >= 2
+            else [compact_result, lifecycle_payload, queue_payload]
+        )
+        queue_result_candidate_id = text(queue_result.get("candidate_id"))
+        queue_result_has_nested = isinstance(queue_result.get("candidate_results"), (list, tuple))
+        if not queue_result_has_nested or queue_result_candidate_id == candidate_id:
+            selected_sources.append(queue_result)
+        result_sources = [source for source in selected_sources if isinstance(source, Mapping)]
         plans = [
             source.get("experiment_plan")
             for source in result_sources
@@ -3740,7 +3905,7 @@ class DashboardData:
             ),
         )
         samples_required = first_integer(
-            [*minimum_checks, plan, *result_sources],
+            [plan, *minimum_checks, *result_sources],
             (
                 "min_observations",
                 "min_independent_samples",
@@ -3763,7 +3928,7 @@ class DashboardData:
             ),
         )
         trades_required = first_integer(
-            [*minimum_checks, plan, *result_sources],
+            [plan, *minimum_checks, *result_sources],
             (
                 "min_trades",
                 "required_trades",
@@ -3771,7 +3936,6 @@ class DashboardData:
                 "required_validation_trades",
             ),
         )
-
         forward_tests = records("load_forward_tests", limit=_RESEARCH_FORWARD_TEST_LIMIT)
         forward_ids: list[str] = []
         for source in result_sources:
@@ -3848,40 +4012,91 @@ class DashboardData:
             for item in worker_rows
             if text(item.get("worker_name"))
         }
+        # ``research-queue`` is the durable worker boundary.  The local
+        # ``research-engine`` name is retained only as a compatibility
+        # fallback for older node records.
         research_worker = worker_map.get("research-queue", {})
         if not research_worker:
             research_worker = worker_map.get("research-engine", {})
         research_payload = research_worker.get("payload")
         research_payload = research_payload if isinstance(research_payload, Mapping) else {}
         worker_cycle = research_payload.get("last_cycle")
+        if not isinstance(worker_cycle, Mapping):
+            worker_cycle = research_payload.get("cycle")
         worker_cycle = worker_cycle if isinstance(worker_cycle, Mapping) else {}
-        job_status = text(scheduler.get("status"))
-        if job_status is None:
-            job_status = text(research_worker.get("status"))
-        job_status = (job_status or "NOT_INITIALIZED").upper()
-        last_completion = first_text(
-            [scheduler, worker_cycle, research_payload, compact_result, queue_item],
-            (
-                "last_completion_at",
-                "last_completed_at",
-                "cycle_ended_at",
-                "ended_at",
-                "last_run_at",
-                "updated_at",
-            ),
+
+        def latest_timestamp(
+            sources: Sequence[Mapping[str, Any]],
+            keys: Sequence[str],
+        ) -> str | None:
+            values: list[tuple[datetime, str]] = []
+            for source in sources:
+                for key in keys:
+                    value = source.get(key)
+                    stamp = parse_timestamp(value)
+                    rendered = text(value)
+                    if stamp is not None and rendered is not None:
+                        values.append((stamp, rendered))
+            if not values:
+                return None
+            return max(values, key=lambda item: (item[0], item[1]))[1]
+
+        scheduled_status = first_text([scheduler], ("status", "state"))
+        worker_status = first_text(
+            [research_worker, research_payload, worker_cycle],
+            ("worker_status", "status", "state"),
         )
-        # A queue item's updated_at is a completion only when it is terminal.
-        # Do not manufacture completion from a worker heartbeat/update.
-        if queue_item and not _is_terminal_hermes_status(queue_item.get("status")):
-            last_completion = first_text(
-                [scheduler, worker_cycle, research_payload],
-                (
-                    "last_completion_at",
-                    "last_completed_at",
-                    "cycle_ended_at",
-                    "ended_at",
-                    "last_run_at",
+        job_status = (scheduled_status or worker_status or "NOT_INITIALIZED").upper()
+        completion_keys = (
+            "last_completion_at",
+            "last_completed_at",
+            "last_tick_completed_at",
+            "completed_at",
+            "completion_at",
+            "cycle_ended_at",
+            "ended_at",
+        )
+        worker_sources = [worker_cycle, research_payload, research_worker]
+        last_completion = latest_timestamp(worker_sources, completion_keys)
+        if last_completion is None:
+            # A worker heartbeat is the only safe fallback when the worker
+            # persisted a completed idle cycle without a dedicated completion
+            # field.  It remains evidence of the queue boundary, including a
+            # cycle whose claimed count is zero.
+            last_completion = latest_timestamp(
+                [research_payload, research_worker],
+                ("heartbeat_at", "worker_heartbeat_at"),
+            )
+        if last_completion is None:
+            last_completion = latest_timestamp(
+                [scheduler],
+                (*completion_keys, "last_run_at"),
+            )
+        if last_completion is None:
+            terminal_queue_items = [
+                item
+                for item in queue_items
+                if _is_terminal_hermes_status(item.get("status"))
+            ]
+            terminal_queue_items.sort(
+                key=lambda item: (
+                    parse_timestamp(item.get("updated_at") or item.get("created_at"))
+                    or datetime.min.replace(tzinfo=datetime.now().astimezone().tzinfo),
+                    text(item.get("item_id")) or "",
                 ),
+                reverse=True,
+            )
+            if terminal_queue_items:
+                last_completion = first_text(
+                    terminal_queue_items[0:1],
+                    ("updated_at", "created_at"),
+                )
+        if last_completion is None:
+            # Keep the old queue-item fallback only for stores that expose no
+            # worker/scheduler completion evidence at all.
+            last_completion = first_text(
+                [queue_item] if queue_item else (),
+                ("last_completion_at", "last_completed_at"),
             )
         collector_state = mapping_call("get_collector_state", "polymarket")
         collector_worker = worker_map.get("polymarket-collector", {})
@@ -3916,7 +4131,11 @@ class DashboardData:
             len(queue_candidate_ids | set(lifecycle_by_id)),
         )
         blocker = first_text(
-            [compact_result, queue_result, lifecycle_payload],
+            (
+                [lifecycle_payload, compact_result, queue_result]
+                if selected_priority >= 2
+                else [compact_result, queue_result, lifecycle_payload]
+            ),
             ("reason_code", "blocker"),
         )
         if blocker and blocker.upper() == "NO_SUPPORTED_EDGE":

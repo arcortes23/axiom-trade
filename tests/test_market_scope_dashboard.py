@@ -209,6 +209,107 @@ class _LifecycleHistoryStore(_ResearchProgressStore):
         return [older, newer]
 
 
+class _MixedResearchProgressStore(_ResearchProgressStore):
+    """Persist a newer legacy row beside an older authenticated starter."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        marker = {
+            "schema": "axiom-generated-queue-v1",
+            "generated": True,
+            "kind": "predeclared_starting_set",
+            "proposal_identity": "sha256:current-starter-identity",
+            "dataset_id": "Polymarket-historical",
+            "dataset_version": "history-v2",
+            "attestation_hash": "sha256:current-attestation",
+        }
+        current_payload = {
+            "candidate_id": "candidate-current",
+            "dataset_id": "Polymarket-historical",
+            "dataset_version": "history-v2",
+            "experiment_plan": {"min_samples": 30, "min_trades": 20},
+            "provenance": {"internal": marker},
+        }
+        self.current_queue_item = {
+            "item_id": "queue-current",
+            "item_type": "hypothesis",
+            "status": "REJECTED",
+            "created_at": "2026-09-11T16:00:00+00:00",
+            "updated_at": "2026-09-11T16:40:00+00:00",
+            "payload": current_payload,
+            "result": {
+                "dataset_id": "Polymarket-historical",
+                "dataset_version": "history-v2",
+                # This aggregate value belongs to neither candidate and must
+                # not replace the selected candidate's plan gate.
+                "required_trades": 1,
+                "candidate_results": [
+                    {
+                        "candidate_id": "candidate-current",
+                        "stage": "SCHEMA_VALIDATED",
+                        "reason_code": "CURRENT_BLOCKER",
+                    }
+                ],
+            },
+        }
+        self.queue_item["updated_at"] = "2026-09-11T16:55:00+00:00"
+        self.queue_item["payload"] = {
+            "dataset_id": "prediction:4199932",
+            "dataset_version": "legacy-v1",
+        }
+        self.queue_item["result"]["dataset_selector"] = {
+            "dataset_id": "prediction:4199932",
+            "dataset_version": "legacy-v1",
+        }
+        self.queue_item["result"]["required_trades"] = 1
+        self.queue_item["result"]["candidate_results"][0]["candidate_id"] = "candidate-legacy"
+        self.legacy_lifecycle = dict(self.lifecycle)
+        self.legacy_lifecycle["candidate_id"] = "candidate-legacy"
+        self.legacy_lifecycle["payload"] = {
+            "dataset_id": "prediction:4199932",
+            "dataset_version": "legacy-v1",
+            "experiment_plan": {"min_samples": 1, "min_trades": 1},
+        }
+        self.current_lifecycle = {
+            "candidate_id": "candidate-current",
+            "stage": "SCHEMA_VALIDATED",
+            "updated_at": "2026-09-11T16:45:00+00:00",
+            "payload": {
+                **current_payload,
+                "blocker": "CURRENT_BLOCKER",
+            },
+        }
+
+    def list_research_items(self, *, limit: int = 50):
+        return [self.queue_item, self.current_queue_item][:limit]
+
+    def load_candidate_lifecycle(self, candidate_id=None, *, limit=50):
+        rows = [self.legacy_lifecycle, self.current_lifecycle]
+        if candidate_id is not None:
+            return next((row for row in rows if candidate_id == row["candidate_id"]), None)
+        return rows[:limit]
+
+    def list_worker_states(self, *, limit: int = 32):
+        return [
+            {
+                "worker_name": "research-queue",
+                "status": "idle",
+                "heartbeat_at": "2026-09-11T16:47:05+00:00",
+                "payload": {
+                    "last_cycle": {
+                        "status": "idle",
+                        "claimed": 0,
+                        "completed_at": "2026-09-11T16:47:05+00:00",
+                    }
+                },
+            }
+        ][:limit]
+
+
+
+
+
+
 class MarketScopeDashboardTests(unittest.TestCase):
     def test_overview_reads_only_persisted_bounded_funnel(self) -> None:
         store = _PersistedScopeStore()
@@ -235,6 +336,23 @@ class MarketScopeDashboardTests(unittest.TestCase):
         self.assertEqual(progress["blocker"], "INSUFFICIENT_DATA")
         self.assertEqual(progress["job_status"], "ACTIVE")
         self.assertEqual(progress["next_run_at"], "2026-09-11T02:00:00+00:00")
+
+    def test_research_progress_prefers_current_generated_candidate_and_worker_tick(self) -> None:
+        progress = DashboardData(store=_MixedResearchProgressStore()).overview_summary()[
+            "research_progress"
+        ]
+
+        self.assertEqual(progress["dataset_id"], "Polymarket-historical")
+        self.assertEqual(progress["dataset_version"], "history-v2")
+        self.assertEqual(progress["candidate_stage"], "SCHEMA_VALIDATED")
+        self.assertEqual(progress["blocker"], "CURRENT_BLOCKER")
+        self.assertIsNone(progress["samples_available"])
+        self.assertEqual(progress["samples_required"], 30)
+        self.assertIsNone(progress["trades_available"])
+        self.assertEqual(progress["trades_required"], 20)
+        self.assertEqual(progress["job_status"], "ACTIVE")
+        self.assertEqual(progress["last_completion_at"], "2026-09-11T16:47:05+00:00")
+
 
     def test_research_progress_bounds_oversized_nested_candidate_results(self) -> None:
         store = _ResearchProgressStore()
