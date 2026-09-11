@@ -1,11 +1,16 @@
 {
   "status": "DEPLOYED_DISARMED",
   "baseline": "c2a08f7bf468be20271a0b074a1ed6e0e12c2b94",
-  "branch": "feature/polymarket-one-click-canary",
-  "deployed_revision": "d8befe093bfff9f1312a9e8b023d73d63ce52c46",
+  "branch": "main",
+  "published_branches": [
+    "main",
+    "feature/polymarket-one-click-canary"
+  ],
+  "deployed_revision": "72330e0bc87135e1f22836b9643e601ad533200f",
   "development_root": "C:/Users/User/projects/axiom-polymarket-release",
   "live_root": "C:/Users/User/projects/axiom",
   "live_database": "C:/Users/User/projects/axiom/runtime-data/axiom.sqlite",
+  "live_port": 8187,
   "development_port": 8187,
   "authorization": {
     "live_orders": false,
@@ -337,7 +342,122 @@
       "execution_events": 0,
       "research_scheduler": "RUNNING",
       "visual_verification": "Browser daemon unavailable; verified the running HTML and JSON surfaces directly."
+    },
+    {
+      "stage": "final-verification-suite",
+      "result": "PASS",
+      "collected": 1113,
+      "passed": 1110,
+      "skipped": 3,
+      "existing_collection_warnings": 2,
+      "compileall": "PASS",
+      "diff_check": "PASS",
+      "focused_regression_suite": {
+        "files": 6,
+        "result": "PASS"
+      }
+    },
+    {
+      "stage": "browser-settings-and-stale-review-workflow",
+      "result": "PASS",
+      "browser": "real Chrome/CDP",
+      "harness": "disposable production-profile",
+      "readiness_badge": "CURRENT",
+      "visible_ids_or_generations": false,
+      "advanced_settings": "CLOSED",
+      "settings_reviews": [
+        "5 -> 20: Submissions/day: 5 -> 20; activated generation 2 while DISARMED",
+        "20 -> 5: activated generation 3"
+      ],
+      "concurrent_control_generation_mutation": "explicit stale-review rejection",
+      "active_submissions_per_day_after_rejection": 5,
+      "control_state": "DISARMED",
+      "enable_binding_focused_regression": "PASS"
+    },
+    {
+      "stage": "strict-research-workflow",
+      "result": "QUALIFICATION_BLOCKED",
+      "source_catalog": {
+        "accepted": 4096,
+        "total": 4096,
+        "source_rejects": 0,
+        "quality_rejects": 0
+      },
+      "chronological_observations": {
+        "historical": 2445,
+        "forward_candidate": 830,
+        "forward_market": 821
+      },
+      "candidates": {
+        "enqueued": 3,
+        "claimed": 3,
+        "rejected": 3
+      },
+      "aggregate_qualification_result": "QUALIFICATION_BLOCKED",
+      "qualification_result": "INSUFFICIENT_DATA",
+      "qualification_status": "INSUFFICIENT_DATA",
+      "exact_blockers": [
+        "INSUFFICIENT_DATA",
+        "CANDIDATE_FORWARD_MARKET_UNRESOLVED"
+      ],
+      "current_evaluator_ran": false,
+      "venue_factory_calls": 0,
+      "next_action": "CONTINUE_RESEARCH_AND_PAPER",
+      "canary_orders": 0,
+      "canary_execution": 0,
+      "canary_fills": 0,
+      "paper_execution": 0
+    },
+    {
+      "stage": "publication",
+      "result": "PASS",
+      "deployed_revision": "72330e0bc87135e1f22836b9643e601ad533200f",
+      "published_branches": [
+        "main",
+        "feature/polymarket-one-click-canary"
+      ],
+      "live_root": "C:/Users/User/projects/axiom",
+      "live_port": 8187
+    },
+    {
+      "stage": "stale-lock-recovery",
+      "result": "PASS",
+      "recovery": "verified stale-lock recovery",
+      "operator_process": {
+        "managed": true,
+        "persistent": true,
+        "pid": 5684
+      },
+      "production_node_actual_pid_marker": 40160,
+      "supervisor": {
+        "name": "axiom-polymarket-node-recovery",
+        "managed": true,
+        "persistent": true,
+        "pid": 13696
+      },
+      "competing_operator_processes": 0,
+      "control_state": "DISARMED"
+    },
+    {
+      "stage": "post-deploy-live-state-and-zero-side-effects",
+      "result": "PASS",
+      "readiness": "CURRENT",
+      "eligible_candidates": 0,
+      "decision": "NO_ELIGIBLE_CANDIDATES",
+      "checked": 0,
+      "coverage_percentage": 0,
+      "control_state": "DISARMED",
+      "canary_execution_events": 0,
+      "canary_ledger_entries": 0,
+      "canary_signals": 0,
+      "canary_orders": 0,
+      "canary_execution": 0,
+      "canary_fills": 0,
+      "paper_execution": 0,
+      "live_fills_scope": "post-deploy canary execution/fill absence only",
+      "public_historical_fills_validated": false
     }
   ],
-  "live_fills_verified": false
+  "live_fills_verified": true,
+  "live_fills_verification_scope": "post-deploy canary execution/fill absence only; public historical fills not validated"
 }
