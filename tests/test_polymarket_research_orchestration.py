@@ -324,6 +324,78 @@ class PolymarketResearchOrchestrationTests(unittest.TestCase):
             )
             self.assertEqual(store.research_queue_stats()["total"], 6)
 
+    def test_waiting_job_projects_large_attestation_below_operator_limit(self) -> None:
+        with AxiomStore(":memory:") as store:
+            proposal = _legacy_prediction_predecessor(candidate_id="large-attestation-predecessor")
+            plan = ExperimentPlan.from_proposal(proposal)
+            bindings = [
+                {
+                    "dataset_id": f"prediction:market-{index}",
+                    "dataset_version": f"market-v{index}",
+                    "row_count": 1,
+                    "padding": "x" * 128,
+                }
+                for index in range(1_000)
+            ]
+            attestation = {
+                "dataset_id": plan.dataset_id,
+                "dataset_version": plan.dataset_version,
+                "source_type": "HISTORICAL",
+                "market_type": "prediction",
+                "row_count": 1_000,
+                "completeness": 1.0,
+                "contamination_result": "PASS",
+                "attestation_hash": "sha256:large-attestation",
+                "status": "CURRENT",
+                "constituent_bindings": bindings,
+            }
+            self.assertGreater(
+                len(json.dumps(attestation, separators=(",", ":"), default=str).encode("utf-8")),
+                150_000,
+            )
+            processor = AutonomousResearchProcessor(store, clock=lambda: T0)
+            catalog = {
+                "dataset_id": plan.dataset_id,
+                "dataset_version": plan.dataset_version,
+                "source_type": "HISTORICAL",
+                "market_type": "prediction",
+                "instrument": "POLYMARKET",
+                "row_count": 1_000,
+                "completeness": 1.0,
+                "missing_ranges": [],
+            }
+            with patch.object(store, "load_dataset_catalog", return_value=catalog), patch.object(
+                store,
+                "load_dataset_integrity_attestation",
+                return_value=attestation,
+            ):
+                job = processor._create_waiting_next_dataset_job(
+                    plan,
+                    candidate_id="large-attestation-predecessor",
+                    result={
+                        "accepted": False,
+                        "blocker": "NO_SUPPORTED_EDGE",
+                        "reason_code": "NEGATIVE_VALIDATION_EXPECTANCY",
+                    },
+                    now=T0,
+                )
+            self.assertIsNotNone(job)
+            assert job is not None
+            encoded = json.dumps(job["payload"], separators=(",", ":"), default=str).encode("utf-8")
+            self.assertLess(len(encoded), 64_000)
+            summary = job["payload"]["rejected_dataset_attestation"]
+            self.assertNotIn("constituent_bindings", summary)
+            self.assertEqual(summary["constituent_count"], len(bindings))
+            self.assertEqual(summary["canonical_digest"], summary["constituent_bindings_digest"])
+            self.assertEqual(
+                summary["canonical_digest"],
+                "sha256:" + hashlib.sha256(_canonical_binding(bindings).encode("utf-8")).hexdigest(),
+            )
+            durable = store.get_operator_job(processor._next_dataset_job_name(plan.plan_id))
+            self.assertIsNotNone(durable)
+            assert durable is not None
+            self.assertEqual(durable["status"], "WAITING_FOR_NEW_DATASET_VERSION")
+
     def test_no_supported_edge_waits_for_distinct_attested_historical_successor(self) -> None:
         with AxiomStore(":memory:") as store:
             _seed_predeclared_historical_dataset(store)
@@ -505,6 +577,13 @@ class PolymarketResearchOrchestrationTests(unittest.TestCase):
                 "dataset_version_successor",
             )
             self.assertEqual(successor_payload["provenance"]["internal"]["attestation_hash"], attestation["attestation_hash"])
+            successor_attestation = successor_payload["dataset_attestation"]
+            self.assertNotIn("constituent_bindings", successor_attestation)
+            self.assertEqual(successor_attestation["dataset_id"], "Polymarket-historical")
+            self.assertEqual(successor_attestation["dataset_version"], "history-v2")
+            self.assertEqual(successor_attestation["status"], "CURRENT")
+            self.assertEqual(successor_attestation["contamination_result"], "PASS")
+            self.assertEqual(successor_attestation["constituent_count"], 0)
 
             processor._schedule_next_dataset_jobs(T0)
             self.assertEqual(

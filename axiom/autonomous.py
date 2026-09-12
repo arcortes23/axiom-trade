@@ -42,6 +42,7 @@ _MAX_LEGACY_RECOVERY_ITEMS = 64
 _LEGACY_RECOVERY_STATE_NAME = "autonomous-legacy-recovery"
 _MAX_AUTOMATIC_REASSESSMENTS = 3
 _MUTABLE_DATASET_VERSION_ALIASES = frozenset({"latest", "current", "default", "unversioned"})
+_NEXT_DATASET_SCHEDULER_STATE_NAME = "autonomous-next-dataset-version"
 _NEXT_DATASET_JOB_PREFIX = "polymarket-dataset-successor:"
 _NEXT_DATASET_JOB_STATUS_WAITING = "WAITING_FOR_NEW_DATASET_VERSION"
 _NEXT_DATASET_JOB_STATUS_ENQUEUED = "ENQUEUED"
@@ -1323,10 +1324,180 @@ class AutonomousResearchProcessor:
                 # fails; retrying the page is safe because report keys dedupe.
                 pass
         return tuple(output)
-
     @staticmethod
     def _next_dataset_job_name(plan_id: str) -> str:
         return _NEXT_DATASET_JOB_PREFIX + str(plan_id).strip()
+
+    @staticmethod
+    def _bounded_dataset_catalog(
+        catalog: Mapping[str, Any] | None,
+        *,
+        dataset_id: str = "",
+        dataset_version: str = "",
+    ) -> dict[str, Any] | None:
+        """Project catalog identity and aggregate facts without nested metadata."""
+        if not isinstance(catalog, Mapping):
+            return None
+        summary: dict[str, Any] = {}
+        for key in (
+            "dataset_id",
+            "dataset_version",
+            "version",
+            "provider",
+            "instrument",
+            "market_type",
+            "timeframe",
+            "start_timestamp",
+            "end_timestamp",
+            "row_count",
+            "completeness",
+            "quality",
+            "source_type",
+            "snapshot_id",
+        ):
+            value = catalog.get(key)
+            if value is None:
+                continue
+            summary[key] = value.isoformat() if isinstance(value, datetime) else _compact_value(value)
+        if not str(summary.get("dataset_id", "")).strip() and dataset_id:
+            summary["dataset_id"] = dataset_id
+        if not str(summary.get("dataset_version", summary.get("version", ""))).strip() and dataset_version:
+            summary["dataset_version"] = dataset_version
+        missing_ranges = catalog.get("missing_ranges")
+        if missing_ranges is not None:
+            if isinstance(missing_ranges, (list, tuple)):
+                summary["missing_ranges_count"] = len(missing_ranges)
+                summary["missing_ranges_digest"] = "sha256:" + hashlib.sha256(
+                    _canonical_binding(missing_ranges).encode("utf-8")
+                ).hexdigest()
+            else:
+                summary["missing_ranges"] = bool(missing_ranges)
+        return summary
+
+    @staticmethod
+    def _bounded_dataset_attestation(
+        attestation: Mapping[str, Any] | None,
+        *,
+        dataset_id: str = "",
+        dataset_version: str = "",
+    ) -> dict[str, Any] | None:
+        """Project immutable attestation facts without constituent bindings."""
+        if not isinstance(attestation, Mapping):
+            return None
+        summary: dict[str, Any] = {}
+        for key in (
+            "dataset_id",
+            "dataset_version",
+            "source_type",
+            "market_type",
+            "row_count",
+            "observed_row_count",
+            "completeness",
+            "start_timestamp",
+            "end_timestamp",
+            "contamination_result",
+            "provenance_version",
+            "policy_version",
+            "reason",
+            "attestation_hash",
+            "verified_at",
+            "status",
+        ):
+            value = attestation.get(key)
+            if value is None:
+                continue
+            summary[key] = value.isoformat() if isinstance(value, datetime) else _compact_value(value)
+        if not str(summary.get("dataset_id", "")).strip() and dataset_id:
+            summary["dataset_id"] = dataset_id
+        if not str(summary.get("dataset_version", "")).strip() and dataset_version:
+            summary["dataset_version"] = dataset_version
+
+        bindings = attestation.get("constituent_bindings", attestation.get("constituents"))
+        count: int | None = None
+        for key in ("constituent_count", "constituents_count", "market_count"):
+            value = attestation.get(key)
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                count = value
+                break
+        if count is None and isinstance(bindings, (list, tuple)):
+            count = len(bindings)
+        if count is not None:
+            summary["constituent_count"] = count
+
+        digest: str | None = None
+        for key in (
+            "canonical_digest",
+            "constituent_bindings_digest",
+            "constituent_digest",
+            "bindings_digest",
+        ):
+            value = attestation.get(key)
+            if value is not None and str(value).strip():
+                digest = str(value).strip()
+                break
+        if digest is None and isinstance(bindings, (list, tuple)):
+            digest = "sha256:" + hashlib.sha256(
+                _canonical_binding(bindings).encode("utf-8")
+            ).hexdigest()
+        if digest is not None:
+            summary["canonical_digest"] = digest
+            summary["constituent_bindings_digest"] = digest
+        return summary
+
+    def _report_next_dataset_scheduler_error(
+        self,
+        exc: BaseException | str,
+        now: datetime,
+        *,
+        plan_id: str | None = None,
+        candidate_id: str | None = None,
+    ) -> None:
+        """Expose successor scheduling failures while allowing queue work to continue."""
+        message = str(exc).strip() or type(exc).__name__
+        code = type(exc).__name__.upper() if not isinstance(exc, str) else "NEXT_DATASET_JOB_SCHEDULER_ERROR"
+        state_loader = getattr(self.store, "get_scheduler_state", None)
+        state_setter = getattr(self.store, "set_scheduler_state", None)
+        if callable(state_setter):
+            try:
+                current = state_loader(_NEXT_DATASET_SCHEDULER_STATE_NAME) if callable(state_loader) else None
+                state = dict(current) if isinstance(current, Mapping) else {}
+                state.update(
+                    {
+                        "status": "DEGRADED",
+                        "last_error": message[:2_000],
+                        "last_error_code": code,
+                        "last_error_at": ensure_utc(now).isoformat(),
+                    }
+                )
+                if plan_id:
+                    state["plan_id"] = plan_id
+                if candidate_id:
+                    state["candidate_id"] = candidate_id
+                state_setter(_NEXT_DATASET_SCHEDULER_STATE_NAME, state)
+            except Exception:
+                pass
+        saver = getattr(self.store, "save_report_if_absent", None)
+        if not callable(saver):
+            return
+        report_key = "|".join((code, message, str(plan_id or ""), str(candidate_id or "")))
+        report_id = "autonomous-next-dataset-error-" + hashlib.sha256(report_key.encode("utf-8")).hexdigest()[:24]
+        try:
+            saver(
+                report_id,
+                {
+                    "report_type": "autonomous_next_dataset_scheduler_error",
+                    "blocker": "NEXT_DATASET_JOB_SCHEDULER_ERROR",
+                    "reason_code": code,
+                    "reason": message[:2_000],
+                    "plan_id": plan_id,
+                    "candidate_id": candidate_id,
+                    "timestamp": ensure_utc(now).isoformat(),
+                    "paper_only": True,
+                },
+                experiment_id=plan_id,
+            )
+        except Exception:
+            pass
 
     @staticmethod
     def _strategy_contract(plan: ExperimentPlan) -> dict[str, Any]:
@@ -1348,7 +1519,6 @@ class AutonomousResearchProcessor:
         return "sha256:" + hashlib.sha256(
             _canonical_binding(cls._strategy_contract(plan)).encode("utf-8")
         ).hexdigest()
-
     @staticmethod
     def _complete_polymarket_catalog(catalog: Any, *, dataset_id: str, version: str) -> bool:
         if not isinstance(catalog, Mapping):
@@ -1591,8 +1761,16 @@ class AutonomousResearchProcessor:
                 "blocker": result.get("blocker"),
                 "accepted": result.get("accepted"),
             },
-            "rejected_dataset_catalog": dict(catalog) if isinstance(catalog, Mapping) else None,
-            "rejected_dataset_attestation": dict(attestation) if isinstance(attestation, Mapping) else None,
+            "rejected_dataset_catalog": self._bounded_dataset_catalog(
+                catalog,
+                dataset_id=dataset_id,
+                dataset_version=rejected_version,
+            ),
+            "rejected_dataset_attestation": self._bounded_dataset_attestation(
+                attestation,
+                dataset_id=dataset_id,
+                dataset_version=rejected_version,
+            ),
             "required_predicate": {
                 "dataset_id": dataset_id,
                 "version_distinct_from": rejected_version,
@@ -1670,10 +1848,16 @@ class AutonomousResearchProcessor:
                 result=result,
                 now=now,
             )
-        except Exception:
+        except Exception as exc:
             # The queue result and rejection remain authoritative if job
-            # creation cannot be persisted in this tick.
-            return
+            # creation cannot be persisted in this tick, but the scheduler
+            # failure must remain visible to operators.
+            self._report_next_dataset_scheduler_error(
+                exc,
+                now,
+                plan_id=str(result.get("plan_id", "")).strip() or None,
+                candidate_id=str(result.get("candidate_id", "")).strip() or None,
+            )
 
     def _build_dataset_successor(
         self,
@@ -1713,21 +1897,11 @@ class AutonomousResearchProcessor:
                 "successor dataset version changed the immutable strategy contract",
             )
         source = self._predecessor_proposal(plan.plan_id) or {}
-        attestation_payload = {
-            key: _compact_value(attestation[key])
-            for key in (
-                "dataset_id",
-                "dataset_version",
-                "source_type",
-                "market_type",
-                "row_count",
-                "completeness",
-                "contamination_result",
-                "attestation_hash",
-                "status",
-            )
-            if key in attestation
-        }
+        attestation_payload = self._bounded_dataset_attestation(
+            attestation,
+            dataset_id=str(plan.dataset_id or "").strip(),
+            dataset_version=version,
+        ) or {}
         proposal = dict(successor.as_dict())
         for name, fallback in (
             ("statement", "Re-evaluate the immutable Polymarket strategy on a new historical dataset version."),
@@ -1941,7 +2115,8 @@ class AutonomousResearchProcessor:
         if callable(lister):
             try:
                 jobs = lister()
-            except Exception:
+            except Exception as exc:
+                self._report_next_dataset_scheduler_error(exc, now)
                 jobs = ()
             if isinstance(jobs, Sequence):
                 for job in jobs:
@@ -1955,10 +2130,8 @@ class AutonomousResearchProcessor:
                             current = self.store.get_operator_job(name)
                             if isinstance(current, Mapping):
                                 self._advance_waiting_next_dataset_job(current, now)
-                    except Exception:
-                        # Dataset attestation/crypto failures are local to
-                        # this resumable job and must not gate the tick.
-                        continue
+                    except Exception as exc:
+                        self._report_next_dataset_scheduler_error(exc, now)
 
     def _backfill_next_dataset_job(self, now: datetime) -> None:
         lister = getattr(self.store, "list_experiment_plans", None)
@@ -1969,9 +2142,11 @@ class AutonomousResearchProcessor:
         except TypeError:
             try:
                 plans = lister(limit=256)
-            except Exception:
+            except Exception as exc:
+                self._report_next_dataset_scheduler_error(exc, now)
                 return
-        except Exception:
+        except Exception as exc:
+            self._report_next_dataset_scheduler_error(exc, now)
             return
         if not isinstance(plans, Sequence):
             return
@@ -1993,7 +2168,8 @@ class AutonomousResearchProcessor:
             item: ResearchQueueItem | Mapping[str, Any] | None = self._predecessor_proposal(plan_id)
             try:
                 resolved = self._rejection_plan(item, result)
-            except Exception:
+            except Exception as exc:
+                self._report_next_dataset_scheduler_error(exc, now, plan_id=plan_id)
                 continue
             if resolved is None:
                 continue
@@ -2010,7 +2186,13 @@ class AutonomousResearchProcessor:
                         now=now,
                     )
                 return
-            except (RuntimeError, TypeError, ValueError):
+            except Exception as exc:
+                self._report_next_dataset_scheduler_error(
+                    exc,
+                    now,
+                    plan_id=plan.plan_id,
+                    candidate_id=candidate_id,
+                )
                 continue
 
     def _schedule_next_dataset_jobs(self, now: datetime) -> None:
