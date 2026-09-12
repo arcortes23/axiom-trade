@@ -22,6 +22,7 @@ from axiom.dashboard import (
     DashboardServer,
     _canary_status_report,
     _dashboard_html,
+    _http_json_bytes,
     _jsonable,
 )
 from axiom.operator import CANARY_CONNECTIVITY_CONFIG_KEY, DEFAULT_HERMES_JOB_ID
@@ -2865,6 +2866,16 @@ class DashboardPaginationEndpointTests(DashboardPaginationFixture):
 
 
 class DashboardPaginationSurfaceTests(DashboardPaginationFixture):
+    def test_overview_preserves_progress_under_one_megabyte_cap(self) -> None:
+        status, payload, body = self._request("api/v2/overview-summary")
+        self.assertEqual(status, 200, body)
+        self.assertIsInstance(payload, dict)
+        assert isinstance(payload, dict)
+        self.assertIsInstance(payload.get("campaign_progress"), dict)
+        self.assertIsInstance(payload.get("research_progress"), dict)
+        self.assertLessEqual(len(body.encode("utf-8")), 1_048_576)
+        oversized = _http_json_bytes({"sentinel": "x" * 20_000_000})
+        self.assertLessEqual(len(oversized), 1_048_576)
 
     def test_overview_and_list_responses_do_not_embed_unbounded_records(self) -> None:
         status, overview, overview_body = self._request("api/overview")

@@ -268,7 +268,7 @@ _HTTP_JSON_MAX_DEPTH = 8
 _HTTP_JSON_MAX_ITEMS = 64
 _HTTP_JSON_MAX_STRING = 4_096
 _HTTP_JSON_MAX_KEYS = 128
-_HTTP_JSON_MAX_BYTES = 262_144
+_HTTP_JSON_MAX_BYTES = 1_048_576
 
 
 def _http_bound_value(
@@ -6836,7 +6836,7 @@ def _dashboard_html(
     const VIEW_TARGET = {datasets:"datasets-table",activity:"activity-table",candidates:"candidates-table",polymarket:"pm-markets",hermes:"hermes-table",crypto:"crypto-table",portfolio:"portfolio-states", "binance-canary":"binance-records"};
     const VIEW_CADENCE = {overview:10000,canary:15000,"binance-canary":15000,datasets:30000,activity:15000,candidates:30000,polymarket:30000,hermes:30000,crypto:30000,portfolio:30000};
     let activeController = null, detailController = null, refreshGeneration = 0, nextRefreshAt = 0, slowRefreshTimer = null, startupPending = true;
-    const REFRESH_TIMEOUT_MS = 8000;
+    const REFRESH_TIMEOUT_MS = 30000;
     const lastGood = {overview:null,canary:null,"binance-canary":null,controls:null};
     let lastSuccessful = 0;
     function refreshError(error) {
