@@ -39,6 +39,7 @@ _MAX_QUEUE_RESULT_ITEMS = 64
 _MAX_DATASET_ROWS = 100_000
 _MAX_FORWARD_ROWS = 100_000
 _MAX_LEGACY_RECOVERY_ITEMS = 64
+_LEGACY_RECOVERY_STATE_NAME = "autonomous-legacy-recovery"
 _MAX_AUTOMATIC_REASSESSMENTS = 3
 _MUTABLE_DATASET_VERSION_ALIASES = frozenset({"latest", "current", "default", "unversioned"})
 
@@ -1022,17 +1023,63 @@ class AutonomousResearchProcessor:
         evidence are durable, while the old lifecycle row is deliberately
         never rewritten.
         """
+        page_loader = getattr(self.store, "load_candidate_lifecycle_page", None)
         loader = getattr(self.store, "load_candidate_lifecycle", None)
-        if not callable(loader):
+        if not callable(page_loader) and not callable(loader):
             return ()
+
+        # The cursor is worker state, not processor state.  A processor
+        # restart therefore resumes the same keyset page instead of silently
+        # returning to the oldest lifecycle rows.
+        state_loader = getattr(self.store, "get_scheduler_state", None)
+        state_setter = getattr(self.store, "set_scheduler_state", None)
+        durable_pagination = (
+            callable(page_loader)
+            and callable(state_loader)
+            and callable(state_setter)
+        )
+        state: Mapping[str, Any] = {}
+        cursor_updated_at: str | None = None
+        cursor_candidate_id: str | None = None
+        if durable_pagination:
+            try:
+                loaded_state = state_loader(_LEGACY_RECOVERY_STATE_NAME)
+            except (RuntimeError, TypeError, ValueError):
+                return ()
+            if isinstance(loaded_state, Mapping):
+                state = loaded_state
+                cursor = loaded_state.get("cursor")
+                if isinstance(cursor, Mapping):
+                    timestamp = str(cursor.get("updated_at", "")).strip()
+                    candidate_id = str(cursor.get("candidate_id", "")).strip()
+                    if timestamp and candidate_id:
+                        cursor_updated_at = timestamp
+                        cursor_candidate_id = candidate_id
         try:
-            records = loader(limit=_MAX_LEGACY_RECOVERY_ITEMS)
+            if callable(page_loader):
+                if cursor_updated_at is not None and cursor_candidate_id is not None:
+                    records = page_loader(
+                        limit=_MAX_LEGACY_RECOVERY_ITEMS,
+                        after_updated_at=cursor_updated_at,
+                        after_candidate_id=cursor_candidate_id,
+                    )
+                    # Reaching the end starts a new deterministic pass.  The
+                    # first page is read in this same cycle so a lone row (or
+                    # a short tail) cannot make the worker idle for a cycle.
+                    if not records:
+                        cursor_updated_at = None
+                        cursor_candidate_id = None
+                        records = page_loader(limit=_MAX_LEGACY_RECOVERY_ITEMS)
+                else:
+                    records = page_loader(limit=_MAX_LEGACY_RECOVERY_ITEMS)
+            else:
+                records = loader(limit=_MAX_LEGACY_RECOVERY_ITEMS)
         except (RuntimeError, TypeError, ValueError):
             return ()
         if not isinstance(records, list):
             return ()
 
-        candidates: list[tuple[str, str, Mapping[str, Any]]] = []
+        candidates: list[Mapping[str, Any]] = []
         for record in records:
             if not isinstance(record, Mapping):
                 continue
@@ -1046,15 +1093,7 @@ class AutonomousResearchProcessor:
                 continue
             if str(payload.get("successor_relation", "")).strip().upper() == "LEGACY_SCOPE_SUCCESSOR":
                 continue
-            candidate_id = str(record.get("candidate_id") or payload.get("candidate_id") or "").strip()
-            candidates.append(
-                (
-                    candidate_id,
-                    str(record.get("stage", "")).strip(),
-                    record,
-                )
-            )
-        candidates.sort(key=lambda item: (item[0], item[1], _canonical_binding(item[2])))
+            candidates.append(record)
 
         output: list[Mapping[str, Any]] = []
         from .legacy_scope import (
@@ -1066,9 +1105,14 @@ class AutonomousResearchProcessor:
         )
 
         inspected = 0
-        for _, _, record in candidates:
-            if inspected >= self.config.max_items_per_cycle:
+        cursor_record: Mapping[str, Any] | None = None
+        recovery_limit = min(_MAX_LEGACY_RECOVERY_ITEMS, self.config.max_items_per_cycle)
+        for record in candidates:
+            if inspected >= recovery_limit:
                 break
+            inspected += 1
+            prior_cursor_record = cursor_record
+            cursor_record = record
             payload = record.get("payload")
             assert isinstance(payload, Mapping)
             document = _legacy_recovery_document(record)
@@ -1078,7 +1122,6 @@ class AutonomousResearchProcessor:
             assessment = classify_legacy_scope(document)
             if assessment.classification == CANONICAL_VALID and selector_reason is None:
                 continue
-            inspected += 1
             candidate_id = assessment.candidate_id or str(
                 document.get("candidate_id") or record.get("candidate_id") or ""
             ).strip() or None
@@ -1226,6 +1269,42 @@ class AutonomousResearchProcessor:
                 persisted = self._persist_legacy_recovery_evidence(evidence, now=now)
             evidence["evidence_persisted"] = persisted
             output.append(evidence)
+            if not persisted:
+                # Do not advance beyond an evidence write that failed.  The
+                # next cycle retries this candidate from the durable boundary.
+                cursor_record = prior_cursor_record
+                break
+        if durable_pagination:
+            # If this page contained no recoverable prediction rows, still
+            # advance past it.  Otherwise an unrelated lifecycle prefix would
+            # be selected forever.  A failed evidence write leaves the cursor
+            # at its prior durable boundary (``cursor_record`` is then None
+            # when the first candidate failed).
+            progress_record = cursor_record
+            if progress_record is None and output == () and candidates == [] and records:
+                progress_record = records[-1]
+            next_cursor: dict[str, str] | None = None
+            if isinstance(progress_record, Mapping):
+                raw_timestamp = progress_record.get("updated_at")
+                if isinstance(raw_timestamp, datetime):
+                    timestamp = ensure_utc(raw_timestamp).isoformat()
+                else:
+                    timestamp = str(raw_timestamp or "").strip()
+                candidate_id = str(progress_record.get("candidate_id") or "").strip()
+                if timestamp and candidate_id:
+                    next_cursor = {
+                        "updated_at": timestamp,
+                        "candidate_id": candidate_id,
+                    }
+            next_state = dict(state)
+            next_state["schema_version"] = "autonomous-legacy-recovery-v1"
+            next_state["cursor"] = next_cursor
+            try:
+                state_setter(_LEGACY_RECOVERY_STATE_NAME, next_state)
+            except (RuntimeError, TypeError, ValueError):
+                # Evidence remains durable even if a transient state write
+                # fails; retrying the page is safe because report keys dedupe.
+                pass
         return tuple(output)
 
     def process_pending(self, *, worker: str = "research-queue", now: datetime | None = None) -> AutonomousQueueCycle:

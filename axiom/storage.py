@@ -7260,6 +7260,59 @@ class AxiomStore:
         if candidate_id is not None:
             return records[0] if records else None
         return records
+    def load_candidate_lifecycle_page(
+        self,
+        *,
+        limit: int = _DEFAULT_PAGE_SIZE,
+        after_updated_at: datetime | str | None = None,
+        after_candidate_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Read one deterministic keyset page of lifecycle rows.
+
+        ``(updated_at, candidate_id)`` is the complete ordering key.  The
+        candidate id makes equal timestamps unambiguous, while keyset
+        selection avoids offset drift when rows are inserted or deleted
+        between pages.
+        """
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+            raise ValueError("limit must be a non-negative integer")
+        if (after_updated_at is None) != (after_candidate_id is None):
+            raise ValueError("after_updated_at and after_candidate_id must be provided together")
+        cursor_updated_at: str | None = None
+        cursor_candidate_id: str | None = None
+        if after_updated_at is not None:
+            if isinstance(after_updated_at, datetime):
+                cursor_updated_at = _iso(after_updated_at)
+            else:
+                cursor_updated_at = str(after_updated_at).strip()
+            cursor_candidate_id = str(after_candidate_id or "").strip()
+            if not cursor_updated_at or not cursor_candidate_id:
+                raise ValueError("keyset cursor values must be non-empty")
+        query = (
+            "SELECT candidate_id,stage,payload_json,updated_at "
+            "FROM candidate_lifecycle"
+        )
+        values: list[Any] = []
+        if cursor_updated_at is not None and cursor_candidate_id is not None:
+            query += (
+                " WHERE updated_at>? "
+                "OR (updated_at=? AND candidate_id>?)"
+            )
+            values.extend((cursor_updated_at, cursor_updated_at, cursor_candidate_id))
+        query += " ORDER BY updated_at,candidate_id LIMIT ?"
+        values.append(int(limit))
+        with self._lock:
+            rows = self._conn.execute(query, values).fetchall()
+        return [
+            {
+                "candidate_id": row["candidate_id"],
+                "stage": row["stage"],
+                "payload": _load(row["payload_json"]),
+                "updated_at": _parse_datetime(row["updated_at"]),
+            }
+            for row in rows
+        ]
+
 
     def list_candidate_lifecycle_events(self, candidate_id: str | None = None, *, limit: int = 100) -> list[dict[str, Any]]:
         if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:

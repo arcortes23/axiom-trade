@@ -577,6 +577,90 @@ class PolymarketResearchOrchestrationTests(unittest.TestCase):
             self.assertEqual(recovery[0]["reason_code"], "MISSING_NESTED_TARGET_MARKET_IDS")
             self.assertEqual(recovery[0]["progress"], "BLOCKED")
             self.assertEqual(store.research_queue_stats().get("total"), 0)
+    def test_legacy_recovery_keyset_paginates_rank_65_across_restart(self) -> None:
+        """Automatic recovery must cover every persisted legacy row."""
+        with AxiomStore(":memory:") as store:
+            predecessors: dict[str, dict[str, object]] = {}
+            for index in range(84):
+                candidate_id = f"legacy-page-{index:03d}"
+                predecessor = {
+                    "candidate_id": candidate_id,
+                    "frozen_hash": f"sha256:{candidate_id}-frozen",
+                    "hypothesis_id": f"{candidate_id}-hypothesis",
+                    "statement": "A missing scope remains blocked.",
+                    "source": "offline legacy fixture",
+                    "market_type": "prediction",
+                    "experiment_plan": {
+                        "market_type": "prediction",
+                        "target": {},
+                    },
+                    "paper_only": True,
+                }
+                predecessors[candidate_id] = predecessor
+                # Equal timestamps exercise the candidate-id keyset tie
+                # breaker.  The 65th row must not be hidden by LIMIT 64.
+                store.save_candidate_lifecycle(
+                    candidate_id,
+                    CandidateStage.IDEA.value,
+                    predecessor,
+                    timestamp=T0,
+                )
+                store.save_candidate_lifecycle(
+                    candidate_id,
+                    CandidateStage.FROZEN.value,
+                    predecessor,
+                    timestamp=T0,
+                )
+
+            config = AutonomousResearchConfig(max_items_per_cycle=64)
+            first_processor = AutonomousResearchProcessor(
+                store,
+                config=config,
+                clock=lambda: T0,
+            )
+            first = first_processor.process_pending(now=T0)
+            self.assertEqual(first.claimed, 0)
+            self.assertEqual(len(first.legacy_recovery), 64)
+            self.assertLessEqual(len(first.legacy_recovery), 64)
+            self.assertNotIn(
+                "legacy-page-064",
+                {item["predecessor_candidate_id"] for item in first.legacy_recovery},
+            )
+            state = store.get_scheduler_state("autonomous-legacy-recovery")
+            self.assertIsInstance(state, dict)
+            self.assertEqual(state["cursor"]["candidate_id"], "legacy-page-063")
+
+            # A new processor has no in-memory authority and must resume from
+            # the cursor persisted by the first automatic cycle.
+            restarted = AutonomousResearchProcessor(
+                store,
+                config=config,
+                clock=lambda: T0,
+            )
+            second = restarted.process_pending(now=T0)
+            self.assertEqual(second.claimed, 0)
+            self.assertEqual(len(second.legacy_recovery), 20)
+            self.assertLessEqual(len(second.legacy_recovery), 64)
+            target = [
+                item
+                for item in second.legacy_recovery
+                if item["predecessor_candidate_id"] == "legacy-page-064"
+            ]
+            self.assertEqual(len(target), 1)
+            self.assertEqual(target[0]["classification"], "INVALID")
+            self.assertEqual(target[0]["reason_code"], "MISSING_MARKET_SCOPE")
+            self.assertEqual(target[0]["next_action"], "RETAIN_LEGACY_PREDECESSOR")
+            self.assertIsNone(target[0]["successor_id"])
+            self.assertEqual(store.research_queue_stats()["total"], 0)
+            self.assertEqual(
+                len(store.list_reports(experiment_id="legacy-page-064")),
+                1,
+            )
+            self.assertEqual(
+                store.load_candidate_lifecycle("legacy-page-064")["payload"],
+                predecessors["legacy-page-064"],
+            )
+
 
 
     def test_legacy_recovery_state_changes_append_and_identical_retry_dedupes(self) -> None:
