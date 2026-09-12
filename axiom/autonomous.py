@@ -11,8 +11,8 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import math
-from statistics import mean
 import re
+from statistics import mean
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from .backtest import CryptoBacktester
@@ -76,6 +76,197 @@ PREDECLARED_STRATEGY_STARTING_SET: tuple[Mapping[str, Any], ...] = (
         },
     },
 )
+
+CAMPAIGN_BUDGET_LIMIT = 24
+CAMPAIGN_MAX_FINALISTS = 1
+CAMPAIGN_STATUSES = frozenset(
+    {
+        "PLANNED",
+        "RUNNING",
+        "WAITING_FOR_DATA",
+        "FINAL_ASSESSMENT",
+        "COMPLETED_QUALIFIED",
+        "CAMPAIGN_EXHAUSTED_NO_QUALIFIED_STRATEGY",
+        "SOFTWARE_OR_INPUT_ERROR",
+    }
+)
+CAMPAIGN_TRIAL_TERMINAL = frozenset(
+    {
+        "ECONOMIC_REJECTION",
+        "DATA_INSUFFICIENT",
+        "SOFTWARE_OR_INPUT_ERROR",
+        "VALIDATION_QUALIFIED",
+        "FINAL_ASSESSMENT",
+    }
+)
+POLYMARKET_CAMPAIGN_GRID: tuple[Mapping[str, Any], ...] = tuple(
+    {
+        "configuration_id": f"{family}:lookback-{lookback}:threshold-{threshold:.2f}",
+        "template": family,
+        "parameters": {"lookback": lookback, "threshold": threshold},
+    }
+    for family in ("momentum", "mean_reversion")
+    for lookback in (1, 3, 5)
+    for threshold in (0.02, 0.05)
+)
+
+
+def _campaign_configuration_key(value: Mapping[str, Any]) -> str:
+    template = str(value.get("template", value.get("family", ""))).strip().lower()
+    parameters = value.get("parameters")
+    if not isinstance(parameters, Mapping):
+        parameters = {
+            key: value[key]
+            for key in ("lookback", "threshold")
+            if key in value
+        }
+    normalized_parameters: dict[str, Any] = {}
+    for key, parameter in parameters.items():
+        if isinstance(parameter, (list, tuple)) and len(parameter) == 1:
+            parameter = parameter[0]
+        normalized_parameters[str(key)] = parameter
+    return _canonical_binding({"template": template, "parameters": normalized_parameters})
+def _campaign_row_identity(row: Mapping[str, Any], index: int) -> str:
+    for name in ("row_identity", "source_snapshot_id", "snapshot_id", "observation_id"):
+        value = row.get(name)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    market = str(row.get("market_id", row.get("symbol", ""))).strip()
+    timestamp = str(row.get("timestamp", row.get("source_timestamp", ""))).strip()
+    if market or timestamp:
+        return f"{market}@{timestamp}"
+    return f"row:{index}"
+
+
+def _campaign_row_manifest(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, str]]:
+    return [
+        {
+            "row_identity": _campaign_row_identity(row, index),
+            "content_hash": _hash_document(row),
+        }
+        for index, row in enumerate(rows)
+    ]
+
+
+def _campaign_split_ranges(count: int) -> dict[str, tuple[int, int]]:
+    train_end = max(0, int(count * 0.60))
+    validation_end = max(train_end, int(count * 0.80))
+    if count:
+        train_end = min(count, max(1, train_end))
+        validation_end = min(count, max(train_end, validation_end))
+    return {
+        "development": (0, train_end),
+        "validation": (train_end, validation_end),
+        "final": (validation_end, count),
+    }
+
+
+def _campaign_compact_row_provenance(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Return bounded evidence that authenticates the complete ordered rows.
+
+    The manifest is materialized only while computing its digest.  Persisted
+    campaign/proposal payloads carry the digest and split boundary identities,
+    never the per-row manifest itself.
+    """
+    manifest = _campaign_row_manifest(rows)
+    timestamps = [
+        parse_timestamp(row.get("timestamp", row.get("source_timestamp")))
+        for row in rows
+    ]
+    timestamps = [value for value in timestamps if value is not None]
+    split_boundaries: dict[str, dict[str, Any]] = {}
+    for name, (start, end) in _campaign_split_ranges(len(rows)).items():
+        part = manifest[start:end]
+        split: dict[str, Any] = {
+            "start_index": start,
+            "end_index": end,
+            "row_count": len(part),
+        }
+        if part:
+            split.update(
+                {
+                    "first_row_identity": part[0]["row_identity"],
+                    "last_row_identity": part[-1]["row_identity"],
+                    "first_content_hash": part[0]["content_hash"],
+                    "last_content_hash": part[-1]["content_hash"],
+                }
+            )
+        split_boundaries[name] = split
+    digest = _hash_document(manifest)
+    return {
+        "schema_version": "axiom-compact-row-provenance-v1",
+        "row_count": len(rows),
+        "exact_cutoff": max(timestamps).isoformat() if timestamps else None,
+        "ordered_row_manifest_digest": digest,
+        # ``root`` is an explicit alias for consumers that call the ordered
+        # manifest commitment a Merkle/root digest; both names are one value.
+        "ordered_row_manifest_root": digest,
+        "content_hash": digest,
+        "split_boundaries": split_boundaries,
+    }
+
+
+def _campaign_rows_for_split(
+    rows: Sequence[Mapping[str, Any]],
+    descriptor: Any,
+) -> list[Mapping[str, Any]]:
+    """Resolve a compact split descriptor while checking its row identities."""
+    if isinstance(descriptor, (list, tuple)):
+        # Read-only compatibility for campaigns persisted before compact
+        # provenance. New payloads never take this path.
+        identities = {
+            str(item.get("row_identity"))
+            for item in descriptor
+            if isinstance(item, Mapping)
+        }
+        return [
+            row
+            for index, row in enumerate(rows)
+            if _campaign_row_identity(row, index) in identities
+        ]
+    if not isinstance(descriptor, Mapping):
+        raise AutonomousResearchError(
+            "DATASET_PROVENANCE_INVALID",
+            "campaign split provenance is missing",
+        )
+    try:
+        start = int(descriptor.get("start_index"))
+        end = int(descriptor.get("end_index"))
+        expected_count = int(descriptor.get("row_count"))
+    except (TypeError, ValueError):
+        raise AutonomousResearchError(
+            "DATASET_PROVENANCE_INVALID",
+            "campaign split provenance indexes are invalid",
+        ) from None
+    if start < 0 or end < start or end > len(rows):
+        raise AutonomousResearchError(
+            "DATASET_PROVENANCE_INVALID",
+            "campaign split provenance indexes exceed the dataset boundary",
+        )
+    manifest = _campaign_row_manifest(rows)
+    part = list(rows[start:end])
+    part_manifest = manifest[start:end]
+    if expected_count != len(part):
+        raise AutonomousResearchError(
+            "DATASET_PROVENANCE_INVALID",
+            "campaign split row count changed after enqueue",
+        )
+    if part_manifest:
+        if (
+            str(descriptor.get("first_row_identity", "")).strip()
+            != part_manifest[0]["row_identity"]
+            or str(descriptor.get("last_row_identity", "")).strip()
+            != part_manifest[-1]["row_identity"]
+            or str(descriptor.get("first_content_hash", "")).strip()
+            != part_manifest[0]["content_hash"]
+            or str(descriptor.get("last_content_hash", "")).strip()
+            != part_manifest[-1]["content_hash"]
+        ):
+            raise AutonomousResearchError(
+                "DATASET_PROVENANCE_INVALID",
+                "campaign split boundary identity changed after enqueue",
+            )
+    return part
 
 
 def _variant_count(plan: ExperimentPlan) -> int:
@@ -857,6 +1048,1053 @@ class AutonomousResearchProcessor:
         self.config = config or AutonomousResearchConfig()
         self.clock = clock
         self.lifecycle = CandidateLifecycleManager(store, criteria=self.config.promotion_criteria)
+        self._campaign_active_state: dict[str, Any] = {}
+    @staticmethod
+    def campaign_job_name(campaign_id: str) -> str:
+        value = str(campaign_id).strip()
+        if not value or len(value) > 128:
+            raise ValueError("campaign_id must be bounded non-empty text")
+        return f"polymarket-research-campaign:{value}"
+
+    @staticmethod
+    def campaign_configurations() -> tuple[Mapping[str, Any], ...]:
+        """Return the fixed, one-variant Polymarket generator grid."""
+        return tuple(dict(item) for item in POLYMARKET_CAMPAIGN_GRID)
+
+    @staticmethod
+    def _campaign_dataset_rows(store: AxiomStore, dataset_id: str, dataset_version: str) -> list[Mapping[str, Any]]:
+        loaded = store.load_dataset(dataset_id, dataset_version)
+        if isinstance(loaded, Mapping) and isinstance(loaded.get("records"), Sequence):
+            loaded = loaded["records"]
+        if not isinstance(loaded, Sequence) or isinstance(loaded, (str, bytes)):
+            return []
+        rows = [_normalize_row(row) for row in loaded if isinstance(row, Mapping)]
+        rows = [row for row in rows if row is not None]
+        rows.sort(
+            key=lambda row: (
+                parse_timestamp(row.get("timestamp", row.get("source_timestamp"))) or datetime.min.replace(tzinfo=timezone.utc),
+                _campaign_row_identity(row, 0),
+                _hash_document(row),
+            )
+        )
+        return rows[:_MAX_DATASET_ROWS]
+
+    def _campaign_prior_configuration_keys(self) -> set[str]:
+        keys: set[str] = set()
+        lister = getattr(self.store, "list_experiment_plans", None)
+        if callable(lister):
+            try:
+                records = lister(limit=10_000, newest_first=False)
+            except TypeError:
+                records = lister(limit=10_000)
+            except Exception:
+                records = ()
+            for record in records or ():
+                if not isinstance(record, Mapping):
+                    continue
+                plan = record.get("plan")
+                if not isinstance(plan, Mapping):
+                    continue
+                template = str(plan.get("template", plan.get("experiment_family", ""))).strip().lower()
+                parameters = plan.get("parameters")
+                if template in {"momentum", "mean_reversion"} and isinstance(parameters, Mapping):
+                    names = tuple(sorted(parameters))
+                    value_sets = tuple(
+                        tuple(value) if isinstance(value, (list, tuple)) else (value,)
+                        for value in (parameters[name] for name in names)
+                    )
+                    for values in product(*value_sets):
+                        keys.add(
+                            _campaign_configuration_key(
+                                {
+                                    "template": template,
+                                    "parameters": dict(zip(names, values)),
+                                }
+                            )
+                        )
+        # Queue rows and immutable reports are evidence too.  A rejected
+        # candidate is never reopened merely because its queue row is still
+        # visible.
+        try:
+            queued = self.store.list_research_items(limit=10_000)
+        except Exception:
+            queued = ()
+        for record in queued or ():
+            payload = record.get("payload") if isinstance(record, Mapping) else None
+            plan = payload.get("experiment_plan") if isinstance(payload, Mapping) else None
+            if isinstance(plan, Mapping):
+                template = str(plan.get("template", "")).strip().lower()
+                parameters = plan.get("parameters")
+                if template in {"momentum", "mean_reversion"} and isinstance(parameters, Mapping):
+                    names = tuple(sorted(parameters))
+                    value_sets = tuple(
+                        tuple(value) if isinstance(value, (list, tuple)) else (value,)
+                        for value in (parameters[name] for name in names)
+                    )
+                    for values in product(*value_sets):
+                        keys.add(
+                            _campaign_configuration_key(
+                                {
+                                    "template": template,
+                                    "parameters": dict(zip(names, values)),
+                                }
+                            )
+                        )
+        return keys
+    @staticmethod
+    def _campaign_split_manifests(rows: Sequence[Mapping[str, Any]]) -> dict[str, dict[str, Any]]:
+        """Return compact split commitments, not the historical row lists."""
+        return dict(_campaign_compact_row_provenance(rows)["split_boundaries"])
+
+    @staticmethod
+    def _campaign_default_protocol(
+        *,
+        campaign_id: str,
+        dataset_id: str,
+        dataset_version: str,
+        rows: Sequence[Mapping[str, Any]],
+        configurations: Sequence[Mapping[str, Any]],
+        qualification_gates: Mapping[str, Any] | None,
+        finalist_count: int,
+        observation_horizon: int,
+    ) -> dict[str, Any]:
+        provenance = _campaign_compact_row_provenance(rows)
+        manifests = dict(provenance["split_boundaries"])
+        boundary = {
+            "schema_version": provenance["schema_version"],
+            "dataset_id": dataset_id,
+            "dataset_version": dataset_version,
+            "source_type": "HISTORICAL",
+            "exact_cutoff": provenance["exact_cutoff"],
+            "row_count": provenance["row_count"],
+            "ordered_row_manifest_digest": provenance["ordered_row_manifest_digest"],
+            "ordered_row_manifest_root": provenance["ordered_row_manifest_root"],
+            "content_hash": provenance["content_hash"],
+            "split_boundaries": dict(manifests),
+        }
+        return {
+            "schema_version": "polymarket-finite-campaign-v1",
+            "campaign_id": campaign_id,
+            "scientific_rationale": (
+                "Test whether short price-path momentum or mean-reversion "
+                "signals survive a fixed chronological paper evaluation after costs."
+            ),
+            "dataset_boundary": boundary,
+            "exact_dataset_row_boundary": dict(boundary),
+            "configuration_manifest": [dict(item) for item in configurations],
+            "fixed_generator": {
+                "families": ["momentum", "mean_reversion"],
+                "lookbacks": [1, 3, 5],
+                "thresholds": [0.02, 0.05],
+                "automatic_mutations": False,
+            },
+            "entry_rules": {
+                "signal": "strategy score exceeds absolute threshold",
+                "price_path": "same-market observed quote only",
+                "selection_partition": "validation",
+            },
+            "exit_rules": {
+                "type": "fixed_holding_period",
+                "unit": "observations",
+                "count": int(observation_horizon),
+            },
+            "required_features": [
+                "timestamp",
+                "market_id",
+                "yes_mid",
+                "yes_bid",
+                "yes_ask",
+                "settlement",
+            ],
+            "scope": {
+                "market_type": "prediction",
+                "instrument": "POLYMARKET",
+                "paper_only": True,
+            },
+            "observation_horizon": {
+                "unit": "observations",
+                "count": int(observation_horizon),
+                "semantics": "per_market_observation_count",
+            },
+            "costs": {"fee_bps": 10.0, "slippage_bps": 5.0},
+            "qualification_gates": dict(
+                qualification_gates
+                or {"min_expectancy": 0.0, "min_samples": 3, "min_trades": 0}
+            ),
+            "budget_limit": CAMPAIGN_BUDGET_LIMIT,
+            "validation_policy": {
+                "chronological": True,
+                "selection_metric": "validation_expectancy",
+                "automatic_mutations": False,
+                "one_variant_per_trial": True,
+            },
+            "final_assessment_policy": {
+                "evaluate_once": True,
+                "max_finalists": int(finalist_count),
+                "select_from": "validation_only",
+                "untouched_until_validation_complete": True,
+            },
+            "protected_row_identity_manifests": manifests,
+            "protected_rows": manifests,
+            "reassessment_limit": 1,
+        }
+
+
+    def _campaign_queue_plan(
+        self,
+        state: Mapping[str, Any],
+        trial: Mapping[str, Any],
+    ) -> ExperimentPlan:
+        protocol = state.get("protocol") if isinstance(state.get("protocol"), Mapping) else {}
+        trial_boundary = trial.get("dataset_boundary")
+        boundary = (
+            dict(trial_boundary)
+            if isinstance(trial_boundary, Mapping)
+            else protocol.get("dataset_boundary")
+            if isinstance(protocol, Mapping)
+            else {}
+        )
+        trial_manifests = trial.get("protected_row_identity_manifests")
+        protected_manifests = (
+            dict(trial_manifests)
+            if isinstance(trial_manifests, Mapping)
+            else protocol.get("protected_row_identity_manifests", {})
+            if isinstance(protocol, Mapping)
+            else {}
+        )
+        config = trial.get("configuration") if isinstance(trial.get("configuration"), Mapping) else {}
+        campaign_id = str(state.get("campaign_id", "")).strip()
+        trial_id = str(trial.get("trial_id", "")).strip()
+        configuration_id = str(trial.get("configuration_id", "")).strip()
+        base = state.get("base_proposal") if isinstance(state.get("base_proposal"), Mapping) else {}
+        raw_base_plan = base.get("experiment_plan") if isinstance(base.get("experiment_plan"), Mapping) else base
+        plan_document = dict(raw_base_plan)
+        plan_document.update(
+            {
+                "plan_id": f"campaign-plan:{campaign_id}:{trial_id}",
+                "hypothesis_id": f"campaign-hypothesis:{campaign_id}:{trial_id}",
+                "campaign_id": campaign_id,
+                "campaign_trial_id": trial_id,
+                "campaign_configuration_id": configuration_id,
+                "campaign_protocol": dict(protocol),
+                "scientific_rationale": protocol.get("scientific_rationale"),
+                "dataset_boundary": boundary,
+                "configuration_manifest": {
+                    "configuration_id": configuration_id,
+                    "template": config.get("template"),
+                    "parameters": dict(config.get("parameters", {})),
+                },
+                "observation_horizon": protocol.get("observation_horizon", {"unit": "observations", "count": 1}),
+                "qualification_gates": protocol.get("qualification_gates", {}),
+                "validation_policy": protocol.get("validation_policy", {}),
+                "final_assessment_policy": protocol.get("final_assessment_policy", {}),
+                "protected_row_identity_manifests": protected_manifests,
+                "template": config.get("template"),
+                "parameters": {
+                    str(name): [value]
+                    for name, value in dict(config.get("parameters", {})).items()
+                },
+                "max_variants": 1,
+                "trial_budget": {"limit": 1, "locked": True},
+                "paper_only": True,
+                "dataset_selector": {
+                    **(
+                        dict(plan_document.get("dataset_selector", {}))
+                        if isinstance(plan_document.get("dataset_selector"), Mapping)
+                        else {}
+                    ),
+                    "dataset_id": boundary.get("dataset_id"),
+                    "dataset_version": boundary.get("dataset_version"),
+                },
+            }
+        )
+        plan_document.setdefault("market_type", "prediction")
+        plan_document.setdefault("market_scope", {
+            "mode": "RULE_BASED_MARKETS",
+            "instrument": "POLYMARKET",
+            "provenance": "canonical",
+        })
+        plan_document.setdefault("allowed_features", protocol.get("required_features", ()))
+        plan_document.setdefault("time_split", "train-validation-holdout")
+        plan_document.setdefault("metrics", ("expectancy", "drawdown", "trade_count", "sample_count"))
+        plan_document.setdefault("min_samples", int(protocol.get("qualification_gates", {}).get("min_samples", 3)))
+        plan_document.setdefault("min_trades", int(protocol.get("qualification_gates", {}).get("min_trades", 0)))
+        plan_document.setdefault("research_mode", "PRICE_PROXY_RESEARCH")
+        plan_document.setdefault("assumptions", protocol.get("costs", {}))
+        plan_document.setdefault("exit_policy", {
+            "type": "fixed_holding_period",
+            "holding_period": int(protocol.get("observation_horizon", {}).get("count", 1)),
+        })
+        plan_document.setdefault("filters", {})
+        plan_document.setdefault("experiment_family", config.get("template"))
+        return ExperimentPlan.from_mapping(plan_document, hypothesis_id=plan_document["hypothesis_id"])
+
+    def _campaign_queue_next(self, now: datetime) -> Mapping[str, Any] | None:
+        campaign_id = str(self._campaign_active_state.get("campaign_id", "")).strip()
+        job_name = self.campaign_job_name(campaign_id)
+        # Queue binding, plan persistence, and the campaign cursor advance are
+        # one durable operation.  An immediate transaction also serializes
+        # concurrent/restarted workers before either can spend the same slot.
+        with self.store.transaction(immediate=True):
+            state = dict(self.store.get_operator_job(job_name) or {})
+            payload = state.get("payload") if isinstance(state.get("payload"), Mapping) else {}
+            payload = dict(payload)
+            trials = [dict(item) for item in payload.get("trials", ()) if isinstance(item, Mapping)]
+            next_trial = next(
+                (
+                    item
+                    for item in trials
+                    if item.get("status") == "PLANNED"
+                    and str(item.get("reassessment_of", "")).strip()
+                ),
+                None,
+            )
+            if next_trial is None:
+                next_trial = next((item for item in trials if item.get("status") == "PLANNED"), None)
+            if next_trial is None:
+                return None
+            plan = self._campaign_queue_plan(payload, next_trial)
+            campaign_trial_id = str(next_trial.get("trial_id", "")).strip()
+            protocol_hash = _hash_document(payload.get("protocol", {}))
+            queue_payload = {
+                "proposal_id": plan.hypothesis_id,
+                "hypothesis_id": plan.hypothesis_id,
+                "statement": str(payload.get("protocol", {}).get("scientific_rationale", "Finite Polymarket campaign")),
+                "source": "axiom-finite-campaign",
+                "tests": ["chronological validation on the protected dataset boundary"],
+                "dataset_id": plan.dataset_id,
+                "dataset_version": plan.dataset_version,
+                "time_split": plan.methodology.get("time_split", "train-validation-holdout"),
+                "experiment_plan": plan.as_dict(),
+                "campaign_id": campaign_id,
+                "campaign_trial_id": campaign_trial_id,
+                "campaign_configuration_id": next_trial.get("configuration_id"),
+                "campaign_protocol_hash": protocol_hash,
+                "paper_only": True,
+                "predeclared_starting_set": False,
+                "automatic_mutations": False,
+            }
+            dedupe_key = f"campaign:{campaign_id}:{campaign_trial_id}"
+            queued = next(
+                (
+                    item
+                    for item in self.bus.list_campaign_trials(campaign_id, limit=10_000)
+                    if str(item.payload.get("campaign_trial_id", "")).strip() == campaign_trial_id
+                ),
+                None,
+            )
+            if queued is not None:
+                existing_payload = queued.payload
+                existing_plan = existing_payload.get("experiment_plan")
+                existing_plan_matches = False
+                if isinstance(existing_plan, Mapping):
+                    try:
+                        existing_bound_plan = ExperimentPlan.from_mapping(
+                            existing_plan,
+                            hypothesis_id=str(existing_payload.get("hypothesis_id", "")).strip() or None,
+                        )
+                    except (ExperimentPlanError, TypeError, ValueError):
+                        existing_bound_plan = None
+                    existing_plan_matches = (
+                        existing_bound_plan is not None
+                        and existing_bound_plan.plan_id == plan.plan_id
+                        and existing_bound_plan.plan_hash == plan.plan_hash
+                    )
+                if (
+                    str(existing_payload.get("campaign_id", "")).strip() != campaign_id
+                    or str(existing_payload.get("proposal_id", "")).strip() != plan.hypothesis_id
+                    or str(existing_payload.get("hypothesis_id", "")).strip() != plan.hypothesis_id
+                    or not existing_plan_matches
+                    or str(existing_payload.get("campaign_protocol_hash", "")).strip() != protocol_hash
+                ):
+                    raise AutonomousResearchError(
+                        "CAMPAIGN_QUEUE_BINDING_MISMATCH",
+                        f"existing queue binding does not match planned trial {campaign_trial_id}",
+                    )
+            else:
+                # Keep the plan PENDING until the queue write succeeds.  If
+                # payload validation rejects the trial, this transaction rolls
+                # back and the trial remains PLANNED for operator diagnosis.
+                self.store.save_experiment_plan(
+                    plan.plan_id,
+                    plan.as_dict(),
+                    hypothesis_id=plan.hypothesis_id,
+                    plan_hash=plan.plan_hash,
+                    status="PENDING",
+                    timestamp=now,
+                )
+                queued = self.bus.submit_campaign_trial(
+                    queue_payload,
+                    campaign_id=campaign_id,
+                    trial_id=campaign_trial_id,
+                    dedupe_key=dedupe_key,
+                    available_at=now,
+                )
+            for item in trials:
+                if item.get("trial_id") == campaign_trial_id:
+                    item.update(
+                        {
+                            "status": "RUNNING",
+                            "proposal_id": plan.hypothesis_id,
+                            "hypothesis_id": plan.hypothesis_id,
+                            "plan_id": plan.plan_id,
+                            "plan_hash": plan.plan_hash,
+                            "queue_item_id": queued.item_id,
+                            "queued_at": ensure_utc(now).isoformat(),
+                        }
+                    )
+            payload["trials"] = trials
+            counts = dict(payload.get("counts") or {})
+            counts["planned"] = max(0, int(counts.get("planned", 0)) - 1)
+            counts["running"] = int(counts.get("running", 0)) + 1
+            payload["counts"] = counts
+            payload["budget_used"] = int(payload.get("budget_used", 0)) + 1
+            payload["budget_remaining"] = max(0, CAMPAIGN_BUDGET_LIMIT - payload["budget_used"])
+            payload["status"] = "RUNNING"
+            payload["next_real_job"] = None
+            payload["last_updated_at"] = ensure_utc(now).isoformat()
+            self.store.set_operator_job(job_name, "RUNNING", payload, resumable=True, timestamp=now)
+            self._campaign_active_state = payload
+            return {
+                "trial_id": campaign_trial_id,
+                "queue_item_id": queued.item_id,
+                "proposal_id": plan.hypothesis_id,
+                "hypothesis_id": plan.hypothesis_id,
+                "plan_id": plan.plan_id,
+                "plan_hash": plan.plan_hash,
+            }
+
+    def start_polymarket_campaign(
+        self,
+        campaign_id: str,
+        proposal: Mapping[str, Any] | None = None,
+        *,
+        dataset_id: str | None = None,
+        dataset_version: str | None = None,
+        observation_horizon: int = 1,
+        finalist_count: int = CAMPAIGN_MAX_FINALISTS,
+        qualification_gates: Mapping[str, Any] | None = None,
+        now: datetime | None = None,
+    ) -> Mapping[str, Any]:
+        """Persist a finite protocol and queue exactly its next trial."""
+        current = ensure_utc(now or self.clock())
+        campaign = str(campaign_id).strip()
+        if not campaign:
+            raise ValueError("campaign_id is required")
+        if isinstance(observation_horizon, bool) or not isinstance(observation_horizon, int) or observation_horizon < 1:
+            raise ValueError("observation_horizon must be a positive observation count")
+        if isinstance(finalist_count, bool) or not 1 <= int(finalist_count) <= CAMPAIGN_MAX_FINALISTS:
+            raise ValueError("finalist_count exceeds the campaign safety bound")
+        existing = self.store.get_operator_job(self.campaign_job_name(campaign))
+        if isinstance(existing, Mapping):
+            existing_payload = dict(existing.get("payload") or {})
+            self._campaign_active_state = existing_payload
+            return existing_payload
+        source = dict(proposal or {})
+        resolved_dataset_id = str(
+            dataset_id
+            or source.get("dataset_id")
+            or (
+                source.get("dataset_selector", {}).get("dataset_id")
+                if isinstance(source.get("dataset_selector"), Mapping)
+                else ""
+            )
+            or "Polymarket-historical"
+        ).strip()
+        resolved_dataset_version = str(
+            dataset_version
+            or source.get("dataset_version")
+            or (
+                source.get("dataset_selector", {}).get("dataset_version")
+                if isinstance(source.get("dataset_selector"), Mapping)
+                else ""
+            )
+            or ""
+        ).strip()
+        if not resolved_dataset_version:
+            raise ValueError("dataset_version is required")
+        rows = self._campaign_dataset_rows(self.store, resolved_dataset_id, resolved_dataset_version)
+        prior = self._campaign_prior_configuration_keys()
+        configurations = [
+            dict(item)
+            for item in self.campaign_configurations()
+            if _campaign_configuration_key(item) not in prior
+        ]
+        protocol = self._campaign_default_protocol(
+            campaign_id=campaign,
+            dataset_id=resolved_dataset_id,
+            dataset_version=resolved_dataset_version,
+            rows=rows,
+            configurations=configurations,
+            qualification_gates=qualification_gates,
+            finalist_count=int(finalist_count),
+            observation_horizon=int(observation_horizon),
+        )
+        trials: list[dict[str, Any]] = [
+            {
+                "trial_id": f"trial:{campaign}:{index:02d}",
+                "configuration_id": item["configuration_id"],
+                "configuration": dict(item),
+                "status": "PLANNED",
+                "result": None,
+            }
+            for index, item in enumerate(configurations)
+        ]
+        # The legacy zero-edge control is evidence, not a new trial.
+        control = {
+            "configuration_id": "control:zero_edge",
+            "template": "probability_mispricing",
+            "parameters": {"threshold": 0.05},
+            "status": "SELECTION_EXCLUDED",
+            "reason": "existing zero-edge control retained; never rerun",
+        }
+        payload: dict[str, Any] = {
+            "schema_version": "polymarket-finite-campaign-v1",
+            "campaign_id": campaign,
+            "status": "PLANNED" if trials else "CAMPAIGN_EXHAUSTED_NO_QUALIFIED_STRATEGY",
+            "protocol": protocol,
+            "base_proposal": source,
+            "dataset_id": resolved_dataset_id,
+            "dataset_version": resolved_dataset_version,
+            "budget_limit": CAMPAIGN_BUDGET_LIMIT,
+            "budget_used": 0,
+            "budget_remaining": CAMPAIGN_BUDGET_LIMIT,
+            "fixed_configuration_count": len(configurations),
+            "counts": {
+                "planned": len(trials),
+                "running": 0,
+                "economic_rejection": 0,
+                "data_insufficient": 0,
+                "software_or_input_error": 0,
+                "validation_qualified": 0,
+                "final_assessment": 0,
+                "qualified": 0,
+            },
+            "trials": trials,
+            "selection_excluded_evidence": [control],
+            "qualified_candidate_ids": [],
+            "finalist_candidate_ids": [],
+            "final_assessment_evaluated": False,
+            "reassessment_count": 0,
+            "last_result": None,
+            "next_real_job": None,
+            "created_at": ensure_utc(current).isoformat(),
+            "last_updated_at": ensure_utc(current).isoformat(),
+            "paper_only": True,
+            "research_only": True,
+        }
+        job_name = self.campaign_job_name(campaign)
+        # This write is deliberately before the first bus write.  A crash
+        # between the two leaves a durable protocol that can be resumed.
+        self.store.set_operator_job(job_name, payload["status"], payload, resumable=True, timestamp=current)
+        self._campaign_active_state = payload
+        if trials:
+            with self.store.transaction():
+                self._campaign_queue_next(current)
+        return dict(self.store.get_operator_job(job_name).get("payload", payload))
+
+    start_campaign = start_polymarket_campaign
+
+    def campaign_state(self, campaign_id: str) -> Mapping[str, Any] | None:
+        record = self.store.get_operator_job(self.campaign_job_name(campaign_id))
+        payload = record.get("payload") if isinstance(record, Mapping) else None
+        if isinstance(payload, Mapping):
+            self._campaign_active_state = dict(payload)
+            return dict(payload)
+        return None
+
+    get_campaign_state = campaign_state
+
+    def _campaign_schedule_data_job(
+        self,
+        payload: dict[str, Any],
+        trial: Mapping[str, Any],
+        *,
+        now: datetime,
+        reason: str,
+    ) -> str:
+        campaign_id = str(payload.get("campaign_id", "")).strip()
+        trial_id = str(trial.get("trial_id", "")).strip()
+        job_name = f"polymarket-research-data:{campaign_id}:{trial_id}"
+        producer_name = f"polymarket-dataset-producer:{campaign_id}:{trial_id}"
+        data_payload = {
+            "schema_version": "polymarket-research-data-v1",
+            "job_kind": "POLYMARKET_RESEARCH_DATA_PREREQUISITE",
+            "campaign_id": campaign_id,
+            "campaign_trial_id": trial_id,
+            "dataset_id": payload.get("dataset_id"),
+            "dataset_version": payload.get("dataset_version"),
+            "reason": reason,
+            "producer_job": producer_name,
+            "status_taxonomy": ["SCHEDULED", "RUNNING", "NO_NEW_DATA", "COMPLETE", "FAILED", "EXHAUSTED"],
+            "cursor": trial.get("data_cursor"),
+            "request_budget": 1,
+            "backoff_seconds": 60,
+            "next_attempt_at": ensure_utc(now).isoformat(),
+            "paper_only": True,
+        }
+        self.store.set_operator_job(job_name, "SCHEDULED", data_payload, resumable=True, timestamp=now)
+        payload["next_real_job"] = job_name
+        return job_name
+
+    @staticmethod
+    def _campaign_result_classification(result: Mapping[str, Any]) -> str:
+        code = str(result.get("reason_code", "")).strip().upper()
+        if code in {"INSUFFICIENT_DATA", "DATA_INSUFFICIENT", "DATASET_PROVENANCE_INVALID", "DATASET_ATTESTATION_MISSING"}:
+            return "DATA_INSUFFICIENT"
+        if code in {"PROCESSING_FAILED", "INVALID_PLAN", "INVALID_DATASET", "SOFTWARE_OR_INPUT_ERROR"}:
+            return "SOFTWARE_OR_INPUT_ERROR"
+        if result.get("accepted") is not False and str(result.get("stage", "")).upper() != CandidateStage.REJECTED.value:
+            return "VALIDATION_QUALIFIED"
+        return "ECONOMIC_REJECTION"
+
+    def _campaign_final_assessment(self, payload: dict[str, Any], *, now: datetime) -> None:
+        if bool(payload.get("final_assessment_evaluated")):
+            return
+        payload["status"] = "FINAL_ASSESSMENT"
+        trials = [dict(item) for item in payload.get("trials", ()) if isinstance(item, Mapping)]
+        qualified = [
+            item
+            for item in trials
+            if item.get("status") == "VALIDATION_QUALIFIED"
+            and not bool(item.get("selection_excluded"))
+        ][: int(payload.get("protocol", {}).get("final_assessment_policy", {}).get("max_finalists", 1))]
+        protocol = payload.get("protocol") if isinstance(payload.get("protocol"), Mapping) else {}
+        protected = protocol.get("protected_row_identity_manifests") if isinstance(protocol, Mapping) else {}
+        protected = protected if isinstance(protected, Mapping) else {}
+        final_manifest = protected.get("final", ())
+        boundary = protocol.get("dataset_boundary") if isinstance(protocol, Mapping) else {}
+        boundary = boundary if isinstance(boundary, Mapping) else {}
+        final_boundary = boundary.get("split_boundaries", {}).get("final", ())
+        if not final_boundary:
+            final_boundary = final_manifest
+        final_ids = {
+            str(item.get("row_identity"))
+            for item in final_manifest
+            if isinstance(item, Mapping)
+        } if isinstance(final_manifest, (list, tuple)) else set()
+        final_row_count = (
+            int(final_manifest.get("row_count", 0))
+            if isinstance(final_manifest, Mapping)
+            else len(final_ids)
+        )
+        final_digest = (
+            str(boundary.get("ordered_row_manifest_digest", boundary.get("content_hash", ""))).strip()
+            if isinstance(boundary, Mapping)
+            else ""
+        )
+        assessments: list[dict[str, Any]] = []
+        for trial in qualified:
+            plan_id = str(trial.get("plan_id", "")).strip()
+            plan_record = self.store.load_experiment_plan(plan_id) if plan_id else None
+            raw_plan = plan_record.get("plan") if isinstance(plan_record, Mapping) else None
+            if not isinstance(raw_plan, Mapping):
+                continue
+            try:
+                plan = ExperimentPlan.from_mapping(
+                    raw_plan,
+                    hypothesis_id=str(plan_record.get("hypothesis_id", "")).strip() or None,
+                )
+                rows = self._campaign_dataset_rows(self.store, plan.dataset_id or "", plan.dataset_version)
+                trial_boundary = raw_plan.get("dataset_boundary")
+                trial_boundary = trial_boundary if isinstance(trial_boundary, Mapping) else boundary
+                trial_protected = raw_plan.get("protected_row_identity_manifests")
+                trial_protected = trial_protected if isinstance(trial_protected, Mapping) else protected
+                trial_manifest = trial_protected.get("final", ())
+                trial_boundary_splits = trial_boundary.get("split_boundaries", {})
+                trial_descriptor = (
+                    trial_boundary_splits.get("final", ())
+                    if isinstance(trial_boundary_splits, Mapping)
+                    else ()
+                ) or trial_manifest
+                expected_digest = str(
+                    trial_boundary.get(
+                        "ordered_row_manifest_digest",
+                        trial_boundary.get("content_hash", ""),
+                    )
+                ).strip()
+                if expected_digest:
+                    actual_provenance = _campaign_compact_row_provenance(rows)
+                    if (
+                        actual_provenance["row_count"] != int(trial_boundary.get("row_count", -1))
+                        or actual_provenance["exact_cutoff"] != trial_boundary.get("exact_cutoff")
+                        or actual_provenance["ordered_row_manifest_digest"] != expected_digest
+                    ):
+                        raise AutonomousResearchError(
+                            "DATASET_PROVENANCE_INVALID",
+                            "campaign final-assessment dataset boundary changed",
+                        )
+                    final_rows = _campaign_rows_for_split(rows, trial_descriptor)
+                    trial_digest = expected_digest
+                else:
+                    final_rows = [
+                        row for index, row in enumerate(rows)
+                        if _campaign_row_identity(row, index) in final_ids
+                    ]
+                    trial_digest = _hash_document(final_manifest)
+                strategy = plan.strategy_for(plan.variants()[0], str(trial.get("candidate_id", trial.get("trial_id"))))
+                metrics = dict(self._run_backtest(plan, strategy, final_rows))
+                gates = protocol.get("qualification_gates", {})
+                sample_check = minimum_sample_check(
+                    int(metrics.get("sample_count", 0)),
+                    trades=int(metrics.get("filled_trades", 0)),
+                    min_observations=int(gates.get("min_samples", 0)),
+                    min_trades=int(gates.get("min_trades", 0)),
+                )
+                passed = (
+                    _finite(metrics.get("expectancy"), -math.inf) >= _finite(gates.get("min_expectancy"), 0.0)
+                    and bool(sample_check["passed"])
+                )
+                assessments.append(
+                    {
+                        "trial_id": trial.get("trial_id"),
+                        "candidate_id": trial.get("candidate_id"),
+                        "status": "QUALIFIED" if passed else "REJECTED",
+                        "passed": passed,
+                        "minimum_sample_check": sample_check,
+                        "metrics": _compact_evidence(metrics),
+                        "protected_row_identity_manifest": dict(trial_descriptor) if isinstance(trial_descriptor, Mapping) else list(trial_manifest),
+                        "final_rows_digest": trial_digest,
+                    }
+                )
+            except (AutonomousResearchError, ExperimentPlanError, TypeError, ValueError) as exc:
+                assessments.append(
+                    {
+                        "trial_id": trial.get("trial_id"),
+                        "candidate_id": trial.get("candidate_id"),
+                        "status": "SOFTWARE_OR_INPUT_ERROR",
+                        "reason": str(exc),
+                    }
+                )
+        qualified_ids = [
+            str(item.get("candidate_id"))
+            for item in assessments
+            if item.get("status") == "QUALIFIED" and str(item.get("candidate_id", "")).strip()
+        ]
+        persisted_final_manifest = (
+            dict(final_manifest)
+            if isinstance(final_manifest, Mapping)
+            else dict(final_boundary)
+            if isinstance(final_boundary, Mapping)
+            else list(final_manifest)
+        )
+        payload["final_assessment"] = {
+            "evaluated_once": True,
+            "assessments": assessments,
+            "protected_row_identity_manifest": persisted_final_manifest,
+            "protected_row_identity_digest": final_digest,
+            "row_count": final_row_count,
+        }
+        payload["final_assessment_evaluated"] = True
+        payload["qualified_candidate_ids"] = qualified_ids
+        payload["counts"]["final_assessment"] = len(assessments)
+        payload["counts"]["qualified"] = len(qualified_ids)
+        payload["status"] = "COMPLETED_QUALIFIED" if qualified_ids else "CAMPAIGN_EXHAUSTED_NO_QUALIFIED_STRATEGY"
+        payload["next_real_job"] = None
+        payload["last_updated_at"] = ensure_utc(now).isoformat()
+
+    def _advance_campaign_after_result(
+        self,
+        item: ResearchQueueItem,
+        result: Mapping[str, Any],
+        now: datetime,
+    ) -> None:
+        campaign_id = str(item.payload.get("campaign_id", "")).strip()
+        if not campaign_id:
+            return
+        job_name = self.campaign_job_name(campaign_id)
+        record = self.store.get_operator_job(job_name)
+        if not isinstance(record, Mapping):
+            return
+        payload = dict(record.get("payload") or {})
+        trial_id = str(item.payload.get("campaign_trial_id", "")).strip()
+        trials = [dict(entry) for entry in payload.get("trials", ()) if isinstance(entry, Mapping)]
+        trial = next((entry for entry in trials if str(entry.get("trial_id", "")) == trial_id), None)
+        if trial is None or str(trial.get("status", "")).upper() in CAMPAIGN_TRIAL_TERMINAL:
+            return
+        classification = self._campaign_result_classification(result)
+        trial.update(
+            {
+                "status": classification,
+                "candidate_id": result.get("candidate_id"),
+                "result": dict(result),
+                "completed_at": ensure_utc(now).isoformat(),
+            }
+        )
+        payload["trials"] = trials
+        counts = dict(payload.get("counts") or {})
+        counts["running"] = max(0, int(counts.get("running", 0)) - 1)
+        count_key = classification.lower()
+        counts[count_key] = int(counts.get(count_key, 0)) + 1
+        payload["counts"] = counts
+        payload["last_result"] = {
+            "trial_id": trial_id,
+            "status": classification,
+            "reason_code": result.get("reason_code"),
+            "candidate_id": result.get("candidate_id"),
+        }
+        self._campaign_active_state = payload
+        if classification == "DATA_INSUFFICIENT":
+            payload["status"] = "WAITING_FOR_DATA"
+            self._campaign_schedule_data_job(
+                payload,
+                trial,
+                now=now,
+                reason=str(result.get("reason", "insufficient observations")),
+            )
+        elif classification == "SOFTWARE_OR_INPUT_ERROR":
+            payload["status"] = "SOFTWARE_OR_INPUT_ERROR"
+            payload["next_real_job"] = None
+        else:
+            payload["status"] = "RUNNING"
+            self.store.set_operator_job(job_name, "RUNNING", payload, resumable=True, timestamp=now)
+            queued_next = (
+                self._campaign_queue_next(now)
+                if payload["budget_remaining"] > 0
+                else None
+            )
+            if queued_next is None:
+                self._campaign_final_assessment(payload, now=now)
+        if classification in {"DATA_INSUFFICIENT", "SOFTWARE_OR_INPUT_ERROR"}:
+            self.store.set_operator_job(job_name, payload["status"], payload, resumable=True, timestamp=now)
+        elif payload.get("status") in {"CAMPAIGN_EXHAUSTED_NO_QUALIFIED_STRATEGY", "COMPLETED_QUALIFIED"}:
+            self.store.set_operator_job(job_name, payload["status"], payload, resumable=False, timestamp=now)
+
+    def _campaign_reassessment_dataset_identity(
+        self,
+        payload: Mapping[str, Any],
+        evidence_identity: str,
+        *,
+        dataset_id: str | None,
+        dataset_version: str | None,
+    ) -> tuple[str, str]:
+        current_id = str(payload.get("dataset_id", "")).strip()
+        current_version = str(payload.get("dataset_version", "")).strip()
+        resolved_id = str(dataset_id or current_id).strip()
+        resolved_version = str(dataset_version or "").strip()
+        if resolved_version:
+            return resolved_id, resolved_version
+        if not resolved_id:
+            return resolved_id, current_version
+        # Attestation hashes are the normal evidence identity. Resolve the
+        # exact immutable version instead of guessing from version ordering.
+        catalog_lister = getattr(self.store, "list_dataset_catalog", None)
+        catalog_loader = getattr(self.store, "load_dataset_catalog", None)
+        attestation_loader = getattr(self.store, "load_dataset_integrity_attestation", None)
+        candidates: list[str] = []
+        if callable(catalog_lister):
+            try:
+                catalogs = catalog_lister(
+                    source_type="HISTORICAL",
+                    market_type=MarketType.PREDICTION.value,
+                    limit=256,
+                )
+            except TypeError:
+                try:
+                    catalogs = catalog_lister(limit=256)
+                except Exception:
+                    catalogs = ()
+            except Exception:
+                catalogs = ()
+            for catalog in catalogs if isinstance(catalogs, Sequence) else ():
+                if not isinstance(catalog, Mapping):
+                    continue
+                listed_id = str(catalog.get("dataset_id", "")).strip()
+                version = str(catalog.get("dataset_version", catalog.get("version", ""))).strip()
+                if listed_id == resolved_id and version:
+                    candidates.append(version)
+        versions = getattr(self.store, "dataset_versions", None)
+        if callable(versions):
+            try:
+                candidates.extend(str(item).strip() for item in versions(resolved_id))
+            except Exception:
+                pass
+        seen: set[str] = set()
+        for version in candidates:
+            if not version or version in seen or version == current_version:
+                continue
+            seen.add(version)
+            if callable(catalog_loader):
+                try:
+                    catalog = catalog_loader(resolved_id, version)
+                except Exception:
+                    continue
+                if not isinstance(catalog, Mapping):
+                    continue
+            if not callable(attestation_loader):
+                continue
+            try:
+                attestation = attestation_loader(resolved_id, version)
+            except Exception:
+                continue
+            if (
+                isinstance(attestation, Mapping)
+                and str(attestation.get("attestation_hash", "")).strip() == evidence_identity
+                and str(attestation.get("status", "")).strip().upper() == "CURRENT"
+            ):
+                return resolved_id, version
+        return resolved_id, current_version
+
+    @staticmethod
+    def _campaign_boundary_for_dataset(
+        dataset_id: str,
+        dataset_version: str,
+        rows: Sequence[Mapping[str, Any]],
+    ) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+        provenance = _campaign_compact_row_provenance(rows)
+        boundary = {
+            "schema_version": provenance["schema_version"],
+            "dataset_id": dataset_id,
+            "dataset_version": dataset_version,
+            "source_type": "HISTORICAL",
+            "exact_cutoff": provenance["exact_cutoff"],
+            "row_count": provenance["row_count"],
+            "ordered_row_manifest_digest": provenance["ordered_row_manifest_digest"],
+            "ordered_row_manifest_root": provenance["ordered_row_manifest_root"],
+            "content_hash": provenance["content_hash"],
+            "split_boundaries": dict(provenance["split_boundaries"]),
+        }
+        return boundary, dict(provenance["split_boundaries"])
+
+    def reassess_campaign(
+        self,
+        campaign_id: str,
+        *,
+        evidence_identity: str,
+        dataset_id: str | None = None,
+        dataset_version: str | None = None,
+        now: datetime | None = None,
+    ) -> Mapping[str, Any]:
+        """Allow one auditable changed-evidence reassessment only."""
+        current = ensure_utc(now or self.clock())
+        job_name = self.campaign_job_name(campaign_id)
+        record = self.store.get_operator_job(job_name)
+        if not isinstance(record, Mapping):
+            raise ValueError("campaign does not exist")
+        payload = dict(record.get("payload") or {})
+        identity = str(evidence_identity).strip()
+        if not identity:
+            raise ValueError("evidence_identity is required")
+        previous_identity = str(payload.get("last_evidence_identity", "")).strip() or None
+        if identity == previous_identity or int(payload.get("reassessment_count", 0)) >= 1:
+            return payload
+        waiting = [
+            dict(item)
+            for item in payload.get("trials", ())
+            if isinstance(item, Mapping) and item.get("status") == "DATA_INSUFFICIENT"
+        ]
+        if not waiting:
+            return payload
+        resolved_dataset_id, resolved_dataset_version = self._campaign_reassessment_dataset_identity(
+            payload,
+            identity,
+            dataset_id=dataset_id,
+            dataset_version=dataset_version,
+        )
+        original_dataset_id = str(payload.get("dataset_id", "")).strip()
+        original_dataset_version = str(payload.get("dataset_version", "")).strip()
+        reassessment_boundary: Mapping[str, Any] = {}
+        reassessment_manifests: Mapping[str, Any] = {}
+        protocol = payload.get("protocol")
+        if isinstance(protocol, Mapping):
+            original_boundary = protocol.get("dataset_boundary")
+            if isinstance(original_boundary, Mapping):
+                reassessment_boundary = dict(original_boundary)
+            original_manifests = protocol.get("protected_row_identity_manifests")
+            if isinstance(original_manifests, Mapping):
+                reassessment_manifests = dict(original_manifests)
+        if (
+            resolved_dataset_id != original_dataset_id
+            or resolved_dataset_version != original_dataset_version
+        ):
+            new_rows = self._campaign_dataset_rows(
+                self.store,
+                resolved_dataset_id,
+                resolved_dataset_version,
+            )
+            reassessment_boundary, reassessment_manifests = self._campaign_boundary_for_dataset(
+                resolved_dataset_id,
+                resolved_dataset_version,
+                new_rows,
+            )
+        payload["reassessment_count"] = 1
+        payload["last_evidence_identity"] = identity
+        payload["reassessment_evidence"] = {
+            "identity": identity,
+            "changed_from": previous_identity,
+            "dataset_id": resolved_dataset_id,
+            "dataset_version": resolved_dataset_version,
+            "recorded_at": ensure_utc(current).isoformat(),
+            "auditable": True,
+        }
+        trials = [dict(item) for item in payload.get("trials", ()) if isinstance(item, Mapping)]
+        existing_trial_ids = {
+            str(item.get("trial_id", "")).strip()
+            for item in trials
+        }
+        appended = 0
+        for old in waiting:
+            reassessment_id = f"{old.get('trial_id')}:reassessment-1"
+            if reassessment_id in existing_trial_ids:
+                continue
+            trials.append(
+                {
+                    "trial_id": reassessment_id,
+                    "configuration_id": old.get("configuration_id"),
+                    "configuration": dict(old.get("configuration", {})),
+                    "status": "PLANNED",
+                    "reassessment_of": old.get("trial_id"),
+                    "dataset_id": resolved_dataset_id,
+                    "dataset_version": resolved_dataset_version,
+                    "dataset_boundary": dict(reassessment_boundary),
+                    "protected_row_identity_manifests": dict(reassessment_manifests),
+                    "result": None,
+                }
+            )
+            existing_trial_ids.add(reassessment_id)
+            appended += 1
+        payload["trials"] = trials
+        counts = dict(payload.get("counts") or {})
+        counts["planned"] = int(counts.get("planned", 0)) + appended
+        payload["counts"] = counts
+        payload["status"] = "RUNNING"
+        payload["next_real_job"] = None
+        self.store.set_operator_job(job_name, "RUNNING", payload, resumable=True, timestamp=current)
+        self.store.save_report_if_absent(
+            f"campaign-reassessment:{campaign_id}:1",
+            {
+                "report_type": "polymarket_campaign_reassessment",
+                "campaign_id": campaign_id,
+                "evidence_identity": identity,
+                "changed_from": previous_identity,
+                "reassessment_count": 1,
+                "paper_only": True,
+            },
+            experiment_id=job_name,
+        )
+        self._campaign_active_state = payload
+        with self.store.transaction():
+            self._campaign_queue_next(current)
+        return dict(self.store.get_operator_job(job_name).get("payload", payload))
+    def advance_campaign(
+        self,
+        campaign_id: str,
+        *,
+        evidence_identity: str | None = None,
+        dataset_id: str | None = None,
+        dataset_version: str | None = None,
+        now: datetime | None = None,
+    ) -> Mapping[str, Any]:
+        if evidence_identity is not None:
+            return self.reassess_campaign(
+                campaign_id,
+                evidence_identity=evidence_identity,
+                dataset_id=dataset_id,
+                dataset_version=dataset_version,
+                now=now,
+            )
+        state = self.campaign_state(campaign_id)
+        return dict(state or {})
 
     def _legacy_provenance_state(
         self,
@@ -1966,7 +3204,22 @@ class AutonomousResearchProcessor:
         dedupe_key = f"successor:{plan.plan_id}:{version}"
         return validated_plan, queued_payload, dedupe_key
 
+    @staticmethod
+    def _next_dataset_job_is_due(job: Mapping[str, Any], now: datetime) -> bool:
+        """Return whether a persisted successor job may be polled now."""
+        if str(job.get("status", "")).strip().upper() != _NEXT_DATASET_JOB_STATUS_WAITING:
+            return True
+        payload = job.get("payload")
+        if not isinstance(payload, Mapping):
+            return True
+        next_check = parse_timestamp(payload.get("next_check_at"))
+        # Jobs written before the cadence field existed (or with a malformed
+        # value) remain immediately eligible rather than becoming stranded.
+        return next_check is None or ensure_utc(now) >= next_check
+
     def _advance_waiting_next_dataset_job(self, job: Mapping[str, Any], now: datetime) -> None:
+        if not self._next_dataset_job_is_due(job, now):
+            return
         job_name = str(job.get("job_name", "")).strip()
         if not job_name:
             return
@@ -2128,7 +3381,7 @@ class AutonomousResearchProcessor:
                     try:
                         with self.store.transaction():
                             current = self.store.get_operator_job(name)
-                            if isinstance(current, Mapping):
+                            if isinstance(current, Mapping) and self._next_dataset_job_is_due(current, now):
                                 self._advance_waiting_next_dataset_job(current, now)
                     except Exception as exc:
                         self._report_next_dataset_scheduler_error(exc, now)
@@ -2240,6 +3493,27 @@ class AutonomousResearchProcessor:
                     phase_event("VALIDATE", {"item_type": item.item_type})
                     result = self._process_item(item, current)
                     result = _bounded_queue_result(result)
+                    try:
+                        self._advance_campaign_after_result(item, result, current)
+                    except (RuntimeError, TypeError, ValueError, KeyError) as campaign_error:
+                        campaign_id = str(item.payload.get("campaign_id", "")).strip()
+                        if campaign_id:
+                            campaign_job = self.campaign_job_name(campaign_id)
+                            campaign_record = self.store.get_operator_job(campaign_job)
+                            campaign_payload = dict(campaign_record.get("payload") or {}) if isinstance(campaign_record, Mapping) else {}
+                            campaign_payload["status"] = "SOFTWARE_OR_INPUT_ERROR"
+                            campaign_payload["last_result"] = {
+                                "trial_id": item.payload.get("campaign_trial_id"),
+                                "status": "SOFTWARE_OR_INPUT_ERROR",
+                                "reason": str(campaign_error),
+                            }
+                            self.store.set_operator_job(
+                                campaign_job,
+                                "SOFTWARE_OR_INPUT_ERROR",
+                                campaign_payload,
+                                resumable=False,
+                                timestamp=current,
+                            )
                     phase_event(
                         "ACCEPT" if result.get("accepted") is not False else "REJECT",
                         {"reason_code": result.get("reason_code")},
@@ -2278,6 +3552,10 @@ class AutonomousResearchProcessor:
                     }
                 )
                 try:
+                    self._advance_campaign_after_result(item, result, current)
+                except (RuntimeError, TypeError, ValueError, KeyError):
+                    pass
+                try:
                     with self.store.transaction():
                         phase_event(
                             "REJECT",
@@ -2309,6 +3587,10 @@ class AutonomousResearchProcessor:
                         "paper_only": True,
                     }
                 )
+                try:
+                    self._advance_campaign_after_result(item, result, current)
+                except (RuntimeError, TypeError, ValueError, KeyError):
+                    pass
                 try:
                     with self.store.transaction():
                         phase_event(
@@ -2919,7 +4201,6 @@ class AutonomousResearchProcessor:
                         "required_validation_trades": plan.min_trades,
                         "minimum_sample_check": historical_sample_check,
                         "validation": {
-                            "sample_count": historical_sample_count,
                             "filled_trades": historical_filled_trades,
                         },
                         **split_counts,
@@ -3037,7 +4318,9 @@ class AutonomousResearchProcessor:
         )
         mutations = (
             ()
-            if bool(item.payload.get("predeclared_starting_set")) or insufficient_data
+            if bool(item.payload.get("predeclared_starting_set"))
+            or bool(item.payload.get("campaign_id"))
+            or insufficient_data
             else self._generate_mutations(plan, prepared, validation_scores, now, lineage=())
         )
         summary = self._hypothesis_result(plan, results, mutations, split_counts=split_counts)
@@ -4265,6 +5548,32 @@ class AutonomousResearchProcessor:
             raise AutonomousResearchError("INSUFFICIENT_DATA", "dataset records are not a bounded sequence")
         rows = [_normalize_row(item) for item in list(records)[:_MAX_DATASET_ROWS]]
         rows = [row for row in rows if row is not None]
+        boundary = plan.dataset_boundary
+        expected_digest = (
+            str(boundary.get("ordered_row_manifest_digest", boundary.get("content_hash", ""))).strip()
+            if isinstance(boundary, Mapping)
+            else ""
+        )
+        if expected_digest:
+            boundary_ordered = sorted(
+                rows,
+                key=lambda row: (
+                    parse_timestamp(row.get("timestamp", row.get("source_timestamp")))
+                    or datetime.min.replace(tzinfo=timezone.utc),
+                    _campaign_row_identity(row, 0),
+                    _hash_document(row),
+                ),
+            )
+            actual_provenance = _campaign_compact_row_provenance(boundary_ordered)
+            if (
+                actual_provenance["row_count"] != int(boundary.get("row_count", -1))
+                or actual_provenance["exact_cutoff"] != boundary.get("exact_cutoff")
+                or actual_provenance["ordered_row_manifest_digest"] != expected_digest
+            ):
+                raise AutonomousResearchError(
+                    "DATASET_PROVENANCE_INVALID",
+                    "dataset rows changed after the campaign boundary was locked",
+                )
         rows = self._apply_plan_filters(plan, rows)
         rows = self._apply_model_document(plan, rows)
         if not rows:
@@ -4491,6 +5800,7 @@ class AutonomousResearchProcessor:
             or slippage_bps < 0
         ):
             raise AutonomousResearchError("INVALID_PLAN", "cost assumptions must be finite and non-negative")
+        holding_period = 1
         research_mode: str | None = None
         exit_policy: Mapping[str, Any] | None = None
         if plan.market_type is MarketType.PREDICTION:
@@ -4513,6 +5823,11 @@ class AutonomousResearchProcessor:
                 resolutions=None,
                 model_document=plan.model_document,
                 holding_period=holding_period,
+                observation_horizon=(
+                    dict(plan.observation_horizon)
+                    if isinstance(plan.observation_horizon, Mapping)
+                    else {"unit": "observations", "count": holding_period}
+                ),
                 exit_policy=exit_policy,
             )
         else:
@@ -4564,6 +5879,11 @@ class AutonomousResearchProcessor:
                 "slippage_bps": slippage_bps,
             },
             "exit_policy": dict(exit_policy) if exit_policy is not None else None,
+            "observation_horizon": (
+                dict(plan.observation_horizon)
+                if isinstance(plan.observation_horizon, Mapping)
+                else {"unit": "observations", "count": holding_period}
+            ),
             "research_mode": research_mode,
             "execution_simulation": False,
             "costs": metrics.get("fees", 0.0) + metrics.get("slippage", 0.0),
@@ -6203,6 +7523,10 @@ def _bounded_queue_result(value: Mapping[str, Any]) -> dict[str, Any]:
 
 __all__ = [
     "PREDECLARED_STRATEGY_STARTING_SET",
+    "POLYMARKET_CAMPAIGN_GRID",
+    "CAMPAIGN_BUDGET_LIMIT",
+    "CAMPAIGN_STATUSES",
+    "CAMPAIGN_TRIAL_TERMINAL",
     "AutonomousQueueCycle",
     "AutonomousResearchConfig",
     "AutonomousResearchError",

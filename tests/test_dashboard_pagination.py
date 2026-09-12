@@ -3151,5 +3151,69 @@ class DashboardPaginationSurfaceTests(DashboardPaginationFixture):
         assert isinstance(payload, dict)
         self.assertEqual(payload["items"][0]["updated_at"], T0.isoformat())
 
+    def test_overview_projects_synthetic_campaign_progress_without_readiness(self) -> None:
+        campaign_id = "dashboard-synthetic-campaign"
+        next_job = f"polymarket-research-data:{campaign_id}:trial-2"
+        producer_job = f"polymarket-dataset-producer:{campaign_id}:trial-2"
+        self.store.set_operator_job(
+            next_job,
+            "WAITING_FOR_DATA",
+            {
+                "campaign_id": campaign_id,
+                "producer_job": producer_job,
+                "dataset_id": "synthetic-polymarket-history",
+                "dataset_version": "v2",
+                "reason": "DATA_INSUFFICIENT",
+            },
+            resumable=True,
+            timestamp=T0 + timedelta(days=1, seconds=2),
+        )
+        self.store.set_operator_job(
+            f"polymarket-research-campaign:{campaign_id}",
+            "WAITING_FOR_DATA",
+            {
+                "campaign_id": campaign_id,
+                "status": "WAITING_FOR_DATA",
+                "budget_limit": 24,
+                "budget_used": 2,
+                "budget_remaining": 22,
+                "last_result": {"classification": "DATA_INSUFFICIENT"},
+                "qualified_candidate_ids": ["synthetic-qualified-candidate"],
+                "next_real_job": next_job,
+                "trials": [
+                    {"trial_id": "trial-1", "status": "ECONOMIC_REJECTION"},
+                    {"trial_id": "trial-2", "status": "RUNNING"},
+                ],
+            },
+            resumable=True,
+            timestamp=T0 + timedelta(days=1, seconds=3),
+        )
+
+        status, payload, _ = self._request("api/v2/overview-summary")
+
+        self.assertEqual(status, 200)
+        assert isinstance(payload, dict)
+        progress = payload["campaign_progress"]
+        self.assertEqual(progress["campaign_id"], campaign_id)
+        self.assertEqual(progress["status"], "WAITING_FOR_DATA")
+        self.assertEqual(progress["budget"], {"limit": 24, "used": 2, "remaining": 22})
+        self.assertEqual(progress["completed"], 1)
+        self.assertEqual(progress["remaining"], 1)
+        self.assertEqual(progress["last_result"]["classification"], "DATA_INSUFFICIENT")
+        self.assertEqual(progress["qualified"], ["synthetic-qualified-candidate"])
+        self.assertEqual(progress["next_real_job"], next_job)
+        self.assertEqual(progress["waiting_prerequisite"]["producer_job"], producer_job)
+        self.assertTrue(progress["synthetic"])
+        self.assertFalse(progress["real_readiness"])
+        self.assertFalse(progress["live_execution"])
+        self.assertNotIn("synthetic-qualified-candidate", json.dumps(payload["canary"]))
+        html = _dashboard_html()
+        for marker in (
+            'researchFeedField("campaign_id","Synthetic campaign"',
+            'researchFeedField("campaign_budget","Campaign budget"',
+            'researchFeedField("campaign_waiting_prerequisite","Waiting prerequisite"',
+        ):
+            self.assertIn(marker, html)
+
 if __name__ == "__main__":
     unittest.main()

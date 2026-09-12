@@ -319,6 +319,35 @@ def build_parser() -> argparse.ArgumentParser:
     operator.add_argument("--isolated", action="store_true", help="deny production credentials and order/account transports")
     operator.add_argument("--open-browser", action="store_true", help="open the localhost operator dashboard in the default browser")
     operator.add_argument("--once", action="store_true", help="bind and stop after readiness smoke check")
+    operator.add_argument(
+        "--historical-refresh-enabled",
+        "--historical-refresh",
+        "--enable-historical-refresh",
+        "--enable-polymarket-autonomy",
+        "--polymarket-autonomy",
+        dest="historical_refresh_enabled",
+        action="store_true",
+        help="opt in to bounded Polymarket historical refresh and one finite paper campaign",
+    )
+    operator.add_argument(
+        "--historical-refresh-interval",
+        "--historical-refresh-interval-seconds",
+        dest="historical_refresh_interval_seconds",
+        type=float,
+        default=3600.0,
+    )
+    operator.add_argument(
+        "--historical-refresh-request-budget",
+        dest="historical_refresh_request_budget",
+        type=int,
+        default=25,
+    )
+    operator.add_argument(
+        "--historical-refresh-market-budget",
+        dest="historical_refresh_market_budget",
+        type=int,
+        default=4,
+    )
     historical = commands.add_parser("historical", help="run public Binance and Polymarket research")
     historical.add_argument("--markets", type=int, default=20, help="maximum resolved prediction markets to inspect")
     historical.add_argument("--timeout", type=float, default=10.0)
@@ -481,6 +510,35 @@ def build_parser() -> argparse.ArgumentParser:
     node_run.add_argument("--disable-mutations", action="store_true")
     node_run.add_argument("--disable-research", action="store_true")
     node_run.add_argument("--crypto-timeout", type=float, default=10.0)
+    node_run.add_argument(
+        "--historical-refresh-enabled",
+        "--historical-refresh",
+        "--enable-historical-refresh",
+        "--enable-polymarket-autonomy",
+        "--polymarket-autonomy",
+        dest="historical_refresh_enabled",
+        action="store_true",
+        help="opt in to bounded Polymarket historical refresh and one finite paper campaign",
+    )
+    node_run.add_argument(
+        "--historical-refresh-interval",
+        "--historical-refresh-interval-seconds",
+        dest="historical_refresh_interval_seconds",
+        type=float,
+        default=3600.0,
+    )
+    node_run.add_argument(
+        "--historical-refresh-request-budget",
+        dest="historical_refresh_request_budget",
+        type=int,
+        default=25,
+    )
+    node_run.add_argument(
+        "--historical-refresh-market-budget",
+        dest="historical_refresh_market_budget",
+        type=int,
+        default=4,
+    )
     node_status = commands.add_parser("node-status", help="show persisted node status")
     node_status.add_argument("--db", default=DEFAULT_DB_PATH)
     node_status.add_argument("--lock")
@@ -1592,6 +1650,10 @@ def _main_impl(argv: Sequence[str] | None = None) -> int:
                 max_generation_depth=args.max_generation_depth,
                 max_experiments_per_day=args.max_experiments_per_day,
                 mutation_enabled=not args.disable_mutations,
+                historical_refresh_enabled=args.historical_refresh_enabled,
+                historical_refresh_interval_seconds=args.historical_refresh_interval_seconds,
+                historical_refresh_request_budget=args.historical_refresh_request_budget,
+                historical_refresh_market_budget=args.historical_refresh_market_budget,
             ),
             crypto_provider=crypto_provider,
         )
@@ -1649,6 +1711,10 @@ def _main_impl(argv: Sequence[str] | None = None) -> int:
             dashboard_store,
             db_path=args.db,
             hermes_job_id=args.hermes_job_id,
+            historical_refresh_enabled=args.historical_refresh_enabled,
+            historical_refresh_interval_seconds=args.historical_refresh_interval_seconds,
+            historical_refresh_request_budget=args.historical_refresh_request_budget,
+            historical_refresh_market_budget=args.historical_refresh_market_budget,
         )
         if dashboard_store.get_operator_config("hermes_research_job_id", None) is None:
             control.configure_hermes_job_id(control.hermes_job_id)
@@ -1677,15 +1743,11 @@ def _main_impl(argv: Sequence[str] | None = None) -> int:
     if args.command == "dashboard" and getattr(args, "dashboard_command", None) in {None, "start"}:
         dashboard_store = AxiomStore(args.db) if args.db else None
         server = DashboardServer(args.host, args.port, data=DashboardData(store=dashboard_store))
-        if args.once:
-            server.start()
-            print(server.url)
-            server.stop()
-            if dashboard_store is not None:
-                dashboard_store.close()
-            return 0
         try:
-            print(f"Axiom dashboard: http://{args.host}:{args.port}")
+            if args.once:
+                server.start()
+                print(server.url)
+                return 0
             server.serve_forever()
         except KeyboardInterrupt:
             return 0

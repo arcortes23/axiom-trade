@@ -324,6 +324,230 @@ class PolymarketResearchOrchestrationTests(unittest.TestCase):
             )
             self.assertEqual(store.research_queue_stats()["total"], 6)
 
+    def test_finite_campaign_persists_protocol_before_queueing_trial(self) -> None:
+        with AxiomStore(":memory:") as store:
+            store.save_dataset(
+                "campaign-history",
+                "v1",
+                [
+                    {
+                        "timestamp": T0.isoformat(),
+                        "market_id": "campaign-market",
+                        "yes_mid": 0.50,
+                        "yes_bid": 0.49,
+                        "yes_ask": 0.51,
+                        "settlement": "open",
+                    }
+                ],
+            )
+            processor = AutonomousResearchProcessor(store, clock=lambda: T0)
+            state = processor.start_polymarket_campaign(
+                "durable-campaign",
+                dataset_id="campaign-history",
+                dataset_version="v1",
+                now=T0,
+            )
+            self.assertEqual(state["schema_version"], "polymarket-finite-campaign-v1")
+            self.assertEqual(state["status"], "RUNNING")
+            self.assertEqual(state["protocol"]["schema_version"], "polymarket-finite-campaign-v1")
+            self.assertEqual(state["protocol"]["dataset_boundary"]["dataset_id"], "campaign-history")
+            self.assertEqual(state["protocol"]["dataset_boundary"]["dataset_version"], "v1")
+            self.assertEqual(state["budget_used"], 1)
+            self.assertEqual(state["counts"]["running"], 1)
+            self.assertEqual(state["counts"]["planned"], len(processor.campaign_configurations()) - 1)
+
+            durable = store.get_operator_job(processor.campaign_job_name("durable-campaign"))
+            self.assertIsNotNone(durable)
+            assert durable is not None
+            self.assertEqual(durable["status"], "RUNNING")
+            self.assertTrue(durable["resumable"])
+            self.assertEqual(durable["payload"], state)
+            queued = processor.bus.list_campaign_trials("durable-campaign")
+            self.assertEqual(len(queued), 1)
+            trial = queued[0]
+            self.assertEqual(trial.payload["campaign_id"], "durable-campaign")
+            self.assertEqual(trial.payload["campaign_trial_id"], state["trials"][0]["trial_id"])
+            self.assertTrue(str(trial.payload["campaign_protocol_hash"]).startswith("sha256:"))
+            self.assertTrue(trial.payload["paper_only"])
+            self.assertEqual(
+                trial.payload["experiment_plan"]["campaign_protocol"],
+                state["protocol"],
+            )
+
+            resumed = AutonomousResearchProcessor(store, clock=lambda: T0).campaign_state("durable-campaign")
+            self.assertEqual(resumed, state)
+
+    def test_finite_campaign_advance_marks_trial_and_queues_next(self) -> None:
+        with AxiomStore(":memory:") as store:
+            store.save_dataset(
+                "campaign-history",
+                "v1",
+                [
+                    {
+                        "timestamp": T0.isoformat(),
+                        "market_id": "campaign-market",
+                        "yes_mid": 0.50,
+                        "yes_bid": 0.49,
+                        "yes_ask": 0.51,
+                        "settlement": "open",
+                    }
+                ],
+            )
+            processor = AutonomousResearchProcessor(store, clock=lambda: T0)
+            processor.start_polymarket_campaign(
+                "advance-campaign",
+                dataset_id="campaign-history",
+                dataset_version="v1",
+                now=T0,
+            )
+            first = processor.bus.list_campaign_trials("advance-campaign")[0]
+            processor._advance_campaign_after_result(
+                first,
+                {
+                    "accepted": False,
+                    "reason_code": "NEGATIVE_VALIDATION_EXPECTANCY",
+                    "stage": CandidateStage.REJECTED.value,
+                    "candidate_id": "campaign-candidate-0",
+                },
+                T0 + timedelta(minutes=1),
+            )
+            state = processor.campaign_state("advance-campaign")
+            self.assertIsNotNone(state)
+            assert state is not None
+            self.assertEqual(state["status"], "RUNNING")
+            self.assertEqual(state["last_result"]["status"], "ECONOMIC_REJECTION")
+            self.assertEqual(state["counts"]["running"], 1)
+            self.assertEqual(state["counts"]["economic_rejection"], 1)
+            self.assertEqual(state["budget_used"], 2)
+            self.assertEqual(state["trials"][0]["status"], "ECONOMIC_REJECTION")
+            self.assertEqual(state["trials"][1]["status"], "RUNNING")
+            queued = processor.bus.list_campaign_trials("advance-campaign")
+            self.assertEqual(len(queued), 2)
+            self.assertEqual(
+                {item.payload["campaign_trial_id"] for item in queued},
+                {state["trials"][0]["trial_id"], state["trials"][1]["trial_id"]},
+            )
+            second = next(item for item in queued if item.payload["campaign_trial_id"] == state["trials"][1]["trial_id"])
+            self.assertEqual(second.payload["proposal_id"], state["trials"][1]["proposal_id"])
+            self.assertEqual(second.payload["hypothesis_id"], state["trials"][1]["hypothesis_id"])
+            queued_plan = ExperimentPlan.from_mapping(
+                second.payload["experiment_plan"],
+                hypothesis_id=second.payload["hypothesis_id"],
+            )
+            self.assertEqual(queued_plan.plan_id, state["trials"][1]["plan_id"])
+            self.assertEqual(queued_plan.plan_hash, state["trials"][1]["plan_hash"])
+            persisted = store.load_experiment_plan(state["trials"][1]["plan_id"])
+            self.assertIsNotNone(persisted)
+            assert persisted is not None
+            persisted_plan = ExperimentPlan.from_mapping(
+                persisted["plan"],
+                hypothesis_id=persisted["hypothesis_id"],
+            )
+            self.assertEqual(persisted_plan.plan_id, queued_plan.plan_id)
+            self.assertEqual(persisted_plan.plan_hash, queued_plan.plan_hash)
+            self.assertEqual(persisted["plan_hash"], queued_plan.plan_hash)
+
+            # Simulate a restart after the queue commit but before the
+            # campaign cursor commit.  Recovery must bind the existing row
+            # without submitting it again or spending another budget unit.
+            durable = store.get_operator_job(processor.campaign_job_name("advance-campaign"))
+            self.assertIsNotNone(durable)
+            assert durable is not None
+            recovery_payload = dict(durable["payload"])
+            recovery_trials = [dict(item) for item in recovery_payload["trials"]]
+            recovery_trials[1]["status"] = "PLANNED"
+            for key in ("proposal_id", "hypothesis_id", "plan_id", "plan_hash", "queue_item_id", "queued_at"):
+                recovery_trials[1].pop(key, None)
+            recovery_payload["trials"] = recovery_trials
+            recovery_counts = dict(recovery_payload["counts"])
+            recovery_counts["planned"] += 1
+            recovery_counts["running"] -= 1
+            recovery_payload["counts"] = recovery_counts
+            recovery_payload["budget_used"] -= 1
+            recovery_payload["budget_remaining"] += 1
+            store.set_operator_job(
+                processor.campaign_job_name("advance-campaign"),
+                "RUNNING",
+                recovery_payload,
+                resumable=True,
+                timestamp=T0 + timedelta(minutes=2),
+            )
+            restarted = AutonomousResearchProcessor(store, clock=lambda: T0)
+            restarted.start_polymarket_campaign(
+                "advance-campaign",
+                dataset_id="campaign-history",
+                dataset_version="v1",
+                now=T0 + timedelta(minutes=2),
+            )
+            with patch.object(
+                restarted.bus,
+                "submit_campaign_trial",
+                side_effect=AssertionError("recovery must reuse the existing queue binding"),
+            ):
+                restarted._campaign_queue_next(T0 + timedelta(minutes=2))
+            recovered = restarted.campaign_state("advance-campaign")
+            self.assertIsNotNone(recovered)
+            assert recovered is not None
+            self.assertEqual(recovered["trials"][1]["status"], "RUNNING")
+            self.assertEqual(recovered["budget_used"], 2)
+            self.assertEqual(len(restarted.bus.list_campaign_trials("advance-campaign")), 2)
+
+    def test_finite_campaign_exhaustion_is_terminal_and_durable(self) -> None:
+        campaign_grid = (
+            {
+                "configuration_id": "momentum:lookback-1:threshold-0.05",
+                "template": "momentum",
+                "parameters": {"lookback": 1, "threshold": 0.05},
+            },
+        )
+        with patch("axiom.autonomous.POLYMARKET_CAMPAIGN_GRID", campaign_grid), AxiomStore(":memory:") as store:
+            store.save_dataset(
+                "campaign-history",
+                "v1",
+                [
+                    {
+                        "timestamp": T0.isoformat(),
+                        "market_id": "campaign-market",
+                        "yes_mid": 0.50,
+                        "yes_bid": 0.49,
+                        "yes_ask": 0.51,
+                        "settlement": "open",
+                    }
+                ],
+            )
+            processor = AutonomousResearchProcessor(store, clock=lambda: T0)
+            processor.start_polymarket_campaign(
+                "exhausted-campaign",
+                dataset_id="campaign-history",
+                dataset_version="v1",
+                now=T0,
+            )
+            trial = processor.bus.list_campaign_trials("exhausted-campaign")[0]
+            processor._advance_campaign_after_result(
+                trial,
+                {
+                    "accepted": False,
+                    "reason_code": "NEGATIVE_VALIDATION_EXPECTANCY",
+                    "stage": CandidateStage.REJECTED.value,
+                    "candidate_id": "campaign-candidate-0",
+                },
+                T0 + timedelta(minutes=1),
+            )
+            state = processor.campaign_state("exhausted-campaign")
+            self.assertIsNotNone(state)
+            assert state is not None
+            self.assertEqual(state["status"], "CAMPAIGN_EXHAUSTED_NO_QUALIFIED_STRATEGY")
+            self.assertTrue(state["final_assessment_evaluated"])
+            self.assertEqual(state["final_assessment"]["assessments"], [])
+            self.assertEqual(state["counts"]["economic_rejection"], 1)
+            self.assertEqual(state["counts"]["qualified"], 0)
+            durable = store.get_operator_job(processor.campaign_job_name("exhausted-campaign"))
+            self.assertIsNotNone(durable)
+            assert durable is not None
+            self.assertEqual(durable["status"], "CAMPAIGN_EXHAUSTED_NO_QUALIFIED_STRATEGY")
+            self.assertFalse(durable["resumable"])
+
+
     def test_waiting_job_projects_large_attestation_below_operator_limit(self) -> None:
         with AxiomStore(":memory:") as store:
             proposal = _legacy_prediction_predecessor(candidate_id="large-attestation-predecessor")
@@ -475,17 +699,30 @@ class PolymarketResearchOrchestrationTests(unittest.TestCase):
             self.assertEqual(waiting_payload["predecessor_candidate_id"], candidate_id)
             self.assertEqual(waiting_payload["rejected_dataset_version"], "history-v1")
             self.assertFalse(waiting_payload["required_predicate"]["rolling_collection_satisfies"])
+            self.assertEqual(waiting_payload["next_check_at"], (T0 + timedelta(minutes=1)).isoformat())
+            waiting_before_early_tick = store.get_operator_job(job_name)
+            self.assertEqual(waiting_before_early_tick, waiting)
+
+            def pending_tick(controller: AutonomousResearchProcessor, tick: datetime):
+                with patch.object(controller, "_recover_legacy_predecessors", return_value=()), patch.object(
+                    controller,
+                    "_enqueue_predeclared_from_persisted_scope",
+                    return_value=(),
+                ), patch.object(controller.bus, "claim", return_value=None):
+                    return controller.process_pending(now=tick)
 
             successor_dedupe = f"successor:{plan.plan_id}:history-v2"
             self.assertEqual(
                 [item for item in store.list_research_items(limit=100) if item["dedupe_key"] == successor_dedupe],
                 [],
             )
-            processor._schedule_next_dataset_jobs(T0)
+            early_cycle = pending_tick(processor, T0)
+            self.assertEqual(early_cycle.claimed, 0)
             self.assertEqual(
                 [item for item in store.list_research_items(limit=100) if item["dedupe_key"] == successor_dedupe],
                 [],
             )
+            self.assertEqual(store.get_operator_job(job_name), waiting_before_early_tick)
 
             old_rows = store.load_dataset("Polymarket-historical", "history-v1")
             store.save_dataset("Polymarket-historical", "rolling-v1", old_rows)
@@ -503,11 +740,12 @@ class PolymarketResearchOrchestrationTests(unittest.TestCase):
                 source_type="FORWARD_COLLECTED",
                 snapshot_id="rolling-snapshot",
             )
-            processor._schedule_next_dataset_jobs(T0)
+            pending_tick(processor, T0)
             self.assertEqual(
                 [item for item in store.list_research_items(limit=100) if item["dedupe_key"] == successor_dedupe],
                 [],
             )
+            self.assertEqual(store.get_operator_job(job_name), waiting_before_early_tick)
 
             store.save_dataset("Polymarket-historical", "history-v2", old_rows)
             store.save_dataset_catalog(
@@ -538,7 +776,22 @@ class PolymarketResearchOrchestrationTests(unittest.TestCase):
             self.assertEqual(attestation["status"], "CURRENT")
             self.assertEqual(attestation["contamination_result"], "PASS")
 
-            processor._schedule_next_dataset_jobs(T0)
+            pending_tick(processor, T0)
+            self.assertEqual(
+                [item for item in store.list_research_items(limit=100) if item["dedupe_key"] == successor_dedupe],
+                [],
+            )
+            self.assertEqual(store.get_operator_job(job_name), waiting_before_early_tick)
+
+            # The exact persisted boundary is honored by a fresh controller.
+            due = T0 + timedelta(minutes=1)
+            restarted = AutonomousResearchProcessor(
+                store,
+                config=AutonomousResearchConfig(max_items_per_cycle=1, mutation_enabled=False),
+                clock=lambda: due,
+            )
+            due_cycle = pending_tick(restarted, due)
+            self.assertEqual(due_cycle.claimed, 0)
             successor_rows = [
                 item for item in store.list_research_items(limit=100)
                 if item["dedupe_key"] == successor_dedupe

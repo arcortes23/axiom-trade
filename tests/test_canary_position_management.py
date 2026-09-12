@@ -68,7 +68,22 @@ class OfflineOfficialVenue:
     def get_order(self, order_id: str) -> dict[str, str]:
         if self.fail_reads:
             raise RuntimeError("temporary account read failure")
-        result = {"id": order_id, "status": self.order_status}
+        side = "BUY" if order_id == "late-entry-order" else "SELL"
+        original_size = (
+            "2"
+            if order_id == "late-entry-order"
+            else "0.5"
+            if order_id == "late-exit-order"
+            else "1"
+        )
+        result = {
+            "id": order_id,
+            "status": self.order_status,
+            "side": side,
+            "market_id": "market-1",
+            "token_id": "token-yes",
+            "original_size": original_size,
+        }
         if self.settlement_status is not None and (
             self.settlement_order_id is None or self.settlement_order_id == order_id
         ):
@@ -78,8 +93,15 @@ class OfflineOfficialVenue:
     def list_account_trades(self, order_id: str) -> list[dict[str, str]]:
         if self.fail_reads:
             raise RuntimeError("temporary account read failure")
+        side = "BUY" if order_id == "late-entry-order" else "SELL"
         return [
-            dict(trade)
+            {
+                **dict(trade),
+                "order_id": trade.get("order_id", order_id),
+                "side": trade.get("side", side),
+                "market_id": trade.get("market_id", "market-1"),
+                "token_id": trade.get("token_id", "token-yes"),
+            }
             for trade in self.trades_by_order.get(order_id, self.trades)
         ]
 
@@ -434,6 +456,11 @@ class CanaryPositionManagementTests(unittest.TestCase):
         self.assertEqual(matched["status"], "RECONCILED")
         self.assertEqual(self._request()["status"], "MATCHED")
         self.assertEqual(self._lot()["pending_exit_quantity"], "1")
+        request = self._request()
+        self.assertEqual(request["request_id"], submitted["request_id"])
+        self.assertEqual(request["position_id"], submitted["position_id"])
+        self.assertEqual(request["reservation_id"], submitted["reservation_id"])
+        self.assertEqual(request["event_id"], submitted["reservation_id"])
         reservation = self._reservation(str(submitted["reservation_id"]))
         self.assertEqual(
             reservation["status"],
@@ -455,6 +482,8 @@ class CanaryPositionManagementTests(unittest.TestCase):
             ),
         )
         self.assertEqual(Decimal(str(equity["equity_loss_usd"])), Decimal("0.01049"))
+        self.assertEqual(Decimal(str(equity["aggregate_open_cost_usd"])), Decimal("0.50"))
+        self.assertEqual(Decimal(str(equity["aggregate_exposure_usd"])), Decimal("0.50"))
 
         self.venue.trades[0]["status"] = "CONFIRMED"
         confirmed = position_module.reconcile_pending(self.service, self.venue)
@@ -465,6 +494,29 @@ class CanaryPositionManagementTests(unittest.TestCase):
         confirmed_reservation = self._reservation(str(submitted["reservation_id"]))
         self.assertEqual(confirmed_reservation["status"], "FILLED")
         self.assertIsNone(confirmed_reservation["released_at"])
+        confirmed_accounting = self.store.canary_risk_accounting(self.now)
+        self.assertEqual(
+            Decimal(str(confirmed_accounting["aggregate_open_cost_usd"])),
+            Decimal("0.50"),
+        )
+        self.assertEqual(
+            Decimal(str(confirmed_accounting["aggregate_exposure_usd"])),
+            Decimal("0.50"),
+        )
+        self.venue.order_status = "FILLED"
+        filled = position_module.reconcile_pending(self.service, self.venue)
+        self.assertEqual(filled["status"], "RECONCILED")
+        self.assertEqual(self._request()["status"], "FILLED")
+        filled_accounting = self.store.canary_risk_accounting(self.now)
+        self.assertEqual(
+            Decimal(str(filled_accounting["aggregate_open_cost_usd"])),
+            Decimal("0.50"),
+        )
+        self.assertEqual(
+            Decimal(str(filled_accounting["aggregate_exposure_usd"])),
+            Decimal("0.50"),
+        )
+        self.venue.order_status = "MATCHED"
         self.venue.settlement_status = "SETTLED"
         settled = position_module.reconcile_pending(self.service, self.venue)
         self.assertEqual(settled["status"], "RECONCILED")
@@ -477,10 +529,16 @@ class CanaryPositionManagementTests(unittest.TestCase):
         self.assertEqual(Decimal(str(lot["exit_fees"])), Decimal("0.00049"))
         self.assertEqual(Decimal(str(lot["realized_pnl"])), Decimal("-0.01049"))
         risk_fill = self.store.connection.execute(
-            "SELECT detail_json FROM canary_risk_fills WHERE fill_id='sell-fill-1'"
+            "SELECT fill_id,reservation_id,detail_json FROM canary_risk_fills "
+            "WHERE fill_id='sell-fill-1'"
         ).fetchone()
         self.assertIsNotNone(risk_fill)
+        assert risk_fill is not None
+        self.assertEqual(risk_fill["reservation_id"], request["reservation_id"])
+        self.assertEqual(risk_fill["fill_id"], "sell-fill-1")
         detail = json.loads(risk_fill["detail_json"])
+        self.assertEqual(detail["position_id"], request["position_id"])
+        self.assertEqual(detail["request_id"], request["request_id"])
         self.assertEqual(detail["entry_cost_usd"], "0.50")
         self.assertEqual(detail["proceeds_usd"], "0.48951")
         self.assertEqual(detail["realized_pnl_usd"], "-0.01049")
@@ -494,8 +552,200 @@ class CanaryPositionManagementTests(unittest.TestCase):
         self.assertEqual(position_fill["fee"], "0.00049")
         self.assertEqual(position_fill["filled_at"], self.now.isoformat())
         final_accounting = self.store.canary_risk_accounting(self.now)
+        self.assertEqual(Decimal(str(final_accounting["aggregate_open_cost_usd"])), Decimal("0"))
+        self.assertEqual(Decimal(str(final_accounting["aggregate_exposure_usd"])), Decimal("0"))
+        self.assertEqual(
+            Decimal(str(final_accounting["today_realized_pnl_usd"])),
+            Decimal("-0.01049"),
+        )
         self.assertEqual(final_accounting["equity_status"], "KNOWN")
         self.assertEqual(Decimal(str(final_accounting["realized_loss_usd"])), Decimal("0.01049"))
+        repeated_accounting = self.store.canary_risk_accounting(self.now)
+        self.assertEqual(
+            repeated_accounting["aggregate_open_cost_usd"],
+            final_accounting["aggregate_open_cost_usd"],
+        )
+        self.assertEqual(
+            repeated_accounting["aggregate_exposure_usd"],
+            final_accounting["aggregate_exposure_usd"],
+        )
+        self.assertEqual(
+            repeated_accounting["today_realized_pnl_usd"],
+            final_accounting["today_realized_pnl_usd"],
+        )
+
+    def test_mixed_unrelated_fill_is_fail_closed_without_lot_or_risk_mutation(self) -> None:
+        submitted = self._submit_exit()
+        self.venue.trades = [
+            {
+                "trade_id": "owned-fill",
+                "quantity": "0.5",
+                "price": "0.49",
+                "fee_rate_bps": "10",
+                "match_time": self.now.isoformat(),
+                "status": "CONFIRMED",
+            },
+            {
+                "trade_id": "unrelated-fill",
+                "order_id": "different-order",
+                "quantity": "0.5",
+                "price": "0.49",
+                "fee_rate_bps": "10",
+                "match_time": self.now.isoformat(),
+                "status": "CONFIRMED",
+            },
+        ]
+
+        reconciled = position_module.reconcile_pending(self.service, self.venue)
+
+        self.assertEqual(reconciled["status"], "DEGRADED")
+        self.assertEqual(self._request()["status"], "UNKNOWN")
+        self.assertEqual(self._lot()["sold_quantity"], "0")
+        self.assertEqual(self._lot()["pending_exit_quantity"], "1")
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM canary_position_fills"
+            ).fetchone()[0],
+            0,
+        )
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM canary_risk_fills"
+            ).fetchone()[0],
+            1,
+        )
+        self.assertEqual(
+            self._reservation(str(submitted["reservation_id"]))["status"],
+            "OPEN",
+        )
+
+    def test_duplicate_fill_owned_by_another_request_is_explicit_conflict(self) -> None:
+        original_lot = dict(
+            self.store.connection.execute(
+                "SELECT * FROM canary_position_lots WHERE position_id='position-1'"
+            ).fetchone()
+        )
+        original_lot.update(
+            {
+                "position_id": "position-2",
+                "event_id": "entry-event-2",
+                "reservation_id": "entry-reservation-2",
+            }
+        )
+        with self.store.connection:
+            self.store.connection.execute(
+                "INSERT INTO canary_position_lots("
+                + ",".join(original_lot)
+                + ") VALUES("
+                + ",".join("?" for _ in original_lot)
+                + ")",
+                tuple(original_lot.values()),
+            )
+        entry = dict(
+            self.store.connection.execute(
+                "SELECT * FROM canary_risk_reservations "
+                "WHERE reservation_id='entry-reservation-1'"
+            ).fetchone()
+        )
+        entry.update(
+            {
+                "reservation_id": "entry-reservation-2",
+                "intent_id": "entry-intent-2",
+                "event_id": "entry-event-2",
+                "filled_cost": "0",
+                "remaining_cost": "0.50",
+                "filled_quantity": "0",
+                "status": "HELD",
+                "detail_json": json.dumps(
+                    {"side": "BUY", "token_id": "token-yes"},
+                    sort_keys=True,
+                ),
+                "created_at": self.now.isoformat(),
+                "updated_at": self.now.isoformat(),
+                "released_at": None,
+            }
+        )
+        with self.store.connection:
+            self.store.connection.execute(
+                "INSERT INTO canary_risk_reservations("
+                + ",".join(entry)
+                + ") VALUES("
+                + ",".join("?" for _ in entry)
+                + ")",
+                tuple(entry.values()),
+            )
+        self.store.record_canary_fill(
+            fill_id="entry-fill-2",
+            reservation_id="entry-reservation-2",
+            quantity="1",
+            price="0.50",
+            cost="0.50",
+            fee="0",
+            filled_at=self.now,
+            detail={
+                "side": "BUY",
+                "token_id": "token-yes",
+                "settlement_status": "CONFIRMED",
+            },
+        )
+        first = self._submit_exit()
+        self.next_order_id = "exit-2"
+        second = self.service.submit_exit(
+            "position-2",
+            self.venue,
+            expected_generation=int(self.config["generation"]),
+            config_id=str(self.config["config_id"]),
+        )
+        self.venue.trades_by_order["exit-1"] = [
+            {
+                "trade_id": "cross-request-fill",
+                "quantity": "1",
+                "price": "0.49",
+                "fee_rate_bps": "10",
+                "match_time": self.now.isoformat(),
+                "status": "CONFIRMED",
+            }
+        ]
+        self.venue.trades_by_order["exit-2"] = [
+            {
+                "trade_id": "cross-request-fill",
+                "quantity": "1",
+                "price": "0.49",
+                "fee_rate_bps": "10",
+                "match_time": self.now.isoformat(),
+                "status": "CONFIRMED",
+            }
+        ]
+
+        reconciled = position_module.reconcile_pending(self.service, self.venue)
+
+        self.assertEqual(reconciled["status"], "DEGRADED")
+        first_request = self.store.connection.execute(
+            "SELECT status FROM canary_position_requests WHERE request_id=?",
+            (first["request_id"],),
+        ).fetchone()
+        second_request = self.store.connection.execute(
+            "SELECT status FROM canary_position_requests WHERE request_id=?",
+            (second["request_id"],),
+        ).fetchone()
+        self.assertEqual(first_request["status"], "MATCHED")
+        self.assertEqual(second_request["status"], "UNKNOWN")
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM canary_risk_fills WHERE fill_id='cross-request-fill'"
+            ).fetchone()[0],
+            1,
+        )
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM canary_position_fills WHERE fill_id='cross-request-fill'"
+            ).fetchone()[0],
+            1,
+        )
+        self.assertEqual(
+            self._reservation(str(second["reservation_id"]))["status"],
+            "OPEN",
+        )
 
     def test_failed_settlement_creates_no_inventory_or_proceeds(self) -> None:
         self.venue.order_status = "FAILED"
@@ -546,6 +796,81 @@ class CanaryPositionManagementTests(unittest.TestCase):
         retry = self._submit_exit()
         self.assertEqual(retry["order_id"], "exit-2")
         self.assertEqual(self.service.submit_position_order.call_count, 2)
+
+    def test_authoritative_partial_settlement_releases_remainder_with_exact_open_basis(self) -> None:
+        self.venue.order_status = "MATCHED"
+        self.venue.trades = [
+            {
+                "trade_id": "partial-settled-fill",
+                "quantity": "0.4",
+                "price": "0.49",
+                "fee_rate_bps": "10",
+                "match_time": self.now.isoformat(),
+                "status": "CONFIRMED",
+            }
+        ]
+        self.venue.settlement_status = "SETTLED_PARTIAL"
+        submitted = self._submit_exit()
+
+        reconciled = position_module.reconcile_pending(self.service, self.venue)
+
+        self.assertEqual(reconciled["status"], "RECONCILED")
+        request = self._request()
+        lot = self._lot()
+        self.assertEqual(request["status"], "SETTLED_PARTIAL")
+        self.assertEqual(request["settlement_status"], "SETTLED_PARTIAL")
+        self.assertEqual(lot["status"], "OPEN")
+        self.assertEqual(lot["quantity"], "1")
+        self.assertEqual(lot["sold_quantity"], "0.4")
+        self.assertEqual(lot["pending_exit_quantity"], "0")
+        self.assertEqual(Decimal(lot["cost_basis"]), Decimal("0.50"))
+        self.assertEqual(Decimal(lot["gross_proceeds"]), Decimal("0.196"))
+        self.assertEqual(Decimal(lot["exit_fees"]), Decimal("0.000196"))
+        self.assertEqual(Decimal(lot["realized_pnl"]), Decimal("-0.004196"))
+        self.assertEqual(
+            self._reservation(str(submitted["reservation_id"]))["status"],
+            "SETTLED",
+        )
+        self.assertEqual(position_module._request_rows(self.service), [])
+        accounting = self.store.canary_risk_accounting(self.now)
+        self.assertEqual(
+            Decimal(str(accounting["aggregate_open_cost_usd"])),
+            Decimal("0.30"),
+        )
+        self.assertEqual(
+            Decimal(str(accounting["aggregate_exposure_usd"])),
+            Decimal("0.30"),
+        )
+        positions = position_module.list_positions(self.service)
+        self.assertEqual(len(positions), 1)
+        self.assertEqual(positions[0].quantity, Decimal("0.6"))
+        self.assertEqual(positions[0].cost_basis, Decimal("0.50"))
+
+        self.next_order_id = "exit-2"
+        self.venue.order_status = "MATCHED"
+        self.venue.settlement_status = None
+        self.venue.trades = []
+        retry = self._submit_exit()
+        self.assertEqual(retry["order_id"], "exit-2")
+        self.assertEqual(retry["quantity"], "0.6")
+        self.assertEqual(Decimal(str(self.post_calls[-1]["size"])), Decimal("0.6"))
+
+    def test_authoritative_zero_fill_malformed_trade_payload_stays_pending(self) -> None:
+        self.venue.order_status = "MATCHED"
+        self.venue.settlement_status = "SETTLED"
+        submitted = self._submit_exit()
+        self.venue.list_account_trades = lambda order_id: {"trades": "bad"}  # type: ignore[method-assign]
+
+        reconciled = position_module.reconcile_pending(self.service, self.venue)
+
+        self.assertEqual(reconciled["status"], "DEGRADED")
+        self.assertEqual(reconciled["requests"][0]["reason"], "CANARY_TRADE_RESPONSE_INVALID")
+        self.assertEqual(self._request()["status"], "UNKNOWN")
+        self.assertEqual(self._lot()["pending_exit_quantity"], "1")
+        self.assertEqual(
+            self._reservation(str(submitted["reservation_id"]))["status"],
+            "OPEN",
+        )
 
     def test_matched_then_failed_preserves_inventory_and_releases_pending_exit(self) -> None:
         self.venue.order_status = "MATCHED"
@@ -802,6 +1127,307 @@ class CanaryPositionManagementTests(unittest.TestCase):
         )
         self.assertEqual(self._request()["status"], "SETTLED")
 
+    def test_unrecognized_venue_status_is_unknown_and_retryable(self) -> None:
+        submitted = self._submit_exit()
+        self.venue.order_status = "PROCESSING"
+
+        first = position_module.reconcile_pending(self.service, self.venue)
+
+        self.assertEqual(first["status"], "RECONCILED")
+        self.assertEqual(first["requests"][0]["status"], "UNKNOWN")
+        self.assertEqual(self._request()["status"], "UNKNOWN")
+        self.assertEqual(self._reservation(str(submitted["reservation_id"]))["status"], "OPEN")
+        self.assertEqual(len(position_module._request_rows(self.service)), 1)
+
+        self.venue.order_status = "MATCHED"
+        retry = position_module.reconcile_pending(self.service, self.venue)
+
+        self.assertEqual(retry["status"], "RECONCILED")
+        self.assertEqual(retry["requests"][0]["status"], "MATCHED")
+        self.assertEqual(self._request()["status"], "MATCHED")
+
+    def test_stale_post_settled_reconciliation_cannot_reopen_or_change_basis(self) -> None:
+        self.venue.trades = [
+            {
+                "trade_id": "settled-fill",
+                "quantity": "1",
+                "price": "0.49",
+                "fee_rate_bps": "10",
+                "match_time": self.now.isoformat(),
+                "status": "CONFIRMED",
+            }
+        ]
+        submitted = self._submit_exit()
+        self.venue.settlement_status = "SETTLED"
+        settled = position_module.reconcile_pending(self.service, self.venue)
+        self.assertEqual(settled["status"], "RECONCILED")
+
+        before = self.store.canary_risk_accounting(self.now)
+        stale_request = self._request()
+        self.venue.settlement_status = None
+        self.venue.order_status = "PROCESSING"
+        stale_order = self.venue.get_order(str(submitted["order_id"]))
+
+        replay = position_module._apply_reconciled_request(
+            self.service,
+            stale_request,
+            stale_order,
+            [],
+            self.now,
+        )
+
+        self.assertEqual(replay["status"], "SETTLED")
+        self.assertEqual(self._request()["status"], "SETTLED")
+        self.assertEqual(self._lot()["status"], "CLOSED")
+        self.assertEqual(
+            self._reservation(str(submitted["reservation_id"]))["status"],
+            "SETTLED",
+        )
+        after = self.store.canary_risk_accounting(self.now)
+        self.assertEqual(after["aggregate_open_cost_usd"], before["aggregate_open_cost_usd"])
+        self.assertEqual(after["aggregate_exposure_usd"], before["aggregate_exposure_usd"])
+        self.assertEqual(after["today_realized_pnl_usd"], before["today_realized_pnl_usd"])
+
+
+    def test_interleaved_stale_reconciliation_applies_confirmed_partial_fill_once(self) -> None:
+        submitted = self._submit_exit()
+        stale_request = self._request()
+        order_id = str(submitted["order_id"])
+        stale_order = {
+            "id": order_id,
+            "status": "MATCHED",
+            "side": "SELL",
+            "market_id": "market-1",
+            "token_id": "token-yes",
+            "original_size": "1",
+        }
+        settled_order = dict(stale_order)
+        settled_order["settlement_status"] = "SETTLED"
+        trade = {
+            "trade_id": "interleaved-fill",
+            "order_id": order_id,
+            "quantity": "0.4",
+            "price": "0.49",
+            "fee_rate_bps": "10",
+            "match_time": self.now.isoformat(),
+            "status": "CONFIRMED",
+            "side": "SELL",
+            "market_id": "market-1",
+            "token_id": "token-yes",
+        }
+        entered = threading.Event()
+        resume = threading.Event()
+        errors: list[BaseException] = []
+        stale_result: list[dict[str, object]] = []
+        validation_calls = 0
+        original_validate = position_module._validate_venue_identity
+
+        def interleaving_validate(**kwargs: object) -> tuple[str, Decimal]:
+            nonlocal validation_calls
+            validation_calls += 1
+            if validation_calls == 1:
+                entered.set()
+                self.assertTrue(resume.wait(2))
+            return original_validate(**kwargs)  # type: ignore[arg-type]
+
+        def stale_worker() -> None:
+            try:
+                stale_result.append(
+                    position_module._apply_reconciled_request(
+                        self.service,
+                        stale_request,
+                        stale_order,
+                        [],
+                        self.now,
+                    )
+                )
+            except BaseException as exc:
+                errors.append(exc)
+
+        with patch.object(
+            position_module,
+            "_validate_venue_identity",
+            side_effect=interleaving_validate,
+        ):
+            worker = threading.Thread(target=stale_worker)
+            worker.start()
+            self.assertTrue(entered.wait(2))
+            settled_result = position_module._apply_reconciled_request(
+                self.service,
+                stale_request,
+                settled_order,
+                [trade],
+                self.now,
+            )
+            resume.set()
+            worker.join(2)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(settled_result["status"], "SETTLED_PARTIAL")
+        self.assertEqual(stale_result[0]["status"], "SETTLED_PARTIAL")
+        request = self._request()
+        lot = self._lot()
+        self.assertEqual(request["status"], "SETTLED_PARTIAL")
+        self.assertEqual(request["filled_quantity"], "0.4")
+        self.assertEqual(request["fees"], "0.000196")
+        self.assertEqual(lot["status"], "OPEN")
+        self.assertEqual(lot["sold_quantity"], "0.4")
+        self.assertEqual(lot["pending_exit_quantity"], "0")
+        self.assertEqual(lot["cost_basis"], "0.50")
+        self.assertEqual(lot["gross_proceeds"], "0.196")
+        self.assertEqual(lot["exit_fees"], "0.000196")
+        self.assertEqual(lot["realized_pnl"], "-0.004196")
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM canary_position_fills "
+                "WHERE fill_id='interleaved-fill'"
+            ).fetchone()[0],
+            1,
+        )
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM canary_risk_fills "
+                "WHERE fill_id='interleaved-fill'"
+            ).fetchone()[0],
+            1,
+        )
+        risk_detail_row = self.store.connection.execute(
+            "SELECT detail_json FROM canary_risk_fills "
+            "WHERE fill_id='interleaved-fill'"
+        ).fetchone()
+        self.assertIsNotNone(risk_detail_row)
+        assert risk_detail_row is not None
+        risk_detail = json.loads(risk_detail_row["detail_json"])
+        self.assertEqual(risk_detail["entry_cost_usd"], "0.200")
+        self.assertEqual(risk_detail["realized_pnl_usd"], "-0.004196")
+
+    def test_atomic_sell_projection_blocks_terminalizer_between_risk_and_local(self) -> None:
+        submitted = self._submit_exit()
+        request = self._request()
+        order_id = str(submitted["order_id"])
+        order = {
+            "id": order_id,
+            "status": "MATCHED",
+            "settlement_status": "SETTLED",
+            "side": "SELL",
+            "market_id": "market-1",
+            "token_id": "token-yes",
+            "original_size": "1",
+        }
+        trade = {
+            "trade_id": "atomic-interleave-fill",
+            "order_id": order_id,
+            "quantity": "0.4",
+            "price": "0.49",
+            "fee_rate_bps": "10",
+            "match_time": self.now.isoformat(),
+            "status": "CONFIRMED",
+            "side": "SELL",
+            "market_id": "market-1",
+            "token_id": "token-yes",
+        }
+        risk_written = threading.Event()
+        allow_local_projection = threading.Event()
+        terminalizer_done = threading.Event()
+        results: list[dict[str, object]] = []
+        errors: list[BaseException] = []
+        original_record = self.store.record_canary_fill
+
+        def pausing_record(**kwargs: object) -> dict[str, object]:
+            result = original_record(**kwargs)
+            risk_written.set()
+            if not allow_local_projection.wait(2):
+                raise AssertionError("timed out before local fill projection")
+            return result
+
+        def reconcile() -> None:
+            try:
+                results.append(
+                    position_module._apply_reconciled_request(
+                        self.service,
+                        request,
+                        order,
+                        [trade],
+                        self.now,
+                    )
+                )
+            except BaseException as exc:
+                errors.append(exc)
+
+        def terminalize() -> None:
+            try:
+                position_module._apply_reconciled_request(
+                    self.service,
+                    request,
+                    order,
+                    [trade],
+                    self.now,
+                )
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                terminalizer_done.set()
+
+        with patch.object(
+            self.store,
+            "record_canary_fill",
+            side_effect=pausing_record,
+        ):
+            first = threading.Thread(target=reconcile)
+            first.start()
+            self.assertTrue(risk_written.wait(2))
+
+            second = threading.Thread(target=terminalize)
+            second.start()
+            # The competing terminalizer must remain outside the projection
+            # until both halves of the first fill are in one transaction.
+            self.assertFalse(terminalizer_done.wait(0.2))
+
+            allow_local_projection.set()
+            first.join(2)
+            second.join(2)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertFalse(errors)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["status"], "SETTLED_PARTIAL")
+        request_row = self._request()
+        lot = self._lot()
+        self.assertEqual(request_row["status"], "SETTLED_PARTIAL")
+        self.assertEqual(request_row["filled_quantity"], "0.4")
+        self.assertEqual(request_row["fees"], "0.000196")
+        self.assertEqual(lot["status"], "OPEN")
+        self.assertEqual(lot["sold_quantity"], "0.4")
+        self.assertEqual(lot["pending_exit_quantity"], "0")
+        self.assertEqual(lot["gross_proceeds"], "0.196")
+        self.assertEqual(lot["exit_fees"], "0.000196")
+        self.assertEqual(lot["realized_pnl"], "-0.004196")
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM canary_position_fills "
+                "WHERE fill_id='atomic-interleave-fill'"
+            ).fetchone()[0],
+            1,
+        )
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM canary_risk_fills "
+                "WHERE fill_id='atomic-interleave-fill'"
+            ).fetchone()[0],
+            1,
+        )
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM canary_risk_fills AS risk "
+                "LEFT JOIN canary_position_fills AS local "
+                "ON local.fill_id=risk.fill_id "
+                "WHERE risk.fill_id='atomic-interleave-fill' "
+                "AND local.fill_id IS NULL"
+            ).fetchone()[0],
+            0,
+        )
 
     def test_partial_buy_sell_then_later_buy_preserves_open_inventory_and_pnl(self) -> None:
         config = self.config

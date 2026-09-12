@@ -248,6 +248,8 @@ class PolymarketMarketScopeAdapterTests(unittest.TestCase):
 
         adapter = PolymarketAdapter(opener=opener)
         first = adapter.market_page(2, liquidity_num_min=1000)
+        larger_page = adapter.market_page(100, liquidity_num_min=1000)
+        self.assertEqual(first.query_fingerprint, larger_page.query_fingerprint)
         cursor = adapter.market_page(2, after_cursor="opaque", liquidity_num_min=1000)
         changed = adapter.market_page(2, liquidity_num_min=1001)
         self.assertEqual(first.query_fingerprint, cursor.query_fingerprint)

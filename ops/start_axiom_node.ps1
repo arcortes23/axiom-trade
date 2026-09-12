@@ -8,7 +8,15 @@ param(
     [int]$Depth = 20,
     [ValidateRange(1, 1000)]
     [int]$MaxMarkets = 100,
+    [ValidateRange(0, 86400)]
+    [double]$HistoricalRefreshIntervalSeconds = 3600,
+    [ValidateRange(0, 100000)]
+    [int]$HistoricalRefreshRequestBudget = 25,
+    [ValidateRange(0, 1000)]
+    [int]$HistoricalRefreshMarketBudget = 4,
     [string]$LogPath = "",
+    [Alias("HistoricalRefresh", "EnablePolymarketAutonomy")]
+    [switch]$HistoricalRefreshEnabled,
     [switch]$Isolated,
     [string]$Python = "python"
 )
@@ -254,6 +262,9 @@ $arguments = @(
     "--db", (Quote-ProcessArgument $dbAbsolute),
     "--interval", $IntervalSeconds.ToString([Globalization.CultureInfo]::InvariantCulture),
     "--depth", $Depth,
+    "--historical-refresh-interval", $HistoricalRefreshIntervalSeconds.ToString([Globalization.CultureInfo]::InvariantCulture),
+    "--historical-refresh-request-budget", $HistoricalRefreshRequestBudget,
+    "--historical-refresh-market-budget", $HistoricalRefreshMarketBudget,
     "--max-markets", $MaxMarkets,
     "--crypto-source", $CryptoSource,
     "--log", (Quote-ProcessArgument $logPath),
@@ -261,6 +272,7 @@ $arguments = @(
     "--pid", (Quote-ProcessArgument $pidPath),
     "--cycles", "0"
 )
+if ($HistoricalRefreshEnabled) { $arguments += "--historical-refresh-enabled" }
 if ($effectiveIsolated) { $arguments += "--isolated" }
 
 $launcherProcess = $null

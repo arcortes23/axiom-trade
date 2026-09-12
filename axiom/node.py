@@ -23,6 +23,11 @@ from typing import Any, Callable, Mapping
 import time
 import uuid
 from .collector import CollectionCycle, CollectorConfig, PolymarketCollector
+from .bootstrap import (
+    HistoricalBootstrapper,
+    POLYMARKET_DATASET_ID,
+    POLYMARKET_HISTORICAL_JOB_NAME,
+)
 from .data import PolymarketAdapter, SyntheticPredictionProvider
 from .domain import OrderBookSnapshot, ensure_utc, parse_timestamp, to_record, utc_now
 from .forward import ForwardTestRegistry, _content_hash
@@ -41,6 +46,35 @@ from .lifecycle import PromotionCriteria
 from .strategy import evaluate_signal_record, load_strategy
 from .auto_canary import AutonomousCanaryWorker
 from .canary import CanaryBlocked, CanaryService
+
+POLYMARKET_HISTORICAL_JOB_NAME = "polymarket-historical-refresh"
+POLYMARKET_AUTONOMY_JOB_NAME = "polymarket-autonomy"
+POLYMARKET_AUTONOMY_PROTOCOL_ID = "polymarket-paper-campaign-v1"
+
+
+class _HistoricalRequestBudget:
+    """Read-only provider facade that enforces one tick's request budget."""
+
+    _NETWORK_METHODS = frozenset({"markets", "market", "market_page", "metadata", "price_history"})
+
+    def __init__(self, provider: Any, budget: int) -> None:
+        self._provider = provider
+        self._budget = int(budget)
+        self.requests = 0
+        self.provider_name = getattr(provider, "provider_name", "polymarket")
+
+    def __getattr__(self, name: str) -> Any:
+        value = getattr(self._provider, name)
+        if name not in self._NETWORK_METHODS or not callable(value):
+            return value
+
+        def call(*args: Any, **kwargs: Any) -> Any:
+            if self.requests >= self._budget:
+                raise RuntimeError("historical request budget exhausted")
+            self.requests += 1
+            return value(*args, **kwargs)
+
+        return call
 
 
 EXECUTION_PROFILE_ENV = "AXIOM_EXECUTION_PROFILE"
@@ -303,6 +337,7 @@ def _consume_provider_errors(provider: Any, context: str) -> tuple[list[str], bo
 @dataclass(frozen=True, slots=True)
 class NodeConfig:
     db_path: str
+    worker_name: str = "axiom-node"
     lock_path: str | None = None
     pid_path: str | None = None
     log_path: str | None = None
@@ -316,11 +351,12 @@ class NodeConfig:
     max_provider_clock_skew_seconds: float = 5.0
     failure_cooldown_seconds: float = 30.0
     retain_cycles: int = 5
-    worker_name: str = "axiom-node"
-    max_log_bytes: int = 5_000_000
-    backup_count: int = 3
     research_enabled: bool = True
     research_max_items_per_cycle: int = 1
+    historical_refresh_enabled: bool = False
+    historical_refresh_interval_seconds: float = 3600.0
+    historical_refresh_request_budget: int = 25
+    historical_refresh_market_budget: int = 4
     paper_candidates_per_cycle: int = 4
     paper_observations_per_candidate: int = 64
     research_lease_seconds: float = 300.0
@@ -336,6 +372,8 @@ class NodeConfig:
     crypto_enabled: bool = True
     auto_canary_interval_seconds: float = 60.0
     execution_profile: str | None = None
+    max_log_bytes: int = 5_000_000
+    backup_count: int = 3
     revision: str | None = None
 
     def __post_init__(self) -> None:
@@ -411,6 +449,18 @@ class NodeConfig:
             raise ValueError("max_log_bytes must be a positive integer")
         if isinstance(self.backup_count, bool) or not isinstance(self.backup_count, int) or self.backup_count < 0:
             raise ValueError("backup_count must be a non-negative integer")
+        if not isinstance(self.historical_refresh_enabled, bool):
+            raise ValueError("historical_refresh_enabled must be boolean")
+        historical_interval = float(self.historical_refresh_interval_seconds)
+        if not math.isfinite(historical_interval) or historical_interval <= 0:
+            raise ValueError("historical_refresh_interval_seconds must be finite and positive")
+        for field_name in (
+            "historical_refresh_request_budget",
+            "historical_refresh_market_budget",
+        ):
+            value = getattr(self, field_name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{field_name} must be a non-negative integer")
         if not isinstance(self.research_enabled, bool):
             raise ValueError("research_enabled must be boolean")
         if isinstance(self.paper_candidates_per_cycle, bool) or not isinstance(self.paper_candidates_per_cycle, int) or self.paper_candidates_per_cycle <= 0:
@@ -492,6 +542,7 @@ class ResearchNode:
         config: NodeConfig,
         *,
         provider: Any | None = None,
+        historical_provider: Any | None = None,
         crypto_provider: Any | None = None,
         opportunity_model: Any | None = None,
         store: AxiomStore | None = None,
@@ -526,6 +577,30 @@ class ResearchNode:
             raise RuntimeError(
                 "ISOLATED_EXECUTION_PROFILE rejects real prediction transports"
             )
+        self.historical_provider: Any | None = None
+        if config.historical_refresh_enabled:
+            selected_historical_provider = historical_provider
+            if selected_historical_provider is None:
+                factory = getattr(selected_provider, "isolated_worker_factory", None)
+                if callable(factory):
+                    candidate = factory()
+                    selected_historical_provider = (
+                        candidate() if callable(candidate) else candidate
+                    )
+                elif self.execution_profile == ISOLATED_EXECUTION_PROFILE:
+                    selected_historical_provider = SyntheticPredictionProvider()
+                else:
+                    selected_historical_provider = PolymarketAdapter()
+            if (
+                self.execution_profile == ISOLATED_EXECUTION_PROFILE
+                and _is_real_transport(selected_historical_provider)
+            ):
+                if self._owns_store:
+                    self.store.close()
+                raise RuntimeError(
+                    "ISOLATED_EXECUTION_PROFILE rejects real historical prediction transports"
+                )
+            self.historical_provider = selected_historical_provider
         self.provider = selected_provider
         self.opportunity_model = opportunity_model
         self.sleep = sleep
@@ -566,7 +641,9 @@ class ResearchNode:
         self._collector_thread: threading.Thread | None = None
         self._research_thread: threading.Thread | None = None
         self._health_thread: threading.Thread | None = None
+        self._historical_refresh_thread: threading.Thread | None = None
         self._auto_canary_thread: threading.Thread | None = None
+        self._historical_thread: threading.Thread | None = None
         self._worker_runtime_lock = threading.RLock()
         self._worker_runtime: dict[str, dict[str, Any]] = {}
         self._worker_restart_counts: dict[str, int] = {}
@@ -585,6 +662,9 @@ class ResearchNode:
         )
         self._collector_error: str | None = None
         self._research_error: str | None = None
+        self._historical_error: str | None = None
+        self._historical_passes = 0
+        self._historical_fatal = False
         self._run_cycle_base = 0
         self._research_passes = 0
         self._cycles: list[CollectionCycle] = []
@@ -610,6 +690,14 @@ class ResearchNode:
             ),
             clock=clock,
             sleep=sleep,
+        )
+        self.historical_bootstrapper = HistoricalBootstrapper(
+            self.store,
+            prediction_provider=self.provider,
+            clock=clock,
+            sleep=sleep,
+            max_attempts=config.max_attempts,
+            backoff=config.failure_cooldown_seconds,
         )
         self.bus = DurableResearchBus(self.store)
         self.research_processor = AutonomousResearchProcessor(
@@ -985,6 +1073,7 @@ class ResearchNode:
         self.stop_event.clear()
         self._collector_error = None
         self._research_error = None
+        self._historical_error = None
         with self._worker_runtime_lock:
             self._worker_runtime = {}
         self._worker_restart_counts = {}
@@ -994,6 +1083,8 @@ class ResearchNode:
         self._collection_count = 0
         self._run_cycle_base = 0
         self._research_passes = 0
+        self._historical_passes = 0
+        self._historical_fatal = False
         self._auto_canary_fatal = False
         cycle_failure = False
         status = "degraded"
@@ -1056,6 +1147,17 @@ class ResearchNode:
                     "production_live_execution": False,
                 },
             }
+            if self.config.historical_refresh_enabled:
+                worker_start_states[POLYMARKET_HISTORICAL_JOB_NAME] = {
+                    "configured_interval_seconds": float(
+                        self.config.historical_refresh_interval_seconds
+                    ),
+                    "request_budget": self.config.historical_refresh_request_budget,
+                    "market_budget": self.config.historical_refresh_market_budget,
+                    "next_work": "refresh_historical_catalog",
+                    "producer_job": POLYMARKET_HISTORICAL_JOB_NAME,
+                    "resumable": True,
+                }
             for worker_name, payload in worker_start_states.items():
                 with self._worker_runtime_lock:
                     self._worker_runtime[worker_name] = {
@@ -1126,8 +1228,8 @@ class ResearchNode:
                     str(runtime.get("worker_status", "")).upper() in {"DEGRADED", "FATAL"}
                     for runtime in self._worker_runtime.values()
                 )
-            cycle_failure = cycle_failure or self._auto_canary_fatal or worker_degraded or bool(
-                self._collector_error or self._research_error
+            cycle_failure = cycle_failure or self._auto_canary_fatal or self._historical_fatal or worker_degraded or bool(
+                self._collector_error or self._research_error or self._historical_error
             )
             status = (
                 "degraded"
@@ -1145,7 +1247,9 @@ class ResearchNode:
                 self._collector_thread,
                 self._research_thread,
                 self._health_thread,
+                self._historical_refresh_thread,
                 self._auto_canary_thread,
+                self._historical_thread,
             ):
                 if worker is not None:
                     worker.join()
@@ -1153,7 +1257,9 @@ class ResearchNode:
             self._collector_thread = None
             self._research_thread = None
             self._health_thread = None
+            self._historical_refresh_thread = None
             self._auto_canary_thread = None
+            self._historical_thread = None
             try:
                 self._heartbeat(
                     status,
@@ -1210,6 +1316,13 @@ class ResearchNode:
             name=f"{self.config.worker_name}-health",
             daemon=True,
         )
+        self._historical_refresh_thread = None
+        if self.config.historical_refresh_enabled:
+            self._historical_refresh_thread = threading.Thread(
+                target=self._historical_refresh_worker_loop,
+                name=f"{self.config.worker_name}-historical-refresh",
+                daemon=True,
+            )
         self._auto_canary_thread = None
         if self.config.mutation_enabled:
             self._auto_canary_thread = threading.Thread(
@@ -1217,9 +1330,12 @@ class ResearchNode:
                 name=f"{self.config.worker_name}-autonomous-canary",
                 daemon=True,
             )
+        self._historical_thread = self._historical_refresh_thread
         self._collector_thread.start()
         self._research_thread.start()
         self._health_thread.start()
+        if self._historical_refresh_thread is not None:
+            self._historical_refresh_thread.start()
         if self._auto_canary_thread is not None:
             self._auto_canary_thread.start()
     def _worker_thread_specs(self, max_cycles: int | None) -> dict[str, tuple[str, Callable[[], None]]]:
@@ -1231,6 +1347,11 @@ class ResearchNode:
             "research-engine": ("_research_thread", self._research_worker_loop),
             "health-monitor": ("_health_thread", self._health_worker_loop),
         }
+        if self.config.historical_refresh_enabled:
+            specs[POLYMARKET_HISTORICAL_JOB_NAME] = (
+                "_historical_refresh_thread",
+                self._historical_refresh_worker_loop,
+            )
         if self.config.mutation_enabled:
             specs["autonomous-canary"] = (
                 "_auto_canary_thread",
@@ -1251,6 +1372,12 @@ class ResearchNode:
                 and self._collection_count - self._run_cycle_base >= max_cycles
             ):
                 continue
+            if (
+                worker_name == POLYMARKET_HISTORICAL_JOB_NAME
+                and max_cycles is not None
+                and self._historical_passes >= max_cycles
+            ):
+                continue
             if worker_name == "autonomous-canary" and self._auto_canary_fatal:
                 self._worker_fatal.add(worker_name)
                 return False
@@ -1267,6 +1394,8 @@ class ResearchNode:
                 )
                 if worker_name == "autonomous-canary":
                     self._auto_canary_fatal = True
+                if worker_name == POLYMARKET_HISTORICAL_JOB_NAME:
+                    self._historical_fatal = True
                 self._log(logging.ERROR, "%s exhausted restart attempts", worker_name)
                 return False
             attempts += 1
@@ -1445,6 +1574,423 @@ class ResearchNode:
                     ),
                 )
 
+    def _latest_eligible_historical_catalog(self) -> tuple[dict[str, Any] | None, Mapping[str, Any] | None, str]:
+        """Return the newest non-empty, attested immutable Polymarket catalog."""
+        try:
+            catalogs = self.store.list_dataset_catalog(
+                source_type="HISTORICAL",
+                market_type="prediction",
+                limit=None,
+            )
+        except TypeError:
+            catalogs = self.store.list_dataset_catalog(limit=None)
+        if not isinstance(catalogs, (list, tuple)):
+            return None, None, "HISTORICAL_CATALOG_UNAVAILABLE"
+        for raw in catalogs:
+            if not isinstance(raw, Mapping):
+                continue
+            if str(raw.get("dataset_id", "")).strip() != POLYMARKET_DATASET_ID:
+                continue
+            version = str(raw.get("dataset_version") or raw.get("version") or "").strip()
+            metadata = raw.get("metadata")
+            metadata = metadata if isinstance(metadata, Mapping) else {}
+            try:
+                complete = (
+                    bool(version)
+                    and version.casefold() not in {"latest", "current", "default", "unversioned"}
+                    and str(raw.get("source_type", "")).strip().upper() == "HISTORICAL"
+                    and str(raw.get("market_type", "")).strip().lower() == "prediction"
+                    and str(raw.get("instrument", "")).strip().upper() == "POLYMARKET"
+                    and (
+                        not metadata.get("instrument")
+                        or str(metadata.get("instrument")).strip().upper() == "POLYMARKET"
+                    )
+                    and int(raw.get("row_count", 0) or 0) > 0
+                    and float(raw.get("completeness", 0.0) or 0.0) >= 1.0
+                    and not raw.get("missing_ranges")
+                )
+            except (TypeError, ValueError, OverflowError):
+                complete = False
+            if not complete:
+                continue
+            attestation = self.store.load_dataset_integrity_attestation(
+                POLYMARKET_DATASET_ID,
+                version,
+            )
+            if not isinstance(attestation, Mapping):
+                verifier = getattr(self.store, "verify_dataset_integrity_attestation", None)
+                if callable(verifier):
+                    try:
+                        attestation = verifier(POLYMARKET_DATASET_ID, version)
+                    except Exception:
+                        attestation = None
+            if (
+                isinstance(attestation, Mapping)
+                and str(attestation.get("status", "")).upper() == "CURRENT"
+                and str(attestation.get("contamination_result", "")).upper() == "PASS"
+            ):
+                return dict(raw), dict(attestation), "READY"
+        return None, None, "WAITING_FOR_CURRENT_HISTORICAL_DATASET"
+
+    @staticmethod
+    def _campaign_reassessment_snapshot(
+        payload: Mapping[str, Any] | None,
+    ) -> tuple[int, frozenset[str], Any, str | None]:
+        """Read durable reassessment evidence without inferring an action."""
+        if not isinstance(payload, Mapping):
+            return 0, frozenset(), None, None
+        raw_count = payload.get("reassessment_count", 0)
+        try:
+            count = (
+                0
+                if isinstance(raw_count, bool)
+                else max(0, int(raw_count))
+            )
+        except (TypeError, ValueError, OverflowError):
+            count = 0
+        raw_trials = payload.get("trials")
+        trials = raw_trials if isinstance(raw_trials, (list, tuple)) else ()
+        trial_ids = frozenset(
+            str(item.get("trial_id", "")).strip()
+            for item in trials
+            if isinstance(item, Mapping) and str(item.get("trial_id", "")).strip()
+        )
+        evidence = payload.get("reassessment_evidence")
+        last_identity = str(payload.get("last_evidence_identity", "")).strip() or None
+        return count, trial_ids, evidence, last_identity
+
+    def _start_polymarket_campaign(
+        self,
+        catalog: Mapping[str, Any],
+        attestation: Mapping[str, Any],
+        now: datetime,
+    ) -> dict[str, Any]:
+        """Start one protocol campaign and account only real reassessments."""
+        state = self.store.get_scheduler_state(POLYMARKET_AUTONOMY_JOB_NAME) or {}
+        state = dict(state) if isinstance(state, Mapping) else {}
+        prior_state = dict(state)
+        version = str(catalog.get("dataset_version") or catalog.get("version") or "").strip()
+        existing_campaign = str(state.get("campaign_id") or "").strip()
+        if existing_campaign:
+            locked_version = str(state.get("dataset_version") or "").strip()
+            last_reassessed_version = str(
+                state.get("last_reassessed_dataset_version") or ""
+            ).strip()
+            attempted_version = str(
+                state.get("last_reassessment_attempted_dataset_version") or ""
+            ).strip()
+            campaign_job_name = self.research_processor.campaign_job_name(existing_campaign)
+            campaign_record = self.store.get_operator_job(campaign_job_name)
+            campaign_before = (
+                campaign_record.get("payload")
+                if isinstance(campaign_record, Mapping)
+                and isinstance(campaign_record.get("payload"), Mapping)
+                else None
+            )
+            before_count, before_trial_ids, before_evidence, before_identity = (
+                self._campaign_reassessment_snapshot(campaign_before)
+            )
+            reassessment_changed = False
+            if (
+                version
+                and locked_version
+                and version != locked_version
+                and version != last_reassessed_version
+                and version != attempted_version
+            ):
+                reassess = getattr(self.research_processor, "reassess_campaign", None)
+                evidence_identity = str(
+                    attestation.get("attestation_hash") or ""
+                ).strip()
+                if callable(reassess) and evidence_identity and campaign_before is not None:
+                    reassess(
+                        existing_campaign,
+                        evidence_identity=evidence_identity,
+                        dataset_id=POLYMARKET_DATASET_ID,
+                        dataset_version=version,
+                        now=now,
+                    )
+                    campaign_after_record = self.store.get_operator_job(campaign_job_name)
+                    campaign_after = (
+                        campaign_after_record.get("payload")
+                        if isinstance(campaign_after_record, Mapping)
+                        and isinstance(campaign_after_record.get("payload"), Mapping)
+                        else None
+                    )
+                    (
+                        after_count,
+                        after_trial_ids,
+                        after_evidence,
+                        after_identity,
+                    ) = self._campaign_reassessment_snapshot(campaign_after)
+                    new_reassessment_trial_ids = {
+                        trial_id
+                        for trial_id in after_trial_ids - before_trial_ids
+                        if trial_id.endswith(":reassessment-1")
+                    }
+                    evidence_changed = (
+                        after_evidence != before_evidence
+                        or after_identity != before_identity
+                    )
+                    reassessment_changed = (
+                        after_count == before_count + 1
+                        and after_count <= 1
+                        and bool(new_reassessment_trial_ids)
+                        and (
+                            evidence_changed
+                            or (
+                                before_evidence is None
+                                and after_evidence is None
+                                and before_identity is None
+                                and after_identity is None
+                            )
+                        )
+                    )
+                    if reassessment_changed:
+                        state["last_reassessed_dataset_version"] = version
+                        state["reassessment_count"] = after_count
+                        state["reassessment"] = dict(campaign_after or {})
+                    else:
+                        # A processor no-op is not a consumed reassessment.
+                        # Remember the attempted dataset only to suppress the
+                        # same durable no-op on the next scheduler tick.
+                        state["last_reassessment_attempted_dataset_version"] = version
+            campaign_after_record = self.store.get_operator_job(campaign_job_name)
+            campaign_payload = (
+                campaign_after_record.get("payload")
+                if isinstance(campaign_after_record, Mapping)
+                and isinstance(campaign_after_record.get("payload"), Mapping)
+                else campaign_before
+            )
+            campaign_payload = (
+                dict(campaign_payload)
+                if isinstance(campaign_payload, Mapping)
+                else {}
+            )
+            campaign_status = (
+                str(campaign_payload.get("status") or state.get("status") or "RUNNING")
+                .strip()
+                .upper()
+            )
+            state.update(
+                {
+                    "protocol_id": POLYMARKET_AUTONOMY_PROTOCOL_ID,
+                    "dataset_id": POLYMARKET_DATASET_ID,
+                    "latest_dataset_version": version,
+                    "latest_attestation_hash": attestation.get("attestation_hash"),
+                    "campaign": campaign_payload,
+                    "campaign_job_status": campaign_status,
+                    "status": campaign_status,
+                    "next_work": (
+                        (
+                            "process_finite_campaign"
+                            if not (
+                                str(
+                                    state.get(
+                                        "last_reassessment_attempted_dataset_version",
+                                        "",
+                                    )
+                                    or ""
+                                ).strip()
+                                == version
+                            )
+                            else (
+                                "wait_for_campaign_data"
+                                if campaign_status == "WAITING_FOR_DATA"
+                                else "wait_for_campaign_state"
+                            )
+                        )
+                        if campaign_status == "RUNNING"
+                        else (
+                            "wait_for_campaign_data"
+                            if campaign_status == "WAITING_FOR_DATA"
+                            else "wait_for_campaign_state"
+                        )
+                    ),
+                    "paper_only": True,
+                    "live_execution": False,
+                }
+            )
+            if state != prior_state:
+                state["updated_at"] = now.isoformat()
+                self.store.set_scheduler_state(POLYMARKET_AUTONOMY_JOB_NAME, state)
+            return state
+        stable_campaign_id = f"{POLYMARKET_AUTONOMY_PROTOCOL_ID}:campaign"
+        campaign = self.research_processor.start_polymarket_campaign(
+            stable_campaign_id,
+            dataset_id=POLYMARKET_DATASET_ID,
+            dataset_version=version,
+            now=now,
+        )
+        campaign_payload = dict(campaign) if isinstance(campaign, Mapping) else {}
+        campaign_status = str(campaign_payload.get("status") or "UNKNOWN").upper()
+        campaign_reassessment_count, _, _, _ = self._campaign_reassessment_snapshot(
+            campaign_payload
+        )
+        campaign_job_name = self.research_processor.campaign_job_name(stable_campaign_id)
+        queued_items = len(
+            self.research_processor.bus.list_campaign_trials(
+                stable_campaign_id,
+                limit=10_000,
+            )
+        )
+        state.update(
+            {
+                "protocol_id": POLYMARKET_AUTONOMY_PROTOCOL_ID,
+                "campaign_id": stable_campaign_id,
+                "campaign_job_name": campaign_job_name,
+                "campaign_job_status": campaign_status,
+                "campaign": campaign_payload,
+                "dataset_id": POLYMARKET_DATASET_ID,
+                "dataset_version": version,
+                "latest_dataset_version": version,
+                "attestation_hash": attestation.get("attestation_hash"),
+                "reassessment_count": min(1, campaign_reassessment_count),
+                "status": campaign_status,
+                "queued_items": queued_items,
+                "next_work": (
+                    "process_finite_campaign"
+                    if campaign_status == "RUNNING"
+                    else "wait_for_campaign_state"
+                ),
+                "updated_at": now.isoformat(),
+                "paper_only": True,
+                "live_execution": False,
+            }
+        )
+        self.store.set_scheduler_state(POLYMARKET_AUTONOMY_JOB_NAME, state)
+        return state
+
+    def _run_historical_refresh(self) -> dict[str, Any]:
+        """Refresh public history and then seed only an eligible finite campaign."""
+        now = ensure_utc(self.clock())
+        if (
+            self.config.historical_refresh_request_budget <= 0
+            or self.config.historical_refresh_market_budget <= 0
+            or self.historical_provider is None
+        ):
+            state = self.store.get_scheduler_state(POLYMARKET_AUTONOMY_JOB_NAME) or {}
+            state = dict(state) if isinstance(state, Mapping) else {}
+            state.update(
+                {
+                    "protocol_id": POLYMARKET_AUTONOMY_PROTOCOL_ID,
+                    "status": "WAITING_FOR_BUDGET",
+                    "next_work": "wait_for_positive_refresh_budget",
+                    "updated_at": now.isoformat(),
+                    "paper_only": True,
+                    "live_execution": False,
+                }
+            )
+            self.store.set_scheduler_state(POLYMARKET_AUTONOMY_JOB_NAME, state)
+            return {"status": "WAITING", "reason": "WAITING_FOR_BUDGET"}
+        provider = _HistoricalRequestBudget(
+            self.historical_provider,
+            self.config.historical_refresh_request_budget,
+        )
+        bootstrapper = HistoricalBootstrapper(
+            self.store,
+            prediction_provider=provider,
+            sleep=self.sleep,
+            clock=self.clock,
+            max_attempts=self.config.max_attempts,
+            backoff=0.0,
+        )
+        report = bootstrapper.bootstrap_polymarket(
+            max_markets=self.config.historical_refresh_market_budget,
+            request_budget=self.config.historical_refresh_request_budget,
+            resume=True,
+        )
+        report_record = report.as_record() if hasattr(report, "as_record") else dict(report)
+        catalog, attestation, reason = self._latest_eligible_historical_catalog()
+        if catalog is not None and attestation is not None:
+            state = self._start_polymarket_campaign(catalog, attestation, now)
+        else:
+            state = self.store.get_scheduler_state(POLYMARKET_AUTONOMY_JOB_NAME) or {}
+            state = dict(state) if isinstance(state, Mapping) else {}
+            state.update(
+                {
+                    "protocol_id": POLYMARKET_AUTONOMY_PROTOCOL_ID,
+                    "status": "WAITING_FOR_ELIGIBLE_CATALOG",
+                    "next_work": "wait_for_current_pass_historical_catalog",
+                    "reason": reason,
+                    "updated_at": now.isoformat(),
+                    "paper_only": True,
+                    "live_execution": False,
+                }
+            )
+            self.store.set_scheduler_state(POLYMARKET_AUTONOMY_JOB_NAME, state)
+        return {
+            "status": str(report_record.get("status") or "UNKNOWN"),
+            "report": report_record,
+            "requests": provider.requests,
+            "campaign": state,
+        }
+
+    def _historical_worker_loop(self, max_cycles: int | None) -> None:
+        completed = 0
+        next_due = time.monotonic()
+        next_scheduled = ensure_utc(self.clock())
+        try:
+            self._persist_worker_runtime(
+                POLYMARKET_HISTORICAL_JOB_NAME,
+                "running",
+                extra={
+                    "configured_interval_seconds": float(
+                        self.config.historical_refresh_interval_seconds
+                    ),
+                    "request_budget": self.config.historical_refresh_request_budget,
+                    "market_budget": self.config.historical_refresh_market_budget,
+                    "next_work": "refresh_historical_catalog",
+                },
+            )
+            while not self.stop_event.is_set() and (
+                max_cycles is None or completed < max_cycles
+            ):
+                self._worker_tick_started(
+                    POLYMARKET_HISTORICAL_JOB_NAME,
+                    next_work=next_scheduled.isoformat(),
+                )
+                try:
+                    result = self._run_historical_refresh()
+                    self._historical_error = None
+                    self._worker_tick_completed(
+                        POLYMARKET_HISTORICAL_JOB_NAME,
+                        successful=True,
+                        decision=str(result.get("status") or "HISTORICAL_REFRESH_COMPLETE"),
+                        next_work="wait_for_next_historical_refresh",
+                        extra=result,
+                    )
+                except BaseException as exc:
+                    self._historical_error = str(exc)
+                    self._worker_tick_failed(
+                        POLYMARKET_HISTORICAL_JOB_NAME,
+                        exc,
+                        fatal=False,
+                        next_work="retry_historical_refresh",
+                    )
+                completed += 1
+                self._historical_passes += 1
+                if max_cycles is not None and completed >= max_cycles:
+                    break
+                next_due += float(self.config.historical_refresh_interval_seconds)
+                delay = max(0.0, next_due - time.monotonic())
+                if self.stop_event.wait(delay):
+                    break
+                next_scheduled = ensure_utc(self.clock()) + timedelta(seconds=delay)
+        finally:
+            try:
+                self._persist_worker_runtime(
+                    POLYMARKET_HISTORICAL_JOB_NAME,
+                    "stopped" if self.stop_event.is_set() else (
+                        "degraded" if self._historical_error else "idle"
+                    ),
+                    extra={"next_work": "stopped"},
+                )
+            except Exception:
+                pass
+            with self._worker_condition:
+                self._worker_condition.notify_all()
+
     def _collector_for_worker(self) -> tuple[PolymarketCollector, AxiomStore | None]:
         """Run collection on the node store while preserving independent cadence."""
         if not isinstance(self.collector, PolymarketCollector):
@@ -1506,6 +2052,166 @@ class ResearchNode:
             started_at=cycle.started_at if cycle is not None else ensure_utc(self.clock()),
             heartbeat_at=ensure_utc(self.clock()),
         )
+
+    def _run_historical_refresh_tick(self) -> None:
+        """Run one bounded historical producer tick when explicitly enabled.
+
+        The producer owns its durable cursor and request budget.  Scheduling
+        happens on a dedicated worker so provider and publication work cannot
+        extend the ordinary collection critical path.
+        """
+        if not self.config.historical_refresh_enabled:
+            return
+        try:
+            if self.historical_provider is not None:
+                autonomy_result = self._run_historical_refresh()
+                report_record = dict(autonomy_result.get("report") or {})
+                report_record.setdefault("status", autonomy_result.get("status"))
+                report_record["requests"] = autonomy_result.get("requests", 0)
+                report_record["campaign"] = autonomy_result.get("campaign")
+            else:
+                report = self.historical_bootstrapper.bootstrap_polymarket(
+                    max_markets=self.config.max_markets,
+                    market_budget=self.config.historical_refresh_market_budget,
+                    request_budget=self.config.historical_refresh_request_budget,
+                    resume=True,
+                )
+                report_record = report.as_record()
+        except BaseException as exc:
+            with self._worker_runtime_lock:
+                runtime = self._worker_runtime.setdefault(
+                    POLYMARKET_HISTORICAL_JOB_NAME,
+                    {"errors": []},
+                )
+                runtime.update(
+                    {
+                        "job_name": POLYMARKET_HISTORICAL_JOB_NAME,
+                        "job_status": "FAILED",
+                        "wait_classification": {
+                            "status": "SOFTWARE_OR_INPUT_ERROR",
+                            "producer_job": POLYMARKET_HISTORICAL_JOB_NAME,
+                        },
+                        "last_error": str(exc),
+                    }
+                )
+            self._persist_worker_runtime(
+                POLYMARKET_HISTORICAL_JOB_NAME,
+                "degraded",
+                extra={
+                    "job_name": POLYMARKET_HISTORICAL_JOB_NAME,
+                    "job_status": "FAILED",
+                    "wait_classification": {
+                        "status": "SOFTWARE_OR_INPUT_ERROR",
+                        "producer_job": POLYMARKET_HISTORICAL_JOB_NAME,
+                    },
+                    "error": str(exc),
+                },
+            )
+            return
+        producer_status = str(report_record.get("status") or "").upper()
+        if producer_status in {"SCHEDULED", "RUNNING"}:
+            worker_status = "waiting"
+            wait_classification = {
+                "status": "WAITING_FOR_DATA",
+                "producer_job": POLYMARKET_HISTORICAL_JOB_NAME,
+                "producer_status": producer_status,
+            }
+        elif producer_status == "EXHAUSTED":
+            worker_status = "degraded"
+            wait_classification = {
+                "status": "WAITING_FOR_DATA",
+                "producer_job": POLYMARKET_HISTORICAL_JOB_NAME,
+                "producer_status": producer_status,
+                "exhausted": True,
+            }
+        elif producer_status == "FAILED":
+            worker_status = "degraded"
+            wait_classification = {
+                "status": "SOFTWARE_OR_INPUT_ERROR",
+                "producer_job": POLYMARKET_HISTORICAL_JOB_NAME,
+                "producer_status": producer_status,
+            }
+        else:
+            worker_status = "idle"
+            wait_classification = {
+                "status": producer_status or "NO_NEW_DATA",
+                "producer_job": POLYMARKET_HISTORICAL_JOB_NAME,
+            }
+        with self._worker_runtime_lock:
+            runtime = self._worker_runtime.setdefault(
+                POLYMARKET_HISTORICAL_JOB_NAME,
+                {"errors": []},
+            )
+            runtime.update(
+                {
+                    "job_name": POLYMARKET_HISTORICAL_JOB_NAME,
+                    "job_status": producer_status,
+                    "wait_classification": wait_classification,
+                    "last_report": report_record,
+                    "last_error": report_record.get("errors", [])[:1],
+                }
+            )
+        self._persist_worker_runtime(
+            POLYMARKET_HISTORICAL_JOB_NAME,
+            worker_status,
+            extra={
+                "job_name": POLYMARKET_HISTORICAL_JOB_NAME,
+                "job_status": producer_status,
+                "wait_classification": wait_classification,
+                "last_report": report_record,
+                "last_error": report_record.get("errors", [])[:1],
+            },
+        )
+
+    def _historical_refresh_worker_loop(self) -> None:
+        """Schedule bounded historical refresh ticks independently."""
+        interval_seconds = max(0.1, float(self.config.historical_refresh_interval_seconds))
+        status = "idle"
+        try:
+            self._persist_worker_runtime(
+                POLYMARKET_HISTORICAL_JOB_NAME,
+                "running",
+                extra={
+                    "configured_interval_seconds": interval_seconds,
+                    "next_work": "refresh_historical_data",
+                    "producer_job": POLYMARKET_HISTORICAL_JOB_NAME,
+                    "resumable": True,
+                },
+            )
+            while not self.stop_event.is_set():
+                if self._external_stop_requested():
+                    break
+                self._worker_tick_started(
+                    POLYMARKET_HISTORICAL_JOB_NAME,
+                    next_work="refresh_historical_data",
+                )
+                self._run_historical_refresh_tick()
+                if self.stop_event.is_set():
+                    break
+                # Schedule from completion, rather than catching up missed
+                # slots, so a slow producer can never spin or starve peers.
+                if self.stop_event.wait(interval_seconds):
+                    break
+        except BaseException as exc:
+            status = "degraded"
+            self._worker_tick_failed(
+                POLYMARKET_HISTORICAL_JOB_NAME,
+                exc,
+                fatal=False,
+                next_work="operator_review_required",
+            )
+            self._log(logging.ERROR, "historical refresh worker failed: %s", exc)
+        finally:
+            try:
+                self._persist_worker_runtime(
+                    POLYMARKET_HISTORICAL_JOB_NAME,
+                    "stopped" if self.stop_event.is_set() else status,
+                    extra={"next_work": "stopped"},
+                )
+            except Exception:
+                pass
+            with self._worker_condition:
+                self._worker_condition.notify_all()
 
     def _collector_worker_loop(self, max_cycles: int | None) -> None:
         collector, owned_store = self._collector_for_worker()
@@ -1587,7 +2293,6 @@ class ResearchNode:
                     "polymarket-collector",
                     successful=not cycle_degraded,
                     successful_markets=cycle_record.get("candidate_bound_scheduled", ()),
-                    decision="COLLECTION_COMPLETE",
                     next_work=next_scheduled.isoformat(),
                     error=cycle_error,
                     extra={
@@ -2216,6 +2921,13 @@ class ResearchNode:
                     "generation_depth": self.config.max_generation_depth,
                     "mutations_enabled": self.config.mutation_enabled,
                 },
+            },
+            "polymarket_autonomy": {
+                "enabled": self.config.historical_refresh_enabled,
+                "historical_refresh_interval_seconds": self.config.historical_refresh_interval_seconds,
+                "request_budget": self.config.historical_refresh_request_budget,
+                "market_budget": self.config.historical_refresh_market_budget,
+                "state": self.store.get_scheduler_state(POLYMARKET_AUTONOMY_JOB_NAME),
             },
             "workers": child_workers,
         }

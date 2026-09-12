@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from urllib.request import urlopen
 
+from axiom.data.polymarket import MarketDiscoveryPage
 from axiom.bootstrap import (
     BTC_DATASET_IDS,
     HistoricalBootstrapper,
@@ -18,6 +19,8 @@ from axiom.bootstrap import (
 from axiom.dashboard import DashboardData, DashboardServer, _dashboard_html
 from axiom.domain import InstrumentMetadata, MarketType, OHLCVBar, PredictionMarketSnapshot, SettlementState, to_record
 from axiom.evaluation import dataset_version
+from axiom.data._http import HTTPFetchError
+
 from axiom.storage import AxiomStore
 
 
@@ -121,6 +124,41 @@ class FakePolymarket:
 
     def consume_transport_errors(self) -> tuple[object, ...]:
         return ()
+
+class RetryAfterPolymarket(FakePolymarket):
+    def __init__(self, retry_after: float) -> None:
+        super().__init__()
+        self.retry_after = retry_after
+        self.discovery_failures = 1
+        self.discovery_calls: list[tuple[bool, int | None]] = []
+        self._transport_errors: list[HTTPFetchError] = []
+
+    def markets(
+        self,
+        active: bool = True,
+        *,
+        limit: int | None = None,
+    ) -> list[PredictionMarketSnapshot]:
+        self.discovery_calls.append((active, limit))
+        if self.discovery_failures:
+            self.discovery_failures -= 1
+            self._transport_errors.append(
+                HTTPFetchError(
+                    "rate limited",
+                    url="https://fixture.invalid/markets",
+                    status=429,
+                    retry_after=self.retry_after,
+                    retryable=True,
+                )
+            )
+            return []
+        return super().markets(active=active, limit=limit)
+
+    def consume_transport_errors(self) -> tuple[HTTPFetchError, ...]:
+        errors = tuple(self._transport_errors)
+        self._transport_errors.clear()
+        return errors
+
 
 
 class Phase42HistoricalTests(unittest.TestCase):
@@ -257,13 +295,279 @@ class Phase42PolymarketTests(unittest.TestCase):
             self.assertEqual(classify_market_category(provider.markets_by_id["m-politics"]), "politics")
 
             second = bootstrapper.bootstrap_polymarket(max_markets=2, resume=True)
-            self.assertEqual(second.status, "COMPLETE")
+            self.assertEqual(second.status, "NO_NEW_DATA")
             self.assertEqual(second.records, 4)
             aggregate = store.load_dataset_catalog("Polymarket-historical")
             self.assertIsNotNone(aggregate)
             assert aggregate is not None
             self.assertEqual(aggregate["row_count"], 4)
+    def test_polymarket_bootstrap_resumes_250_style_short_page_without_fingerprint_change(self) -> None:
+        class PagedPolymarket(FakePolymarket):
+            def __init__(self) -> None:
+                super().__init__()
+                self.markets_by_id = {
+                    f"m-{index:03d}": self._market(
+                        f"m-{index:03d}",
+                        f"Question {index}",
+                        tags=("politics",),
+                    )
+                    for index in range(250)
+                }
+                self.page_calls: list[tuple[int, str | None, bool]] = []
 
+            def market_page(
+                self,
+                limit: int,
+                *,
+                after_cursor: str | None = None,
+                closed: bool = False,
+            ) -> MarketDiscoveryPage:
+                self.page_calls.append((limit, after_cursor, closed))
+                offset = int(after_cursor) if after_cursor is not None else 0
+                values = list(self.markets_by_id.values())[offset : offset + limit]
+                next_offset = offset + len(values)
+                next_cursor = str(next_offset) if next_offset < 250 else None
+                return MarketDiscoveryPage(
+                    snapshots=tuple(values),
+                    next_cursor=next_cursor,
+                    request_path="/markets/keyset",
+                    query={
+                        "limit": str(limit),
+                        "closed": str(closed).lower(),
+                    },
+                    query_fingerprint="scope:polymarket:closed",
+                    raw_count=len(values),
+                    unique_count=len(values),
+                    duplicate_count=0,
+                    malformed_count=0,
+                    coverage_status="PARTIAL" if next_cursor else "COMPLETE",
+                )
+
+        provider = PagedPolymarket()
+        with AxiomStore(":memory:") as store:
+            bootstrapper = HistoricalBootstrapper(
+                store,
+                prediction_provider=provider,
+                sleep=lambda _: None,
+                max_attempts=1,
+            )
+            reports = [
+                bootstrapper.bootstrap_polymarket(max_markets=250, resume=True)
+                for _ in range(3)
+            ]
+
+            self.assertEqual([call[0] for call in provider.page_calls], [100, 100, 50])
+            self.assertTrue(all(call[0] <= 100 for call in provider.page_calls))
+            self.assertTrue(all(call[2] is True for call in provider.page_calls))
+            self.assertFalse(
+                any(
+                    "QUERY_FINGERPRINT_CHANGED" in error
+                    for report in reports
+                    for error in report.errors
+                )
+            )
+            self.assertEqual(reports[-1].status, "COMPLETE")
+            self.assertEqual(reports[-1].records, 500)
+    def test_polymarket_constituent_publication_rolls_back_on_snapshot_fault(self) -> None:
+        provider = FakePolymarket()
+        with AxiomStore(":memory:") as store:
+            bootstrapper = HistoricalBootstrapper(
+                store,
+                prediction_provider=provider,
+                sleep=lambda _: None,
+                max_attempts=1,
+            )
+            original_writer = store.save_polymarket_snapshot
+            calls = 0
+
+            def fail_once(*args: object, **kwargs: object) -> bool:
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    raise RuntimeError("simulated snapshot interruption")
+                return original_writer(*args, **kwargs)
+
+            store.save_polymarket_snapshot = fail_once  # type: ignore[method-assign]
+            with self.assertRaisesRegex(RuntimeError, "simulated snapshot interruption"):
+                bootstrapper.bootstrap_polymarket(max_markets=1)
+            store.save_polymarket_snapshot = original_writer  # type: ignore[method-assign]
+
+            self.assertIsNone(store.load_dataset("prediction:m-politics"))
+            self.assertIsNone(store.load_dataset_catalog("prediction:m-politics"))
+            self.assertEqual(store.load_polymarket_snapshots("m-politics"), [])
+
+            resumed = bootstrapper.bootstrap_polymarket(max_markets=1, resume=True)
+            self.assertEqual(resumed.status, "COMPLETE")
+            self.assertEqual(len(store.load_dataset("prediction:m-politics")), 2)
+            self.assertEqual(len(store.load_polymarket_snapshots("m-politics")), 2)
+    def test_polymarket_zero_effective_budget_preserves_completed_state(self) -> None:
+        provider = FakePolymarket()
+        with AxiomStore(":memory:") as store:
+            bootstrapper = HistoricalBootstrapper(
+                store,
+                prediction_provider=provider,
+                sleep=lambda _: None,
+                max_attempts=1,
+            )
+            first = bootstrapper.bootstrap_polymarket(max_markets=2)
+            self.assertEqual(first.status, "COMPLETE")
+            state_before = store.load_dataset_bootstrap_state("Polymarket-historical")
+            aggregate_before = store.load_dataset_catalog("Polymarket-historical")
+            job_before = store.get_operator_job("polymarket-historical-refresh")
+            self.assertIsNotNone(state_before)
+            self.assertIsNotNone(aggregate_before)
+            self.assertIsNotNone(job_before)
+
+            no_markets = bootstrapper.bootstrap_polymarket(max_markets=0)
+            self.assertEqual(no_markets.status, "EXHAUSTED")
+            self.assertEqual(no_markets.metadata["no_work_reason"], "EFFECTIVE_BUDGET_ZERO")
+            self.assertEqual(no_markets.records, aggregate_before["row_count"])
+            self.assertEqual(
+                store.load_dataset_bootstrap_state("Polymarket-historical"),
+                state_before,
+            )
+            self.assertEqual(
+                store.load_dataset_catalog("Polymarket-historical"),
+                aggregate_before,
+            )
+            self.assertEqual(
+                store.get_operator_job("polymarket-historical-refresh"),
+                job_before,
+            )
+
+            no_requests = bootstrapper.bootstrap_polymarket(
+                max_markets=2,
+                request_budget=0,
+            )
+            self.assertEqual(no_requests.status, "EXHAUSTED")
+            self.assertEqual(no_requests.records, aggregate_before["row_count"])
+            self.assertEqual(
+                store.load_dataset_bootstrap_state("Polymarket-historical"),
+                state_before,
+            )
+            self.assertEqual(
+                store.load_dataset_catalog("Polymarket-historical"),
+                aggregate_before,
+            )
+
+    def test_polymarket_bootstrap_retries_empty_history_without_reprocessing_success(self) -> None:
+        class TransientHistoryPolymarket(FakePolymarket):
+            def __init__(self) -> None:
+                super().__init__()
+                self.market_calls: list[str] = []
+                self.history_calls: list[str] = []
+                self.empty_history = True
+
+            def market(self, market_id: str) -> PredictionMarketSnapshot | None:
+                self.market_calls.append(market_id)
+                return super().market(market_id)
+
+            def price_history(self, market_id: str) -> list[dict[str, object]]:
+                self.history_calls.append(market_id)
+                if market_id == "m-politics" and self.empty_history:
+                    self.empty_history = False
+                    return []
+                return super().price_history(market_id)
+
+        provider = TransientHistoryPolymarket()
+        current_time = [T0]
+        with AxiomStore(":memory:") as store:
+            bootstrapper = HistoricalBootstrapper(
+                store,
+                prediction_provider=provider,
+                sleep=lambda _: None,
+                clock=lambda: current_time[0],
+                backoff=0,
+            )
+            first = bootstrapper.bootstrap_polymarket(max_markets=2)
+            self.assertEqual(first.status, "SCHEDULED")
+            state = store.load_dataset_bootstrap_state("Polymarket-historical")
+            self.assertIsNotNone(state)
+            assert state is not None
+            self.assertEqual(state["processed_market_ids"], ["m-crypto"])
+            self.assertEqual(state["failed_markets"]["m-politics"]["status"], "FAILED")
+            self.assertNotIn("m-politics", state["processed_market_ids"])
+            crypto_market_calls_after_first = provider.market_calls.count("m-crypto")
+            crypto_history_calls_after_first = provider.history_calls.count("m-crypto")
+
+            current_time[0] = T0 + timedelta(seconds=1)
+            second = bootstrapper.bootstrap_polymarket(max_markets=2, resume=True)
+            self.assertEqual(second.status, "COMPLETE")
+            self.assertEqual(
+                provider.market_calls.count("m-crypto"),
+                crypto_market_calls_after_first,
+            )
+            self.assertEqual(
+                provider.history_calls.count("m-crypto"),
+                crypto_history_calls_after_first,
+            )
+
+            self.assertEqual(provider.history_calls.count("m-politics"), 2)
+            catalog = store.load_dataset_catalog("prediction:m-politics")
+            self.assertIsNotNone(catalog)
+            assert catalog is not None
+            self.assertEqual(catalog["row_count"], 2)
+            final_state = store.load_dataset_bootstrap_state("Polymarket-historical")
+            self.assertIsNotNone(final_state)
+            assert final_state is not None
+            self.assertEqual(
+                final_state["processed_market_ids"],
+                ["m-crypto", "m-politics"],
+            )
+            self.assertEqual(final_state["failed_markets"], {})
+
+
+
+    def test_polymarket_discovery_retry_after_survives_restart_and_due_retry(self) -> None:
+        now = [T0]
+        retry_after = 60.0
+        with tempfile.TemporaryDirectory() as directory:
+            database = str(Path(directory) / "bootstrap.sqlite")
+            first_provider = RetryAfterPolymarket(retry_after)
+            with AxiomStore(database) as store:
+                first_bootstrapper = HistoricalBootstrapper(
+                    store,
+                    prediction_provider=first_provider,
+                    clock=lambda: now[0],
+                    sleep=lambda _: None,
+                    max_attempts=1,
+                )
+                failed = first_bootstrapper.bootstrap_polymarket(max_markets=2)
+                self.assertEqual(failed.status, "PARTIAL")
+                failed_state = store.load_dataset_bootstrap_state("Polymarket-historical")
+                self.assertIsNotNone(failed_state)
+                assert failed_state is not None
+                self.assertEqual(failed_state["retry_after"], retry_after)
+                self.assertIsNotNone(failed_state["next_attempt_at"])
+                self.assertEqual(first_provider.discovery_calls, [(False, 2)])
+
+            restarted_provider = RetryAfterPolymarket(retry_after)
+            restarted_provider.discovery_failures = 0
+            with AxiomStore(database) as store:
+                restarted_bootstrapper = HistoricalBootstrapper(
+                    store,
+                    prediction_provider=restarted_provider,
+                    clock=lambda: now[0],
+                    sleep=lambda _: None,
+                    max_attempts=1,
+                )
+                before = store.load_dataset_bootstrap_state("Polymarket-historical")
+                scheduled = restarted_bootstrapper.bootstrap_polymarket(max_markets=2, resume=True)
+                after = store.load_dataset_bootstrap_state("Polymarket-historical")
+                self.assertEqual(scheduled.status, "SCHEDULED")
+                self.assertEqual(scheduled.metadata["bootstrap_status"], "WAITING_FOR_RETRY")
+                self.assertEqual(scheduled.metadata["retry_after"], retry_after)
+                self.assertEqual(before, after)
+                self.assertEqual(restarted_provider.discovery_calls, [])
+
+                now[0] += timedelta(seconds=retry_after)
+                resumed = restarted_bootstrapper.bootstrap_polymarket(max_markets=2, resume=True)
+                self.assertEqual(resumed.status, "COMPLETE")
+                self.assertEqual(restarted_provider.discovery_calls, [(False, 2)])
+                final_state = store.load_dataset_bootstrap_state("Polymarket-historical")
+                self.assertIsNotNone(final_state)
+                assert final_state is not None
+                self.assertIsNone(final_state["next_attempt_at"])
 
 class Phase42DashboardTests(unittest.TestCase):
     def test_dashboard_empty_state_and_dynamic_json_api(self) -> None:

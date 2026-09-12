@@ -48,6 +48,8 @@ class MarketDiscoveryPage:
     malformed_count: int
     coverage_status: str
     error_reason: str | None = None
+    request_failed: bool = False
+    retry_after: float = 0.0
 
 
 _EPOCH = datetime.fromtimestamp(0, tz=timezone.utc)
@@ -227,7 +229,7 @@ class PolymarketAdapter(PredictionMarketDataProvider):
         end_date_min: Any | None = None,
         end_date_max: Any | None = None,
     ) -> MarketDiscoveryPage:
-        """Fetch one Gamma keyset page without broadening the requested scope."""
+        """Fetch one documented Gamma keyset page without using offsets."""
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
             raise ValueError("limit must be an integer between 1 and 100")
         if not isinstance(closed, bool):
@@ -266,22 +268,32 @@ class PolymarketAdapter(PredictionMarketDataProvider):
             query["end_date_min"] = _normalized_date_filter(end_date_min, "end_date_min")
         if end_date_max is not None:
             query["end_date_max"] = _normalized_date_filter(end_date_max, "end_date_max")
-        fingerprint = _market_query_fingerprint(request_path, query)
+        fingerprint = _market_query_fingerprint(
+            request_path,
+            query,
+            provider=self.provider_name,
+        )
+        transport_before = len(self._transport_errors)
         payload = self._gamma_get(request_path, **query)
-        if not isinstance(payload, Mapping):
-            return MarketDiscoveryPage(
-                snapshots=(),
-                next_cursor=None,
-                request_path=request_path,
-                query=query,
-                query_fingerprint=fingerprint,
-                raw_count=0,
-                unique_count=0,
-                duplicate_count=0,
-                malformed_count=1,
-                coverage_status="ERROR",
-            )
-        records = payload.get("markets")
+        request_failed = len(self._transport_errors) > transport_before
+        retry_after = max(
+            (
+                float(getattr(error, "retry_after", 0.0) or 0.0)
+                for error in self._transport_errors[transport_before:]
+            ),
+            default=0.0,
+        )
+        if isinstance(payload, Mapping):
+            records = payload.get("markets")
+            returned_cursor = payload.get("next_cursor", payload.get("nextCursor"))
+        elif isinstance(payload, list):
+            # Some documented Gamma deployments return the page array directly;
+            # such a response is terminal because it carries no continuation.
+            records = payload
+            returned_cursor = None
+        else:
+            records = None
+            returned_cursor = None
         if not isinstance(records, list):
             return MarketDiscoveryPage(
                 snapshots=(),
@@ -294,8 +306,10 @@ class PolymarketAdapter(PredictionMarketDataProvider):
                 duplicate_count=0,
                 malformed_count=1,
                 coverage_status="ERROR",
+                error_reason="REQUEST_FAILED" if request_failed else "MALFORMED_PAGE",
+                request_failed=request_failed,
+                retry_after=max(0.0, retry_after),
             )
-        returned_cursor = payload.get("next_cursor")
         if returned_cursor is not None and not isinstance(returned_cursor, str):
             return MarketDiscoveryPage(
                 snapshots=(),
@@ -308,6 +322,9 @@ class PolymarketAdapter(PredictionMarketDataProvider):
                 duplicate_count=0,
                 malformed_count=1,
                 coverage_status="ERROR",
+                error_reason="MALFORMED_CURSOR",
+                request_failed=request_failed,
+                retry_after=max(0.0, retry_after),
             )
         next_cursor = returned_cursor or None
         snapshots: list[PredictionMarketSnapshot] = []
@@ -337,10 +354,8 @@ class PolymarketAdapter(PredictionMarketDataProvider):
             seen_ids.add(snapshot.market_id)
             snapshots.append(snapshot)
         coverage_status = "PARTIAL" if next_cursor is not None else "COMPLETE"
-        error_reason: str | None = None
+        error_reason: str | None = "REQUEST_FAILED" if request_failed else None
         if after_cursor is not None and next_cursor == after_cursor:
-            # A repeated opaque cursor cannot make progress.  Stop without
-            # handing the caller a continuation that would repeat forever.
             next_cursor = None
             coverage_status = "ERROR"
             error_reason = "REPEATED_CURSOR"
@@ -356,6 +371,8 @@ class PolymarketAdapter(PredictionMarketDataProvider):
             malformed_count=malformed_count,
             coverage_status=coverage_status,
             error_reason=error_reason,
+            request_failed=request_failed,
+            retry_after=max(0.0, retry_after),
         )
 
 
@@ -379,6 +396,7 @@ class PolymarketAdapter(PredictionMarketDataProvider):
         token_id = self._yes_token(market_id)
         if token_id is None:
             return []
+        expected_condition, _ = self._token_context.get(token_id, (None, None))
         payload = self._clob_get(
             "/prices-history",
             market=token_id,
@@ -387,7 +405,6 @@ class PolymarketAdapter(PredictionMarketDataProvider):
             endTs=int(ensure_utc(end).timestamp()) if end is not None else None,
         )
         if isinstance(payload, Mapping):
-            expected_condition, _ = self._token_context.get(token_id, (None, None))
             try:
                 asset = _present_text(payload, "asset_id", "assetId", "token_id")
                 returned_condition = _present_text(payload, "market", "condition_id", "conditionId")
@@ -405,7 +422,19 @@ class PolymarketAdapter(PredictionMarketDataProvider):
             return []
         result: list[dict[str, Any]] = []
         for point in payload:
+            point_asset: str | None = None
+            point_condition: str | None = None
             if isinstance(point, Mapping):
+                try:
+                    point_asset = _present_text(
+                        point, "asset_id", "assetId", "token_id", "tokenId"
+                    )
+                    point_condition = _present_text(
+                        point, "market", "condition_id", "conditionId"
+                    )
+                except PolymarketBookIdentityError as exc:
+                    self._validation_errors.append(exc)
+                    return []
                 stamp = parse_timestamp(point.get("t", point.get("timestamp", point.get("time"))))
                 raw_price = point.get("p", point.get("price", point.get("value")))
                 price = None if isinstance(raw_price, bool) else as_float(raw_price)
@@ -414,6 +443,24 @@ class PolymarketAdapter(PredictionMarketDataProvider):
                 stamp = parse_timestamp(point[0])
             else:
                 continue
+            if point_asset is not None and point_asset != token_id:
+                self._validation_errors.append(
+                    PolymarketBookIdentityError(
+                        "CLOB history point asset does not match token"
+                    )
+                )
+                return []
+            if (
+                point_condition is not None
+                and expected_condition is not None
+                and point_condition != expected_condition
+            ):
+                self._validation_errors.append(
+                    PolymarketBookIdentityError(
+                        "CLOB history point market does not match conditionId"
+                    )
+                )
+                return []
             if stamp is not None and price is not None and 0.0 <= price <= 1.0:
                 result.append({"timestamp": stamp, "price": price, "token_id": token_id})
         result.sort(key=lambda item: item["timestamp"])
@@ -1142,12 +1189,32 @@ def _jsonable_query(value: Any) -> Any:
     return value
 
 
-def _market_query_fingerprint(request_path: str, query: Mapping[str, Any]) -> str:
+def _market_query_fingerprint(
+    request_path: str,
+    query: Mapping[str, Any],
+    *,
+    provider: str = "polymarket",
+) -> str:
+    """Hash the immutable market scope, not one pagination request.
+
+    Gamma keyset pages may use a different ``limit`` as the final page is
+    approached, and ``after_cursor`` necessarily changes on every page.  Both
+    are continuation mechanics rather than scope identity.  The provider,
+    endpoint, closed/open selection, and every actual market filter remain
+    part of the fingerprint.
+    """
+    pagination_keys = {"after_cursor", "limit", "page_size"}
     fingerprint_query = {
-        str(key): value for key, value in query.items() if str(key) != "after_cursor"
+        str(key): value
+        for key, value in query.items()
+        if str(key) not in pagination_keys
     }
     canonical = json.dumps(
-        {"request_path": str(request_path), "query": _jsonable_query(fingerprint_query)},
+        {
+            "provider": str(provider).strip() or "polymarket",
+            "request_path": str(request_path),
+            "query": _jsonable_query(fingerprint_query),
+        },
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),

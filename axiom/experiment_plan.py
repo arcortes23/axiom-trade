@@ -645,8 +645,20 @@ _ALLOWED_FIELDS = frozenset(
         "assumptions",
         "exit_policy",
         "exit",
-    }
-)
+        "campaign_id",
+        "campaign_trial_id",
+        "campaign_configuration_id",
+        "campaign_protocol",
+        "scientific_rationale",
+        "dataset_boundary",
+        "configuration_manifest",
+        "observation_horizon",
+        "qualification_gates",
+        "validation_policy",
+        "final_assessment_policy",
+        "protected_row_identity_manifests",
+        "selection_excluded",
+})
 
 _FORBIDDEN_KEY_TOKENS = frozenset(
     {
@@ -1087,6 +1099,19 @@ class ExperimentPlan:
     trial_budget: Mapping[str, Any] = field(
         default_factory=lambda: MappingProxyType({"limit": 1, "locked": True})
     )
+    campaign_id: str | None = None
+    campaign_trial_id: str | None = None
+    campaign_configuration_id: str | None = None
+    campaign_protocol: Mapping[str, Any] | None = None
+    scientific_rationale: str | None = None
+    dataset_boundary: Mapping[str, Any] | None = None
+    configuration_manifest: Mapping[str, Any] | None = None
+    observation_horizon: Mapping[str, Any] | None = None
+    qualification_gates: Mapping[str, Any] | None = None
+    validation_policy: Mapping[str, Any] | None = None
+    final_assessment_policy: Mapping[str, Any] | None = None
+    protected_row_identity_manifests: Mapping[str, Any] | None = None
+    selection_excluded: bool = False
 
     @classmethod
     def from_mapping(cls, document: Mapping[str, Any], *, hypothesis_id: str | None = None) -> "ExperimentPlan":
@@ -1267,8 +1292,6 @@ class ExperimentPlan:
 
         budget_value = raw.get("family_budget", raw.get("budget"))
         family_budget = _as_mapping(budget_value, name="family_budget")
-        # Hermes may describe limits, but the worker owns the namespace.  Do
-        # not let a proposal redirect reservations into another budget.
         family_budget["budget_id"] = AUTONOMOUS_BUDGET_ID
         for name, default in (("total_limit", 1000), ("per_family_limit", 250)):
             value = family_budget.get(name, default)
@@ -1282,6 +1305,36 @@ class ExperimentPlan:
         assumptions = _research_assumptions(raw.get("assumptions"), research_mode)
         exit_policy = _exit_policy(raw.get("exit_policy", raw.get("exit")), research_mode) if market_type is MarketType.PREDICTION else {"type": "not_applicable"}
         trial_budget = _trial_budget(raw.get("trial_budget"), max_variants=max_variants)
+        campaign_protocol = _as_mapping(raw.get("campaign_protocol"), name="campaign_protocol") if raw.get("campaign_protocol") is not None else {}
+        protocol_budget = campaign_protocol.get("budget_limit", campaign_protocol.get("campaign_budget"))
+        if protocol_budget is not None:
+            if isinstance(protocol_budget, bool) or not isinstance(protocol_budget, int) or not 1 <= protocol_budget <= 24:
+                raise ExperimentPlanError("EXPERIMENT_BUDGET_EXCEEDED", "campaign budget must be between one and 24")
+        campaign_id = str(raw.get("campaign_id", "")).strip() or None
+        campaign_trial_id = str(raw.get("campaign_trial_id", "")).strip() or None
+        campaign_configuration_id = str(raw.get("campaign_configuration_id", "")).strip() or None
+        scientific_rationale = str(raw.get("scientific_rationale", "")).strip() or None
+        protocol_mapping_fields = (
+            "dataset_boundary",
+            "configuration_manifest",
+            "observation_horizon",
+            "qualification_gates",
+            "validation_policy",
+            "final_assessment_policy",
+            "protected_row_identity_manifests",
+        )
+        normalized_protocol_fields: dict[str, Mapping[str, Any]] = {}
+        for field_name in protocol_mapping_fields:
+            supplied = raw.get(field_name)
+            if supplied is not None:
+                normalized_protocol_fields[field_name] = _as_mapping(supplied, name=field_name)
+        for field_name, value in normalized_protocol_fields.items():
+            campaign_protocol.setdefault(field_name, value)
+        selection_excluded = raw.get("selection_excluded", False)
+        if selection_excluded is None:
+            selection_excluded = False
+        if not isinstance(selection_excluded, bool):
+            raise ExperimentPlanError("INVALID_PLAN", "selection_excluded must be boolean")
         methodology["research_mode"] = research_mode
         methodology["assumptions"] = assumptions
         methodology["exit_policy"] = exit_policy
@@ -1360,6 +1413,13 @@ class ExperimentPlan:
             "strategy_document": dict(strategy_document) if strategy_document is not None else None,
             "model_document": dict(model_document) if model_document is not None else None,
             "universe": universe,
+            "campaign_id": campaign_id,
+            "campaign_trial_id": campaign_trial_id,
+            "campaign_configuration_id": campaign_configuration_id,
+            "campaign_protocol": _plain_json(campaign_protocol) if campaign_protocol is not None else None,
+            "scientific_rationale": scientific_rationale,
+            **{key: _plain_json(value) for key, value in normalized_protocol_fields.items()},
+            "selection_excluded": selection_excluded,
         }
         if normalized["strategy_document"] is None:
             normalized.pop("strategy_document")
@@ -1401,6 +1461,19 @@ class ExperimentPlan:
             assumptions=_freeze_json(assumptions),
             exit_policy=_freeze_json(exit_policy),
             trial_budget=_freeze_json(trial_budget),
+            campaign_id=campaign_id,
+            campaign_trial_id=campaign_trial_id,
+            campaign_configuration_id=campaign_configuration_id,
+            campaign_protocol=_freeze_json(campaign_protocol) if campaign_protocol is not None else None,
+            scientific_rationale=scientific_rationale,
+            dataset_boundary=_freeze_json(normalized_protocol_fields["dataset_boundary"]) if "dataset_boundary" in normalized_protocol_fields else None,
+            configuration_manifest=_freeze_json(normalized_protocol_fields["configuration_manifest"]) if "configuration_manifest" in normalized_protocol_fields else None,
+            observation_horizon=_freeze_json(normalized_protocol_fields["observation_horizon"]) if "observation_horizon" in normalized_protocol_fields else None,
+            qualification_gates=_freeze_json(normalized_protocol_fields["qualification_gates"]) if "qualification_gates" in normalized_protocol_fields else None,
+            validation_policy=_freeze_json(normalized_protocol_fields["validation_policy"]) if "validation_policy" in normalized_protocol_fields else None,
+            final_assessment_policy=_freeze_json(normalized_protocol_fields["final_assessment_policy"]) if "final_assessment_policy" in normalized_protocol_fields else None,
+            protected_row_identity_manifests=_freeze_json(normalized_protocol_fields["protected_row_identity_manifests"]) if "protected_row_identity_manifests" in normalized_protocol_fields else None,
+            selection_excluded=selection_excluded,
         )
 
     @classmethod
@@ -1445,6 +1518,19 @@ class ExperimentPlan:
                 "assumptions": proposal.get("assumptions"),
                 "exit_policy": proposal.get("exit_policy", proposal.get("exit")),
                 "trial_budget": proposal.get("trial_budget"),
+                "campaign_id": proposal.get("campaign_id"),
+                "campaign_trial_id": proposal.get("campaign_trial_id"),
+                "campaign_configuration_id": proposal.get("campaign_configuration_id"),
+                "campaign_protocol": proposal.get("campaign_protocol"),
+                "scientific_rationale": proposal.get("scientific_rationale"),
+                "dataset_boundary": proposal.get("dataset_boundary"),
+                "configuration_manifest": proposal.get("configuration_manifest"),
+                "observation_horizon": proposal.get("observation_horizon"),
+                "qualification_gates": proposal.get("qualification_gates"),
+                "validation_policy": proposal.get("validation_policy"),
+                "final_assessment_policy": proposal.get("final_assessment_policy"),
+                "protected_row_identity_manifests": proposal.get("protected_row_identity_manifests"),
+                "selection_excluded": proposal.get("selection_excluded"),
                 "paper_only": proposal.get("paper_only") if proposal.get("paper_only") is not None else True,
             }
             if "filters" not in proposal:
@@ -1676,6 +1762,29 @@ class ExperimentPlan:
             "assumptions": _plain_json(self.assumptions),
             "exit_policy": _plain_json(self.exit_policy),
         }
+        if self.campaign_id is not None:
+            result["campaign_id"] = self.campaign_id
+        if self.campaign_trial_id is not None:
+            result["campaign_trial_id"] = self.campaign_trial_id
+        if self.campaign_configuration_id is not None:
+            result["campaign_configuration_id"] = self.campaign_configuration_id
+        if self.campaign_protocol is not None:
+            result["campaign_protocol"] = _plain_json(self.campaign_protocol)
+        if self.scientific_rationale is not None:
+            result["scientific_rationale"] = self.scientific_rationale
+        for name, value in (
+            ("dataset_boundary", self.dataset_boundary),
+            ("configuration_manifest", self.configuration_manifest),
+            ("observation_horizon", self.observation_horizon),
+            ("qualification_gates", self.qualification_gates),
+            ("validation_policy", self.validation_policy),
+            ("final_assessment_policy", self.final_assessment_policy),
+            ("protected_row_identity_manifests", self.protected_row_identity_manifests),
+        ):
+            if value is not None:
+                result[name] = _plain_json(value)
+        if self.selection_excluded:
+            result["selection_excluded"] = True
         if self.strategy_document is not None:
             result["strategy_document"] = _plain_json(self.strategy_document)
         if self.model_document is not None:

@@ -10,7 +10,7 @@ import unittest
 from unittest.mock import patch
 
 from axiom.auto_canary import AutonomousCanaryWorker
-from axiom.canary import CanaryService, CredentialStore
+from axiom.canary import CanaryBlocked, CanaryService, CredentialStore
 from axiom.canary_positions import CanaryPositionManager
 from axiom.dashboard import DashboardData
 
@@ -71,6 +71,7 @@ class _QualifiedCanaryCredentials(CredentialStore):
 
 
 class _PositionCanaryVenue:
+    fixture_label = "SYNTHETIC_TEST_ONLY"
     def __init__(self, *, timestamp: datetime = T0) -> None:
         self.submissions: list[dict[str, object]] = []
         self.orders: dict[str, dict[str, object]] = {}
@@ -123,6 +124,10 @@ class _PositionCanaryVenue:
             "ok": True,
             "order_id": order_id,
             "status": "FILLED" if is_exit else "MATCHED",
+            "side": str(side).upper(),
+            "market_id": "synthetic-position-market",
+            "token_id": token_id,
+            "original_size": str(quantity),
             "fill_quantity": str(fill_quantity),
             "settlement_status": "SETTLED" if is_exit else None,
             "actual_average_price": str(price),
@@ -148,6 +153,10 @@ class _PositionCanaryVenue:
         return [
             {
                 "id": f"{order_id}-trade",
+                "order_id": order_id,
+                "market_id": order["market_id"],
+                "token_id": order["token_id"],
+                "side": order["side"],
                 "quantity": order["fill_quantity"],
                 "price": order["actual_average_price"],
                 "fee": order["fees"],
@@ -747,8 +756,8 @@ class PolymarketCombinedIntegrationTests(unittest.TestCase):
             credentials=_QualifiedCanaryCredentials(),
             clock=lambda: now[0],
         )
-        candidate_id = "dashboard-position-candidate"
-        market_id = "dashboard-position-market"
+        candidate_id = "synthetic-qualified-position-candidate"
+        market_id = "synthetic-position-market"
         _seed_market(store, market_id, snapshot=True)
         _seed_candidate(
             store,
@@ -772,10 +781,24 @@ class PolymarketCombinedIntegrationTests(unittest.TestCase):
 
         first_evaluation = service.evaluate_signal(
             candidate_id,
-            cycle_id="dashboard-position-partial",
+            cycle_id="synthetic-position-partial",
         )
+        self.assertEqual(first_evaluation["reason_code"], "READY_SIGNAL")
         first_signal = first_evaluation.get("signal")
         self.assertIsInstance(first_signal, dict)
+        persisted_first_signal = service.get_signal(str(first_signal["signal_id"]))
+        self.assertIsNotNone(persisted_first_signal)
+        assert persisted_first_signal is not None
+        self.assertEqual(persisted_first_signal["status"], "READY")
+        self.assertEqual(
+            persisted_first_signal["evidence"]["source_type"],
+            "FORWARD_COLLECTED",
+        )
+        self.assertEqual(
+            persisted_first_signal["evidence"]["current_execution_evidence"],
+            "CURRENT_ORDER_BOOK",
+        )
+        self.assertEqual(venue.fixture_label, "SYNTHETIC_TEST_ONLY")
         first_submission = service.submit_signal(
             str(first_signal["signal_id"]),
             venue=venue,
@@ -806,18 +829,12 @@ class PolymarketCombinedIntegrationTests(unittest.TestCase):
                 (provisional_event["event_id"],),
             ).fetchone()
         )
-        with store.connection:
-            store.connection.execute(
-                "UPDATE canary_ledger SET status='ACCEPTED' WHERE signal_id=?",
-                (first_signal["signal_id"],),
-            )
         entry_reconciliation = positions.reconcile_pending(
             venue,
             allow_test_venue=True,
         )
         self.assertEqual(entry_reconciliation["status"], "RECONCILED")
         self.assertEqual(entry_reconciliation["blocked"], 0)
-
         first_event = store.connection.execute(
             "SELECT event_id,fill_quantity,submitted_quantity,status "
             "FROM canary_ledger WHERE signal_id=?",
@@ -825,11 +842,24 @@ class PolymarketCombinedIntegrationTests(unittest.TestCase):
         ).fetchone()
         self.assertIsNotNone(first_event)
         assert first_event is not None
+        self.assertEqual(first_event["status"], "CONFIRMED")
         self.assertGreater(Decimal(first_event["fill_quantity"]), Decimal("0"))
         self.assertLess(
             Decimal(first_event["fill_quantity"]),
             Decimal(first_event["submitted_quantity"]),
         )
+        self.assertEqual(
+            store.connection.execute(
+                "SELECT COUNT(*) FROM canary_risk_fills AS f "
+                "JOIN canary_risk_reservations AS r "
+                "ON r.reservation_id=f.reservation_id WHERE r.side='BUY'"
+            ).fetchone()[0],
+            1,
+        )
+        first_accounting = store.canary_risk_accounting(now=now[0])
+        self.assertEqual(first_accounting["open_positions"], 1)
+        self.assertEqual(first_accounting["open_market_ids"], [market_id])
+        self.assertEqual(first_accounting["open_lot_slots"], 1)
 
         now[0] += timedelta(seconds=1)
         venue.timestamp = now[0]
@@ -842,8 +872,9 @@ class PolymarketCombinedIntegrationTests(unittest.TestCase):
         )
         second_evaluation = service.evaluate_signal(
             candidate_id,
-            cycle_id="dashboard-position-full",
+            cycle_id="synthetic-position-full",
         )
+        self.assertEqual(second_evaluation["reason_code"], "READY_SIGNAL")
         second_signal = second_evaluation.get("signal")
         self.assertIsInstance(second_signal, dict)
         second_submission = service.submit_signal(
@@ -852,7 +883,7 @@ class PolymarketCombinedIntegrationTests(unittest.TestCase):
             allow_test_venue=True,
         )
         self.assertEqual(second_submission["execution_status"], "MATCHED", second_submission)
-        entry_reconciliation = CanaryPositionManager(service).reconcile_pending(
+        entry_reconciliation = positions.reconcile_pending(
             venue,
             allow_test_venue=True,
         )
@@ -869,6 +900,30 @@ class PolymarketCombinedIntegrationTests(unittest.TestCase):
             Decimal(second_event["fill_quantity"]),
             Decimal(second_event["submitted_quantity"]),
         )
+        buy_fills = store.connection.execute(
+            "SELECT f.quantity,f.price,f.fee,f.cost "
+            "FROM canary_risk_fills AS f "
+            "JOIN canary_risk_reservations AS r "
+            "ON r.reservation_id=f.reservation_id WHERE r.side='BUY' "
+            "ORDER BY f.filled_at,f.fill_id"
+        ).fetchall()
+        self.assertEqual(len(buy_fills), 2)
+        full_lot_before_exit = store.connection.execute(
+            "SELECT quantity,cost_basis,fees,status FROM canary_position_lots "
+            "WHERE event_id=?",
+            (second_event["event_id"],),
+        ).fetchone()
+        self.assertIsNotNone(full_lot_before_exit)
+        assert full_lot_before_exit is not None
+        self.assertEqual(
+            Decimal(full_lot_before_exit["cost_basis"]),
+            Decimal(buy_fills[1]["cost"]),
+        )
+        full_lot_basis = Decimal(full_lot_before_exit["cost_basis"])
+        second_accounting = store.canary_risk_accounting(now=now[0])
+        self.assertEqual(second_accounting["open_positions"], 1)
+        self.assertEqual(second_accounting["open_market_ids"], [market_id])
+        self.assertEqual(second_accounting["open_lot_slots"], 2)
         full_reservation = store.connection.execute(
             "SELECT status,remaining_cost,released_at FROM canary_risk_reservations "
             "WHERE event_id=?",
@@ -890,8 +945,8 @@ class PolymarketCombinedIntegrationTests(unittest.TestCase):
         latest_signal = canary_projection["canary"]["latest_signal"]
         self.assertIsInstance(latest_signal, dict)
         self.assertNotEqual(latest_signal["status"], "NO_SIGNAL")
+        pre_exit_accounting = store.canary_risk_accounting(now[0])
 
-        positions = CanaryPositionManager(service)
         # The minimum-sized partial fill is below the venue's exit minimum.
         # Exit the fully filled lot without consuming that separate inventory.
         position_id = "position:" + str(second_event["event_id"])
@@ -904,8 +959,30 @@ class PolymarketCombinedIntegrationTests(unittest.TestCase):
             allow_test_venue=True,
         )
         self.assertEqual(exit_request["status"], "FILLED", exit_request)
+        exit_position_request = store.connection.execute(
+            "SELECT request_id,position_id,reservation_id,event_id "
+            "FROM canary_position_requests WHERE request_id=?",
+            (exit_request["request_id"],),
+        ).fetchone()
+        self.assertIsNotNone(exit_position_request)
+        assert exit_position_request is not None
+        self.assertEqual(exit_position_request["request_id"], exit_request["request_id"])
+        self.assertEqual(exit_position_request["position_id"], position_id)
+        self.assertEqual(exit_position_request["reservation_id"], exit_request["reservation_id"])
+        self.assertEqual(exit_position_request["event_id"], exit_request["reservation_id"])
+        exit_reservation = store.connection.execute(
+            "SELECT reservation_id,intent_id,event_id FROM canary_risk_reservations "
+            "WHERE reservation_id=?",
+            (exit_request["reservation_id"],),
+        ).fetchone()
+        self.assertIsNotNone(exit_reservation)
+        assert exit_reservation is not None
+        self.assertEqual(exit_reservation["reservation_id"], exit_request["reservation_id"])
+        self.assertEqual(exit_reservation["intent_id"], exit_request["request_id"])
+        self.assertEqual(exit_reservation["event_id"], exit_request["request_id"])
         pending_lot = store.connection.execute(
-            "SELECT sold_quantity,pending_exit_quantity FROM canary_position_lots WHERE position_id=?",
+            "SELECT sold_quantity,pending_exit_quantity FROM canary_position_lots "
+            "WHERE position_id=?",
             (position_id,),
         ).fetchone()
         self.assertEqual(Decimal(pending_lot["sold_quantity"]), Decimal("0"))
@@ -928,13 +1005,202 @@ class PolymarketCombinedIntegrationTests(unittest.TestCase):
         self.assertEqual(lot["status"], "CLOSED")
         self.assertEqual(Decimal(lot["sold_quantity"]), Decimal(second_event["fill_quantity"]))
         partial_lot = store.connection.execute(
-            "SELECT quantity,sold_quantity FROM canary_position_lots WHERE event_id=?",
+            "SELECT quantity,sold_quantity,cost_basis FROM canary_position_lots "
+            "WHERE event_id=?",
             (first_event["event_id"],),
         ).fetchone()
-        self.assertEqual(
-            Decimal(partial_lot["quantity"]) - Decimal(partial_lot["sold_quantity"]),
-            Decimal(first_event["fill_quantity"]),
+        self.assertIsNotNone(partial_lot)
+        assert partial_lot is not None
+        remaining_quantity = (
+            Decimal(partial_lot["quantity"]) - Decimal(partial_lot["sold_quantity"])
         )
+        remaining_basis = (
+            Decimal(partial_lot["cost_basis"])
+            * remaining_quantity
+            / Decimal(partial_lot["quantity"])
+        )
+        exited_quantity = Decimal(lot["sold_quantity"])
+        released_basis = full_lot_basis * exited_quantity / Decimal(
+            second_event["fill_quantity"]
+        )
+        expected_remaining = Decimal("0.0010508295")
+        exit_fill = store.connection.execute(
+            "SELECT f.fill_id,f.reservation_id,f.detail_json,f.quantity,f.price,f.fee,f.cost "
+            "FROM canary_risk_fills AS f "
+            "JOIN canary_risk_reservations AS r "
+            "ON r.reservation_id=f.reservation_id "
+            "WHERE r.side='SELL' AND r.reservation_id=?",
+            (exit_request["reservation_id"],),
+        ).fetchone()
+        self.assertIsNotNone(exit_fill)
+        assert exit_fill is not None
+        self.assertEqual(exit_fill["fill_id"], "exit-order-trade")
+        self.assertEqual(exit_fill["reservation_id"], exit_request["reservation_id"])
+        exit_detail = json.loads(exit_fill["detail_json"])
+        self.assertEqual(exit_detail["position_id"], position_id)
+        self.assertEqual(exit_detail["request_id"], exit_request["request_id"])
+        expected_exit_pnl = (
+            Decimal(exit_fill["quantity"]) * Decimal(exit_fill["price"])
+            - Decimal(exit_fill["fee"])
+            - Decimal(full_lot_before_exit["cost_basis"])
+        )
+        settled_lot = store.connection.execute(
+            "SELECT quantity,sold_quantity,cost_basis,gross_proceeds,exit_fees,"
+            "realized_pnl,status FROM canary_position_lots WHERE position_id=?",
+            (position_id,),
+        ).fetchone()
+        self.assertIsNotNone(settled_lot)
+        assert settled_lot is not None
+        self.assertEqual(
+            Decimal(settled_lot["gross_proceeds"]),
+            Decimal(exit_fill["quantity"]) * Decimal(exit_fill["price"]),
+        )
+        self.assertEqual(Decimal(settled_lot["exit_fees"]), Decimal(exit_fill["fee"]))
+        self.assertEqual(Decimal(settled_lot["realized_pnl"]), expected_exit_pnl)
+        self.assertEqual(
+            store.canary_risk_accounting(now=now[0])["today_realized_pnl_usd"],
+            format(expected_exit_pnl, "f"),
+        )
+        partial_lot_after_exit = store.connection.execute(
+            "SELECT quantity,sold_quantity,cost_basis FROM canary_position_lots "
+            "WHERE event_id=?",
+            (first_event["event_id"],),
+        ).fetchone()
+        self.assertIsNotNone(partial_lot_after_exit)
+        assert partial_lot_after_exit is not None
+        expected_open_cost = Decimal(partial_lot_after_exit["cost_basis"]) * (
+            Decimal(partial_lot_after_exit["quantity"])
+            - Decimal(partial_lot_after_exit["sold_quantity"])
+        ) / Decimal(partial_lot_after_exit["quantity"])
+        pending_buy_cost = sum(
+            (
+                Decimal(row["remaining_cost"])
+                for row in store.connection.execute(
+                    "SELECT remaining_cost FROM canary_risk_reservations "
+                    "WHERE side='BUY' AND status IN "
+                    "('HELD','RESERVED','SUBMITTING','ACKNOWLEDGED',"
+                    "'PARTIALLY_FILLED','PARTIAL','OPEN','SUBMITTED','UNKNOWN')"
+                ).fetchall()
+            ),
+            Decimal("0"),
+        )
+        final_accounting = store.canary_risk_accounting(now=now[0])
+        self.assertEqual(
+            Decimal(final_accounting["today_realized_pnl_usd"]),
+            Decimal(exit_detail["realized_pnl_usd"]),
+        )
+        self.assertEqual(
+            Decimal(final_accounting["aggregate_open_cost_usd"]),
+            Decimal(pre_exit_accounting["aggregate_open_cost_usd"]) - released_basis,
+        )
+        self.assertEqual(
+            Decimal(final_accounting["aggregate_exposure_usd"]),
+            Decimal(pre_exit_accounting["aggregate_exposure_usd"]) - released_basis,
+        )
+        self.assertEqual(remaining_basis, expected_remaining)
+        self.assertEqual(
+            Decimal(final_accounting["aggregate_open_cost_usd"]),
+            expected_remaining,
+        )
+        repeated_accounting = store.canary_risk_accounting(now[0])
+        self.assertEqual(
+            repeated_accounting["aggregate_open_cost_usd"],
+            final_accounting["aggregate_open_cost_usd"],
+        )
+        self.assertEqual(
+            repeated_accounting["aggregate_exposure_usd"],
+            final_accounting["aggregate_exposure_usd"],
+        )
+        self.assertEqual(
+            repeated_accounting["today_realized_pnl_usd"],
+            final_accounting["today_realized_pnl_usd"],
+        )
+        self.assertEqual(
+            Decimal(final_accounting["aggregate_open_cost_usd"]),
+            expected_open_cost,
+        )
+        self.assertEqual(
+            Decimal(final_accounting["aggregate_exposure_usd"]),
+            expected_open_cost + pending_buy_cost,
+        )
+        self.assertEqual(final_accounting["open_positions"], 1)
+        self.assertEqual(final_accounting["open_market_ids"], [market_id])
+        self.assertEqual(
+            store.connection.execute("SELECT COUNT(*) FROM canary_risk_fills").fetchone()[0],
+            3,
+        )
+        self.assertEqual(
+            store.connection.execute(
+                "SELECT COUNT(*) FROM canary_position_requests WHERE status='SETTLED'"
+            ).fetchone()[0],
+            1,
+        )
+        self.assertEqual(len(venue.submissions), 3)
+        self.assertEqual(
+            {str(item["side"]).upper() for item in venue.submissions},
+            {"BUY", "SELL"},
+        )
+        # The fixture remains paper-disabled and every transport call above is
+        # the explicit synthetic venue; no real execution path is activated.
+        self.assertFalse(service.status()["live_execution"])
+        self.assertEqual(service.status()["production_live_trading"], "DISABLED")
+
+        now[0] += timedelta(seconds=1)
+        _seed_market(
+            store,
+            market_id,
+            snapshot=True,
+            observed_at=now[0],
+            snapshot_id=f"{market_id}-snapshot-3",
+        )
+        disarmed_signal = service.evaluate_signal(
+            candidate_id,
+            cycle_id="synthetic-position-disarmed",
+        )["signal"]
+        self.assertIsInstance(disarmed_signal, dict)
+        service.disarm()
+        with self.assertRaisesRegex(CanaryBlocked, "CANARY_NOT_ARMED"):
+            service.submit_signal(
+                str(disarmed_signal["signal_id"]),
+                venue=venue,
+                allow_test_venue=True,
+            )
+        self.assertEqual(len(venue.submissions), 3)
+        rearm_settings = service.settings.snapshot()
+        rearmed = service.arm(
+            candidate_id,
+            venue=venue,
+            credentials_configured=True,
+            config_id=str(rearm_settings["config_id"]),
+            expected_generation=int(rearm_settings["generation"]),
+        )
+        self.assertEqual(rearmed["micro_live_canary"], "ARMED")
+        self.assertFalse(service.status()["live_execution"])
+        self.assertEqual(len(venue.submissions), 3)
+
+        now[0] += timedelta(seconds=1)
+        _seed_market(
+            store,
+            market_id,
+            snapshot=True,
+            observed_at=now[0],
+            snapshot_id=f"{market_id}-snapshot-4",
+        )
+        killed_signal = service.evaluate_signal(
+            candidate_id,
+            cycle_id="synthetic-position-killed",
+        )["signal"]
+        self.assertIsInstance(killed_signal, dict)
+        service.kill()
+        self.assertEqual(service.status()["micro_live_canary"], "KILLED")
+        with self.assertRaisesRegex(CanaryBlocked, "CANARY_NOT_ARMED"):
+            service.submit_signal(
+                str(killed_signal["signal_id"]),
+                venue=venue,
+                allow_test_venue=True,
+            )
+        self.assertEqual(len(venue.submissions), 3)
+        self.assertFalse(service.status()["live_execution"])
 
     def test_canonical_proposal_research_freeze_resolution_fresh_inputs_decide(self):
         store = self._store()

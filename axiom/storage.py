@@ -27,7 +27,13 @@ from zoneinfo import ZoneInfo
 _MAX_LATEST_SCAN_ROWS = 10_000
 _CANARY_EQUITY_MARK_MAX_AGE_SECONDS = 300.0
 _CANARY_CONFIRMED_SETTLEMENT_STATUSES = frozenset(
-    {"CONFIRMED", "TRADE_STATUS_CONFIRMED", "SETTLED", "TRADE_STATUS_SETTLED"}
+    {"CONFIRMED", "TRADE_STATUS_CONFIRMED", "SETTLED", "SETTLED_PARTIAL", "TRADE_STATUS_SETTLED"}
+)
+_CANARY_FINAL_SETTLEMENT_STATUSES = frozenset(
+    {"SETTLED", "SETTLED_PARTIAL", "TRADE_STATUS_SETTLED", "FINAL", "CLOSED", "COMPLETED", "RESOLVED"}
+)
+_CANARY_RESERVATION_TERMINAL_STATUSES = frozenset(
+    {"FILLED", "SETTLED", "RELEASED", "CANCELED", "CANCELLED", "REJECTED"}
 )
 _CANARY_LIMIT_ALIASES = {
     "target_notional_usd": "max_all_in_buy_usd",
@@ -330,8 +336,10 @@ class AxiomStore:
                     yield self
                 except BaseException:
                     try:
-                        self._conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
-                        self._conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                        try:
+                            self._conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                        finally:
+                            self._conn.execute(f"RELEASE SAVEPOINT {savepoint}")
                     finally:
                         self._after_commit_callbacks.pop()
                         self._transaction_depth -= 1
@@ -340,8 +348,14 @@ class AxiomStore:
                     try:
                         self._conn.execute(f"RELEASE SAVEPOINT {savepoint}")
                     except BaseException:
-                        self._after_commit_callbacks.pop()
-                        self._transaction_depth -= 1
+                        try:
+                            try:
+                                self._conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                            finally:
+                                self._conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                        finally:
+                            self._after_commit_callbacks.pop()
+                            self._transaction_depth -= 1
                         raise
                     callbacks_to_run = self._after_commit_callbacks.pop()
                     self._transaction_depth -= 1
@@ -377,11 +391,24 @@ class AxiomStore:
                 try:
                     yield
                 except BaseException:
-                    self._conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
-                    self._conn.execute(f"RELEASE SAVEPOINT {savepoint}")
-                    raise
+                    try:
+                        try:
+                            self._conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                        finally:
+                            self._conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                    finally:
+                        raise
                 else:
-                    self._conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                    try:
+                        self._conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                    except BaseException:
+                        try:
+                            try:
+                                self._conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                            finally:
+                                self._conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                        finally:
+                            raise
             else:
                 with self._conn:
                     yield
@@ -1658,7 +1685,16 @@ class AxiomStore:
                     raise ValueError("submission attempt identity conflict")
                 return identifier
             reservation_status = str(reservation["status"]).upper()
-            if reservation_status in {"RELEASED", "CANCELLED", "CANCELED", "REJECTED", "SETTLED", "FILLED"}:
+            reservation_quantity = _risk_decimal(reservation["quantity"])
+            reservation_filled_quantity = _risk_decimal(reservation["filled_quantity"])
+            filled_projection_incomplete = (
+                reservation_status == "FILLED"
+                and reservation_quantity > 0
+                and reservation_filled_quantity < reservation_quantity
+            )
+            if reservation_status in {"RELEASED", "CANCELLED", "CANCELED", "REJECTED", "SETTLED"} or (
+                reservation_status == "FILLED" and not filled_projection_incomplete
+            ):
                 raise ValueError("submission reservation is terminal")
             if reservation_status == "UNKNOWN":
                 raise ValueError("submission retry for UNKNOWN is forbidden")
@@ -1685,8 +1721,10 @@ class AxiomStore:
             unsubmitted = self._conn.execute(
                 "SELECT COUNT(*) AS n FROM canary_risk_reservations r "
                 "WHERE r.created_at>=? AND r.created_at<? "
-                "AND r.status IN ('HELD','RESERVED','SUBMITTING','ACKNOWLEDGED','UNKNOWN',"
-                "'PARTIAL','PARTIALLY_FILLED','OPEN') "
+                "AND (r.status IN ('HELD','RESERVED','SUBMITTING','ACKNOWLEDGED','UNKNOWN',"
+                "'PARTIAL','PARTIALLY_FILLED','OPEN') OR "
+                "(UPPER(r.status)='FILLED' AND CAST(COALESCE(r.filled_quantity,'0') AS NUMERIC) "
+                "< CAST(COALESCE(r.quantity,'0') AS NUMERIC))) "
                 "AND NOT EXISTS (SELECT 1 FROM canary_submission_attempts a WHERE a.intent_id=r.intent_id)",
                 (start, end),
             ).fetchone()
@@ -2202,8 +2240,10 @@ class AxiomStore:
             unsubmitted = self._conn.execute(
                 "SELECT COUNT(*) AS n FROM canary_risk_reservations r "
                 "WHERE r.created_at>=? AND r.created_at<? "
-                "AND r.status IN ('HELD','RESERVED','SUBMITTING','ACKNOWLEDGED','UNKNOWN',"
-                "'PARTIAL','PARTIALLY_FILLED','OPEN') "
+                "AND (r.status IN ('HELD','RESERVED','SUBMITTING','ACKNOWLEDGED','UNKNOWN',"
+                "'PARTIAL','PARTIALLY_FILLED','OPEN') OR "
+                "(UPPER(r.status)='FILLED' AND CAST(COALESCE(r.filled_quantity,'0') AS NUMERIC) "
+                "< CAST(COALESCE(r.quantity,'0') AS NUMERIC))) "
                 "AND NOT EXISTS (SELECT 1 FROM canary_submission_attempts a WHERE a.intent_id=r.intent_id)",
                 (start, end),
             ).fetchone()
@@ -2290,6 +2330,134 @@ class AxiomStore:
                 "SELECT * FROM canary_risk_fills WHERE fill_id=?",
                 (fill,),
             ).fetchone()
+            # SELL fills are only accepted from the exact persisted position
+            # request.  Legacy low-level reservations without a position
+            # request remain usable for BUY accounting, but a mapped SELL must
+            # carry every immutable identity field.
+            if str(reservation_row["side"] or "").upper() == "SELL":
+                try:
+                    mapped_requests = self._conn.execute(
+                        "SELECT request_id,position_id,order_id,market_id,token_id,"
+                        "side,requested_quantity,status "
+                        "FROM canary_position_requests WHERE reservation_id=?",
+                        (reservation,),
+                    ).fetchall()
+                except sqlite3.OperationalError:
+                    mapped_requests = []
+                incoming_detail = _load(detail_json) if detail_json else {}
+                if mapped_requests:
+                    if len(mapped_requests) != 1 or not isinstance(
+                        incoming_detail, Mapping
+                    ):
+                        raise ValueError("fill identity conflict")
+                    mapped = mapped_requests[0]
+                    if (
+                        prior is None
+                        and str(mapped["status"] or "").strip().upper()
+                        in {
+                            "CANCELED",
+                            "CANCELLED",
+                            "EXPIRED",
+                            "REJECTED",
+                            "FAILED",
+                            "ERROR",
+                            "SETTLED",
+                            "SETTLED_PARTIAL",
+                            "RESOLVED",
+                            "FINAL",
+                            "CLOSED",
+                            "COMPLETED",
+                        }
+                    ):
+                        # Request terminality is authoritative even if a
+                        # stale reservation projection still says OPEN.
+                        raise ValueError("position request is terminal")
+                    request_id = str(mapped["request_id"] or "").strip()
+                    position_id = str(mapped["position_id"] or "").strip()
+                    order_id = str(mapped["order_id"] or "").strip()
+                    market_id = str(mapped["market_id"] or "").strip()
+                    token_id = str(mapped["token_id"] or "").strip()
+                    detail_token_id = str(
+                        incoming_detail.get("token_id") or ""
+                    ).strip()
+                    detail_asset_id = str(
+                        incoming_detail.get("asset_id") or ""
+                    ).strip()
+                    detail_token = detail_token_id or detail_asset_id
+                    detail_token_conflict = (
+                        bool(detail_token_id)
+                        and bool(detail_asset_id)
+                        and detail_token_id != detail_asset_id
+                    )
+                    if (
+                        not request_id
+                        or not position_id
+                        or not order_id
+                        or not market_id
+                        or not token_id
+                        or detail_token_conflict
+                        or str(mapped["side"] or "").upper() != "SELL"
+                        or str(incoming_detail.get("request_id") or "").strip()
+                        != request_id
+                        or str(incoming_detail.get("order_id") or "").strip()
+                        != order_id
+                        or str(incoming_detail.get("side") or "").strip().upper()
+                        != "SELL"
+                        or str(incoming_detail.get("market_id") or "").strip()
+                        != market_id
+                        or detail_token != token_id
+                    ):
+                        raise ValueError("fill identity conflict")
+                    try:
+                        requested_quantity = _risk_decimal(
+                            mapped["requested_quantity"],
+                            name="requested quantity",
+                            nonnegative=True,
+                        )
+                        lot = self._conn.execute(
+                            "SELECT quantity,sold_quantity,market_id,token_id "
+                            "FROM canary_position_lots WHERE position_id=?",
+                            (position_id,),
+                        ).fetchone()
+                    except (InvalidOperation, TypeError, ValueError):
+                        lot = None
+                        requested_quantity = Decimal("0")
+                    if lot is None:
+                        raise ValueError("fill identity conflict")
+                    available_quantity = max(
+                        Decimal("0"),
+                        _risk_decimal(lot["quantity"])
+                        - _risk_decimal(lot["sold_quantity"]),
+                    )
+                    if (
+                        requested_quantity <= 0
+                        or qty <= 0
+                        or qty > requested_quantity
+                        or (prior is None and qty > available_quantity)
+                        or market_id != str(lot["market_id"] or "").strip()
+                        or token_id != str(lot["token_id"] or "").strip()
+                    ):
+                        raise ValueError("fill identity conflict")
+            prior = self._conn.execute(
+                "SELECT * FROM canary_risk_fills WHERE fill_id=?",
+                (fill,),
+            ).fetchone()
+            prior_is_new = prior is None
+            reservation_status_before = str(
+                reservation_row["status"] or ""
+            ).strip().upper()
+            if (
+                prior_is_new
+                and _canary_reservation_terminal(reservation_status_before)
+                and not (
+                    reservation_status_before == "RELEASED"
+                    and str(reservation_row["side"] or "").strip().upper() == "BUY"
+                )
+            ):
+                # A new venue fill can never reopen a terminal reservation.
+                # Exact replays are handled below without changing its
+                # durable terminal state.
+                raise ValueError("risk reservation is terminal")
             if prior is not None:
                 if (
                     str(prior["reservation_id"]) != reservation
@@ -2353,10 +2521,15 @@ class AxiomStore:
                     "UPDATE canary_risk_reservations SET detail_json=? WHERE reservation_id=?",
                     (_dump(reservation_detail), reservation),
                 )
-            fill_status = str(reservation_row["status"]).upper()
+            reservation_status = reservation_status_before
+            reopened_released = (
+                prior_is_new
+                and reservation_status == "RELEASED"
+                and side_value == "BUY"
+            )
             settlement = _canary_fill_settlement_status(_load(detail_json) if detail_json else {})
+            expected_quantity = _risk_decimal(reservation_row["quantity"])
             if side_value == "BUY":
-                expected_quantity = _risk_decimal(reservation_row["quantity"])
                 if settlement not in _CANARY_CONFIRMED_SETTLEMENT_STATUSES:
                     fill_status = "UNKNOWN"
                 elif total_quantity >= expected_quantity and expected_quantity > 0:
@@ -2364,25 +2537,52 @@ class AxiomStore:
                 else:
                     fill_status = "PARTIALLY_FILLED"
             elif side_value == "SELL":
-                expected_quantity = _risk_decimal(reservation_row["quantity"])
                 if settlement not in _CANARY_CONFIRMED_SETTLEMENT_STATUSES:
                     fill_status = "OPEN"
                 elif total_quantity > 0 and total_quantity < expected_quantity:
                     fill_status = "PARTIALLY_FILLED"
                 elif total_quantity >= expected_quantity and expected_quantity > 0:
                     fill_status = "FILLED"
-            self._conn.execute(
-                "UPDATE canary_risk_reservations SET filled_cost=?,remaining_cost=?,filled_quantity=?,"
-                "status=?,updated_at=? WHERE reservation_id=?",
+                else:
+                    fill_status = reservation_status
+            else:
+                fill_status = reservation_status
+            # Replaying a fill cannot downgrade a terminal projection.  A
+            # genuinely new fill is different evidence: RELEASED may reopen
+            # while delayed canonical fills arrive, and FILLED is only final
+            # once its quantity is actually complete.
+            if reservation_status == "SETTLED" or (
+                not prior_is_new and reservation_status == "RELEASED"
+            ):
+                fill_status = reservation_status
+            fill_status = _monotonic_canary_reservation_status(
+                reservation_status,
+                fill_status,
+            )
+            updated = self._conn.execute(
+                "UPDATE canary_risk_reservations SET filled_cost=?,"
+                "remaining_cost=?,filled_quantity=?,status=?,released_at=?,"
+                "updated_at=? WHERE reservation_id=? "
+                "AND UPPER(COALESCE(status,''))=? "
+                "AND filled_quantity IS ? AND filled_cost IS ? "
+                "AND remaining_cost IS ? AND released_at IS ?",
                 (
                     _risk_text(total_cost),
                     _risk_text(remaining),
                     _risk_text(total_quantity),
                     fill_status,
+                    None if reopened_released else reservation_row["released_at"],
                     stamp_iso,
                     reservation,
+                    reservation_status_before,
+                    reservation_row["filled_quantity"],
+                    reservation_row["filled_cost"],
+                    reservation_row["remaining_cost"],
+                    reservation_row["released_at"],
                 ),
             )
+            if int(updated.rowcount or 0) != 1:
+                raise ValueError("risk reservation state changed")
             row = self._conn.execute(
                 "SELECT * FROM canary_risk_reservations WHERE reservation_id=?",
                 (reservation,),
@@ -2415,6 +2615,18 @@ class AxiomStore:
             ).fetchone()
             if row is None:
                 raise ValueError("risk reservation not found")
+            prior_state = str(row["status"] or "").strip().upper()
+            reservation_side = str(row["side"] or "").strip().upper()
+            reservation_quantity = _risk_decimal(
+                row["quantity"],
+                name="reservation quantity",
+                nonnegative=True,
+            )
+            filled_quantity = _risk_decimal(
+                row["filled_quantity"],
+                name="filled quantity",
+                nonnegative=True,
+            )
             remaining = _risk_decimal(row["remaining_cost"])
             adopted_detail = _load(row["detail_json"]) if row["detail_json"] else {}
             adopted_legacy = (
@@ -2431,6 +2643,17 @@ class AxiomStore:
                 ) in _CANARY_CONFIRMED_SETTLEMENT_STATUSES
                 for fill in canonical_fill_rows
             )
+            if prior_state == "SETTLED" and state != "SETTLED":
+                # A stale release/reconciliation cannot rewrite a settled
+                # reservation.  Return the durable terminal record unchanged.
+                return _canary_reservation_record(row)
+            if (
+                prior_state == "RELEASED"
+                and state not in {"RELEASED", "SETTLED"}
+            ):
+                # RELEASED may be upgraded by an explicit settlement, but
+                # stale provisional/unknown writes cannot reopen it.
+                return _canary_reservation_record(row)
             terminal_no_fill = _canary_terminal_no_fill_proof(release_detail)
             if (
                 adopted_legacy
@@ -2457,18 +2680,50 @@ class AxiomStore:
                     "UPDATE canary_risk_reservations SET detail_json=? WHERE reservation_id=?",
                     (_dump(adopted_detail), identifier),
                 )
-            if state not in {"UNKNOWN", "PARTIALLY_FILLED", "PARTIAL", "OPEN"}:
+            fully_filled_buy_release = (
+                prior_state == "FILLED"
+                and state == "RELEASED"
+                and reservation_side == "BUY"
+                and reservation_quantity > 0
+                and filled_quantity >= reservation_quantity
+            )
+            if not fully_filled_buy_release:
+                state = _monotonic_canary_reservation_status(prior_state, state)
+            if (
+                state not in {"UNKNOWN", "PARTIALLY_FILLED", "PARTIAL", "OPEN", "FILLED"}
+            ):
                 remaining = Decimal("0")
-            released_at = (
-                _iso(stamp)
-                if state not in {"UNKNOWN", "PARTIALLY_FILLED", "PARTIAL", "OPEN"}
-                else None
-            )
-            self._conn.execute(
+            if state == "FILLED":
+                # FILLED is still awaiting final SELL settlement; it is not
+                # itself a capacity release and must retain no release marker.
+                released_at = row["released_at"]
+            elif (
+                prior_state in _CANARY_RESERVATION_TERMINAL_STATUSES
+                and state == prior_state
+            ):
+                released_at = row["released_at"] or _iso(stamp)
+            else:
+                released_at = (
+                    _iso(stamp)
+                    if state
+                    not in {"UNKNOWN", "PARTIALLY_FILLED", "PARTIAL", "OPEN"}
+                    else None
+                )
+            updated = self._conn.execute(
                 "UPDATE canary_risk_reservations SET status=?,remaining_cost=?,released_at=?,"
-                "updated_at=? WHERE reservation_id=?",
-                (state, _risk_text(remaining), released_at, _iso(stamp), identifier),
+                "updated_at=? WHERE reservation_id=? AND "
+                "(UPPER(status) <> 'SETTLED' OR UPPER(status)=UPPER(?))",
+                (
+                    state,
+                    _risk_text(remaining),
+                    released_at,
+                    _iso(stamp),
+                    identifier,
+                    state,
+                ),
             )
+            if int(updated.rowcount or 0) != 1:
+                raise ValueError("risk reservation state changed")
             row = self._conn.execute(
                 "SELECT * FROM canary_risk_reservations WHERE reservation_id=?",
                 (identifier,),
@@ -2584,6 +2839,170 @@ class AxiomStore:
                 if start <= stamp < end:
                     target = day_confirmed if confirmed else day_provisional
                     target[reservation_id] = target.get(reservation_id, Decimal("0")) + _risk_decimal(fill["cost"])
+            # Position lots are the authoritative entry-cost basis for exits.
+            # Resolve each canonical SELL through its persisted reservation
+            # and position-request links.  Market/token identity and payload
+            # details are not durable joins: they can be shared by multiple
+            # lots or changed by an untrusted venue response.
+            lot_by_position: dict[str, sqlite3.Row] = {}
+            try:
+                lot_rows = self._conn.execute(
+                    "SELECT position_id,event_id,market_id,token_id,quantity,"
+                    "sold_quantity,cost_basis FROM canary_position_lots"
+                ).fetchall()
+            except sqlite3.OperationalError:
+                lot_rows = []
+            lots_by_event: dict[str, list[sqlite3.Row]] = {}
+            for lot in lot_rows:
+                position_id = str(lot["position_id"] or "").strip()
+                event_id = str(lot["event_id"] or "").strip()
+                if position_id:
+                    lot_by_position[position_id] = lot
+                if event_id:
+                    lots_by_event.setdefault(event_id, []).append(lot)
+
+            # A position request is the authoritative bridge from a risk
+            # reservation to the owned position.  Keep ambiguous or
+            # incomplete links unresolved rather than guessing by market or
+            # token.
+            sell_requests_by_reservation: dict[
+                str, list[sqlite3.Row]
+            ] = {}
+            try:
+                request_rows = self._conn.execute(
+                    "SELECT request_id,position_id,reservation_id,event_id,status,"
+                    "settlement_status,order_id,market_id,token_id,side,"
+                    "requested_quantity "
+                    "FROM canary_position_requests "
+                    "WHERE UPPER(side)='SELL'"
+                ).fetchall()
+            except sqlite3.OperationalError:
+                request_rows = []
+            for request_row in request_rows:
+                reservation_id = str(request_row["reservation_id"] or "").strip()
+                if reservation_id:
+                    sell_requests_by_reservation.setdefault(
+                        reservation_id, []
+                    ).append(request_row)
+
+            sell_quantity_by_position: dict[str, Decimal] = {}
+
+            def linked_lot(
+                reservation: sqlite3.Row,
+            ) -> tuple[sqlite3.Row, sqlite3.Row] | None:
+                reservation_id = str(reservation["reservation_id"] or "").strip()
+                event_id = str(reservation["event_id"] or "").strip()
+                intent_id = str(reservation["intent_id"] or "").strip()
+                requests = sell_requests_by_reservation.get(reservation_id, ())
+                if len(requests) != 1:
+                    return None
+                request = requests[0]
+                request_id = str(request["request_id"] or "").strip()
+                request_position_id = str(request["position_id"] or "").strip()
+                request_event_id = str(request["event_id"] or "").strip()
+                request_order_id = str(request["order_id"] or "").strip()
+                request_market = str(request["market_id"] or "").strip()
+                request_token = str(request["token_id"] or "").strip()
+                request_status = str(request["status"] or "").strip().upper()
+                request_settlement = str(
+                    request["settlement_status"] or ""
+                ).strip().upper()
+                lot = lot_by_position.get(request_position_id)
+                # The combined service persists the same request ID as the
+                # reservation intent/event and as the position request event.
+                # Requiring all links and explicit final settlement prevents a
+                # stale or provisional SELL from releasing another position's
+                # basis.
+                if (
+                    str(reservation["side"] or "").upper() != "SELL"
+                    or not reservation_id
+                    or not event_id
+                    or not intent_id
+                    or not request_id
+                    or not request_position_id
+                    or not request_event_id
+                    or not request_order_id
+                    or request_id != intent_id
+                    or request_event_id != event_id
+                    or request_status not in {"SETTLED", "SETTLED_PARTIAL"}
+                    or request_settlement not in _CANARY_FINAL_SETTLEMENT_STATUSES
+                    or request_market != str(reservation["market_id"] or "").strip()
+                    or not request_market
+                    or not request_token
+                    or lot is None
+                    or request_market != str(lot["market_id"] or "").strip()
+                    or request_token != str(lot["token_id"] or "").strip()
+                ):
+                    return None
+                return request, lot
+
+            def linked_legacy_lot(
+                event_id: str | None,
+                detail: Mapping[str, Any],
+            ) -> sqlite3.Row | None:
+                position_id = str(detail.get("position_id") or "").strip()
+                if position_id:
+                    return lot_by_position.get(position_id)
+                candidates = lots_by_event.get(str(event_id or "").strip(), ())
+                return candidates[0] if len(candidates) == 1 else None
+
+            def valid_sell_fill(
+                row: sqlite3.Row,
+                detail: Mapping[str, Any],
+                quantity: Decimal,
+                linked: tuple[sqlite3.Row, sqlite3.Row] | None,
+            ) -> bool:
+                if quantity <= 0 or str(row["status"]).upper() == "UNKNOWN":
+                    return False
+                if linked is None:
+                    return False
+                request, lot = linked
+                try:
+                    expected = _risk_decimal(
+                        row["quantity"],
+                        name="quantity",
+                        nonnegative=True,
+                    )
+                    requested = _risk_decimal(
+                        request["requested_quantity"],
+                        name="requested quantity",
+                        nonnegative=True,
+                    )
+                    lot_quantity = _risk_decimal(
+                        lot["quantity"],
+                        name="owned lot quantity",
+                        nonnegative=True,
+                    )
+                except (InvalidOperation, TypeError, ValueError):
+                    return False
+                # A fill can release basis only when the persisted request is
+                # the exact owner and carries all immutable venue identity.
+                if (
+                    expected <= 0
+                    or quantity > expected
+                    or requested <= 0
+                    or quantity > requested
+                    or quantity > lot_quantity
+                    or str(detail.get("request_id") or "").strip()
+                    != str(request["request_id"] or "").strip()
+                    or str(detail.get("order_id") or "").strip()
+                    != str(request["order_id"] or "").strip()
+                    or str(detail.get("side") or "").strip().upper() != "SELL"
+                    or str(detail.get("market_id") or "").strip()
+                    != str(request["market_id"] or "").strip()
+                    or str(detail.get("market_id") or "").strip()
+                    != str(lot["market_id"] or "").strip()
+                    or str(detail.get("token_id") or detail.get("asset_id") or "").strip()
+                    != str(request["token_id"] or "").strip()
+                    or str(detail.get("token_id") or detail.get("asset_id") or "").strip()
+                    != str(lot["token_id"] or "").strip()
+                ):
+                    return False
+                breaker = str(detail.get("risk_breaker") or "").strip().upper()
+                return breaker not in {
+                    "EXIT_FILL_OVER_PLAN",
+                    "ACTUAL_FILL_OVER_PLAN",
+                }
             mark_rows = self._conn.execute(
                 "SELECT * FROM canary_equity_marks ORDER BY observed_at DESC,rowid DESC,mark_id DESC"
             ).fetchall()
@@ -2633,6 +3052,16 @@ class AxiomStore:
             for row in reservation_rows:
                 side = str(row["side"]).upper()
                 status = str(row["status"]).upper()
+                filled_quantity = _risk_decimal(row["filled_quantity"])
+                expected_quantity = _risk_decimal(row["quantity"])
+                reservation_active = (
+                    status in active_statuses
+                    or (
+                        status == "FILLED"
+                        and expected_quantity > 0
+                        and filled_quantity < expected_quantity
+                    )
+                )
                 filled = _risk_decimal(row["filled_cost"])
                 remaining = _risk_decimal(row["remaining_cost"])
                 market = str(row["market_id"]) if row["market_id"] else None
@@ -2665,8 +3094,8 @@ class AxiomStore:
                     result["buy_pending_usd"] += day_unknown
                     result["buy_unknown_usd"] += day_unknown
                     result["gross_daily_buy_usd"] += day_filled + day_unknown
-                    outstanding = remaining if status in active_statuses else Decimal("0")
-                    if status in active_statuses:
+                    outstanding = remaining if reservation_active else Decimal("0")
+                    if reservation_active:
                         result["all_in_buy_reserved_usd"] += filled + outstanding
                         result["buy_pending_usd"] += outstanding
                         result["gross_daily_buy_usd"] += outstanding
@@ -2713,7 +3142,9 @@ class AxiomStore:
                             result.setdefault("_pending_market_keys", set()).add(market)
                         if confirmed_quantity > 0 or outstanding > 0:
                             slot_key = market or reservation_id
-                            open_lot_counts[slot_key] = open_lot_counts.get(slot_key, 0) + 1
+                            open_lot_counts[slot_key] = (
+                                open_lot_counts.get(slot_key, 0) + 1
+                            )
                 elif side == "SELL":
                     token = str(
                         reservation_detail.get("token_id")
@@ -2737,7 +3168,7 @@ class AxiomStore:
                             Decimal("0"),
                             _risk_decimal(row["quantity"]) - confirmed_quantity,
                         )
-                        if status in active_statuses and pending_qty > 0:
+                        if reservation_active and pending_qty > 0:
                             market_pending_sell[market] = (
                                 market_pending_sell.get(market, Decimal("0")) + pending_qty
                             )
@@ -2750,6 +3181,34 @@ class AxiomStore:
                                 unknown_inventory = True
                         if provisional_quantity > 0:
                             unknown_execution = True
+                    linked = linked_lot(row)
+                    valid_identity = linked is not None
+                    if valid_identity:
+                        for fill, confirmed in fills:
+                            if not confirmed:
+                                continue
+                            fill_detail = (
+                                _load(fill["detail_json"])
+                                if fill["detail_json"]
+                                else {}
+                            )
+                            if not valid_sell_fill(
+                                row,
+                                fill_detail,
+                                _risk_decimal(fill["quantity"]),
+                                linked,
+                            ):
+                                valid_identity = False
+                                break
+                    if valid_identity:
+                        assert linked is not None
+                        _request, lot = linked
+                        lot_position_id = str(lot["position_id"] or "").strip()
+                        if lot_position_id and confirmed_quantity > 0:
+                            sell_quantity_by_position[lot_position_id] = (
+                                sell_quantity_by_position.get(lot_position_id, Decimal("0"))
+                                + confirmed_quantity
+                            )
                     for fill, confirmed in fills:
                         if not confirmed:
                             continue
@@ -2866,6 +3325,84 @@ class AxiomStore:
                     if start <= stamp_value < end:
                         result["today_realized_pnl_usd"] += pnl
                     result["realized_loss_usd"] += -pnl if pnl < 0 else Decimal("0")
+
+            released_open_cost = Decimal("0")
+            released_by_market: dict[str, Decimal] = {}
+            released_by_event: dict[str, Decimal] = {}
+            # Aggregate confirmations once per lot.  A lot may be closed by
+            # multiple SELL reservations or multiple partial fills; applying
+            # the lot's sold quantity once keeps the release idempotent and
+            # prevents duplicate reservations from releasing its basis twice.
+            for position_id, confirmed_quantity in sell_quantity_by_position.items():
+                lot = lot_by_position.get(position_id)
+                if lot is None:
+                    continue
+                try:
+                    total_quantity = _risk_decimal(
+                        lot["quantity"],
+                        name="owned lot quantity",
+                        nonnegative=True,
+                    )
+                    sold_quantity = _risk_decimal(
+                        lot["sold_quantity"],
+                        name="owned lot sold quantity",
+                        nonnegative=True,
+                    )
+                    cost_basis = _risk_decimal(
+                        lot["cost_basis"],
+                        name="owned lot cost basis",
+                        nonnegative=True,
+                    )
+                except (InvalidOperation, TypeError, ValueError):
+                    continue
+                # A lot reporting more sold quantity than it owns is an
+                # unresolved/excess execution, not permission to release all
+                # of its basis.
+                if (
+                    total_quantity <= 0
+                    or sold_quantity <= 0
+                    or sold_quantity > total_quantity
+                    or confirmed_quantity <= 0
+                ):
+                    continue
+                released_quantity = min(sold_quantity, confirmed_quantity)
+                release = min(
+                    cost_basis,
+                    cost_basis * released_quantity / total_quantity,
+                )
+                if release <= 0:
+                    continue
+                released_open_cost += release
+                market = str(lot["market_id"] or "").strip()
+                event = str(lot["event_id"] or "").strip()
+                if market:
+                    released_by_market[market] = (
+                        released_by_market.get(market, Decimal("0")) + release
+                    )
+                if event:
+                    released_by_event[event] = (
+                        released_by_event.get(event, Decimal("0")) + release
+                    )
+            result["aggregate_open_cost_usd"] = max(
+                Decimal("0"),
+                result["aggregate_open_cost_usd"] - released_open_cost,
+            )
+            result["aggregate_exposure_usd"] = max(
+                Decimal("0"),
+                result["aggregate_exposure_usd"] - released_open_cost,
+            )
+            for market, release in released_by_market.items():
+                if market in result["per_market_buy_usd"]:
+                    result["per_market_buy_usd"][market] = max(
+                        Decimal("0"),
+                        result["per_market_buy_usd"][market] - release,
+                    )
+            for event, release in released_by_event.items():
+                if event in result["per_event_buy_usd"]:
+                    result["per_event_buy_usd"][event] = max(
+                        Decimal("0"),
+                        result["per_event_buy_usd"][event] - release,
+                    )
 
             flow_rows = self._conn.execute(
                 "SELECT kind,amount FROM canary_risk_cashflows"
@@ -10775,6 +11312,25 @@ def _risk_decimal(value: Any = "0", *, name: str = "value", nonnegative: bool = 
 
 def _risk_text(value: Any) -> str:
     return format(_risk_decimal(value), "f")
+
+
+def _monotonic_canary_reservation_status(current: Any, proposed: Any) -> str:
+    """Keep terminal reservation outcomes from being downgraded."""
+    prior = str(current or "").strip().upper()
+    next_status = str(proposed or "").strip().upper()
+    if prior == "SETTLED" and next_status != prior:
+        return prior
+    if prior == "FILLED" and next_status not in {"FILLED", "SETTLED"}:
+        return prior
+    if prior in {"CANCELED", "CANCELLED", "REJECTED"} and next_status != prior:
+        return prior
+    return next_status
+
+
+def _canary_reservation_terminal(current: Any) -> bool:
+    return str(current or "").strip().upper() in _CANARY_RESERVATION_TERMINAL_STATUSES
+
+
 
 
 def _canary_fill_settlement_status(detail: Any) -> str:

@@ -140,6 +140,17 @@ _LATEST_CANDIDATE_LIMIT = 50
 
 _RESEARCH_PROGRESS_LIMIT = 50
 _RESEARCH_FORWARD_TEST_LIMIT = 100
+_CAMPAIGN_JOB_PREFIX = "polymarket-research-campaign:"
+_CAMPAIGN_JOB_LIMIT = 32
+_CAMPAIGN_TRIAL_TERMINAL = frozenset(
+    {
+        "ECONOMIC_REJECTION",
+        "DATA_INSUFFICIENT",
+        "SOFTWARE_OR_INPUT_ERROR",
+        "VALIDATION_QUALIFIED",
+        "FINAL_ASSESSMENT",
+    }
+)
 
 
 def _pagination_params(query: Mapping[str, Any] | None = None) -> dict[str, Any]:
@@ -3122,6 +3133,7 @@ class DashboardData:
                 f"Research report {item.get('report_id')} saved",
                 {"experiment_id": item.get("experiment_id")},
             )
+        events.extend(self._campaign_activity_rows())
         events.sort(key=lambda item: parse_timestamp(item.get("timestamp")) or datetime.min.replace(tzinfo=datetime.now().astimezone().tzinfo), reverse=True)
         return events[:limit]
 
@@ -3538,6 +3550,247 @@ class DashboardData:
             "attempts": row.get("attempts", 0),
             "live_execution": False,
         }
+
+    @staticmethod
+    def _campaign_id_from_job(record: Mapping[str, Any]) -> str | None:
+        payload = record.get("payload")
+        payload = payload if isinstance(payload, Mapping) else {}
+        value = str(payload.get("campaign_id") or "").strip()
+        if value:
+            return value
+        job_name = str(record.get("job_name") or "").strip()
+        if job_name.startswith(_CAMPAIGN_JOB_PREFIX):
+            value = job_name[len(_CAMPAIGN_JOB_PREFIX) :].strip()
+        return value or None
+
+    def _campaign_job_records(self) -> list[Mapping[str, Any]]:
+        if self.store is None:
+            return []
+        lister = getattr(self.store, "list_operator_jobs", None)
+        if not callable(lister):
+            return []
+        try:
+            raw = lister()
+        except (AttributeError, TypeError, ValueError, sqlite3.Error):
+            return []
+        records = [
+            item
+            for item in (raw if isinstance(raw, (list, tuple)) else ())
+            if isinstance(item, Mapping)
+            and str(item.get("job_name") or "").startswith(_CAMPAIGN_JOB_PREFIX)
+            and self._campaign_id_from_job(item) is not None
+        ]
+        records.sort(
+            key=lambda item: (
+                parse_timestamp(item.get("updated_at"))
+                or datetime.min.replace(tzinfo=datetime.now().astimezone().tzinfo),
+                str(item.get("job_name") or ""),
+            ),
+            reverse=True,
+        )
+        return records[:_CAMPAIGN_JOB_LIMIT]
+
+    @staticmethod
+    def _campaign_integer(value: Any, default: int = 0) -> int:
+        if isinstance(value, bool):
+            return default
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError, OverflowError):
+            return default
+
+    def _campaign_progress_projection(self) -> dict[str, Any]:
+        """Expose one bounded synthetic campaign state from durable jobs.
+
+        Campaign qualification is intentionally kept in this research-only
+        projection.  It is never folded into canary eligibility or any other
+        real-readiness count.
+        """
+        empty = {
+            "available": False,
+            "campaign_id": None,
+            "status": "NOT_INITIALIZED",
+            "budget": {"limit": 0, "used": 0, "remaining": 0},
+            "budget_limit": 0,
+            "budget_used": 0,
+            "budget_remaining": 0,
+            "completed": 0,
+            "remaining": 0,
+            "completed_trials": 0,
+            "remaining_trials": 0,
+            "last_result": None,
+            "qualified": [],
+            "qualified_candidate_ids": [],
+            "qualified_count": 0,
+            "next_real_job": None,
+            "waiting_prerequisite": None,
+            "synthetic": True,
+            "paper_only": True,
+            "research_only": True,
+            "real_readiness": False,
+            "live_execution": False,
+        }
+        configured = self._configured("campaign_progress")
+        if configured is None:
+            configured = self._configured("campaign-progress")
+        records = (
+            [configured]
+            if isinstance(configured, Mapping)
+            and (
+                configured.get("campaign_id") is not None
+                or configured.get("campaign") is not None
+            )
+            else self._campaign_job_records()
+        )
+        if not records:
+            return empty
+        record = records[0]
+        payload = record.get("payload")
+        payload = dict(payload) if isinstance(payload, Mapping) else {}
+        campaign_id = self._campaign_id_from_job(record)
+        if campaign_id is None:
+            campaign_value = payload.get("campaign")
+            campaign_id = (
+                str(campaign_value.get("campaign_id") or "").strip()
+                if isinstance(campaign_value, Mapping)
+                else None
+            ) or None
+        raw_status = payload.get("status", record.get("status"))
+        status = str(raw_status or "UNKNOWN").strip().upper() or "UNKNOWN"
+        budget_limit = self._campaign_integer(payload.get("budget_limit"), 0)
+        budget_used = self._campaign_integer(payload.get("budget_used"), 0)
+        budget_remaining = self._campaign_integer(
+            payload.get("budget_remaining"),
+            max(0, budget_limit - budget_used),
+        )
+        if budget_limit:
+            budget_used = min(budget_used, budget_limit)
+            budget_remaining = min(budget_remaining, max(0, budget_limit - budget_used))
+        raw_trials = payload.get("trials")
+        trials = [
+            item
+            for item in (raw_trials if isinstance(raw_trials, (list, tuple)) else ())
+            if isinstance(item, Mapping)
+        ][:64]
+        completed = sum(
+            1
+            for item in trials
+            if str(item.get("status") or "").strip().upper() in _CAMPAIGN_TRIAL_TERMINAL
+        )
+        if not trials:
+            counts = payload.get("counts")
+            counts = counts if isinstance(counts, Mapping) else {}
+            completed = sum(
+                self._campaign_integer(counts.get(name), 0)
+                for name in (
+                    "economic_rejection",
+                    "data_insufficient",
+                    "software_or_input_error",
+                    "validation_qualified",
+                    "final_assessment",
+                )
+            )
+        remaining = max(0, len(trials) - completed) if trials else 0
+        raw_qualified = payload.get("qualified_candidate_ids", payload.get("qualified", ()))
+        if isinstance(raw_qualified, Mapping):
+            raw_qualified = raw_qualified.get("candidate_ids", ())
+        qualified = [
+            str(item).strip()
+            for item in (raw_qualified if isinstance(raw_qualified, (list, tuple, set, frozenset)) else ())
+            if str(item).strip()
+        ][:32]
+        next_real_job = str(payload.get("next_real_job") or "").strip() or None
+        waiting: dict[str, Any] | None = None
+        if next_real_job and self.store is not None:
+            getter = getattr(self.store, "get_operator_job", None)
+            prerequisite = None
+            if callable(getter):
+                try:
+                    prerequisite = getter(next_real_job)
+                except (AttributeError, TypeError, ValueError, sqlite3.Error):
+                    prerequisite = None
+            prerequisite_payload = (
+                prerequisite.get("payload")
+                if isinstance(prerequisite, Mapping)
+                and isinstance(prerequisite.get("payload"), Mapping)
+                else {}
+            )
+            waiting = {
+                "job_name": next_real_job,
+                "status": str(
+                    prerequisite.get("status", "UNKNOWN")
+                    if isinstance(prerequisite, Mapping)
+                    else "UNKNOWN"
+                ).strip().upper()
+                or "UNKNOWN",
+                "producer_job": str(prerequisite_payload.get("producer_job") or "").strip() or None,
+                "dataset_id": prerequisite_payload.get("dataset_id", payload.get("dataset_id")),
+                "dataset_version": prerequisite_payload.get("dataset_version", payload.get("dataset_version")),
+                "reason": prerequisite_payload.get("reason"),
+                "next_attempt_at": prerequisite_payload.get("next_attempt_at"),
+            }
+        last_result = payload.get("last_result")
+        if last_result is not None and not isinstance(last_result, Mapping):
+            last_result = {"value": last_result}
+        return {
+            "available": True,
+            "campaign_id": campaign_id,
+            "status": status,
+            "budget": {
+                "limit": budget_limit,
+                "used": budget_used,
+                "remaining": budget_remaining,
+            },
+            "budget_limit": budget_limit,
+            "budget_used": budget_used,
+            "budget_remaining": budget_remaining,
+            "completed": completed,
+            "remaining": remaining,
+            "completed_trials": completed,
+            "remaining_trials": remaining,
+            "last_result": _bounded_value(last_result),
+            "qualified": qualified,
+            "qualified_candidate_ids": qualified,
+            "qualified_count": len(qualified),
+            "next_real_job": next_real_job,
+            "waiting_prerequisite": _bounded_value(waiting),
+            "synthetic": True,
+            "paper_only": True,
+            "research_only": True,
+            "real_readiness": False,
+            "live_execution": False,
+        }
+
+    def _campaign_activity_rows(self) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for record in self._campaign_job_records():
+            payload = record.get("payload")
+            payload = payload if isinstance(payload, Mapping) else {}
+            campaign_id = self._campaign_id_from_job(record)
+            if not campaign_id:
+                continue
+            status = str(payload.get("status") or record.get("status") or "UNKNOWN").strip().upper()
+            rows.append(
+                {
+                    "kind": "campaign",
+                    "timestamp": parse_timestamp(
+                        record.get("updated_at")
+                        or payload.get("last_updated_at")
+                        or payload.get("created_at")
+                    ),
+                    "message": f"Campaign {campaign_id} is {status.lower()}",
+                    "details": {
+                        "campaign_id": campaign_id,
+                        "status": status,
+                        "budget_used": self._campaign_integer(payload.get("budget_used"), 0),
+                        "budget_remaining": self._campaign_integer(payload.get("budget_remaining"), 0),
+                        "next_real_job": str(payload.get("next_real_job") or "").strip() or None,
+                        "synthetic": True,
+                        "paper_only": True,
+                    },
+                }
+            )
+        return rows
 
     def _research_progress_projection(
         self,
@@ -4693,7 +4946,13 @@ class DashboardData:
         """Return the bounded overview payload; list views stay lazy."""
         configured = self._configured("overview-summary")
         if configured is not None:
-            return dict(configured) if isinstance(configured, Mapping) else {"value": configured}
+            result = dict(configured) if isinstance(configured, Mapping) else {"value": configured}
+            if isinstance(result, dict):
+                if "market_scope_funnel" not in result:
+                    result["market_scope_funnel"] = self.market_scope_funnel_data()
+                if "campaign_progress" not in result:
+                    result["campaign_progress"] = self._campaign_progress_projection()
+            return result
         market_scope_funnel = self.market_scope_funnel_data()
         if self.store is None or not callable(getattr(self.store, "dashboard_overview_summary", None)):
             candidate_records = self._bounded_candidate_lifecycle()
@@ -4708,6 +4967,7 @@ class DashboardData:
                 {},
             )
             research_progress = self._research_progress_projection(aggregate={})
+            campaign_progress = self._campaign_progress_projection()
             latest_candidates = [
                 self._latest_candidate_projection(item)
                 for item in candidate_records[:_LATEST_CANDIDATE_LIMIT]
@@ -4726,11 +4986,23 @@ class DashboardData:
                 ),
                 "research_progress": research_progress,
                 "market_scope_funnel": market_scope_funnel,
+                "campaign_progress": campaign_progress,
                 "signal_scan_reason_counts": {},
                 "live_execution": False,
             }
         aggregate = self.store.dashboard_overview_summary(activity_limit=8)
         research_progress = self._research_progress_projection(aggregate=aggregate)
+        campaign_progress = self._campaign_progress_projection()
+        campaign_activity = self._campaign_activity_rows()
+        latest_activity = list(aggregate.get("latest_activity", []))
+        if campaign_activity:
+            latest_activity = sorted(
+                latest_activity + campaign_activity,
+                key=lambda item: parse_timestamp(item.get("timestamp")) or datetime.min.replace(
+                    tzinfo=datetime.now().astimezone().tzinfo
+                ),
+                reverse=True,
+            )[:8]
         research_feed = (
             self.store.research_feed_status()
             if callable(getattr(self.store, "research_feed_status", None))
@@ -5151,8 +5423,8 @@ class DashboardData:
                 "bootstrap_states": bootstrap_progress,
             },
             "lifecycle_funnel": stages,
-            "activity": aggregate.get("latest_activity", []),
-            "latest_activity": aggregate.get("latest_activity", []),
+            "activity": latest_activity,
+            "latest_activity": latest_activity,
             "latest_candidates": latest_candidates,
             "candidates": latest_candidates,
             "canary": canary_status,
@@ -5160,6 +5432,7 @@ class DashboardData:
             "forward_evidence": forward_evidence,
             "research_progress": research_progress,
             "market_scope_funnel": market_scope_funnel,
+            "campaign_progress": campaign_progress,
             "signal_scan_reason_counts": signal_scan_reason_counts,
             "candidate_status": {
                 "canary_eligible": candidate_canary_count,
@@ -6414,6 +6687,7 @@ def _dashboard_html(
     function researchFeedField(key,label,value,timestamp=false) { return `<div class="key-value" data-field="${safe(key)}"><span class="key">${safe(label)}</span><strong>${safe(timestamp?researchFeedTimestamp(value):researchFeedValue(value))}</strong></div>`; }
     function renderResearchProgress(data) {
       const progress=data?.research_progress&&typeof data.research_progress==="object"?data.research_progress:{};
+      const campaign=data?.campaign_progress&&typeof data.campaign_progress==="object"?data.campaign_progress:{};
       const candidate=progress.candidate&&typeof progress.candidate==="object"?progress.candidate:{};
       const job=progress.job&&typeof progress.job==="object"?progress.job:{};
       const samples=candidate.samples&&typeof candidate.samples==="object"?candidate.samples:{};
@@ -6422,6 +6696,7 @@ def _dashboard_html(
       const dataset=progress.dataset_id||"UNKNOWN",version=progress.dataset_version||"UNKNOWN";
       const blocker=progress.blocker||"—",status=String(progress.job_status||job.status||"NOT_INITIALIZED").toUpperCase();
       const candidateStatus=progress.status||"—";
+      const budget=campaign.budget&&typeof campaign.budget==="object"?campaign.budget:{};
       $("research-progress-content").innerHTML=[
         researchFeedField("dataset","Dataset",dataset),
         researchFeedField("dataset_version","Dataset version",version),
@@ -6433,7 +6708,16 @@ def _dashboard_html(
         researchFeedField("trades","Trades available / required",pair(trades.available??progress.trades_available,trades.required??progress.trades_required)),
         researchFeedField("forward_observations","Forward observations",candidate.forward_observations??progress.forward_observations),
         researchFeedField("blocker","Blocker",blocker),
-        researchFeedField("status","Validation status",candidateStatus)
+        researchFeedField("status","Validation status",candidateStatus),
+        researchFeedField("campaign_id","Synthetic campaign",campaign.campaign_id),
+        researchFeedField("campaign_status","Campaign status",campaign.status),
+        researchFeedField("campaign_budget","Campaign budget",`${budget.used??campaign.budget_used??0} / ${budget.limit??campaign.budget_limit??0} (${budget.remaining??campaign.budget_remaining??0} remaining)`),
+        researchFeedField("campaign_completed","Campaign trials completed",campaign.completed??campaign.completed_trials??0),
+        researchFeedField("campaign_remaining","Campaign trials remaining",campaign.remaining??campaign.remaining_trials??0),
+        researchFeedField("campaign_last_result","Campaign last result",campaign.last_result),
+        researchFeedField("campaign_qualified","Campaign qualified (synthetic)",campaign.qualified??campaign.qualified_candidate_ids),
+        researchFeedField("campaign_next_real_job","Next real job",campaign.next_real_job),
+        researchFeedField("campaign_waiting_prerequisite","Waiting prerequisite",campaign.waiting_prerequisite)
       ].join("");
     }
     function renderResearchFeed(data) {

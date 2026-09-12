@@ -44,6 +44,7 @@ BTC_INTERVAL_SECONDS: dict[str, int] = {
 }
 BTC_DATASET_IDS = {interval: f"{BTC_SYMBOL}-{interval}-full" for interval in BTC_INTERVAL_SECONDS}
 POLYMARKET_DATASET_ID = "Polymarket-historical"
+POLYMARKET_HISTORICAL_JOB_NAME = "polymarket-historical-refresh"
 BOOTSTRAP_PUBLICATION_CHUNK_SIZE = 512
 
 
@@ -102,6 +103,19 @@ class _CallResult:
     value: Any
     errors: tuple[str, ...]
     retries: int
+    retry_after: float = 0.0
+    retryable: bool = False
+    request_failed: bool = False
+
+def _coerce_retry_after(value: Any) -> float | None:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(parsed) or parsed < 0:
+        return None
+    return parsed
+
 
 
 def _jsonable(value: Any) -> Any:
@@ -300,18 +314,77 @@ def _call_with_retries(
             direct_error = exc
         transport_text, transport_errors = _consume_errors(provider, context)
         errors.extend(transport_text)
-        retry_after = max((float(getattr(item, "retry_after", 0.0) or 0.0) for item in transport_errors), default=0.0)
+        retry_values = [
+            parsed
+            for parsed in (
+                _coerce_retry_after(getattr(item, "retry_after", None))
+                for item in transport_errors
+            )
+            if parsed is not None
+        ]
+        retry_after = max(retry_values, default=0.0)
         retryable = any(bool(getattr(item, "retryable", False)) for item in transport_errors)
         if direct_error is not None:
             errors.append(_error_text(context, direct_error))
+            direct_retry_after = _coerce_retry_after(getattr(direct_error, "retry_after", None))
+            if direct_retry_after is not None:
+                retry_after = max(retry_after, direct_retry_after)
             retryable = _retryable_exception(direct_error)
         if not retryable or attempt + 1 >= attempts:
-            return _CallResult(value, tuple(dict.fromkeys(errors)), retries)
+            return _CallResult(value, tuple(dict.fromkeys(errors)), retries, retry_after)
         retries += 1
         delay = retry_after if retry_after > 0 else min(60.0, max(0.0, float(backoff)) * (2**attempt))
         if delay > 0:
             sleep(delay)
-    return _CallResult(None, tuple(dict.fromkeys(errors)), retries)
+    return _CallResult(None, tuple(dict.fromkeys(errors)), retries, retry_after)
+
+def _single_provider_call(
+    provider: Any,
+    operation: Callable[[], Any],
+    *,
+    context: str,
+) -> _CallResult:
+    """Execute one bounded provider request without sleeping under storage locks."""
+    direct_error: Exception | None = None
+    try:
+        value = operation()
+    except Exception as exc:  # provider adapters are intentionally read-only
+        value = None
+        direct_error = exc
+    transport_text, transport_errors = _consume_errors(provider, context)
+
+    errors = list(transport_text)
+    retry_values = [
+        parsed
+        for parsed in (
+            _coerce_retry_after(getattr(item, "retry_after", None))
+            for item in transport_errors
+        )
+        if parsed is not None
+    ]
+    retry_after = max(retry_values, default=0.0)
+    retryable = any(bool(getattr(item, "retryable", False)) for item in transport_errors)
+    if direct_error is not None:
+        errors.append(_error_text(context, direct_error))
+        direct_retry_after = _coerce_retry_after(getattr(direct_error, "retry_after", None))
+        if direct_retry_after is not None:
+            retry_after = max(retry_after, direct_retry_after)
+        retryable = _retryable_exception(direct_error)
+    return _CallResult(
+        value,
+        tuple(dict.fromkeys(errors)),
+        0,
+        retry_after=max(0.0, retry_after),
+        retryable=bool(retryable),
+        request_failed=bool(transport_errors) or (
+            direct_error is not None and not isinstance(
+                direct_error, (ValueError, TypeError, KeyError, AssertionError)
+            )
+        ),
+    )
+
+
+
 
 
 def _provider_name(provider: Any) -> str:
@@ -1325,97 +1398,787 @@ class HistoricalBootstrapper:
         self.store.save_report_if_absent(f"historical-bootstrap:{dataset_id}:{version}", report.as_record(), experiment_id=dataset_id)
         return report
 
-    def bootstrap_polymarket(self, *, max_markets: int = 1000, resume: bool = False) -> BootstrapReport:
-        if isinstance(max_markets, bool) or int(max_markets) < 0:
-            raise ValueError("max_markets must be non-negative")
-        provider = self.prediction_provider
-        state = self.store.load_dataset_bootstrap_state(POLYMARKET_DATASET_ID)
-        state_status = str(state.get("status", "")) if state else ""
-        if state and state_status not in {"COMPLETE", "EMPTY"} and not resume:
-            return BootstrapReport(POLYMARKET_DATASET_ID, "HISTORICAL", _provider_name(provider), "POLYMARKET", "event", "BLOCKED", None, 0, None, None, 0.0, errors=(f"{POLYMARKET_DATASET_ID} has an incomplete bootstrap; rerun with --resume",))
-        discovered_call = _call_with_retries(
-            provider,
-            lambda: provider.markets(active=False, limit=int(max_markets)),
-            context="polymarket market discovery",
-            max_attempts=self.max_attempts,
-            backoff=self.backoff,
-            sleep=self.sleep,
+    def bootstrap_polymarket(
+        self,
+        *,
+        max_markets: int = 1000,
+        resume: bool = False,
+        request_budget: int | None = None,
+        market_budget: int | None = None,
+        max_requests: int | None = None,
+    ) -> BootstrapReport:
+        """Advance one bounded, durable Polymarket historical-refresh tick.
+
+        Discovery and market requests are deliberately performed outside any
+        explicit store transaction.  The cursor and every market outcome are
+        checkpointed after each network boundary so a process restart resumes
+        from the last opaque Gamma cursor and retries only failed markets.
+        """
+        if isinstance(max_markets, bool) or not isinstance(max_markets, int) or max_markets < 0:
+            raise ValueError("max_markets must be a non-negative integer")
+        if max_requests is not None:
+            if request_budget is not None and int(max_requests) != int(request_budget):
+                raise ValueError("request_budget and max_requests disagree")
+            request_budget = max_requests
+        if request_budget is not None and (
+            isinstance(request_budget, bool)
+            or not isinstance(request_budget, int)
+            or request_budget < 0
+        ):
+            raise ValueError("request_budget must be a non-negative integer")
+        if market_budget is not None and (
+            isinstance(market_budget, bool)
+            or not isinstance(market_budget, int)
+            or market_budget < 0
+        ):
+            raise ValueError("market_budget must be a non-negative integer")
+        target_markets = int(max_markets)
+        market_limit = target_markets if market_budget is None else min(
+            target_markets, int(market_budget)
         )
-        if discovered_call.value is None and any("limit" in item.lower() for item in discovered_call.errors):
-            discovered_call = _call_with_retries(
-                provider,
-                lambda: provider.markets(active=False),
-                context="polymarket market discovery",
-                max_attempts=self.max_attempts,
-                backoff=self.backoff,
-                sleep=self.sleep,
-            )
-        errors = list(discovered_call.errors)
-        retries = discovered_call.retries
-        if discovered_call.value is None or (discovered_call.errors and not discovered_call.value):
-            existing_version = (state or {}).get("base_version")
-            status = "PARTIAL" if errors else "FAILED"
-            self.store.save_dataset_bootstrap_state(
-                POLYMARKET_DATASET_ID,
-                {
-                    "provider": _provider_name(provider),
-                    "instrument": "POLYMARKET",
-                    "market_type": MarketType.PREDICTION.value,
-                    "timeframe": "event",
-                    "requested_start": None,
-                    "requested_end": None,
-                    "next_timestamp": None,
-                    "base_version": existing_version,
-                    "status": status,
-                    "processed_market_ids": list((state or {}).get("processed_market_ids", ())),
-                    "errors": list(dict.fromkeys(errors[-64:])),
-                },
-            )
+        request_limit = (
+            max(1, target_markets * 4 + 1)
+            if request_budget is None
+            else int(request_budget)
+        )
+        provider = self.prediction_provider
+        provider_name = _provider_name(provider)
+        now = _stamp(self.clock()) or utc_now()
+        state = self.store.load_dataset_bootstrap_state(POLYMARKET_DATASET_ID) or {}
+        # A zero effective budget is an intentional no-op.  In particular,
+        # do not clear durable IDs or rebuild/publish an empty aggregate just
+        # because a caller asked for a bounded tick with no capacity.
+        if market_limit == 0 or request_limit == 0:
+            latest = self.store.load_dataset_catalog(POLYMARKET_DATASET_ID)
+
+            def _catalog_int(value: Any) -> int:
+                try:
+                    return max(0, int(value))
+                except (TypeError, ValueError, OverflowError):
+                    return 0
+
+            def _catalog_float(value: Any) -> float:
+                try:
+                    parsed = float(value)
+                except (TypeError, ValueError, OverflowError):
+                    return 0.0
+                return parsed if math.isfinite(parsed) else 0.0
+
+            def _state_ids(key: str) -> tuple[str, ...]:
+                raw = state.get(key, ())
+                if isinstance(raw, (str, bytes, Mapping)):
+                    return ()
+                try:
+                    values = iter(raw)
+                except TypeError:
+                    return ()
+                return tuple(
+                    sorted(
+                        {
+                            str(item).strip()
+                            for item in values
+                            if str(item).strip()
+                        }
+                    )
+                )
+
+            discovered_snapshot = _state_ids("discovered_market_ids")
+            processed_snapshot = _state_ids("processed_market_ids")
+            no_work_metadata = {
+                "job_name": POLYMARKET_HISTORICAL_JOB_NAME,
+                "no_work_reason": "EFFECTIVE_BUDGET_ZERO",
+                "market_limit": target_markets,
+                "market_budget": market_limit,
+                "request_budget": request_limit,
+                "discovery_complete": bool(state.get("discovery_complete", False)),
+                "discovered_markets": len(discovered_snapshot),
+                "processed_markets": len(processed_snapshot),
+                "changed": False,
+            }
             return BootstrapReport(
                 POLYMARKET_DATASET_ID,
                 "HISTORICAL",
-                _provider_name(provider),
+                provider_name,
                 "POLYMARKET",
                 "event",
-                status,
-                str(existing_version) if existing_version else None,
-                0,
-                None,
-                None,
-                0.0,
-                errors=tuple(dict.fromkeys(errors)),
+                "EXHAUSTED",
+                str(latest.get("dataset_version")) if latest else None,
+                _catalog_int(latest.get("row_count")) if latest else 0,
+                _stamp(latest.get("start_timestamp")) if latest else None,
+                _stamp(latest.get("end_timestamp")) if latest else None,
+                _catalog_float(latest.get("completeness")) if latest else 0.0,
+                errors=("effective budget is zero; no work performed",),
+                metadata=no_work_metadata,
             )
-        raw_markets = discovered_call.value if isinstance(discovered_call.value, Sequence) and not isinstance(discovered_call.value, (str, bytes, Mapping)) else ()
-        markets = [item for item in raw_markets if isinstance(item, PredictionMarketSnapshot)]
-        markets = markets[: int(max_markets)] if max_markets else []
-        processed = {
-            str(item)
-            for item in (state or {}).get("processed_market_ids", ())
+
+        prior_status = str(state.get("status") or "").upper()
+        if (
+            state
+            and prior_status not in {
+                "COMPLETE",
+                "EMPTY",
+                "NO_NEW_DATA",
+                "EXHAUSTED",
+            }
+            and not resume
+        ):
+            latest = self.store.load_dataset_catalog(POLYMARKET_DATASET_ID)
+            return BootstrapReport(
+                POLYMARKET_DATASET_ID,
+                "HISTORICAL",
+                provider_name,
+                "POLYMARKET",
+                "event",
+                "SCHEDULED",
+                str(latest.get("dataset_version")) if latest else None,
+                int(latest.get("row_count", 0)) if latest else 0,
+                _stamp(latest.get("start_timestamp")) if latest else None,
+                _stamp(latest.get("end_timestamp")) if latest else None,
+                float(latest.get("completeness", 0.0)) if latest else 0.0,
+                errors=("incomplete historical refresh is resumable; pass resume=True to advance",),
+            )
+
+        def _positive_or_zero(value: Any, default: int = 0) -> int:
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError):
+                return default
+            return parsed if parsed >= 0 else default
+
+        discovered_ids = {
+            str(item).strip()
+            for item in state.get("discovered_market_ids", ())
             if str(item).strip()
         }
-        self.store.save_dataset_bootstrap_state(
-            POLYMARKET_DATASET_ID,
-            {
-                "provider": _provider_name(provider),
+        processed = {
+            str(item).strip()
+            for item in state.get("processed_market_ids", ())
+            if str(item).strip()
+        }
+        market_statuses = {
+            str(key): str(value).upper()
+            for key, value in (
+                state.get("market_statuses", {})
+                if isinstance(state.get("market_statuses"), Mapping)
+                else {}
+            ).items()
+            if str(key).strip()
+        }
+        # Processed IDs are durable commit markers.  Discard legacy markers
+        # without a non-empty immutable constituent catalog so an
+        # interrupted/empty market can be resumed instead of being skipped.
+        for market_id in tuple(processed):
+            catalog = self.store.load_dataset_catalog(f"prediction:{market_id}")
+            try:
+                row_count = int(catalog.get("row_count", 0)) if catalog else 0
+            except (TypeError, ValueError):
+                row_count = 0
+            if catalog is None or row_count <= 0:
+                processed.discard(market_id)
+                market_statuses.pop(market_id, None)
+        failed_markets: dict[str, dict[str, Any]] = {}
+        raw_failed = state.get("failed_markets", {})
+        if isinstance(raw_failed, Mapping):
+            for key, value in raw_failed.items():
+                if isinstance(value, Mapping) and str(key).strip():
+                    failed_markets[str(key)] = dict(value)
+        discovery_cursor = state.get("discovery_cursor")
+        discovery_cursor = (
+            str(discovery_cursor) if isinstance(discovery_cursor, str) and discovery_cursor else None
+        )
+        query_fingerprint = str(state.get("query_fingerprint") or "").strip() or None
+        discovery_complete = bool(state.get("discovery_complete", False))
+        if target_markets == 0:
+            discovery_complete = True
+            discovered_ids.clear()
+            processed.clear()
+        errors: list[str] = []
+        no_new_data_count = _positive_or_zero(state.get("no_new_data_count"))
+        retry_count = _positive_or_zero(state.get("retry_count"))
+        request_count = _positive_or_zero(state.get("request_count"))
+        tick_requests = 0
+        error_count = _positive_or_zero(state.get("error_count"))
+        request_failed = False
+        budget_exhausted = False
+        changed_market = False
+        changed_aggregate = False
+        attestation: Mapping[str, Any] | None = None
+        discovery_retry_after: float | None = None
+        discovery_next_attempt_at: datetime | None = None
+        discovery_failed = False
+
+
+        def _coverage() -> dict[str, Any]:
+            return {
+                "market_limit": target_markets,
+                "market_budget": market_limit,
+                "request_budget": request_limit,
+                "discovery_complete": discovery_complete,
+                "discovered_markets": len(discovered_ids),
+                "processed_markets": len(processed),
+                "history_endpoint": "CLOB /prices-history for the aligned YES token",
+            }
+
+        def _next_failed_at() -> datetime | None:
+            values = [
+                _stamp(value.get("next_attempt_at"))
+                for value in failed_markets.values()
+                if isinstance(value, Mapping)
+            ]
+            values = [value for value in values if value is not None]
+            return min(values) if values else None
+
+        def _persist(
+            status: str,
+            *,
+            last_error: str | None = None,
+            next_attempt_at: datetime | None = None,
+        ) -> None:
+            retry_values = (
+                [discovery_retry_after]
+                if discovery_retry_after is not None
+                else []
+            )
+            retry_values.extend(
+                parsed
+                for item in failed_markets.values()
+                if isinstance(item, Mapping)
+                for parsed in (_coerce_retry_after(item.get("retry_after")),)
+                if parsed is not None
+            )
+
+            payload: dict[str, Any] = {
+                "provider": provider_name,
                 "instrument": "POLYMARKET",
                 "market_type": MarketType.PREDICTION.value,
                 "timeframe": "event",
                 "requested_start": None,
                 "requested_end": None,
                 "next_timestamp": None,
-                "base_version": (state or {}).get("base_version"),
-                "status": "RUNNING",
+                "base_version": state.get("base_version"),
+                "status": str(status).upper(),
+                "discovery_cursor": discovery_cursor,
+                "query_fingerprint": query_fingerprint,
+                "discovery_complete": discovery_complete,
+                "discovered_market_ids": sorted(discovered_ids),
                 "processed_market_ids": sorted(processed),
-                "markets_discovered": len(markets),
-                "errors": errors[-32:],
-            },
-        )
-        imported = 0
-        points_total = 0
-        category_counts: dict[str, int] = {}
+                "market_statuses": dict(sorted(market_statuses.items())),
+                "failed_markets": {
+                    key: dict(value) for key, value in sorted(failed_markets.items())
+                },
+                "request_budget": request_limit,
+                "market_budget": market_limit,
+                "request_count": request_count,
+                "error_count": error_count,
+                "no_new_data_count": no_new_data_count,
+                "retry_count": retry_count,
+                "retry_after": max(retry_values, default=0.0),
+                "backoff": self.backoff,
+                "next_attempt_at": (
+                    next_attempt_at
+                    or discovery_next_attempt_at
+                    or _next_failed_at()
+                ),
+
+                "requested_coverage": _coverage(),
+                "honest_gaps": [
+                    {
+                        "market_id": key,
+                        "status": value.get("status"),
+                        "reason": value.get("last_error"),
+                        "next_attempt_at": value.get("next_attempt_at"),
+                    }
+                    for key, value in sorted(failed_markets.items())
+                ],
+                "errors": list(dict.fromkeys(errors[-64:])),
+                "updated_at": now.isoformat(),
+            }
+            state.update(payload)
+            self.store.save_dataset_bootstrap_state(POLYMARKET_DATASET_ID, payload)
+            job_payload = dict(payload)
+            job_payload["job_kind"] = "POLYMARKET_HISTORICAL_REFRESH"
+            job_payload["resumable"] = True
+            self.store.set_operator_job(
+                POLYMARKET_HISTORICAL_JOB_NAME,
+                str(status).upper(),
+                job_payload,
+                pid=None,
+                started_at=_stamp(state.get("started_at")) or now,
+                last_error=last_error or (errors[-1] if errors else None),
+                resumable=True,
+                timestamp=now,
+            )
+        def _record_market_failure(
+            market_id: str,
+            failed: Mapping[str, Any] | None,
+            phase_error: str,
+            retry_after: float = 0.0,
+        ) -> None:
+            nonlocal retry_count
+            previous_attempts = _positive_or_zero(
+                failed.get("attempts") if failed else 0
+            )
+            retry_count += int(previous_attempts > 0)
+            delay = retry_after or min(
+                3600.0, self.backoff * (2**previous_attempts)
+            )
+            retry_at = now + timedelta(seconds=max(0.0, delay))
+            failed_markets[market_id] = {
+                "attempts": previous_attempts + 1,
+                "status": "FAILED",
+                "last_error": phase_error,
+                "retry_after": retry_after,
+                "next_attempt_at": retry_at.isoformat(),
+            }
+            market_statuses[market_id] = "FAILED"
+            _persist("FAILED", last_error=phase_error, next_attempt_at=retry_at)
+
+
+        # A scheduled retry is not allowed to consume a request before its
+        # persisted Retry-After/backoff boundary.
+        scheduled_at = _stamp(state.get("next_attempt_at"))
+        if scheduled_at is not None and scheduled_at > now and (
+            prior_status in {"SCHEDULED", "FAILED", "PARTIAL"}
+        ):
+            latest = self.store.load_dataset_catalog(POLYMARKET_DATASET_ID)
+            retry_after = _coerce_retry_after(state.get("retry_after"))
+            next_attempt_text = scheduled_at.isoformat()
+            return BootstrapReport(
+                POLYMARKET_DATASET_ID,
+                "HISTORICAL",
+                provider_name,
+                "POLYMARKET",
+                "event",
+                "SCHEDULED",
+                str(latest.get("dataset_version")) if latest else None,
+                int(latest.get("row_count", 0)) if latest else 0,
+                _stamp(latest.get("start_timestamp")) if latest else None,
+                _stamp(latest.get("end_timestamp")) if latest else None,
+                float(latest.get("completeness", 0.0)) if latest else 0.0,
+                errors=tuple(dict.fromkeys(errors)),
+                metadata={
+                    "job_name": POLYMARKET_HISTORICAL_JOB_NAME,
+                    "bootstrap_status": "WAITING_FOR_RETRY",
+                    "next_attempt_at": next_attempt_text,
+                    "retry_after": retry_after,
+                    "backoff": {
+                        "status": "WAITING",
+                        "retry_after": retry_after,
+                        "next_attempt_at": next_attempt_text,
+                    },
+                    "requested_coverage": _coverage(),
+                },
+            )
+
+
+        _persist("RUNNING")
+        def _request(operation: Callable[[], Any], context: str) -> _CallResult | None:
+            nonlocal request_count, tick_requests, error_count, request_failed, budget_exhausted
+            if tick_requests >= request_limit:
+                budget_exhausted = True
+                return None
+            tick_requests += 1
+            request_count += 1
+            result = _single_provider_call(provider, operation, context=context)
+            if result.errors:
+                errors.extend(result.errors)
+            if result.request_failed:
+                error_count += 1
+                request_failed = True
+            return result
+
+        # One page per tick keeps discovery bounded and persists the opaque
+        # cursor and scope fingerprint before any market detail requests.
+        if not discovery_complete and len(discovered_ids) < target_markets:
+            page_size = max(1, min(100, target_markets - len(discovered_ids)))
+            market_page = getattr(provider, "market_page", None)
+            if callable(market_page):
+                page_call = _request(
+                    lambda: market_page(
+                        page_size,
+                        after_cursor=discovery_cursor,
+                        closed=True,
+                    ),
+                    "polymarket market discovery",
+                )
+                if page_call is not None and page_call.value is not None:
+                    page = page_call.value
+                    snapshots = getattr(page, "snapshots", ())
+                    if isinstance(snapshots, Sequence) and not isinstance(
+                        snapshots, (str, bytes, Mapping)
+                    ):
+                        for item in snapshots:
+                            market_id = str(getattr(item, "market_id", "")).strip()
+                            if market_id:
+                                discovered_ids.add(market_id)
+                    if page_call.request_failed and not snapshots:
+                        discovery_failed = True
+                        discovery_retry_after = _coerce_retry_after(page_call.retry_after)
+                        if discovery_retry_after is not None and discovery_retry_after > 0:
+                            discovery_next_attempt_at = now + timedelta(
+                                seconds=discovery_retry_after
+                            )
+                    page_fingerprint = str(
+                        getattr(page, "query_fingerprint", "") or ""
+                    ).strip()
+                    if query_fingerprint is None and page_fingerprint:
+                        query_fingerprint = page_fingerprint
+                    elif (
+                        page_fingerprint
+                        and query_fingerprint
+                        and page_fingerprint != query_fingerprint
+                    ):
+                        errors.append("polymarket market discovery: QUERY_FINGERPRINT_CHANGED")
+                        request_failed = True
+                    returned_cursor = getattr(page, "next_cursor", None)
+                    discovery_cursor = (
+                        str(returned_cursor)
+                        if isinstance(returned_cursor, str) and returned_cursor
+                        else None
+                    )
+                    if str(getattr(page, "coverage_status", "")).upper() == "ERROR":
+                        reason = str(getattr(page, "error_reason", "") or "MALFORMED_PAGE")
+                        errors.append(f"polymarket market discovery: {reason}")
+                        request_failed = True
+                    elif discovery_cursor is None or len(discovered_ids) >= target_markets:
+                        discovery_complete = True
+                elif page_call is None:
+                    budget_exhausted = True
+            elif callable(getattr(provider, "markets", None)):
+                remaining = target_markets - len(discovered_ids)
+                market_call = _request(
+                    lambda: provider.markets(active=False, limit=remaining),
+                    "polymarket market discovery",
+                )
+                if market_call is not None:
+                    values = market_call.value
+                    if market_call.request_failed and not values:
+                        discovery_failed = True
+                        discovery_retry_after = _coerce_retry_after(market_call.retry_after)
+                        if discovery_retry_after is not None and discovery_retry_after > 0:
+                            discovery_next_attempt_at = now + timedelta(
+                                seconds=discovery_retry_after
+                            )
+                    elif values is not None:
+                        if isinstance(values, Sequence) and not isinstance(
+                            values, (str, bytes, Mapping)
+                        ):
+                            for item in values:
+                                market_id = str(getattr(item, "market_id", "")).strip()
+                                if market_id:
+                                    discovered_ids.add(market_id)
+                        discovery_complete = True
+                elif market_call is None:
+                    budget_exhausted = True
+            else:
+                errors.append("polymarket market discovery: provider has no discovery API")
+                request_failed = True
+            _persist(
+                "PARTIAL" if discovery_failed else "RUNNING",
+                next_attempt_at=discovery_next_attempt_at if discovery_failed else None,
+            )
+
+
+        attempted_markets = 0
+        for market_id in sorted(discovered_ids):
+            if market_id in processed:
+                continue
+            if attempted_markets >= market_limit:
+                break
+            failed = failed_markets.get(market_id)
+            due_at = _stamp(failed.get("next_attempt_at")) if failed else None
+            if due_at is not None and due_at > now:
+                continue
+            if tick_requests >= request_limit:
+                budget_exhausted = True
+                break
+            attempted_markets += 1
+            market_call = _request(
+                lambda market_id=market_id: provider.market(market_id),
+                f"polymarket market {market_id}",
+            )
+            if market_call is None:
+                budget_exhausted = True
+                break
+            discovered_market = (
+                market_call.value
+                if isinstance(market_call.value, PredictionMarketSnapshot)
+                else None
+            )
+            if discovered_market is None:
+                phase_error = (
+                    market_call.errors[-1]
+                    if market_call.request_failed and market_call.errors
+                    else f"polymarket market {market_id}: "
+                    + ("request failed" if market_call.request_failed else "identity unavailable")
+                )
+                if not market_call.request_failed:
+                    errors.append(phase_error)
+                _record_market_failure(
+                    market_id,
+                    failed,
+                    phase_error,
+                    market_call.retry_after,
+                )
+                continue
+            metadata_call = _request(
+                lambda market_id=market_id: provider.metadata(market_id),
+                f"polymarket metadata {market_id}",
+            )
+            if metadata_call is None:
+                budget_exhausted = True
+                break
+            if metadata_call.request_failed:
+                phase_error = (
+                    metadata_call.errors[-1]
+                    if metadata_call.errors
+                    else f"polymarket metadata {market_id}: request failed"
+                )
+                _record_market_failure(
+                    market_id,
+                    failed,
+                    phase_error,
+                    metadata_call.retry_after,
+                )
+                continue
+            history_call = _request(
+                lambda market_id=market_id: provider.price_history(market_id),
+                f"polymarket price history {market_id}",
+            )
+            if history_call is None:
+                budget_exhausted = True
+                break
+            if history_call.request_failed:
+                phase_error = (
+                    history_call.errors[-1]
+                    if history_call.errors
+                    else f"polymarket price history {market_id}: request failed"
+                )
+                _record_market_failure(
+                    market_id,
+                    failed,
+                    phase_error,
+                    history_call.retry_after,
+                )
+                continue
+            instrument = metadata_call.value
+            history = _normalize_prediction_history(discovered_market, history_call.value)
+            if not history:
+                no_new_data_count += 1
+                phase_error = (
+                    f"polymarket price history {market_id}: "
+                    "empty or incomplete historical payload"
+                )
+                errors.append(phase_error)
+                _record_market_failure(market_id, failed, phase_error)
+                continue
+            category = classify_market_category(discovered_market)
+            extra = getattr(instrument, "extra", {}) if instrument is not None else {}
+            token_ids = {
+                "yes": discovered_market.yes_token_id
+                or (extra.get("yes_token_id") if isinstance(extra, Mapping) else None),
+                "no": discovered_market.no_token_id
+                or (extra.get("no_token_id") if isinstance(extra, Mapping) else None),
+            }
+            history_has_order_book = any(
+                item.get("order_book") is not None for item in history
+            )
+            history_quality = (
+                "HISTORICAL_ORDER_BOOK"
+                if history_has_order_book
+                else ResearchQuality.PRICE_PROXY.value
+            )
+            metadata_payload = {
+                "source_type": "HISTORICAL",
+                "provider": provider_name,
+                "market_id": market_id,
+                "condition_id": discovered_market.condition_id,
+                "question": discovered_market.question,
+                "resolution_criteria": discovered_market.resolution_criteria,
+                "settlement": discovered_market.settlement.value,
+                "volume": discovered_market.volume,
+                "liquidity": discovered_market.liquidity,
+                "expiry": discovered_market.expiry,
+                "category": category,
+                "tags": list(discovered_market.tags),
+                "token_ids": token_ids,
+                "instrument_metadata": to_record(instrument) if instrument is not None else None,
+                "raw_market": to_record(discovered_market),
+                "historical_order_book_available": history_has_order_book,
+                "research_quality": history_quality,
+                "provenance_version": "dataset-provenance-v1",
+                "policy_version": "prediction-integrity-v1",
+            }
+            metadata_hash = _stable_hash(metadata_payload)
+            try:
+                self.store.save_polymarket_market_metadata(
+                    market_id,
+                    metadata_payload,
+                    observed_at=now,
+                    metadata_hash=metadata_hash,
+                    source_type="HISTORICAL",
+                )
+            except ValueError as exc:
+                errors.append(f"{market_id}: metadata persistence: {exc}")
+            version = _stable_hash(history)
+            constituent_id = f"prediction:{market_id}"
+            previous_catalog = self.store.load_dataset_catalog(constituent_id)
+            try:
+                previous_rows = int(previous_catalog.get("row_count", 0)) if previous_catalog else 0
+                previous_completeness = (
+                    float(previous_catalog.get("completeness", 0.0))
+                    if previous_catalog
+                    else 0.0
+                )
+            except (TypeError, ValueError):
+                previous_rows = 0
+                previous_completeness = 0.0
+            previous_complete = (
+                previous_catalog is not None
+                and str(previous_catalog.get("dataset_version", "")) == version
+                and previous_rows == len(history)
+                and previous_rows > 0
+                and math.isfinite(previous_completeness)
+                and previous_completeness >= 1.0
+            )
+            market_changed = not previous_complete
+            publication_accepted = not market_changed
+            if market_changed:
+                changed_market = True
+                immutable_rows: list[dict[str, Any]] = []
+                for point in history:
+                    immutable_rows.append(
+                        {
+                            "source_type": "HISTORICAL",
+                            "provider": provider_name,
+                            "market_id": market_id,
+                            "condition_id": discovered_market.condition_id,
+                            "question": discovered_market.question,
+                            "timestamp": point["timestamp"],
+                            "source_timestamp": point["timestamp"],
+                            "price": point["price"],
+                            "yes_mid": point["price"],
+                            "token_id": point["token_id"],
+                            "category": category,
+                            "tags": list(discovered_market.tags),
+                            "settlement": discovered_market.settlement.value,
+                            "resolution_criteria": discovered_market.resolution_criteria,
+                            "volume": discovered_market.volume,
+                            "liquidity": discovered_market.liquidity,
+                            "expiry": discovered_market.expiry,
+                            "order_book": point.get("order_book"),
+                            "research_quality": history_quality,
+                            "historical_order_book": point.get("order_book") is not None,
+                            "executable_quote": False,
+                        }
+                    )
+                try:
+                    # Keep the immutable constituent dataset, every snapshot,
+                    # and its catalog publication in one rollback boundary.
+                    # All network reads above are complete before entering
+                    # this transaction.
+                    with self.store.transaction(immediate=True):
+                        if self.store.load_dataset(constituent_id, version) is None:
+                            self.store.save_dataset(
+                                constituent_id,
+                                version,
+                                immutable_rows,
+                                metadata=metadata_payload,
+                                quality=history_quality,
+                            )
+                        for point, immutable_row in zip(history, immutable_rows):
+                            snapshot_id = (
+                                f"pmhist:{market_id}:{version}:"
+                                f"{point['token_id']}:{point['timestamp'].isoformat()}"
+                            )
+                            self.store.save_polymarket_snapshot(
+                                snapshot_id,
+                                market_id,
+                                point["timestamp"],
+                                now,
+                                immutable_row,
+                                quality=history_quality,
+                                source_type="HISTORICAL",
+                            )
+                        self.store.save_dataset_catalog(
+                            constituent_id,
+                            version,
+                            provider=provider_name,
+                            instrument=str(
+                                getattr(instrument, "symbol", market_id) or market_id
+                            ),
+                            market_type=MarketType.PREDICTION,
+                            timeframe="event",
+                            start_timestamp=history[0]["timestamp"] if history else None,
+                            end_timestamp=history[-1]["timestamp"] if history else None,
+                            row_count=len(history),
+                            completeness=1.0 if history else 0.0,
+                            missing_ranges=(),
+                            quality=history_quality,
+                            source_type="HISTORICAL",
+                            snapshot_id=f"pmhist:{market_id}:{version}",
+                            metadata={
+                                **metadata_payload,
+                                "dataset_id": constituent_id,
+                                "dataset_version": version,
+                            },
+                        )
+                        published_catalog = self.store.load_dataset_catalog(
+                            constituent_id,
+                            version,
+                        )
+                        try:
+                            published_rows = (
+                                int(published_catalog.get("row_count", 0))
+                                if published_catalog
+                                else 0
+                            )
+                            published_completeness = (
+                                float(published_catalog.get("completeness", 0.0))
+                                if published_catalog
+                                else 0.0
+                            )
+                        except (TypeError, ValueError):
+                            published_rows = 0
+                            published_completeness = 0.0
+                        if (
+                            published_catalog is None
+                            or str(published_catalog.get("dataset_version", "")) != version
+                            or published_rows != len(history)
+                            or published_rows <= 0
+                            or not math.isfinite(published_completeness)
+                            or published_completeness < 1.0
+                        ):
+                            raise ValueError(
+                                f"immutable publication incomplete: {constituent_id}/{version}"
+                            )
+                    publication_accepted = True
+                except (TypeError, ValueError) as exc:
+                    phase_error = f"{market_id}: immutable publication: {exc}"
+                    errors.append(phase_error)
+                    _record_market_failure(market_id, failed, phase_error)
+                    continue
+            if not publication_accepted:
+                phase_error = (
+                    f"{market_id}: immutable publication was not accepted"
+                )
+                errors.append(phase_error)
+                _record_market_failure(market_id, failed, phase_error)
+                continue
+            market_statuses[market_id] = "COMPLETE"
+            processed.add(market_id)
+            failed_markets.pop(market_id, None)
+            _persist("RUNNING")
+
+        # Rebuild the aggregate only from exact immutable constituent catalog
+        # versions.  Its version is therefore a content/identity hash, not a
+        # refresh timestamp.
         market_versions: list[dict[str, Any]] = []
+        category_counts: dict[str, int] = {}
         starts: list[datetime] = []
         ends: list[datetime] = []
+        imported = 0
+        points_total = 0
         timestamped_order_books = 0
         for market_id in sorted(processed):
             catalog = self.store.load_dataset_catalog(f"prediction:{market_id}")
@@ -1423,23 +2186,23 @@ class HistoricalBootstrapper:
                 continue
             metadata = catalog.get("metadata", {})
             metadata = metadata if isinstance(metadata, Mapping) else {}
-            has_order_book = bool(metadata.get("historical_order_book_available", False))
-            if has_order_book:
-                timestamped_order_books += 1
-            category = str(metadata.get("category") or "other")
-            category_counts[category] = category_counts.get(category, 0) + 1
             rows = int(catalog.get("row_count", 0))
-            if rows:
-                imported += 1
-                points_total += rows
+            category = str(metadata.get("category") or "other")
+            has_book = bool(metadata.get("historical_order_book_available", False))
+            category_counts[category] = category_counts.get(category, 0) + 1
+            timestamped_order_books += int(has_book)
+            points_total += rows
+            imported += int(rows > 0)
             version = str(catalog.get("dataset_version", ""))
             market_versions.append(
                 {
                     "market_id": market_id,
+                    "dataset_id": f"prediction:{market_id}",
                     "version": version,
+                    "dataset_version": version,
                     "records": rows,
                     "category": category,
-                    "historical_order_book": has_order_book,
+                    "historical_order_book": has_book,
                 }
             )
             start = _stamp(catalog.get("start_timestamp"))
@@ -1448,265 +2211,346 @@ class HistoricalBootstrapper:
                 starts.append(start)
             if end is not None:
                 ends.append(end)
-        for discovered in markets:
-            market_id = str(discovered.market_id)
-            if market_id in processed:
-                continue
-            market_call = _call_with_retries(
-                provider,
-                lambda market_id=market_id: provider.market(market_id),
-                context=f"polymarket market {market_id}",
-                max_attempts=self.max_attempts,
-                backoff=self.backoff,
-                sleep=self.sleep,
-            )
-            retries += market_call.retries
-            errors.extend(market_call.errors)
-            market = market_call.value if isinstance(market_call.value, PredictionMarketSnapshot) else discovered
-            metadata_call = _call_with_retries(
-                provider,
-                lambda market_id=market_id: provider.metadata(market_id),
-                context=f"polymarket metadata {market_id}",
-                max_attempts=self.max_attempts,
-                backoff=self.backoff,
-                sleep=self.sleep,
-            )
-            retries += metadata_call.retries
-            errors.extend(metadata_call.errors)
-            instrument = metadata_call.value
-            history_call = _call_with_retries(
-                provider,
-                lambda market_id=market_id: provider.price_history(market_id),
-                context=f"polymarket price history {market_id}",
-                max_attempts=self.max_attempts,
-                backoff=self.backoff,
-                sleep=self.sleep,
-            )
-            retries += history_call.retries
-            errors.extend(history_call.errors)
-            history = _normalize_prediction_history(market, history_call.value)
-            category = classify_market_category(market)
-            category_counts[category] = category_counts.get(category, 0) + 1
-            extra = getattr(instrument, "extra", {}) if instrument is not None else {}
-            history_has_order_book = any(item.get("order_book") is not None for item in history)
-            if history_has_order_book:
-                timestamped_order_books += 1
-            history_quality = (
-                "HISTORICAL_ORDER_BOOK"
-                if history_has_order_book
-                else ResearchQuality.PRICE_PROXY.value
-            )
-            token_ids = {
-                "yes": market.yes_token_id or (extra.get("yes_token_id") if isinstance(extra, Mapping) else None),
-                "no": market.no_token_id or (extra.get("no_token_id") if isinstance(extra, Mapping) else None),
-            }
-            raw_market = to_record(market)
-            metadata_payload = {
-                "source_type": "HISTORICAL",
-                "provider": _provider_name(provider),
-                "market_id": market_id,
-                "question": market.question,
-                "resolution_criteria": market.resolution_criteria,
-                "settlement": market.settlement.value,
-                "volume": market.volume,
-                "liquidity": market.liquidity,
-                "expiry": market.expiry,
-                "category": category,
-                "tags": list(market.tags),
-                "token_ids": token_ids,
-                "instrument_metadata": to_record(instrument) if instrument is not None else None,
-                "raw_market": raw_market,
-                "historical_order_book_available": history_has_order_book,
-                "research_quality": history_quality,
-            }
-            metadata_hash = _stable_hash(metadata_payload)
-            try:
-                self.store.save_polymarket_market_metadata(
-                    market_id,
-                    metadata_payload,
-                    observed_at=self.clock(),
-                    metadata_hash=metadata_hash,
-                )
-            except ValueError as exc:
-                errors.append(f"{market_id}: metadata persistence: {exc}")
-            for point in history:
-                snapshot_id = f"pmhist:{market_id}:{point['token_id']}:{point['timestamp'].isoformat()}"
-                payload = {
-                    "source_type": "HISTORICAL",
-                    "provider": _provider_name(provider),
-                    "market_id": market_id,
-                    "question": market.question,
-                    "timestamp": point["timestamp"],
-                    "price": point["price"],
-                    "yes_mid": point["price"],
-                    "token_id": point["token_id"],
-                    "category": category,
-                    "tags": list(market.tags),
-                    "settlement": market.settlement.value,
-                    "resolution_criteria": market.resolution_criteria,
-                    "volume": market.volume,
-                    "liquidity": market.liquidity,
-                    "expiry": market.expiry,
-                    "order_book": point.get("order_book"),
-                    "research_quality": history_quality,
-                    "historical_order_book": point.get("order_book") is not None,
-                    "executable_quote": False,
-                }
-                try:
-                    self.store.save_polymarket_snapshot(
-                        snapshot_id,
-                        market_id,
-                        point["timestamp"],
-                        point["timestamp"],
-                        payload,
-                        quality=history_quality,
-                    )
-                except ValueError as exc:
-                    errors.append(f"{market_id}: snapshot persistence: {exc}")
-            version = _stable_hash(history)
-            starts.extend(item["timestamp"] for item in history)
-            ends.extend(item["timestamp"] for item in history)
-            if history:
-                points_total += len(history)
-                imported += 1
-            market_versions.append({"market_id": market_id, "version": version, "records": len(history), "category": category, "historical_order_book": history_has_order_book})
-            try:
-                self.store.save_dataset_catalog(
-                    f"prediction:{market_id}",
-                    version,
-                    provider=_provider_name(provider),
-                    instrument=str(getattr(instrument, "symbol", market_id) or market_id),
-                    market_type=MarketType.PREDICTION,
-                    timeframe="event",
-                    start_timestamp=history[0]["timestamp"] if history else None,
-                    end_timestamp=history[-1]["timestamp"] if history else None,
-                    row_count=len(history),
-                    completeness=1.0 if history else 0.0,
-                    missing_ranges=(),
-                    quality=history_quality,
-                    source_type="HISTORICAL",
-                    snapshot_id=f"pmhist:{market_id}:{version}",
-                    metadata={
-                        "market_id": market_id,
-                        "polymarket_key": market_id,
-                        "category": category,
-                        "question": market.question,
-                        "resolution_criteria": market.resolution_criteria,
-                        "volume": market.volume,
-                        "liquidity": market.liquidity,
-                        "token_ids": token_ids,
-                        "settlement": market.settlement.value,
-                        "historical_order_book_available": history_has_order_book,
-                        "research_quality": history_quality,
-                    },
-                )
-            except ValueError as exc:
-                errors.append(f"{market_id}: catalog persistence: {exc}")
-            processed.add(market_id)
-            self.store.save_dataset_bootstrap_state(
-                POLYMARKET_DATASET_ID,
-                {
-                    "provider": _provider_name(provider),
-                    "instrument": "POLYMARKET",
-                    "market_type": MarketType.PREDICTION.value,
-                    "timeframe": "event",
-                    "requested_start": None,
-                    "requested_end": None,
-                    "next_timestamp": None,
-                    "base_version": (state or {}).get("base_version"),
-                    "status": "RUNNING",
-                    "processed_market_ids": sorted(processed),
-                    "markets_discovered": len(markets),
-                    "markets_imported": imported,
-                    "price_points": points_total,
-                    "categories": category_counts,
-                    "errors": list(dict.fromkeys(errors[-32:])),
-                },
-            )
-        aggregate_has_order_book = bool(market_versions) and timestamped_order_books == len(market_versions)
+        aggregate_version = _stable_hash(market_versions)
+        aggregate_start = min(starts) if starts else None
+        aggregate_end = max(ends) if ends else None
+        aggregate_has_order_book = bool(market_versions) and (
+            timestamped_order_books == len(market_versions)
+        )
         aggregate_quality = (
             "HISTORICAL_ORDER_BOOK"
             if aggregate_has_order_book
             else ResearchQuality.PRICE_PROXY.value
         )
-        aggregate_version = _stable_hash(market_versions)
-        aggregate_start = min(starts) if starts else None
-        aggregate_end = max(ends) if ends else None
         aggregate_metadata = {
             "source_type": "HISTORICAL",
-            "provider": _provider_name(provider),
+            "provider": provider_name,
             "instrument": "POLYMARKET",
-            "markets_discovered": len(markets),
+            "markets_discovered": len(discovered_ids),
             "markets_imported": imported,
             "price_points": points_total,
             "category_counts": category_counts,
             "market_versions": market_versions,
             "research_quality": aggregate_quality,
             "historical_order_book_available": aggregate_has_order_book,
-            "note": "Only timestamped price history is stored; no historical depth, spread, fills, or executable quotes are fabricated.",
+            "provenance_version": "dataset-provenance-v1",
+            "policy_version": "prediction-integrity-v1",
+            "requested_coverage": _coverage(),
+            "honest_gaps": [
+                {
+                    "market_id": key,
+                    "status": value.get("status"),
+                    "reason": value.get("last_error"),
+                    "next_attempt_at": value.get("next_attempt_at"),
+                }
+                for key, value in sorted(failed_markets.items())
+            ],
+            "note": (
+                "Only timestamped CLOB price history is stored; no historical "
+                "depth, spread, fills, or executable quotes are fabricated."
+            ),
         }
-        completeness = imported / len(markets) if markets else 0.0
-        try:
-            self.store.save_dataset_catalog(
-                POLYMARKET_DATASET_ID,
-                aggregate_version,
-                provider=_provider_name(provider),
-                instrument="POLYMARKET",
-                market_type=MarketType.PREDICTION,
-                timeframe="event",
-                start_timestamp=aggregate_start,
-                end_timestamp=aggregate_end,
-                row_count=points_total,
-                completeness=completeness,
-                missing_ranges=(),
-                quality=aggregate_quality,
-                source_type="HISTORICAL",
-                snapshot_id=f"{POLYMARKET_DATASET_ID}:{aggregate_version}",
-                metadata=aggregate_metadata,
-            )
-        except ValueError as exc:
-            errors.append(f"{POLYMARKET_DATASET_ID}: catalog persistence: {exc}")
-        status = "COMPLETE" if markets and imported == len(markets) and not errors else ("EMPTY" if not markets and not errors else "PARTIAL")
-        self.store.save_dataset_bootstrap_state(
-            POLYMARKET_DATASET_ID,
-            {
-                "provider": _provider_name(provider),
-                "instrument": "POLYMARKET",
-                "market_type": MarketType.PREDICTION.value,
-                "timeframe": "event",
-                "requested_start": None,
-                "requested_end": None,
-                "next_timestamp": None,
-                "base_version": aggregate_version,
-                "status": status,
-                "processed_market_ids": sorted(processed),
-                "markets_discovered": len(markets),
-                "markets_imported": imported,
-                "price_points": points_total,
-                "categories": category_counts,
-                "errors": list(dict.fromkeys(errors[-64:])),
-            },
+        previous_aggregate = self.store.load_dataset_catalog(POLYMARKET_DATASET_ID)
+        changed_aggregate = (
+            previous_aggregate is None
+            or str(previous_aggregate.get("dataset_version", "")) != aggregate_version
         )
+        if changed_aggregate:
+            changed_aggregate = True
+            try:
+                self.store.save_dataset_catalog(
+                    POLYMARKET_DATASET_ID,
+                    aggregate_version,
+                    provider=provider_name,
+                    instrument="POLYMARKET",
+                    market_type=MarketType.PREDICTION,
+                    timeframe="event",
+                    start_timestamp=aggregate_start,
+                    end_timestamp=aggregate_end,
+                    row_count=points_total,
+                    completeness=(
+                        len(processed) / len(discovered_ids) if discovered_ids else 0.0
+                    ),
+                    missing_ranges=tuple(
+                        {
+                            "market_id": key,
+                            "reason": value.get("last_error"),
+                        }
+                        for key, value in sorted(failed_markets.items())
+                    ),
+                    quality=aggregate_quality,
+                    source_type="HISTORICAL",
+                    snapshot_id=f"{POLYMARKET_DATASET_ID}:{aggregate_version}",
+                    metadata=aggregate_metadata,
+                )
+                attestation = self.store.verify_dataset_integrity_attestation(
+                    POLYMARKET_DATASET_ID,
+                    aggregate_version,
+                    force=True,
+                )
+            except (TypeError, ValueError) as exc:
+                errors.append(
+                    f"{POLYMARKET_DATASET_ID}: immutable publication: {exc}"
+                )
+        else:
+            aggregate_version = str(previous_aggregate.get("dataset_version", aggregate_version))
+        remaining = (
+            len(discovered_ids) < target_markets
+            or any(
+                market_id not in processed
+                for market_id in discovered_ids
+            )
+        )
+        if discovery_failed:
+            final_status = "PARTIAL"
+        elif request_failed:
+            final_status = "FAILED"
+
+        elif budget_exhausted and remaining:
+            final_status = "EXHAUSTED"
+        elif remaining:
+            final_status = "SCHEDULED"
+        elif errors:
+            final_status = "FAILED"
+        elif not changed_aggregate and previous_aggregate is not None:
+            final_status = "NO_NEW_DATA"
+        elif discovered_ids:
+            final_status = "COMPLETE"
+        else:
+            final_status = "NO_NEW_DATA"
+        state["base_version"] = aggregate_version or state.get("base_version")
+        _persist(final_status)
+        completeness = (
+            len(processed) / len(discovered_ids) if discovered_ids else 0.0
+        )
+        report_metadata: dict[str, Any] = {
+            **aggregate_metadata,
+            "job_name": POLYMARKET_HISTORICAL_JOB_NAME,
+            "request_count": request_count,
+            "error_count": error_count,
+            "no_new_data_count": no_new_data_count,
+            "retry_count": retry_count,
+            "request_budget": request_limit,
+            "market_budget": market_limit,
+            "discovery_cursor": discovery_cursor,
+            "query_fingerprint": query_fingerprint,
+            "next_attempt_at": discovery_next_attempt_at or _next_failed_at(),
+            "retry_after": discovery_retry_after,
+            "changed": bool(changed_aggregate),
+            "attestation": dict(attestation) if isinstance(attestation, Mapping) else None,
+        }
         report = BootstrapReport(
             POLYMARKET_DATASET_ID,
             "HISTORICAL",
-            _provider_name(provider),
+            provider_name,
             "POLYMARKET",
             "event",
-            status,
-            aggregate_version,
+            final_status,
+            aggregate_version or None,
             points_total,
             aggregate_start,
             aggregate_end,
             completeness,
-            (),
+            tuple(
+                {
+                    "market_id": key,
+                    "reason": value.get("last_error"),
+                }
+                for key, value in sorted(failed_markets.items())
+            ),
             0,
-            retries,
+            retry_count,
             tuple(dict.fromkeys(errors)),
-            aggregate_metadata,
+            report_metadata,
         )
-        self.store.save_report_if_absent(f"historical-bootstrap:{POLYMARKET_DATASET_ID}:{aggregate_version}", report.as_record(), experiment_id=POLYMARKET_DATASET_ID)
+        self.store.save_report_if_absent(
+            f"historical-bootstrap:{POLYMARKET_DATASET_ID}:"
+            f"{aggregate_version or 'none'}:{final_status}:{request_count}",
+            report.as_record(),
+            experiment_id=POLYMARKET_DATASET_ID,
+        )
         return report
+    def publish_polymarket_forward_replay(
+        self,
+        *,
+        cutoff: datetime | None = None,
+        dataset_id: str = "Polymarket-recorded-book-replay",
+        market_ids: Sequence[str] | None = None,
+        max_rows: int | None = None,
+    ) -> dict[str, Any]:
+        """Freeze an exact, provenance-preserving replay of forward snapshots.
+
+        A replay remains ``FORWARD_COLLECTED`` because it is a retrospective
+        view of captured evidence, not a historical provider reconstruction.
+        ``research_mode`` is the only new interpretation label.
+        """
+        cutoff_value = _stamp(cutoff) or _stamp(self.clock()) or utc_now()
+        dataset_identifier = str(dataset_id).strip()
+        if not dataset_identifier:
+            raise ValueError("dataset_id is required")
+        if max_rows is not None and (
+            isinstance(max_rows, bool)
+            or not isinstance(max_rows, int)
+            or max_rows < 0
+        ):
+            raise ValueError("max_rows must be a non-negative integer")
+        selected = (
+            tuple(
+                dict.fromkeys(
+                    str(item).strip()
+                    for item in market_ids
+                    if str(item).strip()
+                )
+            )
+            if market_ids is not None
+            else None
+        )
+        raw_rows = self.store.load_polymarket_snapshots(
+            source_type="FORWARD_COLLECTED",
+            end=cutoff_value,
+            limit=max_rows,
+        )
+        rows: list[dict[str, Any]] = []
+        for row in raw_rows:
+            market_id = str(row.get("market_id") or "").strip()
+            if selected is not None and market_id not in selected:
+                continue
+            observed_at = _stamp(row.get("observed_at"))
+            source_timestamp = _stamp(row.get("source_timestamp"))
+            if not market_id or observed_at is None or observed_at > cutoff_value:
+                continue
+            payload = row.get("payload")
+            if not isinstance(payload, Mapping):
+                continue
+            row_source_type = str(
+                row.get("source_type") or payload.get("source_type") or ""
+            ).strip().upper()
+            if row_source_type != "FORWARD_COLLECTED":
+                continue
+            if str(payload.get("source_type") or "").strip().upper() == "PAPER_FORWARD":
+                raise ValueError("forward replay cannot include PAPER_FORWARD snapshots")
+            snapshot_payload = payload.get("snapshot", payload)
+            if not isinstance(snapshot_payload, Mapping):
+                continue
+            record = dict(snapshot_payload)
+            record.update(
+                {
+                    key: payload[key]
+                    for key in (
+                        "yes_order_book",
+                        "no_order_book",
+                        "order_book",
+                        "available_at",
+                        "response_received_at",
+                        "provider_timestamp",
+                    )
+                    if key in payload
+                }
+            )
+            record["market_id"] = market_id
+            record["timestamp"] = source_timestamp or observed_at
+            record["source_timestamp"] = source_timestamp or observed_at
+            record["observed_at"] = observed_at
+            record["source_type"] = "FORWARD_COLLECTED"
+            record["research_mode"] = "RECORDED_BOOK_REPLAY"
+            record["replay_cutoff"] = cutoff_value
+            source_snapshot_id = str(row.get("snapshot_id") or "").strip()
+            if not source_snapshot_id:
+                continue
+            source_record_hash = _stable_hash(
+                {
+                    "snapshot_id": source_snapshot_id,
+                    "market_id": market_id,
+                    "source_timestamp": source_timestamp or observed_at,
+                    "observed_at": observed_at,
+                    "payload": payload,
+                }
+            )
+            record["source_snapshot_id"] = source_snapshot_id
+            record["source_record_hash"] = source_record_hash
+            record["provenance"] = {
+                "source_type": "FORWARD_COLLECTED",
+                "source_snapshot_id": source_snapshot_id,
+                "source_record_hash": source_record_hash,
+                "captured_at": observed_at,
+            }
+            rows.append(record)
+        rows.sort(
+            key=lambda item: (
+                _stamp(item.get("source_timestamp")) or cutoff_value,
+                str(item.get("market_id") or ""),
+                str(item.get("source_snapshot_id") or ""),
+            )
+        )
+        manifest = [
+            {
+                "snapshot_id": str(item["source_snapshot_id"]),
+                "source_record_hash": str(item["source_record_hash"]),
+                "market_id": str(item["market_id"]),
+                "source_timestamp": _stamp(item["source_timestamp"]),
+            }
+            for item in rows
+        ]
+        version = _stable_hash(
+            {
+                "dataset_id": dataset_identifier,
+                "research_mode": "RECORDED_BOOK_REPLAY",
+                "cutoff": cutoff_value,
+                "manifest": manifest,
+                "rows": rows,
+            }
+        )
+        metadata = {
+            "source_type": "FORWARD_COLLECTED",
+            "provider": "polymarket",
+            "instrument": "POLYMARKET",
+            "research_mode": "RECORDED_BOOK_REPLAY",
+            "exact_cutoff": cutoff_value,
+            "snapshot_manifest": manifest,
+            "provenance_version": "forward-snapshot-provenance-v1",
+            "policy_version": "recorded-book-replay-v1",
+        }
+        if self.store.load_dataset(dataset_identifier, version) is None:
+            self.store.save_dataset(
+                dataset_identifier,
+                version,
+                rows,
+                metadata=metadata,
+                quality="ORDER_BOOK_SIMULATED",
+            )
+        starts = [_stamp(item.get("source_timestamp")) for item in rows]
+        starts = [item for item in starts if item is not None]
+        self.store.save_dataset_catalog(
+            dataset_identifier,
+            version,
+            provider="polymarket",
+            instrument="POLYMARKET",
+            market_type=MarketType.PREDICTION,
+            timeframe="event_snapshots",
+            start_timestamp=min(starts) if starts else None,
+            end_timestamp=max(starts) if starts else None,
+            row_count=len(rows),
+            completeness=1.0 if rows else 0.0,
+            missing_ranges=(),
+            quality="ORDER_BOOK_SIMULATED",
+            source_type="FORWARD_COLLECTED",
+            snapshot_id=f"{dataset_identifier}:{version}",
+            metadata=metadata,
+        )
+        return {
+            "dataset_id": dataset_identifier,
+            "dataset_version": version,
+            "source_type": "FORWARD_COLLECTED",
+            "research_mode": "RECORDED_BOOK_REPLAY",
+            "cutoff": cutoff_value,
+            "row_count": len(rows),
+            "snapshot_manifest": manifest,
+            "provenance_preserved": True,
+        }
+
+    publish_forward_replay = publish_polymarket_forward_replay
+    create_forward_replay_dataset = publish_polymarket_forward_replay
+
 
     def bootstrap(self, *, crypto: bool = False, polymarket: bool = False, all_sources: bool = False, resume: bool = False, full_15m: bool = False, max_markets: int = 1000) -> dict[str, Any]:
         selected_crypto = bool(crypto or all_sources or not (crypto or polymarket or all_sources))
@@ -1723,6 +2567,7 @@ def _normalize_prediction_history(market: PredictionMarketSnapshot, values: Any)
     if not isinstance(values, Sequence) or isinstance(values, (str, bytes, Mapping)):
         return []
     token_default = market.yes_token_id or market.market_id
+    expected_yes = str(token_default).strip()
     by_key: dict[tuple[datetime, str], dict[str, Any]] = {}
     for value in values:
         if not isinstance(value, Mapping):
@@ -1735,7 +2580,11 @@ def _normalize_prediction_history(market: PredictionMarketSnapshot, values: Any)
             continue
         if stamp is None or not math.isfinite(price) or not 0.0 <= price <= 1.0:
             continue
-        token = str(value.get("token_id", value.get("asset_id", token_default)) or token_default)
+        token = str(value.get("token_id", value.get("asset_id", token_default)) or token_default).strip()
+        # ``price_history`` is requested for YES.  A NO or unrelated asset
+        # must never be silently relabeled as the YES price path.
+        if expected_yes and token != expected_yes:
+            continue
         item = {"timestamp": stamp, "price": price, "token_id": token}
         if value.get("order_book") is not None or value.get("book") is not None:
             item["order_book"] = value.get("order_book", value.get("book"))
@@ -2074,6 +2923,7 @@ __all__ = [
     "BootstrapReport",
     "HistoricalBootstrapper",
     "POLYMARKET_DATASET_ID",
+    "POLYMARKET_HISTORICAL_JOB_NAME",
     "classify_market_category",
     "label_btc_regimes",
     "run_btc_historical_research",

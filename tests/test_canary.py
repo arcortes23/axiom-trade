@@ -2509,6 +2509,40 @@ class CanaryTests(unittest.TestCase):
         self.arm(limits=CanaryLimits(max_exposure_usd=Decimal("1"))); self.store.connection.execute("INSERT INTO canary_ledger(event_id,signal_id,timestamp,candidate_id,venue,market_id,token_id,side,requested_notional,paper_expected_price,max_price,status,evidence_json) VALUES('e','old',?,?,?,?,?,?,?,?,?,'OPEN','{}')",(T0.isoformat(),"C123","polymarket","m0","t","BUY","1",".5",".5")); self.store.connection.commit(); self.assertBlocked("EXPOSURE_LIMIT",self.submit)
     def test_max_order_count_prevents_submission(self):
         self.arm(limits=CanaryLimits(max_orders_per_day=1)); self.submit("first"); self.assertBlocked("DAILY_ORDER_LIMIT",lambda:self.submit("second"))
+    def test_daily_submission_budget_accepts_active_five_and_twenty(self):
+        initial = self.service.settings.snapshot(now=T0)
+        initial_effective = initial["effective_limits"]
+        self.assertEqual(initial_effective["max_orders_per_day"], 5)
+        self.assertEqual(initial_effective["max_submitted_orders_per_day"], 5)
+
+        before = self.service.settings.snapshot(now=T0)
+        draft = self.service.settings.save_draft(
+            {"max_submitted_orders_per_day": 20},
+            "synthetic-budget-acceptance",
+        )
+        activated = self.service.settings.activate_draft(
+            draft["config_id"],
+            "synthetic-budget-acceptance",
+            expected_generation=int(before["generation"]),
+        )
+        self.assertEqual(activated["generation"], int(before["generation"]) + 1)
+        updated = self.service.settings.snapshot(now=T0)
+        updated_effective = updated["effective_limits"]
+        self.assertEqual(updated_effective["max_orders_per_day"], 20)
+        self.assertEqual(updated_effective["max_submitted_orders_per_day"], 20)
+        config_id, generation = self.service._settings_binding()
+        armed = self.service.arm(
+            "C123",
+            venue=self.venue,
+            credentials_configured=True,
+            config_id=config_id,
+            expected_generation=generation,
+        )
+        self.assertEqual(armed["limits"]["max_orders_per_day"], 20)
+        self.assertEqual(
+            self.service.authoritative_status()["limits"]["max_orders_per_day"],
+            updated_effective["max_orders_per_day"],
+        )
     def test_daily_order_count_excludes_prior_days(self):
         yesterday = (T0 - timedelta(days=1)).isoformat()
         self.store.connection.execute(

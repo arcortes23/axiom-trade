@@ -437,6 +437,36 @@ def _normalize_exit_contract(
     policy.pop("observations", None)
     return policy, raw_period
 
+def _normalize_observation_horizon(
+    value: Mapping[str, Any] | int | None,
+    holding_period: int,
+) -> tuple[dict[str, Any], int]:
+    """Normalize a fixed per-market observation-count horizon.
+
+    Research plans intentionally do not mix elapsed-time and bar semantics:
+    the same count is used by signal evaluation and by the exit scheduler.
+    """
+    if value is None:
+        count = holding_period
+        unit = "observations"
+    elif isinstance(value, Mapping):
+        unit = str(value.get("unit", "observations")).strip().lower()
+        count = value.get("count", value.get("observations", value.get("bars")))
+    else:
+        unit = "observations"
+        count = value
+    if unit not in {"observation", "observations", "bar", "bars"}:
+        raise ValueError("observation_horizon.unit must be observations")
+    if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+        raise ValueError("observation_horizon.count must be a positive integer")
+    if holding_period != 1 and int(holding_period) != int(count):
+        raise ValueError("holding_period and observation_horizon.count disagree")
+    return {
+        "unit": "observations",
+        "count": int(count),
+        "semantics": "per_market_observation_count",
+    }, int(count)
+
 
 
 
@@ -471,6 +501,7 @@ class PredictionMarketBacktester:
         model_document: Any | None = None,
         mode: PredictionResearchMode | None = None,
         holding_period: int = 1,
+        observation_horizon: Mapping[str, Any] | int | None = None,
         exit_policy: str | Mapping[str, Any] = "fixed_holding_period",
     ) -> BacktestResult:
         """Run the shared evaluator/portfolio loop.
@@ -524,6 +555,10 @@ class PredictionMarketBacktester:
                             raise ValueError(
                                 f"exit_policy assumptions.{name} does not match execution costs"
                             )
+        horizon_document, holding_period = _normalize_observation_horizon(
+            observation_horizon,
+            holding_period,
+        )
         normalized_rows = [_normalize_row(row) for row in snapshots]
         if mode is not None:
             _validate_temporal_rows(normalized_rows)
@@ -899,6 +934,7 @@ class PredictionMarketBacktester:
                     if mode is not None
                     else None,
                     "holding_period": holding_period if mode is not None else None,
+                    "observation_horizon": dict(horizon_document) if mode is not None else None,
                     "price_path_status": _proxy_lifecycle_label(snapshot)
                     if mode is PredictionResearchMode.PRICE_PROXY_RESEARCH
                     else None,
@@ -984,6 +1020,7 @@ class PredictionMarketBacktester:
         mode: PredictionResearchMode | str | None = None,
         research_mode: PredictionResearchMode | str | None = None,
         holding_period: int = 1,
+        observation_horizon: Mapping[str, Any] | int | None = None,
         exit_policy: str | Mapping[str, Any] = "fixed_holding_period",
     ) -> BacktestResult:
         """Evaluate using one explicit evidence mode and the canonical evaluator."""
@@ -1000,6 +1037,7 @@ class PredictionMarketBacktester:
             model_document=model_document,
             mode=resolved_mode,
             holding_period=holding_period,
+            observation_horizon=observation_horizon,
             exit_policy=exit_policy,
         )
 
@@ -1025,6 +1063,7 @@ def run_prediction_research_mode(
     model: Any | None = None,
     model_document: Any | None = None,
     holding_period: int = 1,
+    observation_horizon: Mapping[str, Any] | int | None = None,
     exit_policy: str | Mapping[str, Any] = "fixed_holding_period",
 ) -> BacktestResult:
     """Stable orchestration entry point used by autonomous research."""
@@ -1042,7 +1081,7 @@ def run_prediction_research_mode(
         resolutions=resolutions,
         model=model,
         model_document=model_document,
-        holding_period=holding_period,
+        observation_horizon=observation_horizon,
         exit_policy=exit_policy,
     )
 __all__ = [

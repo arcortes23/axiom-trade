@@ -8,6 +8,7 @@ from axiom.backtest.prediction import (
     RECORDED_BOOK_REPLAY,
     PredictionMarketBacktester,
     PredictionResearchMode,
+    run_prediction_research_mode,
 )
 from axiom.domain import ResearchQuality
 from axiom.strategy.signals import (
@@ -196,6 +197,36 @@ class PolymarketResearchModeTests(unittest.TestCase):
         )
         self.assertEqual(result.equity_curve[0]["exit_policy"], policy)
         self.assertEqual(result.equity_curve[0]["holding_period"], 2)
+
+    def test_research_mode_honors_forwarded_model_document(self) -> None:
+        strategy = {
+            "version": 1,
+            "strategy_id": "model-document-forwarding",
+            "market_type": "prediction",
+            "family": "probability_mispricing",
+            "parameters": {"threshold": 0.10},
+            "probability_model": "deterministic-test-v1",
+            "resolution_aware": True,
+            "resolution_inputs": ["expiry", "settlement"],
+        }
+        rows = [_row(0, 0.40), _row(1, 0.40), _row(2, 0.40)]
+        baseline = run_prediction_research_mode(
+            rows,
+            strategy,
+            mode=PRICE_PROXY_RESEARCH,
+        )
+        modeled = run_prediction_research_mode(
+            rows,
+            strategy,
+            mode=PRICE_PROXY_RESEARCH,
+            model_document={"probability": 0.80},
+        )
+        self.assertFalse(baseline.fills)
+        self.assertTrue(modeled.fills)
+        self.assertEqual(
+            modeled.equity_curve[0]["evaluation_evidence"]["model"]["probability"],
+            0.80,
+        )
 
     def test_prediction_momentum_is_directional_not_probability_calibration(self) -> None:
         signal = evaluate_signal_evaluation(

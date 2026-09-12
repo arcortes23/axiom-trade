@@ -158,6 +158,25 @@ def trade_token(trade: Any) -> str | None:
     value = mapping_value(trade, "token_id", "tokenId", "asset_id", "assetId", "asset")
     text = str(value or "").strip()
     return text or None
+def trade_market(trade: Any) -> str | None:
+    value = mapping_value(trade, "market_id", "market", "condition_id", "conditionId")
+    text = str(value or "").strip()
+    return text or None
+
+
+def _required_identity(value: Any, reason: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        raise CanaryBlocked(reason)
+    return text
+
+
+def _canonical_order_identity(value: Any, reason: str) -> str:
+    canonical = _canonical_exchange_order_id(value)
+    if canonical is None:
+        raise CanaryBlocked(reason)
+    return canonical
+
 
 
 def trade_side(trade: Any) -> str:
@@ -207,18 +226,18 @@ _MAX_ENTRY_RECONCILIATION = 100
 _MAX_ACTIVE_ENTRY_RECONCILIATION = 80
 
 _PENDING = frozenset({
-    "PREPARED", "SUBMITTING", "SUBMITTED", "ACKNOWLEDGED", "OPEN", "UNKNOWN",
-    "MATCHED", "FILLED", "PARTIAL", "PARTIALLY_FILLED", "EXIT_REQUESTED",
-    "RECONCILE_PENDING",
+    "PREPARED", "SUBMITTING", "SUBMITTED", "ACCEPTED", "ACKNOWLEDGED",
+    "OPEN", "LIVE", "DELAYED", "UNKNOWN", "MATCHED", "FILLED", "PARTIAL",
+    "PARTIALLY_FILLED", "EXIT_REQUESTED", "RECONCILE_PENDING",
 })
 _TERMINAL = frozenset({
     "CANCELED", "CANCELLED", "EXPIRED", "REJECTED", "FAILED", "ERROR",
-    "SETTLED", "FINAL", "CLOSED", "COMPLETED",
+    "SETTLED", "SETTLED_PARTIAL", "FINAL", "CLOSED", "COMPLETED",
 })
 # A venue order being matched/filled proves execution, not settlement.  Only
 # explicit settlement/resolution states may release the risk reservation.
 _FINAL_SETTLEMENT = frozenset({
-    "SETTLED", "FINAL", "CLOSED", "COMPLETED", "RESOLVED",
+    "SETTLED", "SETTLED_PARTIAL", "FINAL", "CLOSED", "COMPLETED", "RESOLVED",
 })
 _OWNED_ENTRY_STATUSES = frozenset({
     "CONFIRMED",
@@ -244,8 +263,23 @@ _ACCEPTED_ORDER_STATUSES = frozenset({
     "DELAYED",
     "ACKNOWLEDGED",
     "SETTLED",
+    "SETTLED_PARTIAL",
     "RESOLVED",
 })
+_ORDER_PENDING_STATUSES = frozenset({
+    "ACCEPTED",
+    "SUBMITTED",
+    "SUBMITTING",
+    "ACKNOWLEDGED",
+    "OPEN",
+    "MATCHED",
+    "FILLED",
+    "PARTIAL",
+    "PARTIALLY_FILLED",
+    "CONFIRMED",
+    "TRADE_STATUS_CONFIRMED",
+})
+_KNOWN_ORDER_STATUSES = _ACCEPTED_ORDER_STATUSES | _TERMINAL | {"UNKNOWN"}
 _UNKNOWN_RESPONSE_CODES = frozenset({
     "",
     "UNKNOWN",
@@ -488,6 +522,14 @@ def _ensure_schema(service: CanaryService) -> None:
             "VALUES(1,'','','','',?)",
             (_iso(utc_now()),),
         )
+        allowed_request_statuses = tuple(sorted(_PENDING | _TERMINAL))
+        connection.execute(
+            "UPDATE canary_position_requests SET status='UNKNOWN' "
+            "WHERE UPPER(COALESCE(status,'')) NOT IN ("
+            + ",".join("?" for _ in allowed_request_statuses)
+            + ")",
+            allowed_request_statuses,
+        )
 
 def _settings_fence(service: CanaryService, expected_generation: Any, config_id: Any) -> dict[str, Any]:
     if isinstance(expected_generation, bool):
@@ -718,17 +760,29 @@ def _mark_owned_equity(
 
 
 def _parse_trades(payload: Any) -> list[Mapping[str, Any]]:
+    rows: Any = None
     if isinstance(payload, Mapping):
         for key in ("trades", "fills", "data", "items"):
-            rows = payload.get(key)
-            if isinstance(rows, Sequence) and not isinstance(rows, (str, bytes)):
-                return [row for row in rows if isinstance(row, Mapping)]
-        if any(key in payload for key in ("trade_id", "tradeId", "fill_id", "id")):
-            return [payload]
-        return []
-    if isinstance(payload, Sequence) and not isinstance(payload, (str, bytes)):
-        return [row for row in payload if isinstance(row, Mapping)]
-    return []
+            if key not in payload:
+                continue
+            candidate = payload[key]
+            if not isinstance(candidate, Sequence) or isinstance(
+                candidate, (str, bytes)
+            ):
+                raise CanaryBlocked("CANARY_TRADE_RESPONSE_INVALID")
+            rows = candidate
+            break
+        if rows is None:
+            if any(key in payload for key in ("trade_id", "tradeId", "fill_id", "id")):
+                return [payload]
+            raise CanaryBlocked("CANARY_TRADE_RESPONSE_INVALID")
+    elif isinstance(payload, Sequence) and not isinstance(payload, (str, bytes)):
+        rows = payload
+    else:
+        raise CanaryBlocked("CANARY_TRADE_RESPONSE_INVALID")
+    if any(not isinstance(row, Mapping) for row in rows):
+        raise CanaryBlocked("CANARY_TRADE_RESPONSE_INVALID")
+    return [row for row in rows if isinstance(row, Mapping)]
 def _trade_id(trade: Mapping[str, Any], order_id: str, index: int) -> str:
     value = _value(trade, "trade_id", "tradeId", "fill_id", "id", default=None)
     if value in (None, ""):
@@ -799,17 +853,28 @@ def _trade_fee(trade: Mapping[str, Any], order: Mapping[str, Any]) -> Decimal:
     # when quantity, price, and the explicit rate are all available.
     return quantity * price * parsed_rate / Decimal("10000")
 
-
 def _order_status(order: Mapping[str, Any]) -> str:
-    status = str(_value(order, "status", "state", "order_status", default="UNKNOWN") or "UNKNOWN").upper()
+    """Normalize venue order states to the bounded reconciliation vocabulary."""
+    raw_status = _value(order, "status", "state", "order_status", default=None)
+    status = str(raw_status or "UNKNOWN").strip().upper() or "UNKNOWN"
     if status in {"MATCHED", "MATCH", "EXECUTED"}:
         # MATCHED is execution evidence, not authoritative settlement.
         return "MATCHED"
     if status in {"PARTIAL", "PARTIALLY_FILLED", "PARTIALLYFILLED"}:
         return "PARTIALLY_FILLED"
-    if status in {"RESOLVED", "SETTLED_FULL", "SETTLED_PARTIAL"}:
+    if status in {"RESOLVED", "SETTLED_FULL"}:
         return "SETTLED"
-    return status
+    if status == "SETTLED_PARTIAL":
+        return "SETTLED_PARTIAL"
+    if status in _FAILED_ORDER or status in _CANCELED_ORDER:
+        return status
+    if status in _FINAL_SETTLEMENT:
+        return status
+    # Venue-specific LIVE/DELAYED/PROCESSING values and any unrecognized
+    # response are pollable uncertainty, not durable state names.
+    if status in _ORDER_PENDING_STATUSES:
+        return status
+    return "UNKNOWN"
 
 
 
@@ -837,6 +902,187 @@ def _authoritative_settlement(order: Mapping[str, Any], status: str) -> str | No
     return None
 
 
+def _identity_alias(
+    source: Any,
+    names: Sequence[str],
+    *,
+    missing: str,
+    conflict: str,
+) -> str:
+    values: list[str] = []
+    for name in names:
+        raw = mapping_value(source, name)
+        text = str(raw or "").strip()
+        if text:
+            values.append(text)
+    if not values:
+        raise CanaryBlocked(missing)
+    if len(set(values)) != 1:
+        raise CanaryBlocked(conflict)
+    return values[0]
+
+
+def _validate_venue_identity(
+    *,
+    order: Mapping[str, Any],
+    trades: Sequence[Mapping[str, Any]],
+    expected_order_id: Any,
+    expected_side: Any,
+    expected_market_id: Any,
+    expected_token_id: Any,
+    expected_quantity: Any,
+    lot: Mapping[str, Any] | None = None,
+    prior_request_quantity: Any = ZERO,
+) -> tuple[str, Decimal]:
+    """Require an exact persisted order/request identity before any writes."""
+    expected_order = _canonical_order_identity(
+        expected_order_id,
+        "CANARY_ORDER_IDENTITY_UNAVAILABLE",
+    )
+    side = _identity_alias(
+        {"side": expected_side},
+        ("side",),
+        missing="CANARY_ORDER_IDENTITY_UNAVAILABLE",
+        conflict="CANARY_ORDER_IDENTITY_CONFLICT",
+    ).upper()
+    market = _identity_alias(
+        {"market_id": expected_market_id},
+        ("market_id",),
+        missing="CANARY_ORDER_IDENTITY_UNAVAILABLE",
+        conflict="CANARY_ORDER_IDENTITY_CONFLICT",
+    )
+    token = _identity_alias(
+        {"token_id": expected_token_id},
+        ("token_id",),
+        missing="CANARY_ORDER_IDENTITY_UNAVAILABLE",
+        conflict="CANARY_ORDER_IDENTITY_CONFLICT",
+    )
+    try:
+        requested = decimal_value(
+            expected_quantity,
+            "requested quantity",
+            positive=True,
+        )
+    except ValueError:
+        raise CanaryBlocked("CANARY_ORDER_QUANTITY_UNAVAILABLE") from None
+    if side not in {"BUY", "SELL"}:
+        raise CanaryBlocked("CANARY_ORDER_IDENTITY_UNAVAILABLE")
+    if lot is not None:
+        lot_market = _required_identity(
+            lot.get("market_id"),
+            "CANARY_POSITION_IDENTITY_UNAVAILABLE",
+        )
+        lot_token = _required_identity(
+            lot.get("token_id"),
+            "CANARY_POSITION_IDENTITY_UNAVAILABLE",
+        )
+        if lot_market != market or lot_token != token:
+            raise CanaryBlocked("CANARY_POSITION_IDENTITY_CONFLICT")
+        prior_filled = _decimal(prior_request_quantity, Decimal("-1"))
+        if prior_filled < ZERO or prior_filled > requested + DUST:
+            raise CanaryBlocked("CANARY_ORDER_QUANTITY_CONFLICT")
+        available = max(
+            ZERO,
+            _decimal(lot.get("quantity"), ZERO)
+            - _decimal(lot.get("sold_quantity"), ZERO)
+            + prior_filled,
+        )
+        if requested > available + DUST:
+            raise CanaryBlocked("CANARY_ORDER_QUANTITY_OVER_POSITION")
+
+    observed_order = _canonical_order_identity(
+        _identity_alias(
+            order,
+            ("order_id", "orderId", "id", "exchange_order_id"),
+            missing="CANARY_ORDER_IDENTITY_UNAVAILABLE",
+            conflict="CANARY_ORDER_IDENTITY_CONFLICT",
+        ),
+        "CANARY_ORDER_IDENTITY_UNAVAILABLE",
+    )
+    if observed_order != expected_order:
+        raise CanaryBlocked("CANARY_ORDER_IDENTITY_CONFLICT")
+    observed_side = _identity_alias(
+        order,
+        ("side", "order_side"),
+        missing="CANARY_ORDER_IDENTITY_UNAVAILABLE",
+        conflict="CANARY_ORDER_IDENTITY_CONFLICT",
+    ).upper()
+    observed_token = _identity_alias(
+        order,
+        ("token_id", "tokenId", "asset_id", "assetId", "asset"),
+        missing="CANARY_ORDER_IDENTITY_UNAVAILABLE",
+        conflict="CANARY_ORDER_IDENTITY_CONFLICT",
+    )
+    observed_market = _identity_alias(
+        order,
+        ("market_id", "market", "condition_id", "conditionId"),
+        missing="CANARY_ORDER_IDENTITY_UNAVAILABLE",
+        conflict="CANARY_ORDER_IDENTITY_CONFLICT",
+    )
+    if (
+        observed_side != side
+        or observed_token != token
+        or observed_market != market
+    ):
+        raise CanaryBlocked("CANARY_ORDER_IDENTITY_CONFLICT")
+    try:
+        order_quantity = response_quantity(order)
+    except ValueError:
+        raise CanaryBlocked("CANARY_ORDER_QUANTITY_UNAVAILABLE") from None
+    if abs(order_quantity - requested) > DUST:
+        raise CanaryBlocked("CANARY_ORDER_QUANTITY_CONFLICT")
+
+    aggregate_quantity = ZERO
+    for trade in trades:
+        trade_order = _canonical_order_identity(
+            _identity_alias(
+                trade,
+                (
+                    "order_id",
+                    "orderId",
+                    "taker_order_id",
+                    "takerOrderId",
+                    "exchange_order_id",
+                ),
+                missing="CANARY_TRADE_IDENTITY_UNAVAILABLE",
+                conflict="CANARY_TRADE_IDENTITY_CONFLICT",
+            ),
+            "CANARY_TRADE_IDENTITY_UNAVAILABLE",
+        )
+        if trade_order != expected_order:
+            raise CanaryBlocked("CANARY_TRADE_IDENTITY_CONFLICT")
+        observed_trade_side = _identity_alias(
+            trade,
+            ("side", "order_side"),
+            missing="CANARY_TRADE_IDENTITY_UNAVAILABLE",
+            conflict="CANARY_TRADE_IDENTITY_CONFLICT",
+        ).upper()
+        observed_trade_token = _identity_alias(
+            trade,
+            ("token_id", "tokenId", "asset_id", "assetId", "asset"),
+            missing="CANARY_TRADE_IDENTITY_UNAVAILABLE",
+            conflict="CANARY_TRADE_IDENTITY_CONFLICT",
+        )
+        observed_trade_market = _identity_alias(
+            trade,
+            ("market_id", "market", "condition_id", "conditionId"),
+            missing="CANARY_TRADE_IDENTITY_UNAVAILABLE",
+            conflict="CANARY_TRADE_IDENTITY_CONFLICT",
+        )
+        if (
+            observed_trade_side != side
+            or observed_trade_token != token
+            or observed_trade_market != market
+        ):
+            raise CanaryBlocked("CANARY_TRADE_IDENTITY_CONFLICT")
+        quantity = _trade_quantity(trade)
+        if quantity <= ZERO:
+            raise CanaryBlocked("CANARY_TRADE_QUANTITY_UNAVAILABLE")
+        aggregate_quantity += quantity
+        if aggregate_quantity > requested + DUST:
+            raise CanaryBlocked("CANARY_TRADE_QUANTITY_OVER_PLAN")
+    return expected_order, requested
+
 def _submission_fence(
     service: CanaryService,
     *,
@@ -856,6 +1102,83 @@ def _submission_fence(
         raise CanaryBlocked("CANARY_CONTROL_CORRUPT")
     if current != int(expected_control_generation):
         raise CanaryBlocked("CANARY_CONTROL_CHANGED")
+_REQUEST_NONDEGRADABLE = frozenset(
+    {
+        "FILLED",
+        "SETTLED",
+        "SETTLED_PARTIAL",
+        "CANCELED",
+        "CANCELLED",
+        "EXPIRED",
+        "REJECTED",
+        "FAILED",
+        "ERROR",
+    }
+)
+
+
+def _normalized_request_status(value: Any) -> str:
+    status = str(value or "").strip().upper()
+    return status if status in (_PENDING | _TERMINAL) else "UNKNOWN"
+
+
+def _monotonic_request_status(current: Any, proposed: Any) -> str:
+    """Apply only forward request transitions to a persisted request."""
+    prior = _normalized_request_status(current)
+    next_status = _normalized_request_status(proposed)
+    if prior == "SETTLED":
+        return prior
+    if prior == "SETTLED_PARTIAL":
+        return prior
+    if prior in {"CANCELED", "CANCELLED", "EXPIRED", "REJECTED", "FAILED", "ERROR"}:
+        return prior
+    if prior == "FILLED" and next_status not in {"SETTLED", "SETTLED_PARTIAL"}:
+        return prior
+    return next_status
+
+
+def _request_terminal(value: Any) -> bool:
+    return _normalized_request_status(value) in _REQUEST_NONDEGRADABLE
+
+
+def _mark_request_unknown(
+    service: CanaryService,
+    request_id: Any,
+    reason: Any,
+) -> str:
+    """Keep terminal requests intact while making failures retryable."""
+    identifier = str(request_id or "").strip()
+    if not identifier:
+        return "UNKNOWN"
+    error = str(reason or "UNKNOWN")
+    with service.store._lock, _connection(service):
+        row = _connection(service).execute(
+            "SELECT status FROM canary_position_requests WHERE request_id=?",
+            (identifier,),
+        ).fetchone()
+        if row is None:
+            return "UNKNOWN"
+        prior = _normalized_request_status(row["status"])
+        if not _request_terminal(prior):
+            _connection(service).execute(
+                "UPDATE canary_position_requests SET status='UNKNOWN',"
+                "last_error=?,updated_at=? WHERE request_id=?",
+                (error, _iso(ensure_utc(service.clock())), identifier),
+            )
+            return "UNKNOWN"
+        return prior
+
+
+def _request_snapshot_result(request: Mapping[str, Any], status: Any) -> dict[str, Any]:
+    return {
+        "request_id": str(request.get("request_id") or ""),
+        "position_id": str(request.get("position_id") or ""),
+        "status": _normalized_request_status(status),
+        "filled_quantity": str(request.get("filled_quantity") or "0"),
+        "new_fills": 0,
+        "order_id": str(request.get("order_id") or "") or None,
+    }
+
 
 
 def _request_rows(service: CanaryService, position_id: str | None = None) -> list[dict[str, Any]]:
@@ -1003,8 +1326,8 @@ def _reconcile_entry_ledger(service: CanaryService, venue: Any, now: datetime) -
     connection = _connection(service)
     active_statuses = (
         "(UPPER(status) IN "
-        "('ACCEPTED','SUBMITTED','SUBMITTING','UNKNOWN','PARTIAL',"
-        "'PARTIALLY_FILLED','MATCHED','FILLED','OPEN') "
+        "('ACCEPTED','SUBMITTED','SUBMITTING','ACKNOWLEDGED','LIVE','DELAYED',"
+        "'UNKNOWN','PARTIAL','PARTIALLY_FILLED','MATCHED','FILLED','OPEN') "
         "OR (UPPER(status) IN ('CONFIRMED','TRADE_STATUS_CONFIRMED',"
         "'SETTLED','TRADE_STATUS_SETTLED') "
         "AND COALESCE(settlement,'')='' "
@@ -1027,7 +1350,21 @@ def _reconcile_entry_ledger(service: CanaryService, venue: Any, now: datetime) -
         ") "
     )
     terminal_filter = "AND NOT (" + active_statuses + ") "
-    with service.store._lock:
+    with service.store._lock, connection:
+        known_entry_statuses = tuple(
+            sorted(_KNOWN_ORDER_STATUSES | _OWNED_ENTRY_STATUSES)
+        )
+        try:
+            connection.execute(
+                "UPDATE canary_ledger SET status='UNKNOWN' "
+                "WHERE UPPER(side)='BUY' AND exchange_order_id IS NOT NULL "
+                "AND UPPER(COALESCE(status,'')) NOT IN ("
+                + ",".join("?" for _ in known_entry_statuses)
+                + ")",
+                known_entry_statuses,
+            )
+        except sqlite3.OperationalError:
+            pass
         try:
             cursor = connection.execute(
                 "SELECT active_timestamp,active_event_id,"
@@ -1196,6 +1533,15 @@ def _reconcile_entry_ledger(service: CanaryService, venue: Any, now: datetime) -
                     market=str(row.get("market_id") or "") or None,
                 )
             )
+            _validate_venue_identity(
+                order=order,
+                trades=raw_trades,
+                expected_order_id=order_id,
+                expected_side=row.get("side"),
+                expected_market_id=row.get("market_id"),
+                expected_token_id=row.get("token_id"),
+                expected_quantity=row.get("submitted_quantity"),
+            )
             failed_trade = any(
                 str(_value(trade, "status", "state", default="")).upper()
                 in {"FAILED", "TRADE_STATUS_FAILED"}
@@ -1286,10 +1632,11 @@ def _reconcile_entry_ledger(service: CanaryService, venue: Any, now: datetime) -
             if validated_trades and not callable(risk_fill):
                 raise CanaryBlocked("CANARY_RISK_FILL_UNAVAILABLE")
             risk_reservation_id = event_id
+            reservation_status = ""
             with service.store._lock:
                 try:
                     reservation_row = connection.execute(
-                        "SELECT reservation_id FROM canary_risk_reservations "
+                        "SELECT reservation_id,status FROM canary_risk_reservations "
                         "WHERE event_id=? AND UPPER(side)='BUY' "
                         "ORDER BY created_at DESC,reservation_id DESC LIMIT 1",
                         (event_id,),
@@ -1298,6 +1645,7 @@ def _reconcile_entry_ledger(service: CanaryService, venue: Any, now: datetime) -
                     reservation_row = None
             if reservation_row is not None:
                 risk_reservation_id = str(reservation_row["reservation_id"])
+                reservation_status = str(reservation_row["status"] or "").strip().upper()
             else:
                 adopt = getattr(service.store, "adopt_canary_legacy_reservation", None)
                 if not callable(adopt):
@@ -1331,6 +1679,7 @@ def _reconcile_entry_ledger(service: CanaryService, venue: Any, now: datetime) -
                     candidate_id=str(row.get("candidate_id") or "legacy"),
                 )
                 risk_reservation_id = str(adoption.get("reservation_id") or event_id)
+                reservation_status = str(adoption.get("status") or "").strip().upper()
             with service.store._lock:
                 try:
                     existing_fills = connection.execute(
@@ -1411,6 +1760,9 @@ def _reconcile_entry_ledger(service: CanaryService, venue: Any, now: datetime) -
                     filled_at=matched_at,
                     detail={
                         "event_id": event_id,
+                        "order_id": order_id,
+                        "market_id": str(row.get("market_id") or ""),
+                        "token_id": execution_asset_id,
                         "side": "BUY",
                         "settlement_status": "CONFIRMED",
                         "order_status": status,
@@ -1523,7 +1875,12 @@ def _reconcile_entry_ledger(service: CanaryService, venue: Any, now: datetime) -
             average = cost / quantity if quantity > ZERO else None
             with service.store._lock, connection:
                 connection.execute(
-                    "UPDATE canary_ledger SET status=?,fill_quantity=?,actual_average_price=?,fees=?,exchange_order_id=?,settlement=? WHERE event_id=?",
+                    "UPDATE canary_ledger SET status=?,fill_quantity=?,actual_average_price=?,fees=?,exchange_order_id=?,settlement=? "
+                    "WHERE event_id=? AND ("
+                    "NOT (UPPER(status) IN "
+                    "('SETTLED','FINAL','CLOSED','COMPLETED') OR UPPER(COALESCE(settlement,''))='TERMINAL') "
+                    "OR (UPPER(?)='RELEASED' AND CAST(COALESCE(fill_quantity,'0') AS NUMERIC) < CAST(? AS NUMERIC))"
+                    ")",
                     (
                         ledger_status,
                         str(quantity),
@@ -1532,16 +1889,28 @@ def _reconcile_entry_ledger(service: CanaryService, venue: Any, now: datetime) -
                         order_id,
                         settlement_marker,
                         event_id,
+                        reservation_status,
+                        str(quantity),
                     ),
                 )
             results.append({"event_id": event_id, "status": ledger_status, "fill_quantity": str(quantity)})
         except CanaryBlocked as exc:
             with service.store._lock, connection:
-                connection.execute("UPDATE canary_ledger SET status='UNKNOWN' WHERE event_id=?", (event_id,))
+                connection.execute(
+                    "UPDATE canary_ledger SET status='UNKNOWN' WHERE event_id=? "
+                    "AND NOT (UPPER(status) IN ('SETTLED','FINAL','CLOSED','COMPLETED') "
+                    "OR UPPER(COALESCE(settlement,''))='TERMINAL')",
+                    (event_id,),
+                )
             results.append({"event_id": event_id, "status": "UNKNOWN", "reason": str(exc)})
         except Exception as exc:
             with service.store._lock, connection:
-                connection.execute("UPDATE canary_ledger SET status='UNKNOWN' WHERE event_id=?", (event_id,))
+                connection.execute(
+                    "UPDATE canary_ledger SET status='UNKNOWN' WHERE event_id=? "
+                    "AND NOT (UPPER(status) IN ('SETTLED','FINAL','CLOSED','COMPLETED') "
+                    "OR UPPER(COALESCE(settlement,''))='TERMINAL')",
+                    (event_id,),
+                )
             results.append({"event_id": event_id, "status": "UNKNOWN", "reason": type(exc).__name__})
     if active_cursor_candidate is not None or terminal_cursor_candidate is not None:
         active_cursor = active_cursor_candidate or (
@@ -1805,7 +2174,10 @@ def submit_exit(service: CanaryService, position_id: str, venue: Any, *, expecte
     def persist_submission_failure(status: str, error: str) -> None:
         with service.store._lock, _connection(service):
             _connection(service).execute(
-                "UPDATE canary_position_requests SET status=?,last_error=?,updated_at=? WHERE request_id=?",
+                "UPDATE canary_position_requests SET status=?,last_error=?,updated_at=? "
+                "WHERE request_id=? AND UPPER(COALESCE(status,'')) NOT IN "
+                "('SETTLED','SETTLED_PARTIAL','FINAL','CLOSED','COMPLETED',"
+                "'CANCELED','CANCELLED','EXPIRED','REJECTED','FAILED','ERROR','FILLED')",
                 (status, error, _iso(ensure_utc(service.clock())), request_id),
             )
             if status == "REJECTED":
@@ -1817,15 +2189,16 @@ def submit_exit(service: CanaryService, position_id: str, venue: Any, *, expecte
                         position_key,
                     ),
                 )
-            else:
-                _connection(service).execute(
-                    "UPDATE canary_risk_reservations SET status='UNKNOWN',released_at=NULL,updated_at=? WHERE reservation_id=?",
-                    (_iso(ensure_utc(service.clock())), reservation_id),
-                )
         if status == "REJECTED":
             release(
                 reservation_id,
                 status="RELEASED",
+                timestamp=ensure_utc(service.clock()),
+            )
+        else:
+            release(
+                reservation_id,
+                status="UNKNOWN",
                 timestamp=ensure_utc(service.clock()),
             )
 
@@ -1934,41 +2307,82 @@ def submit_exit(service: CanaryService, position_id: str, venue: Any, *, expecte
         response_error = "CANARY_SUBMISSION_RESPONSE_INVALID"
     with service.store._lock, _connection(service):
         _connection(service).execute(
-            "UPDATE canary_position_requests SET order_id=?,status=?,last_error=?,updated_at=? WHERE request_id=?",
+            "UPDATE canary_position_requests SET order_id=?,status=?,last_error=?,updated_at=? "
+            "WHERE request_id=? AND UPPER(COALESCE(status,'')) NOT IN "
+            "('SETTLED','SETTLED_PARTIAL','FINAL','CLOSED','COMPLETED',"
+            "'CANCELED','CANCELLED','EXPIRED','REJECTED','FAILED','ERROR','FILLED')",
             (order_id, status, response_error, _iso(ensure_utc(service.clock())), request_id),
         )
         if status == "REJECTED":
             _connection(service).execute(
-                "UPDATE canary_position_lots SET status='OPEN',pending_exit_quantity=?,updated_at=? WHERE position_id=?",
+                "UPDATE canary_position_lots SET status='OPEN',pending_exit_quantity=?,updated_at=? WHERE position_id=? "
+                "AND UPPER(COALESCE(status,'')) NOT IN ('CLOSED','DUST')",
                 (str(expected_pending), _iso(ensure_utc(service.clock())), position_key),
             )
-        else:
-            reservation_status = "UNKNOWN" if status == "UNKNOWN" else "OPEN"
-            # Persist the acknowledgement stage with the request.  This
-            # transaction closes the crash window between an acknowledged
-            # order and its reservation projection.
-            _connection(service).execute(
-                "UPDATE canary_risk_reservations SET status=?,released_at=NULL,updated_at=? WHERE reservation_id=?",
-                (reservation_status, _iso(ensure_utc(service.clock())), reservation_id),
-            )
-    if status == "REJECTED":
-        release(reservation_id, status="RELEASED", timestamp=ensure_utc(service.clock()))
+    reservation_status = "RELEASED" if status == "REJECTED" else (
+        "UNKNOWN" if status == "UNKNOWN" else "OPEN"
+    )
+    release(
+        reservation_id,
+        status=reservation_status,
+        timestamp=ensure_utc(service.clock()),
+    )
     return {"request_id": request_id, "position_id": position_key, "reservation_id": reservation_id, "order_id": order_id, "status": status, "quantity": str(quantity), "price": str(price)}
 
 
 def _apply_reconciled_request(service: CanaryService, request: Mapping[str, Any], order: Mapping[str, Any], trades: Sequence[Mapping[str, Any]], now: datetime) -> dict[str, Any]:
     connection = _connection(service)
-    request_id = str(request.get("request_id") or "")
-    position_id = str(request.get("position_id") or "")
-    order_id = str(request.get("order_id") or _value(order, "order_id", "orderId", "id", default="") or "")
-    order_status = _order_status(order)
+    request_id = str(request.get("request_id") or "").strip()
+    position_id = str(request.get("position_id") or "").strip()
+    order_id = str(request.get("order_id") or "").strip()
     with service.store._lock:
-        lot_context = connection.execute(
-            "SELECT quantity,cost_basis FROM canary_position_lots WHERE position_id=?",
+        current_request_row = connection.execute(
+            "SELECT * FROM canary_position_requests WHERE request_id=?",
+            (request_id,),
+        ).fetchone()
+        current_reservation_row = connection.execute(
+            "SELECT status FROM canary_risk_reservations WHERE reservation_id=?",
+            (str(request.get("reservation_id") or "").strip(),),
+        ).fetchone()
+        lot_row = connection.execute(
+            "SELECT * FROM canary_position_lots WHERE position_id=?",
             (position_id,),
         ).fetchone()
-    if lot_context is None:
+    current_request = (
+        dict(current_request_row) if current_request_row is not None else dict(request)
+    )
+    current_request_status = _normalized_request_status(
+        current_request.get("status")
+    )
+    # A request that already reached a terminal outcome must not be reopened
+    # by a stale reconciliation worker.  FILLED remains pollable for the
+    # explicit settlement transition, so it is deliberately handled below.
+    if current_request_status in _TERMINAL:
+        return _request_snapshot_result(current_request, current_request_status)
+    reservation_status = (
+        str(current_reservation_row["status"] or "").strip().upper()
+        if current_reservation_row is not None
+        else ""
+    )
+    # RELEASED is final for a reservation.  No late venue observation may
+    # mutate the sold quantity, P&L, or released accounting basis.
+    if reservation_status == "RELEASED":
+        return _request_snapshot_result(current_request, current_request_status)
+    if lot_row is None:
         raise CanaryBlocked("CANARY_POSITION_NOT_FOUND")
+    lot_context = dict(lot_row)
+    _validate_venue_identity(
+        order=order,
+        trades=trades,
+        expected_order_id=order_id,
+        expected_side=request.get("side"),
+        expected_market_id=request.get("market_id"),
+        expected_token_id=request.get("token_id"),
+        expected_quantity=current_request.get("requested_quantity"),
+        lot=lot_context,
+        prior_request_quantity=current_request.get("filled_quantity"),
+    )
+    order_status = _order_status(order)
     entry_quantity = _decimal(lot_context["quantity"], ZERO)
     entry_cost_basis = _decimal(lot_context["cost_basis"], ZERO)
     # Failed/provisional trade states are not sale evidence.  Only stable
@@ -2027,6 +2441,10 @@ def _apply_reconciled_request(service: CanaryService, request: Mapping[str, Any]
             (trade, fill_id, quantity, price, fee, matched_at)
         )
     existing_local: dict[str, tuple[Decimal, Decimal, Decimal, datetime]] = {}
+    reservation_id = str(request.get("reservation_id") or "").strip()
+    if not reservation_id:
+        raise CanaryBlocked("CANARY_RISK_RESERVATION_UNAVAILABLE")
+    release_reservation_id = reservation_id
     for (
         _trade,
         fill_id,
@@ -2037,12 +2455,23 @@ def _apply_reconciled_request(service: CanaryService, request: Mapping[str, Any]
     ) in validated_trades:
         with service.store._lock:
             prior = connection.execute(
-                "SELECT quantity,price,fee,filled_at "
+                "SELECT request_id,position_id,quantity,price,fee,filled_at "
                 "FROM canary_position_fills WHERE fill_id=?",
                 (fill_id,),
             ).fetchone()
+            global_fill = connection.execute(
+                "SELECT reservation_id FROM canary_risk_fills WHERE fill_id=?",
+                (fill_id,),
+            ).fetchone()
+        if global_fill is not None and str(global_fill["reservation_id"]) != reservation_id:
+            raise CanaryBlocked("CANARY_TRADE_ID_CONFLICT")
         if prior is None:
             continue
+        if (
+            str(prior["request_id"] or "") != request_id
+            or str(prior["position_id"] or "") != position_id
+        ):
+            raise CanaryBlocked("CANARY_TRADE_ID_CONFLICT")
         prior_time = parse_timestamp(prior["filled_at"])
         if prior_time is None:
             raise CanaryBlocked("CANARY_TRADE_TIME_UNAVAILABLE")
@@ -2057,50 +2486,61 @@ def _apply_reconciled_request(service: CanaryService, request: Mapping[str, Any]
         existing_local[fill_id] = prior_evidence
     order_settlement = _authoritative_settlement(order, order_status)
     inserted = 0
-    for (
-        trade,
-        fill_id,
-        quantity,
-        price,
-        fee,
-        matched_at,
-    ) in validated_trades:
-        if fill_id in existing_local:
-            continue
-        risk_fill = getattr(service.store, "record_canary_fill", None)
-        reservation_id = str(request.get("reservation_id") or "").strip()
-        if not callable(risk_fill) or not reservation_id:
-            raise CanaryBlocked("CANARY_RISK_FILL_UNAVAILABLE")
-        entry_cost = (
-            entry_cost_basis * quantity / entry_quantity
-            if entry_quantity > ZERO
-            else ZERO
-        )
-        net_proceeds = quantity * price - fee
-        realized_pnl = net_proceeds - entry_cost
-        risk_detail = {
-            "position_id": position_id,
-            "request_id": request_id,
-            "settlement_status": "CONFIRMED",
-            "entry_cost_usd": str(entry_cost),
-            "cost_basis_usd": str(entry_cost),
-            "proceeds_usd": str(net_proceeds),
-            "realized_pnl_usd": str(realized_pnl),
-            "exit_fee_usd": str(fee),
-        }
-        risk_fill(
-            fill_id=fill_id,
-            reservation_id=reservation_id,
-            quantity=quantity,
-            price=price,
-            cost=quantity * price + fee,
-            fee=fee,
-            filled_at=matched_at,
-            detail=risk_detail,
-        )
-        with service.store._lock, connection:
-            connection.execute(
-                "INSERT INTO canary_position_fills(fill_id,request_id,position_id,quantity,price,fee,status,filled_at,detail_json) VALUES(?,?,?,?,?,?,?,?,?)",
+    with service.store.transaction(immediate=True):
+        # Keep each canonical risk fill and its position projection in the
+        # same outer transaction.  ``record_canary_fill`` uses a nested
+        # savepoint when called here, so it cannot commit independently of
+        # the matching local fill insert.
+        for (
+            trade,
+            fill_id,
+            quantity,
+            price,
+            fee,
+            matched_at,
+        ) in validated_trades:
+            if fill_id in existing_local:
+                continue
+            risk_fill = getattr(service.store, "record_canary_fill", None)
+            if not callable(risk_fill):
+                raise CanaryBlocked("CANARY_RISK_FILL_UNAVAILABLE")
+            entry_cost = (
+                entry_cost_basis * quantity / entry_quantity
+                if entry_quantity > ZERO
+                else ZERO
+            )
+            net_proceeds = quantity * price - fee
+            realized_pnl = net_proceeds - entry_cost
+            risk_detail = {
+                "position_id": position_id,
+                "request_id": request_id,
+                "order_id": order_id,
+                "market_id": str(request.get("market_id") or ""),
+                "token_id": str(request.get("token_id") or ""),
+                "side": "SELL",
+                "requested_quantity": str(request.get("requested_quantity") or ""),
+                "settlement_status": "CONFIRMED",
+                "entry_cost_usd": str(entry_cost),
+                "cost_basis_usd": str(entry_cost),
+                "proceeds_usd": str(net_proceeds),
+                "realized_pnl_usd": str(realized_pnl),
+                "exit_fee_usd": str(fee),
+            }
+            risk_fill(
+                fill_id=fill_id,
+                reservation_id=reservation_id,
+                quantity=quantity,
+                price=price,
+                cost=quantity * price + fee,
+                fee=fee,
+                filled_at=matched_at,
+                detail=risk_detail,
+            )
+            inserted_row = connection.execute(
+                "INSERT INTO canary_position_fills("
+                "fill_id,request_id,position_id,quantity,price,fee,status,"
+                "filled_at,detail_json) VALUES(?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(fill_id) DO NOTHING",
                 (
                     fill_id,
                     request_id,
@@ -2113,162 +2553,429 @@ def _apply_reconciled_request(service: CanaryService, request: Mapping[str, Any]
                     _json(dict(trade)),
                 ),
             )
-            inserted += 1
-    with service.store._lock:
-        fill_rows = connection.execute(
-            "SELECT quantity,fee,price FROM canary_position_fills WHERE request_id=? ORDER BY filled_at,fill_id",
-            (request_id,),
-        ).fetchall()
-        existing_qty = sum((_decimal(row["quantity"], ZERO) for row in fill_rows), ZERO)
-        existing_fees = sum((_decimal(row["fee"], ZERO) for row in fill_rows), ZERO)
-        existing_cost = sum(
-            (_decimal(row["quantity"], ZERO) * _decimal(row["price"], ZERO) for row in fill_rows),
-            ZERO,
+            if int(inserted_row.rowcount or 0) == 1:
+                inserted += 1
+            else:
+                # Two reconcilers can both observe the fill before either
+                # inserts the canonical row.  The losing insert is
+                # idempotent only when its evidence is byte-for-byte equal.
+                prior = connection.execute(
+                    "SELECT request_id,position_id,quantity,price,fee,filled_at "
+                    "FROM canary_position_fills WHERE fill_id=?",
+                    (fill_id,),
+                ).fetchone()
+                if prior is None:
+                    raise CanaryBlocked("CANARY_TRADE_ID_CONFLICT")
+                prior_time = parse_timestamp(prior["filled_at"])
+                if prior_time is None or (
+                    str(prior["request_id"] or "") != request_id
+                    or str(prior["position_id"] or "") != position_id
+                    or _decimal(prior["quantity"], Decimal("-1")) != quantity
+                    or _decimal(prior["price"], Decimal("-1")) != price
+                    or _decimal(prior["fee"], Decimal("-1")) != fee
+                    or prior_time != matched_at
+                ):
+                    raise CanaryBlocked("CANARY_TRADE_ID_CONFLICT")
+    class _ReconciliationCASMiss(Exception):
+        pass
+
+    result: dict[str, Any] | None = None
+    terminal = False
+    settlement_status: str | None = None
+    status = "UNKNOWN"
+    for _attempt in range(2):
+        try:
+            with service.store._lock, connection:
+                current_request_row = connection.execute(
+                    "SELECT * FROM canary_position_requests WHERE request_id=?",
+                    (request_id,),
+                ).fetchone()
+                if current_request_row is None:
+                    raise CanaryBlocked("CANARY_REQUEST_NOT_FOUND")
+                current_request = dict(current_request_row)
+                current_request_status = _normalized_request_status(
+                    current_request.get("status")
+                )
+                # A stale replay must never reopen or re-account a request
+                # whose terminal state is already durable.
+                if current_request_status in _TERMINAL:
+                    return _request_snapshot_result(
+                        current_request,
+                        current_request_status,
+                    )
+                current_reservation_id = str(
+                    current_request.get("reservation_id") or reservation_id
+                ).strip()
+                reservation_row = connection.execute(
+                    "SELECT status FROM canary_risk_reservations "
+                    "WHERE reservation_id=?",
+                    (current_reservation_id,),
+                ).fetchone()
+                if (
+                    reservation_row is not None
+                    and str(reservation_row["status"] or "").strip().upper()
+                    in {
+                        "SETTLED",
+                        "CANCELED",
+                        "CANCELLED",
+                        "REJECTED",
+                        "RELEASED",
+                    }
+                ):
+                    release_reservation_id = current_reservation_id
+                    return _request_snapshot_result(
+                        current_request,
+                        current_request_status,
+                    )
+                lot_row = connection.execute(
+                    "SELECT * FROM canary_position_lots WHERE position_id=?",
+                    (position_id,),
+                ).fetchone()
+                if lot_row is None:
+                    raise CanaryBlocked("CANARY_POSITION_NOT_FOUND")
+                lot_context = dict(lot_row)
+                current_order_id = str(
+                    current_request.get("order_id") or order_id
+                ).strip()
+                _validate_venue_identity(
+                    order=order,
+                    trades=trades,
+                    expected_order_id=current_order_id,
+                    expected_side=current_request.get("side"),
+                    expected_market_id=current_request.get("market_id"),
+                    expected_token_id=current_request.get("token_id"),
+                    expected_quantity=current_request.get("requested_quantity"),
+                    lot=lot_context,
+                    prior_request_quantity=current_request.get("filled_quantity"),
+                )
+                request_status_before = str(
+                    current_request.get("status") or ""
+                ).strip().upper()
+                request_filled_before = current_request.get("filled_quantity")
+                request_average_before = current_request.get("average_price")
+                request_fees_before = current_request.get("fees")
+                request_settlement_before = current_request.get(
+                    "settlement_status"
+                )
+                lot_quantity_before = lot_row["quantity"]
+                lot_basis_before = lot_row["cost_basis"]
+                lot_sold_before = lot_row["sold_quantity"]
+                lot_pending_before = lot_row["pending_exit_quantity"]
+                lot_gross_before = lot_row["gross_proceeds"]
+                lot_exit_fees_before = lot_row["exit_fees"]
+                lot_pnl_before = lot_row["realized_pnl"]
+                lot_status_before = str(lot_row["status"] or "").strip().upper()
+                if lot_status_before in {"CLOSED", "DUST"}:
+                    raise CanaryBlocked("CANARY_POSITION_UNAVAILABLE")
+
+                fill_rows = connection.execute(
+                    "SELECT quantity,fee,price FROM canary_position_fills "
+                    "WHERE request_id=? ORDER BY filled_at,fill_id",
+                    (request_id,),
+                ).fetchall()
+                existing_qty = sum(
+                    (_decimal(row["quantity"], ZERO) for row in fill_rows),
+                    ZERO,
+                )
+                existing_fees = sum(
+                    (_decimal(row["fee"], ZERO) for row in fill_rows),
+                    ZERO,
+                )
+                existing_cost = sum(
+                    (
+                        _decimal(row["quantity"], ZERO)
+                        * _decimal(row["price"], ZERO)
+                        for row in fill_rows
+                    ),
+                    ZERO,
+                )
+                requested = _decimal(
+                    current_request.get("requested_quantity"),
+                    ZERO,
+                )
+                prior_request_qty = _decimal(
+                    request_filled_before,
+                    ZERO,
+                )
+                prior_request_avg = _decimal(
+                    request_average_before,
+                    ZERO,
+                )
+                prior_request_fees = _decimal(
+                    request_fees_before,
+                    ZERO,
+                )
+                # These are deliberately computed from the just-read request
+                # and lot rows, never from the pre-venue snapshot.
+                delta_qty = max(ZERO, existing_qty - prior_request_qty)
+                delta_gross = max(
+                    ZERO,
+                    existing_cost - (prior_request_qty * prior_request_avg),
+                )
+                delta_fees = max(ZERO, existing_fees - prior_request_fees)
+                prior_sold = _decimal(lot_sold_before, ZERO)
+                prior_pending = _decimal(lot_pending_before, ZERO)
+                prior_gross = _decimal(lot_gross_before, ZERO)
+                prior_exit_fees = _decimal(lot_exit_fees_before, ZERO)
+                prior_pnl = _decimal(lot_pnl_before, ZERO)
+                lot_quantity = _decimal(lot_quantity_before, ZERO)
+                lot_basis = _decimal(lot_basis_before, ZERO)
+                fill_over_plan = (
+                    existing_qty > requested + DUST
+                    or prior_sold + delta_qty > lot_quantity + DUST
+                )
+                average_price = (
+                    str(existing_cost / existing_qty)
+                    if existing_qty > ZERO
+                    else None
+                )
+
+                def update_request(
+                    *,
+                    next_status: str,
+                    next_settlement: str | None,
+                ) -> Any:
+                    return connection.execute(
+                        "UPDATE canary_position_requests SET order_id=?,"
+                        "filled_quantity=?,average_price=?,fees=?,status=?,"
+                        "settlement_status=?,updated_at=? WHERE request_id=? "
+                        "AND UPPER(COALESCE(status,''))=? "
+                        "AND filled_quantity IS ? AND average_price IS ? "
+                        "AND fees IS ? AND settlement_status IS ?",
+                        (
+                            current_order_id or None,
+                            str(existing_qty),
+                            average_price,
+                            str(existing_fees),
+                            next_status,
+                            next_settlement,
+                            _iso(now),
+                            request_id,
+                            request_status_before,
+                            request_filled_before,
+                            request_average_before,
+                            request_fees_before,
+                            request_settlement_before,
+                        ),
+                    )
+
+                def update_lot(
+                    *,
+                    sold: Decimal,
+                    pending: Decimal,
+                    gross: Decimal,
+                    exit_fees: Decimal,
+                    pnl: Decimal,
+                    next_status: str,
+                ) -> Any:
+                    return connection.execute(
+                        "UPDATE canary_position_lots SET sold_quantity=?,"
+                        "pending_exit_quantity=?,gross_proceeds=?,"
+                        "exit_fees=?,realized_pnl=?,status=?,updated_at=? "
+                        "WHERE position_id=? AND quantity IS ? "
+                        "AND cost_basis IS ? AND sold_quantity IS ? "
+                        "AND pending_exit_quantity IS ? AND gross_proceeds IS ? "
+                        "AND exit_fees IS ? AND realized_pnl IS ? "
+                        "AND UPPER(COALESCE(status,''))=?",
+                        (
+                            str(sold),
+                            str(pending),
+                            str(gross),
+                            str(exit_fees),
+                            str(pnl),
+                            next_status,
+                            _iso(now),
+                            position_id,
+                            lot_quantity_before,
+                            lot_basis_before,
+                            lot_sold_before,
+                            lot_pending_before,
+                            lot_gross_before,
+                            lot_exit_fees_before,
+                            lot_pnl_before,
+                            lot_status_before,
+                        ),
+                    )
+
+                if fill_over_plan:
+                    reservation_row = connection.execute(
+                        "SELECT detail_json FROM canary_risk_reservations "
+                        "WHERE reservation_id=?",
+                        (current_reservation_id,),
+                    ).fetchone()
+                    try:
+                        reservation_detail = (
+                            json.loads(reservation_row["detail_json"] or "{}")
+                            if reservation_row is not None
+                            else {}
+                        )
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        reservation_detail = {}
+                    reservation_detail["risk_breaker"] = "EXIT_FILL_OVER_PLAN"
+                    reservation_detail["actual_quantity"] = str(existing_qty)
+                    reservation_detail["requested_quantity"] = str(requested)
+                    connection.execute(
+                        "UPDATE canary_risk_reservations SET detail_json=?,"
+                        "status='UNKNOWN',released_at=NULL WHERE reservation_id=? "
+                        "AND UPPER(COALESCE(status,'')) NOT IN "
+                        "('FILLED','SETTLED','RELEASED','CANCELED',"
+                        "'CANCELLED','REJECTED')",
+                        (_json(reservation_detail), current_reservation_id),
+                    )
+                    request_update = update_request(
+                        next_status="UNKNOWN",
+                        next_settlement=None,
+                    )
+                    if int(request_update.rowcount or 0) != 1:
+                        raise _ReconciliationCASMiss
+                    lot_update = update_lot(
+                        sold=prior_sold,
+                        pending=prior_pending,
+                        gross=prior_gross,
+                        exit_fees=prior_exit_fees,
+                        pnl=prior_pnl,
+                        next_status="EXIT_PENDING",
+                    )
+                    if int(lot_update.rowcount or 0) != 1:
+                        raise _ReconciliationCASMiss
+                    result = {
+                        "request_id": request_id,
+                        "position_id": position_id,
+                        "status": "UNKNOWN",
+                        "filled_quantity": str(existing_qty),
+                        "new_fills": inserted,
+                        "order_id": current_order_id or None,
+                        "blocker": "EXIT_FILL_OVER_PLAN",
+                    }
+                else:
+                    settlement_status = order_settlement
+                    terminal = (
+                        (
+                            settlement_status is not None
+                            and not provisional_trades
+                        )
+                        or order_status in _FAILED_ORDER
+                        or (
+                            order_status in _CANCELED_ORDER
+                            and not provisional_trades
+                        )
+                    )
+                    if settlement_status is not None and not provisional_trades:
+                        proposed_status = (
+                            "SETTLED"
+                            if existing_qty + DUST >= requested
+                            else "SETTLED_PARTIAL"
+                        )
+                    elif settlement_status is not None:
+                        # A final marker accompanied by provisional evidence
+                        # remains unresolved.
+                        proposed_status = "UNKNOWN"
+                    elif provisional_trades:
+                        # Provisional evidence retains the pending obligation.
+                        proposed_status = "MATCHED"
+                    else:
+                        proposed_status = order_status
+                    status = _monotonic_request_status(
+                        current_request_status,
+                        proposed_status,
+                    )
+                    if (
+                        current_request_status == "FILLED"
+                        and status == "FILLED"
+                        and settlement_status is None
+                    ):
+                        # FILLED remains pollable for settlement.
+                        terminal = False
+                    pending_total = ZERO if terminal else max(
+                        ZERO,
+                        prior_pending,
+                    )
+                    sold_total = prior_sold + delta_qty
+                    gross_total = prior_gross + delta_gross
+                    exit_fees_total = prior_exit_fees + delta_fees
+                    basis_delta = (
+                        delta_qty * lot_basis / lot_quantity
+                        if lot_quantity > ZERO
+                        else ZERO
+                    )
+                    basis_delta = min(lot_basis, basis_delta)
+                    pnl_total = (
+                        prior_pnl
+                        + delta_gross
+                        - delta_fees
+                        - basis_delta
+                    )
+                    lot_status = (
+                        "CLOSED"
+                        if (
+                            settlement_status is not None
+                            and status == "SETTLED"
+                            and max(ZERO, requested - existing_qty) <= DUST
+                        )
+                        else "OPEN"
+                        if terminal
+                        else "EXIT_PENDING"
+                    )
+                    request_update = update_request(
+                        next_status=status,
+                        next_settlement=settlement_status,
+                    )
+                    if int(request_update.rowcount or 0) != 1:
+                        raise _ReconciliationCASMiss
+                    lot_update = update_lot(
+                        sold=sold_total,
+                        pending=pending_total,
+                        gross=gross_total,
+                        exit_fees=exit_fees_total,
+                        pnl=pnl_total,
+                        next_status=lot_status,
+                    )
+                    if int(lot_update.rowcount or 0) != 1:
+                        raise _ReconciliationCASMiss
+                    result = {
+                        "request_id": request_id,
+                        "position_id": position_id,
+                        "status": status,
+                        "filled_quantity": str(existing_qty),
+                        "new_fills": inserted,
+                        "order_id": current_order_id or None,
+                    }
+        except _ReconciliationCASMiss:
+            # The transaction context rolls back both writes.  Re-read and
+            # recompute once so a stale worker can converge on the winner.
+            continue
+        break
+
+    if result is None:
+        persisted_status = _mark_request_unknown(
+            service,
+            request_id,
+            "CANARY_RECONCILIATION_CAS_FAILED",
         )
-        requested = _decimal(request.get("requested_quantity"), ZERO)
-        prior_request_qty = _decimal(request.get("filled_quantity"), ZERO)
-        prior_request_avg = _decimal(request.get("average_price"), ZERO)
-        prior_request_fees = _decimal(request.get("fees"), ZERO)
-        delta_qty = max(ZERO, existing_qty - prior_request_qty)
-        delta_gross = max(ZERO, existing_cost - (prior_request_qty * prior_request_avg))
-        delta_fees = max(ZERO, existing_fees - prior_request_fees)
-        lot_row = connection.execute(
-            "SELECT quantity,cost_basis,sold_quantity,pending_exit_quantity,gross_proceeds,exit_fees,realized_pnl "
-            "FROM canary_position_lots WHERE position_id=?",
-            (position_id,),
-        ).fetchone()
-        prior_sold = _decimal(lot_row["sold_quantity"], ZERO) if lot_row is not None else ZERO
-        prior_pending = _decimal(lot_row["pending_exit_quantity"], ZERO) if lot_row is not None else ZERO
-        prior_gross = _decimal(lot_row["gross_proceeds"], ZERO) if lot_row is not None else ZERO
-        prior_exit_fees = _decimal(lot_row["exit_fees"], ZERO) if lot_row is not None else ZERO
-        prior_pnl = _decimal(lot_row["realized_pnl"], ZERO) if lot_row is not None else ZERO
-        lot_quantity = _decimal(lot_row["quantity"], ZERO) if lot_row is not None else ZERO
-        lot_basis = _decimal(lot_row["cost_basis"], ZERO) if lot_row is not None else ZERO
-        fill_over_plan = (
-            existing_qty > requested + DUST
-            or prior_sold + delta_qty > lot_quantity + DUST
-        )
-        if fill_over_plan:
-            reservation_id = str(request.get("reservation_id") or "").strip()
-            reservation_row = connection.execute(
-                "SELECT detail_json FROM canary_risk_reservations "
-                "WHERE reservation_id=?",
-                (reservation_id,),
+        with service.store._lock:
+            current_row = connection.execute(
+                "SELECT * FROM canary_position_requests WHERE request_id=?",
+                (request_id,),
             ).fetchone()
-            try:
-                reservation_detail = json.loads(
-                    reservation_row["detail_json"] or "{}"
-                ) if reservation_row is not None else {}
-            except (TypeError, ValueError, json.JSONDecodeError):
-                reservation_detail = {}
-            reservation_detail["risk_breaker"] = "EXIT_FILL_OVER_PLAN"
-            reservation_detail["actual_quantity"] = str(existing_qty)
-            reservation_detail["requested_quantity"] = str(requested)
-            connection.execute(
-                "UPDATE canary_risk_reservations SET detail_json=?,"
-                "status='UNKNOWN',released_at=NULL WHERE reservation_id=?",
-                (_json(reservation_detail), reservation_id),
-            )
-            connection.execute(
-                "UPDATE canary_position_requests SET order_id=?,filled_quantity=?,"
-                "average_price=?,fees=?,status='UNKNOWN',settlement_status=NULL,"
-                "updated_at=? WHERE request_id=?",
-                (
-                    order_id or None,
-                    str(existing_qty),
-                    str(existing_cost / existing_qty) if existing_qty > ZERO else None,
-                    str(existing_fees),
-                    _iso(now),
-                    request_id,
-                ),
-            )
-            connection.execute(
-                "UPDATE canary_position_lots SET status='EXIT_PENDING',updated_at=? "
-                "WHERE position_id=?",
-                (_iso(now), position_id),
-            )
-            return {
-                "request_id": request_id,
-                "position_id": position_id,
-                "status": "UNKNOWN",
-                "filled_quantity": str(existing_qty),
-                "new_fills": inserted,
-                "order_id": order_id or None,
-                "blocker": "EXIT_FILL_OVER_PLAN",
-            }
-        settlement_status = order_settlement
-        terminal = (
-            settlement_status is not None
-            or order_status in _FAILED_ORDER
-            or (order_status in _CANCELED_ORDER and not provisional_trades)
+        if current_row is None:
+            raise CanaryBlocked("CANARY_REQUEST_NOT_FOUND")
+        failed_result = _request_snapshot_result(
+            dict(current_row),
+            persisted_status,
         )
-        if settlement_status is not None:
-            status = "SETTLED" if existing_qty + DUST >= requested else "SETTLED_PARTIAL"
-        elif provisional_trades:
-            # A canceled/matched order with provisional venue evidence still
-            # owns an unresolved settlement obligation.  Keep the reservation
-            # and pending quantity so no duplicate SELL can be admitted.
-            status = "MATCHED"
-        else:
-            status = order_status
-        pending_total = ZERO if terminal else prior_pending
-        sold_total = prior_sold + delta_qty
-        gross_total = prior_gross + delta_gross
-        exit_fees_total = prior_exit_fees + delta_fees
-        basis_delta = (delta_qty * lot_basis / lot_quantity) if lot_quantity > ZERO else ZERO
-        pnl_total = prior_pnl + delta_gross - delta_fees - basis_delta
-        lot_status = (
-            "CLOSED"
-            if settlement_status is not None and status == "SETTLED" and max(ZERO, requested - existing_qty) <= DUST
-            else "OPEN"
-            if terminal
-            else "EXIT_PENDING"
-        )
-        connection.execute(
-            "UPDATE canary_position_requests SET order_id=?,filled_quantity=?,average_price=?,fees=?,status=?,settlement_status=?,updated_at=? WHERE request_id=?",
-            (
-                order_id or None,
-                str(existing_qty),
-                str(existing_cost / existing_qty) if existing_qty > ZERO else None,
-                str(existing_fees),
-                status,
-                settlement_status,
-                _iso(now),
-                request_id,
-            ),
-        )
-        connection.execute(
-            "UPDATE canary_position_lots SET sold_quantity=?,pending_exit_quantity=?,gross_proceeds=?,exit_fees=?,realized_pnl=?,status=?,updated_at=? WHERE position_id=?",
-            (
-                str(sold_total),
-                str(pending_total),
-                str(gross_total),
-                str(exit_fees_total),
-                str(pnl_total),
-                lot_status,
-                _iso(now),
-                position_id,
-            ),
-        )
+        failed_result["blocker"] = "CANARY_RECONCILIATION_CAS_FAILED"
+        return failed_result
     if terminal:
         release = getattr(service.store, "release_canary_capacity", None)
         if not callable(release):
             raise CanaryBlocked("CANARY_RISK_RELEASE_UNAVAILABLE")
-        reservation_id = str(request.get("reservation_id") or "").strip()
-        if reservation_id:
+        if release_reservation_id:
             release(
-                reservation_id,
+                release_reservation_id,
                 status="SETTLED" if settlement_status is not None else "RELEASED",
                 timestamp=now,
             )
-    return {
-        "request_id": request_id,
-        "position_id": position_id,
-        "status": status,
-        "filled_quantity": str(existing_qty),
-        "new_fills": inserted,
-        "order_id": order_id or None,
-    }
+    return result
 
 
 def reconcile_pending(service: CanaryService, venue: Any, *, allow_test_venue: bool = False) -> Mapping[str, Any]:
@@ -2362,13 +3069,18 @@ def reconcile_pending(service: CanaryService, venue: Any, *, allow_test_venue: b
                 )
             results.append({"request_id": request_id, "status": "REJECTED", "reason": "CRASH_BEFORE_SUBMISSION"})
         else:
-            blocked += 1
-            with service.store._lock, _connection(service):
-                _connection(service).execute(
-                    "UPDATE canary_position_requests SET status='UNKNOWN',last_error=?,updated_at=? WHERE request_id=?",
-                    ("ORDER_ID_UNAVAILABLE", _iso(now), request_id),
-                )
-            results.append({"request_id": request_id, "status": "UNKNOWN", "reason": "ORDER_ID_UNAVAILABLE"})
+            persisted_status = _mark_request_unknown(
+                service,
+                request_id,
+                "ORDER_ID_UNAVAILABLE",
+            )
+            if persisted_status == "UNKNOWN":
+                blocked += 1
+            results.append({
+                "request_id": request_id,
+                "status": persisted_status,
+                "reason": "ORDER_ID_UNAVAILABLE",
+            })
     if not with_order and not entry_results:
         return {
             "status": "DEGRADED" if blocked else "RECONCILED",
@@ -2387,23 +3099,41 @@ def reconcile_pending(service: CanaryService, venue: Any, *, allow_test_venue: b
             if not isinstance(order, Mapping):
                 raise CanaryBlocked("CANARY_ORDER_RESPONSE_INVALID")
             trades = _call(list_trades, order_id=order_id)
-            results.append(_apply_reconciled_request(service, request, dict(order), _parse_trades(trades), now))
+            results.append(
+                _apply_reconciled_request(
+                    service,
+                    request,
+                    dict(order),
+                    _parse_trades(trades),
+                    now,
+                )
+            )
         except CanaryBlocked as exc:
-            blocked += 1
-            with service.store._lock, _connection(service):
-                _connection(service).execute(
-                    "UPDATE canary_position_requests SET status='UNKNOWN',last_error=?,updated_at=? WHERE request_id=?",
-                    (str(exc), _iso(now), str(request.get("request_id") or "")),
-                )
-            results.append({"request_id": request.get("request_id"), "status": "UNKNOWN", "reason": str(exc)})
+            persisted_status = _mark_request_unknown(
+                service,
+                request.get("request_id"),
+                str(exc),
+            )
+            if persisted_status == "UNKNOWN":
+                blocked += 1
+            results.append({
+                "request_id": request.get("request_id"),
+                "status": persisted_status,
+                "reason": str(exc),
+            })
         except Exception as exc:
-            blocked += 1
-            with service.store._lock, _connection(service):
-                _connection(service).execute(
-                    "UPDATE canary_position_requests SET status='UNKNOWN',last_error=?,updated_at=? WHERE request_id=?",
-                    (type(exc).__name__, _iso(now), str(request.get("request_id") or "")),
-                )
-            results.append({"request_id": request.get("request_id"), "status": "UNKNOWN", "reason": type(exc).__name__})
+            persisted_status = _mark_request_unknown(
+                service,
+                request.get("request_id"),
+                type(exc).__name__,
+            )
+            if persisted_status == "UNKNOWN":
+                blocked += 1
+            results.append({
+                "request_id": request.get("request_id"),
+                "status": persisted_status,
+                "reason": type(exc).__name__,
+            })
     return {
         "status": "DEGRADED" if blocked else "RECONCILED",
         "reconciled": len(results) + len(entry_results) - blocked,
@@ -2599,6 +3329,7 @@ __all__ = [
     "trade_order_id",
     "trade_token",
     "trade_side",
+    "trade_market",
     "trade_price",
     "trade_quantity",
     "trade_timestamp",

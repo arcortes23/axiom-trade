@@ -301,6 +301,48 @@ class DurableResearchBus:
 
     def submit_hypothesis(self, payload: Mapping[str, Any], **kwargs: Any) -> ResearchQueueItem:
         return self.submit("hypothesis", payload, **kwargs)
+    def submit_campaign_trial(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        campaign_id: str,
+        trial_id: str,
+        **kwargs: Any,
+    ) -> ResearchQueueItem:
+        """Queue one immutable, paper-only finite-campaign trial.
+
+        Campaign protocol persistence remains the controller's responsibility;
+        this boundary only enforces that a queued trial carries the binding and
+        cannot be mistaken for an unconstrained Hermes mutation.
+        """
+        if not isinstance(payload, Mapping):
+            raise TypeError("campaign trial payload must be a mapping")
+        campaign = str(campaign_id).strip()
+        trial = str(trial_id).strip()
+        if not campaign or not trial:
+            raise ValueError("campaign_id and trial_id are required")
+        if payload.get("paper_only") is not True:
+            raise ResearchBusPermissionError("finite campaign trials must be paper_only")
+        if str(payload.get("campaign_id", "")).strip() != campaign:
+            raise ResearchBusPermissionError("campaign trial campaign_id binding mismatch")
+        if str(payload.get("campaign_trial_id", "")).strip() != trial:
+            raise ResearchBusPermissionError("campaign trial trial_id binding mismatch")
+        if not isinstance(payload.get("experiment_plan"), Mapping):
+            raise ResearchBusPermissionError("campaign trial requires a frozen experiment_plan")
+        if not isinstance(payload.get("campaign_protocol_hash"), str) or not str(payload.get("campaign_protocol_hash")).strip():
+            raise ResearchBusPermissionError("campaign trial requires a protocol hash")
+        kwargs.setdefault("dedupe_key", f"campaign:{campaign}:{trial}")
+        return self.submit_hypothesis(payload, **kwargs)
+
+    def list_campaign_trials(self, campaign_id: str, *, limit: int = 100) -> tuple[ResearchQueueItem, ...]:
+        campaign = str(campaign_id).strip()
+        if not campaign:
+            return ()
+        return tuple(
+            item
+            for item in self.list(limit=limit)
+            if str(item.payload.get("campaign_id", "")).strip() == campaign
+        )
 
     def submit_proposal(self, payload: Mapping[str, Any], **kwargs: Any) -> ResearchQueueItem:
         """Validate and enqueue one ordinary hypothesis proposal."""

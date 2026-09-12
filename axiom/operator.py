@@ -1089,6 +1089,10 @@ class OperatorControlPlane:
         hermes_job_id: str | None = None,
         execution_profile: str | None = None,
         profile: Any | None = None,
+        historical_refresh_enabled: bool = False,
+        historical_refresh_interval_seconds: float = 3600.0,
+        historical_refresh_request_budget: int = 25,
+        historical_refresh_market_budget: int = 4,
     ) -> None:
         self.store = store
         ambient_profile = os.environ.get(EXECUTION_PROFILE_ENV)
@@ -1115,6 +1119,10 @@ class OperatorControlPlane:
         raw_db = db_path if db_path is not None else getattr(store, "path", "")
         self.db_path = os.path.abspath(os.path.expanduser(str(raw_db))) if str(raw_db) not in {"", ":memory:"} else str(raw_db)
         self._node_launcher = node_launcher or self._spawn_node
+        self.historical_refresh_enabled = bool(historical_refresh_enabled)
+        self.historical_refresh_interval_seconds = float(historical_refresh_interval_seconds)
+        self.historical_refresh_request_budget = int(historical_refresh_request_budget)
+        self.historical_refresh_market_budget = int(historical_refresh_market_budget)
         self._lock = threading.RLock()
         self._connectivity_lock = threading.RLock()
         self._action_lock = threading.RLock()
@@ -1484,6 +1492,18 @@ class OperatorControlPlane:
                 "--cycles",
                 "0",
             ]
+            command.extend(
+                [
+                    "--historical-refresh-interval",
+                    str(self.historical_refresh_interval_seconds),
+                    "--historical-refresh-request-budget",
+                    str(self.historical_refresh_request_budget),
+                    "--historical-refresh-market-budget",
+                    str(self.historical_refresh_market_budget),
+                ]
+            )
+            if self.historical_refresh_enabled:
+                command.append("--historical-refresh-enabled")
             if self.execution_profile == ISOLATED_EXECUTION_PROFILE:
                 command.append("--isolated")
             try:
