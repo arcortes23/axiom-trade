@@ -3566,13 +3566,39 @@ class DashboardData:
     def _campaign_job_records(self) -> list[Mapping[str, Any]]:
         if self.store is None:
             return []
-        lister = getattr(self.store, "list_operator_jobs", None)
-        if not callable(lister):
-            return []
-        try:
-            raw = lister()
-        except (AttributeError, TypeError, ValueError, sqlite3.Error):
-            return []
+        progress_lister = getattr(self.store, "list_operator_job_progress", None)
+        raw: Any = None
+        if callable(progress_lister):
+            try:
+                # This projection extracts only progress scalars and capped
+                # arrays in SQLite; the protocol/job payload never crosses
+                # into Python.
+                raw = progress_lister(
+                    job_prefix=_CAMPAIGN_JOB_PREFIX,
+                    limit=_CAMPAIGN_JOB_LIMIT,
+                )
+            except (AttributeError, TypeError, ValueError, sqlite3.Error):
+                raw = None
+        if raw is None:
+            lister = getattr(self.store, "list_operator_jobs", None)
+            if not callable(lister):
+                return []
+            try:
+                # Compatibility with stores predating the progress projection.
+                raw = lister(
+                    job_prefix=_CAMPAIGN_JOB_PREFIX,
+                    limit=_CAMPAIGN_JOB_LIMIT,
+                )
+            except TypeError:
+                try:
+                    raw = lister(limit=_CAMPAIGN_JOB_LIMIT)
+                except TypeError:
+                    try:
+                        raw = lister()
+                    except (AttributeError, TypeError, ValueError, sqlite3.Error):
+                        return []
+            except (AttributeError, ValueError, sqlite3.Error):
+                return []
         records = [
             item
             for item in (raw if isinstance(raw, (list, tuple)) else ())
@@ -3666,31 +3692,41 @@ class DashboardData:
         if budget_limit:
             budget_used = min(budget_used, budget_limit)
             budget_remaining = min(budget_remaining, max(0, budget_limit - budget_used))
-        raw_trials = payload.get("trials")
-        trials = [
-            item
-            for item in (raw_trials if isinstance(raw_trials, (list, tuple)) else ())
-            if isinstance(item, Mapping)
-        ][:64]
-        completed = sum(
-            1
-            for item in trials
-            if str(item.get("status") or "").strip().upper() in _CAMPAIGN_TRIAL_TERMINAL
-        )
-        if not trials:
-            counts = payload.get("counts")
-            counts = counts if isinstance(counts, Mapping) else {}
-            completed = sum(
-                self._campaign_integer(counts.get(name), 0)
-                for name in (
-                    "economic_rejection",
-                    "data_insufficient",
-                    "software_or_input_error",
-                    "validation_qualified",
-                    "final_assessment",
-                )
+        projected_trial_count = payload.get("_trial_count")
+        if projected_trial_count is not None:
+            trial_count = self._campaign_integer(projected_trial_count, 0)
+            completed = min(
+                trial_count,
+                self._campaign_integer(payload.get("_completed_trial_count"), 0),
             )
-        remaining = max(0, len(trials) - completed) if trials else 0
+            trials: list[Mapping[str, Any]] = []
+        else:
+            raw_trials = payload.get("trials")
+            trials = [
+                item
+                for item in (raw_trials if isinstance(raw_trials, (list, tuple)) else ())
+                if isinstance(item, Mapping)
+            ][:64]
+            completed = sum(
+                1
+                for item in trials
+                if str(item.get("status") or "").strip().upper() in _CAMPAIGN_TRIAL_TERMINAL
+            )
+            if not trials:
+                counts = payload.get("counts")
+                counts = counts if isinstance(counts, Mapping) else {}
+                completed = sum(
+                    self._campaign_integer(counts.get(name), 0)
+                    for name in (
+                        "economic_rejection",
+                        "data_insufficient",
+                        "software_or_input_error",
+                        "validation_qualified",
+                        "final_assessment",
+                    )
+                )
+            trial_count = len(trials)
+        remaining = max(0, trial_count - completed)
         raw_qualified = payload.get("qualified_candidate_ids", payload.get("qualified", ()))
         if isinstance(raw_qualified, Mapping):
             raw_qualified = raw_qualified.get("candidate_ids", ())

@@ -5696,11 +5696,33 @@ class AxiomStore:
                 ),
             )
 
-    def list_operator_jobs(self) -> list[dict[str, Any]]:
+    def list_operator_jobs(
+        self,
+        *,
+        job_prefix: str | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """List operator jobs with optional SQL-side prefix/row bounds."""
+        if limit is not None and (
+            isinstance(limit, bool) or not isinstance(limit, int) or limit < 0
+        ):
+            raise ValueError("limit must be a non-negative integer or None")
+        clauses: list[str] = []
+        values: list[Any] = []
+        if job_prefix is not None:
+            prefix = str(job_prefix)
+            clauses.append("job_name LIKE ? ESCAPE '\\'")
+            escaped_prefix = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            values.append(escaped_prefix + "%")
+        query = "SELECT * FROM operator_jobs"
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY updated_at DESC,job_name"
+        if limit is not None:
+            query += " LIMIT ?"
+            values.append(int(limit))
         with self._lock:
-            rows = self._conn.execute(
-                "SELECT * FROM operator_jobs ORDER BY updated_at DESC,job_name"
-            ).fetchall()
+            rows = self._conn.execute(query, values).fetchall()
         return [
             {
                 "job_name": row["job_name"],
@@ -5714,6 +5736,105 @@ class AxiomStore:
             }
             for row in rows
         ]
+    def list_operator_job_progress(
+        self,
+        *,
+        job_prefix: str,
+        limit: int = 32,
+    ) -> list[dict[str, Any]]:
+        """Return bounded campaign progress fields without hydrating payloads."""
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+            raise ValueError("limit must be a non-negative integer")
+        prefix = str(job_prefix)
+        escaped_prefix = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        query = (
+            "SELECT job_name,status,updated_at,"
+            "json_extract(payload_json,'$.campaign_id') AS campaign_id,"
+            "json_extract(payload_json,'$.campaign.campaign_id') AS nested_campaign_id,"
+            "json_extract(payload_json,'$.status') AS payload_status,"
+            "json_extract(payload_json,'$.budget_limit') AS budget_limit,"
+            "json_extract(payload_json,'$.budget_used') AS budget_used,"
+            "json_extract(payload_json,'$.budget_remaining') AS budget_remaining,"
+            "json_extract(payload_json,'$.next_real_job') AS next_real_job,"
+            "json_extract(payload_json,'$.dataset_id') AS dataset_id,"
+            "json_extract(payload_json,'$.dataset_version') AS dataset_version,"
+            "json_extract(payload_json,'$.last_result') AS last_result_json,"
+            "COALESCE("
+            "CASE WHEN json_type(payload_json,'$.qualified_candidate_ids')='array' "
+            "THEN (SELECT json_group_array(value) FROM json_each(payload_json,'$.qualified_candidate_ids') WHERE key<32) END,"
+            "CASE WHEN json_type(payload_json,'$.qualified')='array' "
+            "THEN (SELECT json_group_array(value) FROM json_each(payload_json,'$.qualified') WHERE key<32) END,"
+            "CASE WHEN json_type(payload_json,'$.qualified.candidate_ids')='array' "
+            "THEN (SELECT json_group_array(value) FROM json_each(payload_json,'$.qualified.candidate_ids') WHERE key<32) END"
+            ") AS qualified_json,"
+            "CASE WHEN json_type(payload_json,'$.trials')='array' "
+            "THEN MIN(json_array_length(payload_json,'$.trials'),64) END AS trial_count,"
+            "CASE WHEN json_type(payload_json,'$.trials')='array' THEN ("
+            "SELECT COUNT(*) FROM json_each(payload_json,'$.trials') "
+            "WHERE key<64 AND json_extract(value,'$.status') IN "
+            "('ECONOMIC_REJECTION','DATA_INSUFFICIENT','SOFTWARE_OR_INPUT_ERROR',"
+            "'VALIDATION_QUALIFIED','FINAL_ASSESSMENT')) END AS completed_trial_count,"
+            "json_extract(payload_json,'$.counts.economic_rejection') AS economic_rejection,"
+            "json_extract(payload_json,'$.counts.data_insufficient') AS data_insufficient,"
+            "json_extract(payload_json,'$.counts.software_or_input_error') AS software_or_input_error,"
+            "json_extract(payload_json,'$.counts.validation_qualified') AS validation_qualified,"
+            "json_extract(payload_json,'$.counts.final_assessment') AS final_assessment "
+            "FROM operator_jobs WHERE job_name LIKE ? ESCAPE '\\' "
+            "ORDER BY updated_at DESC,job_name LIMIT ?"
+        )
+        with self._lock:
+            rows = self._conn.execute(query, (escaped_prefix + "%", int(limit))).fetchall()
+        records: list[dict[str, Any]] = []
+        for row in rows:
+            payload: dict[str, Any] = {}
+            for key in (
+                "campaign_id",
+                "budget_limit",
+                "budget_used",
+                "budget_remaining",
+                "next_real_job",
+                "dataset_id",
+                "dataset_version",
+            ):
+                value = row[key]
+                if value is not None:
+                    payload[key] = value
+            if row["nested_campaign_id"] is not None:
+                payload["campaign"] = {"campaign_id": row["nested_campaign_id"]}
+            if row["payload_status"] is not None:
+                payload["status"] = row["payload_status"]
+            if row["last_result_json"] is not None:
+                raw_last_result = row["last_result_json"]
+                try:
+                    loaded = _load(raw_last_result)
+                except (TypeError, ValueError):
+                    loaded = raw_last_result
+                payload["last_result"] = loaded
+            if row["qualified_json"] is not None:
+                loaded = _load(row["qualified_json"])
+                payload["qualified_candidate_ids"] = loaded
+            if row["trial_count"] is not None:
+                payload["_trial_count"] = int(row["trial_count"] or 0)
+                payload["_completed_trial_count"] = int(row["completed_trial_count"] or 0)
+            payload["counts"] = {
+                key: int(row[key] or 0)
+                for key in (
+                    "economic_rejection",
+                    "data_insufficient",
+                    "software_or_input_error",
+                    "validation_qualified",
+                    "final_assessment",
+                )
+            }
+            records.append(
+                {
+                    "job_name": row["job_name"],
+                    "status": row["status"],
+                    "payload": payload,
+                    "updated_at": _parse_datetime(row["updated_at"]),
+                }
+            )
+        return records
 
     def record_operator_action(
         self,
@@ -10108,9 +10229,17 @@ class AxiomStore:
         order_direction = str(direction or "desc").strip().lower()
         if order_direction not in {"asc", "desc"}:
             raise ValueError("direction must be 'asc' or 'desc'")
-        cte = """
+        fast_path = (
+            str(sort or "observed_at").strip().lower()
+            in {"observed_at", "source_timestamp", "market_id", "quality"}
+            and not any(
+                str(value or "").strip()
+                for value in (timeframe, quality, category, settlement, filter)
+            )
+        )
+        fast_cte = """
             WITH metadata_ranked AS (
-                SELECT market_id,observed_at,metadata_hash,payload_json,
+                SELECT rowid AS row_id,
                     ROW_NUMBER() OVER (
                         PARTITION BY market_id
                         ORDER BY observed_at DESC,metadata_hash DESC
@@ -10118,11 +10247,13 @@ class AxiomStore:
                 FROM polymarket_markets
             ),
             metadata_latest AS (
-                SELECT market_id,observed_at,metadata_hash,payload_json
-                FROM metadata_ranked WHERE row_number=1
+                SELECT p.rowid AS row_id,p.market_id,p.observed_at,p.metadata_hash
+                FROM polymarket_markets AS p
+                JOIN metadata_ranked AS ranked ON ranked.row_id=p.rowid
+                WHERE ranked.row_number=1
             ),
             snapshot_ranked AS (
-                SELECT market_id,observed_at,source_timestamp,snapshot_id,payload_json,quality,
+                SELECT rowid AS row_id,
                     ROW_NUMBER() OVER (
                         PARTITION BY market_id
                         ORDER BY observed_at DESC,source_timestamp DESC,snapshot_id DESC
@@ -10130,8 +10261,71 @@ class AxiomStore:
                 FROM polymarket_snapshots
             ),
             snapshot_latest AS (
-                SELECT market_id,observed_at,source_timestamp,snapshot_id,payload_json,quality
-                FROM snapshot_ranked WHERE row_number=1
+                SELECT p.rowid AS row_id,p.market_id,p.observed_at,p.source_timestamp,
+                    p.snapshot_id,p.quality
+                FROM polymarket_snapshots AS p
+                JOIN snapshot_ranked AS ranked ON ranked.row_id=p.rowid
+                WHERE ranked.row_number=1
+            ),
+            markets AS (
+                SELECT
+                    m.market_id,
+                    COALESCE(s.observed_at,m.observed_at) AS observed_at,
+                    m.observed_at AS metadata_observed_at,
+                    m.metadata_hash,
+                    m.row_id AS metadata_row_id,
+                    s.observed_at AS snapshot_observed_at,
+                    s.source_timestamp,
+                    s.snapshot_id,
+                    s.row_id AS snapshot_row_id,
+                    s.quality,
+                    NULL AS category,NULL AS timeframe,NULL AS settlement
+                FROM metadata_latest AS m
+                LEFT JOIN snapshot_latest AS s ON s.market_id=m.market_id
+                UNION ALL
+                SELECT
+                    s.market_id,s.observed_at,NULL,NULL,NULL,
+                    s.observed_at,s.source_timestamp,s.snapshot_id,s.row_id,
+                    s.quality,NULL AS category,NULL AS timeframe,NULL AS settlement
+                FROM snapshot_latest AS s
+                LEFT JOIN metadata_latest AS m ON m.market_id=s.market_id
+                WHERE m.market_id IS NULL
+            )
+        """
+        # Rank only row ids first.  Selecting payload_json in the window CTE
+        # forces SQLite to carry every large persisted payload through both
+        # latest-per-market scans before LIMIT/OFFSET can apply.  Join the
+        # winning rows back to their payloads only after the window is bounded
+        # to one row per market.
+        cte = """
+            WITH metadata_ranked AS (
+                SELECT rowid AS row_id,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY market_id
+                        ORDER BY observed_at DESC,metadata_hash DESC
+                    ) AS row_number
+                FROM polymarket_markets
+            ),
+            metadata_latest AS (
+                SELECT p.market_id,p.observed_at,p.metadata_hash,p.payload_json
+                FROM polymarket_markets AS p
+                JOIN metadata_ranked AS ranked ON ranked.row_id=p.rowid
+                WHERE ranked.row_number=1
+            ),
+            snapshot_ranked AS (
+                SELECT rowid AS row_id,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY market_id
+                        ORDER BY observed_at DESC,source_timestamp DESC,snapshot_id DESC
+                    ) AS row_number
+                FROM polymarket_snapshots
+            ),
+            snapshot_latest AS (
+                SELECT p.market_id,p.observed_at,p.source_timestamp,p.snapshot_id,
+                    p.payload_json,p.quality
+                FROM polymarket_snapshots AS p
+                JOIN snapshot_ranked AS ranked ON ranked.row_id=p.rowid
+                WHERE ranked.row_number=1
             ),
             markets AS (
                 SELECT
@@ -10232,16 +10426,61 @@ class AxiomStore:
             clauses.append(like_sql)
             values.extend(like_values)
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        query_cte = fast_cte if fast_path else cte
         with self._lock:
-            total = int(self._conn.execute(f"{cte} SELECT COUNT(*) AS n FROM markets{where}", values).fetchone()["n"])
+            total = int(
+                self._conn.execute(
+                    f"{query_cte} SELECT COUNT(*) AS n FROM markets{where}",
+                    values,
+                ).fetchone()["n"]
+            )
             actual_page, pages = _pagination_shape(requested_page, size, total)
-            rows = self._conn.execute(
-                f"{cte} SELECT market_id,observed_at,metadata_observed_at,metadata_hash,metadata_payload,"
-                "snapshot_observed_at,source_timestamp,snapshot_id,snapshot_payload,quality,category,timeframe,settlement "
-                f"FROM markets{where} ORDER BY {order_column} {order_direction.upper()},market_id ASC "
-                "LIMIT ? OFFSET ?",
-                [*values, size, (actual_page - 1) * size],
-            ).fetchall()
+            if fast_path:
+                rows_query = (
+                    f"{query_cte}, page AS ("
+                    "SELECT market_id,observed_at,metadata_observed_at,metadata_hash,"
+                    "metadata_row_id,snapshot_observed_at,source_timestamp,snapshot_id,"
+                    "snapshot_row_id,quality "
+                    f"FROM markets{where} "
+                    f"ORDER BY {order_column} {order_direction.upper()},market_id ASC "
+                    "LIMIT ? OFFSET ?) "
+                    "SELECT page.market_id,page.observed_at,page.metadata_observed_at,"
+                    "page.metadata_hash,meta.payload_json AS metadata_payload,"
+                    "page.snapshot_observed_at,page.source_timestamp,page.snapshot_id,"
+                    "snap.payload_json AS snapshot_payload,page.quality,"
+                    "COALESCE("
+                    "json_extract(snap.payload_json,'$.category'),"
+                    "json_extract(snap.payload_json,'$.snapshot.category'),"
+                    "json_extract(snap.payload_json,'$.metadata.category'),"
+                    "json_extract(meta.payload_json,'$.category'),"
+                    "json_extract(meta.payload_json,'$.metadata.category')) AS category,"
+                    "COALESCE("
+                    "json_extract(snap.payload_json,'$.timeframe'),"
+                    "json_extract(snap.payload_json,'$.snapshot.timeframe'),"
+                    "json_extract(snap.payload_json,'$.metadata.timeframe'),"
+                    "json_extract(meta.payload_json,'$.timeframe'),"
+                    "json_extract(meta.payload_json,'$.metadata.timeframe')) AS timeframe,"
+                    "lower(COALESCE("
+                    "json_extract(snap.payload_json,'$.settlement'),"
+                    "json_extract(snap.payload_json,'$.snapshot.settlement'),"
+                    "json_extract(snap.payload_json,'$.metadata.settlement'),"
+                    "json_extract(meta.payload_json,'$.settlement'),"
+                    "json_extract(meta.payload_json,'$.metadata.settlement'))) AS settlement "
+                    "FROM page "
+                    "LEFT JOIN polymarket_markets AS meta ON meta.rowid=page.metadata_row_id "
+                    "LEFT JOIN polymarket_snapshots AS snap ON snap.rowid=page.snapshot_row_id"
+                )
+                query_values = [*values, size, (actual_page - 1) * size]
+            else:
+                rows_query = (
+                    f"{query_cte} SELECT market_id,observed_at,metadata_observed_at,"
+                    "metadata_hash,metadata_payload,snapshot_observed_at,source_timestamp,"
+                    "snapshot_id,snapshot_payload,quality,category,timeframe,settlement "
+                    f"FROM markets{where} ORDER BY {order_column} "
+                    f"{order_direction.upper()},market_id ASC LIMIT ? OFFSET ?"
+                )
+                query_values = [*values, size, (actual_page - 1) * size]
+            rows = self._conn.execute(rows_query, query_values).fetchall()
         items: list[dict[str, Any]] = []
         for row in rows:
             metadata_payload = _load(row["metadata_payload"]) if row["metadata_payload"] else None

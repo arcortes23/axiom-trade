@@ -9,6 +9,7 @@ import time
 import unittest
 from axiom.dashboard import DashboardData
 from axiom.storage import AxiomStore
+from unittest.mock import patch
 
 
 UTC = timezone.utc
@@ -96,6 +97,46 @@ class DashboardScaleFixtureTests(unittest.TestCase):
                 self.assertLess(elapsed, 1.0)
             finally:
                 store.close()
+    def test_campaign_projection_does_not_deserialize_unrelated_jobs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database_path = Path(temporary_directory) / "dashboard-campaign-scale.sqlite3"
+            store = AxiomStore(str(database_path))
+            try:
+                store.set_operator_job(
+                    "polymarket-research-campaign:bounded",
+                    "RUNNING",
+                    {
+                        "campaign_id": "bounded",
+                        "budget_limit": 4,
+                        "budget_used": 1,
+                    },
+                    timestamp=T0,
+                )
+                # The old dashboard path listed every operator job and
+                # deserialized each payload before filtering to campaigns.
+                store.set_operator_job(
+                    "unrelated-large-job",
+                    "DONE",
+                    {"unrelated": True, "large": "x" * 60_000},
+                    timestamp=T0 + timedelta(seconds=1),
+                )
+                dashboard = DashboardData(store=store)
+
+                def load_campaign_only(encoded: str) -> object:
+                    value = json.loads(encoded)
+                    if isinstance(value, dict) and value.get("unrelated"):
+                        raise AssertionError("unrelated operator payload was deserialized")
+                    return value
+
+                with patch("axiom.storage._load", side_effect=load_campaign_only):
+                    progress = dashboard._campaign_progress_projection()
+
+                self.assertEqual(progress["campaign_id"], "bounded")
+                self.assertEqual(progress["budget_used"], 1)
+                self.assertEqual(progress["budget_remaining"], 3)
+            finally:
+                store.close()
+
 
     @staticmethod
     def _seed_catalog(store: AxiomStore, count: int) -> None:
