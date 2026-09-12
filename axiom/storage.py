@@ -77,6 +77,11 @@ _DEFAULT_HERMES_JOB_ID = "f1d27bf8c27a"
 _PAPER_POSITION_PROJECTION_LIMIT = 32
 _DATASET_METADATA_PROJECTION_LIMIT = 64
 _DATASET_MISSING_RANGE_PROJECTION_LIMIT = 32
+_DASHBOARD_PAYLOAD_MAX_BYTES = 65_536
+_DASHBOARD_PAYLOAD_MAX_DEPTH = 4
+_DASHBOARD_PAYLOAD_MAX_ITEMS = 64
+_DASHBOARD_PAYLOAD_MAX_STRING = 4_096
+_DASHBOARD_PAYLOAD_MAX_KEYS = 128
 _DEFAULT_PAGE_SIZE = 25
 _PAGINATION_PAGE_SIZES = (10, 25, 50, 100)
 _POLYMARKET_SOURCE_TYPES = frozenset({"HISTORICAL", "FORWARD_COLLECTED"})
@@ -3822,6 +3827,72 @@ class AxiomStore:
         with self._lock:
             rows = self._conn.execute(query, values).fetchall()
         return [_dataset_catalog_record(row) for row in rows]
+    def load_dataset_catalog_dashboard(
+        self,
+        dataset_id: str,
+        dataset_version: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Load one dataset catalog row through the bounded dashboard projection."""
+        clauses = ["dataset_id=?"]
+        values: list[Any] = [str(dataset_id)]
+        if dataset_version is not None:
+            clauses.append("dataset_version=?")
+            values.append(str(dataset_version))
+        query = (
+            "SELECT dataset_id,dataset_version,provider,instrument,market_type,timeframe,"
+            "start_timestamp,end_timestamp,row_count,completeness,missing_ranges_json,"
+            "quality,source_type,snapshot_id,created_at,updated_at,metadata_json,"
+            "(SELECT COUNT(*) FROM json_each(metadata_json)) AS metadata_key_count,"
+            "json_extract(metadata_json,'$.category') AS metadata_category,"
+            "json_extract(metadata_json,'$.historical_order_book_available') AS metadata_historical_order_book_available,"
+            "json_extract(metadata_json,'$.universe_version') AS metadata_universe_version,"
+            "json_array_length(missing_ranges_json) AS missing_range_count "
+            "FROM dataset_catalog WHERE "
+            + " AND ".join(clauses)
+            + " ORDER BY updated_at DESC,created_at DESC,rowid DESC,dataset_version DESC LIMIT 1"
+        )
+        with self._lock:
+            row = self._conn.execute(query, values).fetchone()
+        return _dataset_catalog_dashboard_record(row) if row is not None else None
+
+    def list_dataset_catalog_dashboard(
+        self,
+        *,
+        source_type: str | None = None,
+        market_type: str | None = None,
+        limit: int | None = 1000,
+    ) -> list[dict[str, Any]]:
+        """List catalog rows with metadata/missing-range payloads bounded."""
+        if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 0):
+            raise ValueError("limit must be a non-negative integer or None")
+        clauses: list[str] = []
+        values: list[Any] = []
+        if source_type is not None:
+            clauses.append("source_type=?")
+            values.append(str(source_type).strip().upper())
+        if market_type is not None:
+            clauses.append("market_type=?")
+            values.append(_enum_value(market_type) or str(market_type))
+        query = (
+            "SELECT dataset_id,dataset_version,provider,instrument,market_type,timeframe,"
+            "start_timestamp,end_timestamp,row_count,completeness,missing_ranges_json,"
+            "quality,source_type,snapshot_id,created_at,updated_at,metadata_json,"
+            "(SELECT COUNT(*) FROM json_each(metadata_json)) AS metadata_key_count,"
+            "json_extract(metadata_json,'$.category') AS metadata_category,"
+            "json_extract(metadata_json,'$.historical_order_book_available') AS metadata_historical_order_book_available,"
+            "json_extract(metadata_json,'$.universe_version') AS metadata_universe_version,"
+            "json_array_length(missing_ranges_json) AS missing_range_count "
+            "FROM dataset_catalog"
+        )
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY updated_at DESC,dataset_id,dataset_version"
+        if limit is not None:
+            query += " LIMIT ?"
+            values.append(int(limit))
+        with self._lock:
+            rows = self._conn.execute(query, values).fetchall()
+        return [_dataset_catalog_dashboard_record(row) for row in rows]
 
     # Dataset integrity attestations ---------------------------------
     def load_dataset_integrity_attestation(
@@ -5549,6 +5620,56 @@ class AxiomStore:
             }
             for row in rows
         ]
+    def load_latest_polymarket_snapshots_dashboard(
+        self,
+        market_ids: Sequence[str] | None = None,
+        *,
+        source_type: str | None = None,
+        limit: int = 1000,
+    ) -> list[dict[str, Any]]:
+        """Load latest market snapshots with bounded dashboard payloads."""
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+            raise ValueError("limit must be a non-negative integer")
+        identifiers = tuple(dict.fromkeys(str(item).strip() for item in (market_ids or ()) if str(item).strip()))
+        if market_ids is not None and not identifiers:
+            return []
+        clauses: list[str] = []
+        values: list[Any] = []
+        if identifiers:
+            placeholders = ",".join("?" for _ in identifiers)
+            clauses.append(f"market_id IN ({placeholders})")
+            values.extend(identifiers)
+        if source_type is not None:
+            clauses.append("source_type=?")
+            values.append(_polymarket_source_type(source_type))
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        query = (
+            "SELECT snapshot_id,market_id,source_timestamp,observed_at,payload_json,quality,source_type FROM ("
+            "SELECT p.*, ROW_NUMBER() OVER (PARTITION BY market_id "
+            "ORDER BY observed_at DESC,source_timestamp DESC,snapshot_id DESC) AS row_number "
+            "FROM polymarket_snapshots p"
+            f"{where}"
+            ") WHERE row_number=1 ORDER BY market_id LIMIT ?"
+        )
+        values.append(int(limit))
+        with self._lock:
+            rows = self._conn.execute(query, values).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            payload, projection = _dashboard_payload_projection(row["payload_json"])
+            result.append(
+                {
+                    "snapshot_id": row["snapshot_id"],
+                    "market_id": row["market_id"],
+                    "source_timestamp": _parse_datetime(row["source_timestamp"]),
+                    "observed_at": _parse_datetime(row["observed_at"]),
+                    "payload": payload if isinstance(payload, Mapping) else {},
+                    "quality": row["quality"],
+                    "source_type": str(row["source_type"]).upper(),
+                    **_dashboard_payload_fields(projection),
+                }
+            )
+        return result
 
     def load_polymarket_trades(
         self,
@@ -6949,6 +7070,41 @@ class AxiomStore:
             }
             for row in rows
         ]
+    def list_collection_cycles_dashboard(
+        self,
+        *,
+        collector_name: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """List cycle rows with diagnostics bounded at the dashboard boundary."""
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+            raise ValueError("limit must be a non-negative integer")
+        query = (
+            "SELECT cycle_id,collector_name,started_at,ended_at,payload_json,created_at "
+            "FROM collection_cycles"
+        )
+        values: list[Any] = []
+        if collector_name is not None:
+            query += " WHERE collector_name=?"
+            values.append(str(collector_name))
+        query += " ORDER BY started_at DESC,cycle_id DESC LIMIT ?"
+        values.append(int(limit))
+        with self._lock:
+            rows = self._conn.execute(query, values).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            payload, projection = _dashboard_payload_projection(row["payload_json"])
+            item = {
+                "cycle_id": row["cycle_id"],
+                "collector_name": row["collector_name"],
+                "started_at": _parse_datetime(row["started_at"]),
+                "ended_at": _parse_datetime(row["ended_at"]),
+                "payload": payload,
+                "created_at": _parse_datetime(row["created_at"]),
+            }
+            item.update(_dashboard_payload_fields(projection))
+            result.append(item)
+        return result
 
     def enqueue_research_item(
         self,
@@ -8560,6 +8716,63 @@ class AxiomStore:
             }
             for row in rows
         ]
+    def list_paper_bet_ledger_dashboard(
+        self,
+        experiment_id: str,
+        *,
+        limit: int | None = 1000,
+    ) -> list[dict[str, Any]]:
+        """Read only scalar bet fields needed by dashboard portfolio totals."""
+        if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 0):
+            raise ValueError("limit must be a non-negative integer or None")
+        query = (
+            "SELECT bet_id,experiment_id,market_id,strategy_id,outcome,resolution,"
+            "resolved_at,created_at,updated_at,json_extract(payload_json,'$.net_pnl') AS net_pnl "
+            "FROM paper_bet_ledger WHERE experiment_id=? ORDER BY resolved_at,market_id"
+        )
+        values: list[Any] = [str(experiment_id)]
+        if limit is not None:
+            query += " LIMIT ?"
+            values.append(int(limit))
+        if self.path not in {":memory:", ""} and not self.path.startswith("file:"):
+            snapshot = self._snapshot_read_connection()
+            try:
+                rows = snapshot.execute(query, values).fetchall()
+            finally:
+                snapshot.close()
+        else:
+            with self._lock:
+                rows = self._conn.execute(query, values).fetchall()
+        return [
+            {
+                "bet_id": row["bet_id"],
+                "experiment_id": row["experiment_id"],
+                "market_id": row["market_id"],
+                "strategy_id": row["strategy_id"],
+                "outcome": row["outcome"],
+                "resolution": row["resolution"],
+                "resolved_at": _parse_datetime(row["resolved_at"]),
+                "payload": {"net_pnl": row["net_pnl"]},
+                "created_at": _parse_datetime(row["created_at"]),
+                "updated_at": _parse_datetime(row["updated_at"]),
+            }
+            for row in rows
+        ]
+    def paper_bet_ledger_summary(self, experiment_id: str) -> dict[str, Any]:
+        """Return dashboard bet totals without decoding persisted payloads."""
+        query = (
+            "SELECT COUNT(*) AS count,"
+            "COALESCE(SUM(CAST(json_extract(payload_json,'$.net_pnl') AS REAL)),0.0) AS net_pnl,"
+            "COALESCE(SUM(CASE WHEN CAST(json_extract(payload_json,'$.net_pnl') AS REAL)>0 THEN 1 ELSE 0 END),0) AS wins "
+            "FROM paper_bet_ledger WHERE experiment_id=?"
+        )
+        with self._lock:
+            row = self._conn.execute(query, (str(experiment_id),)).fetchone()
+        return {
+            "count": int(row["count"] if row is not None else 0),
+            "net_pnl": float(row["net_pnl"] if row is not None else 0.0),
+            "wins": int(row["wins"] if row is not None else 0),
+        }
 
     def list_latest_paper_observations(
         self,
@@ -8969,6 +9182,11 @@ class AxiomStore:
                 }
             )
         return result
+    def worker_state_count(self) -> int:
+        """Return worker row count without hydrating worker payloads."""
+        with self._lock:
+            row = self._conn.execute("SELECT COUNT(*) AS n FROM worker_state").fetchone()
+        return int(row["n"] if row is not None else 0)
 
     def candidate_forward_requirements(
         self,
@@ -9560,13 +9778,23 @@ class AxiomStore:
             if stamp is not None and stamp > current:
                 continue
             identifier = str(row["market_id"])
-            metadata_latest[identifier] = (stamp, _load(row["payload_json"]))
+            payload = (
+                _load(row["payload_json"])
+                if include_payload
+                else _dashboard_payload_projection(row["payload_json"])[0]
+            )
+            metadata_latest[identifier] = (stamp, payload)
         for row in snapshot_rows:
             stamp = _parse_datetime(row["observed_at"])
             if stamp is not None and stamp > current:
                 continue
             identifier = str(row["market_id"])
-            snapshot_latest[identifier] = (stamp, _load(row["payload_json"]))
+            payload = (
+                _load(row["payload_json"])
+                if include_payload
+                else _dashboard_payload_projection(row["payload_json"])[0]
+            )
+            snapshot_latest[identifier] = (stamp, payload)
         result: list[dict[str, Any]] = []
         terminal = {
             SettlementState.RESOLVED_YES.value,
@@ -10502,10 +10730,10 @@ class AxiomStore:
             rows = self._conn.execute(rows_query, query_values).fetchall()
         items: list[dict[str, Any]] = []
         for row in rows:
-            metadata_payload = _load(row["metadata_payload"]) if row["metadata_payload"] else None
-            snapshot_payload = _load(row["snapshot_payload"]) if row["snapshot_payload"] else None
-            metadata = metadata_payload if isinstance(metadata_payload, Mapping) else {}
-            snapshot_record = snapshot_payload if isinstance(snapshot_payload, Mapping) else {}
+            metadata, metadata_projection = _dashboard_payload_projection(row["metadata_payload"])
+            snapshot, snapshot_projection = _dashboard_payload_projection(row["snapshot_payload"])
+            metadata = metadata if isinstance(metadata, Mapping) else {}
+            snapshot_record = snapshot if isinstance(snapshot, Mapping) else {}
             if snapshot_record:
                 payload = dict(snapshot_record)
             else:
@@ -10537,7 +10765,6 @@ class AxiomStore:
                 "observed_at": _parse_datetime(row["observed_at"]),
                 "metadata_observed_at": _parse_datetime(row["metadata_observed_at"]),
                 "snapshot_observed_at": _parse_datetime(row["snapshot_observed_at"]),
-
                 "source_timestamp": _parse_datetime(row["source_timestamp"]),
                 "metadata_hash": row["metadata_hash"],
                 "snapshot_id": row["snapshot_id"],
@@ -10547,6 +10774,12 @@ class AxiomStore:
                 "settlement": settlement_value or None,
                 "active": active,
                 "payload": payload,
+                "metadata_sha256": metadata_projection.get("sha256"),
+                "metadata_bytes": metadata_projection.get("bytes", 0),
+                "metadata_truncated": bool(metadata_projection.get("truncated")),
+                "snapshot_sha256": snapshot_projection.get("sha256"),
+                "snapshot_bytes": snapshot_projection.get("bytes", 0),
+                "snapshot_truncated": bool(snapshot_projection.get("truncated")),
             }
             if include_snapshots:
                 item["metadata"] = dict(metadata)
@@ -10561,14 +10794,7 @@ class AxiomStore:
         page_size: int,
         direction: str,
     ) -> dict[str, Any]:
-        """Page the common unfiltered timestamp view using per-table indexes.
-
-        The generic paper CTE is intentionally retained for filtered and
-        non-timestamp views, but its compound scan must materialize every
-        payload before sorting.  The default dashboard view only needs the
-        newest records, so bounded source reads preserve the same global
-        ordering without that full materialization.
-        """
+        """Page the common unfiltered timestamp view using per-table indexes."""
         snapshot = self._snapshot_read_connection()
         try:
             counts = self._paper_record_counts_on(snapshot)
@@ -10578,30 +10804,22 @@ class AxiomStore:
                 return {"items": [], "page": actual_page, "page_size": page_size, "total": 0, "pages": pages}
             source_limit = (actual_page - 1) * page_size + page_size
             order = "DESC" if direction == "desc" else "ASC"
-            # Do not select payload_json in these per-table candidate scans.
-            # State payloads can be tens of megabytes; only the final page
-            # needs to cross the SQLite/Python boundary.
             source_queries = (
                 f"""
                     SELECT 'state' AS record_type,experiment_id AS record_id,
                         experiment_id,NULL AS market_id,updated_at AS timestamp,
-                        NULL AS status,
-                        NULL AS outcome,NULL AS resolution,NULL AS strategy_id,
-                        NULL AS payload_json,updated_at AS created_at,
-                        updated_at
+                        NULL AS status,NULL AS outcome,NULL AS resolution,NULL AS strategy_id,
+                        NULL AS payload_json,updated_at AS created_at,updated_at
                     FROM paper_state
-                    ORDER BY updated_at {order},experiment_id ASC
-                    LIMIT ?
+                    ORDER BY updated_at {order},experiment_id ASC LIMIT ?
                 """,
                 f"""
                     SELECT 'observation' AS record_type,observation_id AS record_id,
-                        experiment_id,market_id,timestamp,
-                        NULL AS status,
+                        experiment_id,market_id,timestamp,NULL AS status,
                         NULL AS outcome,NULL AS resolution,NULL AS strategy_id,
                         NULL AS payload_json,created_at,created_at AS updated_at
                     FROM paper_observations
-                    ORDER BY timestamp {order},observation_id ASC
-                    LIMIT ?
+                    ORDER BY timestamp {order},observation_id ASC LIMIT ?
                 """,
                 f"""
                     SELECT 'execution' AS record_type,event_id AS record_id,
@@ -10609,8 +10827,7 @@ class AxiomStore:
                         NULL AS outcome,NULL AS resolution,NULL AS strategy_id,
                         NULL AS payload_json,created_at,created_at AS updated_at
                     FROM paper_execution_events
-                    ORDER BY timestamp {order},event_id ASC
-                    LIMIT ?
+                    ORDER BY timestamp {order},event_id ASC LIMIT ?
                 """,
                 f"""
                     SELECT 'bet' AS record_type,bet_id AS record_id,
@@ -10618,17 +10835,12 @@ class AxiomStore:
                         resolution AS status,outcome,resolution,strategy_id,
                         NULL AS payload_json,created_at,updated_at
                     FROM paper_bet_ledger
-                    ORDER BY resolved_at {order},bet_id ASC
-                    LIMIT ?
+                    ORDER BY resolved_at {order},bet_id ASC LIMIT ?
                 """,
             )
             rows: list[sqlite3.Row] = []
             for query in source_queries:
                 rows.extend(snapshot.execute(query, (source_limit,)).fetchall())
-
-            # Each source contributes at most ``source_limit`` candidates, so
-            # sorting the small metadata set still yields the exact global
-            # page.  Fetch payloads only after that page is known.
             rows.sort(key=lambda row: (row["record_id"], row["record_type"]))
             rows.sort(key=lambda row: row["timestamp"], reverse=direction == "desc")
             offset = (actual_page - 1) * page_size
@@ -10672,14 +10884,17 @@ class AxiomStore:
                 )
         finally:
             snapshot.close()
-
         items: list[dict[str, Any]] = []
         for row in page_rows:
             payload_json, payload_status = payloads.get(
                 (str(row["record_type"]), str(row["record_id"])),
                 (None, None),
             )
-            payload = _load(payload_json) if payload_json else {}
+            metadata: dict[str, Any] = {}
+            if str(row["record_type"]) == "state":
+                payload = _load(payload_json) if payload_json else {}
+            else:
+                payload, metadata = _dashboard_payload_projection(payload_json)
             item = {
                 "record_type": row["record_type"],
                 "record_id": row["record_id"],
@@ -10695,6 +10910,8 @@ class AxiomStore:
                 "created_at": _parse_datetime(row["created_at"]),
                 "updated_at": _parse_datetime(row["updated_at"]),
             }
+            if metadata:
+                item.update(_dashboard_payload_fields(metadata))
             if row["record_type"] == "state":
                 item["state"] = payload
             items.append(item)
@@ -10862,7 +11079,11 @@ class AxiomStore:
                 if str(row["record_type"]) == "state"
                 else row["payload_json"]
             )
-            payload = _load(payload_json) if payload_json else {}
+            metadata: dict[str, Any] = {}
+            if str(row["record_type"]) == "state":
+                payload = _load(payload_json) if payload_json else {}
+            else:
+                payload, metadata = _dashboard_payload_projection(payload_json)
             item = {
                 "record_type": row["record_type"],
                 "record_id": row["record_id"],
@@ -10878,6 +11099,8 @@ class AxiomStore:
                 "created_at": _parse_datetime(row["created_at"]),
                 "updated_at": _parse_datetime(row["updated_at"]),
             }
+            if metadata:
+                item.update(_dashboard_payload_fields(metadata))
             if row["record_type"] == "state":
                 item["state"] = payload
             items.append(item)
@@ -11293,6 +11516,120 @@ class AxiomStore:
             sqlite_retry(operation, operation_name=f"insert into {table}")
         except sqlite3.IntegrityError as exc:
             raise ValueError(f"duplicate immutable record in {table} ({key_columns})") from exc
+def _dashboard_bound_value(
+    value: Any,
+    *,
+    depth: int = 0,
+    max_depth: int = _DASHBOARD_PAYLOAD_MAX_DEPTH,
+    max_items: int = _DASHBOARD_PAYLOAD_MAX_ITEMS,
+    max_string: int = _DASHBOARD_PAYLOAD_MAX_STRING,
+) -> tuple[Any, bool]:
+    """Bound one decoded dashboard value without mutating the stored object."""
+    if isinstance(value, str):
+        if len(value) <= max_string:
+            return value, False
+        return value[: max(0, max_string - 3)] + "...", True
+    if depth >= max_depth:
+        return "<truncated>", True
+    if isinstance(value, Mapping):
+        result: dict[str, Any] = {}
+        truncated = len(value) > max_items
+        for index, (key, child) in enumerate(value.items()):
+            if index >= max_items:
+                break
+            bounded, child_truncated = _dashboard_bound_value(
+                child,
+                depth=depth + 1,
+                max_depth=max_depth,
+                max_items=max_items,
+                max_string=max_string,
+            )
+            result[str(key)] = bounded
+            truncated = truncated or child_truncated
+        return result, truncated
+    if isinstance(value, (list, tuple, set, frozenset)):
+        source = list(value)
+        result = []
+        truncated = len(source) > max_items
+        for child in source[:max_items]:
+            bounded, child_truncated = _dashboard_bound_value(
+                child,
+                depth=depth + 1,
+                max_depth=max_depth,
+                max_items=max_items,
+                max_string=max_string,
+            )
+            result.append(bounded)
+            truncated = truncated or child_truncated
+        return result, truncated
+    return value, False
+
+
+def _dashboard_payload_projection(
+    raw_json: Any,
+    *,
+    known: Mapping[str, Any] | None = None,
+    key_count: int | None = None,
+) -> tuple[Any, dict[str, Any]]:
+    """Decode a persisted payload only when it fits the dashboard budget.
+
+    The digest and byte count describe the exact stored JSON.  Oversized rows
+    retain only scalar fields selected by the SQL read boundary, while normal
+    rows are recursively bounded so nested diagnostics cannot amplify a page.
+    """
+    raw = str(raw_json or "")
+    encoded = raw.encode("utf-8")
+    metadata: dict[str, Any] = {
+        "sha256": hashlib.sha256(encoded).hexdigest(),
+        "bytes": len(encoded),
+        "key_count": key_count,
+        "truncated": False,
+    }
+    decoded: Any = None
+    if len(encoded) <= _DASHBOARD_PAYLOAD_MAX_BYTES:
+        try:
+            decoded = _load(raw)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            decoded = None
+    if isinstance(decoded, Mapping):
+        metadata["key_count"] = len(decoded) if key_count is None else key_count
+        payload, value_truncated = _dashboard_bound_value(decoded)
+        if isinstance(known, Mapping) and isinstance(payload, Mapping):
+            for key, value in known.items():
+                if value is not None and not isinstance(value, (Mapping, list, tuple, set, frozenset)):
+                    payload.setdefault(str(key), value)
+        metadata["item_count"] = len(decoded)
+        metadata["truncated"] = bool(value_truncated)
+        return payload, metadata
+    if decoded is not None:
+        payload, value_truncated = _dashboard_bound_value(decoded)
+        metadata["item_count"] = len(decoded) if isinstance(decoded, (list, tuple)) else 1
+        metadata["truncated"] = bool(value_truncated)
+        return payload, metadata
+    metadata["truncated"] = bool(raw) or len(encoded) > _DASHBOARD_PAYLOAD_MAX_BYTES
+    if isinstance(known, Mapping):
+        payload = {
+            str(key): value
+            for key, value in known.items()
+            if value is not None and not isinstance(value, (Mapping, list, tuple, set, frozenset))
+        }
+    else:
+        payload = {}
+    metadata["item_count"] = key_count
+    return payload, metadata
+
+
+def _dashboard_payload_fields(metadata: Mapping[str, Any], prefix: str = "payload") -> dict[str, Any]:
+    """Expose stable truncation evidence beside dashboard payload fields."""
+    return {
+        f"{prefix}_sha256": metadata.get("sha256"),
+        f"{prefix}_bytes": metadata.get("bytes", 0),
+        f"{prefix}_key_count": metadata.get("key_count"),
+        f"{prefix}_item_count": metadata.get("item_count"),
+        f"{prefix}_truncated": bool(metadata.get("truncated")),
+    }
+
+
 def _paper_state_projection_sql() -> str:
     """Build a compact JSON projection for dashboard paper-state rows."""
     position_count = "(SELECT COUNT(*) FROM json_each(state_json,'$.portfolio.positions'))"
@@ -11353,7 +11690,8 @@ def _dataset_metadata_projection(
         }
         for key, value in (known or {}).items():
             if value is not None and not isinstance(value, (Mapping, list, tuple)):
-                projection[str(key)] = value
+                bounded, _ = _dashboard_bound_value(value, depth=0)
+                projection[str(key)] = bounded
         return projection
     try:
         decoded = _load(raw)
@@ -11379,12 +11717,11 @@ def _dataset_metadata_projection(
         "timeframe",
         "universe_version",
     }
-    projection = {
-        str(key): value
-        for key, value in decoded.items()
-        if str(key) in selected_keys
-        and not isinstance(value, (Mapping, list, tuple))
-    }
+    projection = {}
+    for key, value in decoded.items():
+        if str(key) in selected_keys and not isinstance(value, (Mapping, list, tuple)):
+            bounded, _ = _dashboard_bound_value(value, depth=0)
+            projection[str(key)] = bounded
     projection.update(
         {
             "sha256": digest,
@@ -11405,19 +11742,19 @@ def _dataset_missing_range_projection(raw_json: Any) -> tuple[Any, bool]:
     try:
         decoded = _load(raw)
     except (TypeError, ValueError, json.JSONDecodeError):
-        return raw[:4096], bool(raw[4096:])
+        return ("<truncated>" if len(raw) > 4096 else raw), bool(len(raw) > 4096)
     if isinstance(decoded, Mapping):
-        projected = {
-            key: decoded[key]
-            for key in ("start", "end", "start_timestamp", "end_timestamp", "reason", "kind")
-            if key in decoded
-        }
+        projected = {}
+        for key in ("start", "end", "start_timestamp", "end_timestamp", "reason", "kind"):
+            if key in decoded:
+                bounded, _ = _dashboard_bound_value(decoded[key], depth=0)
+                projected[key] = bounded
         if projected:
             return projected, len(_dump(decoded)) > len(_dump(projected))
     if isinstance(decoded, str):
-        return decoded[:4096], len(decoded) > 4096
+        return ("<truncated>" if len(decoded) > 4096 else decoded), len(decoded) > 4096
     encoded = _dump(decoded)
-    return encoded[:4096], len(encoded) > 4096
+    return ("<truncated>" if len(encoded) > 4096 else encoded), len(encoded) > 4096
 
 
 def _worker_payload_projection(
@@ -11427,39 +11764,26 @@ def _worker_payload_projection(
     known: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Keep worker liveness fields while bounding persisted diagnostics."""
-    raw = str(raw_json or "{}")
-    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
-    projection = {
-        "sha256": digest,
-        "bytes": len(raw.encode("utf-8")),
-        "key_count": key_count,
-        "truncated": len(raw) > 262_144,
-    }
-    decoded: Any = None
-    if not projection["truncated"]:
-        try:
-            decoded = _load(raw)
-        except (TypeError, ValueError, json.JSONDecodeError):
-            decoded = None
-    if isinstance(decoded, Mapping):
-        payload = dict(decoded)
-    else:
-        payload = {
-            str(key): value
-            for key, value in (known or {}).items()
-            if value is not None and not isinstance(value, (Mapping, list, tuple))
+    payload_value, projection = _dashboard_payload_projection(
+        raw_json,
+        key_count=key_count,
+        known=known,
+    )
+    payload = dict(payload_value) if isinstance(payload_value, Mapping) else {}
+    crypto_enabled = (known or {}).get("crypto_enabled")
+    crypto_error = (known or {}).get("crypto_last_error")
+    if (
+        "crypto_paper" not in payload
+        and (crypto_enabled is not None or crypto_error is not None)
+    ):
+        payload["crypto_paper"] = {
+            key: value
+            for key, value in (
+                ("enabled", crypto_enabled),
+                ("last_error", crypto_error),
+            )
+            if value is not None
         }
-        crypto_enabled = (known or {}).get("crypto_enabled")
-        crypto_error = (known or {}).get("crypto_last_error")
-        if crypto_enabled is not None or crypto_error is not None:
-            payload["crypto_paper"] = {
-                key: value
-                for key, value in (
-                    ("enabled", crypto_enabled),
-                    ("last_error", crypto_error),
-                )
-                if value is not None
-            }
     payload["_projection"] = projection
     return payload, projection
 

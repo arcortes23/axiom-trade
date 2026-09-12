@@ -1625,9 +1625,11 @@ class HistoricalBootstrapper:
                 "history_endpoint": "CLOB /prices-history for the aligned YES token",
             }
         def _completeness() -> float:
-            # The processed set is a subset of the discovered universe by
-            # construction.  Keep the bound as a defensive guard for any
-            # malformed legacy payload while preserving that invariant.
+            # Unknown markets remain outside the observed universe whenever
+            # discovery has not reached a clean terminal page.  Never expose
+            # all processed constituents as complete coverage in that state.
+            if not discovery_complete:
+                return 0.0
             discovered_ids.update(processed)
             return min(
                 1.0,
@@ -1957,15 +1959,20 @@ class HistoricalBootstrapper:
                             )
                     elif values is not None:
                         rejected_count = 0
-                        if isinstance(values, Sequence) and not isinstance(
+                        values_valid = isinstance(values, Sequence) and not isinstance(
                             values, (str, bytes, Mapping)
-                        ):
+                        )
+                        if values_valid:
                             for item in values:
                                 market_id = str(getattr(item, "market_id", "")).strip()
                                 if market_id:
                                     discovered_ids.add(market_id)
                                 else:
                                     rejected_count += 1
+                        else:
+                            # An unexpected provider response is malformed
+                            # discovery, not an empty complete universe.
+                            rejected_count = 1
                         if rejected_count:
                             errors.append(
                                 "polymarket market discovery: "
@@ -2322,7 +2329,12 @@ class HistoricalBootstrapper:
                 starts.append(start)
             if end is not None:
                 ends.append(end)
-        aggregate_version = _stable_hash(market_versions)
+        aggregate_version = _stable_hash(
+            {
+                "market_versions": market_versions,
+                "discovery_complete": bool(discovery_complete),
+            }
+        )
         aggregate_start = min(starts) if starts else None
         aggregate_end = max(ends) if ends else None
         aggregate_has_order_book = bool(market_versions) and (
@@ -2346,6 +2358,8 @@ class HistoricalBootstrapper:
             "historical_order_book_available": aggregate_has_order_book,
             "provenance_version": "dataset-provenance-v1",
             "policy_version": "prediction-integrity-v1",
+            "discovery_complete": bool(discovery_complete),
+            "coverage_status": "COMPLETE" if discovery_complete else "PARTIAL",
             "requested_coverage": _coverage(),
             "honest_gaps": [
                 {

@@ -433,13 +433,54 @@ class Phase42PolymarketTests(unittest.TestCase):
                 state["discovered_market_ids"],
                 ["m-crypto", "m-politics"],
             )
+            aggregate = store.load_dataset_catalog("Polymarket-historical")
+            self.assertIsNotNone(aggregate)
+            assert aggregate is not None
+            self.assertEqual(aggregate["completeness"], 0.0)
+            aggregate_metadata = aggregate["metadata"]
+            self.assertEqual(aggregate_metadata["coverage_status"], "PARTIAL")
+            self.assertFalse(aggregate_metadata["discovery_complete"])
             complete = bootstrapper.bootstrap_polymarket(max_markets=2, resume=True)
-            self.assertEqual(complete.status, "NO_NEW_DATA")
+
+            self.assertEqual(complete.status, "COMPLETE")
             final_state = store.load_dataset_bootstrap_state("Polymarket-historical")
             self.assertIsNotNone(final_state)
             assert final_state is not None
             self.assertTrue(final_state["discovery_complete"])
             self.assertEqual(provider.page_calls, [None, None])
+    def test_malformed_legacy_discovery_shape_stays_partial(self) -> None:
+        class MalformedLegacyPolymarket(FakePolymarket):
+            def __init__(self) -> None:
+                super().__init__()
+                self.market_page = None
+
+            def markets(
+                self,
+                active: bool = True,
+                *,
+                limit: int | None = None,
+            ) -> object:
+                return {"unexpected": "mapping"}
+
+        with AxiomStore(":memory:") as store:
+            bootstrapper = HistoricalBootstrapper(
+                store,
+                prediction_provider=MalformedLegacyPolymarket(),
+                sleep=lambda _: None,
+                max_attempts=1,
+            )
+            report = bootstrapper.bootstrap_polymarket(max_markets=2)
+            self.assertEqual(report.status, "PARTIAL")
+            self.assertEqual(report.completeness, 0.0)
+            state = store.load_dataset_bootstrap_state("Polymarket-historical")
+            self.assertIsNotNone(state)
+            assert state is not None
+            self.assertFalse(state["discovery_complete"])
+            aggregate = store.load_dataset_catalog("Polymarket-historical")
+            self.assertIsNotNone(aggregate)
+            assert aggregate is not None
+            self.assertEqual(aggregate["completeness"], 0.0)
+            self.assertEqual(aggregate["metadata"]["coverage_status"], "PARTIAL")
 
     def test_polymarket_query_scope_migration_preserves_processed_constituents(self) -> None:
         class LegacyPolymarket(FakePolymarket):
@@ -555,8 +596,8 @@ class Phase42PolymarketTests(unittest.TestCase):
                 )
                 self.assertEqual(reset.status, "SCHEDULED")
                 self.assertEqual(reset.records, 10)
-                self.assertEqual(reset.completeness, 1.0)
-                self.assertFalse(reset.metadata["changed"])
+                self.assertEqual(reset.completeness, 0.0)
+                self.assertTrue(reset.metadata["changed"])
                 self.assertEqual(provider.page_calls, ["legacy-cursor"])
                 reset_state = store.load_dataset_bootstrap_state(
                     "Polymarket-historical"
@@ -567,10 +608,12 @@ class Phase42PolymarketTests(unittest.TestCase):
                 self.assertIsNone(reset_state["discovery_cursor"])
                 self.assertEqual(reset_state["discovered_market_ids"], legacy_ids)
                 self.assertEqual(reset_state["processed_market_ids"], legacy_ids)
-                self.assertEqual(
-                    store.load_dataset_catalog("Polymarket-historical"),
-                    prior_aggregate,
-                )
+                reset_aggregate = store.load_dataset_catalog("Polymarket-historical")
+                self.assertIsNotNone(reset_aggregate)
+                assert reset_aggregate is not None
+                self.assertNotEqual(reset_aggregate["dataset_version"], prior_aggregate["dataset_version"])
+                self.assertEqual(reset_aggregate["row_count"], 10)
+                self.assertEqual(reset_aggregate["completeness"], 0.0)
 
                 published = bootstrapper.bootstrap_polymarket(
                     max_markets=9,

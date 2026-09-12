@@ -5763,6 +5763,17 @@ class AutonomousResearchProcessor:
         metadata_source_type = str(metadata.get("source_type", "")).strip().upper()
         if metadata_source_type and metadata_source_type != "HISTORICAL":
             invalid("campaign dataset metadata source_type is not HISTORICAL")
+        if catalog.get("discovery_complete") is False:
+            invalid("campaign dataset catalog discovery coverage is incomplete")
+        coverage_status = str(metadata.get("coverage_status", "")).strip().upper()
+        if coverage_status and coverage_status != "COMPLETE":
+            invalid("campaign dataset catalog coverage status is not COMPLETE")
+        requested_coverage = metadata.get("requested_coverage")
+        if (
+            isinstance(requested_coverage, Mapping)
+            and requested_coverage.get("discovery_complete") is not True
+        ):
+            invalid("campaign dataset requested coverage is incomplete")
 
         declared = source if isinstance(source, Mapping) else {}
         selector = declared.get("dataset_selector")

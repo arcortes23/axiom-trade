@@ -264,6 +264,126 @@ def _bounded_value(value: Any, *, depth: int = 0) -> Any:
     if isinstance(value, float):
         return value
     return _jsonable(value)
+_HTTP_JSON_MAX_DEPTH = 8
+_HTTP_JSON_MAX_ITEMS = 64
+_HTTP_JSON_MAX_STRING = 4_096
+_HTTP_JSON_MAX_KEYS = 128
+_HTTP_JSON_MAX_BYTES = 262_144
+
+
+def _http_bound_value(
+    value: Any,
+    *,
+    depth: int = 0,
+    stats: dict[str, int | bool],
+) -> Any:
+    """Bound arbitrary GET output without recursively materializing raw JSON."""
+    if depth >= _HTTP_JSON_MAX_DEPTH:
+        stats["truncated"] = True
+        stats["omitted_items"] = int(stats.get("omitted_items", 0)) + 1
+        return "<truncated>"
+    if isinstance(value, Mapping):
+        result: dict[str, Any] = {}
+        for index, (key, child) in enumerate(value.items()):
+            if index >= _HTTP_JSON_MAX_KEYS:
+                stats["truncated"] = True
+                stats["omitted_items"] = int(stats.get("omitted_items", 0)) + len(value) - index
+                break
+            result[str(key)] = _http_bound_value(child, depth=depth + 1, stats=stats)
+        return result
+    if isinstance(value, (list, tuple, set, frozenset)):
+        source = list(value)
+        result = [
+            _http_bound_value(child, depth=depth + 1, stats=stats)
+            for child in source[:_HTTP_JSON_MAX_ITEMS]
+        ]
+        if len(source) > _HTTP_JSON_MAX_ITEMS:
+            stats["truncated"] = True
+            stats["omitted_items"] = int(stats.get("omitted_items", 0)) + len(source) - _HTTP_JSON_MAX_ITEMS
+        return result
+    if isinstance(value, str):
+        if len(value) <= _HTTP_JSON_MAX_STRING:
+            return value
+        stats["truncated"] = True
+        stats["omitted_items"] = int(stats.get("omitted_items", 0)) + 1
+        return "<truncated>"
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, bool) or value is None or isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, Decimal):
+        return format(value, "f")[:_HTTP_JSON_MAX_STRING]
+    if is_dataclass(value):
+        try:
+            return _http_bound_value(to_record(value), depth=depth, stats=stats)
+        except (TypeError, ValueError):
+            return _http_bound_value(asdict(value), depth=depth, stats=stats)
+    try:
+        converted = value.value if hasattr(value, "value") else str(value)
+    except Exception:
+        converted = "<unserializable>"
+    return _http_bound_value(converted, depth=depth, stats=stats)
+
+
+def _http_json_bytes(payload: Any) -> bytes:
+    stats: dict[str, int | bool] = {"truncated": False, "omitted_items": 0}
+    bounded = _http_bound_value(payload, stats=stats)
+    metadata = {
+        "truncated": bool(stats["truncated"]),
+        "omitted_items": int(stats["omitted_items"]),
+        "max_depth": _HTTP_JSON_MAX_DEPTH,
+        "max_items": _HTTP_JSON_MAX_ITEMS,
+        "max_string": _HTTP_JSON_MAX_STRING,
+        "max_bytes": _HTTP_JSON_MAX_BYTES,
+    }
+    if isinstance(bounded, Mapping):
+        bounded = dict(bounded)
+    else:
+        bounded = {"value": bounded}
+    body = json.dumps(bounded, sort_keys=True, indent=2, allow_nan=False).encode("utf-8")
+    if len(body) <= _HTTP_JSON_MAX_BYTES and not stats["truncated"]:
+        return body
+    if len(body) <= _HTTP_JSON_MAX_BYTES:
+        bounded["_response_projection"] = metadata
+        return json.dumps(bounded, sort_keys=True, indent=2, allow_nan=False).encode("utf-8")
+    # A bounded top-level scalar fallback preserves IDs/counts/status while
+    # dropping nested sections that would otherwise exceed the hard byte cap.
+    compact: dict[str, Any] = {}
+    byte_metadata = {
+        **metadata,
+        "truncated": True,
+        "byte_cap_applied": True,
+    }
+    if isinstance(bounded, Mapping):
+        for key, value in bounded.items():
+            if str(key) == "_response_projection":
+                continue
+            if not (isinstance(value, (str, int, float, bool)) or value is None):
+                continue
+            candidate = dict(compact)
+            candidate[str(key)] = value
+            candidate["_response_projection"] = byte_metadata
+            candidate_body = json.dumps(candidate, sort_keys=True, indent=2, allow_nan=False).encode("utf-8")
+            if len(candidate_body) > _HTTP_JSON_MAX_BYTES:
+                stats["omitted_items"] = int(stats.get("omitted_items", 0)) + 1
+                continue
+            compact[str(key)] = value
+    byte_metadata["omitted_items"] = int(stats.get("omitted_items", 0))
+    compact["_response_projection"] = byte_metadata
+    body = json.dumps(compact, sort_keys=True, indent=2, allow_nan=False).encode("utf-8")
+    if len(body) <= _HTTP_JSON_MAX_BYTES:
+        return body
+    # The metadata-only fallback is intentionally tiny and always truthful.
+    return json.dumps(
+        {"value": "<truncated>", "_response_projection": byte_metadata},
+        sort_keys=True,
+        indent=2,
+        allow_nan=False,
+    ).encode("utf-8")
+
+
 _BINANCE_SECRET_KEY = re.compile(
     r"(?:secret|password|passwd|token|api[_-]?key|apikey|private[_-]?key|private|mnemonic|passphrase|authorization|bearer|credential)",
     re.IGNORECASE,
@@ -1270,13 +1390,21 @@ class DashboardData:
         markets: list[dict[str, Any]] = []
         if self.store is not None:
             try:
-                tracked = self.store.tracked_polymarket_markets(active_only=True, include_payload=True)
+                tracked = self.store.tracked_polymarket_markets(active_only=True, include_payload=False, limit=1000)
                 active_ids = {
-                    str(item.get("market_id"))
+                    str(item.get("market_id") if isinstance(item, Mapping) else item)
                     for item in tracked
-                    if isinstance(item, Mapping) and item.get("market_id")
+                    if (
+                        isinstance(item, Mapping)
+                        and item.get("market_id")
+                    )
+                    or (not isinstance(item, Mapping) and str(item).strip())
                 }
-                snapshots = self.store.load_latest_polymarket_snapshots(active_ids, limit=1000)
+                latest_loader = getattr(self.store, "load_latest_polymarket_snapshots_dashboard", None)
+                if callable(latest_loader):
+                    snapshots = latest_loader(active_ids, limit=1000)
+                else:
+                    snapshots = self.store.load_latest_polymarket_snapshots(active_ids, limit=1000)
             except AttributeError:
                 snapshots = self.store.load_polymarket_snapshots(limit=1000, latest=True)
                 active_ids = {
@@ -2079,8 +2207,20 @@ class DashboardData:
     def dataset_detail(self, dataset_id: str) -> dict[str, Any]:
         identifier = str(dataset_id)
         record = None
-        if self.store is not None and callable(getattr(self.store, "load_dataset_catalog", None)):
-            record = self.store.load_dataset_catalog(identifier)
+        dashboard_loader = (
+            getattr(self.store, "load_dataset_catalog_dashboard", None)
+            if self.store is not None
+            else None
+        )
+        legacy_loader = (
+            getattr(self.store, "load_dataset_catalog", None)
+            if self.store is not None
+            else None
+        )
+        if callable(dashboard_loader):
+            record = dashboard_loader(identifier)
+        elif callable(legacy_loader):
+            record = legacy_loader(identifier)
         if record is None:
             catalogs = self._configured("datasets")
             if isinstance(catalogs, Mapping):
@@ -2324,7 +2464,11 @@ class DashboardData:
         configured = self._configured("paper")
         if configured is not None:
             return configured
-        states = self.store.list_paper_states() if self.store is not None and callable(getattr(self.store, "list_paper_states", None)) else []
+        states = (
+            self.store.list_paper_states(limit=100)
+            if self.store is not None and callable(getattr(self.store, "list_paper_states", None))
+            else []
+        )
         return {"available": bool(states), "states": states, "live_execution": False}
 
     def opportunities_data(self) -> Any:
@@ -2345,7 +2489,14 @@ class DashboardData:
         # This endpoint is a storage projection.  Process identity and lock
         # ownership are verified by the supervisor/action paths, never by a
         # dashboard refresh.
-        workers = self.store.list_worker_states(limit=2048)
+        worker_count_method = getattr(self.store, "worker_state_count", None)
+        worker_total = (
+            int(worker_count_method())
+            if callable(worker_count_method)
+            else None
+        )
+        worker_limit = 128
+        workers = self.store.list_worker_states(limit=worker_limit)
         now = ensure_utc(self.clock())
         statuses: list[str] = []
         normalized_workers: list[dict[str, Any]] = []
@@ -2420,26 +2571,32 @@ class DashboardData:
             status = "idle"
         else:
             status = "not_started"
-        summary = research_summary(self.store, limit=20)
-        try:
-            current_health = self.dataset_health()
-        except Exception as exc:
-            current_health = {
-                "grade": "F",
-                "reason_code": "HEALTH_UNAVAILABLE",
-                "error": str(exc),
-            }
-        health_fields = self._health_status_fields(
-            normalized_workers,
-            current_health if isinstance(current_health, Mapping) else {},
+        # Do not rebuild collector health or research accounting from large
+        # history tables during a status refresh.  Persisted worker health is
+        # the truthful local read projection; detailed health remains on its
+        # dedicated endpoint.
+        summary = {"autonomous": {}, "hermes": {}}
+        current_health = dict(health_payload) if isinstance(health_payload, Mapping) else {}
+        health_fields = self._health_status_fields(normalized_workers, current_health)
+        cycles_loader = getattr(self.store, "list_collection_cycles_dashboard", None)
+        cycles = (
+            cycles_loader(limit=20)
+            if callable(cycles_loader)
+            else self.store.list_collection_cycles(limit=20)
         )
+        queue = self.store.research_queue_stats()
         return {
             "status": status,
             "summary": self.store.dashboard_summary(),
-            "cycles": self.store.list_collection_cycles(limit=20),
-            "queue": self.store.research_queue_stats(),
+            "cycles": cycles,
+            "queue": queue,
             "workers": normalized_workers,
             "normalized_workers": normalized_workers,
+            "workers_total": worker_total if worker_total is not None else len(normalized_workers),
+            "workers_returned": len(normalized_workers),
+            "workers_truncated": (
+                worker_total is not None and worker_total > len(normalized_workers)
+            ),
             "autonomous": summary.get("autonomous", {}),
             "hermes": summary.get("hermes", {}),
             "health_grade": health_grade or health_fields["health_grade"],
@@ -2656,7 +2813,17 @@ class DashboardData:
         configured = self._configured("datasets")
         if configured is not None:
             return dict(configured) if isinstance(configured, Mapping) else {"value": configured}
-        if self.store is None or not callable(getattr(self.store, "list_dataset_catalog", None)):
+        dashboard_lister = (
+            getattr(self.store, "list_dataset_catalog_dashboard", None)
+            if self.store is not None
+            else None
+        )
+        legacy_lister = (
+            getattr(self.store, "list_dataset_catalog", None)
+            if self.store is not None
+            else None
+        )
+        if self.store is None or not (callable(dashboard_lister) or callable(legacy_lister)):
             return {
                 "historical": [],
                 "forward": [],
@@ -2664,7 +2831,11 @@ class DashboardData:
                 "forward_count": 0,
                 "live_execution": False,
             }
-        records = self.store.list_dataset_catalog(limit=_MAX_SIZE_FALLBACK)
+        records = (
+            dashboard_lister(limit=_MAX_SIZE_FALLBACK)
+            if callable(dashboard_lister)
+            else legacy_lister(limit=_MAX_SIZE_FALLBACK)
+        )
         historical = [item for item in records if str(item.get("source_type", "")).upper() == "HISTORICAL"]
         forward = [item for item in records if str(item.get("source_type", "")).upper() == "FORWARD_COLLECTED"]
         return {
@@ -3196,17 +3367,29 @@ class DashboardData:
             initial = _number_or_zero(portfolio.get("initial_cash", state.get("initial_cash", 0.0)))
             pnl = equity - initial if initial else _number_or_zero(state.get("forward_pnl"))
             ledger = []
-            if callable(getattr(self.store, "list_paper_bet_ledger", None)):
-                ledger = self.store.list_paper_bet_ledger(str(item.get("experiment_id", "")), limit=1000)
-            for bet in ledger:
-                payload = bet.get("payload", {}) if isinstance(bet, Mapping) else {}
-                pnl_value = _number_or_zero(payload.get("net_pnl")) if isinstance(payload, Mapping) else 0.0
-                total_pnl += pnl_value
-                total_bets += 1
-                if pnl_value > 0:
-                    winning_bets += 1
+            ledger_count = 0
+            ledger_summary_loader = getattr(self.store, "paper_bet_ledger_summary", None)
+            if callable(ledger_summary_loader):
+                ledger_summary = ledger_summary_loader(str(item.get("experiment_id", "")))
+                if isinstance(ledger_summary, Mapping):
+                    ledger_count = max(0, int(ledger_summary.get("count", 0) or 0))
+                    total_pnl += _number_or_zero(ledger_summary.get("net_pnl"))
+                    winning_bets += max(0, int(ledger_summary.get("wins", 0) or 0))
+                    total_bets += ledger_count
+            else:
+                ledger_loader = getattr(self.store, "list_paper_bet_ledger", None)
+                if callable(ledger_loader):
+                    ledger = ledger_loader(str(item.get("experiment_id", "")), limit=1000)
+                for bet in ledger:
+                    payload = bet.get("payload", {}) if isinstance(bet, Mapping) else {}
+                    pnl_value = _number_or_zero(payload.get("net_pnl")) if isinstance(payload, Mapping) else 0.0
+                    total_pnl += pnl_value
+                    total_bets += 1
+                    ledger_count += 1
+                    if pnl_value > 0:
+                        winning_bets += 1
             total_equity += equity
-            if not ledger:
+            if ledger_count == 0:
                 total_pnl += pnl
             rows.append(
                 {
@@ -3221,7 +3404,7 @@ class DashboardData:
                     "open_position_count": position_count,
                     "open_positions_returned": position_returned,
                     "open_positions_truncated": positions_truncated,
-                    "resolved_bets": len(ledger),
+                    "resolved_bets": ledger_count,
                     "paper_only": True,
 
                 }
@@ -7042,7 +7225,7 @@ class _DashboardHandler(BaseHTTPRequestHandler):
 
     def _send(self, status: int, payload: Any, content_type: str = "application/json; charset=utf-8") -> None:
         try:
-            body = payload.encode("utf-8") if isinstance(payload, str) else json.dumps(_jsonable(payload), sort_keys=True, indent=2, allow_nan=False).encode("utf-8")
+            body = payload.encode("utf-8") if isinstance(payload, str) else _http_json_bytes(payload)
             self.send_response(status)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
