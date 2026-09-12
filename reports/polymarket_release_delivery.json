@@ -1,7 +1,7 @@
 {
 "status": "NOT_TRADING_READY",
   "trading_ready": false,
-  "trading_readiness_blocker": "LEGACY_SCOPE_SUCCESSOR_REQUIRED",
+  "trading_readiness_blocker": "NO_SUPPORTED_EDGE_NO_ELIGIBLE_FROZEN_CANDIDATE_NO_FRESH_ELIGIBLE_CURRENT_EVALUATION",
   "deployment_state": {
     "deployment": "DEPLOYED",
     "live_control": "DISARMED",
@@ -13,8 +13,8 @@
     "main",
     "feature/polymarket-one-click-canary"
   ],
-  "deployed_revision": "5ad16753466636c52a161ef6c9cebc0a51fb5d98",
-  "source_revision": "5ad16753466636c52a161ef6c9cebc0a51fb5d98",
+  "deployed_revision": "e159e8b",
+  "source_revision": "e159e8b",
   "superseded_revisions": [
     {
       "revision": "72330e0bc87135e1f22836b9643e601ad533200f",
@@ -24,7 +24,12 @@
     {
       "revision": "6b9faffdf45f85e9ea885d0d9c805174f38f5838",
       "superseded_by": "5ad16753466636c52a161ef6c9cebc0a51fb5d98",
-      "reason": "Prior report revision superseded by the corrected trading-readiness evidence and durable recovery implementation."
+      "reason": "Prior report revision superseded by corrected trading-readiness evidence and durable recovery implementation."
+    },
+    {
+      "revision": "5ad16753466636c52a161ef6c9cebc0a51fb5d98",
+      "superseded_by": "e159e8b",
+      "reason": "Prior deployed report revision superseded by the measured filter-separation, stale-binding, and Paper Portfolio UI deployment."
     }
   ],
   "development_root": "C:/Users/User/projects/axiom-polymarket-release",
@@ -51,7 +56,15 @@
     "Historical contemporaneous lifecycle metadata coverage 0/18141; forward prior-or-equal metadata coverage 68793/68793.",
     "Verified bounded mixed archive export SHA256 448e19a5895ca8e295fcef73d512f509d128f66bd455322799f88d25eab57868: 4096 historical and 4091 forward snapshots plus eight metadata anchors.",
     "Remote main branch is unprotected; publication must still fetch, integrate and pass full gates.",
-    "Corrected an earlier API assumption after re-reading https://docs.polymarket.com/api-reference/core/get-trades-for-a-user-or-markets: public /trades supports start/end epoch-second windows, with limit/offset capped at 10000. Preserve supported window pagination; do not remove end parameters."
+    "Corrected an earlier API assumption after re-reading https://docs.polymarket.com/api-reference/core/get-trades-for-a-user-or-markets: public /trades supports start/end epoch-second windows, with limit/offset capped at 10000. Preserve supported window pagination; do not remove end parameters.",
+    "The measured deployed source is e159e8b. Commit 6eeb0f4 separated research filters and rejected stale paper bindings; e159e8b restored the missing Paper Portfolio view.",
+    "Regression proof for the deployed source: 1125 unittests passed (OK), 3 skipped; the preceding 6eeb0f4 source gate was 1124 OK with 3 skipped.",
+    "The prior hotel-only resolver and TLS observations are historical network evidence only. They are not the current home-network conclusion and do not prove the cause of the hotel failures.",
+    "On 2026-09-12, the home Windows C:/Users/User/projects/axiom/.venv CPython 3.11.16 runtime resolved and reached Gamma and CLOB successfully with DNS and TLS verification.",
+    "Canonical scope resolution is time-bound to sha256:f5182dca8b0e0dedf715fdc29bd5d522c7a193a04197f2308ee414aa0d2b164a at 2026-09-12T08:54:03.757240Z: 15 matched, 5 SPREAD_MISMATCH, 0 deferred.",
+    "Automatic exact-candidate paper observations are five NO_SIGNAL events; exact fills, exits, round trips, and settled bets remain zero with paper cash and equity at 10000 USD.",
+    "A later dynamic resolution observed 20 matched markets; it is recorded as continued collection dynamics and does not overwrite the time-bound 15/5 qualification binding.",
+    "The next action is automatic research and collection. No user activation or enablement action is recommended."
   ],
   "verification": [
     {
@@ -707,197 +720,453 @@
   },
   "trading_readiness_acceptance": {
     "trading_ready": false,
+    "ready_for_live": false,
     "status": "NOT_TRADING_READY",
-    "exact_blocker": "LEGACY_SCOPE_SUCCESSOR_REQUIRED",
-    "source_revision": "5ad16753466636c52a161ef6c9cebc0a51fb5d98",
-    "deployed_revision": "5ad16753466636c52a161ef6c9cebc0a51fb5d98",
-    "target_identity": {
-      "candidate_id": "candidate-81d5cd48736c1d2d480f22f6",
-      "candidate_type": "PAPER_FORWARD",
-      "legacy_candidate": true,
-      "plan_id": "plan-08ec30ac4b8aa21caa7888ef",
-      "canonical_market_scope": null,
-      "canonical_market_scope_hash": null,
-      "canonical_market_scope_version": null,
-      "scope_resolution_count": 0,
-      "authenticated_successor": null,
-      "successor_candidate_id": null,
-      "successor_present": false
+    "exact_blocker": "NO_SUPPORTED_EDGE_NO_ELIGIBLE_FROZEN_CANDIDATE_NO_FRESH_ELIGIBLE_CURRENT_EVALUATION",
+    "reason": "No supported edge; no eligible frozen candidate; no fresh eligible current evaluation.",
+    "source_revision": "e159e8b",
+    "deployed_revision": "e159e8b",
+    "source_changes": {
+      "filter_and_binding_fix": {
+        "commit": "6eeb0f4",
+        "message": "Separate research filters and reject stale paper bindings",
+        "effect": "Research filters are kept separate from execution bindings and stale paper bindings are rejected rather than reused."
+      },
+      "paper_portfolio_ui_fix": {
+        "commit": "e159e8b",
+        "effect": "Restored the missing deployed Paper Portfolio view."
+      },
+      "regression_proof": {
+        "source_revision": "e159e8b",
+        "result": "PASS",
+        "unittests_ok": 1125,
+        "skipped": 3,
+        "preceding_fix_revision": {
+          "source_revision": "6eeb0f4",
+          "unittests_ok": 1124,
+          "skipped": 3
+        }
+      }
+    },
+    "network_history": {
+      "historical_hotel_observation": {
+        "observed_at": "2026-09-12T00:51:40.810996+00:00",
+        "status": "HISTORICAL_ONLY",
+        "active_wifi_resolver": "192.168.10.254",
+        "reported_gamma_ip": "161.49.61.85",
+        "reported_result": "Intermittent DNS, TLS, or getaddrinfo failures during the hotel-network run.",
+        "current_home_cause_proven": false,
+        "superseded_by": "timestamped_home_windows_verification"
+      },
+      "timestamped_home_windows_verification": {
+        "verified_at": "2026-09-12T08:54:03.757240Z",
+        "network": "home Windows",
+        "runtime": "C:/Users/User/projects/axiom/.venv/Scripts/python.exe",
+        "python": "CPython 3.11.16",
+        "cwd": "C:/Users/User/projects/axiom",
+        "imports": "C:/Users/User/projects/axiom",
+        "proxy_environment": "none",
+        "dns": {
+          "result": "PASS",
+          "hosts": [
+            "gamma-api.polymarket.com",
+            "clob.polymarket.com"
+          ],
+          "a_records": [
+            "172.64.153.51",
+            "104.18.34.205"
+          ],
+          "aaaa_records": "expected"
+        },
+        "tls": {
+          "result": "PASS",
+          "protocol": "TLS1.3",
+          "all_resolved_addresses_verified": true
+        },
+        "gamma": {
+          "request": "GET https://gamma-api.polymarket.com/markets/keyset?limit=1&closed=false&include_tag=true",
+          "http_status": 200,
+          "latency_ms": 60.7,
+          "market_id": "559651",
+          "condition_id": "0xa467b14d51f01b957109d9cbb1d6c124fab2a089d52ed8f471d23c2812e743b7",
+          "yes_token_id": "32338220190071351435772801779725302244575775216413325951443816017994629993401",
+          "no_token_id": "25659310674993675562345759665114759892400026242514633218387667107987341231962",
+          "adapter_errors": 0
+        },
+        "clob": {
+          "request": "GET https://clob.polymarket.com/book for the Gamma YES token",
+          "http_status": 200,
+          "latency_ms": 251.9,
+          "bids": 36,
+          "asks": 130,
+          "identity_matched": true,
+          "adapter_errors": 0
+        },
+        "orders_or_account_mutations": false,
+        "network_configuration_changed": false
+      }
+    },
+    "process_control_settings": {
+      "ownership": {
+        "node_count": 1,
+        "operator_count": 1,
+        "one_node_one_operator": true,
+        "node_supervisor_pid": 22064,
+        "node_child_pid": 21664,
+        "operator_pid": 38240,
+        "operator_listener_pid": 25876,
+        "listener": "127.0.0.1:8187"
+      },
+      "control": {
+        "state": "DISARMED",
+        "control_generation": 12,
+        "autonomous_canary_enabled": false,
+        "live_orders": false,
+        "live_activation": false,
+        "account_mutation": false
+      },
+      "settings": {
+        "target_notional_usd": "1.00",
+        "max_all_in_buy_usd": "1.00",
+        "max_exposure_usd": "5.00",
+        "max_aggregate_open_cost_usd": "5.00",
+        "max_daily_loss_usd": "2.00",
+        "max_open_positions": 3,
+        "max_orders_per_day": 5,
+        "max_submitted_orders_per_day": 5,
+        "max_slippage_bps": 100,
+        "max_gross_daily_buy_usd": "5.00",
+        "max_fee_reserve_usd": "0.01"
+      },
+      "process_state": "The single owned node and operator remained deployed with live control disarmed."
+    },
+    "canonical_proposal": {
+      "hypothesis_id": "hypothesis-polymarket-mean-reversion-canonical-20260912T071513Z-2bcc4f240f",
+      "experiment_family": "mean_reversion",
+      "template": "mean_reversion",
+      "research_mode": "PRICE_PROXY_RESEARCH",
+      "paper_only": true,
+      "dataset_id": "Polymarket-historical",
+      "dataset_version": "sha256:9a831357e3f4016ad2c4f05d9bb11a98583ad94a2da36873b56e2b7db786a9ea",
+      "plan_id": "plan-canonical-successor-20260912T0835Z-0b2581b3ebbc4ef8",
+      "plan_hash": "sha256:532068e319df07de676af620c35cd8e7cffa7ccba86361bb0dd112a2a9e79dee",
+      "candidate_id": "candidate-048a67b4b0992e2fc8ee5b26",
+      "variant_id": "variant-68c7751290855bb4c5b72395",
+      "scope_hash": "sha256:b8509e68253059a63beb0a13892b56bc3f898c0abca49ca73d7212b379473866",
+      "scope_version": "1",
+      "scope_policy": {
+        "mode": "RULE_BASED_MARKETS",
+        "instrument": "POLYMARKET",
+        "filters": {
+          "min_liquidity": 1.0,
+          "max_spread": 0.5
+        },
+        "provenance": "canonical"
+      }
     },
     "qualification": {
-      "qualified": false,
-      "promotable": false,
-      "decision": "NOT_PROMOTABLE",
-      "blocker": "LEGACY_SCOPE_SUCCESSOR_REQUIRED",
-      "reason": "The exact target is a legacy PAPER_FORWARD candidate without canonical market scope, without any scope resolution, and without an authenticated successor."
-    },
-    "paper_evidence": {
-      "paper_observations": 3485,
-      "paper_execution_events": 3485,
-      "execution_event_breakdown": {
-        "NO_SIGNAL": 1875,
-        "FULL_FILL_BUY": 1610
+      "variants_tested": 1,
+      "selected_candidate_ids": [],
+      "supported_edge": false,
+      "accepted": false,
+      "split": {
+        "train": 10869,
+        "validation": 3638,
+        "holdout": 3634
       },
-      "distinct_buy_fill_ids": 1610,
-      "distinct_buy_order_ids": 1610,
-      "sell_fills": 0,
-      "paper_bet_ledger_settled_bets": 0,
-      "settled_or_resolved_bets": 0
+      "validation_expectancy": -0.01218866641875449,
+      "validation_filled_trades": 17,
+      "validation_sample_count": 3638,
+      "train_sample_count": 10869,
+      "holdout_sample_count": 3634,
+      "holdout_evaluated": false,
+      "holdout_used_for_selection": false,
+      "holdout_selection_fence": "validation_only",
+      "holdout_locked": true,
+      "rejection_reason": "negative_validation_expectancy",
+      "rejection_reason_code": "NEGATIVE_VALIDATION_EXPECTANCY",
+      "decision": "NO_SUPPORTED_EDGE"
     },
-    "fill_vs_trade_semantics": {
-      "fills_are_execution_events": true,
-      "paper_fills_are_completed_trades": false,
-      "completed_round_trips": null,
-      "completed_round_trips_status": "NON_DERIVABLE",
-      "settled_or_resolved_bets": 0,
-      "interpretation": "The 1610 BUY fills are execution events, not completed trades. With zero SELL fills and zero settled paper_bet_ledger bets, completed round trips are NON_DERIVABLE and resolved bets are zero."
-    },
-    "promotion_evidence": {
-      "resolved": 0,
-      "duration_seconds": 509245,
-      "required_duration_seconds": 604800,
-      "duration_comparison": "509245 < 604800",
-      "regimes": 0,
-      "forward_roi": null,
-      "expectancy": null,
-      "pnl": null,
-      "confidence": null,
-      "stability": null,
-      "calibration": null,
-      "promotable": false
-    },
-    "historical_static_tuple": {
-      "samples": 830,
-      "signals": 138,
-      "entries": 27,
-      "exits": 13,
-      "fills": 40,
-      "roi": -0.0035367,
-      "candidate_id": null,
-      "plan_id": null,
-      "matching_db_payload": false,
-      "superseded": true,
-      "scope_linkage": "UNBOUND",
-      "status": "HISTORICAL_RESEARCH_ONLY",
-      "candidate_acceptance": false,
-      "negative_roi_is_positive_qualification": false,
-      "attribution": "MUST_NOT_BE_ATTRIBUTED_TO_TARGET_OR_CALLED_FROZEN_OR_CURRENT_SCOPE_EVIDENCE",
-      "supersession_reason": "The prior mean-reversion static tuple has no candidate_id or plan_id and no matching database payload. Its negative ROI is retained only as unbound historical research."
-    },
-    "independent_candidate_exclusion": {
-      "candidate_id": "10d833",
-      "canonical": true,
-      "may_lend_scope": false,
-      "may_lend_metrics": false,
-      "used_for_target_acceptance": false
-    },
-    "provider_dns_diagnosis": {
-      "active_wifi_resolver": "192.168.10.254",
-      "intermittent_failure": "The active Wi-Fi resolver intermittently failed chatgpt.com resolution and returned Gamma 161.49.61.85.",
-      "gamma_ip": "161.49.61.85",
-      "gamma_network": "Converge ICT",
-      "verified_public_dnssec_doh_ips": [
-        "104.18.34.205",
-        "172.64.153.51"
+    "scope_resolution": {
+      "resolution_id": "sha256:f5182dca8b0e0dedf715fdc29bd5d522c7a193a04197f2308ee414aa0d2b164a",
+      "resolved_at": "2026-09-12T08:54:03.757240Z",
+      "candidate_id": "candidate-048a67b4b0992e2fc8ee5b26",
+      "scope_hash": "sha256:b8509e68253059a63beb0a13892b56bc3f898c0abca49ca73d7212b379473866",
+      "scope_version": "1",
+      "status": "MATCHED",
+      "total_current_markets": 20,
+      "matched_count": 15,
+      "excluded_count": 5,
+      "deferred_count": 0,
+      "excluded_reason": "SPREAD_MISMATCH",
+      "matched_markets": [
+        {
+          "market_id": "678825",
+          "condition_id": "0x17ba5a7a08bd3f7f87487285c5713e305b8fc98ec4849d5a05ecdf111856c428",
+          "yes_token_id": "62247533727165676004874253094340523470392513850065595792317219627735439185128",
+          "no_token_id": "87049471342618998359809919671281112540791713809517983308995135505633015888833"
+        },
+        {
+          "market_id": "679018",
+          "condition_id": "0x8126317d621047fb13d508a2651eecc8d38305904671822a62309c5aabd353aa",
+          "yes_token_id": "55764212211467781322980371912612507865974994976253196346176314491480419639168",
+          "no_token_id": "5649717099758674861276159343380402289083378331461490840325685141994171250523"
+        },
+        {
+          "market_id": "679019",
+          "condition_id": "0x1166388a24a3f2a9bb0a45956bdb205c70f0ecafb8539e277a57adf022e306be",
+          "yes_token_id": "1114938555853162662375805609341386795965961002028313810409954359771505507177",
+          "no_token_id": "39814929193752558825038669670647206213767631805507014416889259758143556745530"
+        },
+        {
+          "market_id": "679020",
+          "condition_id": "0x290b3a5826b17e48ae7166b188767d95df5a9ed0b69fda116d98d0d27d753281",
+          "yes_token_id": "51126599157451146230415396920771455069752975116525743821340393650626382714261",
+          "no_token_id": "90997833546019007990916014938756861651789144262105272333307948825561373623753"
+        },
+        {
+          "market_id": "679021",
+          "condition_id": "0x46f2f457e14ee9021ebd0ef4c27eacd98fdceaf7f2938b484e2551e9e3275ae8",
+          "yes_token_id": "84846382165343032223975853870946110241285484772019446686866815597350660955868",
+          "no_token_id": "80456575204440643570499123641511043765364487572502085512858581574010154701650"
+        },
+        {
+          "market_id": "679022",
+          "condition_id": "0xce610556ec78cfd7894f4169d91fe70e31c2fb49f927fffd7fe7d06530f88d56",
+          "yes_token_id": "55404192439775628931124671719520886657525387168536821457706619003199189099864",
+          "no_token_id": "79358475953126059185096320578578995575874288599466094920037110232928386404141"
+        },
+        {
+          "market_id": "679023",
+          "condition_id": "0x06a27c2810eaca94b53e7a17f15ad47761399ba445a6b02039b2679da203262d",
+          "yes_token_id": "71877540523534201212958253000589157055215242511161152819251873195807458559662",
+          "no_token_id": "103200178761975477029037596273923683691879601935857050688318519991400359134790"
+        },
+        {
+          "market_id": "679025",
+          "condition_id": "0x4c799a8378d60f34f055cf5c61fc3f6f1a6e7abe5d5384ef37961c506eab867c",
+          "yes_token_id": "47932068816905215490793160305898678677032574034362693398677274085713911110765",
+          "no_token_id": "75944740642862929591966294974820816843781742806011089025545405094323592008934"
+        },
+        {
+          "market_id": "679026",
+          "condition_id": "0x6189539ff1b08bc4052607d89921663ca0de0f0cd70b79c9993d7f9f3211ec3e",
+          "yes_token_id": "39040993339692011893931540077322383339631602451525460031216774971808386681386",
+          "no_token_id": "47856683996156403009428090210889176913147998278019471610295491486371570337691"
+        },
+        {
+          "market_id": "679027",
+          "condition_id": "0xc32a544f65e3a8ffec6499e40290f10fa68a3f4a4819dfd366b6cb1fd7c4be1d",
+          "yes_token_id": "76158784025338420583901765224531190025719662766883390440253608804161057467141",
+          "no_token_id": "49760558873212272440771467224266437717913114999491735666209561409981747777766"
+        },
+        {
+          "market_id": "679028",
+          "condition_id": "0xa203cc908da0d417590e01f89fb651a335650d6b797da76ac28726d5f8c7610b",
+          "yes_token_id": "35420390481420086914303850503269939905315993511859334440549793606783994509563",
+          "no_token_id": "45261427927597753948969942484970824173439588002616542194846930375736155382059"
+        },
+        {
+          "market_id": "679029",
+          "condition_id": "0xcfc6e088b78e695e831e094f7aa1197c16b2436e5984b12fb9286361804b8e1b",
+          "yes_token_id": "97531408855841405410232789703119036119573635076996943730887685044477538494161",
+          "no_token_id": "91614037901759358822201019738747890245698909012092657780820261729371244775376"
+        },
+        {
+          "market_id": "679030",
+          "condition_id": "0x174ea87d011bfd0b230efc45e0b4d0756d38af91f0ffbab70013a582603c2be8",
+          "yes_token_id": "88550326946437280548248031502775629664259630024343210447063397951616199975032",
+          "no_token_id": "78935030613038194779147226463048913187247425461933527083007539809178403199936"
+        },
+        {
+          "market_id": "679031",
+          "condition_id": "0xf887472a2ac013ef61840034321aa5b46de87ac093ee77ecafca477fdbaadd45",
+          "yes_token_id": "38208793744406659374526126908148940039609695506378367755718613389085432850399",
+          "no_token_id": "94969123745259238258894495450475423446337462998714163532718486615092828626984"
+        },
+        {
+          "market_id": "679034",
+          "condition_id": "0x20fd4cf096367edbd429168764db975b582249a7a3818684d051f445a3efaed1",
+          "yes_token_id": "94391324985187701312427605791553049327097814064787849723991205429060004737042",
+          "no_token_id": "26890459666562518130876295284144647143504759262811197504274347102239033858901"
+        }
       ],
-      "gamma_tls_result": "TLS was verified but failed with an untrusted root, timeouts, or getaddrinfo before discovery.",
-      "requests": 3,
-      "retries": 2,
-      "markets_attempted": 0,
-      "errors": 1,
-      "cursor_preserved": true,
-      "chatgpt_enotfound": "Transient broad recursive-resolver failure; the current resolver again returns ChatGPT Cloudflare IPs.",
-      "hosts_override": false,
-      "default_route_up": true,
-      "dnscache_up": true,
-      "stale_disconnected_ethernet_resolver": "192.168.254.254",
-      "dns_or_tls_bypass_used": false,
-      "network_configuration_changed": false,
-      "required_fix": "User, administrator, network-owner, or ISP policy approval is required to fix the resolver path."
-    },
-    "deployed_evaluation": {
-      "operation": "CanaryService.evaluate_signal(target)",
-      "evaluated_at": "2026-09-12T00:51:40.810996+00:00",
-      "audit_id": "canary-evaluation-127ab1d025ad464b967a4c95e96166cb",
-      "candidate_id": "candidate-81d5cd48736c1d2d480f22f6",
-      "blocker": "LEGACY_SCOPE_SUCCESSOR_REQUIRED",
-      "blocker_stage": "scope_gate",
-      "evaluation_order": [
-        "scope_gate",
-        "market",
-        "health",
-        "strategy"
+      "excluded_markets": [
+        {
+          "market_id": "679024",
+          "reason": "SPREAD_MISMATCH"
+        },
+        {
+          "market_id": "679032",
+          "reason": "SPREAD_MISMATCH"
+        },
+        {
+          "market_id": "679033",
+          "reason": "SPREAD_MISMATCH"
+        },
+        {
+          "market_id": "679035",
+          "reason": "SPREAD_MISMATCH"
+        },
+        {
+          "market_id": "679036",
+          "reason": "SPREAD_MISMATCH"
+        }
       ],
-      "signal": null,
-      "market": null,
-      "evaluation_rows_before": 0,
-      "evaluation_rows_after": 1,
-      "submissions_before": 0,
-      "submissions_after": 0,
-      "execution_events_before": 0,
-      "execution_events_after": 0,
-      "risk_fills_before": 0,
-      "risk_fills_after": 0,
-      "canary_ledger_rows_before": 0,
-      "canary_ledger_rows_after": 0,
-      "control_state": "DISARMED",
-      "control_generation_before": 12,
-      "control_generation_after": 12,
-      "scope_resolutions": 0
+      "deferred_markets": [],
+      "identity_source": "Persisted market_scope_resolutions row; the resolution_id is authoritative for this time-bound binding."
     },
-    "automatic_next_action": {
-      "implementation_commits": [
-        "19539f3",
-        "5ad16753466636c52a161ef6c9cebc0a51fb5d98"
+    "fresh_collector_evidence": {
+      "source_type": "FORWARD_COLLECTED",
+      "coverage_status": "PARTIAL",
+      "restart_context": "Post-restart live collector cycles completed with persisted cursors and no control changes.",
+      "bounded_cycles": [
+        {
+          "measured_on": "2026-09-12",
+          "markets_attempted": 11,
+          "markets_successful": 11,
+          "duration_seconds": 39.25,
+          "snapshots_inserted": 11,
+          "trades_inserted": 16222,
+          "retries": 0,
+          "provider_failures": 0,
+          "errors": 0
+        },
+        {
+          "measured_on": "2026-09-12",
+          "markets_attempted": 13,
+          "markets_successful": 13,
+          "duration_seconds": 25.109,
+          "snapshots_inserted": 13,
+          "trades_inserted": 3094,
+          "retries": 0,
+          "provider_failures": 0,
+          "errors": 0
+        },
+        {
+          "measured_on": "2026-09-12",
+          "markets_attempted": 6,
+          "markets_successful": 6,
+          "duration_seconds": 43.906,
+          "snapshots_inserted": 6,
+          "trades_inserted": 11373,
+          "retries": 0,
+          "provider_failures": 0,
+          "errors": 0
+        }
       ],
-      "action": "Continue durable bounded keyset recovery without relaxation.",
-      "live_production_node_pid": 41260,
-      "source_revision": "5ad16753466636c52a161ef6c9cebc0a51fb5d98",
-      "research_max_items_per_cycle": 1,
-      "cursor_progression": "The recovery cursor advances durably one candidate per approximately 60 seconds.",
-      "eventual_target_outcome": "The target will honestly persist MISSING_MARKET_SCOPE/RETAIN_LEGACY_PREDECESSOR with no successor.",
-      "collection_retry": "Collection retries each cycle with the cursor intact but cannot resolve markets until the network owner fixes DNS.",
-      "no_relaxation": true,
-      "operator_pid": 8112,
-      "operator_ready": true
-    },
-    "source_evidence": {
-      "source_revision": "5ad16753466636c52a161ef6c9cebc0a51fb5d98",
-      "deployed_revision": "5ad16753466636c52a161ef6c9cebc0a51fb5d98",
-      "durable_recovery_commits": [
-        "19539f3",
-        "5ad16753466636c52a161ef6c9cebc0a51fb5d98"
-      ],
-      "recovery_is_bounded": true,
-      "scope_relaxation": false
-    },
-    "process_evidence": {
-      "production_node_pid": 41260,
-      "operator_pid": 8112,
-      "control_state": "DISARMED",
-      "research": "ACTIVE",
-      "deployment": "DEPLOYED",
-      "recovery_cursor_preserved": true,
-      "autonomous_canary_enabled": false
-    },
-    "test_evidence": {
-      "full_suite": {
-        "result": "PASS",
-        "passed_percent": 100,
-        "skipped": 3,
-        "existing_pytest_collection_warnings": 2,
-        "seconds": 218.89
+      "partial_coverage_reason": "Discovery and crypto ticker coverage remain partial even though the bounded Gamma/CLOB and Polymarket collection requests succeeded.",
+      "known_partial_crypto_blocker": {
+        "symbol": "BTC/USDT",
+        "reason": "future_crypto_ticker"
       }
+    },
+    "dynamic_resolution_after_snapshot": {
+      "resolution_id": "sha256:796c15a4cdad65c3ec4cf4157a76c82cb3620c12aaf9f2ca4394059bf0f99c5a",
+      "resolved_at": "2026-09-12T09:19:21.465003+00:00",
+      "matched_count": 20,
+      "excluded_count": 0,
+      "deferred_count": 0,
+      "interpretation": "Later current-market dynamics continued collection and are not substituted for the time-bound 15 matched/5 SPREAD_MISMATCH qualification binding."
+    },
+    "current_evaluation": {
+      "applicable": false,
+      "status": "NOT_APPLICABLE",
+      "reason": "No eligible frozen candidate and no fresh eligible current evaluation exist after the canonical candidate was rejected for no supported edge.",
+      "candidate_id": "candidate-048a67b4b0992e2fc8ee5b26",
+      "fresh_current_evaluation": false,
+      "current_evaluation_must_not_be_inferred_from_paper_observations": true
+    },
+    "automatic_paper_evidence": {
+      "experiment_id": "forward-candidate-048a67b4b0992e2fc8ee5b26",
+      "candidate_id": "candidate-048a67b4b0992e2fc8ee5b26",
+      "observation_count": 5,
+      "execution_event_count": 5,
+      "execution_event_statuses": {
+        "NO_SIGNAL": 5
+      },
+      "observation_market_ids": [
+        "668591",
+        "667086",
+        "667088",
+        "667209",
+        "667089"
+      ],
+      "observation_timestamps": [
+        "2026-09-12T08:45:08.206000+00:00",
+        "2026-09-12T08:45:13.775000+00:00",
+        "2026-09-12T08:45:13.814000+00:00",
+        "2026-09-12T08:45:16.015000+00:00",
+        "2026-09-12T08:45:17.994000+00:00"
+      ],
+      "exact_fills": 0,
+      "exact_exits": 0,
+      "completed_round_trips": 0,
+      "settled_bets": 0,
+      "paper_cash_usd": 10000.0,
+      "paper_equity_usd": 10000.0,
+      "live_execution": false,
+      "interpretation": "These are automatic paper observations only; NO_SIGNAL is not a completed or settled trade."
+    },
+    "ui_evidence": {
+      "source_revision": "e159e8b",
+      "url": "http://127.0.0.1:8187/?tab=portfolio&page=1&page_size=25",
+      "surface": "deployed Chromium",
+      "paper_portfolio_view_rendered": true,
+      "view_selector": "#view-portfolio",
+      "panel_heading": "Paper Portfolio",
+      "paper_only_label": "PAPER-ONLY - NO LIVE EXECUTION",
+      "controls_clicked": false,
+      "browser_errors": 0,
+      "refresh_result": "Refresh failed (request timed out) - no cached dashboard snapshot available",
+      "refresh_timeout_seconds": 8.001,
+      "visual_scope": "The restored view and safety label rendered; no live order action was exposed or used."
+    },
+    "failed_corrected_submission_attempts": [
+      {
+        "attempt": 1,
+        "status": "FAILED",
+        "failure": "OLD_FILTER_SEMANTICS",
+        "detail": "Corrected-submission attempt used stale/old filter semantics.",
+        "successful_bounded_trial": false
+      },
+      {
+        "attempt": 2,
+        "status": "FAILED",
+        "failure": "PLAN_ID_COLLISION",
+        "detail": "Corrected-submission attempt collided on plan identity.",
+        "successful_bounded_trial": false
+      }
+    ],
+    "successful_bounded_trial": {
+      "status": "COMPLETED_WITH_REJECTION",
+      "candidate_id": "candidate-048a67b4b0992e2fc8ee5b26",
+      "plan_id": "plan-canonical-successor-20260912T0835Z-0b2581b3ebbc4ef8",
+      "variant_count": 1,
+      "scope_resolution_id": "sha256:f5182dca8b0e0dedf715fdc29bd5d522c7a193a04197f2308ee414aa0d2b164a",
+      "holdout_used": false,
+      "paper_observations": 5,
+      "orders_submitted": 0,
+      "decision": "NO_SUPPORTED_EDGE",
+      "separate_from_failed_corrected_submissions": true
+    },
+    "next_action": {
+      "mode": "AUTOMATIC_RESEARCH_AND_COLLECTION",
+      "action": "Continue bounded automatic collection and paper research without relaxing filters, holdout fencing, or safety controls.",
+      "user_activation_action_recommended": false,
+      "no_enablement_requested": true,
+      "known_blocker": "future_crypto_ticker for BTC/USDT remains a partial-coverage blocker."
     },
     "safety_evidence": {
       "live_fills_verified": false,
       "no_unintended_orders_verified": true,
       "control_state": "DISARMED",
+      "control_generation": 12,
       "submissions": 0,
       "execution_events": 0,
       "risk_fills": 0,
       "canary_ledger_rows": 0,
-      "paper_events_and_fills_are_non_live": true
+      "paper_events_are_non_live": true
     }
   }
 }
