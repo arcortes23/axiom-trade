@@ -1,6 +1,7 @@
 {
 "status": "NOT_TRADING_READY",
   "trading_ready": false,
+  "ready_for_live": false,
   "trading_readiness_blocker": "NO_SUPPORTED_EDGE_NO_ELIGIBLE_FROZEN_CANDIDATE_NO_FRESH_ELIGIBLE_CURRENT_EVALUATION",
   "deployment_state": {
     "deployment": "DEPLOYED",
@@ -13,8 +14,8 @@
     "main",
     "feature/polymarket-one-click-canary"
   ],
-  "deployed_revision": "e159e8b",
-  "source_revision": "e159e8b",
+  "deployed_revision": "121e0ca",
+  "source_revision": "121e0ca",
   "superseded_revisions": [
     {
       "revision": "72330e0bc87135e1f22836b9643e601ad533200f",
@@ -30,6 +31,11 @@
       "revision": "5ad16753466636c52a161ef6c9cebc0a51fb5d98",
       "superseded_by": "e159e8b",
       "reason": "Prior deployed report revision superseded by the measured filter-separation, stale-binding, and Paper Portfolio UI deployment."
+    },
+    {
+      "revision": "e159e8b",
+      "superseded_by": "121e0ca",
+      "reason": "Prior deployed report revision superseded by the measured final deployed source revision; the prior report evidence remains historical."
     }
   ],
   "development_root": "C:/Users/User/projects/axiom-polymarket-release",
@@ -57,14 +63,19 @@
     "Verified bounded mixed archive export SHA256 448e19a5895ca8e295fcef73d512f509d128f66bd455322799f88d25eab57868: 4096 historical and 4091 forward snapshots plus eight metadata anchors.",
     "Remote main branch is unprotected; publication must still fetch, integrate and pass full gates.",
     "Corrected an earlier API assumption after re-reading https://docs.polymarket.com/api-reference/core/get-trades-for-a-user-or-markets: public /trades supports start/end epoch-second windows, with limit/offset capped at 10000. Preserve supported window pagination; do not remove end parameters.",
-    "The measured deployed source is e159e8b. Commit 6eeb0f4 separated research filters and rejected stale paper bindings; e159e8b restored the missing Paper Portfolio view.",
-    "Regression proof for the deployed source: 1125 unittests passed (OK), 3 skipped; the preceding 6eeb0f4 source gate was 1124 OK with 3 skipped.",
+    "The measured deployed source is 121e0ca. Commit 84ca0c7 contains Portfolio v1 and the successor scheduler; commit 77b9cd9 contains the bounded job hotfix; 121e0ca is the final deployed source revision.",
+    "Final regression proofs for 121e0ca are the complete final gate (1132 OK, 0 failed, 3 skipped), focused portfolio regressions (63 OK), and focused scheduler regressions (3 OK).",
     "The prior hotel-only resolver and TLS observations are historical network evidence only. They are not the current home-network conclusion and do not prove the cause of the hotel failures.",
     "On 2026-09-12, the home Windows C:/Users/User/projects/axiom/.venv CPython 3.11.16 runtime resolved and reached Gamma and CLOB successfully with DNS and TLS verification.",
     "Canonical scope resolution is time-bound to sha256:f5182dca8b0e0dedf715fdc29bd5d522c7a193a04197f2308ee414aa0d2b164a at 2026-09-12T08:54:03.757240Z: 15 matched, 5 SPREAD_MISMATCH, 0 deferred.",
     "Automatic exact-candidate paper observations are five NO_SIGNAL events; exact fills, exits, round trips, and settled bets remain zero with paper cash and equity at 10000 USD.",
     "A later dynamic resolution observed 20 matched markets; it is recorded as continued collection dynamics and does not overwrite the time-bound 15/5 qualification binding.",
-    "The next action is automatic research and collection. No user activation or enablement action is recommended."
+    "The next action is automatic research and collection. No user activation or enablement action is recommended.",
+    "The canonical candidate remains REJECTED; automatic progression is the accepted alternative and is a scheduled prerequisite, not a processed successor plan.",
+    "One canonical durable resumable WAITING_FOR_NEW_DATASET_VERSION job is retained with no duplicate canonical resubmission and zero successor queue rows until the exact new-version predicate is satisfied.",
+    "The retained future_crypto_ticker error is isolated from the later successful Polymarket collection/research cycle; collection success alone is not discovery.",
+    "The deployed portfolio repair addressed 250MB state/full payload serialization and shared-writer head-of-line blocking; repeated endpoint and actual Chromium evidence are recorded below.",
+    "Live process/control evidence remains one owned node and operator, DISARMED control, zero orders/submissions/execution events/fills, and no enable action."
   ],
   "verification": [
     {
@@ -489,6 +500,265 @@
       "paper_execution": 0,
       "live_fills_scope": "No live fills are claimed or verified; post-deploy live execution remained disarmed and all observed paper events/fills were isolated non-live evidence.",
       "public_historical_fills_validated": false
+    },
+    {
+      "stage": "automatic-progression-durable-prerequisite",
+      "result": "PASS",
+      "candidate_passed": false,
+      "accepted_alternative": "AUTOMATIC_RESEARCH_AND_COLLECTION",
+      "distinction": "Scheduled prerequisite only; no successor plan has been processed or enqueued.",
+      "distinct_queue_plan_created": false,
+      "successor_plan_processed": false,
+      "canonical_job": {
+        "job_id": "polymarket-dataset-successor:plan-canonical-successor-20260912T0835Z-0b2581b3ebbc4ef8",
+        "status": "WAITING_FOR_NEW_DATASET_VERSION",
+        "resumable": true,
+        "started_at": null,
+        "last_error": null,
+        "payload_bytes": 5468,
+        "updated_at": "2026-09-12T12:44:13.542987+00:00",
+        "last_checked_at": "2026-09-12T12:44:13.542987+00:00",
+        "next_check_at": "2026-09-12T12:45:13.542987+00:00",
+        "next_run_at": "2026-09-12T12:45:13.542987+00:00",
+        "schedule_trigger": "AUTOMATIC_RESEARCH_TICK",
+        "schedule_cadence": "collection_cycle",
+        "schedule_cadence_seconds": 60,
+        "dedupe_namespace": "successor",
+        "successor_dedupe_template": "successor:{predecessor_plan_id}:{new_dataset_version}",
+        "paper_only": true,
+        "research_only": true
+      },
+      "canonical_experiment_plan": {
+        "unique": true,
+        "status": "COMPLETED",
+        "created_at": "2026-09-12T08:44:45.233500+00:00",
+        "updated_at": "2026-09-12T08:44:45.233500+00:00"
+      },
+      "predecessor": {
+        "plan_id": "plan-canonical-successor-20260912T0835Z-0b2581b3ebbc4ef8",
+        "plan_hash": "sha256:532068e319df07de676af620c35cd8e7cffa7ccba86361bb0dd112a2a9e79dee",
+        "hypothesis_id": "hypothesis-polymarket-mean-reversion-canonical-20260912T071513Z-2bcc4f240f",
+        "candidate_id": "candidate-048a67b4b0992e2fc8ee5b26",
+        "rejection": {
+          "accepted": false,
+          "blocker": "NO_SUPPORTED_EDGE",
+          "reason_code": "NEGATIVE_VALIDATION_EXPECTANCY"
+        }
+      },
+      "rejected_dataset_attestation": {
+        "dataset_id": "Polymarket-historical",
+        "dataset_version": "sha256:9a831357e3f4016ad2c4f05d9bb11a98583ad94a2da36873b56e2b7db786a9ea",
+        "source_type": "HISTORICAL",
+        "market_type": "prediction",
+        "row_count": 18141,
+        "constituent_count": 1000,
+        "completeness": 1,
+        "status": "CURRENT",
+        "contamination_result": "PASS",
+        "attestation_hash": "sha256:24e279b36735f5c6fb97a6115281d681fbaa3afd08a64c982c36cd929b9d93a3",
+        "canonical_digest": "sha256:96b1ccb92d0bf6c573e501f97d7b20a34fc4102db6c1d068ff4c8ff895cf5b76",
+        "verified_at": "2026-09-08T01:33:49.982877+00:00",
+        "provenance_version": "dataset-provenance-v1",
+        "policy_version": "prediction-integrity-v1",
+        "coverage": {
+          "from": "2026-09-03T23:00:28+00:00",
+          "through": "2026-09-04T13:40:22+00:00"
+        }
+      },
+      "required_new_version_predicate": {
+        "dataset_id": "Polymarket-historical",
+        "version_distinct_from": "sha256:9a831357e3f4016ad2c4f05d9bb11a98583ad94a2da36873b56e2b7db786a9ea",
+        "source_type": "HISTORICAL",
+        "market_type": "prediction",
+        "instrument": "POLYMARKET",
+        "catalog": {
+          "exact_identity": true,
+          "completeness_min": 1.0,
+          "row_count_min": 1,
+          "missing_ranges": false
+        },
+        "attestation": {
+          "status": "CURRENT",
+          "contamination_result": "PASS"
+        },
+        "rolling_collection_satisfies": false
+      },
+      "queue_state": {
+        "canonical_job_rows": 1,
+        "research_queue_successor_rows": 0,
+        "autonomous_next_dataset_version_scheduler_rows": 0,
+        "canonical_research_queue_rows": 1,
+        "canonical_research_queue_status": "REJECTED",
+        "canonical_research_queue_attempts": 1,
+        "duplicate_canonical_resubmission": false,
+        "successor_queue_until_predicate": "ZERO",
+        "distinct_successor_queue_plan": false
+      }
+    },
+    {
+      "stage": "crypto-polymarket-isolation",
+      "result": "PASS",
+      "retained_crypto_error": {
+        "error_id": "65c053d45b3fdd0ba6295e6ca3fe59e118ca214e296335bd6c31f3acdbedc2c2",
+        "kind": "future_crypto_ticker",
+        "observed_at": "2026-09-12T12:25:06.747299+00:00",
+        "created_at": "2026-09-12T12:25:06.880042+00:00",
+        "source_type": "FORWARD_COLLECTED",
+        "detail": "ticker timestamp is in the future",
+        "symbol": "BTC/USDT",
+        "ticker_timestamp": "2026-09-12T12:25:06.950000+00:00"
+      },
+      "later_polymarket_cycle": {
+        "cycle_id": "cycle-fd9f585e07100358defefdacd4100047651cafaed171b95322bc45bf2005d334",
+        "started_at": "2026-09-12T12:42:03.162416+00:00",
+        "ended_at": "2026-09-12T12:42:28.679634+00:00",
+        "markets_attempted": 18,
+        "markets_seen": 18,
+        "markets_successful": 18,
+        "markets_failed": 0,
+        "errors": 0,
+        "snapshots_inserted": 18,
+        "metadata_inserted": 18,
+        "requests": 73,
+        "paper_forward_tier_successes": 18
+      },
+      "research_tick": {
+        "worker_status": "IDLE",
+        "heartbeat": "2026-09-12T12:41:41.390600+00:00",
+        "pending": 0,
+        "claimed": 0,
+        "completed": 0,
+        "rejected": 0,
+        "failed": 0,
+        "paper_only": true,
+        "live_execution": false,
+        "automatic_state": {
+          "last_tick_at": "2026-09-12T12:43:51.231048+00:00",
+          "last_successful_tick": "2026-09-12T12:43:51.231048+00:00",
+          "worker_status": "RUNNING",
+          "next_decision": "EVALUATING_CANDIDATES",
+          "consecutive_failures": 0,
+          "candidates_evaluated": 0,
+          "signals_generated": 0,
+          "orders_attempted": 0,
+          "actionable_candidates_found": 0
+        }
+      },
+      "interpretation": "The crypto error is retained as evidence but did not block the later Polymarket cycle/research tick. Collection success alone is not discovery."
+    },
+    {
+      "stage": "final-regression-proofs",
+      "result": "PASS",
+      "source_revision": "121e0ca",
+      "full_final_gate": {
+        "ok": 1132,
+        "failed": 0,
+        "skipped": 3,
+        "errors": 0
+      },
+      "focused_portfolio": {
+        "ok": 63,
+        "failed": 0
+      },
+      "focused_scheduler": {
+        "ok": 3,
+        "failed": 0
+      }
+    },
+    {
+      "stage": "deployed-paper-portfolio",
+      "result": "PASS",
+      "source_revision": "121e0ca",
+      "root_cause": [
+        "250MB state/full payload serialization",
+        "shared writer head-of-line blocking"
+      ],
+      "repairs": [
+        "Bound dashboard portfolio serialization to the requested page and compact response shape.",
+        "Separated the shared writer path so portfolio reads do not wait behind the full-state writer."
+      ],
+      "endpoint": {
+        "compact_json_bytes": 1577693,
+        "url": "http://127.0.0.1:8187/api/paper/portfolio?page=1&page_size=25",
+        "runs": [
+          {
+            "http_status": 200,
+            "elapsed_ms": 452.1,
+            "total": 103844,
+            "items": 25,
+            "pages": 4154,
+            "record_type_counts": {
+              "state": 9,
+              "observation": 16
+            }
+          },
+          {
+            "http_status": 200,
+            "elapsed_ms": 422,
+            "total": 103844,
+            "items": 25,
+            "pages": 4154,
+            "record_type_counts": {
+              "state": 9,
+              "observation": 16
+            }
+          },
+          {
+            "http_status": 200,
+            "elapsed_ms": 423.3,
+            "total": 103844,
+            "items": 25,
+            "pages": 4154,
+            "record_type_counts": {
+              "state": 9,
+              "observation": 16
+            }
+          }
+        ]
+      },
+      "chromium": {
+        "url": "http://127.0.0.1:8187/?tab=portfolio&page=1&page_size=25",
+        "rows": 25,
+        "pager": "Showing 1–25 of 103844 · Page 1 of 4154",
+        "timeout_banner": false,
+        "console_errors": [],
+        "page_errors": [],
+        "populated": true,
+        "screenshot_captured": true
+      },
+      "paper_only": true,
+      "live_execution": false
+    },
+    {
+      "stage": "final-process-control-and-no-order-evidence",
+      "result": "PASS",
+      "ownership": {
+        "node_count": 1,
+        "operator_count": 1,
+        "one_node_one_operator": true,
+        "listener": "127.0.0.1:8187",
+        "node_supervisor_pid": 15888,
+        "node_child_pid": 10752,
+        "operator_supervisor_pid": 2872,
+        "operator_child_pid": 19896
+      },
+      "control": {
+        "state": "DISARMED",
+        "live_execution": false,
+        "paper_only": true,
+        "autonomous_canary_enabled": false
+      },
+      "no_order_counts": {
+        "execution_event_count": 0,
+        "today_orders": 0,
+        "open_positions": 0,
+        "real_execution_events": 0,
+        "orders_attempted": 0,
+        "submissions": 0,
+        "risk_fills": 0,
+        "canary_ledger_rows": 0
+      },
+      "enable_action": false
     }
   ],
   "live_fills_verified": false,
@@ -724,8 +994,8 @@
     "status": "NOT_TRADING_READY",
     "exact_blocker": "NO_SUPPORTED_EDGE_NO_ELIGIBLE_FROZEN_CANDIDATE_NO_FRESH_ELIGIBLE_CURRENT_EVALUATION",
     "reason": "No supported edge; no eligible frozen candidate; no fresh eligible current evaluation.",
-    "source_revision": "e159e8b",
-    "deployed_revision": "e159e8b",
+    "source_revision": "121e0ca",
+    "deployed_revision": "121e0ca",
     "source_changes": {
       "filter_and_binding_fix": {
         "commit": "6eeb0f4",
@@ -736,14 +1006,35 @@
         "commit": "e159e8b",
         "effect": "Restored the missing deployed Paper Portfolio view."
       },
+      "final_deployed_source": {
+        "commit": "121e0ca",
+        "full_revision": "121e0ca830164f1bc4229ccdca9c1e5f6ce434cc",
+        "preceding_commits": {
+          "portfolio_v1_and_successor_scheduler": "84ca0c7",
+          "bounded_job_hotfix": "77b9cd9"
+        },
+        "report_commit_semantics": "This report records the measured deployed source revision; prior acceptance objects remain historical provenance and are not rewritten as candidate success."
+      },
       "regression_proof": {
-        "source_revision": "e159e8b",
+        "source_revision": "121e0ca",
         "result": "PASS",
-        "unittests_ok": 1125,
-        "skipped": 3,
-        "preceding_fix_revision": {
-          "source_revision": "6eeb0f4",
-          "unittests_ok": 1124,
+        "full_final_gate": {
+          "ok": 1132,
+          "failed": 0,
+          "skipped": 3,
+          "errors": 0
+        },
+        "focused_portfolio": {
+          "ok": 63,
+          "failed": 0
+        },
+        "focused_scheduler": {
+          "ok": 3,
+          "failed": 0
+        },
+        "historical_pre_final": {
+          "source_revision": "e159e8b",
+          "unittests_ok": 1125,
           "skipped": 3
         }
       }
@@ -1109,7 +1400,7 @@
       "interpretation": "These are automatic paper observations only; NO_SIGNAL is not a completed or settled trade."
     },
     "ui_evidence": {
-      "source_revision": "e159e8b",
+      "source_revision": "121e0ca",
       "url": "http://127.0.0.1:8187/?tab=portfolio&page=1&page_size=25",
       "surface": "deployed Chromium",
       "paper_portfolio_view_rendered": true,
@@ -1118,9 +1409,62 @@
       "paper_only_label": "PAPER-ONLY - NO LIVE EXECUTION",
       "controls_clicked": false,
       "browser_errors": 0,
-      "refresh_result": "Refresh failed (request timed out) - no cached dashboard snapshot available",
-      "refresh_timeout_seconds": 8.001,
-      "visual_scope": "The restored view and safety label rendered; no live order action was exposed or used."
+      "endpoint": {
+        "url": "http://127.0.0.1:8187/api/paper/portfolio?page=1&page_size=25",
+        "runs": [
+          {
+            "http_status": 200,
+            "elapsed_ms": 452.1,
+            "wire_bytes": 3815509,
+            "total": 103844,
+            "items": 25,
+            "pages": 4154,
+            "record_type_counts": {
+              "state": 9,
+              "observation": 16
+            }
+          },
+          {
+            "http_status": 200,
+            "elapsed_ms": 422,
+            "wire_bytes": 3815509,
+            "total": 103844,
+            "items": 25,
+            "pages": 4154,
+            "record_type_counts": {
+              "state": 9,
+              "observation": 16
+            }
+          },
+          {
+            "http_status": 200,
+            "elapsed_ms": 423.3,
+            "wire_bytes": 3815509,
+            "total": 103844,
+            "items": 25,
+            "pages": 4154,
+            "record_type_counts": {
+              "state": 9,
+              "observation": 16
+            }
+          }
+        ]
+      },
+      "chromium": {
+        "rows": 25,
+        "pager": "Showing 1–25 of 103844 · Page 1 of 4154",
+        "timeout_banner": false,
+        "console_errors": [],
+        "page_errors": [],
+        "populated": true
+      },
+      "acceptance_basis": "Actual populated Chromium result with 25 rows, pager, no timeout banner, and no browser errors; endpoint responses are supporting repeated latency evidence, not HTTP-only acceptance.",
+      "historical_initial_attempt": {
+        "refresh_result": "Refresh failed (request timed out) - no cached dashboard snapshot available",
+        "refresh_timeout_seconds": 8.001,
+        "status": "HISTORICAL_PRE_REPAIR"
+      },
+      "visual_scope": "The repaired deployed view rendered populated portfolio data; no live order action was exposed or used."
     },
     "failed_corrected_submission_attempts": [
       {
