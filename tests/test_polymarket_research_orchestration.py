@@ -660,6 +660,103 @@ class PolymarketResearchOrchestrationTests(unittest.TestCase):
                 store.load_candidate_lifecycle("legacy-page-064")["payload"],
                 predecessors["legacy-page-064"],
             )
+    def test_legacy_recovery_page_boundary_skips_non_prediction_rows(self) -> None:
+        """A mixed lifecycle page must not stall prediction recovery."""
+        with AxiomStore(":memory:") as store:
+            target_id = "legacy-mixed-066"
+            target_payload = {
+                "candidate_id": target_id,
+                "frozen_hash": "sha256:legacy-mixed-066-frozen",
+                "hypothesis_id": "legacy-mixed-066-hypothesis",
+                "statement": "A missing scope remains blocked.",
+                "source": "offline legacy fixture",
+                "market_type": "prediction",
+                "experiment_plan": {
+                    "market_type": "prediction",
+                    "target": {},
+                },
+                "paper_only": True,
+            }
+            for index in range(84):
+                candidate_id = f"legacy-mixed-{index:03d}"
+                if index == 0:
+                    payload = {
+                        "candidate_id": candidate_id,
+                        "frozen_hash": f"sha256:{candidate_id}-frozen",
+                        "hypothesis_id": f"{candidate_id}-hypothesis",
+                        "statement": "An early legacy scope remains blocked.",
+                        "source": "offline legacy fixture",
+                        "market_type": "prediction",
+                        "experiment_plan": {
+                            "market_type": "prediction",
+                            "target": {},
+                        },
+                        "paper_only": True,
+                    }
+                elif index == 66:
+                    payload = target_payload
+                else:
+                    payload = {
+                        "candidate_id": candidate_id,
+                        "frozen_hash": f"sha256:{candidate_id}-frozen",
+                        "hypothesis_id": f"{candidate_id}-hypothesis",
+                        "statement": "An unrelated lifecycle row.",
+                        "source": "offline fixture",
+                        "market_type": "crypto",
+                        "experiment_plan": {
+                            "market_type": "crypto",
+                            "target": {},
+                        },
+                        "paper_only": True,
+                    }
+                store.save_candidate_lifecycle(
+                    candidate_id,
+                    CandidateStage.IDEA.value,
+                    payload,
+                    timestamp=T0,
+                )
+                store.save_candidate_lifecycle(
+                    candidate_id,
+                    CandidateStage.FROZEN.value,
+                    payload,
+                    timestamp=T0,
+                )
+
+            config = AutonomousResearchConfig(max_items_per_cycle=64)
+            first = AutonomousResearchProcessor(
+                store,
+                config=config,
+                clock=lambda: T0,
+            ).process_pending(now=T0)
+            self.assertEqual(first.claimed, 0)
+            self.assertEqual(len(first.legacy_recovery), 1)
+            self.assertLessEqual(len(first.legacy_recovery), 64)
+            self.assertEqual(
+                first.legacy_recovery[0]["predecessor_candidate_id"],
+                "legacy-mixed-000",
+            )
+            state = store.get_scheduler_state("autonomous-legacy-recovery")
+            self.assertIsInstance(state, dict)
+            self.assertEqual(state["cursor"]["candidate_id"], "legacy-mixed-063")
+
+            restarted = AutonomousResearchProcessor(
+                store,
+                config=config,
+                clock=lambda: T0,
+            )
+            second = restarted.process_pending(now=T0)
+            self.assertEqual(second.claimed, 0)
+            self.assertLessEqual(len(second.legacy_recovery), 64)
+            self.assertEqual(len(second.legacy_recovery), 1)
+            recovery = second.legacy_recovery[0]
+            self.assertEqual(recovery["predecessor_candidate_id"], target_id)
+            self.assertEqual(recovery["classification"], "INVALID")
+            self.assertEqual(recovery["reason_code"], "MISSING_MARKET_SCOPE")
+            self.assertEqual(recovery["next_action"], "RETAIN_LEGACY_PREDECESSOR")
+            self.assertIsNone(recovery["successor_id"])
+            self.assertEqual(store.research_queue_stats()["total"], 0)
+            self.assertEqual(len(store.list_reports(experiment_id=target_id)), 1)
+
 
 
 

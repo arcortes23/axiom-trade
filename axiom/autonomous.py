@@ -1106,6 +1106,7 @@ class AutonomousResearchProcessor:
 
         inspected = 0
         cursor_record: Mapping[str, Any] | None = None
+        scan_aborted = False
         recovery_limit = min(_MAX_LEGACY_RECOVERY_ITEMS, self.config.max_items_per_cycle)
         for record in candidates:
             if inspected >= recovery_limit:
@@ -1273,16 +1274,19 @@ class AutonomousResearchProcessor:
                 # Do not advance beyond an evidence write that failed.  The
                 # next cycle retries this candidate from the durable boundary.
                 cursor_record = prior_cursor_record
+                scan_aborted = True
                 break
         if durable_pagination:
-            # If this page contained no recoverable prediction rows, still
-            # advance past it.  Otherwise an unrelated lifecycle prefix would
-            # be selected forever.  A failed evidence write leaves the cursor
-            # at its prior durable boundary (``cursor_record`` is then None
-            # when the first candidate failed).
-            progress_record = cursor_record
-            if progress_record is None and output == () and candidates == [] and records:
+            # Once every prediction row in a fetched page was scanned, the
+            # final lifecycle row is the safe boundary—even when intervening
+            # rows belong to another market type.  If the page had more than
+            # the per-cycle cap, retain the last scanned prediction row so
+            # unscanned candidates in this page are not skipped.  An evidence
+            # failure similarly retains the prior boundary.
+            if not scan_aborted and records and len(candidates) <= recovery_limit:
                 progress_record = records[-1]
+            else:
+                progress_record = cursor_record
             next_cursor: dict[str, str] | None = None
             if isinstance(progress_record, Mapping):
                 raw_timestamp = progress_record.get("updated_at")
