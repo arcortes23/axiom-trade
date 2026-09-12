@@ -1,5 +1,7 @@
 {
-  "status": "DEPLOYED_DISARMED_RESEARCH_ACTIVE",
+"status": "NOT_TRADING_READY",
+  "trading_ready": false,
+  "trading_readiness_blocker": "LEGACY_SCOPE_SUCCESSOR_REQUIRED",
   "deployment_state": {
     "deployment": "DEPLOYED",
     "live_control": "DISARMED",
@@ -11,13 +13,18 @@
     "main",
     "feature/polymarket-one-click-canary"
   ],
-  "deployed_revision": "6b9faffdf45f85e9ea885d0d9c805174f38f5838",
-  "source_revision": "6b9faffdf45f85e9ea885d0d9c805174f38f5838",
+  "deployed_revision": "5ad16753466636c52a161ef6c9cebc0a51fb5d98",
+  "source_revision": "5ad16753466636c52a161ef6c9cebc0a51fb5d98",
   "superseded_revisions": [
     {
       "revision": "72330e0bc87135e1f22836b9643e601ad533200f",
       "superseded_by": "6b9faffdf45f85e9ea885d0d9c805174f38f5838",
       "reason": "Prior reported deployment revision superseded by the final deployed source revision."
+    },
+    {
+      "revision": "6b9faffdf45f85e9ea885d0d9c805174f38f5838",
+      "superseded_by": "5ad16753466636c52a161ef6c9cebc0a51fb5d98",
+      "reason": "Prior report revision superseded by the corrected trading-readiness evidence and durable recovery implementation."
     }
   ],
   "development_root": "C:/Users/User/projects/axiom-polymarket-release",
@@ -483,6 +490,11 @@
   "live_fills_verification_scope": "No live fills verified because live execution was DISARMED; zero live submissions, execution events, risk fills, and canary ledger rows were observed.",
   "final_acceptance": {
     "source_revision": "6b9faffdf45f85e9ea885d0d9c805174f38f5838",
+    "superseded": true,
+    "superseded_by": "trading_readiness_acceptance",
+    "acceptance_valid": false,
+    "historical_only": true,
+    "supersession_reason": "This historical acceptance record contains an incorrect linkage between an unbound static research tuple and current-scope acceptance. It is retained for provenance and does not establish target-candidate qualification.",
     "status": {
       "deployment": "DEPLOYED",
       "live_control": "DISARMED",
@@ -537,11 +549,21 @@
         "exits": 13,
         "fills": 40,
         "roi": -0.0035367,
-        "historical_status": "FROZEN",
-        "current_scope": [
+        "historical_status": "SUPERSEDED_UNBOUND_HISTORICAL",
+        "prior_historical_status": "FROZEN",
+        "static_tuple": true,
+        "candidate_id": null,
+        "plan_id": null,
+        "matching_db_payload": false,
+        "prior_current_scope": [
           "ZERO_MATCHES",
           "CANDIDATE_FORWARD_MARKET_UNRESOLVED"
-        ]
+        ],
+        "current_scope": null,
+        "current_scope_linkage": "SUPERSEDED_UNBOUND",
+        "candidate_acceptance": false,
+        "attribution": "UNBOUND_HISTORICAL_RESEARCH_ONLY",
+        "qualification": "The negative ROI is not positive qualification, is not target-candidate evidence, and is not current-scope evidence."
       },
       "negative_control": {
         "signals": 0,
@@ -681,6 +703,201 @@
         "passed": 12,
         "total": 12
       }
+    }
+  },
+  "trading_readiness_acceptance": {
+    "trading_ready": false,
+    "status": "NOT_TRADING_READY",
+    "exact_blocker": "LEGACY_SCOPE_SUCCESSOR_REQUIRED",
+    "source_revision": "5ad16753466636c52a161ef6c9cebc0a51fb5d98",
+    "deployed_revision": "5ad16753466636c52a161ef6c9cebc0a51fb5d98",
+    "target_identity": {
+      "candidate_id": "candidate-81d5cd48736c1d2d480f22f6",
+      "candidate_type": "PAPER_FORWARD",
+      "legacy_candidate": true,
+      "plan_id": "plan-08ec30ac4b8aa21caa7888ef",
+      "canonical_market_scope": null,
+      "canonical_market_scope_hash": null,
+      "canonical_market_scope_version": null,
+      "scope_resolution_count": 0,
+      "authenticated_successor": null,
+      "successor_candidate_id": null,
+      "successor_present": false
+    },
+    "qualification": {
+      "qualified": false,
+      "promotable": false,
+      "decision": "NOT_PROMOTABLE",
+      "blocker": "LEGACY_SCOPE_SUCCESSOR_REQUIRED",
+      "reason": "The exact target is a legacy PAPER_FORWARD candidate without canonical market scope, without any scope resolution, and without an authenticated successor."
+    },
+    "paper_evidence": {
+      "paper_observations": 3485,
+      "paper_execution_events": 3485,
+      "execution_event_breakdown": {
+        "NO_SIGNAL": 1875,
+        "FULL_FILL_BUY": 1610
+      },
+      "distinct_buy_fill_ids": 1610,
+      "distinct_buy_order_ids": 1610,
+      "sell_fills": 0,
+      "paper_bet_ledger_settled_bets": 0,
+      "settled_or_resolved_bets": 0
+    },
+    "fill_vs_trade_semantics": {
+      "fills_are_execution_events": true,
+      "paper_fills_are_completed_trades": false,
+      "completed_round_trips": null,
+      "completed_round_trips_status": "NON_DERIVABLE",
+      "settled_or_resolved_bets": 0,
+      "interpretation": "The 1610 BUY fills are execution events, not completed trades. With zero SELL fills and zero settled paper_bet_ledger bets, completed round trips are NON_DERIVABLE and resolved bets are zero."
+    },
+    "promotion_evidence": {
+      "resolved": 0,
+      "duration_seconds": 509245,
+      "required_duration_seconds": 604800,
+      "duration_comparison": "509245 < 604800",
+      "regimes": 0,
+      "forward_roi": null,
+      "expectancy": null,
+      "pnl": null,
+      "confidence": null,
+      "stability": null,
+      "calibration": null,
+      "promotable": false
+    },
+    "historical_static_tuple": {
+      "samples": 830,
+      "signals": 138,
+      "entries": 27,
+      "exits": 13,
+      "fills": 40,
+      "roi": -0.0035367,
+      "candidate_id": null,
+      "plan_id": null,
+      "matching_db_payload": false,
+      "superseded": true,
+      "scope_linkage": "UNBOUND",
+      "status": "HISTORICAL_RESEARCH_ONLY",
+      "candidate_acceptance": false,
+      "negative_roi_is_positive_qualification": false,
+      "attribution": "MUST_NOT_BE_ATTRIBUTED_TO_TARGET_OR_CALLED_FROZEN_OR_CURRENT_SCOPE_EVIDENCE",
+      "supersession_reason": "The prior mean-reversion static tuple has no candidate_id or plan_id and no matching database payload. Its negative ROI is retained only as unbound historical research."
+    },
+    "independent_candidate_exclusion": {
+      "candidate_id": "10d833",
+      "canonical": true,
+      "may_lend_scope": false,
+      "may_lend_metrics": false,
+      "used_for_target_acceptance": false
+    },
+    "provider_dns_diagnosis": {
+      "active_wifi_resolver": "192.168.10.254",
+      "intermittent_failure": "The active Wi-Fi resolver intermittently failed chatgpt.com resolution and returned Gamma 161.49.61.85.",
+      "gamma_ip": "161.49.61.85",
+      "gamma_network": "Converge ICT",
+      "verified_public_dnssec_doh_ips": [
+        "104.18.34.205",
+        "172.64.153.51"
+      ],
+      "gamma_tls_result": "TLS was verified but failed with an untrusted root, timeouts, or getaddrinfo before discovery.",
+      "requests": 3,
+      "retries": 2,
+      "markets_attempted": 0,
+      "errors": 1,
+      "cursor_preserved": true,
+      "chatgpt_enotfound": "Transient broad recursive-resolver failure; the current resolver again returns ChatGPT Cloudflare IPs.",
+      "hosts_override": false,
+      "default_route_up": true,
+      "dnscache_up": true,
+      "stale_disconnected_ethernet_resolver": "192.168.254.254",
+      "dns_or_tls_bypass_used": false,
+      "network_configuration_changed": false,
+      "required_fix": "User, administrator, network-owner, or ISP policy approval is required to fix the resolver path."
+    },
+    "deployed_evaluation": {
+      "operation": "CanaryService.evaluate_signal(target)",
+      "evaluated_at": "2026-09-12T00:51:40.810996+00:00",
+      "audit_id": "canary-evaluation-127ab1d025ad464b967a4c95e96166cb",
+      "candidate_id": "candidate-81d5cd48736c1d2d480f22f6",
+      "blocker": "LEGACY_SCOPE_SUCCESSOR_REQUIRED",
+      "blocker_stage": "scope_gate",
+      "evaluation_order": [
+        "scope_gate",
+        "market",
+        "health",
+        "strategy"
+      ],
+      "signal": null,
+      "market": null,
+      "evaluation_rows_before": 0,
+      "evaluation_rows_after": 1,
+      "submissions_before": 0,
+      "submissions_after": 0,
+      "execution_events_before": 0,
+      "execution_events_after": 0,
+      "risk_fills_before": 0,
+      "risk_fills_after": 0,
+      "canary_ledger_rows_before": 0,
+      "canary_ledger_rows_after": 0,
+      "control_state": "DISARMED",
+      "control_generation_before": 12,
+      "control_generation_after": 12,
+      "scope_resolutions": 0
+    },
+    "automatic_next_action": {
+      "implementation_commits": [
+        "19539f3",
+        "5ad16753466636c52a161ef6c9cebc0a51fb5d98"
+      ],
+      "action": "Continue durable bounded keyset recovery without relaxation.",
+      "live_production_node_pid": 41260,
+      "source_revision": "5ad16753466636c52a161ef6c9cebc0a51fb5d98",
+      "research_max_items_per_cycle": 1,
+      "cursor_progression": "The recovery cursor advances durably one candidate per approximately 60 seconds.",
+      "eventual_target_outcome": "The target will honestly persist MISSING_MARKET_SCOPE/RETAIN_LEGACY_PREDECESSOR with no successor.",
+      "collection_retry": "Collection retries each cycle with the cursor intact but cannot resolve markets until the network owner fixes DNS.",
+      "no_relaxation": true,
+      "operator_pid": 8112,
+      "operator_ready": true
+    },
+    "source_evidence": {
+      "source_revision": "5ad16753466636c52a161ef6c9cebc0a51fb5d98",
+      "deployed_revision": "5ad16753466636c52a161ef6c9cebc0a51fb5d98",
+      "durable_recovery_commits": [
+        "19539f3",
+        "5ad16753466636c52a161ef6c9cebc0a51fb5d98"
+      ],
+      "recovery_is_bounded": true,
+      "scope_relaxation": false
+    },
+    "process_evidence": {
+      "production_node_pid": 41260,
+      "operator_pid": 8112,
+      "control_state": "DISARMED",
+      "research": "ACTIVE",
+      "deployment": "DEPLOYED",
+      "recovery_cursor_preserved": true,
+      "autonomous_canary_enabled": false
+    },
+    "test_evidence": {
+      "full_suite": {
+        "result": "PASS",
+        "passed_percent": 100,
+        "skipped": 3,
+        "existing_pytest_collection_warnings": 2,
+        "seconds": 218.89
+      }
+    },
+    "safety_evidence": {
+      "live_fills_verified": false,
+      "no_unintended_orders_verified": true,
+      "control_state": "DISARMED",
+      "submissions": 0,
+      "execution_events": 0,
+      "risk_fills": 0,
+      "canary_ledger_rows": 0,
+      "paper_events_and_fills_are_non_live": true
     }
   }
 }
