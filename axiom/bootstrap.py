@@ -1808,14 +1808,15 @@ class HistoricalBootstrapper:
 
         # One page per tick keeps discovery bounded and persists the opaque
         # cursor and scope fingerprint before any market detail requests.
-        if not discovery_complete and len(discovered_ids) < target_markets:
+        if not discovery_complete:
             page_size = max(1, min(100, target_markets - len(discovered_ids)))
             market_page = getattr(provider, "market_page", None)
             if callable(market_page):
+                frontier_cursor = discovery_cursor
                 page_call = _request(
                     lambda: market_page(
                         page_size,
-                        after_cursor=discovery_cursor,
+                        after_cursor=frontier_cursor,
                         closed=True,
                     ),
                     "polymarket market discovery",
@@ -1849,13 +1850,54 @@ class HistoricalBootstrapper:
                     else:
                         if query_fingerprint is None and page_fingerprint:
                             query_fingerprint = page_fingerprint
-                        if isinstance(snapshots, Sequence) and not isinstance(
+                        snapshots_valid = isinstance(snapshots, Sequence) and not isinstance(
                             snapshots, (str, bytes, Mapping)
-                        ):
+                        )
+                        invalid_snapshot_count = 0
+                        if snapshots_valid:
                             for item in snapshots:
                                 market_id = str(getattr(item, "market_id", "")).strip()
                                 if market_id:
                                     discovered_ids.add(market_id)
+                                else:
+                                    invalid_snapshot_count += 1
+
+                        def _page_count(*names: str) -> int:
+                            for name in names:
+                                try:
+                                    value = int(getattr(page, name))
+                                except (AttributeError, TypeError, ValueError, OverflowError):
+                                    continue
+                                if value >= 0:
+                                    return value
+                            return 0
+
+                        if not snapshots_valid:
+                            invalid_snapshot_count = 1
+                        raw_count = _page_count("raw_count", "item_count")
+                        if raw_count == 0 and snapshots_valid:
+                            raw_count = len(snapshots)
+                        unique_count = _page_count("unique_count", "accepted_count")
+                        duplicate_count = _page_count("duplicate_count", "duplicates")
+                        malformed_count = max(
+                            _page_count(
+                                "malformed_count",
+                                "invalid_count",
+                                "rejected_count",
+                                "rejected_rows",
+                            ),
+                            invalid_snapshot_count,
+                            max(0, raw_count - unique_count - duplicate_count),
+                        )
+                        returned_cursor = getattr(page, "next_cursor", None)
+                        returned_cursor = (
+                            str(returned_cursor)
+                            if isinstance(returned_cursor, str) and returned_cursor
+                            else None
+                        )
+                        coverage_status = str(
+                            getattr(page, "coverage_status", "")
+                        ).strip().upper()
                         if page_call.request_failed and not snapshots:
                             discovery_failed = True
                             discovery_retry_after = _coerce_retry_after(page_call.retry_after)
@@ -1863,22 +1905,43 @@ class HistoricalBootstrapper:
                                 discovery_next_attempt_at = now + timedelta(
                                     seconds=discovery_retry_after
                                 )
-                        returned_cursor = getattr(page, "next_cursor", None)
-                        discovery_cursor = (
-                            str(returned_cursor)
-                            if isinstance(returned_cursor, str) and returned_cursor
-                            else None
-                        )
-                        if str(getattr(page, "coverage_status", "")).upper() == "ERROR":
-                            reason = str(getattr(page, "error_reason", "") or "MALFORMED_PAGE")
+                        if (
+                            malformed_count > 0
+                            or coverage_status == "ERROR"
+                            or (page_call.request_failed and not snapshots)
+                        ):
+                            # Accepted identities remain durable and are
+                            # deduplicated on retry, but the malformed page is
+                            # the retry frontier: do not advance its cursor or
+                            # claim complete coverage.
+                            reason = str(
+                                getattr(page, "error_reason", "") or
+                                (
+                                    f"REJECTED_PAGE_ITEMS:{malformed_count}"
+                                    if malformed_count > 0
+                                    else "MALFORMED_PAGE"
+                                )
+                            ).strip()
                             errors.append(f"polymarket market discovery: {reason}")
+                            discovery_failed = True
+                            discovery_complete = False
+                            discovery_cursor = frontier_cursor
                             request_failed = True
-                        elif discovery_cursor is None or len(discovered_ids) >= target_markets:
-                            discovery_complete = True
+                            discovery_retry_after = _coerce_retry_after(
+                                page_call.retry_after
+                            )
+                            if discovery_retry_after is not None and discovery_retry_after > 0:
+                                discovery_next_attempt_at = now + timedelta(
+                                    seconds=discovery_retry_after
+                                )
+                        else:
+                            discovery_cursor = returned_cursor
+                            if discovery_cursor is None or len(discovered_ids) >= target_markets:
+                                discovery_complete = True
                 elif page_call is None:
                     budget_exhausted = True
             elif callable(getattr(provider, "markets", None)):
-                remaining = target_markets - len(discovered_ids)
+                remaining = max(1, target_markets - len(discovered_ids))
                 market_call = _request(
                     lambda: provider.markets(active=False, limit=remaining),
                     "polymarket market discovery",
@@ -1893,6 +1956,7 @@ class HistoricalBootstrapper:
                                 seconds=discovery_retry_after
                             )
                     elif values is not None:
+                        rejected_count = 0
                         if isinstance(values, Sequence) and not isinstance(
                             values, (str, bytes, Mapping)
                         ):
@@ -1900,7 +1964,18 @@ class HistoricalBootstrapper:
                                 market_id = str(getattr(item, "market_id", "")).strip()
                                 if market_id:
                                     discovered_ids.add(market_id)
-                        discovery_complete = True
+                                else:
+                                    rejected_count += 1
+                        if rejected_count:
+                            errors.append(
+                                "polymarket market discovery: "
+                                f"REJECTED_PAGE_ITEMS:{rejected_count}"
+                            )
+                            discovery_failed = True
+                            discovery_complete = False
+                            request_failed = True
+                        else:
+                            discovery_complete = True
                 elif market_call is None:
                     budget_exhausted = True
             else:
@@ -2438,11 +2513,45 @@ class HistoricalBootstrapper:
             if market_ids is not None
             else None
         )
-        raw_rows = self.store.load_polymarket_snapshots(
-            source_type="FORWARD_COLLECTED",
-            end=cutoff_value,
-            limit=max_rows,
-        )
+        # ``load_polymarket_snapshots`` orders ordinary reads oldest-first.
+        # Replay publication must first apply the market scope in SQL and
+        # select the newest bounded window, otherwise a LIMIT permanently
+        # excludes snapshots collected after the first publication.
+        if max_rows == 0:
+            raw_rows: Sequence[Mapping[str, Any]] = ()
+        elif selected is None:
+            raw_rows = self.store.load_polymarket_snapshots(
+                source_type="FORWARD_COLLECTED",
+                end=cutoff_value,
+                latest=True,
+                limit=max_rows,
+            )
+        else:
+            scoped_rows: list[Mapping[str, Any]] = []
+            for market_id in selected:
+                scoped_rows.extend(
+                    self.store.load_polymarket_snapshots(
+                        market_id=market_id,
+                        source_type="FORWARD_COLLECTED",
+                        end=cutoff_value,
+                        latest=True,
+                        limit=max_rows,
+                    )
+                )
+            raw_rows = sorted(
+                scoped_rows,
+                key=lambda row: (
+                    _stamp(row.get("observed_at"))
+                    or datetime.min.replace(tzinfo=timezone.utc),
+                    str(row.get("market_id") or ""),
+                    _stamp(row.get("source_timestamp"))
+                    or datetime.min.replace(tzinfo=timezone.utc),
+                    str(row.get("snapshot_id") or ""),
+                ),
+                reverse=True,
+            )
+            if max_rows is not None:
+                raw_rows = raw_rows[:max_rows]
         rows: list[dict[str, Any]] = []
         for row in raw_rows:
             market_id = str(row.get("market_id") or "").strip()

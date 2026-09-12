@@ -41,6 +41,68 @@ from axiom.strategy import validate_strategy
 UTC = timezone.utc
 T0 = datetime(2026, 1, 1, tzinfo=UTC)
 
+def _save_attested_polymarket_dataset(
+    store: AxiomStore,
+    version: str,
+) -> tuple[dict[str, object], dict[str, object]]:
+    rows = [
+        {
+            "timestamp": T0.isoformat(),
+            "market_id": "historical-price-proxy-market",
+            "yes_mid": 0.50,
+            "yes_bid": 0.49,
+            "yes_ask": 0.51,
+            "price": 0.50,
+            "settlement": "open",
+            "source_type": "HISTORICAL",
+        }
+    ]
+    metadata = {
+        "source_type": "HISTORICAL",
+        "market_type": "prediction",
+        "instrument": "POLYMARKET",
+        "provider": "node-campaign-test",
+        "research_quality": "PRICE_PROXY",
+    }
+    store.save_dataset(
+        POLYMARKET_DATASET_ID,
+        version,
+        rows,
+        metadata=metadata,
+        quality="PRICE_PROXY",
+    )
+    store.save_dataset_catalog(
+        POLYMARKET_DATASET_ID,
+        version,
+        provider="node-campaign-test",
+        instrument="POLYMARKET",
+        market_type="prediction",
+        timeframe="event",
+        start_timestamp=T0,
+        end_timestamp=T0,
+        row_count=len(rows),
+        completeness=1.0,
+        missing_ranges=(),
+        quality="PRICE_PROXY",
+        source_type="HISTORICAL",
+        snapshot_id=f"node-campaign-test:{version}",
+        metadata=metadata,
+    )
+    store.verify_dataset_integrity_attestation(
+        POLYMARKET_DATASET_ID,
+        version,
+        force=True,
+    )
+    catalog = store.load_dataset_catalog(POLYMARKET_DATASET_ID, version)
+    attestation = store.load_dataset_integrity_attestation(POLYMARKET_DATASET_ID, version)
+    assert catalog is not None
+    assert attestation is not None
+    assert attestation["status"] == "CURRENT"
+    assert attestation["contamination_result"] == "PASS"
+    return catalog, attestation
+
+
+
 
 class NodeConfigValidationTests(unittest.TestCase):
     def test_execution_profile_accepts_only_exact_supported_values(self) -> None:
@@ -352,26 +414,9 @@ class HistoricalRefreshSchedulingTests(unittest.TestCase):
 
         old_campaign_id = f"{POLYMARKET_AUTONOMY_PROTOCOL_V1_ID}:campaign"
         new_campaign_id = f"{POLYMARKET_AUTONOMY_PROTOCOL_V2_ID}:campaign"
-        historical_rows = [
-            {
-                "timestamp": T0.isoformat(),
-                "market_id": "historical-price-proxy-market",
-                "price": 0.50,
-            }
-        ]
         with AxiomStore(":memory:") as store:
-            store.save_dataset(
-                POLYMARKET_DATASET_ID,
-                "v1",
-                historical_rows,
-                quality="PRICE_PROXY",
-            )
-            store.save_dataset(
-                POLYMARKET_DATASET_ID,
-                "v2",
-                historical_rows,
-                quality="PRICE_PROXY",
-            )
+            v1_catalog, v1_attestation = _save_attested_polymarket_dataset(store, "v1")
+            v2_catalog, v2_attestation = _save_attested_polymarket_dataset(store, "v2")
             node = ResearchNode(
                 NodeConfig(":memory:", crypto_enabled=False),
                 provider=InMemoryPredictionProvider([]),
@@ -381,7 +426,7 @@ class HistoricalRefreshSchedulingTests(unittest.TestCase):
             old = node.research_processor.start_polymarket_campaign(
                 old_campaign_id,
                 dataset_id=POLYMARKET_DATASET_ID,
-                dataset_version="v1",
+                dataset_version=str(v1_catalog["dataset_version"]),
                 protocol_id=POLYMARKET_AUTONOMY_PROTOCOL_V1_ID,
                 now=T0,
             )
@@ -410,14 +455,14 @@ class HistoricalRefreshSchedulingTests(unittest.TestCase):
                     "protocol_id": POLYMARKET_AUTONOMY_PROTOCOL_V1_ID,
                     "campaign_id": old_campaign_id,
                     "dataset_id": POLYMARKET_DATASET_ID,
-                    "dataset_version": "v1",
+                    "dataset_version": str(v1_catalog["dataset_version"]),
                     "status": "WAITING_FOR_DATA",
                 },
             )
 
             first = node._start_polymarket_campaign(
-                {"dataset_id": POLYMARKET_DATASET_ID, "dataset_version": "v2"},
-                {"attestation_hash": "v2-attestation"},
+                v2_catalog,
+                v2_attestation,
                 T0,
             )
             old_job = store.get_operator_job(
@@ -455,8 +500,8 @@ class HistoricalRefreshSchedulingTests(unittest.TestCase):
             self.assertEqual(loaded_rows[0]["yes_mid"], 0.50)
 
             second = node._start_polymarket_campaign(
-                {"dataset_id": POLYMARKET_DATASET_ID, "dataset_version": "v2"},
-                {"attestation_hash": "v2-attestation"},
+                v2_catalog,
+                v2_attestation,
                 T0,
             )
             self.assertEqual(second, first)
@@ -479,6 +524,8 @@ class HistoricalRefreshSchedulingTests(unittest.TestCase):
 
     def test_declined_campaign_reassessment_keeps_slot_and_suppresses_repeat(self) -> None:
         with AxiomStore(":memory:") as store:
+            v1_catalog, v1_attestation = _save_attested_polymarket_dataset(store, "v1")
+            v2_catalog, v2_attestation = _save_attested_polymarket_dataset(store, "v2")
             node = ResearchNode(
                 NodeConfig(":memory:", crypto_enabled=False),
                 provider=InMemoryPredictionProvider([]),
@@ -486,8 +533,8 @@ class HistoricalRefreshSchedulingTests(unittest.TestCase):
                 clock=lambda: T0,
             )
             first = node._start_polymarket_campaign(
-                {"dataset_version": "v1"},
-                {"attestation_hash": "attestation-v1"},
+                v1_catalog,
+                v1_attestation,
                 T0,
             )
             campaign_id = first["campaign_id"]
@@ -499,13 +546,13 @@ class HistoricalRefreshSchedulingTests(unittest.TestCase):
                 wraps=node.research_processor.reassess_campaign,
             ) as reassess:
                 declined = node._start_polymarket_campaign(
-                    {"dataset_version": "v2"},
-                    {"attestation_hash": "attestation-v2"},
+                    v2_catalog,
+                    v2_attestation,
                     T0,
                 )
                 suppressed = node._start_polymarket_campaign(
-                    {"dataset_version": "v2"},
-                    {"attestation_hash": "attestation-v2"},
+                    v2_catalog,
+                    v2_attestation,
                     T0,
                 )
 
@@ -534,6 +581,8 @@ class HistoricalRefreshSchedulingTests(unittest.TestCase):
 
     def test_actual_campaign_reassessment_persists_matching_count_once(self) -> None:
         with AxiomStore(":memory:") as store:
+            v1_catalog, v1_attestation = _save_attested_polymarket_dataset(store, "v1")
+            v2_catalog, v2_attestation = _save_attested_polymarket_dataset(store, "v2")
             node = ResearchNode(
                 NodeConfig(":memory:", crypto_enabled=False),
                 provider=InMemoryPredictionProvider([]),
@@ -541,8 +590,8 @@ class HistoricalRefreshSchedulingTests(unittest.TestCase):
                 clock=lambda: T0,
             )
             first = node._start_polymarket_campaign(
-                {"dataset_version": "v1"},
-                {"attestation_hash": "attestation-v1"},
+                v1_catalog,
+                v1_attestation,
                 T0,
             )
             campaign_id = first["campaign_id"]
@@ -576,13 +625,13 @@ class HistoricalRefreshSchedulingTests(unittest.TestCase):
                 wraps=node.research_processor.reassess_campaign,
             ) as reassess:
                 actual = node._start_polymarket_campaign(
-                    {"dataset_version": "v2"},
-                    {"attestation_hash": "attestation-v2"},
+                    v2_catalog,
+                    v2_attestation,
                     T0 + timedelta(minutes=2),
                 )
                 repeated = node._start_polymarket_campaign(
-                    {"dataset_version": "v2"},
-                    {"attestation_hash": "attestation-v2"},
+                    v2_catalog,
+                    v2_attestation,
                     T0 + timedelta(minutes=3),
                 )
 

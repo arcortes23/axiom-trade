@@ -74,8 +74,11 @@ _MAX_EVIDENCE_SCAN_ROWS = 100_000
 _QUEUE_RELEASE_BATCH = 256
 _QUEUE_LINEAGE_LIMIT = 256
 _DEFAULT_HERMES_JOB_ID = "f1d27bf8c27a"
-_PAGINATION_PAGE_SIZES = (10, 25, 50, 100)
+_PAPER_POSITION_PROJECTION_LIMIT = 32
+_DATASET_METADATA_PROJECTION_LIMIT = 64
+_DATASET_MISSING_RANGE_PROJECTION_LIMIT = 32
 _DEFAULT_PAGE_SIZE = 25
+_PAGINATION_PAGE_SIZES = (10, 25, 50, 100)
 _POLYMARKET_SOURCE_TYPES = frozenset({"HISTORICAL", "FORWARD_COLLECTED"})
 _DEFAULT_OPERATIONAL_WINDOW_SECONDS = 3_600.0
 _MAX_OPERATIONAL_WINDOW_SECONDS = 86_400.0
@@ -8214,13 +8217,7 @@ class AxiomStore:
                 if str(value).strip()
             }
         )
-        projection = (
-            "json_extract(state_json,"
-            "'$.portfolio.equity','$.portfolio.initial_cash',"
-            "'$.portfolio.positions','$.equity','$.initial_cash',"
-            "'$.forward_pnl','$.forward_max_drawdown','$.fill_count',"
-            "'$.risk.max_drawdown') AS projection_json"
-        )
+        projection = f"{_paper_state_projection_sql()} AS projection_json"
         rows: list[sqlite3.Row] = []
         if not identifiers:
             query = (
@@ -8228,7 +8225,7 @@ class AxiomStore:
                 f"{projection} FROM paper_state "
                 "ORDER BY updated_at DESC,experiment_id ASC LIMIT ?"
             )
-            values: list[Any] = [int(limit)]
+            values: list[Any] = _paper_state_projection_parameters(int(limit))
             batches = ((query, values),) if limit else ()
         else:
             batches = []
@@ -8241,7 +8238,7 @@ class AxiomStore:
                         f"{projection} FROM paper_state "
                         f"WHERE experiment_id IN ({placeholders}) "
                         "ORDER BY updated_at DESC,experiment_id ASC",
-                        [*batch],
+                        _paper_state_projection_parameters(*batch),
                     )
                 )
         if self.path not in {":memory:", ""} and not self.path.startswith("file:"):
@@ -8259,31 +8256,8 @@ class AxiomStore:
         rows.sort(key=lambda row: row["updated_at"], reverse=True)
         result: list[dict[str, Any]] = []
         for row in rows[:limit]:
-            values = _load(row["projection_json"]) if row["projection_json"] else []
-            values = list(values) if isinstance(values, list) else []
-            values.extend([None] * (9 - len(values)))
-            portfolio: dict[str, Any] = {}
-            for key, value in (
-                ("equity", values[0]),
-                ("initial_cash", values[1]),
-                ("positions", _load(values[2]) if isinstance(values[2], str) and values[2] else values[2]),
-            ):
-                if value is not None:
-                    portfolio[key] = value
-            state: dict[str, Any] = {}
-            if portfolio:
-                state["portfolio"] = portfolio
-            for key, value in (
-                ("equity", values[3]),
-                ("initial_cash", values[4]),
-                ("forward_pnl", values[5]),
-                ("forward_max_drawdown", values[6]),
-                ("fill_count", values[7]),
-            ):
-                if value is not None:
-                    state[key] = value
-            if values[8] is not None:
-                state["risk"] = {"max_drawdown": values[8]}
+            state = _load(row["projection_json"]) if row["projection_json"] else {}
+            state = state if isinstance(state, Mapping) else {}
             result.append(
                 {
                     "experiment_id": row["experiment_id"],
@@ -8950,18 +8924,51 @@ class AxiomStore:
         if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
             raise ValueError("limit must be a non-negative integer")
         with self._lock:
-            rows = self._conn.execute("SELECT * FROM worker_state ORDER BY worker_name LIMIT ?", (int(limit),)).fetchall()
-        return [
-            {
-                "worker_name": row["worker_name"],
-                "status": row["status"],
-                "payload": _load(row["payload_json"]),
-                "started_at": _parse_datetime(row["started_at"]),
-                "heartbeat_at": _parse_datetime(row["heartbeat_at"]),
-                "updated_at": _parse_datetime(row["updated_at"]),
-            }
-            for row in rows
-        ]
+            rows = self._conn.execute(
+                "SELECT worker_name,status,payload_json,started_at,heartbeat_at,updated_at,"
+                "(SELECT COUNT(*) FROM json_each(payload_json)) AS payload_key_count,"
+                "json_extract(payload_json,'$.worker_identity_valid') AS worker_identity_valid,"
+                "json_extract(payload_json,'$.stale_after_seconds') AS stale_after_seconds,"
+                "json_extract(payload_json,'$.degrading_reason') AS degrading_reason,"
+                "json_extract(payload_json,'$.reason_code') AS reason_code,"
+                "json_extract(payload_json,'$.last_error') AS last_error,"
+                "json_extract(payload_json,'$.grade') AS grade,"
+                "json_extract(payload_json,'$.crypto_paper.enabled') AS crypto_enabled,"
+                "json_extract(payload_json,'$.crypto_paper.last_error') AS crypto_last_error "
+                "FROM worker_state ORDER BY worker_name LIMIT ?",
+                (int(limit),),
+            ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            payload, projection = _worker_payload_projection(
+                row["payload_json"],
+                key_count=int(row["payload_key_count"] or 0),
+                known={
+                    "worker_identity_valid": row["worker_identity_valid"],
+                    "stale_after_seconds": row["stale_after_seconds"],
+                    "degrading_reason": row["degrading_reason"],
+                    "reason_code": row["reason_code"],
+                    "last_error": row["last_error"],
+                    "grade": row["grade"],
+                    "crypto_enabled": row["crypto_enabled"],
+                    "crypto_last_error": row["crypto_last_error"],
+                },
+            )
+            result.append(
+                {
+                    "worker_name": row["worker_name"],
+                    "status": row["status"],
+                    "payload": payload,
+                    "payload_sha256": projection["sha256"],
+                    "payload_bytes": projection["bytes"],
+                    "payload_key_count": projection["key_count"],
+                    "payload_truncated": projection["truncated"],
+                    "started_at": _parse_datetime(row["started_at"]),
+                    "heartbeat_at": _parse_datetime(row["heartbeat_at"]),
+                    "updated_at": _parse_datetime(row["updated_at"]),
+                }
+            )
+        return result
 
     def candidate_forward_requirements(
         self,
@@ -9709,13 +9716,19 @@ class AxiomStore:
             total = int(self._conn.execute(f"SELECT COUNT(*) AS n FROM dataset_catalog{where}", values).fetchone()["n"])
             actual_page, pages = _pagination_shape(requested_page, size, total)
             query = (
-                "SELECT * FROM dataset_catalog"
+                "SELECT dataset_catalog.*, "
+                "(SELECT COUNT(*) FROM json_each(dataset_catalog.metadata_json)) AS metadata_key_count, "
+                "json_extract(dataset_catalog.metadata_json,'$.category') AS metadata_category, "
+                "json_extract(dataset_catalog.metadata_json,'$.historical_order_book_available') AS metadata_historical_order_book_available, "
+                "json_extract(dataset_catalog.metadata_json,'$.universe_version') AS metadata_universe_version, "
+                "json_array_length(dataset_catalog.missing_ranges_json) AS missing_range_count "
+                "FROM dataset_catalog"
                 f"{where} ORDER BY {order_column} {order_direction.upper()},dataset_id ASC,dataset_version ASC "
                 "LIMIT ? OFFSET ?"
             )
             rows = self._conn.execute(query, [*values, size, (actual_page - 1) * size]).fetchall()
         return {
-            "items": [_dataset_catalog_record(row) for row in rows],
+            "items": [_dataset_catalog_dashboard_record(row) for row in rows],
             "page": actual_page,
             "page_size": size,
             "total": total,
@@ -9777,12 +9790,10 @@ class AxiomStore:
                 [*values, size, (actual_page - 1) * size],
             ).fetchall()
         items: list[dict[str, Any]] = []
+        any_truncated = False
         for row in rows:
-            raw_range = row["range_json"]
-            try:
-                parsed_range = _load(raw_range)
-            except (TypeError, ValueError, json.JSONDecodeError):
-                parsed_range = raw_range
+            parsed_range, truncated = _dataset_missing_range_projection(row["range_json"])
+            any_truncated = any_truncated or truncated
             items.append(
                 {
                     "dataset_id": row["dataset_id"],
@@ -9790,9 +9801,17 @@ class AxiomStore:
                     "range_index": int(row["range_index"]),
                     "range": parsed_range,
                     "missing_range": parsed_range,
+                    "range_truncated": truncated,
                 }
             )
-        return {"items": items, "page": actual_page, "page_size": size, "total": total, "pages": pages}
+        return {
+            "items": items,
+            "page": actual_page,
+            "page_size": size,
+            "total": total,
+            "pages": pages,
+            "range_payload_truncated": any_truncated,
+        }
 
     def paginate_candidate_lifecycle(
         self,
@@ -10630,11 +10649,17 @@ class AxiomStore:
                 if not identifiers:
                     continue
                 placeholders = ",".join("?" for _ in identifiers)
+                if record_type == "state":
+                    payload_expression = _paper_state_projection_sql()
+                    payload_values = _paper_state_projection_parameters(*identifiers)
+                else:
+                    payload_expression = payload_column
+                    payload_values = identifiers
                 payload_rows = snapshot.execute(
-                    f"SELECT {id_column} AS record_id,{payload_column} AS payload_json,"
+                    f"SELECT {id_column} AS record_id,{payload_expression} AS payload_json,"
                     f"{status_expression} AS payload_status FROM {table} "
                     f"WHERE {id_column} IN ({placeholders})",
-                    identifiers,
+                    payload_values,
                 ).fetchall()
                 payloads.update(
                     {
@@ -10806,14 +10831,38 @@ class AxiomStore:
             actual_page, pages = _pagination_shape(requested_page, size, total)
             rows = self._conn.execute(
                 f"{cte} SELECT record_type,record_id,experiment_id,market_id,timestamp,status,outcome,"
-                "resolution,strategy_id,payload_json,created_at,updated_at "
+                "resolution,strategy_id,"
+                "CASE WHEN record_type='state' THEN NULL ELSE payload_json END AS payload_json,"
+                "created_at,updated_at "
                 f"FROM paper_records{where} ORDER BY {order_column} {order_direction.upper()},record_id ASC,record_type ASC "
                 "LIMIT ? OFFSET ?",
                 [*values, size, (actual_page - 1) * size],
             ).fetchall()
+            state_ids = [
+                str(row["record_id"])
+                for row in rows
+                if str(row["record_type"]) == "state"
+            ]
+            state_payloads: dict[str, Any] = {}
+            if state_ids:
+                placeholders = ",".join("?" for _ in state_ids)
+                state_payload_rows = self._conn.execute(
+                    f"SELECT experiment_id AS record_id,{_paper_state_projection_sql()} AS payload_json "
+                    f"FROM paper_state WHERE experiment_id IN ({placeholders})",
+                    _paper_state_projection_parameters(*state_ids),
+                ).fetchall()
+                state_payloads = {
+                    str(row["record_id"]): row["payload_json"]
+                    for row in state_payload_rows
+                }
         items: list[dict[str, Any]] = []
         for row in rows:
-            payload = _load(row["payload_json"]) if row["payload_json"] else {}
+            payload_json = (
+                state_payloads.get(str(row["record_id"]))
+                if str(row["record_type"]) == "state"
+                else row["payload_json"]
+            )
+            payload = _load(payload_json) if payload_json else {}
             item = {
                 "record_type": row["record_type"],
                 "record_id": row["record_id"],
@@ -11244,6 +11293,235 @@ class AxiomStore:
             sqlite_retry(operation, operation_name=f"insert into {table}")
         except sqlite3.IntegrityError as exc:
             raise ValueError(f"duplicate immutable record in {table} ({key_columns})") from exc
+def _paper_state_projection_sql() -> str:
+    """Build a compact JSON projection for dashboard paper-state rows."""
+    position_count = "(SELECT COUNT(*) FROM json_each(state_json,'$.portfolio.positions'))"
+    positions = (
+        "(SELECT COALESCE(json_group_object(key,json_object("
+        "'symbol',json_extract(value,'$.symbol'),"
+        "'quantity',json_extract(value,'$.quantity'),"
+        "'average_price',json_extract(value,'$.average_price'),"
+        "'realized_pnl',json_extract(value,'$.realized_pnl'),"
+        "'unrealized_pnl',json_extract(value,'$.unrealized_pnl'),"
+        "'market_type',json_extract(value,'$.market_type'),"
+        "'outcome',json_extract(value,'$.outcome'))),'{}') "
+        "FROM (SELECT key,value FROM json_each(state_json,'$.portfolio.positions') "
+        "ORDER BY key LIMIT ?))"
+    )
+    return (
+        "json_object("
+        "'status',json_extract(state_json,'$.status'),"
+        "'portfolio',json_object("
+        "'equity',json_extract(state_json,'$.portfolio.equity'),"
+        "'initial_cash',json_extract(state_json,'$.portfolio.initial_cash'),"
+        f"'positions',json({positions}),"
+        f"'position_count',{position_count},"
+        f"'positions_returned',MIN({position_count},?),"
+        f"'positions_truncated',CASE WHEN {position_count}>? THEN 1 ELSE 0 END),"
+        "'equity',json_extract(state_json,'$.equity'),"
+        "'initial_cash',json_extract(state_json,'$.initial_cash'),"
+        "'forward_pnl',json_extract(state_json,'$.forward_pnl'),"
+        "'forward_max_drawdown',json_extract(state_json,'$.forward_max_drawdown'),"
+        "'fill_count',json_extract(state_json,'$.fill_count'),"
+        "'risk',json_object('max_drawdown',json_extract(state_json,'$.risk.max_drawdown'))"
+        ")"
+    )
+
+
+def _paper_state_projection_parameters(*values: Any) -> list[Any]:
+    """Bind the position-limit placeholders used by the projection SQL."""
+    return [_PAPER_POSITION_PROJECTION_LIMIT, _PAPER_POSITION_PROJECTION_LIMIT, _PAPER_POSITION_PROJECTION_LIMIT, *values]
+
+
+def _dataset_metadata_projection(
+    raw_json: Any,
+    *,
+    key_limit: int = _DATASET_METADATA_PROJECTION_LIMIT,
+    key_count: int | None = None,
+    known: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return metadata provenance without recursively decoding an unbounded manifest."""
+    raw = str(raw_json or "{}")
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    if len(raw) > 262_144:
+        projection: dict[str, Any] = {
+            "sha256": digest,
+            "bytes": len(raw.encode("utf-8")),
+            "key_count": key_count,
+            "keys": [],
+            "truncated": True,
+        }
+        for key, value in (known or {}).items():
+            if value is not None and not isinstance(value, (Mapping, list, tuple)):
+                projection[str(key)] = value
+        return projection
+    try:
+        decoded = _load(raw)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        decoded = {}
+    if not isinstance(decoded, Mapping):
+        return {
+            "sha256": digest,
+            "bytes": len(raw.encode("utf-8")),
+            "key_count": 0,
+            "keys": [],
+            "truncated": bool(raw),
+        }
+    keys = sorted(str(key) for key in decoded)[:key_limit]
+    selected_keys = {
+        "category",
+        "historical_order_book_available",
+        "instrument",
+        "market_type",
+        "provider",
+        "research_quality",
+        "source_type",
+        "timeframe",
+        "universe_version",
+    }
+    projection = {
+        str(key): value
+        for key, value in decoded.items()
+        if str(key) in selected_keys
+        and not isinstance(value, (Mapping, list, tuple))
+    }
+    projection.update(
+        {
+            "sha256": digest,
+            "bytes": len(raw.encode("utf-8")),
+            "key_count": len(decoded),
+            "keys": keys,
+            "truncated": len(decoded) > key_limit or bool(set(str(key) for key in decoded) - set(projection)),
+        }
+    )
+    return projection
+
+
+def _dataset_missing_range_projection(raw_json: Any) -> tuple[Any, bool]:
+    """Keep range identity fields while bounding arbitrary range payloads."""
+    raw = str(raw_json or "")
+    if len(raw) > 262_144:
+        return {}, True
+    try:
+        decoded = _load(raw)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return raw[:4096], bool(raw[4096:])
+    if isinstance(decoded, Mapping):
+        projected = {
+            key: decoded[key]
+            for key in ("start", "end", "start_timestamp", "end_timestamp", "reason", "kind")
+            if key in decoded
+        }
+        if projected:
+            return projected, len(_dump(decoded)) > len(_dump(projected))
+    if isinstance(decoded, str):
+        return decoded[:4096], len(decoded) > 4096
+    encoded = _dump(decoded)
+    return encoded[:4096], len(encoded) > 4096
+
+
+def _worker_payload_projection(
+    raw_json: Any,
+    *,
+    key_count: int | None = None,
+    known: Mapping[str, Any] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Keep worker liveness fields while bounding persisted diagnostics."""
+    raw = str(raw_json or "{}")
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    projection = {
+        "sha256": digest,
+        "bytes": len(raw.encode("utf-8")),
+        "key_count": key_count,
+        "truncated": len(raw) > 262_144,
+    }
+    decoded: Any = None
+    if not projection["truncated"]:
+        try:
+            decoded = _load(raw)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            decoded = None
+    if isinstance(decoded, Mapping):
+        payload = dict(decoded)
+    else:
+        payload = {
+            str(key): value
+            for key, value in (known or {}).items()
+            if value is not None and not isinstance(value, (Mapping, list, tuple))
+        }
+        crypto_enabled = (known or {}).get("crypto_enabled")
+        crypto_error = (known or {}).get("crypto_last_error")
+        if crypto_enabled is not None or crypto_error is not None:
+            payload["crypto_paper"] = {
+                key: value
+                for key, value in (
+                    ("enabled", crypto_enabled),
+                    ("last_error", crypto_error),
+                )
+                if value is not None
+            }
+    payload["_projection"] = projection
+    return payload, projection
+
+
+def _dataset_catalog_dashboard_record(row: sqlite3.Row) -> dict[str, Any]:
+    metadata = _dataset_metadata_projection(
+        row["metadata_json"],
+        key_count=int(row["metadata_key_count"] or 0),
+        known={
+            "category": row["metadata_category"],
+            "historical_order_book_available": row["metadata_historical_order_book_available"],
+            "universe_version": row["metadata_universe_version"],
+        },
+    )
+    missing_raw = str(row["missing_ranges_json"] or "[]")
+    missing_count = int(row["missing_range_count"] or 0)
+    missing_ranges: list[Any] = []
+    missing_truncated = False
+    if len(missing_raw) <= 262_144:
+        try:
+            decoded = _load(missing_raw)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            decoded = []
+        if isinstance(decoded, list):
+            for value in decoded[:_DATASET_MISSING_RANGE_PROJECTION_LIMIT]:
+                projected, truncated = _dataset_missing_range_projection(_dump(value))
+                missing_ranges.append(projected)
+                missing_truncated = missing_truncated or truncated
+            missing_truncated = missing_truncated or len(decoded) > _DATASET_MISSING_RANGE_PROJECTION_LIMIT
+        else:
+            missing_truncated = bool(missing_raw)
+    else:
+        missing_truncated = True
+    return {
+        "dataset_id": row["dataset_id"],
+        "dataset_version": row["dataset_version"],
+        "version": row["dataset_version"],
+        "provider": row["provider"],
+        "instrument": row["instrument"],
+        "market_type": row["market_type"],
+        "timeframe": row["timeframe"],
+        "start_timestamp": _parse_datetime(row["start_timestamp"]),
+        "end_timestamp": _parse_datetime(row["end_timestamp"]),
+        "row_count": int(row["row_count"]),
+        "completeness": float(row["completeness"]),
+        "missing_ranges": missing_ranges,
+        "missing_range_count": missing_count,
+        "missing_ranges_returned": len(missing_ranges),
+        "missing_ranges_truncated": missing_truncated,
+        "quality": row["quality"],
+        "source_type": row["source_type"],
+        "snapshot_id": row["snapshot_id"],
+        "created_at": _parse_datetime(row["created_at"]),
+        "updated_at": _parse_datetime(row["updated_at"]),
+        "last_updated": _parse_datetime(row["updated_at"]),
+        "metadata": metadata,
+        "metadata_truncated": bool(metadata.get("truncated")),
+        "metadata_key_count": metadata.get("key_count"),
+        "metadata_sha256": metadata.get("sha256"),
+    }
+
+
 def _dataset_catalog_record(row: sqlite3.Row) -> dict[str, Any]:
     metadata = _load(row["metadata_json"])
     missing_ranges = _load(row["missing_ranges_json"])

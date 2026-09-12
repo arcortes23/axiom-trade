@@ -214,6 +214,64 @@ def _seed_predeclared_historical_dataset(store: AxiomStore, *, attested: bool = 
         assert attestation["status"] == "CURRENT"
         assert attestation["contamination_result"] == "PASS"
 
+def _save_attested_campaign_dataset(
+    store: AxiomStore,
+    *,
+    dataset_id: str = "campaign-history",
+    dataset_version: str = "v1",
+) -> dict[str, object]:
+    rows = [
+        {
+            "timestamp": T0.isoformat(),
+            "market_id": "campaign-market",
+            "yes_mid": 0.50,
+            "yes_bid": 0.49,
+            "yes_ask": 0.51,
+            "settlement": "open",
+            "source_type": "HISTORICAL",
+        }
+    ]
+    metadata = {
+        "source_type": "HISTORICAL",
+        "market_type": "prediction",
+        "instrument": "POLYMARKET",
+        "provider": "campaign-test",
+        "research_quality": "PRICE_PROXY",
+    }
+    store.save_dataset(
+        dataset_id,
+        dataset_version,
+        rows,
+        metadata=metadata,
+        quality="PRICE_PROXY",
+    )
+    store.save_dataset_catalog(
+        dataset_id,
+        dataset_version,
+        provider="campaign-test",
+        instrument="POLYMARKET",
+        market_type="prediction",
+        timeframe="event",
+        start_timestamp=T0,
+        end_timestamp=T0,
+        row_count=len(rows),
+        completeness=1.0,
+        missing_ranges=(),
+        quality="PRICE_PROXY",
+        source_type="HISTORICAL",
+        snapshot_id=f"campaign-test:{dataset_version}",
+        metadata=metadata,
+    )
+    attestation = store.verify_dataset_integrity_attestation(
+        dataset_id,
+        dataset_version,
+        force=True,
+    )
+    assert attestation["status"] == "CURRENT"
+    assert attestation["contamination_result"] == "PASS"
+    return attestation
+
+
 def _legacy_prediction_predecessor(
     *,
     selector: dict[str, object] | None = None,
@@ -327,20 +385,7 @@ class PolymarketResearchOrchestrationTests(unittest.TestCase):
 
     def test_finite_campaign_persists_protocol_before_queueing_trial(self) -> None:
         with AxiomStore(":memory:") as store:
-            store.save_dataset(
-                "campaign-history",
-                "v1",
-                [
-                    {
-                        "timestamp": T0.isoformat(),
-                        "market_id": "campaign-market",
-                        "yes_mid": 0.50,
-                        "yes_bid": 0.49,
-                        "yes_ask": 0.51,
-                        "settlement": "open",
-                    }
-                ],
-            )
+            _save_attested_campaign_dataset(store)
             processor = AutonomousResearchProcessor(store, clock=lambda: T0)
             state = processor.start_polymarket_campaign(
                 "durable-campaign",
@@ -418,20 +463,7 @@ class PolymarketResearchOrchestrationTests(unittest.TestCase):
             for index in range(10)
         )
         with patch("axiom.autonomous.POLYMARKET_CAMPAIGN_GRID", legacy_grid), AxiomStore(":memory:") as store:
-            store.save_dataset(
-                "campaign-history",
-                "v1",
-                [
-                    {
-                        "timestamp": T0.isoformat(),
-                        "market_id": "campaign-market",
-                        "yes_mid": 0.50,
-                        "yes_bid": 0.49,
-                        "yes_ask": 0.51,
-                        "settlement": "open",
-                    }
-                ],
-            )
+            _save_attested_campaign_dataset(store)
             processor = AutonomousResearchProcessor(store, clock=lambda: T0)
             modern = processor.start_polymarket_campaign(
                 "legacy-resume-campaign",
@@ -537,20 +569,7 @@ class PolymarketResearchOrchestrationTests(unittest.TestCase):
 
     def test_finite_campaign_advance_marks_trial_and_queues_next(self) -> None:
         with AxiomStore(":memory:") as store:
-            store.save_dataset(
-                "campaign-history",
-                "v1",
-                [
-                    {
-                        "timestamp": T0.isoformat(),
-                        "market_id": "campaign-market",
-                        "yes_mid": 0.50,
-                        "yes_bid": 0.49,
-                        "yes_ask": 0.51,
-                        "settlement": "open",
-                    }
-                ],
-            )
+            _save_attested_campaign_dataset(store)
             processor = AutonomousResearchProcessor(store, clock=lambda: T0)
             processor.start_polymarket_campaign(
                 "advance-campaign",
@@ -659,20 +678,7 @@ class PolymarketResearchOrchestrationTests(unittest.TestCase):
             },
         )
         with patch("axiom.autonomous.POLYMARKET_CAMPAIGN_GRID", campaign_grid), AxiomStore(":memory:") as store:
-            store.save_dataset(
-                "campaign-history",
-                "v1",
-                [
-                    {
-                        "timestamp": T0.isoformat(),
-                        "market_id": "campaign-market",
-                        "yes_mid": 0.50,
-                        "yes_bid": 0.49,
-                        "yes_ask": 0.51,
-                        "settlement": "open",
-                    }
-                ],
-            )
+            _save_attested_campaign_dataset(store)
             processor = AutonomousResearchProcessor(store, clock=lambda: T0)
             processor.start_polymarket_campaign(
                 "exhausted-campaign",

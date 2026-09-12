@@ -301,6 +301,146 @@ class Phase42PolymarketTests(unittest.TestCase):
             self.assertIsNotNone(aggregate)
             assert aggregate is not None
             self.assertEqual(aggregate["row_count"], 4)
+    def test_forward_replay_uses_latest_scoped_rows_before_bounded_limit(self) -> None:
+        with AxiomStore(":memory:") as store:
+            for index in range(4):
+                stamp = T0 + timedelta(minutes=index)
+                store.save_polymarket_snapshot(
+                    f"m1-{index}",
+                    "m1",
+                    stamp,
+                    stamp,
+                    {
+                        "source_type": "FORWARD_COLLECTED",
+                        "snapshot": {
+                            "market_id": "m1",
+                            "timestamp": stamp.isoformat(),
+                        },
+                    },
+                    source_type="FORWARD_COLLECTED",
+                )
+            newest_other = T0 + timedelta(days=1)
+            store.save_polymarket_snapshot(
+                "m2-newest",
+                "m2",
+                newest_other,
+                newest_other,
+                {
+                    "source_type": "FORWARD_COLLECTED",
+                    "snapshot": {
+                        "market_id": "m2",
+                        "timestamp": newest_other.isoformat(),
+                    },
+                },
+                source_type="FORWARD_COLLECTED",
+            )
+            bootstrapper = HistoricalBootstrapper(
+                store,
+                prediction_provider=FakePolymarket(),
+                sleep=lambda _: None,
+            )
+            first = bootstrapper.publish_polymarket_forward_replay(
+                cutoff=T0 + timedelta(minutes=3),
+                market_ids=("m1",),
+                max_rows=2,
+            )
+            self.assertEqual(
+                [item["snapshot_id"] for item in first["snapshot_manifest"]],
+                ["m1-2", "m1-3"],
+            )
+            later = T0 + timedelta(minutes=4)
+            store.save_polymarket_snapshot(
+                "m1-4",
+                "m1",
+                later,
+                later,
+                {
+                    "source_type": "FORWARD_COLLECTED",
+                    "snapshot": {
+                        "market_id": "m1",
+                        "timestamp": later.isoformat(),
+                    },
+                },
+                source_type="FORWARD_COLLECTED",
+            )
+            second = bootstrapper.publish_polymarket_forward_replay(
+                cutoff=later,
+                market_ids=("m1",),
+                max_rows=2,
+            )
+            self.assertEqual(
+                [item["snapshot_id"] for item in second["snapshot_manifest"]],
+                ["m1-3", "m1-4"],
+            )
+            self.assertNotEqual(first["dataset_version"], second["dataset_version"])
+            restarted = HistoricalBootstrapper(
+                store,
+                prediction_provider=FakePolymarket(),
+                sleep=lambda _: None,
+            ).publish_polymarket_forward_replay(
+                cutoff=later,
+                market_ids=("m1",),
+                max_rows=2,
+            )
+            self.assertEqual(restarted["dataset_version"], second["dataset_version"])
+
+    def test_malformed_discovery_page_stays_partial_and_retries_frontier(self) -> None:
+        class MalformedPagePolymarket(FakePolymarket):
+            def __init__(self) -> None:
+                super().__init__()
+                self.malformed = True
+                self.page_calls: list[str | None] = []
+
+            def market_page(
+                self,
+                limit: int,
+                *,
+                after_cursor: str | None = None,
+                closed: bool = False,
+            ) -> MarketDiscoveryPage:
+                self.page_calls.append(after_cursor)
+                values = tuple(self.markets_by_id.values())[:limit]
+                malformed_count = 1 if self.malformed else 0
+                self.malformed = False
+                return MarketDiscoveryPage(
+                    snapshots=values,
+                    next_cursor=None,
+                    request_path="/markets/keyset",
+                    query={"limit": str(limit), "closed": str(closed).lower()},
+                    query_fingerprint="scope:malformed-fixture",
+                    raw_count=len(values) + malformed_count,
+                    unique_count=len(values),
+                    duplicate_count=0,
+                    malformed_count=malformed_count,
+                    coverage_status="COMPLETE",
+                )
+
+        provider = MalformedPagePolymarket()
+        with AxiomStore(":memory:") as store:
+            bootstrapper = HistoricalBootstrapper(
+                store,
+                prediction_provider=provider,
+                sleep=lambda _: None,
+                max_attempts=1,
+            )
+            partial = bootstrapper.bootstrap_polymarket(max_markets=2, resume=True)
+            self.assertEqual(partial.status, "PARTIAL")
+            state = store.load_dataset_bootstrap_state("Polymarket-historical")
+            self.assertIsNotNone(state)
+            assert state is not None
+            self.assertFalse(state["discovery_complete"])
+            self.assertEqual(
+                state["discovered_market_ids"],
+                ["m-crypto", "m-politics"],
+            )
+            complete = bootstrapper.bootstrap_polymarket(max_markets=2, resume=True)
+            self.assertEqual(complete.status, "NO_NEW_DATA")
+            final_state = store.load_dataset_bootstrap_state("Polymarket-historical")
+            self.assertIsNotNone(final_state)
+            assert final_state is not None
+            self.assertTrue(final_state["discovery_complete"])
+            self.assertEqual(provider.page_calls, [None, None])
+
     def test_polymarket_query_scope_migration_preserves_processed_constituents(self) -> None:
         class LegacyPolymarket(FakePolymarket):
             def __init__(self) -> None:

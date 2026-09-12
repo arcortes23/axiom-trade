@@ -6,7 +6,7 @@ import json
 import unittest
 from unittest.mock import patch
 
-from axiom.autonomous import AutonomousResearchProcessor
+from axiom.autonomous import AutonomousResearchError, AutonomousResearchProcessor
 from axiom.storage import AxiomStore
 
 
@@ -81,21 +81,67 @@ def _save_attested_dataset(store: AxiomStore, version: str, *, midpoint: float) 
     assert attestation["status"] == "CURRENT"
     assert attestation["contamination_result"] == "PASS"
     return attestation
+def _save_catalog_attested_dataset(
+    store: AxiomStore,
+    version: str,
+    rows: list[dict[str, object]],
+) -> dict[str, object]:
+    metadata = {
+        "fixture_label": SYNTHETIC_LABEL,
+        "synthetic": True,
+        "provider": SYNTHETIC_LABEL,
+        "source_type": "HISTORICAL",
+        "market_type": "prediction",
+        "instrument": "POLYMARKET",
+        "research_quality": "PRICE_PROXY",
+    }
+    stamps = [
+        datetime.fromisoformat(
+            str(row["timestamp"]).replace("Z", "+00:00")
+        )
+        for row in rows
+        if row.get("timestamp") is not None
+    ]
+    store.save_dataset(
+        DATASET_ID,
+        version,
+        rows,
+        metadata=metadata,
+        quality="PRICE_PROXY",
+    )
+    store.save_dataset_catalog(
+        DATASET_ID,
+        version,
+        provider=SYNTHETIC_LABEL,
+        instrument="POLYMARKET",
+        market_type="prediction",
+        timeframe="event",
+        start_timestamp=min(stamps) if stamps else T0,
+        end_timestamp=max(stamps) if stamps else T0,
+        row_count=len(rows),
+        completeness=1.0 if rows else 0.0,
+        quality="PRICE_PROXY",
+        source_type="HISTORICAL",
+        snapshot_id=f"{SYNTHETIC_LABEL}:catalog:{version}",
+        metadata=metadata,
+    )
+    attestation = store.verify_dataset_integrity_attestation(
+        DATASET_ID,
+        version,
+        force=True,
+    )
+    assert attestation["status"] == "CURRENT"
+    assert attestation["contamination_result"] == "PASS"
+    return attestation
 
 
 class AutonomousCampaignAcceptanceTests(unittest.TestCase):
     def test_large_campaign_uses_compact_locked_provenance(self) -> None:
         with AxiomStore(":memory:") as store:
-            store.save_dataset(
-                DATASET_ID,
+            _save_catalog_attested_dataset(
+                store,
                 "large-v1",
                 _large_rows(),
-                metadata={
-                    "source_type": "HISTORICAL",
-                    "market_type": "prediction",
-                    "instrument": "POLYMARKET",
-                },
-                quality="PRICE_PROXY",
             )
             processor = AutonomousResearchProcessor(store, clock=lambda: T0)
             state = processor.start_polymarket_campaign(
@@ -113,9 +159,9 @@ class AutonomousCampaignAcceptanceTests(unittest.TestCase):
             self.assertTrue(boundary["ordered_row_manifest_digest"].startswith("sha256:"))
             self.assertNotIn("ordered_row_identities", boundary)
             self.assertNotIn("ordered_content_hashes", boundary)
+
     def test_v2_price_proxy_protocol_uses_only_present_required_features(self) -> None:
         from axiom.experiment_plan import ExperimentPlan
-
         rows = [
             {
                 "timestamp": T0.isoformat(),
@@ -124,7 +170,7 @@ class AutonomousCampaignAcceptanceTests(unittest.TestCase):
             }
         ]
         with AxiomStore(":memory:") as store:
-            store.save_dataset(DATASET_ID, "v2", rows, quality="PRICE_PROXY")
+            _save_catalog_attested_dataset(store, "v2", rows)
             processor = AutonomousResearchProcessor(store, clock=lambda: T0)
             state = processor.start_polymarket_campaign(
                 "polymarket-paper-campaign-v2:campaign",
@@ -159,13 +205,40 @@ class AutonomousCampaignAcceptanceTests(unittest.TestCase):
             self.assertNotIn("yes_bid", loaded_rows[0])
             self.assertNotIn("yes_ask", loaded_rows[0])
 
-    def test_campaign_start_deduplicates_prior_multi_parameter_plan(self) -> None:
+    def test_campaign_rejects_unattested_history_before_queueing_work(self) -> None:
+        rows = _rows(midpoint=0.50)
         with AxiomStore(":memory:") as store:
             store.save_dataset(
                 DATASET_ID,
+                "unattested-v1",
+                rows,
+                metadata={
+                    "source_type": "HISTORICAL",
+                    "market_type": "prediction",
+                    "instrument": "POLYMARKET",
+                },
+                quality="PRICE_PROXY",
+            )
+            processor = AutonomousResearchProcessor(store, clock=lambda: T0)
+            with self.assertRaises(AutonomousResearchError) as raised:
+                processor.start_polymarket_campaign(
+                    "unattested-campaign",
+                    dataset_id=DATASET_ID,
+                    dataset_version="unattested-v1",
+                    now=T0,
+                )
+            self.assertEqual(raised.exception.reason, "SOFTWARE_OR_INPUT_ERROR")
+            self.assertEqual(
+                processor.bus.list_campaign_trials("unattested-campaign"),
+                (),
+            )
+
+    def test_campaign_start_deduplicates_prior_multi_parameter_plan(self) -> None:
+        with AxiomStore(":memory:") as store:
+            _save_catalog_attested_dataset(
+                store,
                 "prior-grid-v1",
                 _rows(midpoint=0.50),
-                quality="PRICE_PROXY",
             )
             store.save_experiment_plan(
                 "prior-grid-plan",
@@ -251,6 +324,10 @@ class AutonomousCampaignAcceptanceTests(unittest.TestCase):
             self.assertEqual(initial["status"], "RUNNING")
             self.assertEqual(initial["protocol"]["dataset_boundary"]["dataset_id"], DATASET_ID)
             self.assertEqual(initial["protocol"]["dataset_boundary"]["dataset_version"], "v1")
+            self.assertEqual(
+                initial["protocol"]["dataset_boundary"]["attestation_hash"],
+                first_attestation["attestation_hash"],
+            )
             first_queue = processor.bus.list_campaign_trials(campaign_id, limit=100)
             self.assertEqual(len(first_queue), 1)
             self.assertEqual(first_queue[0].payload["campaign_id"], campaign_id)
@@ -330,6 +407,11 @@ class AutonomousCampaignAcceptanceTests(unittest.TestCase):
             reassessment_id = f"{reassessed['trials'][1]['trial_id']}:reassessment-1"
             reassessment_trial = next(
                 item for item in reassessed["trials"] if item["trial_id"] == reassessment_id
+            )
+            reassessment_boundary = reassessed["reassessment_boundaries"][reassessment_id]
+            self.assertEqual(
+                reassessment_boundary["attestation_hash"],
+                second_attestation["attestation_hash"],
             )
             self.assertEqual(reassessment_trial["status"], "RUNNING")
             reassessment_queue = [
@@ -435,7 +517,7 @@ class AutonomousCampaignAcceptanceTests(unittest.TestCase):
         ]
         gates = {"min_expectancy": 0.0, "min_samples": 1, "min_trades": 1}
         with patch("axiom.autonomous.POLYMARKET_CAMPAIGN_GRID", campaign_grid), AxiomStore(":memory:") as store:
-            store.save_dataset(DATASET_ID, "zero-trades-v1", rows, quality="PRICE_PROXY")
+            _save_catalog_attested_dataset(store, "zero-trades-v1", rows)
             processor = AutonomousResearchProcessor(store, clock=lambda: T0)
             state = processor.start_polymarket_campaign(
                 "zero-trades-campaign",

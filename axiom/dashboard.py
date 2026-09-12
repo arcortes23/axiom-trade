@@ -3185,6 +3185,13 @@ class DashboardData:
             portfolio = portfolio if isinstance(portfolio, Mapping) else {}
             risk = state.get("risk", {})
             risk = risk if isinstance(risk, Mapping) else {}
+            positions = portfolio.get("positions", {})
+            positions = positions if isinstance(positions, Mapping) else {}
+            position_count = _number_or_zero(portfolio.get("position_count", len(positions)))
+            position_count = max(0, int(position_count))
+            position_returned = _number_or_zero(portfolio.get("positions_returned", len(positions)))
+            position_returned = max(0, int(position_returned))
+            positions_truncated = bool(portfolio.get("positions_truncated", position_returned < position_count))
             equity = _number_or_zero(portfolio.get("equity", state.get("equity", 0.0)))
             initial = _number_or_zero(portfolio.get("initial_cash", state.get("initial_cash", 0.0)))
             pnl = equity - initial if initial else _number_or_zero(state.get("forward_pnl"))
@@ -3210,7 +3217,10 @@ class DashboardData:
                     "pnl": pnl,
                     "drawdown": _number_or_zero(state.get("forward_max_drawdown", risk.get("max_drawdown"))),
                     "fills": state.get("fill_count", len(portfolio.get("fills", [])) if isinstance(portfolio.get("fills"), list) else 0),
-                    "open_positions": portfolio.get("positions", {}),
+                    "open_positions": dict(positions),
+                    "open_position_count": position_count,
+                    "open_positions_returned": position_returned,
+                    "open_positions_truncated": positions_truncated,
                     "resolved_bets": len(ledger),
                     "paper_only": True,
 

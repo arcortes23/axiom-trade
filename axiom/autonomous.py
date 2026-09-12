@@ -14,7 +14,7 @@ import math
 import re
 from itertools import product
 from statistics import mean
-from typing import Any, Callable, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, NoReturn, Sequence
 
 from .backtest import CryptoBacktester
 from .backtest.prediction import run_prediction_research_mode
@@ -1082,6 +1082,15 @@ class AutonomousResearchProcessor:
             return []
         rows = [_normalize_row(row) for row in loaded if isinstance(row, Mapping)]
         rows = [row for row in rows if row is not None]
+        if any(
+            str(row.get("source_type", "HISTORICAL")).strip().upper()
+            != "HISTORICAL"
+            for row in rows
+        ):
+            raise AutonomousResearchError(
+                "SOFTWARE_OR_INPUT_ERROR",
+                "campaign dataset rows contain FORWARD_COLLECTED evidence",
+            )
         rows.sort(
             key=lambda row: (
                 parse_timestamp(row.get("timestamp", row.get("source_timestamp"))) or datetime.min.replace(tzinfo=timezone.utc),
@@ -1190,6 +1199,7 @@ class AutonomousResearchProcessor:
         finalist_count: int,
         observation_horizon: int,
         protocol_id: str = CAMPAIGN_PROTOCOL_V1_ID,
+        attestation_hash: str | None = None,
     ) -> dict[str, Any]:
         provenance = _campaign_compact_row_provenance(rows)
         manifests = dict(provenance["split_boundaries"])
@@ -1205,6 +1215,8 @@ class AutonomousResearchProcessor:
             "content_hash": provenance["content_hash"],
             "split_boundaries": dict(manifests),
         }
+        if str(attestation_hash or "").strip():
+            boundary["attestation_hash"] = str(attestation_hash).strip()
         protocol_identity = str(protocol_id).strip()
         if protocol_identity not in {CAMPAIGN_PROTOCOL_V1_ID, CAMPAIGN_PROTOCOL_V2_ID}:
             raise ValueError("unsupported campaign protocol")
@@ -1916,7 +1928,17 @@ class AutonomousResearchProcessor:
         ).strip()
         if not resolved_dataset_version:
             raise ValueError("dataset_version is required")
+        attestation = self._validate_campaign_dataset_provenance(
+            resolved_dataset_id,
+            resolved_dataset_version,
+            source=source,
+        )
         rows = self._campaign_dataset_rows(self.store, resolved_dataset_id, resolved_dataset_version)
+        if len(rows) != int(attestation.get("row_count", -1)):
+            raise AutonomousResearchError(
+                "SOFTWARE_OR_INPUT_ERROR",
+                "campaign dataset rows do not match the attested catalog count",
+            )
         prior = self._campaign_prior_configuration_keys(resolved_protocol_id)
         configurations = [
             dict(item)
@@ -1933,6 +1955,7 @@ class AutonomousResearchProcessor:
             finalist_count=int(finalist_count),
             observation_horizon=int(observation_horizon),
             protocol_id=resolved_protocol_id,
+            attestation_hash=str(attestation.get("attestation_hash", "")).strip(),
         )
         protocol_hash = _hash_document(protocol)
         trials: list[dict[str, Any]] = [
@@ -2048,9 +2071,18 @@ class AutonomousResearchProcessor:
     @staticmethod
     def _campaign_result_classification(result: Mapping[str, Any]) -> str:
         code = str(result.get("reason_code", "")).strip().upper()
-        if code in {"INSUFFICIENT_DATA", "DATA_INSUFFICIENT", "DATASET_PROVENANCE_INVALID", "DATASET_ATTESTATION_MISSING"}:
+        if code in {"INSUFFICIENT_DATA", "DATA_INSUFFICIENT"}:
             return "DATA_INSUFFICIENT"
-        if code in {"PROCESSING_FAILED", "INVALID_PLAN", "INVALID_DATASET", "SOFTWARE_OR_INPUT_ERROR"}:
+        if code in {
+            "PROCESSING_FAILED",
+            "INVALID_PLAN",
+            "INVALID_DATASET",
+            "SOFTWARE_OR_INPUT_ERROR",
+            "DATASET_PROVENANCE_INVALID",
+            "DATASET_ATTESTATION_MISSING",
+            "DATASET_ATTESTATION_STALE",
+            "DATASET_ATTESTATION_CHANGED",
+        }:
             return "SOFTWARE_OR_INPUT_ERROR"
         if result.get("accepted") is not False and str(result.get("stage", "")).upper() != CandidateStage.REJECTED.value:
             return "VALIDATION_QUALIFIED"
@@ -2124,6 +2156,12 @@ class AutonomousResearchProcessor:
                         trial_boundary.get("content_hash", ""),
                     )
                 ).strip()
+                self._validate_campaign_dataset_provenance(
+                    str(trial_boundary.get("dataset_id", "")).strip(),
+                    str(trial_boundary.get("dataset_version", "")).strip(),
+                    boundary=trial_boundary,
+                    plan=plan,
+                )
                 rows = self._campaign_dataset_rows(
                     self.store,
                     str(trial_boundary.get("dataset_id", "")).strip(),
@@ -2164,6 +2202,7 @@ class AutonomousResearchProcessor:
                         "metrics": _compact_evidence(metrics),
                         "protected_row_identity_manifest": dict(trial_descriptor) if isinstance(trial_descriptor, Mapping) else list(trial_manifest),
                         "final_rows_digest": trial_digest,
+                        "dataset_boundary": dict(trial_boundary),
                     }
                 )
             except (AutonomousResearchError, ExperimentPlanError, TypeError, ValueError) as exc:
@@ -2180,19 +2219,51 @@ class AutonomousResearchProcessor:
             for item in assessments
             if item.get("status") == "QUALIFIED" and str(item.get("candidate_id", "")).strip()
         ]
-        persisted_final_manifest = (
-            dict(final_manifest)
-            if isinstance(final_manifest, Mapping)
-            else dict(final_boundary)
-            if isinstance(final_boundary, Mapping)
-            else list(final_manifest)
+        finalist_assessment = next(
+            (
+                item
+                for item in assessments
+                if item.get("status") == "QUALIFIED"
+                and isinstance(item.get("dataset_boundary"), Mapping)
+            ),
+            None,
         )
+        envelope_boundary = (
+            dict(finalist_assessment["dataset_boundary"])
+            if isinstance(finalist_assessment, Mapping)
+            else None
+        )
+        if envelope_boundary is not None:
+            finalist_manifest = finalist_assessment.get("protected_row_identity_manifest")
+            persisted_final_manifest = (
+                dict(finalist_manifest)
+                if isinstance(finalist_manifest, Mapping)
+                else list(finalist_manifest)
+                if isinstance(finalist_manifest, (list, tuple))
+                else {}
+            )
+            final_digest = str(
+                envelope_boundary.get(
+                    "ordered_row_manifest_digest",
+                    envelope_boundary.get("content_hash", ""),
+                )
+            ).strip()
+            final_row_count = int(envelope_boundary.get("row_count", 0))
+        else:
+            persisted_final_manifest = (
+                dict(final_manifest)
+                if isinstance(final_manifest, Mapping)
+                else dict(final_boundary)
+                if isinstance(final_boundary, Mapping)
+                else list(final_manifest)
+            )
         payload["final_assessment"] = {
             "evaluated_once": True,
             "assessments": assessments,
             "protected_row_identity_manifest": persisted_final_manifest,
             "protected_row_identity_digest": final_digest,
             "row_count": final_row_count,
+            "dataset_boundary": envelope_boundary,
         }
         payload["final_assessment_evaluated"] = True
         payload["qualified_candidate_ids"] = qualified_ids
@@ -2350,12 +2421,13 @@ class AutonomousResearchProcessor:
             ):
                 return resolved_id, version
         return resolved_id, current_version
-
     @staticmethod
     def _campaign_boundary_for_dataset(
         dataset_id: str,
         dataset_version: str,
         rows: Sequence[Mapping[str, Any]],
+        *,
+        attestation_hash: str | None = None,
     ) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
         provenance = _campaign_compact_row_provenance(rows)
         boundary = {
@@ -2370,6 +2442,8 @@ class AutonomousResearchProcessor:
             "content_hash": provenance["content_hash"],
             "split_boundaries": dict(provenance["split_boundaries"]),
         }
+        if str(attestation_hash or "").strip():
+            boundary["attestation_hash"] = str(attestation_hash).strip()
         return boundary, dict(provenance["split_boundaries"])
 
     def reassess_campaign(
@@ -2408,25 +2482,29 @@ class AutonomousResearchProcessor:
             dataset_id=dataset_id,
             dataset_version=dataset_version,
         )
-        original_dataset_id = str(payload.get("dataset_id", "")).strip()
-        original_dataset_version = str(payload.get("dataset_version", "")).strip()
-        reassessment_boundary: Mapping[str, Any] = protocol.get("dataset_boundary", {})
-        if not isinstance(reassessment_boundary, Mapping):
-            reassessment_boundary = {}
-        if (
-            resolved_dataset_id != original_dataset_id
-            or resolved_dataset_version != original_dataset_version
-        ):
-            new_rows = self._campaign_dataset_rows(
-                self.store,
-                resolved_dataset_id,
-                resolved_dataset_version,
+        reassessment_attestation = self._validate_campaign_dataset_provenance(
+            resolved_dataset_id,
+            resolved_dataset_version,
+            expected_attestation_hash=identity,
+        )
+        new_rows = self._campaign_dataset_rows(
+            self.store,
+            resolved_dataset_id,
+            resolved_dataset_version,
+        )
+        if len(new_rows) != int(reassessment_attestation.get("row_count", -1)):
+            raise AutonomousResearchError(
+                "SOFTWARE_OR_INPUT_ERROR",
+                "campaign reassessment rows do not match the attested catalog count",
             )
-            reassessment_boundary, reassessment_manifests = self._campaign_boundary_for_dataset(
-                resolved_dataset_id,
-                resolved_dataset_version,
-                new_rows,
-            )
+        reassessment_boundary, _ = self._campaign_boundary_for_dataset(
+            resolved_dataset_id,
+            resolved_dataset_version,
+            new_rows,
+            attestation_hash=str(
+                reassessment_attestation.get("attestation_hash", "")
+            ).strip(),
+        )
         payload["reassessment_count"] = 1
         payload["last_evidence_identity"] = identity
         payload["reassessment_evidence"] = {
@@ -4456,6 +4534,13 @@ class AutonomousResearchProcessor:
                 plan,
                 queue_payload=item.payload,
             )
+            self._validate_campaign_dataset_provenance(
+                str(campaign_boundary.get("dataset_id", "")).strip(),
+                str(campaign_boundary.get("dataset_version", "")).strip(),
+                boundary=campaign_boundary,
+                plan=plan,
+            )
+            self._validate_persisted_dataset_provenance(plan)
         elif plan.campaign_id:
             raise AutonomousResearchError(
                 "CAMPAIGN_PROTOCOL_INVALID",
@@ -5628,6 +5713,163 @@ class AutonomousResearchProcessor:
                 "DATASET_ATTESTATION_MISSING",
                 f"no immutable dataset attestation for {dataset_id}/{dataset_version}",
             )
+        return dict(attestation)
+
+    def _validate_campaign_dataset_provenance(
+        self,
+        dataset_id: str,
+        dataset_version: str,
+        *,
+        boundary: Mapping[str, Any] | None = None,
+        source: Mapping[str, Any] | None = None,
+        plan: ExperimentPlan | None = None,
+        expected_attestation_hash: str | None = None,
+    ) -> Mapping[str, Any]:
+        """Validate a campaign dataset fence before loading any trial rows."""
+        identifier = str(dataset_id).strip()
+        version = str(dataset_version).strip()
+
+        def invalid(detail: str) -> NoReturn:
+            raise AutonomousResearchError("SOFTWARE_OR_INPUT_ERROR", detail)
+
+        if not identifier or not version or version.casefold() in _MUTABLE_DATASET_VERSION_ALIASES:
+            invalid("campaign requires an exact immutable dataset id and version")
+        catalog_loader = getattr(self.store, "load_dataset_catalog", None)
+        if not callable(catalog_loader):
+            invalid(f"no persisted dataset catalog for {identifier}/{version}")
+        try:
+            catalog = catalog_loader(identifier, version)
+        except Exception as exc:
+            invalid(f"persisted dataset catalog could not be loaded for {identifier}/{version}: {exc}")
+        if not isinstance(catalog, Mapping):
+            invalid(f"no persisted dataset catalog for {identifier}/{version}")
+        catalog_id = str(catalog.get("dataset_id", "")).strip()
+        catalog_version = str(catalog.get("dataset_version", catalog.get("version", ""))).strip()
+        if catalog_id != identifier or catalog_version != version:
+            invalid("campaign dataset catalog identity does not match its frozen boundary")
+        if str(catalog.get("market_type", "")).strip().lower() != MarketType.PREDICTION.value:
+            invalid("campaign dataset catalog market_type is not prediction")
+        catalog_source_type = str(catalog.get("source_type", "")).strip().upper()
+        if catalog_source_type != "HISTORICAL":
+            invalid(
+                "campaign dataset catalog source_type "
+                f"{catalog_source_type or '<missing>'} is not HISTORICAL"
+            )
+        catalog_instrument = str(catalog.get("instrument", "")).strip().upper()
+        if catalog_instrument != "POLYMARKET":
+            invalid("campaign dataset catalog instrument is not POLYMARKET")
+        metadata = catalog.get("metadata")
+        metadata = metadata if isinstance(metadata, Mapping) else {}
+        metadata_source_type = str(metadata.get("source_type", "")).strip().upper()
+        if metadata_source_type and metadata_source_type != "HISTORICAL":
+            invalid("campaign dataset metadata source_type is not HISTORICAL")
+
+        declared = source if isinstance(source, Mapping) else {}
+        selector = declared.get("dataset_selector")
+        selector = dict(selector) if isinstance(selector, Mapping) else {}
+        for raw_name, field in (
+            ("dataset_source_type", "source_type"),
+            ("dataset_source", "source"),
+            ("dataset_timeframe", "timeframe"),
+        ):
+            if raw_name in declared and declared.get(raw_name) is not None:
+                selector.setdefault(field, declared.get(raw_name))
+        if plan is not None:
+            selector = plan.dataset_selector
+        for field in ("provider", "source", "timeframe", "interval", "source_type"):
+            value = selector.get(field)
+            if value is None or not str(value).strip():
+                continue
+            if field == "source_type":
+                if str(value).strip().upper() != catalog_source_type:
+                    invalid(f"campaign dataset selector {field} does not match HISTORICAL")
+            elif field in {"timeframe", "interval"}:
+                if str(value).strip() != str(catalog.get("timeframe", "")).strip():
+                    invalid(f"campaign dataset selector {field} does not match its catalog")
+            else:
+                catalog_source = str(
+                    catalog.get("provider", catalog.get("source", ""))
+                ).strip()
+                if str(value).strip() != catalog_source:
+                    invalid(f"campaign dataset selector {field} does not match its catalog")
+
+        try:
+            catalog_count = catalog.get("row_count")
+            catalog_complete = float(catalog.get("completeness", 0.0))
+        except (TypeError, ValueError, OverflowError):
+            invalid("campaign dataset catalog row count or completeness is malformed")
+        if (
+            isinstance(catalog_count, bool)
+            or not isinstance(catalog_count, int)
+            or catalog_count <= 0
+            or not math.isfinite(catalog_complete)
+            or catalog_complete < 1.0
+        ):
+            invalid("campaign dataset catalog is empty or incomplete")
+
+        if isinstance(boundary, Mapping):
+            boundary_id = str(boundary.get("dataset_id", "")).strip()
+            boundary_version = str(boundary.get("dataset_version", "")).strip()
+            boundary_source = str(boundary.get("source_type", "")).strip().upper()
+            if (
+                boundary_id != identifier
+                or boundary_version != version
+                or boundary_source != "HISTORICAL"
+            ):
+                invalid("campaign dataset provenance does not match its frozen boundary")
+            boundary_count = boundary.get("row_count")
+            if (
+                isinstance(boundary_count, bool)
+                or not isinstance(boundary_count, int)
+                or boundary_count != catalog_count
+            ):
+                invalid("campaign dataset row count does not match its frozen boundary")
+
+        attestation_loader = getattr(self.store, "load_dataset_integrity_attestation", None)
+        if not callable(attestation_loader):
+            invalid(f"no persisted dataset attestation for {identifier}/{version}")
+        try:
+            attestation = attestation_loader(identifier, version)
+        except Exception as exc:
+            invalid(f"persisted dataset attestation could not be loaded for {identifier}/{version}: {exc}")
+        if not isinstance(attestation, Mapping):
+            invalid(f"no persisted dataset attestation for {identifier}/{version}")
+        attestation_id = str(attestation.get("dataset_id", "")).strip()
+        attestation_version = str(attestation.get("dataset_version", "")).strip()
+        attestation_hash = str(attestation.get("attestation_hash", "")).strip()
+        if (
+            attestation_id != identifier
+            or attestation_version != version
+            or not attestation_hash
+        ):
+            invalid("campaign dataset attestation identity or hash is mismatched")
+        if expected_attestation_hash and attestation_hash != str(expected_attestation_hash).strip():
+            invalid("campaign reassessment evidence does not match the current attestation")
+        if isinstance(boundary, Mapping):
+            frozen_hash = str(boundary.get("attestation_hash", "")).strip()
+            if frozen_hash and frozen_hash != attestation_hash:
+                invalid("campaign dataset attestation changed after the boundary was frozen")
+        if str(attestation.get("status", "")).strip().upper() != "CURRENT":
+            invalid("campaign dataset attestation is not CURRENT")
+        if str(attestation.get("source_type", "")).strip().upper() != "HISTORICAL":
+            invalid("campaign dataset attestation source_type is not HISTORICAL")
+        if str(attestation.get("market_type", "")).strip().lower() != MarketType.PREDICTION.value:
+            invalid("campaign dataset attestation market_type is not prediction")
+        if str(attestation.get("contamination_result", "")).strip().upper() != "PASS":
+            invalid("campaign dataset attestation reports forward contamination")
+        attestation_count = attestation.get("row_count")
+        try:
+            attestation_complete = float(attestation.get("completeness", 0.0))
+        except (TypeError, ValueError, OverflowError):
+            invalid("campaign dataset attestation completeness is malformed")
+        if (
+            isinstance(attestation_count, bool)
+            or not isinstance(attestation_count, int)
+            or attestation_count != catalog_count
+            or not math.isfinite(attestation_complete)
+            or attestation_complete < 1.0
+        ):
+            invalid("campaign dataset attestation does not match its catalog")
         return dict(attestation)
 
     def _validate_persisted_dataset_provenance(

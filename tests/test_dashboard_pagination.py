@@ -2106,6 +2106,132 @@ class DashboardPaginationEndpointTests(DashboardPaginationFixture):
         self.assertEqual(large_state["equity"], 1234.0)
         self.assertEqual(large_state["open_positions"]["market"]["quantity"], 2)
         self.assertNotIn(history_marker, json.dumps(portfolio, default=str, sort_keys=True))
+    def test_large_paper_state_page_projects_positions_and_summary_truthfully(self) -> None:
+        history_marker = "paper-state-history-marker-" + ("x" * 20_000_000)
+        positions = {
+            f"market-{index:04d}": {
+                "symbol": f"SYM{index:04d}",
+                "quantity": index + 1,
+                "average_price": 10.0 + index,
+                "realized_pnl": 0.0,
+                "unrealized_pnl": 0.5,
+                "market_type": "prediction",
+                "outcome": "yes",
+            }
+            for index in range(128)
+        }
+        before = DashboardData(store=self.store, clock=lambda: T0)._paper_portfolio()
+        self.store.save_paper_state(
+            "large-paper-state",
+            {
+                "status": "OPEN",
+                "portfolio": {
+                    "equity": 54321.0,
+                    "initial_cash": 50000.0,
+                    "positions": positions,
+                },
+                "signal_history_by_market": {"bulk": history_marker},
+            },
+            timestamp=T0 + timedelta(days=1),
+        )
+        status, payload, body = self._request(
+            "api/v2/paper",
+            page=1,
+            page_size=10,
+            sort="timestamp",
+            direction="desc",
+            filter="large-paper-state",
+        )
+        self.assertEqual(status, 200)
+        self.assertIsInstance(payload, dict)
+        assert isinstance(payload, dict)
+        self.assertEqual(payload["total"], 1)
+        self.assertLess(len(body), 200_000)
+        self.assertNotIn(history_marker, body)
+        item = payload["items"][0]
+        projection = item["payload"]["portfolio"]
+        self.assertEqual(projection["equity"], 54321.0)
+        self.assertEqual(projection["initial_cash"], 50000.0)
+        self.assertEqual(projection["position_count"], len(positions))
+        self.assertEqual(projection["positions_returned"], 32)
+        self.assertTrue(projection["positions_truncated"])
+        self.assertEqual(len(projection["positions"]), 32)
+        self.assertEqual(item["state"], item["payload"])
+
+        after = DashboardData(store=self.store, clock=lambda: T0)._paper_portfolio()
+        self.assertEqual(after["total_equity"], before["total_equity"] + 54321.0)
+        self.assertEqual(after["total_pnl"], before["total_pnl"] + 4321.0)
+        row = next(item for item in after["states"] if item["experiment_id"] == "large-paper-state")
+        self.assertEqual(row["open_position_count"], len(positions))
+        self.assertEqual(row["open_positions_returned"], 32)
+        self.assertTrue(row["open_positions_truncated"])
+        self.assertEqual(len(row["open_positions"]), 32)
+
+    def test_large_dataset_metadata_and_worker_payloads_are_digest_bounded(self) -> None:
+        metadata_manifest = "replay-manifest-" + ("m" * 2_600_000)
+        self.store.save_dataset_catalog(
+            "large-dashboard-catalog",
+            "v1",
+            provider="fixture-provider",
+            instrument="POLYMARKET",
+            market_type="prediction",
+            timeframe="1d",
+            start_timestamp=T0,
+            end_timestamp=T0,
+            row_count=1,
+            completeness=1.0,
+            missing_ranges=(),
+            quality="HIGH",
+            source_type="HISTORICAL",
+            snapshot_id="large-dashboard-snapshot",
+            metadata={"category": "stress", "replay_manifest": metadata_manifest},
+            created_at=T0,
+            updated_at=T0 + timedelta(days=1),
+        )
+        status, dataset_page, dataset_body = self._request(
+            "api/v2/datasets",
+            page=1,
+            page_size=10,
+            sort="dataset_id",
+            direction="asc",
+            filter="large-dashboard-catalog",
+        )
+        self.assertEqual(status, 200)
+        self.assertLess(len(dataset_body), 200_000)
+        dataset_item = dataset_page["items"][0]
+        self.assertTrue(dataset_item["metadata_truncated"])
+        self.assertEqual(dataset_item["metadata_key_count"], 2)
+        self.assertEqual(dataset_item["metadata"]["category"], "stress")
+        expected_metadata_json = json.dumps(
+            {"category": "stress", "replay_manifest": metadata_manifest},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        self.assertEqual(
+            dataset_item["metadata_sha256"],
+            hashlib.sha256(expected_metadata_json.encode("utf-8")).hexdigest(),
+        )
+        self.assertNotIn(metadata_manifest, dataset_body)
+
+        worker_payload = {
+            "grade": "A",
+            "stale_after_seconds": 300,
+            "worker_identity_valid": True,
+            "large_diagnostic": "worker-history-" + ("w" * 13_000_000),
+        }
+        self.store.save_worker_state("large-worker", "IDLE", worker_payload, heartbeat_at=T0)
+        status, status_page, status_body = self._request("api/status")
+        self.assertEqual(status, 200)
+        self.assertLess(len(status_body), 200_000)
+        worker = next(item for item in status_page["workers"] if item["worker_name"] == "large-worker")
+        self.assertTrue(worker["payload_truncated"])
+        self.assertEqual(worker["payload_key_count"], len(worker_payload))
+        expected_worker_json = json.dumps(worker_payload, sort_keys=True, separators=(",", ":"))
+        self.assertEqual(
+            worker["payload_sha256"],
+            hashlib.sha256(expected_worker_json.encode("utf-8")).hexdigest(),
+        )
+        self.assertNotIn(worker_payload["large_diagnostic"], status_body)
 
 
     def test_every_ui_sort_column_has_a_supported_paged_endpoint(self) -> None:
