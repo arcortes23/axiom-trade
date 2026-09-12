@@ -1928,6 +1928,25 @@ class DashboardPaginationEndpointTests(DashboardPaginationFixture):
         self.assertTrue(all(item["status"] == "OPEN" for item in open_paper["items"]))
 
 
+    def test_paper_page_does_not_depend_on_unrelated_dashboard_counts(self) -> None:
+        # A paper page must remain available even when an unrelated table
+        # summary cannot be read; paper telemetry has its own bounded counts.
+        with patch.object(self.store, "dashboard_summary", side_effect=AssertionError("unrelated summary")):
+            status, payload, _ = self._request(
+                "api/v2/paper",
+                page=1,
+                page_size=25,
+                sort="timestamp",
+                direction="desc",
+            )
+        self.assertEqual(status, 200)
+        self.assertIsInstance(payload, dict)
+        assert isinstance(payload, dict)
+        self.assertEqual(payload["total"], PAPER_COUNT)
+        self.assertEqual(len(payload["items"]), PAPER_COUNT)
+        self.assertEqual(payload["paper_telemetry"]["record_count"], 0)
+        self.assertTrue(payload["paper_only"])
+
     def test_every_ui_sort_column_has_a_supported_paged_endpoint(self) -> None:
         # These are the backend keys emitted by each table's sort buttons.
         # A click must not silently produce an empty page or a server error.

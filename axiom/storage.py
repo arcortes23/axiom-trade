@@ -7423,6 +7423,64 @@ class AxiomStore:
             }
             for row in rows
         ]
+    def list_paper_states_for_experiments(
+        self,
+        experiment_ids: Iterable[str],
+        *,
+        limit: int = 1000,
+    ) -> list[dict[str, Any]]:
+        """Load only paper states bound to the supplied experiment IDs."""
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+            raise ValueError("limit must be non-negative")
+        identifiers = sorted(
+            {
+                str(value).strip()
+                for value in experiment_ids
+                if str(value).strip()
+            }
+        )
+        if not identifiers or limit == 0:
+            return []
+        rows: list[sqlite3.Row] = []
+        with self._lock:
+            for offset in range(0, len(identifiers), 900):
+                batch = identifiers[offset : offset + 900]
+                placeholders = ",".join("?" for _ in batch)
+                rows.extend(
+                    self._conn.execute(
+                        "SELECT * FROM paper_state "
+                        f"WHERE experiment_id IN ({placeholders}) "
+                        "ORDER BY updated_at DESC,experiment_id ASC",
+                        batch,
+                    ).fetchall()
+                )
+        rows.sort(key=lambda row: row["experiment_id"])
+        rows.sort(key=lambda row: row["updated_at"], reverse=True)
+        return [
+            {
+                "experiment_id": row["experiment_id"],
+                "state": _load(row["state_json"]),
+                "updated_at": _parse_datetime(row["updated_at"]),
+            }
+            for row in rows[:limit]
+        ]
+
+    def paper_record_counts(self) -> dict[str, int]:
+        """Return paper-table counts without scanning unrelated runtime tables."""
+        with self._lock:
+            return self._paper_record_counts_locked()
+
+    def _paper_record_counts_locked(self) -> dict[str, int]:
+        return {
+            label: int(self._conn.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()["n"])
+            for table, label in (
+                ("paper_state", "paper_state"),
+                ("paper_observations", "paper_observations"),
+                ("paper_execution_events", "paper_execution_events"),
+                ("paper_bet_ledger", "paper_bet_ledger"),
+            )
+        }
+
 
     def paper_observation_exists(self, observation_id: str) -> bool:
         identifier = str(observation_id).strip()
@@ -9497,6 +9555,7 @@ class AxiomStore:
                 "observed_at": _parse_datetime(row["observed_at"]),
                 "metadata_observed_at": _parse_datetime(row["metadata_observed_at"]),
                 "snapshot_observed_at": _parse_datetime(row["snapshot_observed_at"]),
+
                 "source_timestamp": _parse_datetime(row["source_timestamp"]),
                 "metadata_hash": row["metadata_hash"],
                 "snapshot_id": row["snapshot_id"],
@@ -9513,6 +9572,101 @@ class AxiomStore:
             items.append(item)
         return {"items": items, "page": actual_page, "page_size": size, "total": total, "pages": pages}
 
+    def _paginate_paper_records_unfiltered(
+        self,
+        *,
+        requested_page: int,
+        page_size: int,
+        direction: str,
+    ) -> dict[str, Any]:
+        """Page the common unfiltered timestamp view using per-table indexes.
+
+        The generic paper CTE is intentionally retained for filtered and
+        non-timestamp views, but its compound scan must materialize every
+        payload before sorting.  The default dashboard view only needs the
+        newest records, so bounded source reads preserve the same global
+        ordering without that full materialization.
+        """
+        with self._lock:
+            counts = self._paper_record_counts_locked()
+            total = sum(counts.values())
+            actual_page, pages = _pagination_shape(requested_page, page_size, total)
+            if not total:
+                return {"items": [], "page": actual_page, "page_size": page_size, "total": 0, "pages": pages}
+            source_limit = (actual_page - 1) * page_size + page_size
+            order = "DESC" if direction == "desc" else "ASC"
+            source_queries = (
+                f"""
+                    SELECT 'state' AS record_type,experiment_id AS record_id,
+                        experiment_id,NULL AS market_id,updated_at AS timestamp,
+                        json_extract(state_json,'$.status') AS status,
+                        NULL AS outcome,NULL AS resolution,NULL AS strategy_id,
+                        state_json AS payload_json,updated_at AS created_at,
+                        updated_at
+                    FROM paper_state
+                    ORDER BY updated_at {order},experiment_id ASC
+                    LIMIT ?
+                """,
+                f"""
+                    SELECT 'observation' AS record_type,observation_id AS record_id,
+                        experiment_id,market_id,timestamp,
+                        json_extract(payload_json,'$.status') AS status,
+                        NULL AS outcome,NULL AS resolution,NULL AS strategy_id,
+                        payload_json,created_at,created_at AS updated_at
+                    FROM paper_observations
+                    ORDER BY timestamp {order},observation_id ASC
+                    LIMIT ?
+                """,
+                f"""
+                    SELECT 'execution' AS record_type,event_id AS record_id,
+                        experiment_id,market_id,timestamp,status,
+                        NULL AS outcome,NULL AS resolution,NULL AS strategy_id,
+                        payload_json,created_at,created_at AS updated_at
+                    FROM paper_execution_events
+                    ORDER BY timestamp {order},event_id ASC
+                    LIMIT ?
+                """,
+                f"""
+                    SELECT 'bet' AS record_type,bet_id AS record_id,
+                        experiment_id,market_id,resolved_at AS timestamp,
+                        resolution AS status,outcome,resolution,strategy_id,
+                        payload_json,created_at,updated_at
+                    FROM paper_bet_ledger
+                    ORDER BY resolved_at {order},bet_id ASC
+                    LIMIT ?
+                """,
+            )
+            rows: list[sqlite3.Row] = []
+            for query in source_queries:
+                rows.extend(self._conn.execute(query, (source_limit,)).fetchall())
+
+        # SQL's direction applies only to the primary sort key; its tie
+        # breakers stay ascending in both directions.
+        rows.sort(key=lambda row: (row["record_id"], row["record_type"]))
+        rows.sort(key=lambda row: row["timestamp"], reverse=direction == "desc")
+        offset = (actual_page - 1) * page_size
+        items: list[dict[str, Any]] = []
+        for row in rows[offset : offset + page_size]:
+            payload = _load(row["payload_json"]) if row["payload_json"] else {}
+            item = {
+                "record_type": row["record_type"],
+                "record_id": row["record_id"],
+                "id": row["record_id"],
+                "experiment_id": row["experiment_id"],
+                "market_id": row["market_id"],
+                "timestamp": _parse_datetime(row["timestamp"]),
+                "status": row["status"],
+                "outcome": row["outcome"],
+                "resolution": row["resolution"],
+                "strategy_id": row["strategy_id"],
+                "payload": payload,
+                "created_at": _parse_datetime(row["created_at"]),
+                "updated_at": _parse_datetime(row["updated_at"]),
+            }
+            if row["record_type"] == "state":
+                item["state"] = payload
+            items.append(item)
+        return {"items": items, "page": actual_page, "page_size": page_size, "total": total, "pages": pages}
     def paginate_paper_records(
         self,
         *,
@@ -9545,6 +9699,16 @@ class AxiomStore:
         order_direction = str(direction or "desc").strip().lower()
         if order_direction not in {"asc", "desc"}:
             raise ValueError("direction must be 'asc' or 'desc'")
+        if order_column == "timestamp" and not any(
+            str(value or "").strip()
+            for value in (experiment_id, market, market_id, status, record_type, filter)
+        ):
+            return self._paginate_paper_records_unfiltered(
+                requested_page=requested_page,
+                page_size=size,
+                direction=order_direction,
+            )
+
         cte = """
             WITH paper_records(
                 record_type,record_id,experiment_id,market_id,timestamp,status,

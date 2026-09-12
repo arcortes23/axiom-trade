@@ -14,7 +14,7 @@ from axiom.autonomous import (
 )
 from axiom.experiment_plan import ExperimentPlan
 from axiom.legacy_scope import LegacyScopeError, create_legacy_successor
-from axiom.lifecycle import CandidateStage
+from axiom.lifecycle import CandidateLifecycleManager, CandidateStage
 from axiom.storage import AxiomStore
 from axiom.collector import CollectorConfig, PolymarketCollector
 from axiom.data import InMemoryPredictionProvider
@@ -323,6 +323,199 @@ class PolymarketResearchOrchestrationTests(unittest.TestCase):
                 tuple(item.item_id for item in second),
             )
             self.assertEqual(store.research_queue_stats()["total"], 6)
+
+    def test_no_supported_edge_waits_for_distinct_attested_historical_successor(self) -> None:
+        with AxiomStore(":memory:") as store:
+            _seed_predeclared_historical_dataset(store)
+            candidate_id = "dataset-successor-rejected"
+            proposal = dict(_legacy_prediction_predecessor(candidate_id=candidate_id))
+            proposal.pop("candidate_id")
+            proposal.pop("frozen_hash")
+            proposal.update(
+                {
+                    "proposal_id": f"{candidate_id}-hypothesis",
+                    "dataset_id": "Polymarket-historical",
+                    "dataset_version": "history-v1",
+                    "tests": ["bounded chronological backtest and validation"],
+                    "time_split": "train-validation-holdout",
+                }
+            )
+            plan = ExperimentPlan.from_proposal(proposal)
+            result = {
+                "accepted": False,
+                "blocker": "NO_SUPPORTED_EDGE",
+                "reason_code": "NEGATIVE_VALIDATION_EXPECTANCY",
+                "reason": "negative validation expectancy",
+                "kind": "hypothesis",
+                "hypothesis_id": plan.hypothesis_id,
+                "plan_id": plan.plan_id,
+                "plan_hash": plan.plan_hash,
+                "candidate_results": [
+                    {
+                        "candidate_id": candidate_id,
+                        "stage": CandidateStage.REJECTED.value,
+                        "reason": "negative validation expectancy",
+                    }
+                ],
+            }
+            store.save_experiment_plan(
+                plan.plan_id,
+                plan.as_dict(),
+                hypothesis_id=plan.hypothesis_id,
+                plan_hash=plan.plan_hash,
+                status="PENDING",
+                result=None,
+                timestamp=T0,
+            )
+            lifecycle = CandidateLifecycleManager(store)
+            lifecycle.register_idea(
+                candidate_id,
+                {
+                    "candidate_id": candidate_id,
+                    "plan_id": plan.plan_id,
+                    "plan_hash": plan.plan_hash,
+                    "dataset_id": plan.dataset_id,
+                    "dataset_version": plan.dataset_version,
+                },
+            )
+            lifecycle.reject(candidate_id, "negative validation expectancy")
+
+            bus = DurableResearchBus(store)
+            bus.submit_proposal(proposal, priority=100)
+            processor = AutonomousResearchProcessor(
+                store,
+                config=AutonomousResearchConfig(max_items_per_cycle=1, mutation_enabled=False),
+                clock=lambda: T0,
+            )
+            with patch.object(processor, "_process_item", return_value=result):
+                cycle = processor.process_pending(now=T0)
+            self.assertEqual(cycle.claimed, 1)
+            self.assertEqual(cycle.rejected, 1)
+
+            job_name = processor._next_dataset_job_name(plan.plan_id)
+            waiting = store.get_operator_job(job_name)
+            self.assertIsNotNone(waiting)
+            assert waiting is not None
+            self.assertEqual(waiting["status"], "WAITING_FOR_NEW_DATASET_VERSION")
+            waiting_payload = waiting["payload"]
+            self.assertEqual(waiting_payload["predecessor_plan_id"], plan.plan_id)
+            self.assertEqual(waiting_payload["predecessor_plan_hash"], plan.plan_hash)
+            self.assertEqual(waiting_payload["predecessor_candidate_id"], candidate_id)
+            self.assertEqual(waiting_payload["rejected_dataset_version"], "history-v1")
+            self.assertFalse(waiting_payload["required_predicate"]["rolling_collection_satisfies"])
+
+            successor_dedupe = f"successor:{plan.plan_id}:history-v2"
+            self.assertEqual(
+                [item for item in store.list_research_items(limit=100) if item["dedupe_key"] == successor_dedupe],
+                [],
+            )
+            processor._schedule_next_dataset_jobs(T0)
+            self.assertEqual(
+                [item for item in store.list_research_items(limit=100) if item["dedupe_key"] == successor_dedupe],
+                [],
+            )
+
+            old_rows = store.load_dataset("Polymarket-historical", "history-v1")
+            store.save_dataset("Polymarket-historical", "rolling-v1", old_rows)
+            store.save_dataset_catalog(
+                "Polymarket-historical",
+                "rolling-v1",
+                provider="fixture",
+                instrument="POLYMARKET",
+                market_type="prediction",
+                timeframe="event",
+                row_count=100,
+                completeness=1.0,
+                missing_ranges=(),
+                quality="PRICE_PROXY",
+                source_type="FORWARD_COLLECTED",
+                snapshot_id="rolling-snapshot",
+            )
+            processor._schedule_next_dataset_jobs(T0)
+            self.assertEqual(
+                [item for item in store.list_research_items(limit=100) if item["dedupe_key"] == successor_dedupe],
+                [],
+            )
+
+            store.save_dataset("Polymarket-historical", "history-v2", old_rows)
+            store.save_dataset_catalog(
+                "Polymarket-historical",
+                "history-v2",
+                provider="fixture",
+                instrument="POLYMARKET",
+                market_type="prediction",
+                timeframe="event",
+                start_timestamp=T0,
+                end_timestamp=T0 + timedelta(minutes=99),
+                row_count=100,
+                completeness=1.0,
+                missing_ranges=(),
+                quality="PRICE_PROXY",
+                source_type="HISTORICAL",
+                snapshot_id="snapshot-v2",
+                metadata={
+                    "research_quality": "PRICE_PROXY",
+                    "provenance_version": "dataset-provenance-v1",
+                    "policy_version": "prediction-integrity-v1",
+                },
+            )
+            attestation = store.verify_dataset_integrity_attestation(
+                "Polymarket-historical",
+                "history-v2",
+            )
+            self.assertEqual(attestation["status"], "CURRENT")
+            self.assertEqual(attestation["contamination_result"], "PASS")
+
+            processor._schedule_next_dataset_jobs(T0)
+            successor_rows = [
+                item for item in store.list_research_items(limit=100)
+                if item["dedupe_key"] == successor_dedupe
+            ]
+            self.assertEqual(len(successor_rows), 1)
+            successor_payload = successor_rows[0]["payload"]
+            successor = ExperimentPlan.from_proposal(successor_payload)
+            self.assertNotEqual(successor.plan_id, plan.plan_id)
+            self.assertNotEqual(successor.hypothesis_id, plan.hypothesis_id)
+            self.assertEqual(successor.dataset_id, plan.dataset_id)
+            self.assertEqual(successor.dataset_version, "history-v2")
+            predecessor_document = plan.as_dict()
+            successor_document = successor.as_dict()
+            for field in (
+                "template",
+                "allowed_features",
+                "parameters",
+                "market_scope",
+                "filters",
+                "methodology",
+                "metrics",
+                "experiment_family",
+                "family_budget",
+                "trial_budget",
+                "max_variants",
+                "min_samples",
+                "min_trades",
+                "paper_only",
+                "research_mode",
+                "assumptions",
+                "exit_policy",
+            ):
+                self.assertEqual(successor_document[field], predecessor_document[field], field)
+            self.assertEqual(
+                successor_payload["provenance"]["internal"]["kind"],
+                "dataset_version_successor",
+            )
+            self.assertEqual(successor_payload["provenance"]["internal"]["attestation_hash"], attestation["attestation_hash"])
+
+            processor._schedule_next_dataset_jobs(T0)
+            self.assertEqual(
+                len(
+                    [
+                        item for item in store.list_research_items(limit=100)
+                        if item["dedupe_key"] == successor_dedupe
+                    ]
+                ),
+                1,
+            )
 
 
     def test_unchanged_predeclared_generated_identity_processes(self) -> None:

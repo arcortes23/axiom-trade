@@ -2014,7 +2014,14 @@ class DashboardData:
 
 
     def _paper_view_result(self, result: dict[str, Any]) -> dict[str, Any]:
-        counts = self.store.dashboard_summary() if self.store is not None else {}
+        counts_method = getattr(self.store, "paper_record_counts", None) if self.store is not None else None
+        counts = (
+            counts_method()
+            if callable(counts_method)
+            else self.store.dashboard_summary()
+            if self.store is not None
+            else {}
+        )
         candidate = self._paper_portfolio(candidate_only=True)
         result = dict(result)
         result["paper_telemetry"] = {
@@ -3127,18 +3134,28 @@ class DashboardData:
                 "total_equity": 0.0,
                 "total_pnl": 0.0,
             }
-        states = self.store.list_paper_states(limit=1000)
         if candidate_only:
             candidate_ids = self._candidate_paper_experiment_ids()
-            states = [
-                item
-                for item in states
-                if isinstance(item, Mapping)
-                and (
-                    str(item.get("experiment_id") or "").strip() in candidate_ids
-                    or str((item.get("state") or {}).get("candidate_id") if isinstance(item.get("state"), Mapping) else "").strip() in candidate_ids
+            if not candidate_ids:
+                states = []
+            else:
+                scoped_loader = getattr(self.store, "list_paper_states_for_experiments", None)
+                states = (
+                    scoped_loader(candidate_ids, limit=1000)
+                    if callable(scoped_loader)
+                    else self.store.list_paper_states(limit=1000)
                 )
-            ]
+                states = [
+                    item
+                    for item in states
+                    if isinstance(item, Mapping)
+                    and (
+                        str(item.get("experiment_id") or "").strip() in candidate_ids
+                        or str((item.get("state") or {}).get("candidate_id") if isinstance(item.get("state"), Mapping) else "").strip() in candidate_ids
+                    )
+                ]
+        else:
+            states = self.store.list_paper_states(limit=1000)
         rows: list[dict[str, Any]] = []
         total_equity = 0.0
         total_pnl = 0.0

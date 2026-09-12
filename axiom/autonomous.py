@@ -42,6 +42,14 @@ _MAX_LEGACY_RECOVERY_ITEMS = 64
 _LEGACY_RECOVERY_STATE_NAME = "autonomous-legacy-recovery"
 _MAX_AUTOMATIC_REASSESSMENTS = 3
 _MUTABLE_DATASET_VERSION_ALIASES = frozenset({"latest", "current", "default", "unversioned"})
+_NEXT_DATASET_JOB_PREFIX = "polymarket-dataset-successor:"
+_NEXT_DATASET_JOB_STATUS_WAITING = "WAITING_FOR_NEW_DATASET_VERSION"
+_NEXT_DATASET_JOB_STATUS_ENQUEUED = "ENQUEUED"
+_NEXT_DATASET_JOB_STATUS_COMPLETED = "COMPLETED"
+_NEXT_DATASET_JOB_STATUS_FAILED = "FAILED"
+_NEXT_DATASET_JOB_CADENCE = "collection_cycle"
+_NEXT_DATASET_JOB_TRIGGER = "AUTOMATIC_RESEARCH_TICK"
+_NEXT_DATASET_GENERATED_KIND = "dataset_version_successor"
 
 PAPER_MARKET_AUTHORITY_CAP = 100
 
@@ -126,7 +134,12 @@ def _canonical_binding(value: Any) -> str:
         return item
     return json.dumps(plain(value), sort_keys=True, separators=(",", ":"), allow_nan=False, default=str)
 _GENERATED_QUEUE_PROVENANCE_SCHEMA = "axiom-generated-queue-v1"
-_GENERATED_QUEUE_KINDS = frozenset({"predeclared_starting_set", "legacy_scope_successor", "mutation_child"})
+_GENERATED_QUEUE_KINDS = frozenset({
+    "predeclared_starting_set",
+    "legacy_scope_successor",
+    "mutation_child",
+    _NEXT_DATASET_GENERATED_KIND,
+})
 
 
 def _payload_without_generated_provenance(payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -1311,6 +1324,700 @@ class AutonomousResearchProcessor:
                 pass
         return tuple(output)
 
+    @staticmethod
+    def _next_dataset_job_name(plan_id: str) -> str:
+        return _NEXT_DATASET_JOB_PREFIX + str(plan_id).strip()
+
+    @staticmethod
+    def _strategy_contract(plan: ExperimentPlan) -> dict[str, Any]:
+        """Return the immutable strategy material independent of data version."""
+        document = dict(plan.as_dict())
+        document.pop("plan_id", None)
+        document.pop("hypothesis_id", None)
+        selector = document.pop("dataset_selector", {})
+        if isinstance(selector, Mapping):
+            document["dataset_selector_contract"] = {
+                str(key): value
+                for key, value in selector.items()
+                if str(key) not in {"dataset_id", "dataset_version", "version"}
+            }
+        return document
+
+    @classmethod
+    def _strategy_contract_digest(cls, plan: ExperimentPlan) -> str:
+        return "sha256:" + hashlib.sha256(
+            _canonical_binding(cls._strategy_contract(plan)).encode("utf-8")
+        ).hexdigest()
+
+    @staticmethod
+    def _complete_polymarket_catalog(catalog: Any, *, dataset_id: str, version: str) -> bool:
+        if not isinstance(catalog, Mapping):
+            return False
+        catalog_id = str(catalog.get("dataset_id", "")).strip()
+        catalog_version = str(catalog.get("dataset_version", catalog.get("version", ""))).strip()
+        if (
+            catalog_id != dataset_id
+            or catalog_version != version
+            or not version
+            or version.casefold() in _MUTABLE_DATASET_VERSION_ALIASES
+            or str(catalog.get("source_type", "")).strip().upper() != "HISTORICAL"
+            or str(catalog.get("market_type", "")).strip().lower() != MarketType.PREDICTION.value
+            or str(catalog.get("instrument", "")).strip().upper() != "POLYMARKET"
+        ):
+            return False
+        try:
+            completeness = float(catalog.get("completeness", 0.0))
+            row_count = catalog.get("row_count", 0)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        return (
+            math.isfinite(completeness)
+            and completeness >= 1.0
+            and isinstance(row_count, int)
+            and not isinstance(row_count, bool)
+            and row_count > 0
+            and not catalog.get("missing_ranges")
+        )
+
+    def _load_next_dataset_version(
+        self,
+        *,
+        dataset_id: str,
+        rejected_version: str,
+    ) -> tuple[Mapping[str, Any], Mapping[str, Any]] | None:
+        """Find one newer, exact, attested aggregate without touching crypto."""
+        catalog_loader = getattr(self.store, "load_dataset_catalog", None)
+        attestation_loader = getattr(self.store, "load_dataset_integrity_attestation", None)
+        catalog_lister = getattr(self.store, "list_dataset_catalog", None)
+        if not callable(catalog_loader) or not callable(attestation_loader) or not callable(catalog_lister):
+            return None
+        try:
+            catalogs = catalog_lister(
+                source_type="HISTORICAL",
+                market_type=MarketType.PREDICTION.value,
+                limit=256,
+            )
+        except TypeError:
+            try:
+                catalogs = catalog_lister(limit=256)
+            except Exception:
+                return None
+        except Exception:
+            return None
+        if not isinstance(catalogs, Sequence):
+            return None
+        for listed in catalogs:
+            if not isinstance(listed, Mapping):
+                continue
+            version = str(listed.get("dataset_version", listed.get("version", ""))).strip()
+            if version == rejected_version or not version:
+                continue
+            # Re-load by exact identity rather than trusting a broad catalog
+            # projection.  Forward/rolling rows never pass this source gate.
+            try:
+                catalog = catalog_loader(dataset_id, version)
+            except Exception:
+                continue
+            if not self._complete_polymarket_catalog(catalog, dataset_id=dataset_id, version=version):
+                continue
+            try:
+                attestation = attestation_loader(dataset_id, version)
+            except Exception:
+                # A crypto provider failure or an attestation read failure is
+                # evidence for this job only; it must not stop the scheduler.
+                continue
+            if not isinstance(attestation, Mapping):
+                continue
+            if (
+                str(attestation.get("dataset_id", "")).strip() != dataset_id
+                or str(attestation.get("dataset_version", "")).strip() != version
+                or str(attestation.get("status", "")).strip().upper() != "CURRENT"
+                or str(attestation.get("contamination_result", "")).strip().upper() != "PASS"
+                or not str(attestation.get("attestation_hash", "")).strip()
+            ):
+                continue
+            return dict(catalog), dict(attestation)
+        return None
+
+    def _predecessor_proposal(self, plan_id: str) -> Mapping[str, Any] | None:
+        lister = getattr(self.store, "list_research_items", None)
+        if not callable(lister):
+            return None
+        try:
+            items = lister(limit=4096)
+        except Exception:
+            return None
+        if not isinstance(items, Sequence):
+            return None
+        for item in items:
+            if not isinstance(item, Mapping):
+                continue
+            payload = item.get("payload")
+            if not isinstance(payload, Mapping):
+                continue
+            item_plan_id = str(payload.get("plan_id", "")).strip()
+            nested = payload.get("experiment_plan")
+            if not item_plan_id and isinstance(nested, Mapping):
+                item_plan_id = str(nested.get("plan_id", "")).strip()
+            if item_plan_id == plan_id:
+                return dict(payload)
+        return None
+
+    def _rejection_plan(
+        self,
+        item: ResearchQueueItem | Mapping[str, Any] | None,
+        result: Mapping[str, Any],
+    ) -> tuple[ExperimentPlan, str] | None:
+        plan_id = str(result.get("plan_id", "")).strip()
+        item_payload = (
+            item.payload
+            if isinstance(item, ResearchQueueItem)
+            else item
+            if isinstance(item, Mapping)
+            else None
+        )
+        if not plan_id and isinstance(item_payload, Mapping):
+            plan_id = str(item_payload.get("plan_id", "")).strip()
+        plan_record = self.store.load_experiment_plan(plan_id) if plan_id else None
+        raw_plan = plan_record.get("plan") if isinstance(plan_record, Mapping) else None
+        if not isinstance(raw_plan, Mapping) and isinstance(item_payload, Mapping):
+            raw_plan = item_payload.get("experiment_plan")
+        if not isinstance(raw_plan, Mapping):
+            return None
+        try:
+            plan = ExperimentPlan.from_mapping(
+                raw_plan,
+                hypothesis_id=(
+                    str(plan_record.get("hypothesis_id", "")).strip()
+                    if isinstance(plan_record, Mapping)
+                    else str(result.get("hypothesis_id", "")).strip()
+                ) or None,
+            )
+        except (ExperimentPlanError, TypeError, ValueError):
+            return None
+        if plan_id and plan.plan_id != plan_id:
+            return None
+        expected_hash = str(
+            plan_record.get("plan_hash", "")
+            if isinstance(plan_record, Mapping)
+            else result.get("plan_hash", "")
+        ).strip()
+        if expected_hash and expected_hash != plan.plan_hash:
+            return None
+        candidates = result.get("candidate_results")
+        candidate_ids = [
+            str(candidate.get("candidate_id", "")).strip()
+            for candidate in candidates
+            if isinstance(candidate, Mapping) and str(candidate.get("candidate_id", "")).strip()
+        ] if isinstance(candidates, Sequence) and not isinstance(candidates, (str, bytes)) else []
+        if not candidate_ids and isinstance(item_payload, Mapping):
+            candidate_id = str(item_payload.get("candidate_id", "")).strip()
+            if candidate_id:
+                candidate_ids.append(candidate_id)
+        candidate_id = candidate_ids[0] if candidate_ids else ""
+        if not candidate_id:
+            return None
+        lifecycle_loader = getattr(self.store, "load_candidate_lifecycle", None)
+        if callable(lifecycle_loader):
+            lifecycle = lifecycle_loader(candidate_id)
+            if not isinstance(lifecycle, Mapping):
+                return None
+            lifecycle_payload = lifecycle.get("payload")
+            if not isinstance(lifecycle_payload, Mapping):
+                return None
+            if str(lifecycle.get("stage", "")).strip().upper() != CandidateStage.REJECTED.value:
+                return None
+            relation = str(lifecycle_payload.get("successor_relation", "")).strip().upper()
+            generated = _generated_queue_provenance(lifecycle_payload)
+            if relation == "LEGACY_SCOPE_SUCCESSOR" or (
+                isinstance(generated, Mapping)
+                and str(generated.get("kind", "")).strip() == "legacy_scope_successor"
+            ):
+                return None
+        if isinstance(item_payload, Mapping):
+            relation = str(item_payload.get("successor_relation", "")).strip().upper()
+            generated = _generated_queue_provenance(item_payload)
+            if relation == "LEGACY_SCOPE_SUCCESSOR" or (
+                isinstance(generated, Mapping)
+                and str(generated.get("kind", "")).strip() == "legacy_scope_successor"
+            ):
+                return None
+        if (
+            plan.market_type is not MarketType.PREDICTION
+            or str(plan.dataset_id or "").strip() != "Polymarket-historical"
+            or not str(plan.dataset_version).strip()
+            or str(plan.dataset_version).casefold() in _MUTABLE_DATASET_VERSION_ALIASES
+        ):
+            return None
+        return plan, candidate_id
+
+
+    def _waiting_job_payload(
+        self,
+        plan: ExperimentPlan,
+        *,
+        candidate_id: str,
+        result: Mapping[str, Any],
+        now: datetime,
+    ) -> dict[str, Any]:
+        dataset_id = str(plan.dataset_id or "").strip()
+        rejected_version = str(plan.dataset_version).strip()
+        catalog_loader = getattr(self.store, "load_dataset_catalog", None)
+        attestation_loader = getattr(self.store, "load_dataset_integrity_attestation", None)
+        try:
+            catalog = catalog_loader(dataset_id, rejected_version) if callable(catalog_loader) else None
+        except Exception:
+            catalog = None
+        try:
+            attestation = attestation_loader(dataset_id, rejected_version) if callable(attestation_loader) else None
+        except Exception:
+            attestation = None
+        contract = self._strategy_contract(plan)
+        contract_digest = self._strategy_contract_digest(plan)
+        next_check = ensure_utc(now) + timedelta(seconds=60)
+        return {
+            "schema_version": "autonomous-next-dataset-version-v1",
+            "job_kind": "POLYMARKET_DATASET_VERSION_SUCCESSOR",
+            "progress": "WAITING_FOR_NEW_DATASET_VERSION",
+            "predecessor_plan_id": plan.plan_id,
+            "predecessor_plan_hash": plan.plan_hash,
+            "predecessor_hypothesis_id": plan.hypothesis_id,
+            "predecessor_candidate_id": candidate_id,
+            "dataset_id": dataset_id,
+            "old_dataset_version": rejected_version,
+            "rejected_dataset_version": rejected_version,
+            "rejected_result": {
+                "reason_code": result.get("reason_code"),
+                "blocker": result.get("blocker"),
+                "accepted": result.get("accepted"),
+            },
+            "rejected_dataset_catalog": dict(catalog) if isinstance(catalog, Mapping) else None,
+            "rejected_dataset_attestation": dict(attestation) if isinstance(attestation, Mapping) else None,
+            "required_predicate": {
+                "dataset_id": dataset_id,
+                "version_distinct_from": rejected_version,
+                "source_type": "HISTORICAL",
+                "market_type": MarketType.PREDICTION.value,
+                "instrument": "POLYMARKET",
+                "catalog": {
+                    "exact_identity": True,
+                    "completeness_min": 1.0,
+                    "row_count_min": 1,
+                    "missing_ranges": False,
+                },
+                "attestation": {
+                    "status": "CURRENT",
+                    "contamination_result": "PASS",
+                },
+                "rolling_collection_satisfies": False,
+            },
+            "strategy_contract": contract,
+            "strategy_contract_digest": contract_digest,
+            "schedule_trigger": _NEXT_DATASET_JOB_TRIGGER,
+            "schedule_cadence": _NEXT_DATASET_JOB_CADENCE,
+            "schedule_cadence_seconds": 60,
+            "next_check_at": next_check.isoformat(),
+            "next_run_at": next_check.isoformat(),
+            "last_checked_at": ensure_utc(now).isoformat(),
+            "dedupe_namespace": "successor",
+            "successor_dedupe_template": "successor:{predecessor_plan_id}:{new_dataset_version}",
+            "paper_only": True,
+            "research_only": True,
+        }
+
+    def _create_waiting_next_dataset_job(
+        self,
+        plan: ExperimentPlan,
+        *,
+        candidate_id: str,
+        result: Mapping[str, Any],
+        now: datetime,
+    ) -> Mapping[str, Any] | None:
+        """Create one durable waiting job; caller may already hold a tx."""
+        job_name = self._next_dataset_job_name(plan.plan_id)
+        existing = self.store.get_operator_job(job_name)
+        if existing is not None:
+            return existing
+        payload = self._waiting_job_payload(plan, candidate_id=candidate_id, result=result, now=now)
+        self.store.set_operator_job(
+            job_name,
+            _NEXT_DATASET_JOB_STATUS_WAITING,
+            payload,
+            resumable=True,
+            timestamp=now,
+        )
+        return self.store.get_operator_job(job_name)
+
+    def _maybe_create_waiting_next_dataset_job(
+        self,
+        item: ResearchQueueItem,
+        result: Mapping[str, Any],
+        now: datetime,
+    ) -> None:
+        if (
+            result.get("accepted") is not False
+            or str(result.get("blocker", "")).strip().upper() != "NO_SUPPORTED_EDGE"
+        ):
+            return
+        try:
+            resolved = self._rejection_plan(item, result)
+            if resolved is None:
+                return
+            plan, candidate_id = resolved
+            self._create_waiting_next_dataset_job(
+                plan,
+                candidate_id=candidate_id,
+                result=result,
+                now=now,
+            )
+        except Exception:
+            # The queue result and rejection remain authoritative if job
+            # creation cannot be persisted in this tick.
+            return
+
+    def _build_dataset_successor(
+        self,
+        plan: ExperimentPlan,
+        *,
+        candidate_id: str,
+        catalog: Mapping[str, Any],
+        attestation: Mapping[str, Any],
+        job_payload: Mapping[str, Any],
+    ) -> tuple[ExperimentPlan, dict[str, Any], str]:
+        version = str(catalog.get("dataset_version", catalog.get("version", ""))).strip()
+        old_hash = str(job_payload.get("predecessor_plan_hash", plan.plan_hash)).strip()
+        identity = {
+            "schema": "axiom-polymarket-dataset-successor-v1",
+            "predecessor_plan_id": plan.plan_id,
+            "predecessor_plan_hash": old_hash,
+            "predecessor_hypothesis_id": plan.hypothesis_id,
+            "predecessor_candidate_id": candidate_id,
+            "dataset_id": str(plan.dataset_id or "").strip(),
+            "dataset_version": version,
+        }
+        token = hashlib.sha256(_canonical_binding(identity).encode("utf-8")).hexdigest()[:24]
+        hypothesis_id = "hypothesis-successor-" + token
+        plan_id = "plan-successor-" + token
+        plan_document = plan.as_dict()
+        plan_document["plan_id"] = plan_id
+        plan_document["hypothesis_id"] = hypothesis_id
+        selector = dict(plan_document.get("dataset_selector", {}))
+        selector["dataset_id"] = str(plan.dataset_id or "").strip()
+        selector["dataset_version"] = version
+        plan_document["dataset_selector"] = selector
+        successor = ExperimentPlan.from_mapping(plan_document, hypothesis_id=hypothesis_id)
+        contract_digest = self._strategy_contract_digest(successor)
+        if contract_digest != str(job_payload.get("strategy_contract_digest", "")).strip():
+            raise AutonomousResearchError(
+                "STRATEGY_CONTRACT_CHANGED",
+                "successor dataset version changed the immutable strategy contract",
+            )
+        source = self._predecessor_proposal(plan.plan_id) or {}
+        attestation_payload = {
+            key: _compact_value(attestation[key])
+            for key in (
+                "dataset_id",
+                "dataset_version",
+                "source_type",
+                "market_type",
+                "row_count",
+                "completeness",
+                "contamination_result",
+                "attestation_hash",
+                "status",
+            )
+            if key in attestation
+        }
+        proposal = dict(successor.as_dict())
+        for name, fallback in (
+            ("statement", "Re-evaluate the immutable Polymarket strategy on a new historical dataset version."),
+            ("source", "axiom-autonomous-dataset-successor"),
+            ("tests", ["bounded chronological backtest and validation"]),
+            ("time_split", plan.methodology.get("time_split", "train-validation-holdout")),
+        ):
+            value = source.get(name, fallback)
+            if name == "tests" and (
+                not isinstance(value, (list, tuple))
+                or not value
+                or any(not isinstance(test, str) or not test.strip() for test in value)
+            ):
+                value = fallback
+            proposal[name] = value
+        proposal.update(
+            {
+                "proposal_id": hypothesis_id,
+                "hypothesis_id": hypothesis_id,
+                "dataset_id": successor.dataset_id,
+                "dataset_version": successor.dataset_version,
+                "market_type": successor.market_type.value,
+                "experiment_plan": successor.as_dict(),
+                "dataset_attestation": dict(attestation_payload),
+                "strategy_contract_digest": contract_digest,
+                "successor_relation": "POLYMARKET_DATASET_VERSION_SUCCESSOR",
+                "dataset_successor_predecessor": {
+                    "plan_id": plan.plan_id,
+                    "plan_hash": plan.plan_hash,
+                    "candidate_id": candidate_id,
+                },
+                "paper_only": True,
+            }
+        )
+        validation = validate_hermes_proposal(proposal, store=self.store)
+        if not validation.accepted:
+            detail = "; ".join(validation.reasons) or "successor proposal rejected"
+            raise AutonomousResearchError("SUCCESSOR_PROPOSAL_INVALID", detail)
+        normalized = dict(validation.normalized or proposal)
+        validated_plan = ExperimentPlan.from_proposal(normalized)
+        if (
+            validated_plan.plan_id != plan_id
+            or validated_plan.hypothesis_id != hypothesis_id
+            or validated_plan.dataset_version != version
+            or validated_plan.plan_hash != successor.plan_hash
+        ):
+            raise AutonomousResearchError(
+                "SUCCESSOR_PROPOSAL_INVALID",
+                "validated successor identity or dataset binding changed",
+            )
+        queued_payload = _normalize_hypothesis_payload(
+            normalized,
+            source_fallback=str(getattr(self.bus, "author", "") or "hermes"),
+        )
+        queued_payload = _mark_generated_queue_payload(
+            queued_payload,
+            kind=_NEXT_DATASET_GENERATED_KIND,
+            dataset_id=validated_plan.dataset_id,
+            dataset_version=validated_plan.dataset_version,
+            attestation_hash=str(attestation.get("attestation_hash", "")).strip() or None,
+        )
+        dedupe_key = f"successor:{plan.plan_id}:{version}"
+        return validated_plan, queued_payload, dedupe_key
+
+    def _advance_waiting_next_dataset_job(self, job: Mapping[str, Any], now: datetime) -> None:
+        job_name = str(job.get("job_name", "")).strip()
+        if not job_name:
+            return
+        payload = job.get("payload")
+        payload = dict(payload) if isinstance(payload, Mapping) else {}
+        status = str(job.get("status", "")).strip().upper()
+        if status == _NEXT_DATASET_JOB_STATUS_ENQUEUED:
+            queue_id = str(payload.get("queue_item_id", "")).strip()
+            queued = self.bus.get(queue_id) if queue_id else None
+            if queued is None or queued.status.value not in {"COMPLETED", "ACCEPTED", "REJECTED", "FAILED"}:
+                return
+            payload.update(
+                {
+                    "progress": "COMPLETED" if queued.status.value in {"COMPLETED", "ACCEPTED"} else "FAILED",
+                    "queue_status": queued.status.value,
+                    "successor_result": dict(queued.result) if isinstance(queued.result, Mapping) else None,
+                    "last_checked_at": ensure_utc(now).isoformat(),
+                }
+            )
+            self.store.set_operator_job(
+                job_name,
+                _NEXT_DATASET_JOB_STATUS_COMPLETED
+                if queued.status.value in {"COMPLETED", "ACCEPTED"}
+                else _NEXT_DATASET_JOB_STATUS_FAILED,
+                payload,
+                resumable=False,
+                timestamp=now,
+            )
+            return
+        if status != _NEXT_DATASET_JOB_STATUS_WAITING:
+            return
+        dataset_id = str(payload.get("dataset_id", "Polymarket-historical")).strip()
+        old_version = str(
+            payload.get("rejected_dataset_version", payload.get("old_dataset_version", ""))
+        ).strip()
+        plan_id = str(payload.get("predecessor_plan_id", "")).strip()
+        plan_record = self.store.load_experiment_plan(plan_id) if plan_id else None
+        raw_plan = plan_record.get("plan") if isinstance(plan_record, Mapping) else payload.get("predecessor_plan")
+        if not isinstance(raw_plan, Mapping):
+            return
+        try:
+            plan = ExperimentPlan.from_mapping(
+                raw_plan,
+                hypothesis_id=str(
+                    (plan_record or {}).get("hypothesis_id", payload.get("predecessor_hypothesis_id", ""))
+                ).strip() or None,
+            )
+        except (ExperimentPlanError, TypeError, ValueError):
+            return
+        if (
+            plan.plan_id != plan_id
+            or str(plan.dataset_id or "").strip() != dataset_id
+            or str(plan.dataset_version).strip() != old_version
+        ):
+            return
+        found = self._load_next_dataset_version(dataset_id=dataset_id, rejected_version=old_version)
+        next_check = ensure_utc(now) + timedelta(seconds=60)
+        if found is None:
+            payload.update(
+                {
+                    "progress": "WAITING_FOR_NEW_DATASET_VERSION",
+                    "last_checked_at": ensure_utc(now).isoformat(),
+                    "next_check_at": next_check.isoformat(),
+                    "next_run_at": next_check.isoformat(),
+                }
+            )
+            self.store.set_operator_job(
+                job_name,
+                _NEXT_DATASET_JOB_STATUS_WAITING,
+                payload,
+                resumable=True,
+                timestamp=now,
+            )
+            return
+        catalog, attestation = found
+        candidate_id = str(payload.get("predecessor_candidate_id", "")).strip()
+        try:
+            successor, queued_payload, dedupe_key = self._build_dataset_successor(
+                plan,
+                candidate_id=candidate_id,
+                catalog=catalog,
+                attestation=attestation,
+                job_payload=payload,
+            )
+            self.store.save_experiment_plan(
+                successor.plan_id,
+                successor.as_dict(),
+                hypothesis_id=successor.hypothesis_id,
+                plan_hash=successor.plan_hash,
+                status="PENDING",
+                timestamp=now,
+            )
+            queue_id = "queue-" + hashlib.sha256(dedupe_key.encode("utf-8")).hexdigest()
+            queued = self.bus.get(queue_id)
+            if queued is None:
+                queued = self.bus.submit_proposal(
+                    queued_payload,
+                    dedupe_key=dedupe_key,
+                    lineage=(plan.plan_id, plan.plan_hash, candidate_id),
+                    available_at=now,
+                )
+            payload.update(
+                {
+                    "progress": "ENQUEUED",
+                    "successor_plan_id": successor.plan_id,
+                    "successor_plan_hash": successor.plan_hash,
+                    "successor_hypothesis_id": successor.hypothesis_id,
+                    "successor_dataset_version": successor.dataset_version,
+                    "successor_attestation_hash": attestation.get("attestation_hash"),
+                    "queue_item_id": queued.item_id,
+                    "queue_status": queued.status.value,
+                    "dedupe_key": dedupe_key,
+                    "next_check_at": None,
+                    "next_run_at": now.isoformat(),
+                    "last_checked_at": ensure_utc(now).isoformat(),
+                }
+            )
+            self.store.set_operator_job(
+                job_name,
+                _NEXT_DATASET_JOB_STATUS_ENQUEUED,
+                payload,
+                resumable=True,
+                timestamp=now,
+            )
+        except (AutonomousResearchError, ResearchBusPermissionError, ExperimentPlanError, RuntimeError, TypeError, ValueError) as exc:
+            payload.update(
+                {
+                    "progress": "WAITING_FOR_NEW_DATASET_VERSION",
+                    "last_error": str(exc),
+                    "last_checked_at": ensure_utc(now).isoformat(),
+                    "next_check_at": next_check.isoformat(),
+                    "next_run_at": next_check.isoformat(),
+                }
+            )
+            self.store.set_operator_job(
+                job_name,
+                _NEXT_DATASET_JOB_STATUS_WAITING,
+                payload,
+                last_error=str(exc),
+                resumable=True,
+                timestamp=now,
+            )
+
+    def _poll_waiting_next_dataset_jobs(self, now: datetime) -> None:
+        lister = getattr(self.store, "list_operator_jobs", None)
+        if callable(lister):
+            try:
+                jobs = lister()
+            except Exception:
+                jobs = ()
+            if isinstance(jobs, Sequence):
+                for job in jobs:
+                    if not isinstance(job, Mapping):
+                        continue
+                    name = str(job.get("job_name", "")).strip()
+                    if not name.startswith(_NEXT_DATASET_JOB_PREFIX):
+                        continue
+                    try:
+                        with self.store.transaction():
+                            current = self.store.get_operator_job(name)
+                            if isinstance(current, Mapping):
+                                self._advance_waiting_next_dataset_job(current, now)
+                    except Exception:
+                        # Dataset attestation/crypto failures are local to
+                        # this resumable job and must not gate the tick.
+                        continue
+
+    def _backfill_next_dataset_job(self, now: datetime) -> None:
+        lister = getattr(self.store, "list_experiment_plans", None)
+        if not callable(lister):
+            return
+        try:
+            plans = lister(limit=256, newest_first=True)
+        except TypeError:
+            try:
+                plans = lister(limit=256)
+            except Exception:
+                return
+        except Exception:
+            return
+        if not isinstance(plans, Sequence):
+            return
+        for record in plans:
+            if not isinstance(record, Mapping):
+                continue
+            result = record.get("result")
+            if not isinstance(result, Mapping):
+                continue
+            if (
+                result.get("accepted") is not False
+                or str(result.get("blocker", "")).strip().upper() != "NO_SUPPORTED_EDGE"
+            ):
+                continue
+            plan_id = str(record.get("plan_id", "")).strip()
+            raw_plan = record.get("plan")
+            if not plan_id or not isinstance(raw_plan, Mapping):
+                continue
+            item: ResearchQueueItem | Mapping[str, Any] | None = self._predecessor_proposal(plan_id)
+            try:
+                resolved = self._rejection_plan(item, result)
+            except Exception:
+                continue
+            if resolved is None:
+                continue
+            plan, candidate_id = resolved
+            job_name = self._next_dataset_job_name(plan.plan_id)
+            try:
+                with self.store.transaction():
+                    if self.store.get_operator_job(job_name) is not None:
+                        continue
+                    self._create_waiting_next_dataset_job(
+                        plan,
+                        candidate_id=candidate_id,
+                        result=result,
+                        now=now,
+                    )
+                return
+            except (RuntimeError, TypeError, ValueError):
+                continue
+
+    def _schedule_next_dataset_jobs(self, now: datetime) -> None:
+        """Poll resumable successors, then backfill only the latest rejection."""
+        self._poll_waiting_next_dataset_jobs(now)
+        self._backfill_next_dataset_job(now)
+
     def process_pending(self, *, worker: str = "research-queue", now: datetime | None = None) -> AutonomousQueueCycle:
         """Claim at most the configured bounded number of items.
 
@@ -1322,6 +2029,7 @@ class AutonomousResearchProcessor:
         current = ensure_utc(now or self.clock())
         legacy_recovery = self._recover_legacy_predecessors(current)
         self._enqueue_predeclared_from_persisted_scope(current)
+        self._schedule_next_dataset_jobs(current)
         released = self.bus.resume_expired(now=current)
         results: list[Mapping[str, Any]] = []
         claimed = 0
@@ -1357,6 +2065,8 @@ class AutonomousResearchProcessor:
                     for stage in ("BOUNDED_EXPERIMENT", "TEST", "RESULT", "LIFECYCLE"):
                         phase_event(stage, {"item_type": item.item_type})
                     accepted = result.get("accepted") is not False
+                    if not accepted:
+                        self._maybe_create_waiting_next_dataset_job(item, result, current)
                     phase_event(
                         "COMPLETE",
                         {"item_type": item.item_type, "accepted": accepted},
@@ -1775,7 +2485,8 @@ class AutonomousResearchProcessor:
         generated_scope_binding: tuple[str | None, str | None, str | None, str | None, str | None, str | None] | None = None
         generated_provenance = _generated_queue_provenance(proposal)
         generated_kind_hint = bool(proposal.get("predeclared_starting_set")) or (
-            str(proposal.get("successor_relation", "")).strip().upper() == "LEGACY_SCOPE_SUCCESSOR"
+            str(proposal.get("successor_relation", "")).strip().upper()
+            in {"LEGACY_SCOPE_SUCCESSOR", "POLYMARKET_DATASET_VERSION_SUCCESSOR"}
         )
         if generated_provenance is None and generated_kind_hint:
             raise AutonomousResearchError(
@@ -1854,10 +2565,7 @@ class AutonomousResearchProcessor:
                 "INVALID_PROPOSAL",
             )
             raise AutonomousResearchError(reason_code, "; ".join(validation.reasons))
-        try:
-            plan = ExperimentPlan.from_proposal(validation.normalized or proposal)
-        except ExperimentPlanError as exc:
-            raise AutonomousResearchError(exc.reason, exc.detail) from exc
+        plan = ExperimentPlan.from_proposal(validation.normalized or proposal)
         if generated_scope_binding is None:
             self._revalidate_generated_queue_item(item, plan, proposal)
         else:
