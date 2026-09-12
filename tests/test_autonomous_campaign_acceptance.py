@@ -113,6 +113,56 @@ class AutonomousCampaignAcceptanceTests(unittest.TestCase):
             self.assertTrue(boundary["ordered_row_manifest_digest"].startswith("sha256:"))
             self.assertNotIn("ordered_row_identities", boundary)
             self.assertNotIn("ordered_content_hashes", boundary)
+    def test_campaign_start_deduplicates_prior_multi_parameter_plan(self) -> None:
+        with AxiomStore(":memory:") as store:
+            store.save_dataset(
+                DATASET_ID,
+                "prior-grid-v1",
+                _rows(midpoint=0.50),
+                quality="PRICE_PROXY",
+            )
+            store.save_experiment_plan(
+                "prior-grid-plan",
+                {
+                    "template": "momentum",
+                    "parameters": {
+                        "lookback": [1, 3],
+                        "threshold": [0.02, 0.05],
+                    },
+                },
+                hypothesis_id="prior-grid-hypothesis",
+                timestamp=T0,
+            )
+
+            processor = AutonomousResearchProcessor(store, clock=lambda: T0)
+            state = processor.start_polymarket_campaign(
+                "prior-grid-campaign",
+                dataset_id=DATASET_ID,
+                dataset_version="prior-grid-v1",
+                now=T0,
+            )
+
+            self.assertEqual(state["status"], "RUNNING")
+            self.assertEqual(state["fixed_configuration_count"], 8)
+            configurations = {
+                trial["configuration_id"]
+                for trial in state["trials"]
+            }
+            self.assertTrue(
+                {
+                    "momentum:lookback-1:threshold-0.02",
+                    "momentum:lookback-1:threshold-0.05",
+                    "momentum:lookback-3:threshold-0.02",
+                    "momentum:lookback-3:threshold-0.05",
+                }.isdisjoint(configurations)
+            )
+            queued = processor.bus.list_campaign_trials("prior-grid-campaign", limit=10)
+            self.assertEqual(len(queued), 1)
+            self.assertEqual(
+                queued[0].payload["campaign_configuration_id"],
+                "momentum:lookback-5:threshold-0.02",
+            )
+
 
     def test_synthetic_campaign_covers_protocol_progress_reassessment_and_exhaustion(self) -> None:
         """Exercise A/B/C/D/G against only labelled, attested offline fixtures."""

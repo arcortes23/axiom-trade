@@ -301,6 +301,180 @@ class Phase42PolymarketTests(unittest.TestCase):
             self.assertIsNotNone(aggregate)
             assert aggregate is not None
             self.assertEqual(aggregate["row_count"], 4)
+    def test_polymarket_query_scope_migration_preserves_processed_constituents(self) -> None:
+        class LegacyPolymarket(FakePolymarket):
+            def __init__(self) -> None:
+                super().__init__()
+                self.markets_by_id = {
+                    f"legacy-{index}": self._market(
+                        f"legacy-{index}",
+                        f"Legacy question {index}",
+                        tags=("politics",),
+                    )
+                    for index in range(5)
+                }
+
+        class MigratingPolymarket(LegacyPolymarket):
+            def __init__(self) -> None:
+                super().__init__()
+                self.markets_by_id.update(
+                    {
+                        f"new-{index}": self._market(
+                            f"new-{index}",
+                            f"New question {index}",
+                            tags=("politics",),
+                        )
+                        for index in range(4)
+                    }
+                )
+                self.page_calls: list[str | None] = []
+
+            def market_page(
+                self,
+                limit: int,
+                *,
+                after_cursor: str | None = None,
+                closed: bool = False,
+            ) -> MarketDiscoveryPage:
+                self.page_calls.append(after_cursor)
+                values = tuple(self.markets_by_id[f"new-{index}"] for index in range(4))
+                return MarketDiscoveryPage(
+                    snapshots=values[:limit],
+                    next_cursor=None,
+                    request_path="/markets/keyset",
+                    query={
+                        "limit": str(limit),
+                        "closed": str(closed).lower(),
+                    },
+                    query_fingerprint="scope:new",
+                    raw_count=len(values[:limit]),
+                    unique_count=len(values[:limit]),
+                    duplicate_count=0,
+                    malformed_count=0,
+                    coverage_status="COMPLETE",
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            database = str(Path(directory) / "bootstrap.sqlite")
+            legacy_ids = [f"legacy-{index}" for index in range(5)]
+            with AxiomStore(database) as store:
+                legacy_provider = LegacyPolymarket()
+                legacy_bootstrapper = HistoricalBootstrapper(
+                    store,
+                    prediction_provider=legacy_provider,
+                    sleep=lambda _: None,
+                    max_attempts=1,
+                )
+                seeded = legacy_bootstrapper.bootstrap_polymarket(
+                    max_markets=5,
+                    resume=True,
+                )
+                self.assertEqual(seeded.status, "COMPLETE")
+                prior_rows = {
+                    market_id: store.load_dataset(f"prediction:{market_id}")
+                    for market_id in legacy_ids
+                }
+                prior_aggregate = store.load_dataset_catalog("Polymarket-historical")
+                self.assertIsNotNone(prior_aggregate)
+                assert prior_aggregate is not None
+                self.assertEqual(prior_aggregate["row_count"], 10)
+
+                legacy_state = store.load_dataset_bootstrap_state(
+                    "Polymarket-historical"
+                )
+                self.assertIsNotNone(legacy_state)
+                assert legacy_state is not None
+                legacy_state.update(
+                    {
+                        "status": "RUNNING",
+                        "discovered_market_ids": [],
+                        "processed_market_ids": legacy_ids,
+                        "market_statuses": {
+                            market_id: "COMPLETE" for market_id in legacy_ids
+                        },
+                        "discovery_cursor": "legacy-cursor",
+                        "query_fingerprint": "scope:old",
+                        "discovery_complete": False,
+                    }
+                )
+                store.save_dataset_bootstrap_state(
+                    "Polymarket-historical",
+                    legacy_state,
+                )
+
+                provider = MigratingPolymarket()
+                bootstrapper = HistoricalBootstrapper(
+                    store,
+                    prediction_provider=provider,
+                    sleep=lambda _: None,
+                    max_attempts=1,
+                )
+                reset = bootstrapper.bootstrap_polymarket(
+                    max_markets=9,
+                    resume=True,
+                )
+                self.assertEqual(reset.status, "SCHEDULED")
+                self.assertEqual(reset.records, 10)
+                self.assertEqual(reset.completeness, 1.0)
+                self.assertFalse(reset.metadata["changed"])
+                self.assertEqual(provider.page_calls, ["legacy-cursor"])
+                reset_state = store.load_dataset_bootstrap_state(
+                    "Polymarket-historical"
+                )
+                self.assertIsNotNone(reset_state)
+                assert reset_state is not None
+                self.assertEqual(reset_state["query_fingerprint"], "scope:new")
+                self.assertIsNone(reset_state["discovery_cursor"])
+                self.assertEqual(reset_state["discovered_market_ids"], legacy_ids)
+                self.assertEqual(reset_state["processed_market_ids"], legacy_ids)
+                self.assertEqual(
+                    store.load_dataset_catalog("Polymarket-historical"),
+                    prior_aggregate,
+                )
+
+                published = bootstrapper.bootstrap_polymarket(
+                    max_markets=9,
+                    resume=True,
+                )
+                self.assertEqual(published.status, "COMPLETE")
+                self.assertEqual(published.records, 18)
+                self.assertEqual(published.completeness, 1.0)
+                self.assertTrue(published.metadata["changed"])
+                self.assertEqual(provider.page_calls, ["legacy-cursor", None])
+                for market_id, rows in prior_rows.items():
+                    self.assertEqual(
+                        store.load_dataset(f"prediction:{market_id}"),
+                        rows,
+                    )
+
+            with AxiomStore(database) as store:
+                restarted = HistoricalBootstrapper(
+                    store,
+                    prediction_provider=MigratingPolymarket(),
+                    sleep=lambda _: None,
+                    max_attempts=1,
+                )
+                no_new_data = restarted.bootstrap_polymarket(
+                    max_markets=9,
+                    resume=True,
+                )
+                self.assertEqual(no_new_data.status, "NO_NEW_DATA")
+                self.assertEqual(no_new_data.records, 18)
+                self.assertEqual(no_new_data.completeness, 1.0)
+                final_state = store.load_dataset_bootstrap_state(
+                    "Polymarket-historical"
+                )
+                self.assertIsNotNone(final_state)
+                assert final_state is not None
+                self.assertTrue(
+                    set(final_state["processed_market_ids"]).issubset(
+                        set(final_state["discovered_market_ids"])
+                    )
+                )
+                aggregate = store.load_dataset_catalog("Polymarket-historical")
+                self.assertIsNotNone(aggregate)
+                assert aggregate is not None
+                self.assertEqual(aggregate["row_count"], 18)
     def test_polymarket_bootstrap_resumes_250_style_short_page_without_fingerprint_change(self) -> None:
         class PagedPolymarket(FakePolymarket):
             def __init__(self) -> None:

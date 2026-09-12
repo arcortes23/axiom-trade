@@ -1576,6 +1576,11 @@ class HistoricalBootstrapper:
             if catalog is None or row_count <= 0:
                 processed.discard(market_id)
                 market_statuses.pop(market_id, None)
+        # Discovery is a resumable frontier, while processed IDs are durable
+        # publication markers.  A legacy state or a query-scope migration may
+        # have reset that frontier; never let it omit a valid published
+        # constituent from the discovered universe.
+        discovered_ids.update(processed)
         failed_markets: dict[str, dict[str, Any]] = {}
         raw_failed = state.get("failed_markets", {})
         if isinstance(raw_failed, Mapping):
@@ -1606,6 +1611,7 @@ class HistoricalBootstrapper:
         discovery_retry_after: float | None = None
         discovery_next_attempt_at: datetime | None = None
         discovery_failed = False
+        discovery_scope_reset = False
 
 
         def _coverage() -> dict[str, Any]:
@@ -1618,6 +1624,15 @@ class HistoricalBootstrapper:
                 "processed_markets": len(processed),
                 "history_endpoint": "CLOB /prices-history for the aligned YES token",
             }
+        def _completeness() -> float:
+            # The processed set is a subset of the discovered universe by
+            # construction.  Keep the bound as a defensive guard for any
+            # malformed legacy payload while preserving that invariant.
+            discovered_ids.update(processed)
+            return min(
+                1.0,
+                len(processed) / len(discovered_ids),
+            ) if discovered_ids else 0.0
 
         def _next_failed_at() -> datetime | None:
             values = [
@@ -1634,6 +1649,10 @@ class HistoricalBootstrapper:
             last_error: str | None = None,
             next_attempt_at: datetime | None = None,
         ) -> None:
+            # Keep the durable publication set in the discovered universe on
+            # every checkpoint, including checkpoints taken during migration
+            # or after individual market outcomes.
+            discovered_ids.update(processed)
             retry_values = (
                 [discovery_retry_after]
                 if discovery_retry_after is not None
@@ -1804,44 +1823,58 @@ class HistoricalBootstrapper:
                 if page_call is not None and page_call.value is not None:
                     page = page_call.value
                     snapshots = getattr(page, "snapshots", ())
-                    if isinstance(snapshots, Sequence) and not isinstance(
-                        snapshots, (str, bytes, Mapping)
-                    ):
-                        for item in snapshots:
-                            market_id = str(getattr(item, "market_id", "")).strip()
-                            if market_id:
-                                discovered_ids.add(market_id)
-                    if page_call.request_failed and not snapshots:
-                        discovery_failed = True
-                        discovery_retry_after = _coerce_retry_after(page_call.retry_after)
-                        if discovery_retry_after is not None and discovery_retry_after > 0:
-                            discovery_next_attempt_at = now + timedelta(
-                                seconds=discovery_retry_after
-                            )
                     page_fingerprint = str(
                         getattr(page, "query_fingerprint", "") or ""
                     ).strip()
-                    if query_fingerprint is None and page_fingerprint:
-                        query_fingerprint = page_fingerprint
-                    elif (
+                    fingerprint_changed = bool(
                         page_fingerprint
                         and query_fingerprint
                         and page_fingerprint != query_fingerprint
-                    ):
-                        errors.append("polymarket market discovery: QUERY_FINGERPRINT_CHANGED")
-                        request_failed = True
-                    returned_cursor = getattr(page, "next_cursor", None)
-                    discovery_cursor = (
-                        str(returned_cursor)
-                        if isinstance(returned_cursor, str) and returned_cursor
-                        else None
                     )
-                    if str(getattr(page, "coverage_status", "")).upper() == "ERROR":
-                        reason = str(getattr(page, "error_reason", "") or "MALFORMED_PAGE")
-                        errors.append(f"polymarket market discovery: {reason}")
-                        request_failed = True
-                    elif discovery_cursor is None or len(discovered_ids) >= target_markets:
-                        discovery_complete = True
+                    if fingerprint_changed:
+                        # A cursor is scoped to the query that produced it.
+                        # Discard the fetched page rather than mixing scopes,
+                        # but retain every successfully published constituent.
+                        query_fingerprint = page_fingerprint
+                        discovery_cursor = None
+                        discovery_complete = False
+                        discovered_ids = set(processed)
+                        market_statuses = {
+                            key: value
+                            for key, value in market_statuses.items()
+                            if key in processed
+                        }
+                        failed_markets.clear()
+                        discovery_scope_reset = True
+                    else:
+                        if query_fingerprint is None and page_fingerprint:
+                            query_fingerprint = page_fingerprint
+                        if isinstance(snapshots, Sequence) and not isinstance(
+                            snapshots, (str, bytes, Mapping)
+                        ):
+                            for item in snapshots:
+                                market_id = str(getattr(item, "market_id", "")).strip()
+                                if market_id:
+                                    discovered_ids.add(market_id)
+                        if page_call.request_failed and not snapshots:
+                            discovery_failed = True
+                            discovery_retry_after = _coerce_retry_after(page_call.retry_after)
+                            if discovery_retry_after is not None and discovery_retry_after > 0:
+                                discovery_next_attempt_at = now + timedelta(
+                                    seconds=discovery_retry_after
+                                )
+                        returned_cursor = getattr(page, "next_cursor", None)
+                        discovery_cursor = (
+                            str(returned_cursor)
+                            if isinstance(returned_cursor, str) and returned_cursor
+                            else None
+                        )
+                        if str(getattr(page, "coverage_status", "")).upper() == "ERROR":
+                            reason = str(getattr(page, "error_reason", "") or "MALFORMED_PAGE")
+                            errors.append(f"polymarket market discovery: {reason}")
+                            request_failed = True
+                        elif discovery_cursor is None or len(discovered_ids) >= target_markets:
+                            discovery_complete = True
                 elif page_call is None:
                     budget_exhausted = True
             elif callable(getattr(provider, "markets", None)):
@@ -1873,10 +1906,13 @@ class HistoricalBootstrapper:
             else:
                 errors.append("polymarket market discovery: provider has no discovery API")
                 request_failed = True
-            _persist(
-                "PARTIAL" if discovery_failed else "RUNNING",
-                next_attempt_at=discovery_next_attempt_at if discovery_failed else None,
-            )
+            if discovery_scope_reset:
+                _persist("SCHEDULED")
+            else:
+                _persist(
+                    "PARTIAL" if discovery_failed else "RUNNING",
+                    next_attempt_at=discovery_next_attempt_at if discovery_failed else None,
+                )
 
 
         attempted_markets = 0
@@ -2268,9 +2304,7 @@ class HistoricalBootstrapper:
                     start_timestamp=aggregate_start,
                     end_timestamp=aggregate_end,
                     row_count=points_total,
-                    completeness=(
-                        len(processed) / len(discovered_ids) if discovered_ids else 0.0
-                    ),
+                    completeness=_completeness(),
                     missing_ranges=tuple(
                         {
                             "market_id": key,
@@ -2301,11 +2335,12 @@ class HistoricalBootstrapper:
                 for market_id in discovered_ids
             )
         )
-        if discovery_failed:
+        if discovery_scope_reset:
+            final_status = "SCHEDULED"
+        elif discovery_failed:
             final_status = "PARTIAL"
         elif request_failed:
             final_status = "FAILED"
-
         elif budget_exhausted and remaining:
             final_status = "EXHAUSTED"
         elif remaining:
@@ -2320,9 +2355,7 @@ class HistoricalBootstrapper:
             final_status = "NO_NEW_DATA"
         state["base_version"] = aggregate_version or state.get("base_version")
         _persist(final_status)
-        completeness = (
-            len(processed) / len(discovered_ids) if discovered_ids else 0.0
-        )
+        completeness = _completeness()
         report_metadata: dict[str, Any] = {
             **aggregate_metadata,
             "job_name": POLYMARKET_HISTORICAL_JOB_NAME,
