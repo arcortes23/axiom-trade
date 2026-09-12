@@ -2767,6 +2767,28 @@ class DashboardPaginationSurfaceTests(DashboardPaginationFixture):
         # literal in the initial HTML document.
         self.assertNotIn("dataset-00", html)
         self.assertNotIn("market-00", html)
+    def test_paper_portfolio_surface_projects_refresh_status(self) -> None:
+        html = _dashboard_html()
+        start = html.index('<section id="view-portfolio"')
+        end = html.index('<section id="view-canary"', start)
+        portfolio = html[start:end]
+        for marker in (
+            'id="portfolio-summary"',
+            'id="portfolio-states"',
+            'id="paper-pager"',
+            'class="section-title"',
+        ):
+            self.assertIn(marker, portfolio)
+
+        load_start = html.index("loadPage = async function(tab,force=false)")
+        load_end = html.index("activate = function(tab,push=true)", load_start)
+        load_page = html[load_start:load_end]
+        self.assertIn("portfolio:renderPaper", load_page)
+        self.assertIn(
+            "Refresh failed (${refreshError(error)}) · no cached dashboard snapshot available",
+            load_page,
+        )
+
     def test_canary_renderer_labels_research_and_actionable_scan_separately(self) -> None:
         html = _dashboard_html()
         start = html.index("function renderCanary(data)")
