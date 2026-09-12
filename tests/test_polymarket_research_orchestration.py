@@ -369,10 +369,40 @@ class PolymarketResearchOrchestrationTests(unittest.TestCase):
             self.assertEqual(trial.payload["campaign_trial_id"], state["trials"][0]["trial_id"])
             self.assertTrue(str(trial.payload["campaign_protocol_hash"]).startswith("sha256:"))
             self.assertTrue(trial.payload["paper_only"])
+            compact_protocol = trial.payload["experiment_plan"]["campaign_protocol"]
             self.assertEqual(
-                trial.payload["experiment_plan"]["campaign_protocol"],
-                state["protocol"],
+                compact_protocol["schema_version"],
+                state["protocol"]["schema_version"],
             )
+            self.assertEqual(compact_protocol["campaign_id"], state["campaign_id"])
+            self.assertEqual(compact_protocol["protocol_hash"], state["protocol_hash"])
+            self.assertEqual(
+                compact_protocol["protocol_hash"],
+                trial.payload["campaign_protocol_hash"],
+            )
+            self.assertEqual(compact_protocol["budget_version"], state["protocol"]["budget_version"])
+            self.assertEqual(
+                compact_protocol["reassessment_version"],
+                state["protocol"]["reassessment_version"],
+            )
+            plan = trial.payload["experiment_plan"]
+            self.assertEqual(
+                plan["dataset_boundary"],
+                {
+                    "ordered_row_manifest_digest": state["protocol"]["dataset_boundary"][
+                        "ordered_row_manifest_digest"
+                    ]
+                },
+            )
+            for duplicated in (
+                "exact_dataset_row_boundary",
+                "protected_rows",
+                "protected_row_identity_manifests",
+                "ordered_row_identities",
+                "ordered_content_hashes",
+            ):
+                self.assertNotIn(duplicated, plan)
+                self.assertNotIn(duplicated, compact_protocol)
 
             resumed = AutonomousResearchProcessor(store, clock=lambda: T0).campaign_state("durable-campaign")
             self.assertEqual(resumed, state)

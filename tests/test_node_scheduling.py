@@ -24,6 +24,7 @@ from axiom.node import (
     POLYMARKET_AUTONOMY_PROTOCOL_ID,
     POLYMARKET_AUTONOMY_JOB_NAME,
     POLYMARKET_DATASET_ID,
+    POLYMARKET_HISTORICAL_JOB_NAME,
     PRODUCTION_EXECUTION_PROFILE,
     NodeConfig,
     ResearchNode,
@@ -473,6 +474,219 @@ class HistoricalRefreshSchedulingTests(unittest.TestCase):
                 durable_campaign["reassessment_count"],
             )
 
+    def test_historical_tick_publishes_idempotent_recorded_book_replay(self) -> None:
+        replay_dataset_id = "Polymarket-recorded-book-replay"
+        payload = {
+            "source_type": "FORWARD_COLLECTED",
+            "snapshot": {
+                "timestamp": T0.isoformat(),
+                "market_id": "replay-market",
+                "question": "Will the event happen?",
+            },
+            "yes_order_book": {
+                "timestamp": T0.isoformat(),
+                "asks": [{"price": 0.51, "size": 10.0}],
+                "bids": [{"price": 0.49, "size": 10.0}],
+            },
+            "no_order_book": {
+                "timestamp": T0.isoformat(),
+                "asks": [{"price": 0.51, "size": 10.0}],
+                "bids": [{"price": 0.49, "size": 10.0}],
+            },
+        }
+        with AxiomStore(":memory:") as store:
+            store.save_polymarket_snapshot(
+                "forward-snapshot-1",
+                "replay-market",
+                T0,
+                T0,
+                payload,
+                source_type="FORWARD_COLLECTED",
+            )
+            store.set_scheduler_state(
+                POLYMARKET_AUTONOMY_JOB_NAME,
+                {"status": "RUNNING", "campaign_id": "existing-campaign"},
+            )
+            node = ResearchNode(
+                NodeConfig(
+                    ":memory:",
+                    historical_refresh_enabled=True,
+                    historical_refresh_request_budget=1,
+                    historical_refresh_market_budget=1,
+                    crypto_enabled=False,
+                ),
+                provider=InMemoryPredictionProvider([]),
+                historical_provider=InMemoryPredictionProvider([]),
+                store=store,
+                clock=lambda: T0,
+                sleep=lambda _seconds: None,
+            )
+            with patch.object(
+                node,
+                "_run_historical_refresh",
+                return_value={
+                    "status": "COMPLETE",
+                    "report": {"status": "COMPLETE", "records": 1},
+                    "requests": 0,
+                    "campaign": {"status": "RUNNING"},
+                },
+            ):
+                node._run_historical_refresh_tick(cutoff=T0)
+                first_state = store.get_scheduler_state(POLYMARKET_AUTONOMY_JOB_NAME)
+                node._run_historical_refresh_tick(cutoff=T0)
+                second_state = store.get_scheduler_state(POLYMARKET_AUTONOMY_JOB_NAME)
+                restarted = ResearchNode(
+                    node.config,
+                    provider=InMemoryPredictionProvider([]),
+                    historical_provider=InMemoryPredictionProvider([]),
+                    store=store,
+                    clock=lambda: T0,
+                    sleep=lambda _seconds: None,
+                )
+                with patch.object(
+                    restarted,
+                    "_run_historical_refresh",
+                    return_value={
+                        "status": "COMPLETE",
+                        "report": {"status": "COMPLETE", "records": 1},
+                        "requests": 0,
+                        "campaign": {"status": "RUNNING"},
+                    },
+                ):
+                    restarted._run_historical_refresh_tick(cutoff=T0)
+                restarted_state = store.get_scheduler_state(POLYMARKET_AUTONOMY_JOB_NAME)
+
+            catalogs = store.list_dataset_catalog(
+                source_type="FORWARD_COLLECTED",
+                limit=100,
+            )
+            replay_catalogs = [
+                item
+                for item in catalogs
+                if item.get("dataset_id") == replay_dataset_id
+            ]
+            self.assertEqual(len(replay_catalogs), 1)
+            catalog = replay_catalogs[0]
+            self.assertEqual(catalog["row_count"], 1)
+            self.assertEqual(catalog["metadata"]["research_mode"], "RECORDED_BOOK_REPLAY")
+            self.assertEqual(catalog["metadata"]["exact_cutoff"], T0.isoformat())
+            manifest = catalog["metadata"]["snapshot_manifest"]
+            self.assertEqual(len(manifest), 1)
+            self.assertEqual(manifest[0]["snapshot_id"], "forward-snapshot-1")
+            self.assertEqual(manifest[0]["market_id"], "replay-market")
+            self.assertEqual(manifest[0]["source_timestamp"], T0.isoformat())
+            self.assertTrue(manifest[0]["source_record_hash"])
+            second_replay = second_state["replay"]
+            self.assertEqual(second_replay["dataset_id"], replay_dataset_id)
+            self.assertEqual(second_replay["dataset_version"], catalog["dataset_version"])
+            self.assertEqual(second_replay["status"], "NO_NEW_DATA")
+            replay = restarted_state["replay"]
+            self.assertEqual(replay["dataset_id"], replay_dataset_id)
+            self.assertEqual(replay["dataset_version"], catalog["dataset_version"])
+            self.assertEqual(replay["cutoff"], T0.isoformat())
+            self.assertEqual(replay["snapshot_manifest"], manifest)
+            self.assertEqual(replay["status"], "NO_NEW_DATA")
+            self.assertEqual(replay["query_limit"], 10_000)
+            self.assertEqual(second_state["status"], "RUNNING")
+            self.assertEqual(first_state["replay"]["status"], "PUBLISHED")
+            worker = store.get_worker_state(POLYMARKET_HISTORICAL_JOB_NAME)
+            self.assertIsNotNone(worker)
+            assert worker is not None
+            self.assertEqual(worker["payload"]["replay_dataset_version"], catalog["dataset_version"])
+            self.assertEqual(worker["payload"]["replay_row_count"], 1)
+            self.assertEqual(worker["payload"]["replay_cutoff"], T0.isoformat())
+    def test_replay_failure_isolated_from_historical_and_campaign_state(self) -> None:
+        with AxiomStore(":memory:") as store:
+            store.set_scheduler_state(
+                POLYMARKET_AUTONOMY_JOB_NAME,
+                {"status": "RUNNING", "campaign_id": "existing-campaign"},
+            )
+            node = ResearchNode(
+                NodeConfig(
+                    ":memory:",
+                    historical_refresh_enabled=True,
+                    historical_refresh_request_budget=1,
+                    historical_refresh_market_budget=1,
+                    crypto_enabled=False,
+                ),
+                provider=InMemoryPredictionProvider([]),
+                historical_provider=InMemoryPredictionProvider([]),
+                store=store,
+                clock=lambda: T0,
+                sleep=lambda _seconds: None,
+            )
+            with patch.object(
+                node,
+                "_run_historical_refresh",
+                return_value={
+                    "status": "COMPLETE",
+                    "report": {"status": "COMPLETE", "records": 1},
+                    "requests": 1,
+                    "campaign": {"status": "RUNNING"},
+                },
+            ), patch.object(
+                node.historical_bootstrapper,
+                "publish_polymarket_forward_replay",
+                side_effect=RuntimeError("replay publication failed"),
+            ):
+                node._run_historical_refresh_tick(cutoff=T0)
+
+            state = store.get_scheduler_state(POLYMARKET_AUTONOMY_JOB_NAME)
+            self.assertIsNotNone(state)
+            assert state is not None
+            self.assertEqual(state["status"], "RUNNING")
+            self.assertEqual(state["campaign_id"], "existing-campaign")
+            self.assertEqual(state["replay"]["status"], "FAILED")
+            self.assertEqual(state["replay"]["error"], "replay publication failed")
+            worker = store.get_worker_state(POLYMARKET_HISTORICAL_JOB_NAME)
+            self.assertIsNotNone(worker)
+            assert worker is not None
+            self.assertEqual(worker["payload"]["job_status"], "COMPLETE")
+            self.assertIsNone(worker["payload"]["historical_error"])
+            self.assertEqual(
+                worker["payload"]["replay_error"],
+                "replay publication failed",
+            )
+            self.assertEqual(worker["status"], "degraded")
+    def test_empty_replay_is_a_non_failing_historical_tick(self) -> None:
+        with AxiomStore(":memory:") as store:
+            node = ResearchNode(
+                NodeConfig(
+                    ":memory:",
+                    historical_refresh_enabled=True,
+                    historical_refresh_request_budget=1,
+                    historical_refresh_market_budget=1,
+                    crypto_enabled=False,
+                ),
+                provider=InMemoryPredictionProvider([]),
+                historical_provider=InMemoryPredictionProvider([]),
+                store=store,
+                clock=lambda: T0,
+                sleep=lambda _seconds: None,
+            )
+            with patch.object(
+                node,
+                "_run_historical_refresh",
+                return_value={
+                    "status": "COMPLETE",
+                    "report": {"status": "COMPLETE", "records": 0},
+                    "requests": 0,
+                    "campaign": {"status": "RUNNING"},
+                },
+            ):
+                node._run_historical_refresh_tick(cutoff=T0)
+
+            state = store.get_scheduler_state(POLYMARKET_AUTONOMY_JOB_NAME)
+            self.assertIsNotNone(state)
+            assert state is not None
+            self.assertEqual(state["replay"]["status"], "EMPTY")
+            self.assertEqual(state["replay"]["row_count"], 0)
+            worker = store.get_worker_state(POLYMARKET_HISTORICAL_JOB_NAME)
+            self.assertIsNotNone(worker)
+            assert worker is not None
+            self.assertEqual(worker["payload"]["job_status"], "COMPLETE")
+            self.assertIsNone(worker["payload"]["replay_error"])
+            self.assertEqual(worker["status"], "idle")
 
 
 

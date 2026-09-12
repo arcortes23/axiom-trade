@@ -50,6 +50,8 @@ from .canary import CanaryBlocked, CanaryService
 POLYMARKET_HISTORICAL_JOB_NAME = "polymarket-historical-refresh"
 POLYMARKET_AUTONOMY_JOB_NAME = "polymarket-autonomy"
 POLYMARKET_AUTONOMY_PROTOCOL_ID = "polymarket-paper-campaign-v1"
+POLYMARKET_REPLAY_DATASET_ID = "Polymarket-recorded-book-replay"
+POLYMARKET_REPLAY_MAX_ROWS = 10_000
 
 
 class _HistoricalRequestBudget:
@@ -811,8 +813,15 @@ class ResearchNode:
         except Exception as exc:
             self._log(logging.WARNING, "worker state update failed for %s: %s", worker_name, exc)
 
-    def _worker_tick_started(self, worker_name: str, *, next_work: Any = None) -> None:
-        timestamp = ensure_utc(self.clock()).isoformat()
+    def _worker_tick_started(
+        self,
+        worker_name: str,
+        *,
+        next_work: Any = None,
+        timestamp: datetime | None = None,
+    ) -> datetime:
+        timestamp_value = ensure_utc(timestamp or self.clock())
+        timestamp = timestamp_value.isoformat()
         with self._worker_runtime_lock:
             runtime = self._worker_runtime.setdefault(
                 worker_name,
@@ -831,6 +840,7 @@ class ResearchNode:
                 }
             )
         self._persist_worker_runtime(worker_name, "running")
+        return timestamp_value
 
     def _worker_tick_completed(
         self,
@@ -1154,6 +1164,7 @@ class ResearchNode:
                     ),
                     "request_budget": self.config.historical_refresh_request_budget,
                     "market_budget": self.config.historical_refresh_market_budget,
+                    "replay_row_limit": POLYMARKET_REPLAY_MAX_ROWS,
                     "next_work": "refresh_historical_catalog",
                     "producer_job": POLYMARKET_HISTORICAL_JOB_NAME,
                     "resumable": True,
@@ -1861,9 +1872,13 @@ class ResearchNode:
         self.store.set_scheduler_state(POLYMARKET_AUTONOMY_JOB_NAME, state)
         return state
 
-    def _run_historical_refresh(self) -> dict[str, Any]:
+    def _run_historical_refresh(
+        self,
+        *,
+        cutoff: datetime | None = None,
+    ) -> dict[str, Any]:
         """Refresh public history and then seed only an eligible finite campaign."""
-        now = ensure_utc(self.clock())
+        now = ensure_utc(cutoff or self.clock())
         if (
             self.config.historical_refresh_request_budget <= 0
             or self.config.historical_refresh_market_budget <= 0
@@ -2053,18 +2068,182 @@ class ResearchNode:
             heartbeat_at=ensure_utc(self.clock()),
         )
 
-    def _run_historical_refresh_tick(self) -> None:
-        """Run one bounded historical producer tick when explicitly enabled.
+    def _persist_polymarket_replay_state(
+        self,
+        replay: Mapping[str, Any],
+        *,
+        cutoff: datetime,
+    ) -> None:
+        state = self.store.get_scheduler_state(POLYMARKET_AUTONOMY_JOB_NAME) or {}
+        state = dict(state) if isinstance(state, Mapping) else {}
+        replay_payload = dict(replay)
+        state.update(
+            {
+                "protocol_id": state.get(
+                    "protocol_id",
+                    POLYMARKET_AUTONOMY_PROTOCOL_ID,
+                ),
+                "replay": replay_payload,
+                "replay_dataset_id": replay_payload.get("dataset_id"),
+                "replay_dataset_version": replay_payload.get("dataset_version"),
+                "replay_row_count": replay_payload.get("row_count", 0),
+                "replay_cutoff": replay_payload.get("cutoff"),
+                "replay_manifest": replay_payload.get("snapshot_manifest", []),
+                "replay_status": replay_payload.get("status"),
+                "replay_error": replay_payload.get("error"),
+                "updated_at": cutoff.isoformat(),
+                "paper_only": True,
+                "live_execution": False,
+            }
+        )
+        self.store.set_scheduler_state(POLYMARKET_AUTONOMY_JOB_NAME, state)
 
-        The producer owns its durable cursor and request budget.  Scheduling
-        happens on a dedicated worker so provider and publication work cannot
-        extend the ordinary collection critical path.
-        """
+    def _publish_polymarket_forward_replay(self, cutoff: datetime) -> dict[str, Any]:
+        """Publish a bounded, immutable replay without touching the network."""
+        prior_state = self.store.get_scheduler_state(POLYMARKET_AUTONOMY_JOB_NAME) or {}
+        prior_state = dict(prior_state) if isinstance(prior_state, Mapping) else {}
+        prior_replay = prior_state.get("replay")
+        cutoff_value = ensure_utc(cutoff)
+        cutoff_text = cutoff_value.isoformat()
+        existing_versions: set[str] = set()
+        try:
+            existing_catalogs = self.store.list_dataset_catalog(
+                source_type="FORWARD_COLLECTED",
+                limit=256,
+            )
+            for catalog in existing_catalogs:
+                if not isinstance(catalog, Mapping):
+                    continue
+                if str(catalog.get("dataset_id") or "").strip() != POLYMARKET_REPLAY_DATASET_ID:
+                    continue
+                metadata = catalog.get("metadata")
+                if (
+                    isinstance(metadata, Mapping)
+                    and str(metadata.get("exact_cutoff") or "").strip() == cutoff_text
+                ):
+                    version = str(catalog.get("dataset_version") or "").strip()
+                    if version:
+                        existing_versions.add(version)
+        except Exception:
+            existing_versions = set()
+        try:
+            raw_result = self.historical_bootstrapper.publish_polymarket_forward_replay(
+                cutoff=cutoff_value,
+                dataset_id=POLYMARKET_REPLAY_DATASET_ID,
+                max_rows=POLYMARKET_REPLAY_MAX_ROWS,
+            )
+            if not isinstance(raw_result, Mapping):
+                raise TypeError("forward replay publisher returned a non-mapping result")
+            replay = dict(raw_result)
+            replay["dataset_id"] = str(
+                replay.get("dataset_id") or POLYMARKET_REPLAY_DATASET_ID
+            )
+            replay["cutoff"] = cutoff_text
+            replay["exact_cutoff"] = cutoff_text
+            replay["research_mode"] = "RECORDED_BOOK_REPLAY"
+            replay["source_type"] = "FORWARD_COLLECTED"
+            replay["query_limit"] = POLYMARKET_REPLAY_MAX_ROWS
+            try:
+                row_count = int(replay.get("row_count", 0) or 0)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError("forward replay publisher returned an invalid row count") from exc
+            if row_count < 0:
+                raise ValueError("forward replay publisher returned a negative row count")
+            replay["row_count"] = row_count
+            manifest = replay.get("snapshot_manifest", [])
+            if isinstance(manifest, (list, tuple)):
+                normalized_manifest: list[Any] = []
+                for item in manifest:
+                    if not isinstance(item, Mapping):
+                        normalized_manifest.append(item)
+                        continue
+                    entry = dict(item)
+                    source_stamp = parse_timestamp(entry.get("source_timestamp"))
+                    if source_stamp is not None:
+                        entry["source_timestamp"] = source_stamp.isoformat()
+                    normalized_manifest.append(entry)
+                replay["snapshot_manifest"] = normalized_manifest
+            else:
+                replay["snapshot_manifest"] = []
+            prior_version = (
+                str(prior_replay.get("dataset_version") or "").strip()
+                if isinstance(prior_replay, Mapping)
+                else ""
+            )
+            prior_cutoff = (
+                str(prior_replay.get("cutoff") or "").strip()
+                if isinstance(prior_replay, Mapping)
+                else ""
+            )
+            prior_manifest = (
+                prior_replay.get("snapshot_manifest", [])
+                if isinstance(prior_replay, Mapping)
+                else []
+            )
+            current_version = str(replay.get("dataset_version") or "").strip()
+            same_content = (
+                row_count > 0
+                and bool(current_version)
+                and (
+                    current_version in existing_versions
+                    or (
+                        isinstance(prior_replay, Mapping)
+                        and prior_version == current_version
+                        and prior_cutoff == cutoff_text
+                        and prior_replay.get("row_count") == row_count
+                        and prior_manifest == replay["snapshot_manifest"]
+                    )
+                )
+            )
+            replay["status"] = (
+                "EMPTY" if row_count == 0 else ("NO_NEW_DATA" if same_content else "PUBLISHED")
+            )
+        except BaseException as exc:
+            replay = {
+                "status": "FAILED",
+                "dataset_id": POLYMARKET_REPLAY_DATASET_ID,
+                "dataset_version": None,
+                "row_count": 0,
+                "cutoff": cutoff_text,
+                "exact_cutoff": cutoff_text,
+                "snapshot_manifest": [],
+                "research_mode": "RECORDED_BOOK_REPLAY",
+                "source_type": "FORWARD_COLLECTED",
+                "query_limit": POLYMARKET_REPLAY_MAX_ROWS,
+                "error": str(exc),
+                "error_type": type(exc).__name__,
+            }
+        try:
+            self._persist_polymarket_replay_state(replay, cutoff=cutoff_value)
+        except BaseException as exc:
+            replay = {
+                **replay,
+                "status": "FAILED",
+                "error": str(exc),
+                "error_type": type(exc).__name__,
+            }
+        return replay
+
+    def _run_historical_refresh_tick(
+        self,
+        *,
+        cutoff: datetime | None = None,
+    ) -> None:
+        """Run one bounded historical tick and its persisted replay publication."""
         if not self.config.historical_refresh_enabled:
             return
+        if cutoff is None:
+            with self._worker_runtime_lock:
+                started_text = (
+                    self._worker_runtime.get(POLYMARKET_HISTORICAL_JOB_NAME, {})
+                    .get("last_tick_started_at")
+                )
+            cutoff = parse_timestamp(started_text) if started_text else None
+        tick_cutoff = ensure_utc(cutoff or self.clock())
+        historical_error: BaseException | None = None
         try:
             if self.historical_provider is not None:
-                autonomy_result = self._run_historical_refresh()
+                autonomy_result = self._run_historical_refresh(cutoff=tick_cutoff)
                 report_record = dict(autonomy_result.get("report") or {})
                 report_record.setdefault("status", autonomy_result.get("status"))
                 report_record["requests"] = autonomy_result.get("requests", 0)
@@ -2078,37 +2257,15 @@ class ResearchNode:
                 )
                 report_record = report.as_record()
         except BaseException as exc:
-            with self._worker_runtime_lock:
-                runtime = self._worker_runtime.setdefault(
-                    POLYMARKET_HISTORICAL_JOB_NAME,
-                    {"errors": []},
-                )
-                runtime.update(
-                    {
-                        "job_name": POLYMARKET_HISTORICAL_JOB_NAME,
-                        "job_status": "FAILED",
-                        "wait_classification": {
-                            "status": "SOFTWARE_OR_INPUT_ERROR",
-                            "producer_job": POLYMARKET_HISTORICAL_JOB_NAME,
-                        },
-                        "last_error": str(exc),
-                    }
-                )
-            self._persist_worker_runtime(
-                POLYMARKET_HISTORICAL_JOB_NAME,
-                "degraded",
-                extra={
-                    "job_name": POLYMARKET_HISTORICAL_JOB_NAME,
-                    "job_status": "FAILED",
-                    "wait_classification": {
-                        "status": "SOFTWARE_OR_INPUT_ERROR",
-                        "producer_job": POLYMARKET_HISTORICAL_JOB_NAME,
-                    },
-                    "error": str(exc),
-                },
-            )
-            return
+            historical_error = exc
+            report_record = {
+                "status": "FAILED",
+                "errors": [str(exc)],
+                "error_type": type(exc).__name__,
+            }
         producer_status = str(report_record.get("status") or "").upper()
+        if historical_error is not None:
+            producer_status = "FAILED"
         if producer_status in {"SCHEDULED", "RUNNING"}:
             worker_status = "waiting"
             wait_classification = {
@@ -2137,6 +2294,47 @@ class ResearchNode:
                 "status": producer_status or "NO_NEW_DATA",
                 "producer_job": POLYMARKET_HISTORICAL_JOB_NAME,
             }
+        replay = self._publish_polymarket_forward_replay(tick_cutoff)
+        replay_status = str(replay.get("status") or "").upper()
+        if replay_status == "FAILED":
+            worker_status = "degraded"
+        manifest = replay.get("snapshot_manifest", [])
+        if isinstance(manifest, (list, tuple)):
+            normalized_manifest: list[Any] = []
+            for item in manifest:
+                if not isinstance(item, Mapping):
+                    normalized_manifest.append(item)
+                    continue
+                entry = dict(item)
+                source_stamp = parse_timestamp(entry.get("source_timestamp"))
+                if source_stamp is not None:
+                    entry["source_timestamp"] = source_stamp.isoformat()
+                normalized_manifest.append(entry)
+            replay["snapshot_manifest"] = normalized_manifest
+        else:
+            replay["snapshot_manifest"] = []
+        report_record["replay"] = replay
+        historical_error_text = (
+            str(historical_error)
+            if historical_error is not None
+            else (
+                str(report_record.get("error"))
+                if report_record.get("error")
+                else None
+            )
+        )
+        replay_error = str(replay.get("error")) if replay.get("error") else None
+        last_report_errors = report_record.get("errors", [])
+        last_error = (
+            list(last_report_errors)[:1]
+            if isinstance(last_report_errors, (list, tuple))
+            else ([historical_error_text] if historical_error_text else [])
+        )
+        next_work = (
+            "retry_replay_publication"
+            if replay_status == "FAILED"
+            else "wait_for_next_historical_refresh"
+        )
         with self._worker_runtime_lock:
             runtime = self._worker_runtime.setdefault(
                 POLYMARKET_HISTORICAL_JOB_NAME,
@@ -2148,7 +2346,16 @@ class ResearchNode:
                     "job_status": producer_status,
                     "wait_classification": wait_classification,
                     "last_report": report_record,
-                    "last_error": report_record.get("errors", [])[:1],
+                    "last_error": last_error,
+                    "historical_error": historical_error_text,
+                    "replay": replay,
+                    "replay_status": replay_status,
+                    "replay_error": replay_error,
+                    "replay_dataset_id": replay.get("dataset_id"),
+                    "replay_dataset_version": replay.get("dataset_version"),
+                    "replay_row_count": replay.get("row_count", 0),
+                    "replay_cutoff": replay.get("cutoff"),
+                    "replay_manifest": replay.get("snapshot_manifest", []),
                 }
             )
         self._persist_worker_runtime(
@@ -2159,7 +2366,17 @@ class ResearchNode:
                 "job_status": producer_status,
                 "wait_classification": wait_classification,
                 "last_report": report_record,
-                "last_error": report_record.get("errors", [])[:1],
+                "last_error": last_error,
+                "historical_error": historical_error_text,
+                "replay": replay,
+                "replay_status": replay_status,
+                "replay_error": replay_error,
+                "replay_dataset_id": replay.get("dataset_id"),
+                "replay_dataset_version": replay.get("dataset_version"),
+                "replay_row_count": replay.get("row_count", 0),
+                "replay_cutoff": replay.get("cutoff"),
+                "replay_manifest": replay.get("snapshot_manifest", []),
+                "next_work": next_work,
             },
         )
 
@@ -2173,6 +2390,7 @@ class ResearchNode:
                 "running",
                 extra={
                     "configured_interval_seconds": interval_seconds,
+                    "replay_row_limit": POLYMARKET_REPLAY_MAX_ROWS,
                     "next_work": "refresh_historical_data",
                     "producer_job": POLYMARKET_HISTORICAL_JOB_NAME,
                     "resumable": True,

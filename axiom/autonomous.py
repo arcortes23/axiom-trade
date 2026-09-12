@@ -1181,7 +1181,6 @@ class AutonomousResearchProcessor:
                 "signals survive a fixed chronological paper evaluation after costs."
             ),
             "dataset_boundary": boundary,
-            "exact_dataset_row_boundary": dict(boundary),
             "configuration_manifest": [dict(item) for item in configurations],
             "fixed_generator": {
                 "families": ["momentum", "mean_reversion"],
@@ -1223,6 +1222,7 @@ class AutonomousResearchProcessor:
                 or {"min_expectancy": 0.0, "min_samples": 3, "min_trades": 0}
             ),
             "budget_limit": CAMPAIGN_BUDGET_LIMIT,
+            "budget_version": "v1",
             "validation_policy": {
                 "chronological": True,
                 "selection_metric": "validation_expectancy",
@@ -1236,33 +1236,200 @@ class AutonomousResearchProcessor:
                 "untouched_until_validation_complete": True,
             },
             "protected_row_identity_manifests": manifests,
-            "protected_rows": manifests,
             "reassessment_limit": 1,
+            "reassessment_version": "v1",
         }
 
+    @staticmethod
+    def _campaign_protocol_state(payload: Mapping[str, Any]) -> tuple[Mapping[str, Any], str]:
+        protocol = payload.get("protocol")
+        if not isinstance(protocol, Mapping):
+            raise AutonomousResearchError(
+                "CAMPAIGN_PROTOCOL_INVALID",
+                "campaign operator job has no durable protocol",
+            )
+        protocol_hash = _hash_document(protocol)
+        declared_hash = str(payload.get("protocol_hash", "")).strip()
+        if not declared_hash or declared_hash != protocol_hash:
+            raise AutonomousResearchError(
+                "CAMPAIGN_PROTOCOL_INVALID",
+                "campaign operator job protocol identity does not match its canonical protocol",
+            )
+        return protocol, protocol_hash
+
+    @staticmethod
+    def _campaign_trial_boundary(
+        payload: Mapping[str, Any],
+        protocol: Mapping[str, Any],
+        trial: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        trial_id = str(trial.get("trial_id", "")).strip()
+        reassessment_of = str(trial.get("reassessment_of", "")).strip()
+        if reassessment_of:
+            boundaries = payload.get("reassessment_boundaries")
+            boundary = boundaries.get(trial_id) if isinstance(boundaries, Mapping) else None
+        else:
+            boundary = protocol.get("dataset_boundary")
+        if not isinstance(boundary, Mapping):
+            raise AutonomousResearchError(
+                "CAMPAIGN_PROTOCOL_INVALID",
+                f"durable campaign boundary is missing for trial {trial_id}",
+            )
+        return boundary
+
+    def _validate_campaign_plan_binding(
+        self,
+        payload: Mapping[str, Any],
+        trial: Mapping[str, Any],
+        plan: ExperimentPlan,
+        *,
+        queue_payload: Mapping[str, Any] | None = None,
+    ) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
+        protocol, protocol_hash = self._campaign_protocol_state(payload)
+        campaign_id = str(payload.get("campaign_id", "")).strip()
+        reference = plan.campaign_protocol
+        if not isinstance(reference, Mapping):
+            raise AutonomousResearchError(
+                "CAMPAIGN_PROTOCOL_INVALID",
+                "campaign plan has no compact durable protocol reference",
+            )
+        expected_reference = {
+            "schema_version": protocol.get("schema_version"),
+            "campaign_id": campaign_id,
+            "protocol_hash": protocol_hash,
+            "budget_version": protocol.get("budget_version"),
+            "reassessment_version": protocol.get("reassessment_version"),
+        }
+        # ExperimentPlan normalizes the compact reference by copying the
+        # separately persisted trial fields into ``campaign_protocol``.  Bind
+        # the protocol identity itself exactly, while leaving those bounded
+        # projections to the field-level checks below.
+        reference_identity = {
+            key: reference.get(key)
+            for key in expected_reference
+            if key in reference
+        }
+        if reference_identity != expected_reference:
+            raise AutonomousResearchError(
+                "CAMPAIGN_PROTOCOL_INVALID",
+                "campaign plan protocol reference is not bound to the durable protocol",
+            )
+        unexpected_reference_fields = set(reference) - set(expected_reference) - {
+            "dataset_boundary",
+            "configuration_manifest",
+            "observation_horizon",
+            "qualification_gates",
+            "validation_policy",
+            "final_assessment_policy",
+        }
+        if unexpected_reference_fields:
+            raise AutonomousResearchError(
+                "CAMPAIGN_PROTOCOL_INVALID",
+                "campaign plan protocol reference contains unapproved duplicated protocol fields",
+            )
+        if plan.campaign_id != campaign_id:
+            raise AutonomousResearchError(
+                "CAMPAIGN_PROTOCOL_INVALID",
+                "campaign plan campaign_id does not match the durable campaign",
+            )
+        trial_id = str(trial.get("trial_id", "")).strip()
+        if plan.campaign_trial_id != trial_id:
+            raise AutonomousResearchError(
+                "CAMPAIGN_PROTOCOL_INVALID",
+                "campaign plan trial_id does not match the durable campaign trial",
+            )
+        configuration_id = str(trial.get("configuration_id", "")).strip()
+        if plan.campaign_configuration_id != configuration_id:
+            raise AutonomousResearchError(
+                "CAMPAIGN_PROTOCOL_INVALID",
+                "campaign plan configuration does not match the durable campaign trial",
+            )
+        if queue_payload is not None and str(queue_payload.get("campaign_protocol_hash", "")).strip() != protocol_hash:
+            raise AutonomousResearchError(
+                "CAMPAIGN_PROTOCOL_INVALID",
+                "campaign queue protocol hash does not match the durable protocol",
+            )
+        boundary = self._campaign_trial_boundary(payload, protocol, trial)
+        expected_digest = str(
+            boundary.get("ordered_row_manifest_digest", boundary.get("content_hash", ""))
+        ).strip()
+        plan_boundary = plan.dataset_boundary
+        plan_digest = (
+            str(plan_boundary.get("ordered_row_manifest_digest", plan_boundary.get("content_hash", ""))).strip()
+            if isinstance(plan_boundary, Mapping)
+            else ""
+        )
+        if not expected_digest or plan_digest != expected_digest:
+            raise AutonomousResearchError(
+                "CAMPAIGN_PROTOCOL_INVALID",
+                "campaign plan boundary digest does not match the durable trial boundary",
+            )
+        selector_id = str(plan.dataset_id or "").strip()
+        selector_version = str(plan.dataset_version or "").strip()
+        if (
+            selector_id != str(boundary.get("dataset_id", "")).strip()
+            or selector_version != str(boundary.get("dataset_version", "")).strip()
+        ):
+            raise AutonomousResearchError(
+                "CAMPAIGN_PROTOCOL_INVALID",
+                "campaign plan dataset selector does not match the durable trial boundary",
+            )
+        durable_configuration = trial.get("configuration")
+        manifest = plan.configuration_manifest
+        if not isinstance(durable_configuration, Mapping) or not isinstance(manifest, Mapping):
+            raise AutonomousResearchError(
+                "CAMPAIGN_PROTOCOL_INVALID",
+                "campaign trial configuration is not durably bound",
+            )
+        expected_manifest = {
+            "configuration_id": configuration_id,
+            "template": durable_configuration.get("template"),
+            "parameters": dict(durable_configuration.get("parameters", {})),
+        }
+        if _canonical_binding(manifest) != _canonical_binding(expected_manifest):
+            raise AutonomousResearchError(
+                "CAMPAIGN_PROTOCOL_INVALID",
+                "campaign plan configuration manifest is not durably bound",
+            )
+        return protocol, boundary
+
+    def _campaign_trial_from_payload(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        campaign_id: str,
+        trial_id: str,
+    ) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
+        record = self.store.get_operator_job(self.campaign_job_name(campaign_id))
+        state_payload = record.get("payload") if isinstance(record, Mapping) else None
+        if not isinstance(state_payload, Mapping):
+            raise AutonomousResearchError(
+                "CAMPAIGN_PROTOCOL_INVALID",
+                "campaign operator job is missing",
+            )
+        trials = state_payload.get("trials")
+        trial = next(
+            (
+                item
+                for item in trials
+                if isinstance(item, Mapping) and str(item.get("trial_id", "")).strip() == trial_id
+            ),
+            None,
+        ) if isinstance(trials, Sequence) and not isinstance(trials, (str, bytes)) else None
+        if trial is None:
+            raise AutonomousResearchError(
+                "CAMPAIGN_PROTOCOL_INVALID",
+                f"campaign trial {trial_id} is missing from the durable operator job",
+            )
+        return state_payload, trial
 
     def _campaign_queue_plan(
         self,
         state: Mapping[str, Any],
         trial: Mapping[str, Any],
     ) -> ExperimentPlan:
-        protocol = state.get("protocol") if isinstance(state.get("protocol"), Mapping) else {}
-        trial_boundary = trial.get("dataset_boundary")
-        boundary = (
-            dict(trial_boundary)
-            if isinstance(trial_boundary, Mapping)
-            else protocol.get("dataset_boundary")
-            if isinstance(protocol, Mapping)
-            else {}
-        )
-        trial_manifests = trial.get("protected_row_identity_manifests")
-        protected_manifests = (
-            dict(trial_manifests)
-            if isinstance(trial_manifests, Mapping)
-            else protocol.get("protected_row_identity_manifests", {})
-            if isinstance(protocol, Mapping)
-            else {}
-        )
+        protocol, _ = self._campaign_protocol_state(state)
+        boundary = self._campaign_trial_boundary(state, protocol, trial)
         config = trial.get("configuration") if isinstance(trial.get("configuration"), Mapping) else {}
         campaign_id = str(state.get("campaign_id", "")).strip()
         trial_id = str(trial.get("trial_id", "")).strip()
@@ -1270,6 +1437,15 @@ class AutonomousResearchProcessor:
         base = state.get("base_proposal") if isinstance(state.get("base_proposal"), Mapping) else {}
         raw_base_plan = base.get("experiment_plan") if isinstance(base.get("experiment_plan"), Mapping) else base
         plan_document = dict(raw_base_plan)
+        for redundant in ("exact_dataset_row_boundary", "protected_rows", "protected_row_identity_manifests"):
+            plan_document.pop(redundant, None)
+        protocol_reference = {
+            "schema_version": protocol.get("schema_version"),
+            "campaign_id": campaign_id,
+            "protocol_hash": _hash_document(protocol),
+            "budget_version": protocol.get("budget_version"),
+            "reassessment_version": protocol.get("reassessment_version"),
+        }
         plan_document.update(
             {
                 "plan_id": f"campaign-plan:{campaign_id}:{trial_id}",
@@ -1277,9 +1453,12 @@ class AutonomousResearchProcessor:
                 "campaign_id": campaign_id,
                 "campaign_trial_id": trial_id,
                 "campaign_configuration_id": configuration_id,
-                "campaign_protocol": dict(protocol),
-                "scientific_rationale": protocol.get("scientific_rationale"),
-                "dataset_boundary": boundary,
+                "campaign_protocol": protocol_reference,
+                "dataset_boundary": {
+                    "ordered_row_manifest_digest": str(
+                        boundary.get("ordered_row_manifest_digest", boundary.get("content_hash", ""))
+                    ).strip()
+                },
                 "configuration_manifest": {
                     "configuration_id": configuration_id,
                     "template": config.get("template"),
@@ -1289,7 +1468,6 @@ class AutonomousResearchProcessor:
                 "qualification_gates": protocol.get("qualification_gates", {}),
                 "validation_policy": protocol.get("validation_policy", {}),
                 "final_assessment_policy": protocol.get("final_assessment_policy", {}),
-                "protected_row_identity_manifests": protected_manifests,
                 "template": config.get("template"),
                 "parameters": {
                     str(name): [value]
@@ -1309,6 +1487,7 @@ class AutonomousResearchProcessor:
                 },
             }
         )
+        plan_document.pop("scientific_rationale", None)
         plan_document.setdefault("market_type", "prediction")
         plan_document.setdefault("market_scope", {
             "mode": "RULE_BASED_MARKETS",
@@ -1329,6 +1508,8 @@ class AutonomousResearchProcessor:
         plan_document.setdefault("filters", {})
         plan_document.setdefault("experiment_family", config.get("template"))
         return ExperimentPlan.from_mapping(plan_document, hypothesis_id=plan_document["hypothesis_id"])
+
+
 
     def _campaign_queue_next(self, now: datetime) -> Mapping[str, Any] | None:
         campaign_id = str(self._campaign_active_state.get("campaign_id", "")).strip()
@@ -1354,13 +1535,13 @@ class AutonomousResearchProcessor:
                 next_trial = next((item for item in trials if item.get("status") == "PLANNED"), None)
             if next_trial is None:
                 return None
+            protocol, protocol_hash = self._campaign_protocol_state(payload)
             plan = self._campaign_queue_plan(payload, next_trial)
             campaign_trial_id = str(next_trial.get("trial_id", "")).strip()
-            protocol_hash = _hash_document(payload.get("protocol", {}))
             queue_payload = {
                 "proposal_id": plan.hypothesis_id,
                 "hypothesis_id": plan.hypothesis_id,
-                "statement": str(payload.get("protocol", {}).get("scientific_rationale", "Finite Polymarket campaign")),
+                "statement": str(protocol.get("scientific_rationale", "Finite Polymarket campaign")),
                 "source": "axiom-finite-campaign",
                 "tests": ["chronological validation on the protected dataset boundary"],
                 "dataset_id": plan.dataset_id,
@@ -1489,6 +1670,7 @@ class AutonomousResearchProcessor:
         existing = self.store.get_operator_job(self.campaign_job_name(campaign))
         if isinstance(existing, Mapping):
             existing_payload = dict(existing.get("payload") or {})
+            self._campaign_protocol_state(existing_payload)
             self._campaign_active_state = existing_payload
             return existing_payload
         source = dict(proposal or {})
@@ -1531,6 +1713,7 @@ class AutonomousResearchProcessor:
             finalist_count=int(finalist_count),
             observation_horizon=int(observation_horizon),
         )
+        protocol_hash = _hash_document(protocol)
         trials: list[dict[str, Any]] = [
             {
                 "trial_id": f"trial:{campaign}:{index:02d}",
@@ -1554,6 +1737,8 @@ class AutonomousResearchProcessor:
             "campaign_id": campaign,
             "status": "PLANNED" if trials else "CAMPAIGN_EXHAUSTED_NO_QUALIFIED_STRATEGY",
             "protocol": protocol,
+            "protocol_hash": protocol_hash,
+            "reassessment_boundaries": {},
             "base_proposal": source,
             "dataset_id": resolved_dataset_id,
             "dataset_version": resolved_dataset_version,
@@ -1652,6 +1837,7 @@ class AutonomousResearchProcessor:
     def _campaign_final_assessment(self, payload: dict[str, Any], *, now: datetime) -> None:
         if bool(payload.get("final_assessment_evaluated")):
             return
+        protocol, _ = self._campaign_protocol_state(payload)
         payload["status"] = "FINAL_ASSESSMENT"
         trials = [dict(item) for item in payload.get("trials", ()) if isinstance(item, Mapping)]
         qualified = [
@@ -1659,9 +1845,8 @@ class AutonomousResearchProcessor:
             for item in trials
             if item.get("status") == "VALIDATION_QUALIFIED"
             and not bool(item.get("selection_excluded"))
-        ][: int(payload.get("protocol", {}).get("final_assessment_policy", {}).get("max_finalists", 1))]
-        protocol = payload.get("protocol") if isinstance(payload.get("protocol"), Mapping) else {}
-        protected = protocol.get("protected_row_identity_manifests") if isinstance(protocol, Mapping) else {}
+        ][: int(protocol.get("final_assessment_policy", {}).get("max_finalists", 1))]
+        protected = protocol.get("protected_row_identity_manifests")
         protected = protected if isinstance(protected, Mapping) else {}
         final_manifest = protected.get("final", ())
         boundary = protocol.get("dataset_boundary") if isinstance(protocol, Mapping) else {}
@@ -1696,11 +1881,14 @@ class AutonomousResearchProcessor:
                     raw_plan,
                     hypothesis_id=str(plan_record.get("hypothesis_id", "")).strip() or None,
                 )
-                rows = self._campaign_dataset_rows(self.store, plan.dataset_id or "", plan.dataset_version)
-                trial_boundary = raw_plan.get("dataset_boundary")
-                trial_boundary = trial_boundary if isinstance(trial_boundary, Mapping) else boundary
-                trial_protected = raw_plan.get("protected_row_identity_manifests")
-                trial_protected = trial_protected if isinstance(trial_protected, Mapping) else protected
+                expected_plan_hash = str(trial.get("plan_hash", "")).strip()
+                if not expected_plan_hash or expected_plan_hash != plan.plan_hash:
+                    raise AutonomousResearchError(
+                        "CAMPAIGN_PROTOCOL_INVALID",
+                        "campaign final-assessment plan hash is not durably bound",
+                    )
+                _, trial_boundary = self._validate_campaign_plan_binding(payload, trial, plan)
+                trial_protected = protected if not str(trial.get("reassessment_of", "")).strip() else {}
                 trial_manifest = trial_protected.get("final", ())
                 trial_boundary_splits = trial_boundary.get("split_boundaries", {})
                 trial_descriptor = (
@@ -1714,25 +1902,23 @@ class AutonomousResearchProcessor:
                         trial_boundary.get("content_hash", ""),
                     )
                 ).strip()
-                if expected_digest:
-                    actual_provenance = _campaign_compact_row_provenance(rows)
-                    if (
-                        actual_provenance["row_count"] != int(trial_boundary.get("row_count", -1))
-                        or actual_provenance["exact_cutoff"] != trial_boundary.get("exact_cutoff")
-                        or actual_provenance["ordered_row_manifest_digest"] != expected_digest
-                    ):
-                        raise AutonomousResearchError(
-                            "DATASET_PROVENANCE_INVALID",
-                            "campaign final-assessment dataset boundary changed",
-                        )
-                    final_rows = _campaign_rows_for_split(rows, trial_descriptor)
-                    trial_digest = expected_digest
-                else:
-                    final_rows = [
-                        row for index, row in enumerate(rows)
-                        if _campaign_row_identity(row, index) in final_ids
-                    ]
-                    trial_digest = _hash_document(final_manifest)
+                rows = self._campaign_dataset_rows(
+                    self.store,
+                    str(trial_boundary.get("dataset_id", "")).strip(),
+                    str(trial_boundary.get("dataset_version", "")).strip(),
+                )
+                actual_provenance = _campaign_compact_row_provenance(rows)
+                if (
+                    actual_provenance["row_count"] != int(trial_boundary.get("row_count", -1))
+                    or actual_provenance["exact_cutoff"] != trial_boundary.get("exact_cutoff")
+                    or actual_provenance["ordered_row_manifest_digest"] != expected_digest
+                ):
+                    raise AutonomousResearchError(
+                        "DATASET_PROVENANCE_INVALID",
+                        "campaign final-assessment dataset boundary changed",
+                    )
+                final_rows = _campaign_rows_for_split(rows, trial_descriptor)
+                trial_digest = expected_digest
                 strategy = plan.strategy_for(plan.variants()[0], str(trial.get("candidate_id", trial.get("trial_id"))))
                 metrics = dict(self._run_backtest(plan, strategy, final_rows))
                 gates = protocol.get("qualification_gates", {})
@@ -1973,6 +2159,7 @@ class AutonomousResearchProcessor:
         if not isinstance(record, Mapping):
             raise ValueError("campaign does not exist")
         payload = dict(record.get("payload") or {})
+        protocol, _ = self._campaign_protocol_state(payload)
         identity = str(evidence_identity).strip()
         if not identity:
             raise ValueError("evidence_identity is required")
@@ -1994,16 +2181,9 @@ class AutonomousResearchProcessor:
         )
         original_dataset_id = str(payload.get("dataset_id", "")).strip()
         original_dataset_version = str(payload.get("dataset_version", "")).strip()
-        reassessment_boundary: Mapping[str, Any] = {}
-        reassessment_manifests: Mapping[str, Any] = {}
-        protocol = payload.get("protocol")
-        if isinstance(protocol, Mapping):
-            original_boundary = protocol.get("dataset_boundary")
-            if isinstance(original_boundary, Mapping):
-                reassessment_boundary = dict(original_boundary)
-            original_manifests = protocol.get("protected_row_identity_manifests")
-            if isinstance(original_manifests, Mapping):
-                reassessment_manifests = dict(original_manifests)
+        reassessment_boundary: Mapping[str, Any] = protocol.get("dataset_boundary", {})
+        if not isinstance(reassessment_boundary, Mapping):
+            reassessment_boundary = {}
         if (
             resolved_dataset_id != original_dataset_id
             or resolved_dataset_version != original_dataset_version
@@ -2028,6 +2208,7 @@ class AutonomousResearchProcessor:
             "recorded_at": ensure_utc(current).isoformat(),
             "auditable": True,
         }
+        reassessment_boundaries = dict(payload.get("reassessment_boundaries") or {})
         trials = [dict(item) for item in payload.get("trials", ()) if isinstance(item, Mapping)]
         existing_trial_ids = {
             str(item.get("trial_id", "")).strip()
@@ -2047,13 +2228,13 @@ class AutonomousResearchProcessor:
                     "reassessment_of": old.get("trial_id"),
                     "dataset_id": resolved_dataset_id,
                     "dataset_version": resolved_dataset_version,
-                    "dataset_boundary": dict(reassessment_boundary),
-                    "protected_row_identity_manifests": dict(reassessment_manifests),
                     "result": None,
                 }
             )
+            reassessment_boundaries[reassessment_id] = dict(reassessment_boundary)
             existing_trial_ids.add(reassessment_id)
             appended += 1
+        payload["reassessment_boundaries"] = reassessment_boundaries
         payload["trials"] = trials
         counts = dict(payload.get("counts") or {})
         counts["planned"] = int(counts.get("planned", 0)) + appended
@@ -4031,6 +4212,26 @@ class AutonomousResearchProcessor:
             )
             raise AutonomousResearchError(reason_code, "; ".join(validation.reasons))
         plan = ExperimentPlan.from_proposal(validation.normalized or proposal)
+        campaign_boundary: Mapping[str, Any] | None = None
+        campaign_id = str(item.payload.get("campaign_id", "")).strip()
+        if campaign_id:
+            campaign_trial_id = str(item.payload.get("campaign_trial_id", "")).strip()
+            campaign_state, campaign_trial = self._campaign_trial_from_payload(
+                item.payload,
+                campaign_id=campaign_id,
+                trial_id=campaign_trial_id,
+            )
+            _, campaign_boundary = self._validate_campaign_plan_binding(
+                campaign_state,
+                campaign_trial,
+                plan,
+                queue_payload=item.payload,
+            )
+        elif plan.campaign_id:
+            raise AutonomousResearchError(
+                "CAMPAIGN_PROTOCOL_INVALID",
+                "campaign plan is missing its queue campaign binding",
+            )
         if generated_scope_binding is None:
             self._revalidate_generated_queue_item(item, plan, proposal)
         else:
@@ -4107,7 +4308,7 @@ class AutonomousResearchProcessor:
                     "evaluation": None,
                 }
             )
-        rows, split = self._load_split(plan)
+        rows, split = self._load_split(plan, boundary_override=campaign_boundary)
         split_counts = {
             "dataset_row_count": len(rows),
             "train_sample_count": len(split.train),
@@ -5502,7 +5703,12 @@ class AutonomousResearchProcessor:
                     return found.get("records")
         return None
 
-    def _load_split(self, plan: ExperimentPlan) -> tuple[list[Mapping[str, Any]], Any]:
+    def _load_split(
+        self,
+        plan: ExperimentPlan,
+        *,
+        boundary_override: Mapping[str, Any] | None = None,
+    ) -> tuple[list[Mapping[str, Any]], Any]:
         records: Any = None
         if plan.dataset_version.lower() in {"latest", "current", "default", "unversioned"}:
             if plan.market_type is MarketType.CRYPTO_SPOT:
@@ -5549,7 +5755,7 @@ class AutonomousResearchProcessor:
             raise AutonomousResearchError("INSUFFICIENT_DATA", "dataset records are not a bounded sequence")
         rows = [_normalize_row(item) for item in list(records)[:_MAX_DATASET_ROWS]]
         rows = [row for row in rows if row is not None]
-        boundary = plan.dataset_boundary
+        boundary = boundary_override if boundary_override is not None else plan.dataset_boundary
         expected_digest = (
             str(boundary.get("ordered_row_manifest_digest", boundary.get("content_hash", ""))).strip()
             if isinstance(boundary, Mapping)
