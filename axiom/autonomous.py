@@ -91,6 +91,12 @@ CAMPAIGN_STATUSES = frozenset(
         "SOFTWARE_OR_INPUT_ERROR",
     }
 )
+CAMPAIGN_TERMINAL_STATUSES = frozenset(
+    {
+        "COMPLETED_QUALIFIED",
+        "CAMPAIGN_EXHAUSTED_NO_QUALIFIED_STRATEGY",
+    }
+)
 CAMPAIGN_TRIAL_TERMINAL = frozenset(
     {
         "ECONOMIC_REJECTION",
@@ -1241,6 +1247,117 @@ class AutonomousResearchProcessor:
         }
 
     @staticmethod
+    def _campaign_state_defaults(
+        payload: Mapping[str, Any],
+        protocol: Mapping[str, Any],
+        *,
+        campaign_id: str,
+        now: datetime,
+    ) -> dict[str, Any]:
+        """Fill fields introduced after the first durable campaign writer."""
+        state = dict(payload)
+        boundary = protocol.get("dataset_boundary")
+        boundary = boundary if isinstance(boundary, Mapping) else {}
+        raw_trials = state.get("trials")
+        trials = [
+            item
+            for item in (raw_trials if isinstance(raw_trials, Sequence) and not isinstance(raw_trials, (str, bytes)) else ())
+            if isinstance(item, Mapping)
+        ]
+        if "schema_version" not in state:
+            state["schema_version"] = protocol.get(
+                "schema_version",
+                "polymarket-finite-campaign-v1",
+            )
+        if "campaign_id" not in state:
+            state["campaign_id"] = campaign_id
+        if "status" not in state:
+            state["status"] = "PLANNED"
+        if "reassessment_boundaries" not in state:
+            state["reassessment_boundaries"] = {}
+        if "base_proposal" not in state:
+            state["base_proposal"] = {}
+        if "dataset_id" not in state:
+            state["dataset_id"] = boundary.get("dataset_id")
+        if "dataset_version" not in state:
+            state["dataset_version"] = boundary.get("dataset_version")
+        if "budget_limit" not in state:
+            state["budget_limit"] = protocol.get("budget_limit", CAMPAIGN_BUDGET_LIMIT)
+        if "budget_used" not in state:
+            state["budget_used"] = 0
+        if "budget_remaining" not in state:
+            try:
+                budget_limit = int(state["budget_limit"])
+            except (TypeError, ValueError, OverflowError):
+                budget_limit = CAMPAIGN_BUDGET_LIMIT
+                state["budget_limit"] = budget_limit
+            try:
+                budget_used = int(state["budget_used"])
+            except (TypeError, ValueError, OverflowError):
+                budget_used = 0
+                state["budget_used"] = budget_used
+            state["budget_remaining"] = max(0, budget_limit - budget_used)
+        if "fixed_configuration_count" not in state:
+            manifest = protocol.get("configuration_manifest")
+            state["fixed_configuration_count"] = (
+                len(manifest)
+                if isinstance(manifest, Sequence) and not isinstance(manifest, (str, bytes))
+                else len(trials)
+            )
+        if "trials" not in state or not isinstance(state.get("trials"), Sequence) or isinstance(
+            state.get("trials"),
+            (str, bytes),
+        ):
+            state["trials"] = []
+            trials = []
+        if "counts" not in state or not isinstance(state.get("counts"), Mapping):
+            state["counts"] = {}
+        counts = dict(state["counts"])
+        status_counts = {
+            "planned": sum(str(item.get("status", "")).upper() == "PLANNED" for item in trials),
+            "running": sum(str(item.get("status", "")).upper() == "RUNNING" for item in trials),
+            "economic_rejection": sum(
+                str(item.get("status", "")).upper() == "ECONOMIC_REJECTION"
+                for item in trials
+            ),
+            "data_insufficient": sum(
+                str(item.get("status", "")).upper() == "DATA_INSUFFICIENT"
+                for item in trials
+            ),
+            "software_or_input_error": sum(
+                str(item.get("status", "")).upper() == "SOFTWARE_OR_INPUT_ERROR"
+                for item in trials
+            ),
+            "validation_qualified": sum(
+                str(item.get("status", "")).upper() == "VALIDATION_QUALIFIED"
+                for item in trials
+            ),
+            "final_assessment": sum(
+                str(item.get("status", "")).upper() == "FINAL_ASSESSMENT"
+                for item in trials
+            ),
+            "qualified": 0,
+        }
+        for key, default in status_counts.items():
+            counts.setdefault(key, default)
+        state["counts"] = counts
+        for key, default in (
+            ("selection_excluded_evidence", []),
+            ("qualified_candidate_ids", []),
+            ("finalist_candidate_ids", []),
+            ("final_assessment_evaluated", False),
+            ("reassessment_count", 0),
+            ("last_result", None),
+            ("next_real_job", None),
+            ("created_at", ensure_utc(now).isoformat()),
+            ("last_updated_at", ensure_utc(now).isoformat()),
+            ("paper_only", True),
+            ("research_only", True),
+        ):
+            state.setdefault(key, default)
+        return state
+
+    @staticmethod
     def _campaign_protocol_state(payload: Mapping[str, Any]) -> tuple[Mapping[str, Any], str]:
         protocol = payload.get("protocol")
         if not isinstance(protocol, Mapping):
@@ -1667,12 +1784,68 @@ class AutonomousResearchProcessor:
             raise ValueError("observation_horizon must be a positive observation count")
         if isinstance(finalist_count, bool) or not 1 <= int(finalist_count) <= CAMPAIGN_MAX_FINALISTS:
             raise ValueError("finalist_count exceeds the campaign safety bound")
-        existing = self.store.get_operator_job(self.campaign_job_name(campaign))
+        job_name = self.campaign_job_name(campaign)
+        existing = self.store.get_operator_job(job_name)
         if isinstance(existing, Mapping):
-            existing_payload = dict(existing.get("payload") or {})
-            self._campaign_protocol_state(existing_payload)
-            self._campaign_active_state = existing_payload
-            return existing_payload
+            # A scheduler restart may observe a protocol written by the
+            # pre-compact writer after it crashed before its first queue
+            # commit.  Re-read and repair under the writer lock so two
+            # restarts cannot each spend the same first campaign slot.
+            with self.store.transaction(immediate=True):
+                durable = self.store.get_operator_job(job_name)
+                if not isinstance(durable, Mapping):
+                    return {}
+                existing_payload = dict(durable.get("payload") or {})
+                protocol = existing_payload.get("protocol")
+                if not isinstance(protocol, Mapping):
+                    self._campaign_protocol_state(existing_payload)
+                protocol_hash = _hash_document(protocol)
+                declared_hash = str(existing_payload.get("protocol_hash", "")).strip()
+                if declared_hash and declared_hash != protocol_hash:
+                    raise AutonomousResearchError(
+                        "CAMPAIGN_PROTOCOL_INVALID",
+                        "campaign operator job protocol identity does not match its canonical protocol",
+                    )
+                payload_status = str(existing_payload.get("status", "")).strip().upper()
+                record_status = str(durable.get("status", "")).strip().upper()
+                if payload_status in CAMPAIGN_TERMINAL_STATUSES or record_status in CAMPAIGN_TERMINAL_STATUSES:
+                    # Terminal campaigns are immutable evidence.  Validate an
+                    # already-declared hash, but do not rewrite legacy rows or
+                    # enqueue a successor.
+                    if declared_hash:
+                        self._campaign_protocol_state(existing_payload)
+                    self._campaign_active_state = existing_payload
+                    return existing_payload
+                if not str(existing_payload.get("status", "")).strip():
+                    existing_payload["status"] = record_status or "PLANNED"
+                if "protocol_hash" not in existing_payload or not declared_hash:
+                    existing_payload["protocol_hash"] = protocol_hash
+                resumed_payload = self._campaign_state_defaults(
+                    existing_payload,
+                    protocol,
+                    campaign_id=campaign,
+                    now=current,
+                )
+                status = str(resumed_payload.get("status", "PLANNED")).strip().upper()
+                if resumed_payload != dict(durable.get("payload") or {}):
+                    self.store.set_operator_job(
+                        job_name,
+                        status,
+                        resumed_payload,
+                        resumable=True,
+                        timestamp=current,
+                    )
+                self._campaign_active_state = resumed_payload
+                if status == "PLANNED":
+                    self._campaign_queue_next(current)
+                resumed_record = self.store.get_operator_job(job_name)
+                result_payload = (
+                    resumed_record.get("payload")
+                    if isinstance(resumed_record, Mapping)
+                    and isinstance(resumed_record.get("payload"), Mapping)
+                    else resumed_payload
+                )
+            return dict(result_payload)
         source = dict(proposal or {})
         resolved_dataset_id = str(
             dataset_id

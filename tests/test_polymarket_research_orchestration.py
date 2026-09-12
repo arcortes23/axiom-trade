@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from axiom.autonomous import (
     AutonomousResearchConfig,
+    AutonomousResearchError,
     AutonomousResearchProcessor,
     _canonical_binding,
     _proposal_identity,
@@ -406,6 +407,133 @@ class PolymarketResearchOrchestrationTests(unittest.TestCase):
 
             resumed = AutonomousResearchProcessor(store, clock=lambda: T0).campaign_state("durable-campaign")
             self.assertEqual(resumed, state)
+
+    def test_legacy_planned_campaign_resumes_once_after_restart(self) -> None:
+        legacy_grid = tuple(
+            {
+                "configuration_id": f"legacy:{index:02d}",
+                "template": "momentum",
+                "parameters": {"lookback": index + 1, "threshold": 0.05},
+            }
+            for index in range(10)
+        )
+        with patch("axiom.autonomous.POLYMARKET_CAMPAIGN_GRID", legacy_grid), AxiomStore(":memory:") as store:
+            store.save_dataset(
+                "campaign-history",
+                "v1",
+                [
+                    {
+                        "timestamp": T0.isoformat(),
+                        "market_id": "campaign-market",
+                        "yes_mid": 0.50,
+                        "yes_bid": 0.49,
+                        "yes_ask": 0.51,
+                        "settlement": "open",
+                    }
+                ],
+            )
+            processor = AutonomousResearchProcessor(store, clock=lambda: T0)
+            modern = processor.start_polymarket_campaign(
+                "legacy-resume-campaign",
+                dataset_id="campaign-history",
+                dataset_version="v1",
+                now=T0,
+            )
+            job_name = processor.campaign_job_name("legacy-resume-campaign")
+            legacy = dict(modern)
+            legacy.pop("protocol_hash", None)
+            legacy["status"] = "PLANNED"
+            legacy["budget_used"] = 0
+            legacy["budget_remaining"] = 24
+            legacy["counts"] = {"planned": 10, "running": 0}
+            legacy["trials"] = [
+                {
+                    **dict(trial),
+                    "status": "PLANNED",
+                    "result": None,
+                }
+                for trial in legacy["trials"]
+            ]
+            for trial in legacy["trials"]:
+                for key in ("proposal_id", "hypothesis_id", "plan_id", "plan_hash", "queue_item_id", "queued_at"):
+                    trial.pop(key, None)
+            for key in (
+                "reassessment_boundaries",
+                "dataset_id",
+                "dataset_version",
+                "fixed_configuration_count",
+                "selection_excluded_evidence",
+                "qualified_candidate_ids",
+                "finalist_candidate_ids",
+                "final_assessment_evaluated",
+                "reassessment_count",
+                "last_result",
+                "next_real_job",
+                "last_updated_at",
+                "research_only",
+            ):
+                legacy.pop(key, None)
+            with store.transaction(immediate=True):
+                for item in processor.bus.list_campaign_trials("legacy-resume-campaign"):
+                    store.connection.execute(
+                        "DELETE FROM research_queue WHERE item_id=?",
+                        (item.item_id,),
+                    )
+                store.set_operator_job(
+                    job_name,
+                    "PLANNED",
+                    legacy,
+                    resumable=True,
+                    timestamp=T0,
+                )
+
+            restarted = AutonomousResearchProcessor(store, clock=lambda: T0)
+            resumed = restarted.start_polymarket_campaign(
+                "legacy-resume-campaign",
+                dataset_id="campaign-history",
+                dataset_version="v1",
+                now=T0,
+            )
+            self.assertEqual(resumed["status"], "RUNNING")
+            self.assertEqual(resumed["budget_used"], 1)
+            self.assertEqual(resumed["counts"]["planned"], 9)
+            self.assertEqual(resumed["counts"]["running"], 1)
+            self.assertTrue(str(resumed["protocol_hash"]).startswith("sha256:"))
+            queued = restarted.bus.list_campaign_trials("legacy-resume-campaign")
+            self.assertEqual(len(queued), 1)
+            self.assertLess(
+                len(json.dumps(queued[0].payload["experiment_plan"], separators=(",", ":")).encode("utf-8")),
+                16_384,
+            )
+
+            again = AutonomousResearchProcessor(store, clock=lambda: T0).start_polymarket_campaign(
+                "legacy-resume-campaign",
+                dataset_id="campaign-history",
+                dataset_version="v1",
+                now=T0,
+            )
+            self.assertEqual(again, resumed)
+            self.assertEqual(
+                len(restarted.bus.list_campaign_trials("legacy-resume-campaign")),
+                1,
+            )
+            tampered = dict(again)
+            tampered["protocol"] = {
+                **dict(tampered["protocol"]),
+                "scientific_rationale": "tampered",
+            }
+            store.set_operator_job(
+                job_name,
+                "RUNNING",
+                tampered,
+                resumable=True,
+                timestamp=T0,
+            )
+            with self.assertRaises(AutonomousResearchError):
+                AutonomousResearchProcessor(store, clock=lambda: T0).start_polymarket_campaign(
+                    "legacy-resume-campaign",
+                    now=T0,
+                )
 
     def test_finite_campaign_advance_marks_trial_and_queues_next(self) -> None:
         with AxiomStore(":memory:") as store:

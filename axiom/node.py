@@ -1692,6 +1692,16 @@ class ResearchNode:
             ).strip()
             campaign_job_name = self.research_processor.campaign_job_name(existing_campaign)
             campaign_record = self.store.get_operator_job(campaign_job_name)
+            if isinstance(campaign_record, Mapping):
+                # Re-enter the processor on every scheduler tick.  In
+                # addition to being a harmless modern no-op, this repairs a
+                # legacy PLANNED campaign that was persisted before protocol
+                # hashing and queue cursor advancement became durable.
+                self.research_processor.start_polymarket_campaign(
+                    existing_campaign,
+                    now=now,
+                )
+                campaign_record = self.store.get_operator_job(campaign_job_name)
             campaign_before = (
                 campaign_record.get("payload")
                 if isinstance(campaign_record, Mapping)

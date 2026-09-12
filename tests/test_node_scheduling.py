@@ -319,7 +319,13 @@ class HistoricalRefreshSchedulingTests(unittest.TestCase):
                 1,
             )
 
-            second = node._start_polymarket_campaign(catalog, attestation, T0)
+            with patch.object(
+                node.research_processor,
+                "start_polymarket_campaign",
+                wraps=node.research_processor.start_polymarket_campaign,
+            ) as resume:
+                second = node._start_polymarket_campaign(catalog, attestation, T0)
+            self.assertEqual(resume.call_count, 1)
             self.assertEqual(second["campaign_id"], stable_campaign_id)
             campaign_jobs = [
                 item
