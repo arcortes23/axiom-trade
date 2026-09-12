@@ -3452,6 +3452,9 @@ class AutonomousResearchProcessor:
         return ordered, split
 
     def _apply_plan_filters(self, plan: ExperimentPlan, rows: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+        # Historical qualification is bound only to the plan's explicit
+        # top-level filters; current market-scope filters belong to forward
+        # resolution and must not remove PRICE_PROXY history rows.
         filters = dict(plan.filters)
         restrictions = dict(plan.regime_restrictions)
         supported = {

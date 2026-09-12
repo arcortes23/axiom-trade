@@ -45,6 +45,44 @@ class MarketScopeContractTests(unittest.TestCase):
         self.assertEqual(round_trip.plan_hash, plan.plan_hash)
         self.assertEqual(round_trip.market_scope_hash, plan.market_scope_hash)
 
+    def test_explicit_historical_filters_are_independent_from_current_scope(self) -> None:
+        scope = {
+            "schema_version": "1",
+            "mode": "RULE_BASED_MARKETS",
+            "instrument": "POLYMARKET",
+            "filters": {"min_liquidity": 1, "max_spread": 0.5},
+        }
+        proposal = {
+            "proposal_id": "separated-historical-scope",
+            "filters": {},
+            "experiment_plan": self._base(
+                target={"instrument": "POLYMARKET"},
+                market_scope=scope,
+                filters={"min_liquidity": 1, "max_spread": 0.5},
+            ),
+        }
+        plan = ExperimentPlan.from_proposal(proposal)
+        rows = [
+            {"market_id": "proxy-without-book", "instrument": "POLYMARKET", "yes_mid": 0.4},
+            {"market_id": "scope-match", "instrument": "POLYMARKET", "liquidity": 10, "spread": 0.1, "yes_mid": 0.5},
+        ]
+
+        with AxiomStore(":memory:") as store:
+            selected = AutonomousResearchProcessor(store)._apply_plan_filters(plan, rows)
+        self.assertEqual(plan.filters, {})
+        self.assertEqual(plan.market_scope.filters["min_liquidity"], 1.0)
+        self.assertEqual(plan.market_scope.filters["max_spread"], 0.5)
+        self.assertEqual([row["market_id"] for row in selected], ["proxy-without-book", "scope-match"])
+
+        legacy_document = dict(proposal["experiment_plan"])
+        legacy_document.pop("filters")
+        legacy = ExperimentPlan.from_mapping(legacy_document)
+        with AxiomStore(":memory:") as store:
+            legacy_selected = AutonomousResearchProcessor(store)._apply_plan_filters(legacy, rows)
+        self.assertEqual(legacy.filters, legacy.market_scope.filters)
+        self.assertEqual([row["market_id"] for row in legacy_selected], ["scope-match"])
+        self.assertNotEqual(plan.plan_hash, legacy.plan_hash)
+
     def test_exact_ids_and_filters_are_an_intersection(self) -> None:
         scope = normalize_market_scope(
             target={"market_ids": ["b", "a"]},

@@ -8194,7 +8194,7 @@ class AxiomStore:
                 declared_market_ids = tuple(plan.target_markets)
                 target_markets = declared_market_ids
                 target_instrument = plan.target_instrument
-                filters = plan.filters
+                filters = plan.market_scope.filters
                 restrictions = plan.regime_restrictions
                 historical_source = source_is_historical(payload) or source_is_historical(plan.dataset_selector)
                 provenance = payload.get("dataset_provenance")

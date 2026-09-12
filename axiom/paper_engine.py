@@ -38,6 +38,89 @@ from .strategy.signals import (
 )
 
 _MAX_RUN_OBSERVATIONS = 100_000
+PAPER_STATE_EXECUTION_BINDING_MISMATCH = "PAPER_STATE_EXECUTION_BINDING_MISMATCH"
+
+
+def paper_execution_binding(
+    spec: ForwardTestSpec,
+    *,
+    config: PaperTradingConfig | None = None,
+    storage_namespace: str | None = None,
+    execution_mode: str | None = None,
+) -> dict[str, Any]:
+    """Build the immutable binding used by one paper execution namespace."""
+    if not isinstance(spec, ForwardTestSpec):
+        raise TypeError("spec must be a ForwardTestSpec")
+    paper_config = config or PaperTradingConfig()
+    run_id = str(storage_namespace or spec.experiment_id).strip()
+    if not run_id:
+        raise ValueError("storage_namespace must be non-empty")
+    mode = str(
+        execution_mode
+        or ("forward" if storage_namespace is None else "isolated")
+    ).strip().lower()
+    if mode not in {"forward", "historical_replay", "isolated"}:
+        raise ValueError("execution_mode is invalid")
+    research_mode = "RECORDED_BOOK_REPLAY" if mode == "historical_replay" else "PAPER_FORWARD"
+    return {
+        "experiment_id": run_id,
+        "spec_experiment_id": spec.experiment_id,
+        "execution_mode": mode,
+        "research_mode": research_mode,
+        "strategy_hash": spec.strategy_hash,
+        "model_hash": spec.model_hash,
+        "config_hash": hashlib.sha256(
+            _canonical_json(
+                {
+                    "config": spec.config,
+                    "risk_limits": spec.risk_limits,
+                    "bankroll": spec.bankroll,
+                }
+            ).encode("utf-8")
+        ).hexdigest(),
+        "paper_config_hash": hashlib.sha256(
+            _canonical_json(
+                {
+                    "fee_rate": paper_config.fee_rate,
+                    "slippage_bps": paper_config.slippage_bps,
+                    "depth": paper_config.depth,
+                    "quality": paper_config.quality,
+                    "live": paper_config.live,
+                }
+            ).encode("utf-8")
+        ).hexdigest(),
+    }
+
+
+def paper_state_binding_blocker(
+    persisted_binding: Any,
+    current_binding: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Return the stable fail-closed blocker for an incompatible paper state."""
+    if (
+        isinstance(persisted_binding, Mapping)
+        and _canonical_json(persisted_binding) == _canonical_json(current_binding)
+    ):
+        return None
+    persisted_hash = hashlib.sha256(
+        _canonical_json(persisted_binding).encode("utf-8")
+    ).hexdigest()
+    current_hash = hashlib.sha256(
+        _canonical_json(current_binding).encode("utf-8")
+    ).hexdigest()
+    return {
+        "status": "BLOCKED",
+        "blocker": PAPER_STATE_EXECUTION_BINDING_MISMATCH,
+        "reason_code": PAPER_STATE_EXECUTION_BINDING_MISMATCH,
+        "reason": "persisted paper state execution binding does not match the current frozen forward test",
+        "retryable": False,
+        "non_retryable": True,
+        "execution_skipped": True,
+        "persisted_binding_hash": f"sha256:{persisted_hash}",
+        "current_binding_hash": f"sha256:{current_hash}",
+        "persisted_execution_binding": deepcopy(persisted_binding),
+        "current_execution_binding": deepcopy(dict(current_binding)),
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,9 +134,11 @@ class PaperEngineCycle:
     settlements: int
     errors: tuple[str, ...] = ()
     execution_events: int = 0
+    blocker: str | None = None
+    retryable: bool | None = None
 
     def as_record(self) -> dict[str, Any]:
-        return {
+        record = {
             "started_at": self.started_at.isoformat(),
             "ended_at": self.ended_at.isoformat(),
             "duration_seconds": max(0.0, (self.ended_at - self.started_at).total_seconds()),
@@ -65,6 +150,18 @@ class PaperEngineCycle:
             "errors": list(self.errors),
             "execution_events": self.execution_events,
         }
+        if self.blocker is not None:
+            record.update(
+                {
+                    "status": "BLOCKED",
+                    "blocker": self.blocker,
+                    "reason_code": self.blocker,
+                    "retryable": self.retryable,
+                    "non_retryable": self.retryable is False,
+                    "execution_skipped": True,
+                }
+            )
+        return record
 
 
 class _ObservationTrader(PaperTrader):
@@ -107,41 +204,47 @@ class ForwardPaperEngine:
             raise ValueError("execution_mode is invalid")
         self._execution_strategy_id = spec.strategy_hash
         self._research_mode = "RECORDED_BOOK_REPLAY" if self._execution_mode == "historical_replay" else "PAPER_FORWARD"
-        self._execution_binding = {
-            "experiment_id": self._run_id,
-            "spec_experiment_id": spec.experiment_id,
-            "execution_mode": self._execution_mode,
-            "research_mode": self._research_mode,
-            "strategy_hash": spec.strategy_hash,
-            "model_hash": spec.model_hash,
-            "config_hash": hashlib.sha256(
-                _canonical_json(
-                    {
-                        "config": spec.config,
-                        "risk_limits": spec.risk_limits,
-                        "bankroll": spec.bankroll,
-                    }
-                ).encode("utf-8")
-            ).hexdigest(),
-            "paper_config_hash": hashlib.sha256(
-                _canonical_json(
-                    {
-                        "fee_rate": self.config.fee_rate,
-                        "slippage_bps": self.config.slippage_bps,
-                        "depth": self.config.depth,
-                        "quality": self.config.quality,
-                        "live": self.config.live,
-                    }
-                ).encode("utf-8")
-            ).hexdigest(),
-        }
+        self._execution_binding = paper_execution_binding(
+            spec,
+            config=self.config,
+            storage_namespace=storage_namespace,
+            execution_mode=execution_mode,
+        )
         loaded_state = store.load_paper_state(self._run_id)
         self._state_version = int(loaded_state.get("state_version", 0)) if loaded_state is not None else -1
         raw_state = loaded_state.get("state", {}) if loaded_state is not None else {}
         self._state = dict(raw_state) if isinstance(raw_state, Mapping) else {}
         persisted_binding = self._state.get("execution_binding")
-        if persisted_binding is not None and dict(persisted_binding) != self._execution_binding:
-            raise ValueError("paper state execution binding does not match the frozen forward test")
+        self._compatibility_blocker = paper_state_binding_blocker(
+            persisted_binding,
+            self._execution_binding,
+        ) if loaded_state is not None else None
+        if self._compatibility_blocker is not None:
+            # Do not hydrate any mutable state from a stale namespace.  In
+            # particular, restoring its ledger or risk status would mutate a
+            # caller-owned portfolio before the blocker is exposed.
+            self._processed = set()
+            self._cursor = {}
+            self._source_cursor = {}
+            self._settled = set()
+            self._settlement_by_market = {}
+            self._signal_history = {}
+            self.portfolio = portfolio or Portfolio(spec.bankroll)
+            self.risk = risk or RiskEngine(
+                RiskLimits(**dict(spec.risk_limits)),
+                initial_equity=spec.bankroll,
+            )
+            self._strategy_document = {}
+            self._model_state_restored = False
+            self.trader = _ObservationTrader(
+                provider=None,
+                strategy=strategy,
+                risk=self.risk,
+                portfolio=self.portfolio,
+                strategy_id=self._execution_strategy_id,
+                config=self.config,
+            )
+            return
         self._processed: set[str] = set(str(item) for item in self._state.get("processed_observations", ()))
         self._cursor: dict[str, datetime] = {
             str(key): parsed
@@ -250,6 +353,14 @@ class ForwardPaperEngine:
     @property
     def state(self) -> dict[str, Any]:
         return deepcopy(self._state)
+    @property
+    def compatibility_blocker(self) -> dict[str, Any] | None:
+        return deepcopy(self._compatibility_blocker)
+
+    @property
+    def execution_binding(self) -> dict[str, Any]:
+        return deepcopy(self._execution_binding)
+
     def _append_signal_history(self, market_id: str, observation: Mapping[str, Any]) -> None:
         history = self._signal_history.setdefault(str(market_id), [])
         history.append(dict(observation))
@@ -312,7 +423,6 @@ class ForwardPaperEngine:
         if rebuilt:
             self._signal_history = rebuilt
 
-
     def run(
         self,
         observations: Iterable[Any] | None = None,
@@ -327,6 +437,24 @@ class ForwardPaperEngine:
             or max_observations < 0
         ):
             raise ValueError("max_observations must be non-negative or None")
+        if self._compatibility_blocker is not None:
+            ended = ensure_utc(now or utc_now())
+            if ended < started:
+                ended = started
+            blocker = str(self._compatibility_blocker["blocker"])
+            return PaperEngineCycle(
+                started,
+                ended,
+                0,
+                0,
+                0,
+                0,
+                0,
+                (blocker,),
+                0,
+                blocker,
+                False,
+            )
         observation_cutoff = started
         observation_limit = _MAX_RUN_OBSERVATIONS if max_observations is None else max_observations
         if observations is None:
@@ -1473,9 +1601,12 @@ def run_historical_replay(
 
 __all__ = [
     "ForwardPaperEngine",
+    "PAPER_STATE_EXECUTION_BINDING_MISMATCH",
     "PaperEngineCycle",
     "build_resolved_bet",
     "historical_replay_id",
+    "paper_execution_binding",
+    "paper_state_binding_blocker",
     "run_forward_paper",
     "run_historical_replay",
 ]

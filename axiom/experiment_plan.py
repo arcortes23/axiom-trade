@@ -390,7 +390,57 @@ def normalize_market_scope(
             filters=filters,
             regime_restrictions=regime_restrictions,
         )
-        if not _scope_equivalent(explicit, legacy):
+        # Legacy aliases are partial constraints, not a second complete
+        # policy.  Compare only dimensions supplied by those aliases so a
+        # richer explicit scope (for example, target instrument plus nested
+        # liquidity filters) remains valid while contradictions still fail.
+        explicit_filters = dict(explicit.filters)
+        legacy_filters = dict(legacy.filters)
+        if explicit.mode == MarketScopeMode.RESEARCH_ONLY.value and (
+            legacy.instrument
+            or legacy.categories
+            or legacy.market_ids
+            or legacy_filters
+            or legacy.regime_restrictions
+        ):
+            raise ExperimentPlanError("CONFLICTING_MARKET_SCOPE", "explicit market_scope conflicts with legacy target/filter sources")
+        if legacy.market_ids and (
+            explicit.mode != MarketScopeMode.EXACT_MARKETS.value
+            or not explicit.market_ids
+            or set(explicit.market_ids) != set(legacy.market_ids)
+        ):
+            raise ExperimentPlanError("CONFLICTING_MARKET_SCOPE", "explicit market_scope conflicts with legacy target/filter sources")
+        if legacy.instrument and (
+            explicit.instrument is None or explicit.instrument != legacy.instrument
+        ):
+            raise ExperimentPlanError("CONFLICTING_MARKET_SCOPE", "explicit market_scope conflicts with legacy target/filter sources")
+        if legacy.categories:
+            explicit_categories = explicit.categories
+            if not explicit_categories:
+                explicit_category = explicit_filters.get("category")
+                explicit_categories = _scope_values(
+                    explicit_category,
+                    name="market_scope.filters.category",
+                    limit=64,
+                    casefold=True,
+                )
+            if not explicit_categories or set(explicit_categories) != set(legacy.categories):
+                raise ExperimentPlanError("CONFLICTING_MARKET_SCOPE", "explicit market_scope conflicts with legacy target/filter sources")
+        for key, value in legacy_filters.items():
+            if key == "category":
+                explicit_category = explicit_filters.get("category")
+                if explicit_category is None:
+                    explicit_category = explicit.categories
+                if set(_scope_values(explicit_category, name="market_scope.filters.category", limit=64, casefold=True)) != set(
+                    _scope_values(value, name="filters.category", limit=64, casefold=True)
+                ):
+                    raise ExperimentPlanError("CONFLICTING_MARKET_SCOPE", "explicit market_scope conflicts with legacy target/filter sources")
+            elif key not in explicit_filters or _canonical(explicit_filters[key]) != _canonical(value):
+                raise ExperimentPlanError("CONFLICTING_MARKET_SCOPE", "explicit market_scope conflicts with legacy target/filter sources")
+        if legacy.regime_restrictions and (
+            not explicit.regime_restrictions
+            or _canonical(dict(explicit.regime_restrictions)) != _canonical(dict(legacy.regime_restrictions))
+        ):
             raise ExperimentPlanError("CONFLICTING_MARKET_SCOPE", "explicit market_scope conflicts with legacy target/filter sources")
         return explicit
 
@@ -1012,6 +1062,7 @@ class ExperimentPlan:
     allowed_features: tuple[str, ...]
     parameters: Mapping[str, tuple[Any, ...]]
     market_scope: MarketScopePolicy
+    filters: Mapping[str, Any]
     dataset_selector: Mapping[str, Any]
     methodology: Mapping[str, Any]
     metrics: tuple[str, ...]
@@ -1121,17 +1172,30 @@ class ExperimentPlan:
             possible_variants *= len(values)
             if possible_variants > MAX_PLAN_VARIANTS * MAX_PARAMETER_VALUES:
                 raise ExperimentPlanError("EXPERIMENT_BUDGET_EXCEEDED", "parameter search space is too large")
+        raw_market_scope = raw.get("market_scope")
+        # A nested market scope owns current filters. Top-level filters are
+        # historical qualification filters, except for legacy documents that
+        # have no nested scope and therefore used that field for both roles.
+        scope_filters = raw.get("filters") if not isinstance(raw_market_scope, Mapping) else None
         market_scope = normalize_market_scope(
-            raw.get("market_scope"),
+            raw_market_scope,
             target=raw.get("target"),
             market_ids=raw.get("market_ids"),
             target_market_ids=raw.get("target_market_ids"),
             target_instrument=raw.get("target_instrument"),
             instrument=raw.get("instrument"),
             categories=raw.get("categories"),
-            filters=raw.get("filters"),
+            filters=scope_filters,
             regime_restrictions=raw.get("regime_restrictions"),
         )
+        if "filters" in raw:
+            try:
+                historical_filters = normalize_forward_filters(raw.get("filters"))
+            except ExperimentPlanError as exc:
+                raise ExperimentPlanError("UNSUPPORTED_FEATURE", exc.detail) from exc
+        else:
+            # Legacy plans used market_scope.filters for historical selection.
+            historical_filters = market_scope.filters
         provided_scope_hash = raw.get("market_scope_hash")
         if provided_scope_hash is not None and str(provided_scope_hash).strip() != market_scope.policy_hash:
             raise ExperimentPlanError("CONFLICTING_MARKET_SCOPE", "market_scope_hash does not match canonical market scope")
@@ -1277,7 +1341,7 @@ class ExperimentPlan:
             "market_scope": market_scope.as_dict(),
             "market_scope_hash": market_scope.policy_hash,
             "market_scope_version": market_scope.version,
-            "filters": dict(market_scope.filters),
+            "filters": dict(historical_filters),
             "regime_restrictions": dict(market_scope.regime_restrictions),
             "target": target,
             "dataset_selector": selector,
@@ -1320,6 +1384,7 @@ class ExperimentPlan:
             allowed_features=features,
             parameters=MappingProxyType({key: tuple(values) for key, values in sorted(parameters.items())}),
             market_scope=market_scope,
+            filters=_freeze_json(historical_filters),
             dataset_selector=_freeze_json(selector),
             methodology=_freeze_json(methodology),
             metrics=metrics,
@@ -1382,6 +1447,8 @@ class ExperimentPlan:
                 "trial_budget": proposal.get("trial_budget"),
                 "paper_only": proposal.get("paper_only") if proposal.get("paper_only") is not None else True,
             }
+            if "filters" not in proposal:
+                raw_plan.pop("filters", None)
             if raw_plan.get("experiment_family") is None:
                 raw_plan.pop("experiment_family", None)
             if isinstance(proposal.get("strategy_document"), Mapping):
@@ -1422,7 +1489,6 @@ class ExperimentPlan:
                 "market_scope",
                 "market_scope_hash",
                 "market_scope_version",
-                "filters",
                 "regime_restrictions",
                 "target",
                 "target_instrument",
@@ -1437,6 +1503,12 @@ class ExperimentPlan:
                 or supplied == []
                 or supplied == ()
             ):
+                continue
+            if alias == "filters" and supplied == {}:
+                # An explicit empty proposal filter set is meaningful. It
+                # intentionally replaces an embedded legacy copy instead of
+                # falling back to that copy.
+                plan_document[alias] = supplied
                 continue
             if alias in plan_document and _canonical(plan_document[alias]) != _canonical(supplied):
                 if alias == "market_scope":
@@ -1511,10 +1583,6 @@ class ExperimentPlan:
     @property
     def dataset_survivorship(self) -> str | None:
         return self._selector_text(self.dataset_selector, "survivorship_bias", "survivorship")
-    @property
-    def filters(self) -> Mapping[str, Any]:
-        """Compatibility view derived from the canonical market scope."""
-        return self.market_scope.filters
 
     @property
     def regime_restrictions(self) -> Mapping[str, Any]:

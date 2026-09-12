@@ -28,7 +28,12 @@ from .domain import OrderBookSnapshot, ensure_utc, parse_timestamp, to_record, u
 from .forward import ForwardTestRegistry, _content_hash
 from .opportunity import scan_opportunities
 from .paper import CryptoPaperTrader
-from .paper_engine import run_forward_paper
+from .paper_engine import (
+    PAPER_STATE_EXECUTION_BINDING_MISMATCH,
+    paper_execution_binding,
+    paper_state_binding_blocker,
+    run_forward_paper,
+)
 from .storage import AxiomStore
 from .autonomous import AutonomousResearchConfig, AutonomousResearchProcessor
 from .research_bus import DurableResearchBus
@@ -1854,7 +1859,8 @@ class ResearchNode:
         if isinstance(paper_stats, Mapping):
             processed = int(paper_stats.get("processed_candidates", 0) or 0)
             successful = int(paper_stats.get("successful_candidates", processed) or 0)
-            if "error" in paper_stats or successful < processed:
+            blocked = int(paper_stats.get("blocked_candidates", 0) or 0)
+            if "error" in paper_stats or successful + blocked < processed:
                 errors.append("paper engine completed with degraded candidate output")
         self.research_processor.reevaluate_forward_candidates(now=ensure_utc(self.clock()))
         queue_stats = self._run_research_queue()
@@ -2901,6 +2907,12 @@ class ResearchNode:
                 "candidate_count": 0,
                 "processed_candidates": 0,
                 "successful_candidates": 0,
+                "blocked_candidates": 0,
+                "blocked_candidate_ids": [],
+                "blockers": [],
+                "failed_candidates": 0,
+                "failed_candidate_ids": [],
+                "errors": [],
                 "observations_processed": 0,
                 "fills_inserted": 0,
                 "remaining_candidates": 0,
@@ -2932,6 +2944,9 @@ class ResearchNode:
             "candidate_count": len(specs),
             "processed_candidates": len(selected),
             "successful_candidates": 0,
+            "blocked_candidates": 0,
+            "blocked_candidate_ids": [],
+            "blockers": [],
             "failed_candidates": 0,
             "failed_candidate_ids": [],
             "errors": [],
@@ -2975,6 +2990,21 @@ class ResearchNode:
                 stats["failed_candidates"] += 1
                 stats["failed_candidate_ids"].append(spec.experiment_id)
                 stats["errors"].append("paper worker returned no result")
+            elif (
+                str(result.get("status") or "").upper() == "BLOCKED"
+                and result.get("retryable") is False
+                and str(result.get("blocker") or "").strip()
+            ):
+                stats["blocked_candidates"] += 1
+                stats["blocked_candidate_ids"].append(spec.experiment_id)
+                stats["blockers"].append(
+                    {
+                        "candidate_id": spec.experiment_id,
+                        "blocker": str(result["blocker"]),
+                        "reason_code": str(result.get("reason_code") or result["blocker"]),
+                        "retryable": False,
+                    }
+                )
             elif "error" not in result:
                 stats["successful_candidates"] += 1
                 stats["observations_processed"] += int(result.get("observations_processed", 0))
@@ -3007,6 +3037,61 @@ class ResearchNode:
             heartbeat_at=ensure_utc(self.clock()),
         )
         return stats
+    def _paper_binding_blocked_result(
+        self,
+        spec: Any,
+        *,
+        worker_name: str,
+        started: datetime,
+        paper_store: AxiomStore,
+    ) -> dict[str, Any] | None:
+        state_record = paper_store.load_paper_state(spec.experiment_id)
+        if state_record is None:
+            return None
+        state_payload = state_record.get("state")
+        persisted_binding = (
+            state_payload.get("execution_binding")
+            if isinstance(state_payload, Mapping)
+            else None
+        )
+        blocker = paper_state_binding_blocker(
+            persisted_binding,
+            paper_execution_binding(spec),
+        )
+        if blocker is None:
+            return None
+        worker_payload = {
+            "pid": os.getpid(),
+            "experiment_id": spec.experiment_id,
+            **blocker,
+            "error": blocker["reason"],
+            "error_code": PAPER_STATE_EXECUTION_BINDING_MISMATCH,
+            "last_error": None,
+            "last_error_code": PAPER_STATE_EXECUTION_BINDING_MISMATCH,
+            "next_retry_at": None,
+            "paper_only": True,
+            "live_execution": False,
+        }
+        self.store.save_worker_state(
+            worker_name,
+            "blocked",
+            worker_payload,
+            started_at=started,
+            heartbeat_at=ensure_utc(self.clock()),
+        )
+        return {
+            "status": "BLOCKED",
+            "experiment_id": spec.experiment_id,
+            "observations_seen": 0,
+            "observations_processed": 0,
+            "observations_skipped": 0,
+            "fills_inserted": 0,
+            "settlements": 0,
+            "execution_events": 0,
+            "errors": [blocker["blocker"]],
+            **blocker,
+        }
+
 
     def _run_single_paper_worker(self, spec: Any) -> dict[str, Any] | None:
         worker_name = f"paper:{spec.experiment_id}"
@@ -3020,6 +3105,14 @@ class ResearchNode:
             heartbeat_at=started,
         )
         try:
+            blocked_result = self._paper_binding_blocked_result(
+                spec,
+                worker_name=worker_name,
+                started=started,
+                paper_store=paper_store,
+            )
+            if blocked_result is not None:
+                return blocked_result
             config = spec.config if isinstance(spec.config, Mapping) else {}
             strategy_document = config.get("strategy_document")
             model_document = config.get("model_document")

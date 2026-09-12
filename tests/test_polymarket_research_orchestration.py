@@ -20,7 +20,12 @@ from axiom.collector import CollectorConfig, PolymarketCollector
 from axiom.data import InMemoryPredictionProvider
 from axiom.domain import Fill, MarketType, OrderBookLevel, OrderBookSnapshot, PredictionMarketSnapshot, SettlementState, Side
 from axiom.forward import ForwardTestRegistry
-from axiom.paper_engine import run_forward_paper
+from axiom.node import NodeConfig, ResearchNode
+from axiom.paper_engine import (
+    PAPER_STATE_EXECUTION_BINDING_MISMATCH,
+    paper_execution_binding,
+    run_forward_paper,
+)
 from axiom.research_bus import DurableResearchBus
 from axiom.strategy import load_strategy
 from tools.polymarket_release_smoke import _run_recorded_book_replay
@@ -1268,6 +1273,107 @@ class PolymarketResearchOrchestrationTests(unittest.TestCase):
                 store.load_candidate_lifecycle(candidate_id)["payload"]["forward_evidence_identity"],
                 first_identity,
             )
+    def test_stale_paper_binding_is_blocked_once_without_state_or_execution_mutation(self) -> None:
+        strategy_document = {
+            "version": 1,
+            "market_type": "prediction",
+            "family": "probability_mispricing",
+            "parameters": {},
+            "probability_model": "market",
+            "resolution_aware": True,
+            "resolution_inputs": ["expiry"],
+        }
+        model_document = {"yes_probability": 0.60}
+        config = {
+            "execution": "paper_only",
+            "live_execution": False,
+            "strategy_document": strategy_document,
+            "model_document": model_document,
+        }
+        with AxiomStore(":memory:") as store:
+            spec = ForwardTestRegistry(store).freeze(
+                strategy=strategy_document,
+                model=model_document,
+                config=config,
+                start_timestamp=T0,
+                allowed_markets=("stale-market",),
+                experiment_id="stale-paper-binding",
+            )
+            stale_binding = paper_execution_binding(spec)
+            stale_binding["research_mode"] = "LEGACY_PAPER_FORWARD"
+            stale_state = {
+                "experiment_id": spec.experiment_id,
+                "execution_binding": stale_binding,
+                "portfolio": {"cash": 9_000.0, "positions": {"stale-market": 1.0}},
+                "processed_observations": ["legacy-observation"],
+            }
+            store.save_paper_state(spec.experiment_id, stale_state, timestamp=T0)
+            before = store.connection.execute(
+                "SELECT state_json,updated_at,state_version FROM paper_state WHERE experiment_id=?",
+                (spec.experiment_id,),
+            ).fetchone()
+
+            direct = run_forward_paper(
+                spec,
+                store=store,
+                strategy=load_strategy(strategy_document),
+                model=model_document,
+                observations=[
+                    {
+                        "market_id": "stale-market",
+                        "timestamp": T0.isoformat(),
+                        "yes_mid": 0.40,
+                    }
+                ],
+                now=T0,
+            )
+            self.assertEqual(direct.blocker, PAPER_STATE_EXECUTION_BINDING_MISMATCH)
+            self.assertFalse(direct.retryable)
+
+            node = ResearchNode(
+                NodeConfig(":memory:", max_markets=1, crypto_enabled=False),
+                provider=InMemoryPredictionProvider([]),
+                store=store,
+                clock=lambda: T0,
+            )
+            first = node._run_research_cycle()
+            second = node._run_research_cycle()
+            restarted = ResearchNode(
+                NodeConfig(":memory:", max_markets=1, crypto_enabled=False),
+                provider=InMemoryPredictionProvider([]),
+                store=store,
+                clock=lambda: T0,
+            )
+            third = restarted._run_research_cycle()
+            after = store.connection.execute(
+                "SELECT state_json,updated_at,state_version FROM paper_state WHERE experiment_id=?",
+                (spec.experiment_id,),
+            ).fetchone()
+
+            self.assertEqual(tuple(before), tuple(after))
+            self.assertEqual(
+                [cycle["degraded"] for cycle in (first, second, third)],
+                [False, False, False],
+            )
+            for cycle in (first, second, third):
+                paper = cycle["paper"]
+                self.assertEqual(paper["failed_candidates"], 0)
+                self.assertEqual(paper["blocked_candidate_ids"], [spec.experiment_id])
+                self.assertEqual(
+                    paper["blockers"][0]["blocker"],
+                    PAPER_STATE_EXECUTION_BINDING_MISMATCH,
+                )
+            worker = store.get_worker_state("paper:" + spec.experiment_id)
+            self.assertIsNotNone(worker)
+            assert worker is not None
+            self.assertEqual(worker["status"], "blocked")
+            self.assertEqual(worker["payload"]["blocker"], PAPER_STATE_EXECUTION_BINDING_MISMATCH)
+            self.assertFalse(worker["payload"]["retryable"])
+            self.assertIsNone(worker["payload"]["next_retry_at"])
+            self.assertEqual(store.list_paper_observations(spec.experiment_id), [])
+            self.assertEqual(store.list_paper_execution_events(spec.experiment_id), [])
+            self.assertEqual(store.list_paper_bet_ledger(spec.experiment_id), [])
+
 
     def test_recorded_replay_partitions_rows_by_each_candidate_scope(self) -> None:
         plan_a = _recorded_replay_plan("plan-replay-a", "market-a")
