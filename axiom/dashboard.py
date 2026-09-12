@@ -3134,10 +3134,13 @@ class DashboardData:
                 "total_equity": 0.0,
                 "total_pnl": 0.0,
             }
+        portfolio_loader = getattr(self.store, "list_paper_portfolio_states", None)
         if candidate_only:
             candidate_ids = self._candidate_paper_experiment_ids()
             if not candidate_ids:
                 states = []
+            elif callable(portfolio_loader):
+                states = portfolio_loader(experiment_ids=candidate_ids, limit=1000)
             else:
                 scoped_loader = getattr(self.store, "list_paper_states_for_experiments", None)
                 states = (
@@ -3154,6 +3157,8 @@ class DashboardData:
                         or str((item.get("state") or {}).get("candidate_id") if isinstance(item.get("state"), Mapping) else "").strip() in candidate_ids
                     )
                 ]
+        elif callable(portfolio_loader):
+            states = portfolio_loader(limit=1000)
         else:
             states = self.store.list_paper_states(limit=1000)
         rows: list[dict[str, Any]] = []
@@ -3212,7 +3217,9 @@ class DashboardData:
     def _candidate_paper_experiment_ids(self) -> set[str]:
         if self.store is None:
             return set()
-        lifecycle_loader = getattr(self.store, "load_candidate_lifecycle", None)
+        lifecycle_loader = getattr(self.store, "list_candidate_lifecycle_for_dashboard", None)
+        if not callable(lifecycle_loader):
+            lifecycle_loader = getattr(self.store, "load_candidate_lifecycle", None)
         if not callable(lifecycle_loader):
             return set()
         records = lifecycle_loader(limit=1000)

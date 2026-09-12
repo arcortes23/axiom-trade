@@ -3508,13 +3508,25 @@ class AxiomStore:
 
     def _snapshot_read_connection(self) -> sqlite3.Connection:
         """Open a dedicated read snapshot; never share the writer handle."""
-        filename = self._database_filename()
+        # A regular filesystem path is already authoritative.  Avoid asking
+        # the writer connection for PRAGMA database_list in this common case:
+        # that call takes ``self._lock`` and would put a dashboard read behind
+        # an unrelated long-lived writer transaction.
+        path = str(self.path)
+        if path not in {":memory:", ""} and not path.startswith("file:"):
+            filename = path
+            connect_target = path
+            connect_uri = False
+        else:
+            filename = self._database_filename()
+            connect_target = path if path.startswith("file:") else filename
+            connect_uri = path.startswith("file:")
         if filename and filename not in {":memory:", ""} and not filename.startswith("file::memory:"):
             connection = sqlite3.connect(
-                self.path,
+                connect_target,
                 timeout=self._sqlite_timeout_seconds,
                 check_same_thread=False,
-                uri=self.path.startswith("file:"),
+                uri=connect_uri,
             )
             connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA query_only=ON")
@@ -7260,6 +7272,39 @@ class AxiomStore:
         if candidate_id is not None:
             return records[0] if records else None
         return records
+    def list_candidate_lifecycle_for_dashboard(self, *, limit: int = 1000) -> list[dict[str, Any]]:
+        """Read bounded lifecycle rows without blocking on the writer handle.
+
+        Dashboard portfolio projections only need candidate stage and payload
+        identity.  Keep this read path separate from ``load_candidate_lifecycle``
+        so lifecycle/evidence callers retain the writer-transaction semantics
+        required for read-your-writes behavior.
+        """
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+            raise ValueError("limit must be a non-negative integer")
+        query = (
+            "SELECT candidate_id,stage,payload_json,updated_at "
+            "FROM candidate_lifecycle ORDER BY updated_at,candidate_id LIMIT ?"
+        )
+        if self.path not in {":memory:", ""} and not self.path.startswith("file:"):
+            snapshot = self._snapshot_read_connection()
+            try:
+                rows = snapshot.execute(query, (int(limit),)).fetchall()
+            finally:
+                snapshot.close()
+        else:
+            with self._lock:
+                rows = self._conn.execute(query, (int(limit),)).fetchall()
+        return [
+            {
+                "candidate_id": row["candidate_id"],
+                "stage": row["stage"],
+                "payload": _load(row["payload_json"]),
+                "updated_at": _parse_datetime(row["updated_at"]),
+            }
+            for row in rows
+        ]
+
     def load_candidate_lifecycle_page(
         self,
         *,
@@ -7413,8 +7458,16 @@ class AxiomStore:
     def list_paper_states(self, *, limit: int = 100) -> list[dict[str, Any]]:
         if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
             raise ValueError("limit must be non-negative")
-        with self._lock:
-            rows = self._conn.execute("SELECT * FROM paper_state ORDER BY updated_at DESC,experiment_id LIMIT ?", (int(limit),)).fetchall()
+        query = "SELECT * FROM paper_state ORDER BY updated_at DESC,experiment_id LIMIT ?"
+        if self.path not in {":memory:", ""} and not self.path.startswith("file:"):
+            snapshot = self._snapshot_read_connection()
+            try:
+                rows = snapshot.execute(query, (int(limit),)).fetchall()
+            finally:
+                snapshot.close()
+        else:
+            with self._lock:
+                rows = self._conn.execute(query, (int(limit),)).fetchall()
         return [
             {
                 "experiment_id": row["experiment_id"],
@@ -7442,18 +7495,35 @@ class AxiomStore:
         if not identifiers or limit == 0:
             return []
         rows: list[sqlite3.Row] = []
-        with self._lock:
-            for offset in range(0, len(identifiers), 900):
-                batch = identifiers[offset : offset + 900]
-                placeholders = ",".join("?" for _ in batch)
-                rows.extend(
-                    self._conn.execute(
-                        "SELECT * FROM paper_state "
-                        f"WHERE experiment_id IN ({placeholders}) "
-                        "ORDER BY updated_at DESC,experiment_id ASC",
-                        batch,
-                    ).fetchall()
-                )
+        if self.path not in {":memory:", ""} and not self.path.startswith("file:"):
+            snapshot = self._snapshot_read_connection()
+            try:
+                for offset in range(0, len(identifiers), 900):
+                    batch = identifiers[offset : offset + 900]
+                    placeholders = ",".join("?" for _ in batch)
+                    rows.extend(
+                        snapshot.execute(
+                            "SELECT * FROM paper_state "
+                            f"WHERE experiment_id IN ({placeholders}) "
+                            "ORDER BY updated_at DESC,experiment_id ASC",
+                            batch,
+                        ).fetchall()
+                    )
+            finally:
+                snapshot.close()
+        else:
+            with self._lock:
+                for offset in range(0, len(identifiers), 900):
+                    batch = identifiers[offset : offset + 900]
+                    placeholders = ",".join("?" for _ in batch)
+                    rows.extend(
+                        self._conn.execute(
+                            "SELECT * FROM paper_state "
+                            f"WHERE experiment_id IN ({placeholders}) "
+                            "ORDER BY updated_at DESC,experiment_id ASC",
+                            batch,
+                        ).fetchall()
+                    )
         rows.sort(key=lambda row: row["experiment_id"])
         rows.sort(key=lambda row: row["updated_at"], reverse=True)
         return [
@@ -7465,14 +7535,121 @@ class AxiomStore:
             for row in rows[:limit]
         ]
 
+    def list_paper_portfolio_states(
+        self,
+        *,
+        experiment_ids: Iterable[str] | None = None,
+        limit: int = 1000,
+    ) -> list[dict[str, Any]]:
+        """Load only the fields needed to render paper portfolio summaries.
+
+        Paper engine state also carries unbounded observation history.  The
+        dashboard never renders that history, so avoid transferring or
+        decoding it when computing portfolio totals.
+        """
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+            raise ValueError("limit must be non-negative")
+        identifiers = sorted(
+            {
+                str(value).strip()
+                for value in experiment_ids or ()
+                if str(value).strip()
+            }
+        )
+        projection = (
+            "json_extract(state_json,"
+            "'$.portfolio.equity','$.portfolio.initial_cash',"
+            "'$.portfolio.positions','$.equity','$.initial_cash',"
+            "'$.forward_pnl','$.forward_max_drawdown','$.fill_count',"
+            "'$.risk.max_drawdown') AS projection_json"
+        )
+        rows: list[sqlite3.Row] = []
+        if not identifiers:
+            query = (
+                "SELECT experiment_id,updated_at,"
+                f"{projection} FROM paper_state "
+                "ORDER BY updated_at DESC,experiment_id ASC LIMIT ?"
+            )
+            values: list[Any] = [int(limit)]
+            batches = ((query, values),) if limit else ()
+        else:
+            batches = []
+            for offset in range(0, len(identifiers), 900):
+                batch = identifiers[offset : offset + 900]
+                placeholders = ",".join("?" for _ in batch)
+                batches.append(
+                    (
+                        "SELECT experiment_id,updated_at,"
+                        f"{projection} FROM paper_state "
+                        f"WHERE experiment_id IN ({placeholders}) "
+                        "ORDER BY updated_at DESC,experiment_id ASC",
+                        [*batch],
+                    )
+                )
+        if self.path not in {":memory:", ""} and not self.path.startswith("file:"):
+            snapshot = self._snapshot_read_connection()
+            try:
+                for query, values in batches:
+                    rows.extend(snapshot.execute(query, values).fetchall())
+            finally:
+                snapshot.close()
+        else:
+            with self._lock:
+                for query, values in batches:
+                    rows.extend(self._conn.execute(query, values).fetchall())
+        rows.sort(key=lambda row: row["experiment_id"])
+        rows.sort(key=lambda row: row["updated_at"], reverse=True)
+        result: list[dict[str, Any]] = []
+        for row in rows[:limit]:
+            values = _load(row["projection_json"]) if row["projection_json"] else []
+            values = list(values) if isinstance(values, list) else []
+            values.extend([None] * (9 - len(values)))
+            portfolio: dict[str, Any] = {}
+            for key, value in (
+                ("equity", values[0]),
+                ("initial_cash", values[1]),
+                ("positions", _load(values[2]) if isinstance(values[2], str) and values[2] else values[2]),
+            ):
+                if value is not None:
+                    portfolio[key] = value
+            state: dict[str, Any] = {}
+            if portfolio:
+                state["portfolio"] = portfolio
+            for key, value in (
+                ("equity", values[3]),
+                ("initial_cash", values[4]),
+                ("forward_pnl", values[5]),
+                ("forward_max_drawdown", values[6]),
+                ("fill_count", values[7]),
+            ):
+                if value is not None:
+                    state[key] = value
+            if values[8] is not None:
+                state["risk"] = {"max_drawdown": values[8]}
+            result.append(
+                {
+                    "experiment_id": row["experiment_id"],
+                    "state": state,
+                    "updated_at": _parse_datetime(row["updated_at"]),
+                }
+            )
+        return result
+
     def paper_record_counts(self) -> dict[str, int]:
         """Return paper-table counts without scanning unrelated runtime tables."""
-        with self._lock:
-            return self._paper_record_counts_locked()
+        if self.path in {":memory:", ""} or self.path.startswith("file:"):
+            with self._lock:
+                return self._paper_record_counts_locked()
+        snapshot = self._snapshot_read_connection()
+        try:
+            return self._paper_record_counts_on(snapshot)
+        finally:
+            snapshot.close()
 
-    def _paper_record_counts_locked(self) -> dict[str, int]:
+    @staticmethod
+    def _paper_record_counts_on(connection: sqlite3.Connection) -> dict[str, int]:
         return {
-            label: int(self._conn.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()["n"])
+            label: int(connection.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()["n"])
             for table, label in (
                 ("paper_state", "paper_state"),
                 ("paper_observations", "paper_observations"),
@@ -7480,6 +7657,9 @@ class AxiomStore:
                 ("paper_bet_ledger", "paper_bet_ledger"),
             )
         }
+
+    def _paper_record_counts_locked(self) -> dict[str, int]:
+        return self._paper_record_counts_on(self._conn)
 
 
     def paper_observation_exists(self, observation_id: str) -> bool:
@@ -7724,8 +7904,15 @@ class AxiomStore:
         if limit is not None:
             query += " LIMIT ?"
             values.append(int(limit))
-        with self._lock:
-            rows = self._conn.execute(query, values).fetchall()
+        if self.path not in {":memory:", ""} and not self.path.startswith("file:"):
+            snapshot = self._snapshot_read_connection()
+            try:
+                rows = snapshot.execute(query, values).fetchall()
+            finally:
+                snapshot.close()
+        else:
+            with self._lock:
+                rows = self._conn.execute(query, values).fetchall()
         return [
             {
                 "bet_id": row["bet_id"],
@@ -9587,21 +9774,25 @@ class AxiomStore:
         newest records, so bounded source reads preserve the same global
         ordering without that full materialization.
         """
-        with self._lock:
-            counts = self._paper_record_counts_locked()
+        snapshot = self._snapshot_read_connection()
+        try:
+            counts = self._paper_record_counts_on(snapshot)
             total = sum(counts.values())
             actual_page, pages = _pagination_shape(requested_page, page_size, total)
             if not total:
                 return {"items": [], "page": actual_page, "page_size": page_size, "total": 0, "pages": pages}
             source_limit = (actual_page - 1) * page_size + page_size
             order = "DESC" if direction == "desc" else "ASC"
+            # Do not select payload_json in these per-table candidate scans.
+            # State payloads can be tens of megabytes; only the final page
+            # needs to cross the SQLite/Python boundary.
             source_queries = (
                 f"""
                     SELECT 'state' AS record_type,experiment_id AS record_id,
                         experiment_id,NULL AS market_id,updated_at AS timestamp,
-                        json_extract(state_json,'$.status') AS status,
+                        NULL AS status,
                         NULL AS outcome,NULL AS resolution,NULL AS strategy_id,
-                        state_json AS payload_json,updated_at AS created_at,
+                        NULL AS payload_json,updated_at AS created_at,
                         updated_at
                     FROM paper_state
                     ORDER BY updated_at {order},experiment_id ASC
@@ -9610,9 +9801,9 @@ class AxiomStore:
                 f"""
                     SELECT 'observation' AS record_type,observation_id AS record_id,
                         experiment_id,market_id,timestamp,
-                        json_extract(payload_json,'$.status') AS status,
+                        NULL AS status,
                         NULL AS outcome,NULL AS resolution,NULL AS strategy_id,
-                        payload_json,created_at,created_at AS updated_at
+                        NULL AS payload_json,created_at,created_at AS updated_at
                     FROM paper_observations
                     ORDER BY timestamp {order},observation_id ASC
                     LIMIT ?
@@ -9621,7 +9812,7 @@ class AxiomStore:
                     SELECT 'execution' AS record_type,event_id AS record_id,
                         experiment_id,market_id,timestamp,status,
                         NULL AS outcome,NULL AS resolution,NULL AS strategy_id,
-                        payload_json,created_at,created_at AS updated_at
+                        NULL AS payload_json,created_at,created_at AS updated_at
                     FROM paper_execution_events
                     ORDER BY timestamp {order},event_id ASC
                     LIMIT ?
@@ -9630,7 +9821,7 @@ class AxiomStore:
                     SELECT 'bet' AS record_type,bet_id AS record_id,
                         experiment_id,market_id,resolved_at AS timestamp,
                         resolution AS status,outcome,resolution,strategy_id,
-                        payload_json,created_at,updated_at
+                        NULL AS payload_json,created_at,updated_at
                     FROM paper_bet_ledger
                     ORDER BY resolved_at {order},bet_id ASC
                     LIMIT ?
@@ -9638,16 +9829,56 @@ class AxiomStore:
             )
             rows: list[sqlite3.Row] = []
             for query in source_queries:
-                rows.extend(self._conn.execute(query, (source_limit,)).fetchall())
+                rows.extend(snapshot.execute(query, (source_limit,)).fetchall())
 
-        # SQL's direction applies only to the primary sort key; its tie
-        # breakers stay ascending in both directions.
-        rows.sort(key=lambda row: (row["record_id"], row["record_type"]))
-        rows.sort(key=lambda row: row["timestamp"], reverse=direction == "desc")
-        offset = (actual_page - 1) * page_size
+            # Each source contributes at most ``source_limit`` candidates, so
+            # sorting the small metadata set still yields the exact global
+            # page.  Fetch payloads only after that page is known.
+            rows.sort(key=lambda row: (row["record_id"], row["record_type"]))
+            rows.sort(key=lambda row: row["timestamp"], reverse=direction == "desc")
+            offset = (actual_page - 1) * page_size
+            page_rows = rows[offset : offset + page_size]
+            payloads: dict[tuple[str, str], tuple[Any, Any]] = {}
+            payload_specs = (
+                ("state", "paper_state", "experiment_id", "state_json", "json_extract(state_json,'$.status')"),
+                ("observation", "paper_observations", "observation_id", "payload_json", "json_extract(payload_json,'$.status')"),
+                ("execution", "paper_execution_events", "event_id", "payload_json", "NULL"),
+                ("bet", "paper_bet_ledger", "bet_id", "payload_json", "NULL"),
+            )
+            for record_type, table, id_column, payload_column, status_expression in payload_specs:
+                identifiers = [
+                    str(row["record_id"])
+                    for row in page_rows
+                    if str(row["record_type"]) == record_type
+                ]
+                if not identifiers:
+                    continue
+                placeholders = ",".join("?" for _ in identifiers)
+                payload_rows = snapshot.execute(
+                    f"SELECT {id_column} AS record_id,{payload_column} AS payload_json,"
+                    f"{status_expression} AS payload_status FROM {table} "
+                    f"WHERE {id_column} IN ({placeholders})",
+                    identifiers,
+                ).fetchall()
+                payloads.update(
+                    {
+                        (record_type, str(row["record_id"])): (
+                            row["payload_json"],
+                            row["payload_status"],
+                        )
+                        for row in payload_rows
+                    }
+                )
+        finally:
+            snapshot.close()
+
         items: list[dict[str, Any]] = []
-        for row in rows[offset : offset + page_size]:
-            payload = _load(row["payload_json"]) if row["payload_json"] else {}
+        for row in page_rows:
+            payload_json, payload_status = payloads.get(
+                (str(row["record_type"]), str(row["record_id"])),
+                (None, None),
+            )
+            payload = _load(payload_json) if payload_json else {}
             item = {
                 "record_type": row["record_type"],
                 "record_id": row["record_id"],
@@ -9655,7 +9886,7 @@ class AxiomStore:
                 "experiment_id": row["experiment_id"],
                 "market_id": row["market_id"],
                 "timestamp": _parse_datetime(row["timestamp"]),
-                "status": row["status"],
+                "status": row["status"] if row["status"] is not None else payload_status,
                 "outcome": row["outcome"],
                 "resolution": row["resolution"],
                 "strategy_id": row["strategy_id"],

@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import Mock, patch
 from urllib.error import HTTPError
@@ -1927,6 +1928,44 @@ class DashboardPaginationEndpointTests(DashboardPaginationFixture):
         self.assertEqual([item["experiment_id"] for item in open_paper["items"]], ["paper-20", "paper-22"])
         self.assertTrue(all(item["status"] == "OPEN" for item in open_paper["items"]))
 
+    def test_public_execution_event_payload_is_retained_with_bounded_paper_page(self) -> None:
+        event_payload = {
+            "paper_only": True,
+            "live_execution": False,
+            "reason": "payload-contract",
+            "nested": {"marker": "full-payload"},
+        }
+        self.assertTrue(
+            self.store.save_paper_execution_event(
+                "payload-contract-event",
+                "paper-00",
+                "paper-observation-00",
+                "market-00",
+                T0,
+                "FILLED",
+                event_payload,
+            )
+        )
+        events = self.store.list_paper_execution_events("paper-00")
+        self.assertEqual(events[0]["payload"], event_payload)
+
+        started = time.perf_counter()
+        status, page, body = self._request(
+            "api/v2/paper",
+            page=1,
+            page_size=10,
+            sort="timestamp",
+            direction="desc",
+        )
+        elapsed = time.perf_counter() - started
+        self.assertEqual(status, 200)
+        self.assertIsInstance(page, dict)
+        assert isinstance(page, dict)
+        self.assertEqual(page["total"], PAPER_COUNT + 1)
+        self.assertEqual(len(page["items"]), 10)
+        self.assertLess(len(body), 200_000)
+        self.assertLess(elapsed, 2.0)
+
 
     def test_paper_page_does_not_depend_on_unrelated_dashboard_counts(self) -> None:
         # A paper page must remain available even when an unrelated table
@@ -1946,6 +1985,128 @@ class DashboardPaginationEndpointTests(DashboardPaginationFixture):
         self.assertEqual(len(payload["items"]), PAPER_COUNT)
         self.assertEqual(payload["paper_telemetry"]["record_count"], 0)
         self.assertTrue(payload["paper_only"])
+
+    def test_paper_page_does_not_decode_unselected_large_state_history(self) -> None:
+        large_history = "unselected-paper-history:" + ("x" * 2_000_000)
+        for index in range(12):
+            self.store.save_paper_state(
+                f"large-state-{index:02d}",
+                {
+                    "status": "OPEN",
+                    "portfolio": {"equity": 1000.0, "initial_cash": 1000.0, "positions": {}},
+                    "signal_history_by_market": {"bulk": large_history},
+                },
+                timestamp=T0 + timedelta(hours=1, minutes=index),
+            )
+        for index in range(30):
+            self.store.save_paper_observation(
+                f"new-observation-{index:02d}",
+                f"observation-experiment-{index:02d}",
+                f"market-{index:02d}",
+                T0 + timedelta(hours=2, minutes=index),
+                {"status": "OBSERVED", "value": index},
+            )
+
+        started = time.perf_counter()
+        status, payload, body = self._request(
+            "api/v2/paper",
+            page=1,
+            page_size=25,
+            sort="timestamp",
+            direction="desc",
+        )
+        elapsed = time.perf_counter() - started
+        self.assertEqual(status, 200)
+        self.assertIsInstance(payload, dict)
+        assert isinstance(payload, dict)
+        self.assertEqual(payload["total"], PAPER_COUNT + 12 + 30)
+        self.assertEqual(len(payload["items"]), 25)
+        self.assertTrue(all(item["record_type"] == "observation" for item in payload["items"]))
+        self.assertNotIn(large_history, body)
+        self.assertLess(len(body), 200_000)
+        self.assertLess(elapsed, 2.0)
+
+    def test_paper_page_is_not_head_of_line_blocked_by_same_store_writer(self) -> None:
+        writer_entered = threading.Event()
+        release_writer = threading.Event()
+        reader_done = threading.Event()
+        writer_errors: list[BaseException] = []
+        reader_result: dict[str, object] = {}
+
+        def hold_writer_transaction() -> None:
+            try:
+                with self.store.transaction(immediate=True):
+                    self.store.save_paper_state(
+                        "writer-held-state",
+                        {"status": "OPEN", "portfolio": {"equity": 1000.0}},
+                        timestamp=T0,
+                    )
+
+                    writer_entered.set()
+                    if not release_writer.wait(timeout=3):
+                        raise AssertionError("writer release timed out")
+            except BaseException as exc:
+                writer_errors.append(exc)
+
+        def read_paper_page() -> None:
+            try:
+                reader_result["response"] = self._request(
+                    "api/v2/paper",
+                    page=1,
+                    page_size=25,
+                    sort="timestamp",
+                    direction="desc",
+                )
+            except BaseException as exc:
+                reader_result["error"] = exc
+            finally:
+                reader_done.set()
+
+        writer = threading.Thread(target=hold_writer_transaction)
+        writer.start()
+        self.assertTrue(writer_entered.wait(timeout=2))
+        reader = threading.Thread(target=read_paper_page)
+        reader.start()
+        try:
+            self.assertTrue(reader_done.wait(timeout=1), "paper request waited behind writer transaction")
+        finally:
+            release_writer.set()
+            writer.join(timeout=3)
+            reader.join(timeout=3)
+        self.assertFalse(writer.is_alive())
+        self.assertFalse(reader.is_alive())
+        self.assertEqual(writer_errors, [])
+        self.assertNotIn("error", reader_result)
+        status, payload, _body = reader_result["response"]
+        self.assertEqual(status, 200)
+        self.assertIsInstance(payload, dict)
+        assert isinstance(payload, dict)
+        self.assertEqual(payload["total"], PAPER_COUNT)
+        self.assertEqual(len(payload["items"]), PAPER_COUNT)
+    def test_paper_portfolio_keeps_summary_fields_without_history_projection(self) -> None:
+        history_marker = "portfolio-history-marker"
+        self.store.save_paper_state(
+            "portfolio-large-state",
+            {
+                "status": "OPEN",
+                "portfolio": {
+                    "equity": 1234.0,
+                    "initial_cash": 1000.0,
+                    "positions": {"market": {"quantity": 2}},
+                },
+                "signal_history_by_market": {"bulk": history_marker},
+            },
+            timestamp=T0 + timedelta(hours=3),
+        )
+        portfolio = DashboardData(store=self.store, clock=lambda: T0)._paper_portfolio()
+        self.assertEqual(len(portfolio["states"]), PAPER_COUNT + 1)
+        self.assertEqual(portfolio["total_equity"], 24487.0)
+        self.assertEqual(portfolio["total_pnl"], 487.0)
+        large_state = next(item for item in portfolio["states"] if item["experiment_id"] == "portfolio-large-state")
+        self.assertEqual(large_state["equity"], 1234.0)
+        self.assertEqual(large_state["open_positions"]["market"]["quantity"], 2)
+        self.assertNotIn(history_marker, json.dumps(portfolio, default=str, sort_keys=True))
+
 
     def test_every_ui_sort_column_has_a_supported_paged_endpoint(self) -> None:
         # These are the backend keys emitted by each table's sort buttons.
