@@ -43,6 +43,11 @@ _MAX_LEGACY_RECOVERY_ITEMS = 64
 _LEGACY_RECOVERY_STATE_NAME = "autonomous-legacy-recovery"
 _MAX_AUTOMATIC_REASSESSMENTS = 3
 _MUTABLE_DATASET_VERSION_ALIASES = frozenset({"latest", "current", "default", "unversioned"})
+CAMPAIGN_PROTOCOL_V1_ID = "polymarket-paper-campaign-v1"
+CAMPAIGN_PROTOCOL_V2_ID = "polymarket-paper-campaign-v2"
+CAMPAIGN_SCHEMA_V1 = "polymarket-finite-campaign-v1"
+CAMPAIGN_SCHEMA_V2 = "polymarket-finite-campaign-v2"
+
 _NEXT_DATASET_SCHEDULER_STATE_NAME = "autonomous-next-dataset-version"
 _NEXT_DATASET_JOB_PREFIX = "polymarket-dataset-successor:"
 _NEXT_DATASET_JOB_STATUS_WAITING = "WAITING_FOR_NEW_DATASET_VERSION"
@@ -1086,7 +1091,11 @@ class AutonomousResearchProcessor:
         )
         return rows[:_MAX_DATASET_ROWS]
 
-    def _campaign_prior_configuration_keys(self) -> set[str]:
+    def _campaign_prior_configuration_keys(
+        self,
+        protocol_id: str | None = None,
+    ) -> set[str]:
+        target_protocol = str(protocol_id or "").strip()
         keys: set[str] = set()
         lister = getattr(self.store, "list_experiment_plans", None)
         if callable(lister):
@@ -1102,6 +1111,14 @@ class AutonomousResearchProcessor:
                 plan = record.get("plan")
                 if not isinstance(plan, Mapping):
                     continue
+                if target_protocol == CAMPAIGN_PROTOCOL_V2_ID:
+                    protocol = plan.get("campaign_protocol")
+                    if (
+                        isinstance(protocol, Mapping)
+                        and str(protocol.get("schema_version") or "").strip()
+                        == CAMPAIGN_SCHEMA_V1
+                    ):
+                        continue
                 template = str(plan.get("template", plan.get("experiment_family", ""))).strip().lower()
                 parameters = plan.get("parameters")
                 if template in {"momentum", "mean_reversion"} and isinstance(parameters, Mapping):
@@ -1130,6 +1147,14 @@ class AutonomousResearchProcessor:
             payload = record.get("payload") if isinstance(record, Mapping) else None
             plan = payload.get("experiment_plan") if isinstance(payload, Mapping) else None
             if isinstance(plan, Mapping):
+                if target_protocol == CAMPAIGN_PROTOCOL_V2_ID:
+                    protocol = plan.get("campaign_protocol")
+                    if (
+                        isinstance(protocol, Mapping)
+                        and str(protocol.get("schema_version") or "").strip()
+                        == CAMPAIGN_SCHEMA_V1
+                    ):
+                        continue
                 template = str(plan.get("template", "")).strip().lower()
                 parameters = plan.get("parameters")
                 if template in {"momentum", "mean_reversion"} and isinstance(parameters, Mapping):
@@ -1164,6 +1189,7 @@ class AutonomousResearchProcessor:
         qualification_gates: Mapping[str, Any] | None,
         finalist_count: int,
         observation_horizon: int,
+        protocol_id: str = CAMPAIGN_PROTOCOL_V1_ID,
     ) -> dict[str, Any]:
         provenance = _campaign_compact_row_provenance(rows)
         manifests = dict(provenance["split_boundaries"])
@@ -1179,8 +1205,21 @@ class AutonomousResearchProcessor:
             "content_hash": provenance["content_hash"],
             "split_boundaries": dict(manifests),
         }
+        protocol_identity = str(protocol_id).strip()
+        if protocol_identity not in {CAMPAIGN_PROTOCOL_V1_ID, CAMPAIGN_PROTOCOL_V2_ID}:
+            raise ValueError("unsupported campaign protocol")
+        schema_version = (
+            CAMPAIGN_SCHEMA_V2
+            if protocol_identity == CAMPAIGN_PROTOCOL_V2_ID
+            else CAMPAIGN_SCHEMA_V1
+        )
+        required_features = (
+            ["timestamp", "market_id", "yes_mid"]
+            if protocol_identity == CAMPAIGN_PROTOCOL_V2_ID
+            else ["timestamp", "market_id", "yes_mid", "yes_bid", "yes_ask", "settlement"]
+        )
         return {
-            "schema_version": "polymarket-finite-campaign-v1",
+            "schema_version": schema_version,
             "campaign_id": campaign_id,
             "scientific_rationale": (
                 "Test whether short price-path momentum or mean-reversion "
@@ -1204,14 +1243,7 @@ class AutonomousResearchProcessor:
                 "unit": "observations",
                 "count": int(observation_horizon),
             },
-            "required_features": [
-                "timestamp",
-                "market_id",
-                "yes_mid",
-                "yes_bid",
-                "yes_ask",
-                "settlement",
-            ],
+            "required_features": required_features,
             "scope": {
                 "market_type": "prediction",
                 "instrument": "POLYMARKET",
@@ -1611,12 +1643,11 @@ class AutonomousResearchProcessor:
             "instrument": "POLYMARKET",
             "provenance": "canonical",
         })
-        plan_document.setdefault("allowed_features", protocol.get("required_features", ()))
         plan_document.setdefault("time_split", "train-validation-holdout")
         plan_document.setdefault("metrics", ("expectancy", "drawdown", "trade_count", "sample_count"))
         plan_document.setdefault("min_samples", int(protocol.get("qualification_gates", {}).get("min_samples", 3)))
         plan_document.setdefault("min_trades", int(protocol.get("qualification_gates", {}).get("min_trades", 0)))
-        plan_document.setdefault("research_mode", "PRICE_PROXY_RESEARCH")
+        plan_document["allowed_features"] = list(protocol.get("required_features", ()))
         plan_document.setdefault("assumptions", protocol.get("costs", {}))
         plan_document.setdefault("exit_policy", {
             "type": "fixed_holding_period",
@@ -1770,6 +1801,7 @@ class AutonomousResearchProcessor:
         *,
         dataset_id: str | None = None,
         dataset_version: str | None = None,
+        protocol_id: str | None = None,
         observation_horizon: int = 1,
         finalist_count: int = CAMPAIGN_MAX_FINALISTS,
         qualification_gates: Mapping[str, Any] | None = None,
@@ -1784,6 +1816,17 @@ class AutonomousResearchProcessor:
             raise ValueError("observation_horizon must be a positive observation count")
         if isinstance(finalist_count, bool) or not 1 <= int(finalist_count) <= CAMPAIGN_MAX_FINALISTS:
             raise ValueError("finalist_count exceeds the campaign safety bound")
+        source = dict(proposal or {})
+        inferred_protocol_id = (
+            CAMPAIGN_PROTOCOL_V2_ID
+            if campaign.startswith(f"{CAMPAIGN_PROTOCOL_V2_ID}:")
+            else CAMPAIGN_PROTOCOL_V1_ID
+        )
+        resolved_protocol_id = str(
+            protocol_id or source.get("protocol_id") or inferred_protocol_id
+        ).strip()
+        if resolved_protocol_id not in {CAMPAIGN_PROTOCOL_V1_ID, CAMPAIGN_PROTOCOL_V2_ID}:
+            raise ValueError("unsupported campaign protocol")
         job_name = self.campaign_job_name(campaign)
         existing = self.store.get_operator_job(job_name)
         if isinstance(existing, Mapping):
@@ -1808,7 +1851,12 @@ class AutonomousResearchProcessor:
                     )
                 payload_status = str(existing_payload.get("status", "")).strip().upper()
                 record_status = str(durable.get("status", "")).strip().upper()
-                if payload_status in CAMPAIGN_TERMINAL_STATUSES or record_status in CAMPAIGN_TERMINAL_STATUSES:
+                if (
+                    payload_status in CAMPAIGN_TERMINAL_STATUSES
+                    or record_status in CAMPAIGN_TERMINAL_STATUSES
+                    or str(existing_payload.get("supersession_reason", "")).strip().upper()
+                    == "SUPERSEDED_PROTOCOL"
+                ):
                     # Terminal campaigns are immutable evidence.  Validate an
                     # already-declared hash, but do not rewrite legacy rows or
                     # enqueue a successor.
@@ -1846,7 +1894,6 @@ class AutonomousResearchProcessor:
                     else resumed_payload
                 )
             return dict(result_payload)
-        source = dict(proposal or {})
         resolved_dataset_id = str(
             dataset_id
             or source.get("dataset_id")
@@ -1870,7 +1917,7 @@ class AutonomousResearchProcessor:
         if not resolved_dataset_version:
             raise ValueError("dataset_version is required")
         rows = self._campaign_dataset_rows(self.store, resolved_dataset_id, resolved_dataset_version)
-        prior = self._campaign_prior_configuration_keys()
+        prior = self._campaign_prior_configuration_keys(resolved_protocol_id)
         configurations = [
             dict(item)
             for item in self.campaign_configurations()
@@ -1885,6 +1932,7 @@ class AutonomousResearchProcessor:
             qualification_gates=qualification_gates,
             finalist_count=int(finalist_count),
             observation_horizon=int(observation_horizon),
+            protocol_id=resolved_protocol_id,
         )
         protocol_hash = _hash_document(protocol)
         trials: list[dict[str, Any]] = [
@@ -1906,7 +1954,8 @@ class AutonomousResearchProcessor:
             "reason": "existing zero-edge control retained; never rerun",
         }
         payload: dict[str, Any] = {
-            "schema_version": "polymarket-finite-campaign-v1",
+            "schema_version": protocol.get("schema_version", CAMPAIGN_SCHEMA_V1),
+            "protocol_id": resolved_protocol_id,
             "campaign_id": campaign,
             "status": "PLANNED" if trials else "CAMPAIGN_EXHAUSTED_NO_QUALIFIED_STRATEGY",
             "protocol": protocol,
@@ -2167,6 +2216,13 @@ class AutonomousResearchProcessor:
         if not isinstance(record, Mapping):
             return
         payload = dict(record.get("payload") or {})
+        if (
+            str(record.get("status", "")).strip().upper() in CAMPAIGN_TERMINAL_STATUSES
+            or str(payload.get("status", "")).strip().upper() in CAMPAIGN_TERMINAL_STATUSES
+            or str(payload.get("supersession_reason", "")).strip().upper()
+            == "SUPERSEDED_PROTOCOL"
+        ):
+            return
         trial_id = str(item.payload.get("campaign_trial_id", "")).strip()
         trials = [dict(entry) for entry in payload.get("trials", ()) if isinstance(entry, Mapping)]
         trial = next((entry for entry in trials if str(entry.get("trial_id", "")) == trial_id), None)
@@ -7702,6 +7758,12 @@ def _normalize_row(value: Any) -> dict[str, Any] | None:
             merged = dict(payload["snapshot"])
             merged.update({key: child for key, child in row.items() if key != "payload"})
             row = merged
+        # Historical PRICE_PROXY records may persist the observed probability
+        # under ``price``.  This is a representation normalization, not a
+        # quote synthesis: bid/ask fields remain absent when they were absent
+        # in the source dataset.
+        if row.get("yes_mid") is None and row.get("price") is not None:
+            row["yes_mid"] = row["price"]
         return row
     return None
 

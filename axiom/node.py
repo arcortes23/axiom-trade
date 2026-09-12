@@ -40,7 +40,12 @@ from .paper_engine import (
     run_forward_paper,
 )
 from .storage import AxiomStore
-from .autonomous import AutonomousResearchConfig, AutonomousResearchProcessor
+from .autonomous import (
+    AutonomousResearchConfig,
+    AutonomousResearchProcessor,
+    CAMPAIGN_PROTOCOL_V1_ID,
+    CAMPAIGN_PROTOCOL_V2_ID,
+)
 from .research_bus import DurableResearchBus
 from .lifecycle import PromotionCriteria
 from .strategy import evaluate_signal_record, load_strategy
@@ -49,7 +54,9 @@ from .canary import CanaryBlocked, CanaryService
 
 POLYMARKET_HISTORICAL_JOB_NAME = "polymarket-historical-refresh"
 POLYMARKET_AUTONOMY_JOB_NAME = "polymarket-autonomy"
-POLYMARKET_AUTONOMY_PROTOCOL_ID = "polymarket-paper-campaign-v1"
+POLYMARKET_AUTONOMY_PROTOCOL_V1_ID = CAMPAIGN_PROTOCOL_V1_ID
+POLYMARKET_AUTONOMY_PROTOCOL_V2_ID = CAMPAIGN_PROTOCOL_V2_ID
+POLYMARKET_AUTONOMY_PROTOCOL_ID = POLYMARKET_AUTONOMY_PROTOCOL_V2_ID
 POLYMARKET_REPLAY_DATASET_ID = "Polymarket-recorded-book-replay"
 POLYMARKET_REPLAY_MAX_ROWS = 10_000
 
@@ -1670,6 +1677,183 @@ class ResearchNode:
         last_identity = str(payload.get("last_evidence_identity", "")).strip() or None
         return count, trial_ids, evidence, last_identity
 
+    @staticmethod
+    def _campaign_protocol_identity(
+        scheduler_state: Mapping[str, Any],
+        campaign_payload: Mapping[str, Any] | None,
+        campaign_id: str,
+    ) -> str:
+        for source in (scheduler_state, campaign_payload or {}):
+            value = str(source.get("protocol_id") or "").strip()
+            if value:
+                return value
+        protocol = campaign_payload.get("protocol") if isinstance(campaign_payload, Mapping) else None
+        if isinstance(protocol, Mapping):
+            schema = str(protocol.get("schema_version") or "").strip()
+            if schema == "polymarket-finite-campaign-v1":
+                return POLYMARKET_AUTONOMY_PROTOCOL_V1_ID
+            if schema == "polymarket-finite-campaign-v2":
+                return POLYMARKET_AUTONOMY_PROTOCOL_V2_ID
+        if campaign_id.startswith(f"{POLYMARKET_AUTONOMY_PROTOCOL_V2_ID}:"):
+            return POLYMARKET_AUTONOMY_PROTOCOL_V2_ID
+        if campaign_id.startswith(f"{POLYMARKET_AUTONOMY_PROTOCOL_V1_ID}:"):
+            return POLYMARKET_AUTONOMY_PROTOCOL_V1_ID
+        return ""
+
+    def _supersede_obsolete_polymarket_campaign(
+        self,
+        *,
+        campaign_id: str,
+        replacement_campaign_id: str,
+        now: datetime,
+    ) -> None:
+        """Terminally audit v1 without changing its immutable protocol."""
+        job_name = self.research_processor.campaign_job_name(campaign_id)
+        record = self.store.get_operator_job(job_name)
+        if not isinstance(record, Mapping):
+            return
+        payload = record.get("payload")
+        payload = dict(payload) if isinstance(payload, Mapping) else {}
+        if (
+            str(payload.get("supersession_reason") or "").strip().upper()
+            == "SUPERSEDED_PROTOCOL"
+            and str(payload.get("superseded_by_protocol_id") or "").strip()
+            == POLYMARKET_AUTONOMY_PROTOCOL_V2_ID
+        ):
+            return
+        prior_status = str(payload.get("status") or record.get("status") or "").strip().upper()
+        prior_last_result = payload.get("last_result")
+        counts = dict(payload.get("counts") or {})
+        counts["running"] = 0
+        counts["software_or_input_error"] = int(
+            counts.get("software_or_input_error", 0) or 0
+        ) + 1
+        payload.update(
+            {
+                "status": "SOFTWARE_OR_INPUT_ERROR",
+                "supersession_reason": "SUPERSEDED_PROTOCOL",
+                "reason_code": "SUPERSEDED_PROTOCOL",
+                "terminal_reason": "SUPERSEDED_PROTOCOL",
+                "superseded_protocol_id": POLYMARKET_AUTONOMY_PROTOCOL_V1_ID,
+                "superseded_by_protocol_id": POLYMARKET_AUTONOMY_PROTOCOL_V2_ID,
+                "superseded_by_campaign_id": replacement_campaign_id,
+                "superseded_from_status": prior_status,
+                "superseded_from_last_result": prior_last_result,
+                "superseded_at": ensure_utc(now).isoformat(),
+                "last_result": {
+                    "status": "SOFTWARE_OR_INPUT_ERROR",
+                    "reason_code": "SUPERSEDED_PROTOCOL",
+                    "classification": "SOFTWARE_OR_INPUT_ERROR",
+                    "campaign_id": campaign_id,
+                },
+                "next_real_job": None,
+                "counts": counts,
+                "last_updated_at": ensure_utc(now).isoformat(),
+            }
+        )
+        self.store.set_operator_job(
+            job_name,
+            "SOFTWARE_OR_INPUT_ERROR",
+            payload,
+            last_error="SUPERSEDED_PROTOCOL",
+            resumable=False,
+            timestamp=now,
+        )
+        self.store.save_report_if_absent(
+            f"campaign-supersession:{campaign_id}:{POLYMARKET_AUTONOMY_PROTOCOL_V2_ID}",
+            {
+                "report_type": "polymarket_campaign_supersession",
+                "campaign_id": campaign_id,
+                "protocol_id": POLYMARKET_AUTONOMY_PROTOCOL_V1_ID,
+                "replacement_campaign_id": replacement_campaign_id,
+                "replacement_protocol_id": POLYMARKET_AUTONOMY_PROTOCOL_V2_ID,
+                "classification": "SOFTWARE_OR_INPUT_ERROR",
+                "reason_code": "SUPERSEDED_PROTOCOL",
+                "paper_only": True,
+                "recorded_at": ensure_utc(now).isoformat(),
+            },
+            experiment_id=job_name,
+        )
+
+    def _rollover_polymarket_campaign(
+        self,
+        state: Mapping[str, Any],
+        catalog: Mapping[str, Any],
+        attestation: Mapping[str, Any],
+        now: datetime,
+    ) -> dict[str, Any]:
+        """Atomically replace ownership of an obsolete v1 scheduler state."""
+        old_campaign_id = str(state.get("campaign_id") or "").strip()
+        replacement_campaign_id = (
+            f"{POLYMARKET_AUTONOMY_PROTOCOL_V2_ID}:campaign"
+        )
+        self._supersede_obsolete_polymarket_campaign(
+            campaign_id=old_campaign_id,
+            replacement_campaign_id=replacement_campaign_id,
+            now=now,
+        )
+        campaign = self.research_processor.start_polymarket_campaign(
+            replacement_campaign_id,
+            dataset_id=POLYMARKET_DATASET_ID,
+            dataset_version=str(
+                catalog.get("dataset_version") or catalog.get("version") or ""
+            ).strip(),
+            protocol_id=POLYMARKET_AUTONOMY_PROTOCOL_V2_ID,
+            now=now,
+        )
+        campaign_payload = dict(campaign) if isinstance(campaign, Mapping) else {}
+        campaign_status = str(campaign_payload.get("status") or "UNKNOWN").upper()
+        campaign_reassessment_count, _, _, _ = self._campaign_reassessment_snapshot(
+            campaign_payload
+        )
+        campaign_job_name = self.research_processor.campaign_job_name(
+            replacement_campaign_id
+        )
+        queued_items = len(
+            self.research_processor.bus.list_campaign_trials(
+                replacement_campaign_id,
+                limit=10_000,
+            )
+        )
+        replacement_state = dict(state)
+        replacement_state.update(
+            {
+                "protocol_id": POLYMARKET_AUTONOMY_PROTOCOL_V2_ID,
+                "campaign_id": replacement_campaign_id,
+                "campaign_job_name": campaign_job_name,
+                "campaign_job_status": campaign_status,
+                "campaign": campaign_payload,
+                "dataset_id": POLYMARKET_DATASET_ID,
+                "dataset_version": str(
+                    catalog.get("dataset_version") or catalog.get("version") or ""
+                ).strip(),
+                "latest_dataset_version": str(
+                    catalog.get("dataset_version") or catalog.get("version") or ""
+                ).strip(),
+                "attestation_hash": attestation.get("attestation_hash"),
+                "latest_attestation_hash": attestation.get("attestation_hash"),
+                "reassessment_count": min(1, campaign_reassessment_count),
+                "status": campaign_status,
+                "queued_items": queued_items,
+                "next_work": (
+                    "process_finite_campaign"
+                    if campaign_status == "RUNNING"
+                    else "wait_for_campaign_state"
+                ),
+                "superseded_campaign_id": old_campaign_id,
+                "superseded_protocol_id": POLYMARKET_AUTONOMY_PROTOCOL_V1_ID,
+                "supersession_reason": "SUPERSEDED_PROTOCOL",
+                "updated_at": ensure_utc(now).isoformat(),
+                "paper_only": True,
+                "live_execution": False,
+            }
+        )
+        self.store.set_scheduler_state(
+            POLYMARKET_AUTONOMY_JOB_NAME,
+            replacement_state,
+        )
+        return replacement_state
+
     def _start_polymarket_campaign(
         self,
         catalog: Mapping[str, Any],
@@ -1692,6 +1876,22 @@ class ResearchNode:
             ).strip()
             campaign_job_name = self.research_processor.campaign_job_name(existing_campaign)
             campaign_record = self.store.get_operator_job(campaign_job_name)
+            protocol_identity = self._campaign_protocol_identity(
+                state,
+                campaign_record.get("payload")
+                if isinstance(campaign_record, Mapping)
+                and isinstance(campaign_record.get("payload"), Mapping)
+                else None,
+                existing_campaign,
+            )
+            if protocol_identity == POLYMARKET_AUTONOMY_PROTOCOL_V1_ID:
+                with self.store.transaction(immediate=True):
+                    return self._rollover_polymarket_campaign(
+                        state,
+                        catalog,
+                        attestation,
+                        now,
+                    )
             if isinstance(campaign_record, Mapping):
                 # Re-enter the processor on every scheduler tick.  In
                 # addition to being a harmless modern no-op, this repairs a
@@ -1699,6 +1899,14 @@ class ResearchNode:
                 # hashing and queue cursor advancement became durable.
                 self.research_processor.start_polymarket_campaign(
                     existing_campaign,
+                    protocol_id=(
+                        protocol_identity
+                        if protocol_identity in {
+                            POLYMARKET_AUTONOMY_PROTOCOL_V1_ID,
+                            POLYMARKET_AUTONOMY_PROTOCOL_V2_ID,
+                        }
+                        else None
+                    ),
                     now=now,
                 )
                 campaign_record = self.store.get_operator_job(campaign_job_name)
@@ -1841,6 +2049,7 @@ class ResearchNode:
             stable_campaign_id,
             dataset_id=POLYMARKET_DATASET_ID,
             dataset_version=version,
+            protocol_id=POLYMARKET_AUTONOMY_PROTOCOL_ID,
             now=now,
         )
         campaign_payload = dict(campaign) if isinstance(campaign, Mapping) else {}

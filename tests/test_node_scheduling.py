@@ -22,6 +22,8 @@ from axiom.forward import ForwardTestRegistry
 from axiom.node import (
     ISOLATED_EXECUTION_PROFILE,
     POLYMARKET_AUTONOMY_PROTOCOL_ID,
+    POLYMARKET_AUTONOMY_PROTOCOL_V1_ID,
+    POLYMARKET_AUTONOMY_PROTOCOL_V2_ID,
     POLYMARKET_AUTONOMY_JOB_NAME,
     POLYMARKET_DATASET_ID,
     POLYMARKET_HISTORICAL_JOB_NAME,
@@ -344,6 +346,136 @@ class HistoricalRefreshSchedulingTests(unittest.TestCase):
                 ),
                 1,
             )
+    def test_v1_waiting_campaign_rolls_to_v2_once_with_price_proxy_features(self) -> None:
+        """An obsolete v1 input error is audited, never treated as economic."""
+        from axiom.experiment_plan import ExperimentPlan
+
+        old_campaign_id = f"{POLYMARKET_AUTONOMY_PROTOCOL_V1_ID}:campaign"
+        new_campaign_id = f"{POLYMARKET_AUTONOMY_PROTOCOL_V2_ID}:campaign"
+        historical_rows = [
+            {
+                "timestamp": T0.isoformat(),
+                "market_id": "historical-price-proxy-market",
+                "price": 0.50,
+            }
+        ]
+        with AxiomStore(":memory:") as store:
+            store.save_dataset(
+                POLYMARKET_DATASET_ID,
+                "v1",
+                historical_rows,
+                quality="PRICE_PROXY",
+            )
+            store.save_dataset(
+                POLYMARKET_DATASET_ID,
+                "v2",
+                historical_rows,
+                quality="PRICE_PROXY",
+            )
+            node = ResearchNode(
+                NodeConfig(":memory:", crypto_enabled=False),
+                provider=InMemoryPredictionProvider([]),
+                store=store,
+                clock=lambda: T0,
+            )
+            old = node.research_processor.start_polymarket_campaign(
+                old_campaign_id,
+                dataset_id=POLYMARKET_DATASET_ID,
+                dataset_version="v1",
+                protocol_id=POLYMARKET_AUTONOMY_PROTOCOL_V1_ID,
+                now=T0,
+            )
+            old_protocol = old["protocol"]
+            old_queue = node.research_processor.bus.list_campaign_trials(
+                old_campaign_id,
+                limit=100,
+            )
+            self.assertEqual(len(old_queue), 1)
+            node.research_processor._advance_campaign_after_result(
+                old_queue[0],
+                {
+                    "accepted": False,
+                    "reason_code": "INSUFFICIENT_DATA",
+                    "candidate_id": "v1-data-error",
+                },
+                now=T0,
+            )
+            waiting = node.research_processor.campaign_state(old_campaign_id)
+            self.assertIsNotNone(waiting)
+            assert waiting is not None
+            self.assertEqual(waiting["status"], "WAITING_FOR_DATA")
+            store.set_scheduler_state(
+                POLYMARKET_AUTONOMY_JOB_NAME,
+                {
+                    "protocol_id": POLYMARKET_AUTONOMY_PROTOCOL_V1_ID,
+                    "campaign_id": old_campaign_id,
+                    "dataset_id": POLYMARKET_DATASET_ID,
+                    "dataset_version": "v1",
+                    "status": "WAITING_FOR_DATA",
+                },
+            )
+
+            first = node._start_polymarket_campaign(
+                {"dataset_id": POLYMARKET_DATASET_ID, "dataset_version": "v2"},
+                {"attestation_hash": "v2-attestation"},
+                T0,
+            )
+            old_job = store.get_operator_job(
+                node.research_processor.campaign_job_name(old_campaign_id)
+            )
+            self.assertIsNotNone(old_job)
+            assert old_job is not None
+            self.assertEqual(old_job["status"], "SOFTWARE_OR_INPUT_ERROR")
+            self.assertFalse(old_job["resumable"])
+            self.assertEqual(old_job["payload"]["reason_code"], "SUPERSEDED_PROTOCOL")
+            self.assertEqual(old_job["payload"]["supersession_reason"], "SUPERSEDED_PROTOCOL")
+            self.assertEqual(old_job["payload"]["protocol"], old_protocol)
+            self.assertEqual(
+                old_job["payload"]["counts"]["economic_rejection"],
+                0,
+            )
+            self.assertEqual(first["protocol_id"], POLYMARKET_AUTONOMY_PROTOCOL_V2_ID)
+            self.assertEqual(first["campaign_id"], new_campaign_id)
+            queued_v2 = node.research_processor.bus.list_campaign_trials(
+                new_campaign_id,
+                limit=100,
+            )
+            self.assertEqual(len(queued_v2), 1)
+            v2_plan_payload = queued_v2[0].payload["experiment_plan"]
+            self.assertEqual(
+                v2_plan_payload["allowed_features"],
+                ["timestamp", "market_id", "yes_mid"],
+            )
+            self.assertNotIn("settlement", v2_plan_payload["allowed_features"])
+            v2_plan = ExperimentPlan.from_mapping(
+                v2_plan_payload,
+                hypothesis_id=queued_v2[0].payload["hypothesis_id"],
+            )
+            loaded_rows, _ = node.research_processor._load_split(v2_plan, boundary_override=first["campaign"]["protocol"]["dataset_boundary"])
+            self.assertEqual(loaded_rows[0]["yes_mid"], 0.50)
+
+            second = node._start_polymarket_campaign(
+                {"dataset_id": POLYMARKET_DATASET_ID, "dataset_version": "v2"},
+                {"attestation_hash": "v2-attestation"},
+                T0,
+            )
+            self.assertEqual(second, first)
+            self.assertEqual(
+                len(
+                    node.research_processor.bus.list_campaign_trials(
+                        new_campaign_id,
+                        limit=100,
+                    )
+                ),
+                1,
+            )
+            self.assertEqual(
+                store.get_operator_job(
+                    node.research_processor.campaign_job_name(old_campaign_id)
+                )["payload"]["reason_code"],
+                "SUPERSEDED_PROTOCOL",
+            )
+
 
     def test_declined_campaign_reassessment_keeps_slot_and_suppresses_repeat(self) -> None:
         with AxiomStore(":memory:") as store:

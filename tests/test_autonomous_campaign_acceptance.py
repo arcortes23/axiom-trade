@@ -113,6 +113,52 @@ class AutonomousCampaignAcceptanceTests(unittest.TestCase):
             self.assertTrue(boundary["ordered_row_manifest_digest"].startswith("sha256:"))
             self.assertNotIn("ordered_row_identities", boundary)
             self.assertNotIn("ordered_content_hashes", boundary)
+    def test_v2_price_proxy_protocol_uses_only_present_required_features(self) -> None:
+        from axiom.experiment_plan import ExperimentPlan
+
+        rows = [
+            {
+                "timestamp": T0.isoformat(),
+                "market_id": "historical-price-proxy-market",
+                "price": 0.50,
+            }
+        ]
+        with AxiomStore(":memory:") as store:
+            store.save_dataset(DATASET_ID, "v2", rows, quality="PRICE_PROXY")
+            processor = AutonomousResearchProcessor(store, clock=lambda: T0)
+            state = processor.start_polymarket_campaign(
+                "polymarket-paper-campaign-v2:campaign",
+                dataset_id=DATASET_ID,
+                dataset_version="v2",
+                now=T0,
+            )
+            self.assertEqual(state["schema_version"], "polymarket-finite-campaign-v2")
+            self.assertEqual(
+                state["protocol"]["required_features"],
+                ["timestamp", "market_id", "yes_mid"],
+            )
+            queued = processor.bus.list_campaign_trials(
+                "polymarket-paper-campaign-v2:campaign",
+                limit=100,
+            )
+            self.assertEqual(len(queued), 1)
+            plan_payload = queued[0].payload["experiment_plan"]
+            self.assertEqual(
+                plan_payload["allowed_features"],
+                ["timestamp", "market_id", "yes_mid"],
+            )
+            plan = ExperimentPlan.from_mapping(
+                plan_payload,
+                hypothesis_id=queued[0].payload["hypothesis_id"],
+            )
+            loaded_rows, _ = processor._load_split(
+                plan,
+                boundary_override=state["protocol"]["dataset_boundary"],
+            )
+            self.assertEqual(loaded_rows[0]["yes_mid"], 0.50)
+            self.assertNotIn("yes_bid", loaded_rows[0])
+            self.assertNotIn("yes_ask", loaded_rows[0])
+
     def test_campaign_start_deduplicates_prior_multi_parameter_plan(self) -> None:
         with AxiomStore(":memory:") as store:
             store.save_dataset(
