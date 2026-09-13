@@ -411,7 +411,7 @@ def _trade_alias_values(
                 raise CanaryBlocked("CANARY_TRADE_IDENTITY_CONFLICT")
             text = canonical
         else:
-            text = str(raw or "").strip()
+            text = str(raw if raw is not None else "").strip()
             if not text:
                 raise CanaryBlocked("CANARY_TRADE_IDENTITY_UNAVAILABLE")
         values.append(text)
@@ -435,6 +435,40 @@ def _trade_side_alias(
     if side not in {"BUY", "SELL"}:
         raise CanaryBlocked("CANARY_TRADE_IDENTITY_CONFLICT")
     return side
+
+
+def _optional_trade_alias_values(
+    source: Any,
+    names: Sequence[str],
+) -> tuple[bool, list[str]]:
+    """Read optional maker economics without dropping numeric zero."""
+    present = False
+    values: list[str] = []
+    for name in names:
+        raw = _sdk_value(source, name, _UNSET)
+        if raw is _UNSET:
+            continue
+        present = True
+        if raw is None:
+            continue
+        text = str(raw).strip()
+        if not text:
+            raise CanaryBlocked("CANARY_TRADE_IDENTITY_CONFLICT")
+        values.append(text)
+    if len(set(values)) > 1:
+        raise CanaryBlocked("CANARY_TRADE_IDENTITY_CONFLICT")
+    return present, values
+
+def _maker_order_economics_complete(order: Mapping[str, Any]) -> bool:
+    if any(
+        order.get(field) in (None, "")
+        for field in ("asset_id", "price", "size")
+    ):
+        return False
+    return order.get("fee_rate_bps") not in (None, "") or order.get(
+        "fee"
+    ) not in (None, "")
+
 
 
 def _normalize_nested_maker_orders(
@@ -527,8 +561,13 @@ def _normalize_nested_maker_orders(
                     True,
                 ),
             ):
-                _present, values = _trade_alias_values(maker_order, aliases)
+                present, values = _optional_trade_alias_values(
+                    maker_order, aliases
+                )
+                if not present:
+                    continue
                 if not values:
+                    normalized_order[output_name] = None
                     continue
                 if numeric:
                     try:
@@ -589,6 +628,10 @@ def _account_trade_binding(
     if role not in {None, "MAKER", "TAKER"}:
         raise CanaryBlocked("CANARY_TRADE_IDENTITY_CONFLICT")
     top_side = _trade_side_alias(trade, ("side", "order_side"), required=False)
+    _top_asset_present, top_asset_values = _trade_alias_values(
+        trade, ("asset_id", "assetId", "asset")
+    )
+    top_asset = top_asset_values[0] if top_asset_values else None
     account_side = _trade_side_alias(
         trade, ("account_order_side", "accountOrderSide"), required=False
     )
@@ -610,12 +653,11 @@ def _account_trade_binding(
         if len(matching_makers) != 1:
             raise CanaryBlocked("CANARY_TRADE_IDENTITY_UNAVAILABLE")
         maker_order = matching_makers[0]
-        if any(
-            field not in maker_order
-            for field in ("asset_id", "price", "size", "fee_rate_bps")
-        ):
+        if not _maker_order_economics_complete(maker_order):
             raise CanaryBlocked("CANARY_TRADE_IDENTITY_UNAVAILABLE")
         resolved_side = maker_order["side"]
+        if top_asset is not None and maker_order["asset_id"] != top_asset:
+            raise CanaryBlocked("CANARY_TRADE_IDENTITY_CONFLICT")
     elif role == "TAKER":
         if in_top and in_maker:
             raise CanaryBlocked("CANARY_TRADE_IDENTITY_CONFLICT")
@@ -650,12 +692,11 @@ def _account_trade_binding(
                     raise CanaryBlocked("CANARY_TRADE_IDENTITY_UNAVAILABLE")
             else:
                 maker_order = matching_makers[0]
-                if any(
-                    field not in maker_order
-                    for field in ("asset_id", "price", "size", "fee_rate_bps")
-                ):
+                if not _maker_order_economics_complete(maker_order):
                     raise CanaryBlocked("CANARY_TRADE_IDENTITY_UNAVAILABLE")
                 resolved_side = maker_order["side"]
+                if top_asset is not None and maker_order["asset_id"] != top_asset:
+                    raise CanaryBlocked("CANARY_TRADE_IDENTITY_CONFLICT")
         if maker_order is not None:
             resolved_side = maker_order["side"]
     if account_side is not None and account_side != resolved_side:
