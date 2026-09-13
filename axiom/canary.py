@@ -62,6 +62,8 @@ AUTONOMOUS_CANARY_LIMITS = {
     "max_slippage_bps": DEFAULT_MAX_SLIPPAGE_BPS,
 }
 _UNSET = object()
+_MAX_ACCOUNT_TRADE_PAGES = 256
+_ACCOUNT_TRADE_END_CURSOR = "LTE="
 _AUTONOMOUS_SCAN_CYCLE_RETENTION = 8
 CANARY_SIGNAL_TRANSIENT_RETENTION = 4096
 CANARY_SUBMISSION_TIMEOUT_SECONDS = 15.0
@@ -306,6 +308,79 @@ _CANARY_ACCEPTED_STATUSES = frozenset(
 _CANARY_UNKNOWN_RESPONSE_CODES = frozenset(
     {"", "UNKNOWN", "UNSPECIFIED", "NONE", "NULL"}
 )
+def _validate_trade_history_coverage(payload: Any) -> None:
+    """Reject a trade payload unless it explicitly represents all pages."""
+    if not isinstance(payload, Mapping):
+        return
+    sources: list[Mapping[str, Any]] = [payload]
+    for key in ("coverage", "pagination"):
+        nested = payload.get(key)
+        if isinstance(nested, Mapping):
+            sources.append(nested)
+    marker = object()
+    for source in sources:
+        complete = source.get(
+            "complete",
+            source.get("is_complete", source.get("complete_coverage", marker)),
+        )
+        if complete is not marker:
+            if not isinstance(complete, bool):
+                raise CanaryBlocked("CANARY_TRADE_RESPONSE_INVALID")
+            if not complete:
+                raise CanaryBlocked("CANARY_TRADE_HISTORY_INCOMPLETE")
+
+        truncated = source.get("truncated", source.get("is_truncated", marker))
+        if truncated is not marker:
+            if not isinstance(truncated, bool):
+                raise CanaryBlocked("CANARY_TRADE_RESPONSE_INVALID")
+            if truncated:
+                raise CanaryBlocked("CANARY_TRADE_HISTORY_INCOMPLETE")
+
+        has_more = source.get("has_more", source.get("hasMore", marker))
+        raw_cursor = source.get("next_cursor", source.get("nextCursor", marker))
+        if has_more is not marker:
+            if not isinstance(has_more, bool):
+                raise CanaryBlocked("CANARY_TRADE_RESPONSE_INVALID")
+            if has_more:
+                if (
+                    raw_cursor is marker
+                    or raw_cursor is None
+                    or not isinstance(raw_cursor, str)
+                    or not raw_cursor
+                ):
+                    raise CanaryBlocked("CANARY_TRADE_HISTORY_CURSOR_INVALID")
+                if raw_cursor == _ACCOUNT_TRADE_END_CURSOR:
+                    raise CanaryBlocked("CANARY_TRADE_HISTORY_CURSOR_INVALID")
+                raise CanaryBlocked("CANARY_TRADE_HISTORY_INCOMPLETE")
+        if raw_cursor is not marker:
+            if raw_cursor is None:
+                pass
+            elif not isinstance(raw_cursor, str) or not raw_cursor:
+                raise CanaryBlocked("CANARY_TRADE_HISTORY_CURSOR_INVALID")
+            elif raw_cursor != _ACCOUNT_TRADE_END_CURSOR:
+                if has_more is False:
+                    raise CanaryBlocked("CANARY_TRADE_HISTORY_CURSOR_INVALID")
+                raise CanaryBlocked("CANARY_TRADE_HISTORY_INCOMPLETE")
+            elif has_more is True:
+                raise CanaryBlocked("CANARY_TRADE_HISTORY_CURSOR_INVALID")
+
+        raw_status = source.get(
+            "coverage_status",
+            source.get("coverageStatus", source.get("status", marker)),
+        )
+        if raw_status is not marker:
+            status = str(raw_status or "").strip().upper()
+            if status in {"INCOMPLETE", "PARTIAL", "TRUNCATED", "UNKNOWN", "ERROR"}:
+                raise CanaryBlocked("CANARY_TRADE_HISTORY_INCOMPLETE")
+            if status not in {"COMPLETE", "EXHAUSTED", "FULL", "TERMINAL"}:
+                # A trade row's status is not a coverage marker; only inspect
+                # status when this mapping carries no trade identity.
+                if not any(
+                    name in payload
+                    for name in ("trade_id", "tradeId", "fill_id", "id")
+                ):
+                    raise CanaryBlocked("CANARY_TRADE_RESPONSE_INVALID")
+
 
 
 def _canonical_exchange_order_id(value: Any) -> str | None:
@@ -730,6 +805,160 @@ def _read_only_operation(
             elif isinstance(item, datetime):
                 result[name] = ensure_utc(item).isoformat()
         return result
+    def trade_page_parts(value: Any) -> tuple[Sequence[Any], bool, str | None] | None:
+        """Normalize one SDK account-trade page and validate continuation."""
+        page_items = _sdk_value(value, "items", _UNSET)
+        if page_items is _UNSET:
+            for candidate_key in ("data", "trades", "fills"):
+                candidate = _sdk_value(value, candidate_key, _UNSET)
+                if candidate is not _UNSET:
+                    page_items = candidate
+                    break
+        if page_items is _UNSET:
+            return None
+        if not isinstance(page_items, Sequence) or isinstance(
+            page_items, (str, bytes, bytearray)
+        ):
+            raise CanaryBlocked("CANARY_TRADE_RESPONSE_INVALID")
+
+        raw_has_more = _sdk_value(value, "has_more", _UNSET)
+        if raw_has_more is _UNSET:
+            raw_has_more = _sdk_value(value, "hasMore", _UNSET)
+        raw_cursor = _sdk_value(value, "next_cursor", _UNSET)
+        if raw_cursor is _UNSET:
+            raw_cursor = _sdk_value(value, "nextCursor", _UNSET)
+        if raw_cursor is _UNSET or raw_cursor is None:
+            cursor: str | None = None
+        elif isinstance(raw_cursor, str) and raw_cursor:
+            # The SDK translates its END_CURSOR sentinel to ``None``.  Accept
+            # it here as well for mapping test doubles that expose raw pages.
+            cursor = (
+                None
+                if raw_cursor == _ACCOUNT_TRADE_END_CURSOR
+                else raw_cursor
+            )
+        else:
+            raise CanaryBlocked("CANARY_TRADE_HISTORY_CURSOR_INVALID")
+        if raw_has_more is _UNSET:
+            has_more = cursor is not None
+        elif isinstance(raw_has_more, bool):
+            has_more = raw_has_more
+        else:
+            raise CanaryBlocked("CANARY_TRADE_RESPONSE_INVALID")
+        if has_more and cursor is None:
+            raise CanaryBlocked("CANARY_TRADE_HISTORY_CURSOR_INVALID")
+        if not has_more and cursor is not None:
+            raise CanaryBlocked("CANARY_TRADE_HISTORY_CURSOR_INVALID")
+        return page_items, has_more, cursor
+
+    def trade_page_batches(source: Any) -> Any:
+        """Yield all account-trade pages or fail closed on incomplete reads.
+
+        ``polymarket-client`` exposes a Paginator whose iteration yields Page
+        objects, not individual trades.  Drain it explicitly so a page cap,
+        repeated cursor, or malformed continuation cannot look like a complete
+        empty/partial trade set to reconciliation.
+        """
+        first_page = getattr(source, "first_page", None)
+        from_cursor = getattr(source, "from_cursor", None)
+        if callable(first_page):
+            if not callable(from_cursor):
+                raise CanaryBlocked("CANARY_TRADE_HISTORY_CURSOR_INVALID")
+            cursor: str | None = None
+            seen_cursors: set[str] = set()
+            for page_number in range(_MAX_ACCOUNT_TRADE_PAGES):
+                try:
+                    if page_number == 0:
+                        page = first_page()
+                    else:
+                        next_paginator = from_cursor(cursor)
+                        next_first_page = getattr(next_paginator, "first_page", None)
+                        if not callable(next_first_page):
+                            raise CanaryBlocked(
+                                "CANARY_TRADE_HISTORY_CURSOR_INVALID"
+                            )
+                        page = next_first_page()
+                except CanaryBlocked:
+                    raise
+                except Exception as exc:
+                    raise CanaryBlocked(
+                        "CANARY_TRADE_HISTORY_CURSOR_INVALID"
+                    ) from exc
+                parts = trade_page_parts(page)
+                if parts is None:
+                    raise CanaryBlocked("CANARY_TRADE_RESPONSE_INVALID")
+                rows, has_more, next_cursor = parts
+                yield rows
+                if not has_more:
+                    return
+                assert next_cursor is not None
+                if next_cursor in seen_cursors:
+                    raise CanaryBlocked("CANARY_TRADE_HISTORY_CURSOR_INVALID")
+                seen_cursors.add(next_cursor)
+                cursor = next_cursor
+            raise CanaryBlocked("CANARY_TRADE_HISTORY_INCOMPLETE")
+
+        direct_page = trade_page_parts(source)
+        if direct_page is not None:
+            rows, has_more, _next_cursor = direct_page
+            yield rows
+            if has_more:
+                raise CanaryBlocked("CANARY_TRADE_HISTORY_INCOMPLETE")
+            return
+        if isinstance(source, Mapping):
+            # A bare mapping is one already-drained trade only when it carries
+            # a durable trade identity, not an iterable of mapping keys.
+            if any(
+                key in source for key in ("trade_id", "tradeId", "fill_id", "id")
+            ):
+                yield (source,)
+                return
+            raise CanaryBlocked("CANARY_TRADE_RESPONSE_INVALID")
+
+        try:
+            iterator = iter(source)
+        except TypeError as exc:
+            raise CanaryBlocked("CANARY_TRADE_RESPONSE_INVALID") from exc
+        try:
+            first = next(iterator)
+        except StopIteration:
+            return
+        first_parts = trade_page_parts(first)
+        if first_parts is None:
+            # Legacy/test transports may return one already-drained sequence of
+            # individual trades.  There is no continuation contract to drain.
+            yield (first,)
+            for value in iterator:
+                yield (value,)
+            return
+
+        seen_cursors: set[str] = set()
+        page = first
+        for page_number in range(_MAX_ACCOUNT_TRADE_PAGES):
+            parts = first_parts if page_number == 0 else trade_page_parts(page)
+            if parts is None:
+                raise CanaryBlocked("CANARY_TRADE_RESPONSE_INVALID")
+            rows, has_more, next_cursor = parts
+            yield rows
+            if not has_more:
+                return
+            assert next_cursor is not None
+            if next_cursor in seen_cursors:
+                raise CanaryBlocked("CANARY_TRADE_HISTORY_CURSOR_INVALID")
+            seen_cursors.add(next_cursor)
+            try:
+                page = next(iterator)
+            except StopIteration as exc:
+                raise CanaryBlocked(
+                    "CANARY_TRADE_HISTORY_CURSOR_INVALID"
+                ) from exc
+            except Exception as exc:
+                raise CanaryBlocked(
+                    "CANARY_TRADE_HISTORY_CURSOR_INVALID"
+                ) from exc
+            first_parts = None
+        raise CanaryBlocked("CANARY_TRADE_HISTORY_INCOMPLETE")
+
 
     if operation == "get_order":
         if not order_id:
@@ -784,78 +1013,73 @@ def _read_only_operation(
                 before=before,
             )
             records: list[dict[str, Any]] = []
-            iterator = (
-                iter(paginator)
-                if not isinstance(paginator, Mapping)
-                else iter((paginator,))
-            )
-            for sequence, value in enumerate(iterator):
-                record = normalize_record(
-                    value,
-                    (
-                        "id",
-                        "trade_id",
-                        "order_id",
-                        "taker_order_id",
-                        "condition_id",
-                        "asset_id",
-                        "market",
-                        "side",
-                        "price",
-                        "size",
-                        "timestamp",
-                        "fee",
-                        "fee_rate_bps",
-                        "match_time",
-                        "matched_at",
-                        "updated_at",
-                        "trader_side",
-                        "transaction_hash",
-                        "status",
-                        "state",
-                        "owner",
-                        "owner_address",
-                        "maker",
-                        "maker_address",
-                        "account",
-                        "account_address",
-                    ),
-                )
-                maker_orders = _sdk_value(value, "maker_orders", ())
-                maker_order_ids: list[str] = []
-                if isinstance(maker_orders, Sequence) and not isinstance(
-                    maker_orders, (str, bytes, bytearray)
-                ):
-                    maker_order_ids = [
-                        str(identifier)
-                        for maker_order in maker_orders
-                        if (
-                            identifier := _sdk_value(
-                                maker_order, "order_id", None
-                            )
-                        ) is not None
-                    ]
-                    if maker_order_ids:
-                        record["maker_order_ids"] = maker_order_ids
-                if order_id is not None:
-                    requested_order_id = str(order_id)
-                    direct_order_id = (
-                        record.get("taker_order_id") or record.get("order_id")
+            sequence = 0
+            for batch in trade_page_batches(paginator):
+                for value in batch:
+                    record = normalize_record(
+                        value,
+                        (
+                            "id",
+                            "trade_id",
+                            "order_id",
+                            "taker_order_id",
+                            "condition_id",
+                            "asset_id",
+                            "market",
+                            "side",
+                            "price",
+                            "size",
+                            "timestamp",
+                            "fee",
+                            "fee_rate_bps",
+                            "match_time",
+                            "matched_at",
+                            "updated_at",
+                            "trader_side",
+                            "transaction_hash",
+                            "status",
+                            "state",
+                            "owner",
+                            "owner_address",
+                            "maker",
+                            "maker_address",
+                            "account",
+                            "account_address",
+                        ),
                     )
-                    if (
-                        str(direct_order_id or "") != requested_order_id
-                        and requested_order_id not in maker_order_ids
+                    maker_orders = _sdk_value(value, "maker_orders", ())
+                    maker_order_ids: list[str] = []
+                    if isinstance(maker_orders, Sequence) and not isinstance(
+                        maker_orders, (str, bytes, bytearray)
                     ):
-                        if sequence >= 255:
-                            break
-                        continue
-                durable_id = record.get("trade_id") or record.get("id")
-                if durable_id is not None:
-                    record["trade_id"] = str(durable_id)
-                record.setdefault("sequence", sequence)
-                records.append(record)
-                if sequence >= 255:
-                    break
+                        maker_order_ids = [
+                            str(identifier)
+                            for maker_order in maker_orders
+                            if (
+                                identifier := _sdk_value(
+                                    maker_order, "order_id", None
+                                )
+                            ) is not None
+                        ]
+                        if maker_order_ids:
+                            record["maker_order_ids"] = maker_order_ids
+                    if order_id is not None:
+                        requested_order_id = str(order_id)
+                        direct_order_id = (
+                            record.get("taker_order_id") or record.get("order_id")
+                        )
+                        if (
+                            str(direct_order_id or "") != requested_order_id
+                            and requested_order_id not in maker_order_ids
+                        ):
+                            sequence += 1
+                            continue
+                    durable_id = record.get("trade_id") or record.get("id")
+                    if durable_id is not None:
+                        record["trade_id"] = str(durable_id)
+                    record.setdefault("sequence", sequence)
+                    records.append(record)
+                    sequence += 1
             return records
         except CanaryBlocked:
             raise
@@ -7792,15 +8016,23 @@ class CanaryService:
 
     @staticmethod
     def _recovery_records(value: Any, *, key: str) -> list[Any]:
+        _validate_trade_history_coverage(value)
         if isinstance(value, Mapping):
+            found_nested = False
             for field in (key, "data", "items", "results"):
-                nested = value.get(field)
+                if field not in value:
+                    continue
+                found_nested = True
+                nested = value[field]
                 if isinstance(nested, (list, tuple)):
                     return list(nested)
+                raise CanaryBlocked("CANARY_TRADE_RESPONSE_INVALID")
+            if found_nested:
+                raise CanaryBlocked("CANARY_TRADE_RESPONSE_INVALID")
             return [value]
         if isinstance(value, (list, tuple)):
             return list(value)
-        return []
+        raise CanaryBlocked("CANARY_TRADE_RESPONSE_INVALID")
 
     @staticmethod
     def _recovery_method(
@@ -7888,11 +8120,14 @@ class CanaryService:
         ledger: Mapping[str, Any],
         signal: Mapping[str, Any],
         order: Any,
-        trades: Sequence[Any],
+        trades: Sequence[Any] | Mapping[str, Any],
         exchange_order_id: str,
         *,
         now: datetime,
     ) -> dict[str, Any]:
+        _validate_trade_history_coverage(trades)
+        if isinstance(trades, Mapping):
+            trades = self._recovery_records(trades, key="trades")
         binding_evidence = self._validate_recovery_persisted_binding(ledger, signal)
         if response_order_id(order) != exchange_order_id:
             raise CanaryBlocked("CANARY_RECOVERY_ORDER_ID_MISMATCH")
@@ -7967,6 +8202,8 @@ class CanaryService:
             trade_state = str(
                 mapping_value(trade, "status", "state") or ""
             ).strip().upper()
+            if trade_side(trade) != "BUY":
+                raise CanaryBlocked("CANARY_RECOVERY_TRADE_SIDE_MISMATCH")
             try:
                 trade_price_value = trade_price(trade)
                 trade_quantity_value = trade_quantity(trade)
@@ -8119,7 +8356,11 @@ class CanaryService:
             trades = self._recovery_records(raw_trades, key="trades")
         else:
             order, trades = _observed
-            trades = list(trades)
+            if isinstance(trades, Mapping):
+                _validate_trade_history_coverage(trades)
+                trades = self._recovery_records(trades, key="trades")
+            else:
+                trades = list(trades)
         observed = self._validate_recovery_observation(
             ledger, signal, order, trades, exchange_order_id,
             now=ensure_utc(self.clock()),

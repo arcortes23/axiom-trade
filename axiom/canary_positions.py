@@ -216,6 +216,7 @@ from .canary import (
     PolymarketClobV2Venue,
     _call_with_timeout,
     _canonical_exchange_order_id,
+    _validate_trade_history_coverage,
 )
 from .domain import ensure_utc, parse_timestamp, utc_now
 
@@ -759,7 +760,9 @@ def _mark_owned_equity(
     return {"status": "KNOWN", "marks": marks, "blocked": []}
 
 
+
 def _parse_trades(payload: Any) -> list[Mapping[str, Any]]:
+    _validate_trade_history_coverage(payload)
     rows: Any = None
     if isinstance(payload, Mapping):
         for key in ("trades", "fills", "data", "items"):

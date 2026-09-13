@@ -1332,6 +1332,84 @@ class MutationSchedulingTests(unittest.TestCase):
                     "AUTONOMOUS_CANARY_DISABLED",
                 )
 
+    def test_persisted_autonomous_fatal_survives_restart_while_research_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = str(Path(directory) / "persisted-autonomous-fatal.sqlite")
+            with AxiomStore(db) as store:
+                seed = ResearchNode(
+                    NodeConfig(db, mutation_enabled=True, crypto_enabled=False),
+                    provider=InMemoryPredictionProvider([]),
+                    store=store,
+                    clock=lambda: T0,
+                    sleep=lambda _: None,
+                )
+                seed._persist_autonomous_fatal("AUTONOMOUS_WORKER_TICK_EXHAUSTED")
+
+                restarted = ResearchNode(
+                    NodeConfig(db, mutation_enabled=True, crypto_enabled=False),
+                    provider=InMemoryPredictionProvider([]),
+                    store=store,
+                    clock=lambda: T0,
+                    sleep=lambda _: None,
+                )
+                self.assertTrue(restarted._auto_canary_fatal)
+                self.assertNotIn(
+                    "autonomous-canary",
+                    restarted._worker_thread_specs(max_cycles=1),
+                )
+
+                def collector_worker(max_cycles: int | None) -> None:
+                    restarted._collection_count += 1
+                    with restarted._worker_condition:
+                        restarted._worker_condition.notify_all()
+
+                def research_worker() -> None:
+                    with restarted._worker_condition:
+                        restarted._research_passes += 1
+                        restarted._worker_condition.notify_all()
+                    while not restarted.stop_event.wait(0.01):
+                        pass
+
+                def health_worker() -> None:
+                    with restarted._worker_condition:
+                        restarted._health_passes += 1
+                        restarted._worker_condition.notify_all()
+                    while not restarted.stop_event.wait(0.01):
+                        pass
+
+                restarted._collector_worker_loop = collector_worker  # type: ignore[method-assign]
+                restarted._research_worker_loop = research_worker  # type: ignore[method-assign]
+                restarted._health_worker_loop = health_worker  # type: ignore[method-assign]
+                restarted._configure_logging = lambda: None  # type: ignore[method-assign]
+                restarted._start_heartbeat_watchdog = lambda: None  # type: ignore[method-assign]
+                restarted._stop_heartbeat_watchdog = lambda: None  # type: ignore[method-assign]
+                with patch.object(
+                    restarted._auto_canary_worker,
+                    "tick",
+                    side_effect=AssertionError("persisted fatal worker must stay fenced"),
+                ) as tick:
+                    restarted.run(max_cycles=1)
+
+                tick.assert_not_called()
+                self.assertGreaterEqual(restarted._research_passes, 1)
+                self.assertGreaterEqual(restarted._health_passes, 1)
+                canonical = store.connection.execute(
+                    "SELECT worker_status FROM canary_autonomous_state WHERE singleton=1"
+                ).fetchone()
+                self.assertIsNotNone(canonical)
+                assert canonical is not None
+                self.assertEqual(canonical["worker_status"], "FATAL")
+                auto_state = store.get_worker_state("autonomous-canary")
+                self.assertIsNotNone(auto_state)
+                assert auto_state is not None
+                self.assertEqual(auto_state["status"], "fatal")
+                self.assertEqual(auto_state["payload"]["worker_status"], "FATAL")
+                self.assertTrue(auto_state["payload"]["fatal"])
+                self.assertEqual(
+                    restarted.status()["workers"]["autonomous-canary"]["status"],
+                    "fatal",
+                )
+
     def test_unknown_no_retry_result_marks_worker_degraded(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             db = str(Path(directory) / "unknown-no-retry.sqlite")

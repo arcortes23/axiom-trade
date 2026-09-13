@@ -353,8 +353,17 @@ class PolymarketAdapter(PredictionMarketDataProvider):
                 continue
             seen_ids.add(snapshot.market_id)
             snapshots.append(snapshot)
-        coverage_status = "PARTIAL" if next_cursor is not None else "COMPLETE"
+        # A provider/transport error invalidates the page even if a partial
+        # payload happened to be returned alongside it.
+        if request_failed:
+            coverage_status = "ERROR"
+        elif next_cursor is not None or malformed_count:
+            coverage_status = "PARTIAL"
+        else:
+            coverage_status = "COMPLETE"
         error_reason: str | None = "REQUEST_FAILED" if request_failed else None
+        if malformed_count and error_reason is None:
+            error_reason = "MALFORMED_ROWS"
         if after_cursor is not None and next_cursor == after_cursor:
             next_cursor = None
             coverage_status = "ERROR"

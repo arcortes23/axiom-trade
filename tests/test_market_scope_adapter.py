@@ -221,6 +221,22 @@ class PolymarketMarketScopeAdapterTests(unittest.TestCase):
         self.assertEqual(complete.coverage_status, "COMPLETE")
         self.assertIsNone(complete.next_cursor)
 
+    def test_keyset_page_with_malformed_terminal_rows_is_partial(self) -> None:
+        def opener(request: object, *, timeout: float) -> _Response:
+            del request, timeout
+            return _Response({"markets": [GAMMA_MARKET, None], "next_cursor": None})
+
+        adapter = PolymarketAdapter(opener=opener)
+        page = adapter.market_page(4)
+
+        self.assertEqual([item.market_id for item in page.snapshots], ["gamma-market-42"])
+        self.assertEqual(page.raw_count, 2)
+        self.assertEqual(page.unique_count, 1)
+        self.assertEqual(page.malformed_count, 1)
+        self.assertEqual(page.coverage_status, "PARTIAL")
+        self.assertEqual(page.error_reason, "MALFORMED_ROWS")
+        self.assertIsNone(page.next_cursor)
+
     def test_keyset_page_rejects_repeated_cursor_without_continuation(self) -> None:
         calls: list[str] = []
 

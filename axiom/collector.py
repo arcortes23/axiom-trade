@@ -158,6 +158,7 @@ class CollectionCycle:
     capacity_reason: str | None = None
     discovery_coverage_status: str | None = None
     discovery_cursor: str | None = None
+    discovery_complete: bool | None = None
 
     @property
     def duration_seconds(self) -> float:
@@ -209,6 +210,7 @@ class CollectionCycle:
             "capacity_reason": self.capacity_reason,
             "discovery_coverage_status": self.discovery_coverage_status,
             "discovery_cursor": self.discovery_cursor,
+            "discovery_complete": self.discovery_complete,
         }
 
 
@@ -448,6 +450,7 @@ class PolymarketCollector:
                 discovery_cursor = next_cursor
             except Exception as exc:
                 counters["errors"] += 1
+                discovery_coverage_status = "ERROR"
                 self.store.save_collection_error(None, started, "discovery", str(exc))
         if not configured and not scope_candidate_set and remaining > len(discovery_scheduled):
             try:
@@ -578,6 +581,15 @@ class PolymarketCollector:
         )
         if capacity_reason is None and due_candidates and len(candidate_scheduled) < len(due_candidates):
             capacity_reason = "COLLECTOR_CAPACITY_INSUFFICIENT"
+        discovery_complete = (
+            None
+            if configured or scope_candidate_set
+            else (
+                discovery_coverage_status == "COMPLETE"
+                if discovery_coverage_status is not None
+                else None
+            )
+        )
         cycle = CollectionCycle(
             started,
             ended,
@@ -604,6 +616,7 @@ class PolymarketCollector:
                 if isinstance(discovery_cursor, str) and discovery_cursor.strip()
                 else None
             ),
+            discovery_complete=discovery_complete,
             **counters,
         )
         cycle_payload = cycle.as_record()
@@ -641,9 +654,19 @@ class PolymarketCollector:
                 market_type=MarketType.PREDICTION,
                 timeframe="live",
                 start_timestamp=min(source_times) if source_times else None,
-                end_timestamp=max(source_times) if source_times else None,
                 row_count=len(forward_snapshots),
-                completeness=1.0 if counters["errors"] == 0 else max(0.0, 1.0 - counters["errors"] / max(1, len(planned_ids))),
+                completeness=(
+                    1.0
+                    if counters["errors"] == 0 and discovery_complete is not False
+                    else (
+                        0.0
+                        if discovery_complete is False
+                        else max(
+                            0.0,
+                            1.0 - counters["errors"] / max(1, len(planned_ids)),
+                        )
+                    )
+                ),
                 missing_ranges=(),
                 quality=forward_quality,
                 source_type="FORWARD_COLLECTED",
@@ -653,6 +676,8 @@ class PolymarketCollector:
                     "cycle_id": cycle_id,
                     "markets_seen": len(planned_ids),
                     "collection_cycle": cycle_payload,
+                    "discovery_coverage_status": discovery_coverage_status,
+                    "discovery_complete": discovery_complete,
                     "live_execution": False,
                 },
             )
@@ -672,6 +697,7 @@ class PolymarketCollector:
                 "discovery_carry_cursor": discovery_cursor,
                 "discovery_continuation": self._discovery_continuation,
                 "discovery_coverage_status": discovery_coverage_status,
+                "discovery_complete": discovery_complete,
                 "scope_discovery_carry_cursor": scope_cursor,
                 "scope_inventory_continuation": self._scope_inventory_continuation,
                 "candidate_bound_markets": list(candidate_bound),
@@ -2156,45 +2182,120 @@ class PolymarketCollector:
                 }
                 self.store.save_collection_error(None, observed_at, "discovery", "invalid discovery page")
                 return (), cursor, ()
-            status = str(self._scope_page_value(page, "coverage_status", "")).strip().upper()
+            raw_status = self._scope_page_value(page, "coverage_status", _UNSET)
+            status = (
+                str(raw_status).strip().upper()
+                if raw_status not in (_UNSET, None)
+                else ""
+            )
+            status_declared = raw_status not in (_UNSET, None) and bool(status)
             next_cursor = self._scope_page_value(page, "next_cursor", None)
-            if next_cursor is not None and (
-                not isinstance(next_cursor, str) or not next_cursor.strip() or next_cursor == cursor
-            ):
-                counters["errors"] += 1
-                status = "ERROR"
-                next_cursor = cursor
-                self.store.save_collection_error(None, observed_at, "discovery", "invalid or repeated keyset cursor")
+            page_error_reason = self._scope_page_value(page, "error_reason", None)
+            page_error_reason = (
+                str(page_error_reason).strip()
+                if page_error_reason is not None and str(page_error_reason).strip()
+                else None
+            )
+            request_failed = self._scope_page_value(page, "request_failed", False) is True
             raw_items = self._scope_page_value(page, "snapshots", _UNSET)
             if raw_items is _UNSET and isinstance(page, Mapping):
                 raw_items = page.get("markets", page.get("data", ()))
-            try:
-                snapshots = [
-                    item for item in list(raw_items or ())
-                    if isinstance(item, PredictionMarketSnapshot)
-                ]
-            except TypeError:
-                snapshots = []
-            malformed_count = self._scope_count(
-                self._scope_page_value(page, "malformed_count", 0)
+            if raw_items is _UNSET:
+                raw_items = ()
+            malformed_computed = 0
+            if isinstance(raw_items, (str, bytes, bytearray, Mapping)):
+                raw_values: list[Any] = []
+                malformed_computed = 1
+            else:
+                try:
+                    raw_values = list(raw_items or ())
+                except TypeError:
+                    raw_values = []
+                    malformed_computed = 1
+            snapshots = []
+            for item in raw_values:
+                if isinstance(item, PredictionMarketSnapshot):
+                    snapshots.append(item)
+                else:
+                    malformed_computed += 1
+            supplied_raw = self._scope_page_value(page, "raw_count", _UNSET)
+            raw_count = self._scope_count(
+                supplied_raw,
+                len(raw_values) if supplied_raw is _UNSET else 0,
             )
+            supplied_malformed = self._scope_page_value(page, "malformed_count", _UNSET)
+            malformed_count = max(
+                malformed_computed,
+                self._scope_count(supplied_malformed, 0)
+                if supplied_malformed is not _UNSET
+                else 0,
+            )
+            supplied_unique = self._scope_page_value(page, "unique_count", _UNSET)
+            unique_count = self._scope_count(
+                supplied_unique,
+                len(snapshots) if supplied_unique is _UNSET else 0,
+            )
+            supplied_duplicate = self._scope_page_value(page, "duplicate_count", _UNSET)
+            duplicate_count = self._scope_count(
+                supplied_duplicate,
+                0,
+            )
+
+            def persist_page_error(
+                reason: str,
+                *,
+                kind: str = "discovery",
+            ) -> None:
+                self._discovery_continuation = {
+                    **dict(self._discovery_continuation or {}),
+                    "coverage_status": "ERROR",
+                    "after_cursor": cursor,
+                    "error_reason": reason,
+                    "raw_count": raw_count,
+                    "unique_count": unique_count,
+                    "duplicate_count": duplicate_count,
+                    "malformed_count": malformed_count,
+                    "updated_at": observed_at.isoformat(),
+                }
+                self.store.save_collection_error(None, observed_at, kind, reason)
+
+            if status_declared and status not in {"PARTIAL", "COMPLETE", "BUDGET_EXHAUSTED", "ERROR"}:
+                counters["errors"] += 1
+                persist_page_error(f"INVALID_COVERAGE_STATUS:{status}")
+                return (), cursor, ()
+            if request_failed:
+                counters["errors"] += 1
+                persist_page_error(page_error_reason or "REQUEST_FAILED")
+                return (), cursor, ()
+            if next_cursor is not None and (
+                not isinstance(next_cursor, str)
+                or not next_cursor.strip()
+                or next_cursor == cursor
+            ):
+                counters["errors"] += 1
+                persist_page_error(page_error_reason or "INVALID_NEXT_CURSOR")
+                return (), cursor, ()
+            if status == "ERROR":
+                counters["errors"] += 1
+                persist_page_error(page_error_reason or "PAGE_ERROR")
+                return (), cursor, ()
             if malformed_count:
                 counters["errors"] += malformed_count
+                if page_error_reason is None:
+                    page_error_reason = f"REJECTED_PAGE_ITEMS:{malformed_count}"
                 self.store.save_collection_error(
                     None,
                     observed_at,
                     "discovery_malformed_rows",
                     f"{malformed_count} malformed public market rows",
                 )
-            if status == "ERROR":
-                counters["errors"] += 1
-                self._discovery_continuation = {
-                    **dict(self._discovery_continuation or {}),
-                    "coverage_status": status,
-                    "after_cursor": next_cursor,
-                    "updated_at": observed_at.isoformat(),
-                }
-                return (), next_cursor, ()
+                # The incoming cursor identifies the retryable frontier.  A
+                # page containing malformed rows must never advance to its
+                # returned cursor, even if the page advertises COMPLETE.
+                status = "PARTIAL"
+                continuation_cursor = cursor
+            else:
+                continuation_cursor = next_cursor
             selected = [item for item in snapshots if item.market_id not in excluded][:budget]
             selected_ids = {item.market_id for item in selected}
             deferred = [
@@ -2202,26 +2303,29 @@ class PolymarketCollector:
                 for item in snapshots
                 if item.market_id not in excluded and item.market_id not in selected_ids
             ]
-            if not selected and not deferred and next_cursor is None:
-                status = "NO_MATCHING_MARKETS"
-            elif next_cursor is not None:
-                status = status if status in {"PARTIAL", "BUDGET_EXHAUSTED"} else "PARTIAL"
-            else:
-                status = status if status in {"PARTIAL", "COMPLETE"} else "COMPLETE"
+            if not malformed_count:
+                if not selected and not deferred and continuation_cursor is None:
+                    status = "NO_MATCHING_MARKETS"
+                elif continuation_cursor is not None:
+                    status = status if status in {"PARTIAL", "BUDGET_EXHAUSTED"} else "PARTIAL"
+                else:
+                    status = status if status in {"PARTIAL", "COMPLETE"} else "COMPLETE"
             self._discovery_continuation = {
                 "request_path": str(self._scope_page_value(page, "request_path", "/markets/keyset")),
                 "request_query": dict(kwargs),
                 "query_fingerprint": self._scope_page_value(page, "query_fingerprint", None),
-                "after_cursor": next_cursor,
+                "after_cursor": continuation_cursor,
                 "coverage_status": status,
-                "raw_count": self._scope_count(self._scope_page_value(page, "raw_count", len(snapshots))),
-                "unique_count": self._scope_count(self._scope_page_value(page, "unique_count", len(snapshots))),
-                "duplicate_count": self._scope_count(self._scope_page_value(page, "duplicate_count", 0)),
-                "malformed_count": self._scope_count(self._scope_page_value(page, "malformed_count", 0)),
+                "raw_count": raw_count,
+                "unique_count": unique_count,
+                "duplicate_count": duplicate_count,
+                "malformed_count": malformed_count,
                 "requested_at": observed_at.isoformat(),
                 "updated_at": observed_at.isoformat(),
             }
-            return tuple(selected), next_cursor, tuple(deferred)
+            if page_error_reason is not None:
+                self._discovery_continuation["error_reason"] = page_error_reason
+            return tuple(selected), continuation_cursor, tuple(deferred)
 
         method = getattr(provider, "markets", None)
         if not callable(method):

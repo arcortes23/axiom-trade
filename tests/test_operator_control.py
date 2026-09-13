@@ -522,6 +522,79 @@ class OperatorControlTests(unittest.TestCase):
             "WHERE execution_event_id='event-1-recovery'"
         ).fetchone()
         self.assertEqual(event["status"], RECOVERY_ATTACHED)
+    def test_canceled_recovery_with_truncated_trade_history_stays_unknown(self) -> None:
+        self._seed_recovery_entry()
+        service = self._recovery_service()
+        venue = self._valid_recovery_venue()
+        venue.order["status"] = "CANCELED"
+        venue.list_account_trades = lambda order_id: {  # type: ignore[method-assign]
+            "trades": [
+                {
+                    "trade_id": "visible-before-truncation",
+                    "order_id": order_id,
+                    "side": "BUY",
+                    "token_id": "position-1",
+                    "price": "0.50",
+                    "size": "1",
+                    "status": "CONFIRMED",
+                }
+            ],
+            "truncated": True,
+        }
+        with self.assertRaisesRegex(
+            CanaryBlocked, "CANARY_TRADE_HISTORY_INCOMPLETE"
+        ):
+            service.recover_entry_intent(
+                "event-1",
+                "order-1",
+                signal_id="signal-1",
+                venue=venue,
+                confirmation=RECOVERY_CONFIRMATION,
+            )
+        row = self.store.connection.execute(
+            "SELECT status,exchange_order_id FROM canary_ledger WHERE event_id='event-1'"
+        ).fetchone()
+        self.assertIsNotNone(row)
+        assert row is not None
+        self.assertEqual((row["status"], row["exchange_order_id"]), ("UNKNOWN", None))
+    def test_recovery_rejects_authenticated_sell_trade_without_mutation(self) -> None:
+        self._seed_recovery_entry()
+        service = self._recovery_service()
+        venue = self._valid_recovery_venue()
+        venue.list_account_trades = lambda order_id: [
+            {
+                "trade_id": "wrong-side-recovery",
+                "order_id": order_id,
+                "side": "SELL",
+                "market_id": "market-1",
+                "token_id": "position-1",
+                "price": "0.50",
+                "size": "2",
+                "timestamp": "2026-01-02T12:00:01+00:00",
+                "status": "CONFIRMED",
+            }
+        ]
+        with self.assertRaisesRegex(
+            CanaryBlocked, "CANARY_RECOVERY_TRADE_SIDE_MISMATCH"
+        ):
+            service.recover_entry_intent(
+                "event-1",
+                "order-1",
+                signal_id="signal-1",
+                venue=venue,
+                confirmation=RECOVERY_CONFIRMATION,
+            )
+        row = self.store.connection.execute(
+            "SELECT status,exchange_order_id,fill_quantity FROM canary_ledger "
+            "WHERE event_id='event-1'"
+        ).fetchone()
+        self.assertIsNotNone(row)
+        assert row is not None
+        self.assertEqual(
+            (row["status"], row["exchange_order_id"], row["fill_quantity"]),
+            ("UNKNOWN", None, None),
+        )
+
 
     def test_unknown_entry_recovery_blocks_isolated_profile_before_credentials_or_venue(self) -> None:
         self._seed_recovery_entry()

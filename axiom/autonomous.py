@@ -2472,27 +2472,71 @@ class AutonomousResearchProcessor:
         now: datetime | None = None,
     ) -> Mapping[str, Any]:
         """Allow one auditable changed-evidence reassessment only."""
-        current = ensure_utc(now or self.clock())
         job_name = self.campaign_job_name(campaign_id)
         record = self.store.get_operator_job(job_name)
         if not isinstance(record, Mapping):
             raise ValueError("campaign does not exist")
         payload = dict(record.get("payload") or {})
+        # Terminal campaign outcomes are immutable evidence.  Guard before
+        # protocol, identity, provenance, or clock handling so legacy terminal
+        # rows cannot be reopened by changed evidence (including v1
+        # non-resumable input-error and superseded-protocol rows).
+        record_status = str(record.get("status", "")).strip().upper()
+        payload_status = str(payload.get("status", "")).strip().upper()
+        supersession_reason = (
+            str(payload.get("supersession_reason", "")).strip().upper()
+            or str(record.get("supersession_reason", "")).strip().upper()
+        )
+        resumable_marker = payload.get("resumable")
+        if resumable_marker is None:
+            resumable_marker = record.get("resumable")
+        legacy_nonresumable_error = (
+            (
+                record_status == "SOFTWARE_OR_INPUT_ERROR"
+                or payload_status == "SOFTWARE_OR_INPUT_ERROR"
+            )
+            and (
+                resumable_marker is False
+                or (
+                    isinstance(resumable_marker, str)
+                    and resumable_marker.strip().upper() in {"0", "FALSE"}
+                )
+                or (
+                    isinstance(resumable_marker, (int, float))
+                    and not isinstance(resumable_marker, bool)
+                    and resumable_marker == 0
+                )
+            )
+        )
+        if (
+            record_status in CAMPAIGN_TERMINAL_STATUSES
+            or payload_status in CAMPAIGN_TERMINAL_STATUSES
+            or supersession_reason == "SUPERSEDED_PROTOCOL"
+            or legacy_nonresumable_error
+        ):
+            return payload
+        current = ensure_utc(now or self.clock())
         protocol, _ = self._campaign_protocol_state(payload)
         identity = str(evidence_identity).strip()
         if not identity:
             raise ValueError("evidence_identity is required")
         boundary = protocol.get("dataset_boundary")
         boundary_identity = (
-            str(boundary.get("attestation_hash", "")).strip()
+            str(boundary.get("attestation_hash")).strip()
             if isinstance(boundary, Mapping)
+            and boundary.get("attestation_hash") is not None
             else ""
         )
+        raw_previous_identity = payload.get("last_evidence_identity")
         previous_identity = (
-            str(payload.get("last_evidence_identity", "")).strip()
-            or boundary_identity
-            or None
-        )
+            str(raw_previous_identity).strip()
+            if raw_previous_identity is not None
+            else ""
+        ) or boundary_identity or None
+        if previous_identity is None:
+            # Legacy rows without an authenticated prior identity cannot
+            # establish that supplied evidence is changed.
+            return payload
         if identity == previous_identity or int(payload.get("reassessment_count", 0)) >= 1:
             return payload
         waiting = [

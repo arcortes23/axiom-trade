@@ -669,6 +669,45 @@ class MarketScopeCollectorTests(unittest.TestCase):
         self.assertEqual(by_candidate["zero"].status, ZERO_MATCHES)
         self.assertEqual(by_candidate["zero"].reason, ZERO_MATCHES)
 
+    def test_broad_discovery_malformed_terminal_page_retries_without_completion(self) -> None:
+        valid = market("broad-valid")
+        provider = _PagedProvider(
+            (valid,),
+            (
+                {"snapshots": (valid, None), "next_cursor": None},
+                {"snapshots": (valid, None), "next_cursor": None},
+            ),
+        )
+        store = _ScopeStore({})
+        collector = self._collector(provider, store, (), max_markets=1)
+
+        first = collector.collect_once(now=T0)
+        second = collector.collect_once(now=T0)
+
+        self.assertEqual(list(first.discovery_scheduled), ["broad-valid"])
+        self.assertEqual(list(second.discovery_scheduled), ["broad-valid"])
+        self.assertEqual(first.discovery_coverage_status, "PARTIAL")
+        self.assertFalse(first.discovery_complete)
+        self.assertFalse(second.discovery_complete)
+        self.assertEqual([call["after_cursor"] for call in provider.page_calls], [None, None])
+        state = store.states["polymarket"]
+        self.assertFalse(state["discovery_complete"])
+        continuation = state["discovery_continuation"]
+        self.assertEqual(continuation["coverage_status"], "PARTIAL")
+        self.assertEqual(continuation["malformed_count"], 1)
+        self.assertIsNone(continuation["after_cursor"])
+        self.assertEqual(
+            [
+                (error[2], error[3])
+                for error in store.errors
+                if error[2] == "discovery_malformed_rows"
+            ],
+            [
+                ("discovery_malformed_rows", "1 malformed public market rows"),
+                ("discovery_malformed_rows", "1 malformed public market rows"),
+            ],
+        )
+
     def test_keyset_scope_continuation_is_opaque_and_budgeted(self) -> None:
         first = market("page-one", category="politics")
         second = market("page-two", category="politics")

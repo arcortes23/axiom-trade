@@ -1598,5 +1598,133 @@ class CanaryPositionManagementTests(unittest.TestCase):
         self.assertEqual(Decimal(late_lot["realized_pnl"]), prior_pnl)
         self.assertEqual(late_lot["status"], "OPEN")
 
+    def test_canceled_exit_with_truncated_trade_history_stays_unknown_and_reserved(self) -> None:
+        submitted = self._submit_exit()
+        self.venue.order_status = "CANCELED"
+        visible_fill = {
+            "trade_id": "visible-before-truncation",
+            "quantity": "1",
+            "price": "0.49",
+            "fee_rate_bps": "10",
+            "match_time": self.now.isoformat(),
+            "status": "CONFIRMED",
+        }
+        self.venue.list_account_trades = (  # type: ignore[method-assign]
+            lambda order_id: {
+                "trades": [visible_fill],
+                "truncated": True,
+            }
+        )
+
+        reconciled = position_module.reconcile_pending(self.service, self.venue)
+
+        self.assertEqual(reconciled["status"], "DEGRADED")
+        self.assertEqual(reconciled["requests"][0]["status"], "UNKNOWN")
+        self.assertEqual(reconciled["requests"][0]["reason"], "CANARY_TRADE_HISTORY_INCOMPLETE")
+        request = self._request()
+        lot = self._lot()
+        self.assertEqual(request["status"], "UNKNOWN")
+        self.assertEqual(lot["status"], "EXIT_PENDING")
+        self.assertEqual(lot["sold_quantity"], "0")
+        self.assertEqual(lot["pending_exit_quantity"], "1")
+        self.assertEqual(
+            self._reservation(str(submitted["reservation_id"]))["status"],
+            "OPEN",
+        )
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM canary_position_fills"
+            ).fetchone()[0],
+            0,
+        )
+
+    def test_canceled_entry_with_truncated_trade_history_stays_unknown_and_reserved(self) -> None:
+        config = self.config
+        position_module._mark_owned_equity(self.service, self.venue, self.now)
+        self.store.reserve_canary_capacity(
+            intent_id="truncated-entry-intent",
+            reservation_id="truncated-entry-reservation",
+            side="BUY",
+            requested_cost="1.00",
+            fee_reserve="0",
+            quantity="2",
+            market_id="market-1",
+            event_id="truncated-entry-event",
+            config_id=str(config["config_id"]),
+            config_generation=int(config["generation"]),
+            config_hash=str(config["config_hash"]),
+            control_generation=int(config["control_generation"]),
+            detail={"side": "BUY", "token_id": "token-yes"},
+            timestamp=self.now,
+        )
+        with self.store.connection:
+            self.store.connection.execute(
+                "INSERT INTO canary_ledger("
+                "event_id,signal_id,timestamp,candidate_id,venue,market_id,token_id,"
+                "side,requested_notional,paper_expected_price,max_price,submitted_quantity,"
+                "exchange_order_id,fill_quantity,actual_average_price,fees,status,evidence_json,"
+                "control_generation) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    "truncated-entry-event",
+                    "truncated-entry-signal",
+                    self.now.isoformat(),
+                    "candidate-1",
+                    "polymarket",
+                    "market-1",
+                    "token-yes",
+                    "BUY",
+                    "1.00",
+                    "0.50",
+                    "0.51",
+                    "2",
+                    "truncated-entry-order",
+                    "0",
+                    None,
+                    "0",
+                    "CANCELED",
+                    "{}",
+                    int(config["control_generation"]),
+                ),
+            )
+        self.venue.order_status = "CANCELED"
+        visible_fill = {
+            "trade_id": "entry-visible-before-truncation",
+            "quantity": "1",
+            "price": "0.50",
+            "fee_rate_bps": "10",
+            "match_time": self.now.isoformat(),
+            "status": "CONFIRMED",
+        }
+        self.venue.list_account_trades = (  # type: ignore[method-assign]
+            lambda order_id: {
+                "trades": [visible_fill],
+                "truncated": True,
+            }
+        )
+
+        reconciled = position_module.reconcile_pending(self.service, self.venue)
+
+        self.assertEqual(reconciled["status"], "DEGRADED")
+        self.assertEqual(reconciled["entries"][0]["status"], "UNKNOWN")
+        self.assertEqual(
+            reconciled["entries"][0]["reason"],
+            "CANARY_TRADE_HISTORY_INCOMPLETE",
+        )
+        entry = self.store.connection.execute(
+            "SELECT status,fill_quantity FROM canary_ledger "
+            "WHERE event_id='truncated-entry-event'"
+        ).fetchone()
+        self.assertIsNotNone(entry)
+        assert entry is not None
+        self.assertEqual(entry["status"], "UNKNOWN")
+        self.assertEqual(entry["fill_quantity"], "0")
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT status FROM canary_risk_reservations "
+                "WHERE reservation_id='truncated-entry-reservation'"
+            ).fetchone()["status"],
+            "HELD",
+        )
+
 if __name__ == "__main__":
     unittest.main()

@@ -6,7 +6,11 @@ import json
 import unittest
 from unittest.mock import patch
 
-from axiom.autonomous import AutonomousResearchError, AutonomousResearchProcessor
+from axiom.autonomous import (
+    AutonomousResearchError,
+    AutonomousResearchProcessor,
+    _hash_document,
+)
 from axiom.storage import AxiomStore
 
 
@@ -600,10 +604,207 @@ class AutonomousCampaignAcceptanceTests(unittest.TestCase):
             self.assertEqual(persisted_rows[0]["fixture_label"], SYNTHETIC_LABEL)
             self.assertTrue(persisted_rows[0]["synthetic"])
 
+    def test_terminal_campaign_reassessment_does_not_reopen_legacy_payload(self) -> None:
+        with AxiomStore(":memory:") as store:
+            initial_attestation = _save_attested_dataset(store, "v1", midpoint=0.50)
+            changed_attestation = _save_attested_dataset(store, "v2", midpoint=0.55)
+            self.assertNotEqual(
+                initial_attestation["attestation_hash"],
+                changed_attestation["attestation_hash"],
+            )
+            processor = AutonomousResearchProcessor(store, clock=lambda: T0)
+            campaign_id = "legacy-terminal-reassessment-campaign"
+            processor.start_polymarket_campaign(
+                campaign_id,
+                dataset_id=DATASET_ID,
+                dataset_version="v1",
+                now=T0,
+            )
+            first_trial = processor.bus.list_campaign_trials(campaign_id, limit=10)[0]
+            processor._advance_campaign_after_result(
+                first_trial,
+                {
+                    "accepted": False,
+                    "reason_code": "INSUFFICIENT_DATA",
+                    "candidate_id": "legacy-terminal-candidate",
+                },
+                now=T0 + timedelta(minutes=1),
+            )
+            waiting = processor.campaign_state(campaign_id)
+            self.assertIsNotNone(waiting)
+            assert waiting is not None
+            self.assertEqual(waiting["status"], "WAITING_FOR_DATA")
+
+            # Older terminal rows did not always preserve either evidence
+            # identity.  Keep a waiting trial to prove the guard runs before
+            # reassessment eligibility and queue handling.
+            legacy_payload = json.loads(json.dumps(waiting))
+            legacy_payload["status"] = "CAMPAIGN_EXHAUSTED_NO_QUALIFIED_STRATEGY"
+            legacy_payload["last_evidence_identity"] = None
+            legacy_boundary = legacy_payload["protocol"]["dataset_boundary"]
+            self.assertIsInstance(legacy_boundary, dict)
+            legacy_boundary["attestation_hash"] = None
+            campaign_job_name = processor.campaign_job_name(campaign_id)
+            store.set_operator_job(
+                campaign_job_name,
+                "CAMPAIGN_EXHAUSTED_NO_QUALIFIED_STRATEGY",
+                legacy_payload,
+                resumable=False,
+                timestamp=T0 + timedelta(minutes=2),
+            )
+            before_record = store.get_operator_job(campaign_job_name)
+            self.assertIsNotNone(before_record)
+            assert before_record is not None
+            before_payload = before_record["payload"]
+            before_queue = tuple(
+                (
+                    item.item_id,
+                    item.status.value,
+                    json.dumps(dict(item.payload), sort_keys=True),
+                )
+                for item in processor.bus.list_campaign_trials(campaign_id, limit=100)
+            )
+
+            returned = processor.reassess_campaign(
+                campaign_id,
+                evidence_identity=str(changed_attestation["attestation_hash"]),
+                dataset_id=DATASET_ID,
+                dataset_version="v2",
+                now=T0 + timedelta(minutes=3),
+            )
+            self.assertEqual(returned, before_payload)
+            after_record = store.get_operator_job(campaign_job_name)
+            self.assertIsNotNone(after_record)
+            assert after_record is not None
+            self.assertEqual(after_record["status"], before_record["status"])
+            self.assertEqual(after_record["payload"], before_record["payload"])
+            self.assertFalse(after_record["resumable"])
+            self.assertEqual(after_record["payload"]["status"], before_payload["status"])
+            self.assertEqual(after_record["payload"]["budget_used"], before_payload["budget_used"])
+            self.assertEqual(
+                after_record["payload"]["budget_remaining"],
+                before_payload["budget_remaining"],
+            )
+            self.assertEqual(
+                after_record["payload"]["reassessment_count"],
+                before_payload["reassessment_count"],
+            )
+            after_queue = tuple(
+                (
+                    item.item_id,
+                    item.status.value,
+                    json.dumps(dict(item.payload), sort_keys=True),
+                )
+                for item in processor.bus.list_campaign_trials(campaign_id, limit=100)
+            )
+            self.assertEqual(after_queue, before_queue)
+            self.assertEqual(
+                str(after_record["payload"]["last_evidence_identity"] or ""),
+                "",
+            )
+            self.assertIsNone(after_record["payload"]["protocol"]["dataset_boundary"]["attestation_hash"])
+
+    def test_legacy_nonresumable_and_superseded_campaign_reassessment_is_terminal(self) -> None:
+        variants = (
+            ("nonresumable-error", False, None),
+            ("superseded-error", True, "SUPERSEDED_PROTOCOL"),
+        )
+        for suffix, resumable, supersession_reason in variants:
+            with self.subTest(suffix=suffix):
+                with AxiomStore(":memory:") as store:
+                    initial_attestation = _save_attested_dataset(store, "v1", midpoint=0.50)
+                    changed_attestation = _save_attested_dataset(store, "v2", midpoint=0.55)
+                    self.assertNotEqual(
+                        initial_attestation["attestation_hash"],
+                        changed_attestation["attestation_hash"],
+                    )
+                    processor = AutonomousResearchProcessor(store, clock=lambda: T0)
+                    campaign_id = f"legacy-{suffix}-campaign"
+                    processor.start_polymarket_campaign(
+                        campaign_id,
+                        dataset_id=DATASET_ID,
+                        dataset_version="v1",
+                        now=T0,
+                    )
+                    first_trial = processor.bus.list_campaign_trials(campaign_id, limit=10)[0]
+                    processor._advance_campaign_after_result(
+                        first_trial,
+                        {
+                            "accepted": False,
+                            "reason_code": "INSUFFICIENT_DATA",
+                            "candidate_id": f"{suffix}-candidate",
+                        },
+                        now=T0 + timedelta(minutes=1),
+                    )
+                    waiting = processor.campaign_state(campaign_id)
+                    self.assertIsNotNone(waiting)
+                    assert waiting is not None
+                    legacy_payload = json.loads(json.dumps(waiting))
+                    legacy_payload["status"] = "SOFTWARE_OR_INPUT_ERROR"
+                    legacy_payload["last_evidence_identity"] = None
+                    if supersession_reason is None:
+                        legacy_payload.pop("supersession_reason", None)
+                    else:
+                        legacy_payload["supersession_reason"] = supersession_reason
+                    campaign_job_name = processor.campaign_job_name(campaign_id)
+                    store.set_operator_job(
+                        campaign_job_name,
+                        "SOFTWARE_OR_INPUT_ERROR",
+                        legacy_payload,
+                        resumable=resumable,
+                        timestamp=T0 + timedelta(minutes=2),
+                    )
+                    before_record = store.get_operator_job(campaign_job_name)
+                    self.assertIsNotNone(before_record)
+                    assert before_record is not None
+                    before_payload = before_record["payload"]
+                    before_queue_ids = tuple(
+                        item.item_id
+                        for item in processor.bus.list_campaign_trials(campaign_id, limit=100)
+                    )
+
+                    returned = processor.reassess_campaign(
+                        campaign_id,
+                        evidence_identity=str(changed_attestation["attestation_hash"]),
+                        dataset_id=DATASET_ID,
+                        dataset_version="v2",
+                        now=T0 + timedelta(minutes=3),
+                    )
+                    self.assertEqual(returned, before_payload)
+                    after_record = store.get_operator_job(campaign_job_name)
+                    self.assertIsNotNone(after_record)
+                    assert after_record is not None
+                    self.assertEqual(after_record["status"], before_record["status"])
+                    self.assertEqual(after_record["payload"], before_record["payload"])
+                    self.assertEqual(after_record["resumable"], before_record["resumable"])
+                    self.assertEqual(
+                        after_record["payload"]["budget_used"],
+                        before_payload["budget_used"],
+                    )
+                    self.assertEqual(
+                        after_record["payload"]["budget_remaining"],
+                        before_payload["budget_remaining"],
+                    )
+                    self.assertEqual(
+                        after_record["payload"]["reassessment_count"],
+                        before_payload["reassessment_count"],
+                    )
+                    self.assertEqual(
+                        tuple(
+                            item.item_id
+                            for item in processor.bus.list_campaign_trials(
+                                campaign_id,
+                                limit=100,
+                            )
+                        ),
+                        before_queue_ids,
+                    )
+
     def test_reassessment_rejects_initial_boundary_attestation_identity(self) -> None:
         with AxiomStore(":memory:") as store:
             initial_attestation = _save_attested_dataset(store, "initial-v1", midpoint=0.50)
             processor = AutonomousResearchProcessor(store, clock=lambda: T0)
+            changed_attestation = _save_attested_dataset(store, "changed-v2", midpoint=0.55)
             campaign_id = "unchanged-evidence-campaign"
             processor.start_polymarket_campaign(
                 campaign_id,
@@ -624,6 +825,16 @@ class AutonomousCampaignAcceptanceTests(unittest.TestCase):
             before = processor.campaign_state(campaign_id)
             self.assertEqual(before["status"], "WAITING_FOR_DATA")
             self.assertEqual(before["reassessment_count"], 0)
+            legacy_payload = json.loads(json.dumps(before))
+            legacy_payload["last_evidence_identity"] = None
+            store.set_operator_job(
+                processor.campaign_job_name(campaign_id),
+                "WAITING_FOR_DATA",
+                legacy_payload,
+                resumable=True,
+                timestamp=T0 + timedelta(minutes=1, seconds=30),
+            )
+            before = processor.campaign_state(campaign_id)
             queue_before = len(processor.bus.list_campaign_trials(campaign_id, limit=100))
 
             after = processor.reassess_campaign(
@@ -631,11 +842,67 @@ class AutonomousCampaignAcceptanceTests(unittest.TestCase):
                 evidence_identity=str(initial_attestation["attestation_hash"]),
                 now=T0 + timedelta(minutes=2),
             )
+            self.assertEqual(after["status"], "WAITING_FOR_DATA")
             self.assertEqual(after["reassessment_count"], 0)
-            self.assertEqual(after["last_evidence_identity"], initial_attestation["attestation_hash"])
+            self.assertIsNone(after["last_evidence_identity"])
+            self.assertEqual(
+                after["protocol"]["dataset_boundary"]["attestation_hash"],
+                initial_attestation["attestation_hash"],
+            )
+            self.assertEqual(
+                after["budget_used"],
+                before["budget_used"],
+            )
             self.assertEqual(
                 len(processor.bus.list_campaign_trials(campaign_id, limit=100)),
                 queue_before,
+            )
+
+            no_baseline_payload = json.loads(json.dumps(after))
+            no_baseline_payload["protocol"]["dataset_boundary"]["attestation_hash"] = None
+            # Keep the legacy payload's protocol envelope canonical after
+            # removing the old boundary attestation.
+            no_baseline_payload["protocol_hash"] = _hash_document(
+                no_baseline_payload["protocol"]
+            )
+            store.set_operator_job(
+                processor.campaign_job_name(campaign_id),
+                "WAITING_FOR_DATA",
+                no_baseline_payload,
+                resumable=True,
+                timestamp=T0 + timedelta(minutes=2, seconds=30),
+            )
+            no_baseline_before = processor.campaign_state(campaign_id)
+            self.assertIsNotNone(no_baseline_before)
+            assert no_baseline_before is not None
+            no_baseline_queue = tuple(
+                item.item_id
+                for item in processor.bus.list_campaign_trials(campaign_id, limit=100)
+            )
+            no_baseline_after = processor.reassess_campaign(
+                campaign_id,
+                evidence_identity=str(changed_attestation["attestation_hash"]),
+                dataset_id=DATASET_ID,
+                dataset_version="changed-v2",
+                now=T0 + timedelta(minutes=3),
+            )
+            self.assertEqual(no_baseline_after["status"], "WAITING_FOR_DATA")
+            self.assertEqual(no_baseline_after["reassessment_count"], 0)
+            self.assertIsNone(no_baseline_after["last_evidence_identity"])
+            self.assertEqual(
+                no_baseline_after["budget_used"],
+                no_baseline_before["budget_used"],
+            )
+            self.assertEqual(
+                no_baseline_after["budget_remaining"],
+                no_baseline_before["budget_remaining"],
+            )
+            self.assertEqual(
+                tuple(
+                    item.item_id
+                    for item in processor.bus.list_campaign_trials(campaign_id, limit=100)
+                ),
+                no_baseline_queue,
             )
 
     def test_final_assessment_rejects_zero_trades_with_sufficient_observations(self) -> None:

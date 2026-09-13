@@ -493,6 +493,80 @@ class Phase42PolymarketTests(unittest.TestCase):
             self.assertEqual(aggregate["completeness"], 0.0)
             self.assertEqual(aggregate["metadata"]["coverage_status"], "PARTIAL")
 
+    def test_error_discovery_page_rejects_snapshots_and_cursor(self) -> None:
+        class ErrorPagePolymarket(FakePolymarket):
+            def __init__(self, next_cursor: str | None) -> None:
+                super().__init__()
+                self.next_cursor = next_cursor
+                self.page_calls: list[str | None] = []
+
+            def market_page(
+                self,
+                limit: int,
+                *,
+                after_cursor: str | None = None,
+                closed: bool = False,
+            ) -> MarketDiscoveryPage:
+                self.page_calls.append(after_cursor)
+                return MarketDiscoveryPage(
+                    snapshots=(self.markets_by_id["m-politics"],),
+                    next_cursor=self.next_cursor,
+                    request_path="/markets/keyset",
+                    query={"limit": str(limit), "closed": str(closed).lower()},
+                    query_fingerprint="scope:error-fixture",
+                    raw_count=1,
+                    unique_count=1,
+                    duplicate_count=0,
+                    malformed_count=0,
+                    coverage_status="ERROR",
+                    error_reason="REPEATED_CURSOR",
+                )
+
+        for next_cursor in (None, "opaque-error"):
+            with self.subTest(next_cursor=next_cursor):
+                provider = ErrorPagePolymarket(next_cursor)
+                with AxiomStore(":memory:") as store:
+                    report = HistoricalBootstrapper(
+                        store,
+                        prediction_provider=provider,
+                        sleep=lambda _: None,
+                        max_attempts=1,
+                    ).bootstrap_polymarket(max_markets=2, resume=True)
+
+                    self.assertEqual(report.status, "PARTIAL")
+                    self.assertEqual(report.records, 0)
+                    self.assertEqual(report.completeness, 0.0)
+                    self.assertEqual(provider.page_calls, [None])
+                    state = store.load_dataset_bootstrap_state(POLYMARKET_DATASET_ID)
+                    self.assertIsNotNone(state)
+                    assert state is not None
+                    self.assertFalse(state["discovery_complete"])
+                    self.assertEqual(state["discovery_cursor"], None)
+                    self.assertEqual(state["discovered_market_ids"], [])
+                    self.assertEqual(state["processed_market_ids"], [])
+                    self.assertIn(
+                        "polymarket market discovery: REPEATED_CURSOR",
+                        state["errors"],
+                    )
+                    self.assertIsNone(store.load_dataset("prediction:m-politics"))
+                    self.assertIsNone(
+                        store.load_dataset_catalog("prediction:m-politics")
+                    )
+                    self.assertEqual(
+                        store.load_polymarket_snapshots("m-politics"),
+                        [],
+                    )
+                    aggregate = store.load_dataset_catalog(POLYMARKET_DATASET_ID)
+                    self.assertIsNotNone(aggregate)
+                    assert aggregate is not None
+                    self.assertEqual(aggregate["row_count"], 0)
+                    self.assertEqual(aggregate["completeness"], 0.0)
+                    self.assertFalse(aggregate["metadata"]["discovery_complete"])
+                    self.assertEqual(
+                        aggregate["metadata"]["coverage_status"],
+                        "PARTIAL",
+                    )
+
     def test_unknown_discovery_coverage_status_stays_partial(self) -> None:
         class UnknownCoveragePolymarket(FakePolymarket):
             def __init__(self, coverage_status: str) -> None:

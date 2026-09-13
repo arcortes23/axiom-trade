@@ -1915,7 +1915,10 @@ class HistoricalBootstrapper:
                 )
                 if page_call is not None and page_call.value is not None:
                     page = page_call.value
-                    snapshots = getattr(page, "snapshots", ())
+                    coverage_status = str(
+                        getattr(page, "coverage_status", "")
+                    ).strip().upper()
+                    coverage_status_error = coverage_status == "ERROR"
                     page_fingerprint = str(
                         getattr(page, "query_fingerprint", "") or ""
                     ).strip()
@@ -1924,7 +1927,27 @@ class HistoricalBootstrapper:
                         and query_fingerprint
                         and page_fingerprint != query_fingerprint
                     )
-                    if fingerprint_changed:
+                    if coverage_status_error:
+                        # An adapter error is a fail-closed discovery
+                        # frontier.  Do not inspect snapshots or the
+                        # returned cursor: neither can contribute data or
+                        # advance an opaque cursor from an errored page.
+                        reason = str(
+                            getattr(page, "error_reason", "") or "PAGE_ERROR"
+                        ).strip()
+                        errors.append(f"polymarket market discovery: {reason}")
+                        discovery_failed = True
+                        discovery_complete = False
+                        discovery_cursor = frontier_cursor
+                        request_failed = True
+                        discovery_retry_after = _coerce_retry_after(
+                            page_call.retry_after
+                        )
+                        if discovery_retry_after is not None and discovery_retry_after > 0:
+                            discovery_next_attempt_at = now + timedelta(
+                                seconds=discovery_retry_after
+                            )
+                    elif fingerprint_changed:
                         # A cursor is scoped to the query that produced it.
                         # Discard the fetched page rather than mixing scopes,
                         # but retain every successfully published constituent.
@@ -1940,6 +1963,7 @@ class HistoricalBootstrapper:
                         failed_markets.clear()
                         discovery_scope_reset = True
                     else:
+                        snapshots = getattr(page, "snapshots", ())
                         if query_fingerprint is None and page_fingerprint:
                             query_fingerprint = page_fingerprint
                         snapshots_valid = isinstance(snapshots, Sequence) and not isinstance(
@@ -1987,14 +2011,10 @@ class HistoricalBootstrapper:
                             if isinstance(returned_cursor, str) and returned_cursor
                             else None
                         )
-                        coverage_status = str(
-                            getattr(page, "coverage_status", "")
-                        ).strip().upper()
                         coverage_status_invalid = coverage_status not in {
                             "COMPLETE",
                             "PARTIAL",
                             "BUDGET_EXHAUSTED",
-                            "ERROR",
                         }
                         incomplete_without_cursor = (
                             coverage_status in {"PARTIAL", "BUDGET_EXHAUSTED"}

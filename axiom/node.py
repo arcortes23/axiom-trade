@@ -678,7 +678,7 @@ class ResearchNode:
         self._research_passes = 0
         self._cycles: list[CollectionCycle] = []
         self._collection_count = 0
-        self._auto_canary_fatal = False
+        self._auto_canary_fatal = self._hydrate_auto_canary_fatal()
         self._restart_count = 0
         self._last_status: dict[str, Any] | None = None
         self._paper_store: AxiomStore | None = None
@@ -784,6 +784,51 @@ class ResearchNode:
                 return False
         self.stop_event.set()
         return True
+    def _hydrate_auto_canary_fatal(self) -> bool:
+        """Recover the autonomous worker's terminal latch from durable state."""
+        fatal = False
+        try:
+            getter = getattr(self.store, "get_worker_state", None)
+            state = getter("autonomous-canary") if callable(getter) else None
+            if isinstance(state, Mapping):
+                status = str(state.get("status") or "").strip().upper()
+                payload = state.get("payload")
+                payload = payload if isinstance(payload, Mapping) else {}
+                fatal = (
+                    status in {"FATAL", "EXHAUSTED"}
+                    or payload.get("fatal") is True
+                    or str(payload.get("worker_status") or "").strip().upper()
+                    in {"FATAL", "EXHAUSTED"}
+                )
+        except Exception:
+            # A failed diagnostic read must not clear a latch already held by
+            # this process.  The worker remains fenced until durable state is
+            # readable again or an explicit recovery action clears it.
+            return bool(getattr(self, "_auto_canary_fatal", False))
+        if not fatal:
+            try:
+                connection = getattr(self.store, "connection", None)
+                if connection is not None:
+                    lock = getattr(self.store, "_lock", None)
+                    if lock is None:
+                        row = connection.execute(
+                            "SELECT worker_status FROM canary_autonomous_state "
+                            "WHERE singleton=1 LIMIT 1"
+                        ).fetchone()
+                    else:
+                        with lock:
+                            row = connection.execute(
+                                "SELECT worker_status FROM canary_autonomous_state "
+                                "WHERE singleton=1 LIMIT 1"
+                            ).fetchone()
+                    if row is not None:
+                        worker_status = str(row["worker_status"] or "").strip().upper()
+                        fatal = worker_status in {"FATAL", "EXHAUSTED"}
+            except Exception:
+                # Older stores may not have the autonomous projection yet.
+                # The worker_state row remains the first canonical source.
+                pass
+        return fatal
     def _worker_payload(self, worker_name: str) -> dict[str, Any]:
         with self._worker_runtime_lock:
             runtime = dict(self._worker_runtime.get(worker_name, {}))
@@ -1102,7 +1147,7 @@ class ResearchNode:
         self._research_passes = 0
         self._historical_passes = 0
         self._historical_fatal = False
-        self._auto_canary_fatal = False
+        self._auto_canary_fatal = self._hydrate_auto_canary_fatal()
         cycle_failure = False
         status = "degraded"
         try:
@@ -1126,7 +1171,8 @@ class ResearchNode:
                 started_at=self.started_at,
                 heartbeat_at=self.started_at,
             )
-            self._publish_autonomous_initializing(self.started_at)
+            if not self._auto_canary_fatal:
+                self._publish_autonomous_initializing(self.started_at)
             worker_start_states = {
                 "polymarket-collector": {
                     "configured_interval_seconds": float(self.config.interval_seconds),
@@ -1147,20 +1193,39 @@ class ResearchNode:
                     "configured_interval_seconds": float(self.config.auto_canary_interval_seconds),
                     "autonomous": True,
                     "next_work": (
-                        "evaluate_candidates"
-                        if self.config.mutation_enabled
-                        else "disabled"
+                        "operator_review_required"
+                        if self._auto_canary_fatal
+                        else (
+                            "evaluate_candidates"
+                            if self.config.mutation_enabled
+                            else "disabled"
+                        )
                     ),
                     "decision": (
-                        None
-                        if self.config.mutation_enabled
-                        else "AUTONOMOUS_CANARY_DISABLED"
+                        "AUTONOMOUS_WORKER_FATAL_REVIEW_REQUIRED"
+                        if self._auto_canary_fatal
+                        else (
+                            None
+                            if self.config.mutation_enabled
+                            else "AUTONOMOUS_CANARY_DISABLED"
+                        )
                     ),
                     "blocker": (
-                        None
-                        if self.config.mutation_enabled
-                        else "AUTONOMOUS_CANARY_DISABLED"
+                        "AUTONOMOUS_WORKER_FATAL_PERSISTED"
+                        if self._auto_canary_fatal
+                        else (
+                            None
+                            if self.config.mutation_enabled
+                            else "AUTONOMOUS_CANARY_DISABLED"
+                        )
                     ),
+                    "worker_status": (
+                        "FATAL"
+                        if self._auto_canary_fatal
+                        else ("DISABLED" if not self.config.mutation_enabled else "IDLE")
+                    ),
+                    "fatal": self._auto_canary_fatal,
+                    "requires_attention": self._auto_canary_fatal,
                     "production_live_execution": False,
                 },
             }
@@ -1192,12 +1257,19 @@ class ResearchNode:
                 self._persist_worker_runtime(
                     worker_name,
                     (
-                        "disabled"
+                        "fatal"
                         if (
                             worker_name == "autonomous-canary"
-                            and not self.config.mutation_enabled
+                            and self._auto_canary_fatal
                         )
-                        else ("idle" if max_cycles == 0 else "running")
+                        else (
+                            "disabled"
+                            if (
+                                worker_name == "autonomous-canary"
+                                and not self.config.mutation_enabled
+                            )
+                            else ("idle" if max_cycles == 0 else "running")
+                        )
                     ),
                 )
             self._start_heartbeat_watchdog()
@@ -1229,7 +1301,7 @@ class ResearchNode:
             elif max_cycles == 0:
                 # No child was launched; immediately settle the startup
                 # marker so direct bounded invocations cannot leave RUNNING.
-                if self.config.mutation_enabled:
+                if self.config.mutation_enabled and not self._auto_canary_fatal:
                     try:
                         service = CanaryService(self.store, clock=self.clock)
                         service.record_autonomous_decision(
@@ -1315,8 +1387,8 @@ class ResearchNode:
             self._close_logging()
             if self._owns_store:
                 self.store.close()
-        return list(self._cycles)
 
+        return list(self._cycles)
     def _start_worker_threads(self, max_cycles: int | None) -> None:
         self._collector_thread = threading.Thread(
             target=self._collector_worker_loop,
@@ -1342,7 +1414,7 @@ class ResearchNode:
                 daemon=True,
             )
         self._auto_canary_thread = None
-        if self.config.mutation_enabled:
+        if self.config.mutation_enabled and not self._auto_canary_fatal:
             self._auto_canary_thread = threading.Thread(
                 target=self._auto_canary_worker_loop,
                 name=f"{self.config.worker_name}-autonomous-canary",
@@ -1370,7 +1442,7 @@ class ResearchNode:
                 "_historical_refresh_thread",
                 self._historical_refresh_worker_loop,
             )
-        if self.config.mutation_enabled:
+        if self.config.mutation_enabled and not self._auto_canary_fatal:
             specs["autonomous-canary"] = (
                 "_auto_canary_thread",
                 self._auto_canary_worker_loop,
@@ -1445,6 +1517,14 @@ class ResearchNode:
         return True
     def _auto_canary_worker_loop(self) -> None:
         """Run isolated ticks with bounded recovery and truthful boundaries."""
+        if self._auto_canary_fatal:
+            self._save_autonomous_worker_state(
+                "fatal",
+                decision="AUTONOMOUS_WORKER_FATAL_REVIEW_REQUIRED",
+                blocker="AUTONOMOUS_WORKER_FATAL_PERSISTED",
+                error_type="AUTONOMOUS_THREAD_EXITED",
+            )
+            return
         if not self.config.mutation_enabled:
             self._save_autonomous_worker_state(
                 "disabled",
