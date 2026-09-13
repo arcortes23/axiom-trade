@@ -8138,6 +8138,13 @@ class CanaryService:
             raise CanaryBlocked("CANARY_RECOVERY_BINDING_INVALID") from exc
         if not isinstance(evidence, Mapping):
             raise CanaryBlocked("CANARY_RECOVERY_BINDING_INVALID")
+        normalized_evidence, _identity_reason = _legacy_entry_identity(
+            ledger,
+            evidence,
+        )
+        if normalized_evidence is None:
+            raise CanaryBlocked("CANARY_RECOVERY_BINDING_INVALID")
+        evidence = {**evidence, **normalized_evidence}
         required = (
             "control_generation", "control_state", "control_candidate",
             "control_expiry", "signal_candidate_id", "signal_market_id",
@@ -8207,10 +8214,37 @@ class CanaryService:
             raise CanaryBlocked("CANARY_RECOVERY_SIDE_MISMATCH")
         expected_token = str(ledger.get("token_id") or "").strip()
         expected_asset = str(binding_evidence.get("resolved_asset_id") or "").strip()
+        market_version = str(
+            binding_evidence.get("market_version")
+            or ""
+        ).strip().lower()
+
+        def observed_identity(value: Any) -> tuple[str | None, str | None]:
+            token_raw = mapping_value(value, "token_id", "tokenId", "token")
+            asset_raw = mapping_value(value, "asset_id", "assetId")
+            generic_asset = mapping_value(value, "asset")
+            token = str(token_raw or "").strip() or None
+            asset = str(asset_raw or "").strip() or None
+            if asset is None:
+                asset = str(generic_asset or "").strip() or None
+            return token, asset
+
+        observed_token, observed_asset = observed_identity(order)
         if (
             not expected_token
             or not expected_asset
-            or response_token(order) != expected_asset
+            or market_version not in {"v1", "v2"}
+        ):
+            raise CanaryBlocked("CANARY_RECOVERY_TOKEN_MISMATCH")
+        if market_version == "v2":
+            if observed_asset != expected_asset or (
+                observed_token is not None and observed_token != expected_token
+            ):
+                raise CanaryBlocked("CANARY_RECOVERY_TOKEN_MISMATCH")
+        elif (
+            (observed_token is not None and observed_token != expected_token)
+            or (observed_asset is not None and observed_asset != expected_token)
+            or (observed_token or observed_asset) != expected_token
         ):
             raise CanaryBlocked("CANARY_RECOVERY_TOKEN_MISMATCH")
         returned_market = response_market(order)
@@ -8263,7 +8297,21 @@ class CanaryService:
             }
             if exchange_order_id not in bound_order_ids:
                 raise CanaryBlocked("CANARY_RECOVERY_TRADE_ORDER_ID_MISMATCH")
-            if trade_token(trade) != expected_asset:
+            observed_trade_token, observed_trade_asset = observed_identity(trade)
+            if market_version == "v2":
+                if observed_trade_asset != expected_asset or (
+                    observed_trade_token is not None
+                    and observed_trade_token != expected_token
+                ):
+                    raise CanaryBlocked("CANARY_RECOVERY_TRADE_TOKEN_MISMATCH")
+            elif (
+                (observed_trade_token is not None and observed_trade_token != expected_token)
+                or (
+                    observed_trade_asset is not None
+                    and observed_trade_asset != expected_token
+                )
+                or (observed_trade_token or observed_trade_asset) != expected_token
+            ):
                 raise CanaryBlocked("CANARY_RECOVERY_TRADE_TOKEN_MISMATCH")
             returned_trade_market = response_market(trade)
             if returned_trade_market is not None and returned_trade_market != expected_market:
@@ -8392,6 +8440,7 @@ class CanaryService:
         venue: Any | None = None,
         _observed: tuple[Any, Sequence[Any]] | None = None,
     ) -> dict[str, Any]:
+        _ensure_schema(self)
         connection = self.store.connection
         event_key = str(event_id).strip()
         with self.store._lock:
@@ -8417,13 +8466,23 @@ class CanaryService:
         if _observed is None:
             if venue is None:
                 raise CanaryBlocked("CANARY_RECOVERY_READ_UNAVAILABLE")
-            order = self._recovery_method(venue, "get_order", exchange_order_id)
+            order = self._recovery_method(
+                venue,
+                "get_order",
+                exchange_order_id,
+                market=str(signal.get("market_id") or "") or None,
+                market_version=str(binding_evidence.get("market_version") or "") or None,
+                asset_id=str(binding_evidence.get("resolved_asset_id") or "") or None,
+                token_id=str(ledger.get("token_id") or "") or None,
+            )
             raw_trades = self._recovery_method(
                 venue,
                 "list_account_trades",
                 exchange_order_id,
-                token_id=str(binding_evidence.get("resolved_asset_id") or "") or None,
                 market=str(signal.get("market_id") or "") or None,
+                market_version=str(binding_evidence.get("market_version") or "") or None,
+                asset_id=str(binding_evidence.get("resolved_asset_id") or "") or None,
+                token_id=str(ledger.get("token_id") or "") or None,
             )
             trades = self._recovery_records(raw_trades, key="trades")
         else:
@@ -8519,6 +8578,7 @@ class CanaryService:
         signal_key = recovery_identifier(signal_id, "signal ID")
         if venue is None:
             raise CanaryBlocked("CANARY_RECOVERY_READ_UNAVAILABLE")
+        _ensure_schema(self)
         connection = self.store.connection
         with self.store._lock:
             row = connection.execute(
@@ -8553,13 +8613,23 @@ class CanaryService:
                 raise CanaryBlocked("CANARY_RECOVERY_STALE_CONCURRENT_ATTACH") from exc
             expected_status = str(ledger.get("status") or "").upper()
         self.require_current_credential_binding()
-        order = self._recovery_method(venue, "get_order", order_key)
+        order = self._recovery_method(
+            venue,
+            "get_order",
+            order_key,
+            market=str(signal.get("market_id") or "") or None,
+            market_version=str(binding_evidence.get("market_version") or "") or None,
+            asset_id=str(binding_evidence.get("resolved_asset_id") or "") or None,
+            token_id=str(ledger.get("token_id") or "") or None,
+        )
         raw_trades = self._recovery_method(
             venue,
             "list_account_trades",
             order_key,
-            token_id=str(binding_evidence.get("resolved_asset_id") or "") or None,
             market=str(signal.get("market_id") or "") or None,
+            market_version=str(binding_evidence.get("market_version") or "") or None,
+            asset_id=str(binding_evidence.get("resolved_asset_id") or "") or None,
+            token_id=str(ledger.get("token_id") or "") or None,
         )
         trades = self._recovery_records(raw_trades, key="trades")
         observed = self._validate_recovery_observation(
@@ -12102,48 +12172,65 @@ class CanaryService:
                     return None
                 return parsed if parsed.is_finite() else None
 
+            def _resolve_decimal_aliases(
+                names: tuple[str, ...],
+                *,
+                probability: bool = False,
+                nonnegative: bool = False,
+            ) -> tuple[Decimal | None, bool, bool]:
+                values: list[Decimal] = []
+                malformed = False
+                for name in names:
+                    if name not in response or response[name] in (None, ""):
+                        continue
+                    parsed = _decimal(response[name])
+                    if parsed is None:
+                        malformed = True
+                        continue
+                    if probability and not Decimal("0") < parsed < Decimal("1"):
+                        malformed = True
+                    if nonnegative and parsed < 0:
+                        malformed = True
+                    values.append(parsed)
+                if values and any(value != values[0] for value in values[1:]):
+                    malformed = True
+                return (values[0] if values else None, bool(values), malformed)
+
             expected_price = _decimal(
                 response.get("paper_expected_price"),
                 paper_expected_price,
             )
-            raw_actual_price = response.get("actual_average_price")
-            actual_price = _decimal(raw_actual_price)
-            raw_fill_quantity = response.get(
-                "fill_quantity",
-                response.get("filled_quantity"),
+            actual_price, actual_price_present, malformed_price = (
+                _resolve_decimal_aliases(
+                    (
+                        "actual_average_price",
+                        "average_price",
+                        "avg_price",
+                        "actual_price",
+                    ),
+                    probability=True,
+                )
             )
-            fill_quantity = _decimal(raw_fill_quantity)
-            fee_values = [
-                response[name]
-                for name in ("fees", "fee", "fee_amount")
-                if name in response and response[name] not in (None, "")
-            ]
-            raw_actual_fees = fee_values[0] if fee_values else None
-            actual_fees = _decimal(raw_actual_fees)
-            actual_price_present = raw_actual_price not in (None, "")
-            fill_quantity_present = raw_fill_quantity not in (None, "")
+            fill_quantity, fill_quantity_present, malformed_quantity = (
+                _resolve_decimal_aliases(
+                    ("fill_quantity", "filled_quantity"),
+                    nonnegative=True,
+                )
+            )
+            actual_fees, fees_present, malformed_fees = _resolve_decimal_aliases(
+                ("fees", "fee", "fee_amount"),
+                nonnegative=True,
+            )
             malformed_economic = (
-                (
-                    actual_price_present
-                    and (
-                        actual_price is None
-                        or not Decimal("0") < actual_price < Decimal("1")
-                    )
-                )
-                or (
-                    fill_quantity_present
-                    and (
-                        fill_quantity is None
-                        or fill_quantity < 0
-                    )
-                )
+                malformed_price
+                or malformed_quantity
+                or malformed_fees
                 or (
                     fill_quantity is not None
                     and fill_quantity > 0
                     and (
                         not actual_price_present
                         or actual_price is None
-                        or not Decimal("0") < actual_price < Decimal("1")
                     )
                 )
                 or (
@@ -12155,10 +12242,6 @@ class CanaryService:
                         "RESOLVED",
                     }
                     and not actual_price_present
-                )
-                or any(
-                    _decimal(raw_fee) is None or _decimal(raw_fee) < 0
-                    for raw_fee in fee_values
                 )
                 or (
                     fill_quantity is not None
@@ -12659,6 +12742,8 @@ class CanaryService:
         )
 from .canary_positions import (
     RECOVERY_ACTION,
+    _ensure_schema,
+    _legacy_entry_identity,
     RECOVERY_ATTACHED,
     RECOVERY_CONFIRMATION,
     UNKNOWN_ENTRY_STATUSES,

@@ -271,7 +271,8 @@ class RecoveryVenue:
                 "trade_id": "trade-recovery-1",
                 "order_id": order_id,
                 "side": "BUY",
-                "token_id": "position-1",
+                "token_id": "token-1",
+                "asset_id": "position-1",
                 "price": "0.50",
                 "size": "2",
                 "timestamp": "2026-01-02T12:00:01+00:00",
@@ -356,6 +357,18 @@ class OperatorControlTests(unittest.TestCase):
                         "signal_market_id": "market-1",
                         "signal_token_id": "token-1",
                         "resolved_asset_id": "position-1",
+                        "market_version": "v2",
+                        "outcome_index": 0,
+                        "identity_bindings": [
+                            {
+                                "index": 0,
+                                "outcome": "yes",
+                                "token_id": "token-1",
+                                "position_id": "position-1",
+                            }
+                        ],
+                        "selected_token_id": "token-1",
+                        "selected_position_id": "position-1",
                         "signal_side": "BUY",
                         "signal_frozen_hash": "frozen-1",
                         "signal_strategy_hash": "strategy-1",
@@ -376,8 +389,15 @@ class OperatorControlTests(unittest.TestCase):
         self._seed_recovery_entry()
         credentials = _configured_credentials()
         venue = RecoveryVenue(
-            {"side": "BUY", "token_id": "position-1", "market_id": "market-1",
-             "price": "0.51", "original_size": "2", "status": "FILLED"}
+            {
+                "side": "BUY",
+                "token_id": "token-1",
+                "asset_id": "position-1",
+                "market_id": "market-1",
+                "price": "0.51",
+                "original_size": "2",
+                "status": "FILLED",
+            }
         )
         with patch("axiom.operator.CredentialStore", return_value=credentials), patch(
             "axiom.operator.PolymarketClobV2Venue", return_value=venue
@@ -429,7 +449,8 @@ class OperatorControlTests(unittest.TestCase):
         return RecoveryVenue(
             {
                 "side": "BUY",
-                "token_id": "position-1",
+                "token_id": "token-1",
+                "asset_id": "position-1",
                 "market_id": "market-1",
                 "price": "0.51",
                 "original_size": "2",
@@ -437,13 +458,32 @@ class OperatorControlTests(unittest.TestCase):
             }
         )
 
+    def test_recovery_rejects_wrong_v2_token_with_right_position(self) -> None:
+        self._seed_recovery_entry()
+        service = self._recovery_service()
+        venue = self._valid_recovery_venue()
+        venue.order["token_id"] = "wrong-token"
+        with self.assertRaisesRegex(CanaryBlocked, "CANARY_RECOVERY_TOKEN_MISMATCH"):
+            service.recover_entry_intent(
+                "event-1",
+                "order-1",
+                signal_id="signal-1",
+                venue=venue,
+                confirmation=RECOVERY_CONFIRMATION,
+            )
+        row = self.store.connection.execute(
+            "SELECT status,exchange_order_id FROM canary_ledger WHERE event_id='event-1'"
+        ).fetchone()
+        self.assertEqual((row["status"], row["exchange_order_id"]), ("UNKNOWN", None))
+
     def test_recovery_rejects_lower_price_wrong_order_without_attachment(self) -> None:
         self._seed_recovery_entry()
         service = self._recovery_service()
         venue = RecoveryVenue(
             {
                 "side": "BUY",
-                "token_id": "position-1",
+                "token_id": "token-1",
+                "asset_id": "position-1",
                 "market_id": "market-1",
                 "price": "0.50",
                 "original_size": "2",
@@ -567,7 +607,8 @@ class OperatorControlTests(unittest.TestCase):
                 "order_id": order_id,
                 "side": "SELL",
                 "market_id": "market-1",
-                "token_id": "position-1",
+                "token_id": "token-1",
+                "asset_id": "position-1",
                 "price": "0.50",
                 "size": "2",
                 "timestamp": "2026-01-02T12:00:01+00:00",

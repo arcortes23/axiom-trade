@@ -664,6 +664,50 @@ class CanaryPositionManagementTests(unittest.TestCase):
     def test_valid_v2_exit_uses_canonical_position_asset(self) -> None:
         self.venue.market_version = "v2"
         self.venue.position_id = "position-yes"
+        evidence = {
+            "market_version": "v2",
+            "outcome_index": 0,
+            "identity_bindings": [
+                {
+                    "index": 0,
+                    "outcome": "yes",
+                    "token_id": "token-yes",
+                    "position_id": "position-yes",
+                }
+            ],
+            "selected_token_id": "token-yes",
+            "selected_position_id": "position-yes",
+            "resolved_asset_id": "position-yes",
+        }
+        with self.store.connection:
+            self.store.connection.execute(
+                "INSERT INTO canary_ledger("
+                "event_id,signal_id,timestamp,candidate_id,venue,market_id,token_id,"
+                "side,requested_notional,paper_expected_price,max_price,submitted_quantity,"
+                "exchange_order_id,fill_quantity,actual_average_price,fees,status,evidence_json,"
+                "control_generation) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    "entry-event-1",
+                    "v2-fixture-signal",
+                    self.now.isoformat(),
+                    "candidate-1",
+                    "polymarket",
+                    "market-1",
+                    "token-yes",
+                    "BUY",
+                    "0.50",
+                    "0.50",
+                    "0.49",
+                    "1",
+                    None,
+                    "1",
+                    "0.50",
+                    "0",
+                    "CONFIRMED",
+                    json.dumps(evidence, sort_keys=True),
+                    int(self.config["control_generation"]),
+                ),
+            )
         submitted = self._submit_exit()
         self.assertEqual(submitted["status"], "SUBMITTED")
         call = self.service.submit_position_order.call_args.kwargs
@@ -832,6 +876,125 @@ class CanaryPositionManagementTests(unittest.TestCase):
         ).fetchone()[0]
         self.assertEqual(marks_after, marks_before)
 
+
+    def test_pre339_v2_buy_evidence_migrates_without_remote_identity_guess(self) -> None:
+        from axiom.canary_positions import _ensure_schema
+
+        _ensure_schema(self.service)
+        event_id = "legacy-v2-entry-event"
+        reservation_id = "legacy-v2-entry-reservation"
+        token_id = "legacy-token-yes"
+        asset_id = "legacy-position-yes"
+        config = self.config
+        self.assertEqual(
+            position_module._mark_owned_equity(self.service, self.venue, self.now)["status"],
+            "KNOWN",
+        )
+        self.store.reserve_canary_capacity(
+            intent_id="legacy-v2-entry-intent",
+            reservation_id=reservation_id,
+            side="BUY",
+            requested_cost="0.70",
+            fee_reserve="0",
+            quantity="1",
+            market_id="market-1",
+            event_id=event_id,
+            config_id=str(config["config_id"]),
+            config_generation=int(config["generation"]),
+            config_hash=str(config["config_hash"]),
+            control_generation=int(config["control_generation"]),
+            detail={"side": "BUY", "token_id": token_id},
+            timestamp=self.now,
+        )
+        self.store.record_canary_fill(
+            fill_id="legacy-v2-entry-fill",
+            reservation_id=reservation_id,
+            quantity="1",
+            price="0.70",
+            cost="0.70",
+            fee="0",
+            filled_at=self.now,
+            detail={"side": "BUY", "token_id": token_id},
+        )
+        with self.store.connection:
+            self.store.connection.execute(
+                "INSERT INTO canary_ledger("
+                "event_id,signal_id,timestamp,candidate_id,venue,market_id,token_id,"
+                "side,requested_notional,paper_expected_price,max_price,submitted_quantity,"
+                "exchange_order_id,fill_quantity,actual_average_price,fees,status,evidence_json,"
+                "control_generation) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    event_id,
+                    "legacy-v2-entry-signal",
+                    self.now.isoformat(),
+                    "candidate-1",
+                    "polymarket",
+                    "market-1",
+                    token_id,
+                    "BUY",
+                    "0.70",
+                    "0.70",
+                    "0.70",
+                    "1",
+                    "legacy-v2-entry-order",
+                    "0",
+                    None,
+                    "0",
+                    "MATCHED",
+                    json.dumps(
+                        {
+                            "market_version": "v2",
+                            "selected_token_id": token_id,
+                            "resolved_asset_id": asset_id,
+                            "exit_policy": {
+                                "type": "fixed_holding_period",
+                                "holding_period_seconds": 0,
+                            },
+                        },
+                        sort_keys=True,
+                    ),
+                    int(config["control_generation"]),
+                ),
+            )
+        self.venue.order_assets_by_order["legacy-v2-entry-order"] = asset_id
+        self.venue.order_tokens_by_order["legacy-v2-entry-order"] = token_id
+        self.venue.order_sides_by_order["legacy-v2-entry-order"] = "BUY"
+        self.venue.order_prices_by_order["legacy-v2-entry-order"] = "0.70"
+        self.venue.market_versions_by_token[token_id] = "v2"
+        self.venue.position_ids_by_token[token_id] = asset_id
+        self.venue.trades_by_order["legacy-v2-entry-order"] = [
+            {
+                "trade_id": "legacy-v2-entry-fill",
+                "quantity": "1",
+                "price": "0.70",
+                "token_id": token_id,
+                "fee_rate_bps": "0",
+                "match_time": self.now.isoformat(),
+                "status": "CONFIRMED",
+            }
+        ]
+        reconciled = position_module.reconcile_pending(self.service, self.venue)
+        self.assertEqual(reconciled["status"], "RECONCILED")
+        evidence_row = self.store.connection.execute(
+            "SELECT evidence_json FROM canary_ledger WHERE event_id=?",
+            (event_id,),
+        ).fetchone()
+        self.assertIsNotNone(evidence_row)
+        assert evidence_row is not None
+        migrated = json.loads(evidence_row["evidence_json"])
+        self.assertTrue(migrated["legacy_identity_binding"])
+        self.assertEqual(migrated["identity_bindings"][0]["token_id"], token_id)
+        self.assertEqual(migrated["identity_bindings"][0]["position_id"], asset_id)
+        lot = self.store.connection.execute(
+            "SELECT token_id,asset_id,market_version FROM canary_position_lots "
+            "WHERE position_id=?",
+            ("position:" + event_id,),
+        ).fetchone()
+        self.assertIsNotNone(lot)
+        assert lot is not None
+        self.assertEqual(lot["token_id"], token_id)
+        self.assertEqual(lot["asset_id"], asset_id)
+        self.assertEqual(lot["market_version"], "v2")
 
     def _request(self) -> dict[str, object]:
         row = self.store.connection.execute(
@@ -2114,6 +2277,90 @@ class CanaryPositionManagementTests(unittest.TestCase):
             0,
         )
 
+    def test_no_current_fill_does_not_revoke_prior_confirmed_ownership(self) -> None:
+        config = self.config
+        event_id = "entry-event-1"
+        reservation_id = "entry-reservation-1"
+        with self.store.connection:
+            self.store.connection.execute(
+                "INSERT INTO canary_ledger("
+                "event_id,signal_id,timestamp,candidate_id,venue,market_id,token_id,"
+                "side,requested_notional,paper_expected_price,max_price,submitted_quantity,"
+                "exchange_order_id,fill_quantity,actual_average_price,fees,status,evidence_json,"
+                "control_generation) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    event_id,
+                    "entry-prior-owned-signal",
+                    self.now.isoformat(),
+                    "candidate-1",
+                    "polymarket",
+                    "market-1",
+                    "token-yes",
+                    "BUY",
+                    "0.50",
+                    "0.50",
+                    "0.49",
+                    "2",
+                    "late-entry-order",
+                    "1",
+                    "0.50",
+                    "0",
+                    "CONFIRMED",
+                    json.dumps(
+                        {
+                            "market_version": "v1",
+                            "selected_token_id": "token-yes",
+                            "resolved_asset_id": "token-yes",
+                        },
+                        sort_keys=True,
+                    ),
+                    int(config["control_generation"]),
+                ),
+            )
+            self.store.connection.execute(
+                "DELETE FROM canary_risk_fills WHERE reservation_id=?",
+                (reservation_id,),
+            )
+        self.venue.order_sides_by_order["late-entry-order"] = "BUY"
+        self.venue.order_prices_by_order["late-entry-order"] = "0.49"
+        self.venue.order_status = "CANCELED"
+
+        reconciled = position_module.reconcile_pending(self.service, self.venue)
+
+        self.assertEqual(reconciled["status"], "RECONCILED")
+        self.assertEqual(reconciled["entries"][0]["status"], "CONFIRMED")
+        entry = self.store.connection.execute(
+            "SELECT status,fill_quantity,actual_average_price,fees,settlement "
+            "FROM canary_ledger WHERE event_id=?",
+            (event_id,),
+        ).fetchone()
+        self.assertIsNotNone(entry)
+        assert entry is not None
+        self.assertEqual(entry["status"], "CONFIRMED")
+        self.assertEqual(entry["fill_quantity"], "1")
+        self.assertEqual(entry["actual_average_price"], "0.50")
+        self.assertEqual(entry["fees"], "0")
+        self.assertIsNone(entry["settlement"])
+        reservation = self.store.connection.execute(
+            "SELECT status,released_at FROM canary_risk_reservations "
+            "WHERE reservation_id=?",
+            (reservation_id,),
+        ).fetchone()
+        self.assertIsNotNone(reservation)
+        assert reservation is not None
+        self.assertEqual(reservation["status"], "FILLED")
+        self.assertIsNone(reservation["released_at"])
+        lot = self.store.connection.execute(
+            "SELECT quantity,cost_basis,status FROM canary_position_lots "
+            "WHERE position_id=?",
+            ("position-1",),
+        ).fetchone()
+        self.assertIsNotNone(lot)
+        assert lot is not None
+        self.assertEqual(lot["quantity"], "1")
+        self.assertEqual(lot["cost_basis"], "0.50")
+        self.assertEqual(lot["status"], "OPEN")
+
     def test_canceled_entry_without_fill_releases_reservation_terminally(self) -> None:
         config = self.config
         position_module._mark_owned_equity(self.service, self.venue, self.now)
@@ -2164,6 +2411,7 @@ class CanaryPositionManagementTests(unittest.TestCase):
                     int(config["control_generation"]),
                 ),
             )
+        self.venue.order_prices_by_order["late-entry-order"] = "0.51"
         self.venue.order_status = "CANCELED"
 
         reconciled = position_module.reconcile_pending(self.service, self.venue)

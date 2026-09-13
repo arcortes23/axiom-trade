@@ -3866,6 +3866,52 @@ class CanaryTests(unittest.TestCase):
             "-0.01",
         )
 
+    def test_contradictory_external_economics_stay_unknown_without_persistence(self):
+        self.arm()
+
+        class ContradictoryOutcomeVenue(FakeVenue):
+            def submit_limit_order(self, **kwargs):
+                self.submissions.append(kwargs)
+                return {
+                    "ok": True,
+                    "order_id": "contradictory-order",
+                    "status": "matched",
+                    "fill_quantity": "1",
+                    "filled_quantity": "0.5",
+                    "actual_average_price": "0.50",
+                    "average_price": "0.51",
+                    "fees": "0.01",
+                    "fee_amount": "0.02",
+                }
+
+        with self.assertRaisesRegex(
+            CanaryBlocked,
+            "CANARY_SUBMISSION_UNKNOWN",
+        ):
+            self.submit(
+                "contradictory-economics",
+                venue=ContradictoryOutcomeVenue(),
+            )
+        ledger = self.store.connection.execute(
+            "SELECT event_id,status,actual_average_price,fees "
+            "FROM canary_ledger WHERE signal_id=?",
+            ("contradictory-economics",),
+        ).fetchone()
+        self.assertIsNotNone(ledger)
+        assert ledger is not None
+        self.assertEqual(ledger["status"], "UNKNOWN")
+        self.assertIsNone(ledger["actual_average_price"])
+        self.assertIsNone(ledger["fees"])
+        event = self.store.connection.execute(
+            "SELECT status,actual_average_price,fees "
+            "FROM canary_execution_events WHERE canary_event_id=?",
+            (ledger["event_id"],),
+        ).fetchone()
+        self.assertIsNotNone(event)
+        assert event is not None
+        self.assertEqual(event["status"], "UNKNOWN")
+        self.assertIsNone(event["actual_average_price"])
+        self.assertIsNone(event["fees"])
     def test_different_candidate_cannot_trade_or_write_ledger(self):
         self.arm()
         venue = FakeVenue()
