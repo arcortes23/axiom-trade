@@ -1056,7 +1056,6 @@ class PolymarketGeoblockSchemaTests(unittest.TestCase):
     def test_geoblock_requires_explicit_boolean_authority(self) -> None:
         malformed: list[tuple[str, object]] = [
             ("missing blocked", {"close_only": False}),
-            ("missing close_only", {"blocked": False}),
             ("null blocked", {"blocked": None, "close_only": False}),
             ("null close_only", {"blocked": False, "close_only": None}),
             ("zero blocked", {"blocked": 0, "close_only": False}),
@@ -1095,6 +1094,17 @@ class PolymarketGeoblockSchemaTests(unittest.TestCase):
                 self.assertEqual(result["close_only"], close_only)
                 self.assertEqual(result["country"], "ZZ")
                 self.assertEqual(result["region"], "T")
+
+    def test_geoblock_accepts_official_response_without_close_only(self) -> None:
+        result = self._read(
+            {
+                "blocked": False,
+                "country": "ZZ",
+                "region": "T",
+            }
+        )
+        self.assertEqual(result["blocked"], False)
+        self.assertIs(result["close_only"], False)
 
     def test_geoblock_provider_error_is_a_local_block(self) -> None:
         with patch.dict(
@@ -1433,6 +1443,15 @@ class CanaryReadinessTests(unittest.TestCase):
             "token_id": "yes",
             "position_id": "position-yes",
             "market_version": "v2",
+            "outcome_index": 0,
+            "identity_bindings": [
+                {
+                    "index": 0,
+                    "outcome": "yes",
+                    "token_id": "yes",
+                    "position_id": "position-yes",
+                }
+            ],
             "neg_risk": False,
             "accepting_orders": True,
             "min_order_size": "1",
@@ -1647,6 +1666,15 @@ class CanaryReadinessTests(unittest.TestCase):
                     "token_id": "yes",
                     "position_id": "position-yes",
                     "market_version": "v2",
+                    "outcome_index": 0,
+                    "identity_bindings": [
+                        {
+                            "index": 0,
+                            "outcome": "yes",
+                            "token_id": "yes",
+                            "position_id": "position-yes",
+                        }
+                    ],
                     "neg_risk": False,
                     "accepting_orders": True,
                     "min_order_size": "1",

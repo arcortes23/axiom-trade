@@ -474,6 +474,8 @@ def _ensure_schema(service: CanaryService) -> None:
               venue TEXT NOT NULL,
               market_id TEXT NOT NULL,
               token_id TEXT NOT NULL,
+              asset_id TEXT,
+              market_version TEXT,
               side TEXT NOT NULL,
               order_id TEXT,
               requested_quantity TEXT NOT NULL,
@@ -526,6 +528,17 @@ def _ensure_schema(service: CanaryService) -> None:
                 connection.execute(
                     f"ALTER TABLE canary_position_lots "
                     f"ADD COLUMN {name} TEXT NOT NULL DEFAULT '0'"
+                )
+        request_columns = {
+            str(row["name"])
+            for row in connection.execute(
+                "PRAGMA table_info(canary_position_requests)"
+            )
+        }
+        for name in ("asset_id", "market_version"):
+            if name not in request_columns:
+                connection.execute(
+                    f"ALTER TABLE canary_position_requests ADD COLUMN {name} TEXT"
                 )
         reconciliation_columns = {
             str(row["name"])
@@ -743,6 +756,18 @@ def _mark_owned_equity(
             )
             if not isinstance(context, Mapping):
                 raise CanaryBlocked("CANARY_EQUITY_MARKET_CONTEXT_INVALID")
+            market_version, asset_id = _validate_market_context_identity(
+                context,
+                token_id,
+                missing_reason="CANARY_EQUITY_IDENTITY_UNAVAILABLE",
+                conflict_reason="CANARY_EQUITY_IDENTITY_CONFLICT",
+            )
+            persisted_identity = _lot_persisted_identity(service, lot)
+            if persisted_identity is None:
+                if market_version != "v1" or asset_id != token_id:
+                    raise CanaryBlocked("CANARY_EQUITY_IDENTITY_UNAVAILABLE")
+            elif persisted_identity != (market_version, asset_id):
+                raise CanaryBlocked("CANARY_EQUITY_IDENTITY_CONFLICT")
             price = _extract_book_price(context, side="SELL")
             mark_fee = _mark_fee(context, quantity=quantity, price=price)
             cost_basis = max(ZERO, _decimal(lot.get("cost_basis"), ZERO))
@@ -1018,7 +1043,152 @@ def _validate_market_context_identity(
         )
         if asset_id != position_id:
             raise CanaryBlocked(conflict_reason)
+    _validate_context_outcome_binding(
+        context,
+        token_id=selected_token,
+        asset_id=asset_id,
+        market_version=market_version,
+        missing_reason=missing_reason,
+        conflict_reason=conflict_reason,
+    )
     return market_version, asset_id
+def _entry_context_identity(
+    row: Mapping[str, Any],
+    evidence: Mapping[str, Any],
+    *,
+    missing_reason: str,
+    conflict_reason: str,
+) -> tuple[str, str]:
+    """Resolve the owned token and exchange asset for one persisted BUY."""
+    token_id = _required_identity(row.get("token_id"), missing_reason)
+    identity_values = (
+        evidence.get("market_version"),
+        evidence.get("marketVersion"),
+        evidence.get("selected_token_id"),
+        evidence.get("selectedTokenId"),
+        evidence.get("token_id"),
+        evidence.get("tokenId"),
+        evidence.get("selected_position_id"),
+        evidence.get("selectedPositionId"),
+        evidence.get("position_id"),
+        evidence.get("positionId"),
+        evidence.get("resolved_asset_id"),
+        evidence.get("asset_id"),
+        evidence.get("assetId"),
+    )
+    if not any(str(value or "").strip() for value in identity_values):
+        # Rows written before identity evidence was persisted can only be
+        # accepted as the v1 token/asset identity.  A v2 observation must
+        # carry its explicit context and therefore cannot be guessed here.
+        return "v1", token_id
+    context = dict(evidence)
+    context.setdefault(
+        "token_id",
+        evidence.get("selected_token_id")
+        or evidence.get("selectedTokenId")
+        or evidence.get("tokenId"),
+    )
+    context.setdefault(
+        "position_id",
+        evidence.get("selected_position_id")
+        or evidence.get("selectedPositionId")
+        or evidence.get("positionId"),
+    )
+    context.setdefault(
+        "asset_id",
+        evidence.get("resolved_asset_id")
+        or evidence.get("assetId"),
+    )
+    market_version, asset_id = _validate_market_context_identity(
+        context,
+        token_id,
+        missing_reason=missing_reason,
+        conflict_reason=conflict_reason,
+    )
+    return market_version, asset_id
+def _validate_context_outcome_binding(
+    context: Mapping[str, Any],
+    *,
+    token_id: str,
+    asset_id: str,
+    market_version: str,
+    missing_reason: str,
+    conflict_reason: str,
+) -> None:
+    if market_version != "v2":
+        return
+    raw_index = context.get("outcome_index")
+    if isinstance(raw_index, bool) or raw_index in (None, ""):
+        raise CanaryBlocked(missing_reason)
+    try:
+        outcome_index = int(raw_index)
+    except (TypeError, ValueError, OverflowError):
+        raise CanaryBlocked(conflict_reason) from None
+    bindings = context.get("identity_bindings")
+    if not isinstance(bindings, Sequence) or isinstance(
+        bindings, (str, bytes, bytearray)
+    ):
+        raise CanaryBlocked(missing_reason)
+    matched: list[tuple[int, str, str]] = []
+    seen_indexes: set[int] = set()
+    seen_tokens: set[str] = set()
+    seen_assets: set[str] = set()
+    for binding in bindings:
+        if not isinstance(binding, Mapping):
+            raise CanaryBlocked(conflict_reason)
+        try:
+            index_value = binding.get("index")
+            if isinstance(index_value, bool):
+                raise ValueError
+            index = int(index_value)
+            bound_token = _required_identity(
+                binding.get("token_id"),
+                missing_reason,
+            )
+            bound_asset = _required_identity(
+                binding.get("position_id"),
+                missing_reason,
+            )
+        except (TypeError, ValueError, OverflowError):
+            raise CanaryBlocked(conflict_reason) from None
+        if (
+            index in seen_indexes
+            or bound_token in seen_tokens
+            or bound_asset in seen_assets
+        ):
+            raise CanaryBlocked(conflict_reason)
+        seen_indexes.add(index)
+        seen_tokens.add(bound_token)
+        seen_assets.add(bound_asset)
+        if bound_token == token_id:
+            matched.append((index, bound_token, bound_asset))
+    if len(matched) != 1:
+        raise CanaryBlocked(conflict_reason)
+    bound_index, _, bound_asset = matched[0]
+    if bound_index != outcome_index or bound_asset != asset_id:
+        raise CanaryBlocked(conflict_reason)
+def _lot_persisted_identity(
+    service: CanaryService,
+    lot: Mapping[str, Any],
+) -> tuple[str, str] | None:
+    """Read the immutable BUY context that established an owned lot."""
+    event_id = str(lot.get("event_id") or "").strip()
+    if not event_id:
+        return None
+    with service.store._lock:
+        row = _connection(service).execute(
+            "SELECT token_id,evidence_json FROM canary_ledger WHERE event_id=?",
+            (event_id,),
+        ).fetchone()
+    if row is None:
+        return None
+    evidence = _decode(row["evidence_json"])
+    return _entry_context_identity(
+        {"token_id": row["token_id"]},
+        evidence,
+        missing_reason="CANARY_EQUITY_IDENTITY_UNAVAILABLE",
+        conflict_reason="CANARY_EQUITY_IDENTITY_CONFLICT",
+    )
 
 
 
@@ -1031,6 +1201,8 @@ def _validate_venue_identity(
     expected_market_id: Any,
     expected_token_id: Any,
     expected_quantity: Any,
+    expected_asset_id: Any = None,
+    expected_market_version: Any = None,
     lot: Mapping[str, Any] | None = None,
     prior_request_quantity: Any = ZERO,
 ) -> tuple[str, Decimal]:
@@ -1057,6 +1229,44 @@ def _validate_venue_identity(
         missing="CANARY_ORDER_IDENTITY_UNAVAILABLE",
         conflict="CANARY_ORDER_IDENTITY_CONFLICT",
     )
+    try:
+        market_version = _required_identity(
+            expected_market_version,
+            "CANARY_ORDER_IDENTITY_UNAVAILABLE",
+        ).lower()
+        expected_asset = _required_identity(
+            expected_asset_id,
+            "CANARY_ORDER_IDENTITY_UNAVAILABLE",
+        )
+    except CanaryBlocked:
+        raise
+    if market_version not in {"v1", "v2"}:
+        raise CanaryBlocked("CANARY_ORDER_IDENTITY_CONFLICT")
+    if market_version == "v1" and expected_asset != token:
+        raise CanaryBlocked("CANARY_ORDER_IDENTITY_CONFLICT")
+
+    def observed_asset(
+        source: Mapping[str, Any],
+        *,
+        missing: str,
+        conflict: str,
+    ) -> str:
+        if market_version == "v2" and any(
+            str(mapping_value(source, name) or "").strip()
+            for name in ("asset_id", "assetId")
+        ):
+            return _identity_alias(
+                source,
+                ("asset_id", "assetId"),
+                missing=missing,
+                conflict=conflict,
+            )
+        return _identity_alias(
+            source,
+            ("token_id", "tokenId", "asset_id", "assetId", "asset"),
+            missing=missing,
+            conflict=conflict,
+        )
     try:
         requested = decimal_value(
             expected_quantity,
@@ -1107,9 +1317,8 @@ def _validate_venue_identity(
         missing="CANARY_ORDER_IDENTITY_UNAVAILABLE",
         conflict="CANARY_ORDER_IDENTITY_CONFLICT",
     ).upper()
-    observed_token = _identity_alias(
+    observed_token = observed_asset(
         order,
-        ("token_id", "tokenId", "asset_id", "assetId", "asset"),
         missing="CANARY_ORDER_IDENTITY_UNAVAILABLE",
         conflict="CANARY_ORDER_IDENTITY_CONFLICT",
     )
@@ -1121,22 +1330,16 @@ def _validate_venue_identity(
     )
     if (
         observed_side != side
-        or observed_token != token
+        or observed_token != expected_asset
         or observed_market != market
     ):
         raise CanaryBlocked("CANARY_ORDER_IDENTITY_CONFLICT")
-    raw_order_price = _value(
-        order,
-        "price",
-        "limit_price",
-        "limitPrice",
-        default=None,
-    )
-    if raw_order_price not in (None, ""):
-        try:
-            response_price(order)
-        except ValueError:
-            raise CanaryBlocked("CANARY_ORDER_PRICE_UNAVAILABLE") from None
+    try:
+        order_price = response_price(order)
+    except ValueError:
+        raise CanaryBlocked("CANARY_ORDER_PRICE_UNAVAILABLE") from None
+    if not ZERO < order_price < ONE:
+        raise CanaryBlocked("CANARY_ORDER_PRICE_UNAVAILABLE")
     try:
         order_quantity = response_quantity(order)
     except ValueError:
@@ -1169,9 +1372,8 @@ def _validate_venue_identity(
             missing="CANARY_TRADE_IDENTITY_UNAVAILABLE",
             conflict="CANARY_TRADE_IDENTITY_CONFLICT",
         ).upper()
-        observed_trade_token = _identity_alias(
+        observed_trade_token = observed_asset(
             trade,
-            ("token_id", "tokenId", "asset_id", "assetId", "asset"),
             missing="CANARY_TRADE_IDENTITY_UNAVAILABLE",
             conflict="CANARY_TRADE_IDENTITY_CONFLICT",
         )
@@ -1183,7 +1385,7 @@ def _validate_venue_identity(
         )
         if (
             observed_trade_side != side
-            or observed_trade_token != token
+            or observed_trade_token != expected_asset
             or observed_trade_market != market
         ):
             raise CanaryBlocked("CANARY_TRADE_IDENTITY_CONFLICT")
@@ -1374,9 +1576,17 @@ def _sync_entry_lots(service: CanaryService, now: datetime) -> int:
         if quantity <= DUST or not ZERO < price < ONE or fees < ZERO:
             continue
         evidence = _decode(row.get("evidence_json"))
-        execution_asset_id = str(
-            evidence.get("resolved_asset_id") or row.get("token_id") or ""
-        ).strip()
+        try:
+            market_version, execution_asset_id = _entry_context_identity(
+                row,
+                evidence,
+                missing_reason="CANARY_POSITION_IDENTITY_UNAVAILABLE",
+                conflict_reason="CANARY_POSITION_IDENTITY_CONFLICT",
+            )
+        except CanaryBlocked:
+            # Invalid or incomplete identity evidence must not establish
+            # ownership, and must not prevent unrelated entries projecting.
+            continue
         signal_id = str(row.get("signal_id") or "")
         with service.store._lock:
             signal_row = connection.execute("SELECT strategy_hash,model_hash,config_hash FROM canary_signals WHERE signal_id=?", (signal_id,)).fetchone() if signal_id else None
@@ -1395,8 +1605,11 @@ def _sync_entry_lots(service: CanaryService, now: datetime) -> int:
         strategy_hash = str(evidence.get("strategy_hash") or "")
         opened = _iso(row.get("timestamp"), now)
         with service.store._lock, connection:
-            existing = connection.execute("SELECT quantity,cost_basis,fees,status FROM canary_position_lots WHERE position_id=?", (position_id,)).fetchone()
+            existing = connection.execute("SELECT token_id,quantity,cost_basis,fees,status FROM canary_position_lots WHERE position_id=?", (position_id,)).fetchone()
             if existing is not None:
+                existing_token = str(existing["token_id"] or "").strip()
+                if not existing_token or existing_token != str(row.get("token_id") or "").strip():
+                    continue
                 # Reconnect/reordered reads must never reduce owned inventory
                 # or rewrite a lot's immutable policy/version binding.  A
                 # later confirmed acquisition may reopen a previously closed
@@ -1430,7 +1643,7 @@ def _sync_entry_lots(service: CanaryService, now: datetime) -> int:
                 continue
             connection.execute(
                 "INSERT INTO canary_position_lots(position_id,reservation_id,event_id,venue,market_id,token_id,candidate_id,strategy_id,strategy_version,strategy_hash,model_hash,config_id,config_generation,exit_policy_json,quantity,sold_quantity,cost_basis,fees,pending_exit_quantity,status,opened_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (position_id, reservation_id, event_id, str(row.get("venue") or "polymarket"), str(row.get("market_id") or ""), execution_asset_id, candidate_id, evidence.get("strategy_id"), evidence.get("strategy_version"), strategy_hash, evidence.get("model_hash"), reservation_config_id, reservation_config_generation, _json(policy), str(quantity), "0", str(quantity * price + fees), str(fees), "0", policy_status, opened, _iso(now)),
+                (position_id, reservation_id, event_id, str(row.get("venue") or "polymarket"), str(row.get("market_id") or ""), str(row.get("token_id") or "").strip(), candidate_id, evidence.get("strategy_id"), evidence.get("strategy_version"), strategy_hash, evidence.get("model_hash"), reservation_config_id, reservation_config_generation, _json(policy), str(quantity), "0", str(quantity * price + fees), str(fees), "0", policy_status, opened, _iso(now)),
             )
             created += 1
     return created
@@ -1631,22 +1844,24 @@ def _reconcile_entry_ledger(service: CanaryService, venue: Any, now: datetime) -
             terminal_cursor_candidate = row_key
         try:
             entry_evidence = _decode(row.get("evidence_json"))
-            execution_asset_id = str(
-                entry_evidence.get("resolved_asset_id")
-                or row.get("token_id")
-                or ""
-            ).strip()
+            market_version, execution_asset_id = _entry_context_identity(
+                row,
+                entry_evidence,
+                missing_reason="CANARY_ORDER_IDENTITY_UNAVAILABLE",
+                conflict_reason="CANARY_ORDER_IDENTITY_CONFLICT",
+            )
             order = _call(get_order, order_id=order_id)
             if not isinstance(order, Mapping):
                 raise CanaryBlocked("CANARY_ORDER_RESPONSE_INVALID")
             status = _order_status(order)
+            trade_query = {
+                "order_id": order_id,
+                "market": str(row.get("market_id") or "") or None,
+                "asset_id": execution_asset_id if market_version == "v2" else None,
+                "token_id": execution_asset_id if market_version == "v1" else None,
+            }
             raw_trades = _parse_trades(
-                _call(
-                    list_trades,
-                    order_id=order_id,
-                    token_id=execution_asset_id or None,
-                    market=str(row.get("market_id") or "") or None,
-                )
+                _call(list_trades, **trade_query)
             )
             _validate_venue_identity(
                 order=order,
@@ -1656,6 +1871,8 @@ def _reconcile_entry_ledger(service: CanaryService, venue: Any, now: datetime) -
                 expected_market_id=row.get("market_id"),
                 expected_token_id=row.get("token_id"),
                 expected_quantity=row.get("submitted_quantity"),
+                expected_asset_id=execution_asset_id,
+                expected_market_version=market_version,
             )
             failed_trade = any(
                 str(_value(trade, "status", "state", default="")).upper()
@@ -1827,19 +2044,6 @@ def _reconcile_entry_ledger(service: CanaryService, venue: Any, now: datetime) -
                 quantity += existing_quantity
                 cost += existing_quantity * existing_price
                 fees += existing_fee
-            if quantity <= ZERO:
-                prior_status = str(row.get("status") or "").upper()
-                prior_price = _decimal(row.get("actual_average_price"), Decimal("-1"))
-                prior_fees = _decimal(row.get("fees"), Decimal("-1"))
-                if (
-                    prior_status in _OWNED_ENTRY_STATUSES
-                    and prior_quantity > ZERO
-                    and ZERO < prior_price < ONE
-                    and prior_fees >= ZERO
-                ):
-                    quantity = prior_quantity
-                    cost = prior_quantity * prior_price
-                    fees = prior_fees
             for (
                 _trade,
                 fill_id,
@@ -2198,8 +2402,8 @@ def submit_exit(service: CanaryService, position_id: str, venue: Any, *, expecte
             if int(updated.rowcount or 0) != 1:
                 raise CanaryBlocked("DUPLICATE_EXIT_REQUEST")
             _connection(service).execute(
-                "INSERT INTO canary_position_requests(request_id,position_id,reservation_id,event_id,venue,market_id,token_id,side,requested_quantity,status,expected_generation,config_id,submitted_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (request_id, position_key, reservation_id, request_id, lot.get("venue"), market_id, token_id, "SELL", str(quantity), "PREPARED", int(expected_generation), str(config_id), _iso(now), _iso(now)),
+                "INSERT INTO canary_position_requests(request_id,position_id,reservation_id,event_id,venue,market_id,token_id,asset_id,market_version,side,requested_quantity,status,expected_generation,config_id,submitted_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (request_id, position_key, reservation_id, request_id, lot.get("venue"), market_id, token_id, asset_id, market_version, "SELL", str(quantity), "PREPARED", int(expected_generation), str(config_id), _iso(now), _iso(now)),
             )
     except (CanaryBlocked, sqlite3.IntegrityError) as exc:
         reject_prepared(str(exc))
@@ -2516,10 +2720,12 @@ def _apply_reconciled_request(service: CanaryService, request: Mapping[str, Any]
         order=order,
         trades=trades,
         expected_order_id=order_id,
-        expected_side=request.get("side"),
-        expected_market_id=request.get("market_id"),
-        expected_token_id=request.get("token_id"),
+        expected_side=current_request.get("side"),
+        expected_market_id=current_request.get("market_id"),
+        expected_token_id=current_request.get("token_id"),
         expected_quantity=current_request.get("requested_quantity"),
+        expected_asset_id=current_request.get("asset_id"),
+        expected_market_version=current_request.get("market_version"),
         lot=lot_context,
         prior_request_quantity=current_request.get("filled_quantity"),
     )
@@ -2786,6 +2992,8 @@ def _apply_reconciled_request(service: CanaryService, request: Mapping[str, Any]
                     expected_market_id=current_request.get("market_id"),
                     expected_token_id=current_request.get("token_id"),
                     expected_quantity=current_request.get("requested_quantity"),
+                    expected_asset_id=current_request.get("asset_id"),
+                    expected_market_version=current_request.get("market_version"),
                     lot=lot_context,
                     prior_request_quantity=current_request.get("filled_quantity"),
                 )

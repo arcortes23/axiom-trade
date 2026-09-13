@@ -676,16 +676,31 @@ def _best_ask_price(asks: Any) -> Decimal:
     return min(prices)
 
 
+def _market_protocol_version(market: Any) -> str:
+    """Return the explicit market protocol version; never infer it from IDs."""
+    values: list[str] = []
+    for name in (
+        "version",
+        "market_version",
+        "marketVersion",
+        "protocol_version",
+        "protocolVersion",
+    ):
+        raw = _sdk_value(market, name, None)
+        value = _sdk_value(raw, "value", raw)
+        text = str(value or "").strip().lower()
+        if text:
+            values.append(text)
+    if not values or len(set(values)) != 1 or values[0] not in {"v1", "v2"}:
+        raise CanaryBlocked("MARKET_CONTEXT_FAILED")
+    return values[0]
+
+
 def _select_market_asset(
     market: Any,
     requested_id: str,
 ) -> tuple[str, str, str | None, str | None]:
-    version_value = _sdk_value(
-        _sdk_value(market, "version"),
-        "value",
-        _sdk_value(market, "version", ""),
-    )
-    version = str(version_value or "").lower()
+    version = _market_protocol_version(market)
     outcomes = _sdk_value(market, "outcomes")
     requested = str(requested_id).strip()
     selected_name = requested.lower()
@@ -713,6 +728,24 @@ def _select_market_asset(
     return str(asset_id), selected_name, (
         str(token_id) if token_id is not None else None
     ), (str(position_id) if position_id is not None else None)
+def _market_identity_bindings(market: Any) -> list[dict[str, Any]]:
+    """Extract the protocol's independent outcome token/position mapping."""
+    outcomes = _sdk_value(market, "outcomes")
+    bindings: list[dict[str, Any]] = []
+    for index, name in enumerate(("yes", "no")):
+        candidate = _sdk_value(outcomes, name) if outcomes is not None else None
+        token_id = str(_sdk_value(candidate, "token_id", "") or "").strip()
+        position_id = str(_sdk_value(candidate, "position_id", "") or "").strip()
+        if token_id and position_id:
+            bindings.append(
+                {
+                    "index": index,
+                    "outcome": name,
+                    "token_id": token_id,
+                    "position_id": position_id,
+                }
+            )
+    return bindings
 
 
 def _read_only_operation(
@@ -1128,7 +1161,7 @@ def _read_only_operation(
             fee_rate = Decimal(str(_sdk_value(market, "fee_bps", 0) or 0)) / Decimal("10000")
         if fee_exponent is None:
             fee_exponent = _sdk_value(fee_schedule, "exponent", 1)
-        market_version = "v2" if selected_position_id else "v1"
+        market_version = _market_protocol_version(market)
         fee_rate = Decimal(str(fee_rate))
         fee_exponent = Decimal(str(fee_exponent))
         if (
@@ -1163,10 +1196,19 @@ def _read_only_operation(
             accepting_orders = _sdk_value(market, "accepting_orders", _UNSET)
         if type(accepting_orders) is not bool:
             raise CanaryBlocked("MARKET_CONTEXT_FAILED")
+        identity_bindings = _market_identity_bindings(market)
+        if market_version == "v2" and not any(
+            binding["token_id"] == selected_token_id
+            and binding["position_id"] == selected_position_id
+            for binding in identity_bindings
+        ):
+            raise CanaryBlocked("MARKET_OUTCOME_ID_UNAVAILABLE")
         return {
             "market_version": market_version,
             "neg_risk": canonical_neg_risk,
             "outcome": outcome,
+            "outcome_index": 0 if outcome == "yes" else 1,
+            "identity_bindings": identity_bindings,
             "token_id": selected_token_id,
             "position_id": selected_position_id,
             "asset_id": asset_id,
@@ -1546,7 +1588,7 @@ def _validated_geoblock_response(payload: Any) -> dict[str, Any]:
         raise CanaryBlocked("GEOBLOCK_RESPONSE_INVALID")
     try:
         blocked = payload["blocked"]
-        close_only = payload["close_only"]
+        close_only = payload.get("close_only", False)
         country = payload.get("country")
         region = payload.get("region")
     except Exception as exc:
@@ -11272,6 +11314,8 @@ class CanaryService:
                 "estimated_fees": str(estimated_fees),
                 "resolved_asset_id": resolved_asset_id,
                 "market_version": market_version,
+                "outcome_index": context.get("outcome_index"),
+                "identity_bindings": context.get("identity_bindings"),
                 "selected_token_id": context.get("token_id"),
                 "selected_position_id": context.get("position_id"),
                 "geoblock": {
@@ -12057,9 +12101,84 @@ class CanaryService:
                 except (TypeError, ValueError, ArithmeticError):
                     return None
                 return parsed if parsed.is_finite() else None
-            expected_price = _decimal(response.get("paper_expected_price"), paper_expected_price)
-            actual_price = _decimal(response.get("actual_average_price"))
-            actual_fees = _decimal(response.get("fees"))
+
+            expected_price = _decimal(
+                response.get("paper_expected_price"),
+                paper_expected_price,
+            )
+            raw_actual_price = response.get("actual_average_price")
+            actual_price = _decimal(raw_actual_price)
+            raw_fill_quantity = response.get(
+                "fill_quantity",
+                response.get("filled_quantity"),
+            )
+            fill_quantity = _decimal(raw_fill_quantity)
+            fee_values = [
+                response[name]
+                for name in ("fees", "fee", "fee_amount")
+                if name in response and response[name] not in (None, "")
+            ]
+            raw_actual_fees = fee_values[0] if fee_values else None
+            actual_fees = _decimal(raw_actual_fees)
+            actual_price_present = raw_actual_price not in (None, "")
+            fill_quantity_present = raw_fill_quantity not in (None, "")
+            malformed_economic = (
+                (
+                    actual_price_present
+                    and (
+                        actual_price is None
+                        or not Decimal("0") < actual_price < Decimal("1")
+                    )
+                )
+                or (
+                    fill_quantity_present
+                    and (
+                        fill_quantity is None
+                        or fill_quantity < 0
+                    )
+                )
+                or (
+                    fill_quantity is not None
+                    and fill_quantity > 0
+                    and (
+                        not actual_price_present
+                        or actual_price is None
+                        or not Decimal("0") < actual_price < Decimal("1")
+                    )
+                )
+                or (
+                    outcome in {
+                        "FILLED",
+                        "PARTIAL",
+                        "PARTIALLY_FILLED",
+                        "SETTLED",
+                        "RESOLVED",
+                    }
+                    and not actual_price_present
+                )
+                or any(
+                    _decimal(raw_fee) is None or _decimal(raw_fee) < 0
+                    for raw_fee in fee_values
+                )
+                or (
+                    fill_quantity is not None
+                    and fill_quantity > quantity
+                )
+                or (
+                    fill_quantity is not None
+                    and fill_quantity > 0
+                    and actual_price is not None
+                    and fill_quantity * actual_price > notional
+                )
+            )
+            if malformed_economic:
+                if outcome not in {"REJECTED", "UNKNOWN"}:
+                    raise CanaryBlocked("CANARY_SUBMISSION_RESPONSE_INVALID")
+                error = error or "CANARY_SUBMISSION_RESPONSE_INVALID"
+                # Never persist an untrusted economic observation alongside
+                # an ambiguous outcome.
+                actual_price = None
+                actual_fees = None
             price_difference = (
                 actual_price - expected_price
                 if actual_price is not None and expected_price is not None
@@ -12132,12 +12251,8 @@ class CanaryService:
                             canonical_order_id,
                             outcome,
                             None,
-                            str(response.get("actual_average_price"))
-                            if response.get("actual_average_price") is not None
-                            else None,
-                            str(response.get("fees"))
-                            if response.get("fees") is not None
-                            else None,
+                            str(actual_price) if actual_price is not None else None,
+                            str(actual_fees) if actual_fees is not None else None,
                             latency_ms,
                             json.dumps(evidence_event, sort_keys=True),
                         ),

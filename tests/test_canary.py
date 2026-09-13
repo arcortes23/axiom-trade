@@ -621,6 +621,15 @@ class CanaryTests(unittest.TestCase):
             "token_id": "yes",
             "position_id": "position-yes",
             "market_version": "v2",
+            "outcome_index": 0,
+            "identity_bindings": [
+                {
+                    "index": 0,
+                    "outcome": "yes",
+                    "token_id": "yes",
+                    "position_id": "position-yes",
+                }
+            ],
             "neg_risk": False,
             "accepting_orders": True,
             "min_order_size": "1",
@@ -2157,7 +2166,6 @@ class CanaryTests(unittest.TestCase):
 
         malformed = [
             ("missing blocked", {"close_only": False}),
-            ("missing close_only", {"blocked": False}),
             ("null blocked", {"blocked": None, "close_only": False}),
             ("null close_only", {"blocked": False, "close_only": None}),
             ("zero blocked", {"blocked": 0, "close_only": False}),
@@ -2365,6 +2373,7 @@ class CanaryTests(unittest.TestCase):
     def test_official_market_context_tick_reaches_buy_preflight(self):
         self.arm()
         posted = []
+        book_assets = []
 
         class OrderMetadata:
             @staticmethod
@@ -2391,13 +2400,18 @@ class CanaryTests(unittest.TestCase):
                 return SimpleNamespace(
                     version="v1",
                     outcomes=SimpleNamespace(
-                        yes=SimpleNamespace(label="yes", token_id="yes"),
+                        yes=SimpleNamespace(
+                            label="yes",
+                            token_id="yes",
+                            position_id="deprecated-position-yes",
+                        ),
                     ),
                     state=SimpleNamespace(accepting_orders=True),
                     fee_bps="0",
                 )
 
             def get_order_book(self, *, asset_id):
+                book_assets.append(asset_id)
                 return SimpleNamespace(
                     min_order_size="1",
                     size_increment="0.01",
@@ -2463,6 +2477,7 @@ class CanaryTests(unittest.TestCase):
         self.assertEqual(result["execution_status"], "MATCHED")
         self.assertEqual(result["status"], "matched")
         self.assertEqual(len(posted), 1)
+        self.assertEqual(book_assets, ["yes"])
     def _assert_official_context_identity_blocked(
         self,
         signal_id,
@@ -2957,6 +2972,15 @@ class CanaryTests(unittest.TestCase):
             "token_id": "yes",
             "position_id": "position-yes",
             "market_version": "v2",
+            "outcome_index": 0,
+            "identity_bindings": [
+                {
+                    "index": 0,
+                    "outcome": "yes",
+                    "token_id": "yes",
+                    "position_id": "position-yes",
+                }
+            ],
             "neg_risk": False,
             "accepting_orders": True,
             "min_order_size": "1",
@@ -3208,6 +3232,15 @@ class CanaryTests(unittest.TestCase):
             "token_id": "yes",
             "position_id": "position-yes",
             "market_version": "v2",
+            "outcome_index": 0,
+            "identity_bindings": [
+                {
+                    "index": 0,
+                    "outcome": "yes",
+                    "token_id": "yes",
+                    "position_id": "position-yes",
+                }
+            ],
             "neg_risk": False,
             "accepting_orders": True,
             "min_order_size": "1",
@@ -3327,6 +3360,15 @@ class CanaryTests(unittest.TestCase):
             "token_id": "yes",
             "position_id": "position-yes",
             "market_version": "v2",
+            "outcome_index": 0,
+            "identity_bindings": [
+                {
+                    "index": 0,
+                    "outcome": "yes",
+                    "token_id": "yes",
+                    "position_id": "position-yes",
+                }
+            ],
             "neg_risk": False,
             "accepting_orders": True,
             "min_order_size": "1",
@@ -3737,12 +3779,107 @@ class CanaryTests(unittest.TestCase):
         self.assertEqual(evidence["actual_average_price"], "0.50")
         self.assertEqual(evidence["actual_fees"], "0.01")
 
+    def _assert_malformed_external_economics(
+        self,
+        signal_id,
+        actual_price,
+        fee_amount,
+    ):
+        self.arm()
+
+        class MalformedOutcomeVenue(FakeVenue):
+            def submit_limit_order(self, **kwargs):
+                self.submissions.append(kwargs)
+                return {
+                    "ok": True,
+                    "order_id": "malformed-" + signal_id,
+                    "status": "matched",
+                    "fill_quantity": "1",
+                    "actual_average_price": actual_price,
+                    "fee_amount": fee_amount,
+                }
+
+        with self.assertRaisesRegex(
+            CanaryBlocked,
+            "CANARY_SUBMISSION_UNKNOWN",
+        ):
+            self.submit(signal_id, venue=MalformedOutcomeVenue())
+        ledger = self.store.connection.execute(
+            "SELECT event_id,status,actual_average_price,fees "
+            "FROM canary_ledger WHERE signal_id=?",
+            (signal_id,),
+        ).fetchone()
+        self.assertIsNotNone(ledger)
+        assert ledger is not None
+        self.assertEqual(ledger["status"], "UNKNOWN")
+        self.assertIsNone(ledger["actual_average_price"])
+        self.assertIsNone(ledger["fees"])
+        event = self.store.connection.execute(
+            "SELECT status,actual_average_price,fees "
+            "FROM canary_execution_events WHERE canary_event_id=?",
+            (ledger["event_id"],),
+        ).fetchone()
+        self.assertIsNotNone(event)
+        assert event is not None
+        self.assertEqual(event["status"], "UNKNOWN")
+        self.assertIsNone(event["actual_average_price"])
+        self.assertIsNone(event["fees"])
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM canary_risk_fills"
+            ).fetchone()[0],
+            0,
+        )
+
+    def test_response_price_zero_stays_unknown_without_fill_accounting(self):
+        self._assert_malformed_external_economics(
+            "response-price-zero",
+            "0",
+            "0",
+        )
+
+    def test_response_price_one_stays_unknown_without_fill_accounting(self):
+        self._assert_malformed_external_economics(
+            "response-price-one",
+            "1",
+            "0",
+        )
+
+    def test_response_price_over_one_stays_unknown_without_fill_accounting(self):
+        self._assert_malformed_external_economics(
+            "response-price-over-one",
+            "2",
+            "0",
+        )
+
+    def test_response_price_nan_stays_unknown_without_fill_accounting(self):
+        self._assert_malformed_external_economics(
+            "response-price-nan",
+            "NaN",
+            "0",
+        )
+
+    def test_response_negative_fee_stays_unknown_without_fill_accounting(self):
+        self._assert_malformed_external_economics(
+            "response-negative-fee",
+            "0.50",
+            "-0.01",
+        )
+
     def test_different_candidate_cannot_trade_or_write_ledger(self):
         self.arm()
         venue = FakeVenue()
-        self.assertBlocked("CANARY_SIGNAL_NOT_FOUND", lambda: self.submit(candidate_id="C999", venue=venue))
+        self.assertBlocked(
+            "CANARY_SIGNAL_NOT_FOUND",
+            lambda: self.submit(candidate_id="C999", venue=venue),
+        )
         self.assertFalse(venue.submissions)
-        self.assertEqual(self.store.connection.execute("SELECT COUNT(*) FROM canary_ledger").fetchone()[0], 0)
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM canary_ledger"
+            ).fetchone()[0],
+            0,
+        )
     def test_invalid_frozen_binding_cannot_trade(self):
         self.arm()
         self.store.connection.execute(

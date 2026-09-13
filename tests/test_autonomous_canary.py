@@ -126,7 +126,7 @@ class TestVenue:
             "ok": True,
             "order_id": "quality-order",
             "status": "matched",
-            "fill_quantity": kwargs["size"],
+            "fill_quantity": "0.9",
             "actual_average_price": "0.51",
             "fees": "0.02",
         }

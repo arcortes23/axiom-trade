@@ -94,6 +94,15 @@ class _PositionCanaryVenue:
             "asset_id": token_id,
             "position_id": token_id,
             "market_version": "v2",
+            "outcome_index": 0,
+            "identity_bindings": [
+                {
+                    "index": 0,
+                    "outcome": "yes",
+                    "token_id": token_id,
+                    "position_id": token_id,
+                }
+            ],
             "neg_risk": False,
             "accepting_orders": True,
             "min_order_size": "0.01",
@@ -128,8 +137,10 @@ class _PositionCanaryVenue:
             "side": str(side).upper(),
             "market_id": "synthetic-position-market",
             "token_id": token_id,
+            "asset_id": token_id,
             "original_size": str(quantity),
             "fill_quantity": str(fill_quantity),
+            "price": str(price),
             "settlement_status": "SETTLED" if is_exit else None,
             "actual_average_price": str(price),
             "fees": str(fill_quantity * price * (Decimal("1") - price) * Decimal("0.001")),
@@ -148,8 +159,14 @@ class _PositionCanaryVenue:
 
     def get_order(self, *, order_id: str) -> dict[str, object]:
         return dict(self.orders[order_id])
-
-    def list_account_trades(self, *, order_id: str) -> list[dict[str, object]]:
+    def list_account_trades(
+        self,
+        *,
+        order_id: str,
+        asset_id: str | None = None,
+        token_id: str | None = None,
+        market: str | None = None,
+    ) -> list[dict[str, object]]:
         order = self.orders[order_id]
         return [
             {
@@ -157,6 +174,7 @@ class _PositionCanaryVenue:
                 "order_id": order_id,
                 "market_id": order["market_id"],
                 "token_id": order["token_id"],
+                "asset_id": order["asset_id"],
                 "side": order["side"],
                 "quantity": order["fill_quantity"],
                 "price": order["actual_average_price"],

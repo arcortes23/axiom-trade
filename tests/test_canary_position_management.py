@@ -51,13 +51,21 @@ class OfflineOfficialVenue:
         self.asset_id: str | None = None
         self.trades: list[dict[str, str]] = []
         self.trades_by_order: dict[str, list[dict[str, str]]] = {}
-
+        self.order_assets_by_order: dict[str, str] = {}
+        self.order_tokens_by_order: dict[str, str] = {}
+        self.order_sides_by_order: dict[str, str] = {}
+        self.order_prices_by_order: dict[str, str] = {}
+        self.market_versions_by_token: dict[str, str] = {}
+        self.position_ids_by_token: dict[str, str] = {}
     def geoblock(self) -> dict[str, object]:
         return {"blocked": False, "close_only": False, "country": "ZZ"}
 
     def market_context(self, market_id: str, token_id: str) -> dict[str, object]:
-        version = str(self.market_version or "").strip().lower()
-        position_id = self.position_id
+        version = self.market_versions_by_token.get(
+            token_id,
+            str(self.market_version or "").strip().lower(),
+        )
+        position_id = self.position_ids_by_token.get(token_id, self.position_id)
         asset_id = self.asset_id or (
             position_id if version == "v2" else token_id
         )
@@ -65,7 +73,20 @@ class OfflineOfficialVenue:
             "market_id": market_id,
             "token_id": token_id,
             "asset_id": asset_id,
-            "market_version": self.market_version,
+            "market_version": version,
+            "outcome_index": 0,
+            "identity_bindings": (
+                [
+                    {
+                        "index": 0,
+                        "outcome": "yes",
+                        "token_id": token_id,
+                        "position_id": position_id,
+                    }
+                ]
+                if position_id
+                else []
+            ),
             "position_id": position_id,
             "neg_risk": False,
             "accepting_orders": True,
@@ -77,7 +98,10 @@ class OfflineOfficialVenue:
     def get_order(self, order_id: str) -> dict[str, str]:
         if self.fail_reads:
             raise RuntimeError("temporary account read failure")
-        side = "BUY" if order_id == "late-entry-order" else "SELL"
+        side = self.order_sides_by_order.get(
+            order_id,
+            "BUY" if order_id == "late-entry-order" else "SELL",
+        )
         original_size = (
             "2"
             if order_id == "late-entry-order"
@@ -85,14 +109,22 @@ class OfflineOfficialVenue:
             if order_id == "late-exit-order"
             else "1"
         )
+        token_id = self.order_tokens_by_order.get(order_id, "token-yes")
         result = {
             "id": order_id,
             "status": self.order_status,
             "side": side,
             "market_id": "market-1",
-            "token_id": "token-yes",
+            "token_id": token_id,
             "original_size": original_size,
+            "price": self.order_prices_by_order.get(
+                order_id,
+                "0.70" if order_id == "late-entry-order" else "0.49",
+            ),
         }
+        asset_id = self.order_assets_by_order.get(order_id)
+        if asset_id is not None:
+            result["asset_id"] = asset_id
         if self.settlement_status is not None and (
             self.settlement_order_id is None or self.settlement_order_id == order_id
         ):
@@ -102,17 +134,24 @@ class OfflineOfficialVenue:
     def list_account_trades(self, order_id: str) -> list[dict[str, str]]:
         if self.fail_reads:
             raise RuntimeError("temporary account read failure")
-        side = "BUY" if order_id == "late-entry-order" else "SELL"
-        return [
-            {
+        side = self.order_sides_by_order.get(
+            order_id,
+            "BUY" if order_id == "late-entry-order" else "SELL",
+        )
+        asset_id = self.order_assets_by_order.get(order_id)
+        rows: list[dict[str, str]] = []
+        for trade in self.trades_by_order.get(order_id, self.trades):
+            row = {
                 **dict(trade),
                 "order_id": trade.get("order_id", order_id),
                 "side": trade.get("side", side),
                 "market_id": trade.get("market_id", "market-1"),
                 "token_id": trade.get("token_id", "token-yes"),
             }
-            for trade in self.trades_by_order.get(order_id, self.trades)
-        ]
+            if asset_id is not None:
+                row.setdefault("asset_id", asset_id)
+            rows.append(row)
+        return rows
 
     def submit_limit_order(self, **kwargs: object) -> dict[str, object]:
         raise AssertionError("production exits must use CanaryService.submit_position_order")
@@ -630,6 +669,168 @@ class CanaryPositionManagementTests(unittest.TestCase):
         call = self.service.submit_position_order.call_args.kwargs
         self.assertEqual(call["market_version"], "v2")
         self.assertEqual(call["asset_id"], "position-yes")
+    def test_v2_buy_evidence_sync_preserves_lot_token_for_sell(self) -> None:
+        from axiom.canary_positions import _ensure_schema, _sync_entry_lots
+
+        self.assertEqual(
+            position_module._mark_owned_equity(self.service, self.venue, self.now)["status"],
+            "KNOWN",
+        )
+        _ensure_schema(self.service)
+        event_id = "v2-entry-event"
+        reservation_id = "v2-entry-reservation"
+        token_id = "token-v2-yes"
+        asset_id = "position-v2-yes"
+        config = self.config
+        self.store.reserve_canary_capacity(
+            intent_id="v2-entry-intent",
+            reservation_id=reservation_id,
+            side="BUY",
+            requested_cost="0.50",
+            fee_reserve="0",
+            quantity="1",
+            market_id="market-1",
+            event_id=event_id,
+            config_id=str(config["config_id"]),
+            config_generation=int(config["generation"]),
+            config_hash=str(config["config_hash"]),
+            control_generation=int(config["control_generation"]),
+            detail={"side": "BUY", "token_id": token_id},
+            timestamp=self.now,
+        )
+        self.store.record_canary_fill(
+            fill_id="v2-entry-fill",
+            reservation_id=reservation_id,
+            quantity="1",
+            price="0.50",
+            cost="0.50",
+            fee="0",
+            filled_at=self.now,
+            detail={"side": "BUY", "token_id": token_id},
+        )
+        evidence = {
+            "market_version": "v2",
+            "outcome_index": 0,
+            "identity_bindings": [
+                {
+                    "index": 0,
+                    "outcome": "yes",
+                    "token_id": token_id,
+                    "position_id": asset_id,
+                }
+            ],
+            "selected_token_id": token_id,
+            "selected_position_id": asset_id,
+            "resolved_asset_id": asset_id,
+            "exit_policy": {
+                "type": "fixed_holding_period",
+                "holding_period_seconds": 0,
+            },
+        }
+        with self.store.connection:
+            self.store.connection.execute(
+                "INSERT INTO canary_ledger("
+                "event_id,signal_id,timestamp,candidate_id,venue,market_id,token_id,"
+                "side,requested_notional,paper_expected_price,max_price,submitted_quantity,"
+                "exchange_order_id,fill_quantity,actual_average_price,fees,status,evidence_json,"
+                "control_generation) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    event_id,
+                    "v2-entry-signal",
+                    self.now.isoformat(),
+                    "candidate-1",
+                    "polymarket",
+                    "market-1",
+                    token_id,
+                    "BUY",
+                    "0.50",
+                    "0.50",
+                    "0.70",
+                    "1",
+                    "v2-entry-order",
+                    "0",
+                    None,
+                    "0",
+                    "MATCHED",
+                    json.dumps(evidence, sort_keys=True),
+                    int(config["control_generation"]),
+                ),
+            )
+        self.venue.order_assets_by_order["v2-entry-order"] = asset_id
+        self.venue.order_tokens_by_order["v2-entry-order"] = token_id
+        self.venue.order_sides_by_order["v2-entry-order"] = "BUY"
+        self.venue.order_prices_by_order["v2-entry-order"] = "0.70"
+        self.venue.market_versions_by_token[token_id] = "v2"
+        self.venue.position_ids_by_token[token_id] = asset_id
+        self.venue.trades_by_order["v2-entry-order"] = [
+            {
+                "trade_id": "v2-entry-fill",
+                "quantity": "1",
+                "price": "0.50",
+                "token_id": token_id,
+                "fee_rate_bps": "0",
+                "match_time": self.now.isoformat(),
+                "status": "CONFIRMED",
+            }
+        ]
+        reconciled = position_module.reconcile_pending(self.service, self.venue)
+        self.assertEqual(reconciled["status"], "RECONCILED")
+        self.assertEqual(reconciled["entries"][0]["status"], "CONFIRMED")
+
+        lot_row = self.store.connection.execute(
+            "SELECT token_id,quantity FROM canary_position_lots WHERE position_id=?",
+            ("position:" + event_id,),
+        ).fetchone()
+        self.assertIsNotNone(lot_row)
+        assert lot_row is not None
+        self.assertEqual(lot_row["token_id"], token_id)
+        self.assertEqual(lot_row["quantity"], "1")
+
+        self.venue.market_version = "v2"
+        self.venue.position_id = asset_id
+        self.next_order_id = "v2-exit-order"
+        submitted = self.service.submit_exit(
+            "position:" + event_id,
+            self.venue,
+            expected_generation=int(config["generation"]),
+            config_id=str(config["config_id"]),
+        )
+        self.assertEqual(submitted["status"], "SUBMITTED")
+        self.assertEqual(self.post_calls[-1]["asset_id"], asset_id)
+        request_row = self.store.connection.execute(
+            "SELECT token_id,asset_id,market_version FROM canary_position_requests "
+            "WHERE request_id=?",
+            (submitted["request_id"],),
+        ).fetchone()
+        self.assertIsNotNone(request_row)
+        assert request_row is not None
+        self.assertEqual(request_row["token_id"], token_id)
+        self.assertEqual(request_row["asset_id"], asset_id)
+        self.assertEqual(request_row["market_version"], "v2")
+        marks_before = self.store.connection.execute(
+            "SELECT COUNT(*) FROM canary_equity_marks"
+        ).fetchone()[0]
+        valid_context = self.venue.market_context("market-1", token_id)
+        wrong_pair = {
+            **valid_context,
+            "position_id": "position-v2-no",
+            "asset_id": "position-v2-no",
+        }
+        with patch.object(self.venue, "market_context", return_value=wrong_pair):
+            marked = position_module._mark_owned_equity(
+                self.service,
+                self.venue,
+                self.now + timedelta(seconds=1),
+            )
+        self.assertEqual(marked["status"], "UNKNOWN")
+        self.assertEqual(
+            marked["blocked"][0]["reason"],
+            "CANARY_EQUITY_IDENTITY_CONFLICT",
+        )
+        marks_after = self.store.connection.execute(
+            "SELECT COUNT(*) FROM canary_equity_marks"
+        ).fetchone()[0]
+        self.assertEqual(marks_after, marks_before)
 
 
     def _request(self) -> dict[str, object]:
@@ -1191,6 +1392,48 @@ class CanaryPositionManagementTests(unittest.TestCase):
             ),
         )
 
+    def test_missing_authoritative_order_price_is_unknown_and_blocking(self) -> None:
+        submitted = self._submit_exit()
+        original_get_order = self.venue.get_order
+
+        def order_without_price(order_id: str) -> dict[str, str]:
+            result = original_get_order(order_id)
+            result.pop("price", None)
+            return result
+
+        with patch.object(
+            self.venue,
+            "get_order",
+            side_effect=order_without_price,
+        ):
+            reconciled = position_module.reconcile_pending(
+                self.service,
+                self.venue,
+            )
+
+        self.assertEqual(reconciled["status"], "DEGRADED")
+        request = self._request()
+        self.assertEqual(request["status"], "UNKNOWN")
+        self.assertEqual(request["last_error"], "CANARY_ORDER_PRICE_UNAVAILABLE")
+        self.assertEqual(self._lot()["pending_exit_quantity"], "1")
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM canary_position_fills"
+            ).fetchone()[0],
+            0,
+        )
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM canary_risk_fills "
+                "WHERE fill_id != 'entry-fill-1'"
+            ).fetchone()[0],
+            0,
+        )
+        self.assertEqual(
+            self._reservation(str(submitted["reservation_id"]))["status"],
+            "OPEN",
+        )
+
     def test_kill_during_blocked_pre_post_callback_prevents_send(self) -> None:
         entered = threading.Event()
         release = threading.Event()
@@ -1431,6 +1674,7 @@ class CanaryPositionManagementTests(unittest.TestCase):
             "market_id": "market-1",
             "token_id": "token-yes",
             "original_size": "1",
+            "price": "0.49",
         }
         settled_order = dict(stale_order)
         settled_order["settlement_status"] = "SETTLED"
@@ -1545,6 +1789,7 @@ class CanaryPositionManagementTests(unittest.TestCase):
             "market_id": "market-1",
             "token_id": "token-yes",
             "original_size": "1",
+            "price": "0.49",
         }
         trade = {
             "trade_id": "atomic-interleave-fill",
@@ -1867,6 +2112,88 @@ class CanaryPositionManagementTests(unittest.TestCase):
                 "SELECT COUNT(*) FROM canary_position_fills"
             ).fetchone()[0],
             0,
+        )
+
+    def test_canceled_entry_without_fill_releases_reservation_terminally(self) -> None:
+        config = self.config
+        position_module._mark_owned_equity(self.service, self.venue, self.now)
+        event_id = "canceled-entry-no-fill"
+        reservation_id = "canceled-entry-reservation"
+        self.store.reserve_canary_capacity(
+            intent_id=event_id,
+            reservation_id=reservation_id,
+            side="BUY",
+            requested_cost="1.00",
+            fee_reserve="0",
+            quantity="2",
+            market_id="market-1",
+            event_id=event_id,
+            config_id=str(config["config_id"]),
+            config_generation=int(config["generation"]),
+            config_hash=str(config["config_hash"]),
+            control_generation=int(config["control_generation"]),
+            detail={"side": "BUY", "token_id": "token-yes"},
+            timestamp=self.now,
+        )
+        with self.store.connection:
+            self.store.connection.execute(
+                "INSERT INTO canary_ledger("
+                "event_id,signal_id,timestamp,candidate_id,venue,market_id,token_id,"
+                "side,requested_notional,paper_expected_price,max_price,submitted_quantity,"
+                "exchange_order_id,fill_quantity,actual_average_price,fees,status,evidence_json,"
+                "control_generation) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    event_id,
+                    "canceled-entry-signal",
+                    self.now.isoformat(),
+                    "candidate-1",
+                    "polymarket",
+                    "market-1",
+                    "token-yes",
+                    "BUY",
+                    "1.00",
+                    "0.50",
+                    "0.51",
+                    "2",
+                    "late-entry-order",
+                    "0",
+                    None,
+                    "0",
+                    "CANCELED",
+                    "{}",
+                    int(config["control_generation"]),
+                ),
+            )
+        self.venue.order_status = "CANCELED"
+
+        reconciled = position_module.reconcile_pending(self.service, self.venue)
+
+        self.assertEqual(reconciled["status"], "RECONCILED")
+        self.assertEqual(reconciled["entries"][0]["status"], "CANCELED")
+        entry = self.store.connection.execute(
+            "SELECT status,fill_quantity,settlement FROM canary_ledger "
+            "WHERE event_id=?",
+            (event_id,),
+        ).fetchone()
+        self.assertIsNotNone(entry)
+        assert entry is not None
+        self.assertEqual(entry["status"], "CANCELED")
+        self.assertEqual(entry["fill_quantity"], "0")
+        self.assertEqual(entry["settlement"], "TERMINAL")
+        reservation = self.store.connection.execute(
+            "SELECT status,released_at FROM canary_risk_reservations "
+            "WHERE reservation_id=?",
+            (reservation_id,),
+        ).fetchone()
+        self.assertIsNotNone(reservation)
+        assert reservation is not None
+        self.assertEqual(reservation["status"], "RELEASED")
+        self.assertEqual(reservation["released_at"], self.now.isoformat())
+        self.assertIsNone(
+            self.store.connection.execute(
+                "SELECT 1 FROM canary_position_lots WHERE event_id=?",
+                (event_id,),
+            ).fetchone()
         )
 
     def test_canceled_entry_with_truncated_trade_history_stays_unknown_and_reserved(self) -> None:
