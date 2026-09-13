@@ -923,6 +923,7 @@ class AxiomStore:
                 )
             self._migrate_market_tables()
             self._initialize_canary_risk_schema()
+            self._initialize_rolling_portfolio_schema()
             self._create_dataset_attestation_triggers()
     def _migrate_market_tables(self) -> None:
         """Upgrade pre-versioned market tables without discarding records."""
@@ -987,6 +988,291 @@ class AxiomStore:
                 self._conn.execute(query, (_now_iso(),) if created_expr == "?" else ())
                 self._conn.execute("DROP TABLE snapshots_legacy")
                 self._conn.execute("CREATE INDEX idx_snapshots_key_time ON snapshots(key, timestamp)")
+    def _initialize_rolling_portfolio_schema(self) -> None:
+        """Create additive rolling-portfolio tables without touching legacy data."""
+        self._conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS strategy_versions (
+                strategy_version_id TEXT PRIMARY KEY,
+                strategy_id TEXT NOT NULL DEFAULT '',
+                version TEXT NOT NULL DEFAULT '',
+                code_hash TEXT NOT NULL DEFAULT '',
+                config_hash TEXT NOT NULL DEFAULT '',
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                CHECK(length(strategy_version_id) BETWEEN 1 AND 256)
+            );
+            CREATE INDEX IF NOT EXISTS idx_strategy_versions_created
+                ON strategy_versions(created_at DESC, strategy_version_id DESC);
+            CREATE TABLE IF NOT EXISTS research_trials (
+                research_trial_id TEXT PRIMARY KEY,
+                strategy_version_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT '',
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                CHECK(length(research_trial_id) BETWEEN 1 AND 256),
+                FOREIGN KEY(strategy_version_id) REFERENCES strategy_versions(strategy_version_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_research_trials_strategy_created
+                ON research_trials(strategy_version_id, created_at DESC, research_trial_id DESC);
+            CREATE TABLE IF NOT EXISTS admission_policies (
+                policy_id TEXT NOT NULL,
+                version TEXT NOT NULL,
+                config_hash TEXT NOT NULL,
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                PRIMARY KEY(policy_id, version),
+                CHECK(length(policy_id) BETWEEN 1 AND 256),
+                CHECK(length(version) BETWEEN 1 AND 128),
+                CHECK(length(config_hash) BETWEEN 1 AND 512)
+            );
+            CREATE INDEX IF NOT EXISTS idx_admission_policies_created
+                ON admission_policies(created_at DESC, policy_id, version);
+            CREATE TABLE IF NOT EXISTS strategy_evidence_windows (
+                evidence_window_id TEXT PRIMARY KEY,
+                strategy_version_id TEXT NOT NULL,
+                available_from TEXT NOT NULL,
+                available_through TEXT NOT NULL,
+                requested_days INTEGER NOT NULL CHECK(requested_days IN (7, 30)),
+                actual_coverage_seconds INTEGER NOT NULL CHECK(actual_coverage_seconds >= 0),
+                source_class TEXT NOT NULL,
+                paper_sizing_assumptions_json TEXT NOT NULL DEFAULT '{}',
+                paper_fee_assumptions_json TEXT NOT NULL DEFAULT '{}',
+                paper_slippage_assumptions_json TEXT NOT NULL DEFAULT '{}',
+                allocated_capital_net_return TEXT NOT NULL DEFAULT '0',
+                realized_pnl TEXT NOT NULL DEFAULT '0',
+                unrealized_pnl TEXT NOT NULL DEFAULT '0',
+                fees TEXT NOT NULL DEFAULT '0',
+                costs TEXT NOT NULL DEFAULT '0',
+                drawdown TEXT NOT NULL DEFAULT '0',
+                completed_outcomes INTEGER NOT NULL DEFAULT 0 CHECK(completed_outcomes >= 0),
+                reliability TEXT NOT NULL DEFAULT '0',
+                execution_feasibility TEXT NOT NULL DEFAULT '',
+                evidence_digest TEXT NOT NULL,
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                CHECK(length(evidence_window_id) BETWEEN 1 AND 256),
+                FOREIGN KEY(strategy_version_id) REFERENCES strategy_versions(strategy_version_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_strategy_evidence_windows_strategy_available
+                ON strategy_evidence_windows(strategy_version_id, available_through DESC,
+                                              available_from DESC, evidence_window_id DESC);
+            CREATE INDEX IF NOT EXISTS idx_strategy_evidence_windows_created
+                ON strategy_evidence_windows(created_at DESC, evidence_window_id DESC);
+            CREATE TABLE IF NOT EXISTS portfolio_selections (
+                portfolio_selection_id TEXT PRIMARY KEY,
+                policy_id TEXT NOT NULL,
+                policy_version TEXT NOT NULL,
+                risk_config_id TEXT NOT NULL,
+                risk_config_generation INTEGER NOT NULL,
+                risk_config_hash TEXT NOT NULL,
+                global_budget TEXT NOT NULL,
+                k INTEGER NOT NULL CHECK(k BETWEEN 0 AND 10),
+                selected_at TEXT NOT NULL,
+                review_due_at TEXT NOT NULL,
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                committed_at TEXT NOT NULL,
+                CHECK(length(portfolio_selection_id) BETWEEN 1 AND 256),
+                CHECK(risk_config_generation >= 0),
+                FOREIGN KEY(policy_id, policy_version)
+                    REFERENCES admission_policies(policy_id, version)
+            );
+            CREATE INDEX IF NOT EXISTS idx_portfolio_selections_committed
+                ON portfolio_selections(committed_at DESC, portfolio_selection_id DESC);
+            CREATE INDEX IF NOT EXISTS idx_portfolio_selections_policy
+                ON portfolio_selections(policy_id, policy_version, committed_at DESC);
+            CREATE TABLE IF NOT EXISTS portfolio_selection_members (
+                portfolio_selection_id TEXT NOT NULL,
+                strategy_version_id TEXT NOT NULL,
+                allocation TEXT NOT NULL,
+                status TEXT NOT NULL,
+                score TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                evidence_window_id TEXT,
+                overlap_key TEXT NOT NULL DEFAULT '',
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                PRIMARY KEY(portfolio_selection_id, strategy_version_id),
+                FOREIGN KEY(portfolio_selection_id) REFERENCES portfolio_selections(portfolio_selection_id),
+                FOREIGN KEY(strategy_version_id) REFERENCES strategy_versions(strategy_version_id),
+                FOREIGN KEY(evidence_window_id) REFERENCES strategy_evidence_windows(evidence_window_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_portfolio_selection_members_selection
+                ON portfolio_selection_members(portfolio_selection_id, score DESC, strategy_version_id);
+            CREATE INDEX IF NOT EXISTS idx_portfolio_selection_members_strategy
+                ON portfolio_selection_members(strategy_version_id, created_at DESC);
+            CREATE TABLE IF NOT EXISTS portfolio_current_selection (
+                pointer_id TEXT PRIMARY KEY CHECK(pointer_id = 'current'),
+                portfolio_selection_id TEXT NOT NULL,
+                committed_at TEXT NOT NULL,
+                FOREIGN KEY(portfolio_selection_id) REFERENCES portfolio_selections(portfolio_selection_id)
+            );
+            CREATE TABLE IF NOT EXISTS portfolio_review_state (
+                state_id TEXT PRIMARY KEY CHECK(state_id = 'current'),
+                portfolio_selection_id TEXT,
+                review_due_at TEXT,
+                reviewed_at TEXT,
+                status TEXT NOT NULL DEFAULT '',
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(portfolio_selection_id) REFERENCES portfolio_selections(portfolio_selection_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_portfolio_review_state_updated
+                ON portfolio_review_state(updated_at DESC);
+            """
+        )
+        selection_columns = {
+            str(row["name"])
+            for row in self._conn.execute("PRAGMA table_info(portfolio_selections)").fetchall()
+        }
+        if "k" not in selection_columns:
+            self._conn.execute(
+                "ALTER TABLE portfolio_selections ADD COLUMN k INTEGER NOT NULL DEFAULT 0"
+            )
+        selection_sql_row = self._conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='portfolio_selections'"
+        ).fetchone()
+        selection_sql = " ".join(str(selection_sql_row["sql"] or "").upper().split()) if selection_sql_row else ""
+        if "BETWEEN 1 AND 10" in selection_sql:
+            self._migrate_rolling_selection_k_constraint()
+        self._conn.execute(
+            "UPDATE portfolio_selections SET k=("
+            "SELECT COUNT(*) FROM portfolio_selection_members "
+            "WHERE portfolio_selection_members.portfolio_selection_id=portfolio_selections.portfolio_selection_id"
+            ")"
+        )
+        for row in self._conn.execute(
+            "SELECT portfolio_selection_id,k,payload_json FROM portfolio_selections"
+        ).fetchall():
+            payload = _load(row["payload_json"])
+            canonical_payload = dict(payload) if isinstance(payload, Mapping) else {}
+            canonical_payload["k"] = int(row["k"])
+            payload_json = _rolling_dump(canonical_payload)
+            if payload_json != row["payload_json"]:
+                self._conn.execute(
+                    "UPDATE portfolio_selections SET payload_json=? WHERE portfolio_selection_id=?",
+                    (payload_json, row["portfolio_selection_id"]),
+                )
+
+    def _migrate_rolling_selection_k_constraint(self) -> None:
+        """Rebuild legacy rolling tables so empty selections can persist.
+
+        SQLite cannot alter a CHECK constraint in place.  Rebuild the small
+        rolling namespace while retaining every row and repairing child
+        foreign keys to point at the replacement selection table.
+        """
+        for index_name in (
+            "idx_portfolio_selections_committed",
+            "idx_portfolio_selections_policy",
+            "idx_portfolio_selection_members_selection",
+            "idx_portfolio_selection_members_strategy",
+            "idx_portfolio_review_state_updated",
+        ):
+            self._conn.execute(f"DROP INDEX IF EXISTS {index_name}")
+        self._conn.executescript(
+            """
+            ALTER TABLE portfolio_selection_members RENAME TO portfolio_selection_members_legacy_k;
+            ALTER TABLE portfolio_current_selection RENAME TO portfolio_current_selection_legacy_k;
+            ALTER TABLE portfolio_review_state RENAME TO portfolio_review_state_legacy_k;
+            ALTER TABLE portfolio_selections RENAME TO portfolio_selections_legacy_k;
+            CREATE TABLE portfolio_selections (
+                portfolio_selection_id TEXT PRIMARY KEY,
+                policy_id TEXT NOT NULL,
+                policy_version TEXT NOT NULL,
+                risk_config_id TEXT NOT NULL,
+                risk_config_generation INTEGER NOT NULL,
+                risk_config_hash TEXT NOT NULL,
+                global_budget TEXT NOT NULL,
+                k INTEGER NOT NULL CHECK(k BETWEEN 0 AND 10),
+                selected_at TEXT NOT NULL,
+                review_due_at TEXT NOT NULL,
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                committed_at TEXT NOT NULL,
+                CHECK(length(portfolio_selection_id) BETWEEN 1 AND 256),
+                CHECK(risk_config_generation >= 0),
+                FOREIGN KEY(policy_id, policy_version)
+                    REFERENCES admission_policies(policy_id, version)
+            );
+            INSERT INTO portfolio_selections(
+                portfolio_selection_id,policy_id,policy_version,risk_config_id,
+                risk_config_generation,risk_config_hash,global_budget,k,selected_at,
+                review_due_at,payload_json,committed_at
+            )
+            SELECT
+                legacy.portfolio_selection_id,legacy.policy_id,legacy.policy_version,legacy.risk_config_id,
+                legacy.risk_config_generation,legacy.risk_config_hash,legacy.global_budget,
+                (SELECT COUNT(*) FROM portfolio_selection_members_legacy_k members
+                 WHERE members.portfolio_selection_id=legacy.portfolio_selection_id),
+                legacy.selected_at,legacy.review_due_at,legacy.payload_json,legacy.committed_at
+            FROM portfolio_selections_legacy_k legacy;
+            CREATE TABLE portfolio_selection_members (
+                portfolio_selection_id TEXT NOT NULL,
+                strategy_version_id TEXT NOT NULL,
+                allocation TEXT NOT NULL,
+                status TEXT NOT NULL,
+                score TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                evidence_window_id TEXT,
+                overlap_key TEXT NOT NULL DEFAULT '',
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                PRIMARY KEY(portfolio_selection_id, strategy_version_id),
+                FOREIGN KEY(portfolio_selection_id) REFERENCES portfolio_selections(portfolio_selection_id),
+                FOREIGN KEY(strategy_version_id) REFERENCES strategy_versions(strategy_version_id),
+                FOREIGN KEY(evidence_window_id) REFERENCES strategy_evidence_windows(evidence_window_id)
+            );
+            INSERT INTO portfolio_selection_members(
+                portfolio_selection_id,strategy_version_id,allocation,status,score,reason,
+                evidence_window_id,overlap_key,payload_json,created_at
+            )
+            SELECT portfolio_selection_id,strategy_version_id,allocation,status,score,reason,
+                   evidence_window_id,overlap_key,payload_json,created_at
+            FROM portfolio_selection_members_legacy_k;
+            CREATE TABLE portfolio_current_selection (
+                pointer_id TEXT PRIMARY KEY CHECK(pointer_id = 'current'),
+                portfolio_selection_id TEXT NOT NULL,
+                committed_at TEXT NOT NULL,
+                FOREIGN KEY(portfolio_selection_id) REFERENCES portfolio_selections(portfolio_selection_id)
+            );
+            INSERT INTO portfolio_current_selection(pointer_id,portfolio_selection_id,committed_at)
+            SELECT pointer_id,portfolio_selection_id,committed_at
+            FROM portfolio_current_selection_legacy_k;
+            CREATE TABLE portfolio_review_state (
+                state_id TEXT PRIMARY KEY CHECK(state_id = 'current'),
+                portfolio_selection_id TEXT,
+                review_due_at TEXT,
+                reviewed_at TEXT,
+                status TEXT NOT NULL DEFAULT '',
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(portfolio_selection_id) REFERENCES portfolio_selections(portfolio_selection_id)
+            );
+            INSERT INTO portfolio_review_state(
+                state_id,portfolio_selection_id,review_due_at,reviewed_at,status,payload_json,updated_at
+            )
+            SELECT state_id,portfolio_selection_id,review_due_at,reviewed_at,status,payload_json,updated_at
+            FROM portfolio_review_state_legacy_k;
+            DROP TABLE portfolio_selection_members_legacy_k;
+            DROP TABLE portfolio_current_selection_legacy_k;
+            DROP TABLE portfolio_review_state_legacy_k;
+            DROP TABLE portfolio_selections_legacy_k;
+            """
+        )
+        self._conn.executescript(
+            """
+            CREATE INDEX IF NOT EXISTS idx_portfolio_selections_committed
+                ON portfolio_selections(committed_at DESC, portfolio_selection_id DESC);
+            CREATE INDEX IF NOT EXISTS idx_portfolio_selections_policy
+                ON portfolio_selections(policy_id, policy_version, committed_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_portfolio_selection_members_selection
+                ON portfolio_selection_members(portfolio_selection_id, score DESC, strategy_version_id);
+            CREATE INDEX IF NOT EXISTS idx_portfolio_selection_members_strategy
+                ON portfolio_selection_members(strategy_version_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_portfolio_review_state_updated
+                ON portfolio_review_state(updated_at DESC);
+            """
+        )
+
     def _initialize_canary_risk_schema(self) -> None:
         """Create versioned canary settings and append-only risk accounting.
 
@@ -6717,6 +7003,883 @@ class AxiomStore:
             "storage_bytes": _storage_bytes(self._conn, self.path),
             "scan_limits": {"latest_window_seconds": latest_window_seconds, "recent_window_seconds": window, "recent_cycles": recent_cycles, "gap_sample": 64},
         }
+    # Rolling portfolio persistence ------------------------------------
+    def save_strategy_version(self, record: Any) -> None:
+        data = _rolling_mapping(record, name="strategy_version")
+        identifier = _rolling_required_text(data, "strategy_version_id", name="strategy_version_id")
+        strategy_id = _rolling_optional_text(data, "strategy_id", "strategy")
+        version = _rolling_optional_text(data, "version", "strategy_version")
+        code_hash = _rolling_optional_text(data, "code_hash", "strategy_hash")
+        config_hash = _rolling_optional_text(data, "config_hash")
+        created_at = _rolling_timestamp(data.get("created_at"), name="created_at", default_now=True)
+        payload_data = dict(data)
+        payload_data.update(
+            {
+                "strategy_version_id": identifier,
+                "strategy_id": strategy_id,
+                "version": version,
+                "code_hash": code_hash,
+                "config_hash": config_hash,
+                "created_at": created_at,
+            }
+        )
+        payload_json = _rolling_dump(payload_data)
+        values = (identifier, strategy_id, version, code_hash, config_hash, payload_json, created_at)
+        with self._write_context():
+            existing = self._conn.execute(
+                "SELECT * FROM strategy_versions WHERE strategy_version_id=?",
+                (identifier,),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    str(existing["strategy_id"]) != strategy_id
+                    or str(existing["version"]) != version
+                    or str(existing["code_hash"]) != code_hash
+                    or str(existing["config_hash"]) != config_hash
+                    or not _rolling_payload_equal(
+                        _load(existing["payload_json"]),
+                        payload_data,
+                        ignored=frozenset({"created_at"}),
+                    )
+                ):
+                    raise ValueError("strategy version identity conflict")
+                return
+            self._conn.execute(
+                "INSERT INTO strategy_versions("
+                "strategy_version_id,strategy_id,version,code_hash,config_hash,payload_json,created_at"
+                ") VALUES (?,?,?,?,?,?,?)",
+                values,
+            )
+
+    def save_research_trial(self, record: Any) -> None:
+        data = _rolling_mapping(record, name="research_trial")
+        identifier = _rolling_required_text(
+            data,
+            "research_trial_id",
+            "trial_id",
+            name="research_trial_id",
+        )
+        strategy_version_id = _rolling_required_text(
+            data,
+            "strategy_version_id",
+            name="strategy_version_id",
+        )
+        status = _rolling_optional_text(data, "status")
+        created_at = _rolling_timestamp(data.get("created_at"), name="created_at", default_now=True)
+        payload_data = dict(data)
+        payload_data.update(
+            {
+                "research_trial_id": identifier,
+                "trial_id": identifier,
+                "strategy_version_id": strategy_version_id,
+                "status": status,
+                "created_at": created_at,
+            }
+        )
+        payload_json = _rolling_dump(payload_data)
+        with self._write_context():
+            if self._conn.execute(
+                "SELECT 1 FROM strategy_versions WHERE strategy_version_id=?",
+                (strategy_version_id,),
+            ).fetchone() is None:
+                raise ValueError("research trial strategy version does not exist")
+            existing = self._conn.execute(
+                "SELECT * FROM research_trials WHERE research_trial_id=?",
+                (identifier,),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    str(existing["strategy_version_id"]) != strategy_version_id
+                    or str(existing["status"]) != status
+                    or not _rolling_payload_equal(
+                        _load(existing["payload_json"]),
+                        payload_data,
+                        ignored=frozenset({"created_at"}),
+                    )
+                ):
+                    raise ValueError("research trial identity conflict")
+                return
+            self._conn.execute(
+                "INSERT INTO research_trials("
+                "research_trial_id,strategy_version_id,status,payload_json,created_at"
+                ") VALUES (?,?,?,?,?)",
+                (identifier, strategy_version_id, status, payload_json, created_at),
+            )
+
+    def save_admission_policy(self, record: Any) -> None:
+        data = _rolling_mapping(record, name="admission_policy")
+        policy_id = _rolling_required_text(data, "policy_id", name="policy_id")
+        version = _rolling_required_text(data, "version", "policy_version", name="version")
+        config_hash = _rolling_required_text(data, "config_hash", name="config_hash")
+        created_at = _rolling_timestamp(data.get("created_at"), name="created_at", default_now=True)
+        payload_data = dict(data)
+        payload_data.update(
+            {
+                "policy_id": policy_id,
+                "version": version,
+                "policy_version": version,
+                "config_hash": config_hash,
+                "created_at": created_at,
+            }
+        )
+        payload_json = _rolling_dump(payload_data)
+        with self._write_context():
+            existing = self._conn.execute(
+                "SELECT * FROM admission_policies WHERE policy_id=? AND version=?",
+                (policy_id, version),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    str(existing["config_hash"]) != config_hash
+                    or not _rolling_payload_equal(
+                        _load(existing["payload_json"]),
+                        payload_data,
+                        ignored=frozenset({"created_at"}),
+                    )
+                ):
+                    raise ValueError("admission policy identity conflict")
+                return
+            self._conn.execute(
+                "INSERT INTO admission_policies("
+                "policy_id,version,config_hash,payload_json,created_at"
+                ") VALUES (?,?,?,?,?)",
+                (policy_id, version, config_hash, payload_json, created_at),
+            )
+
+    def load_admission_policy(self, policy_id: str, version: str) -> dict[str, Any] | None:
+        identifier, version_value = str(policy_id).strip(), str(version).strip()
+        if not identifier or not version_value:
+            raise ValueError("policy_id and version are required")
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM admission_policies WHERE policy_id=? AND version=?",
+                (identifier, version_value),
+            ).fetchone()
+        if row is None:
+            return None
+        payload = _load(row["payload_json"])
+        result = dict(payload) if isinstance(payload, Mapping) else {}
+        result.update(
+            {
+                "policy_id": row["policy_id"],
+                "version": row["version"],
+                "policy_version": row["version"],
+                "config_hash": row["config_hash"],
+                "created_at": row["created_at"],
+            }
+        )
+        return result
+
+    def save_strategy_evidence_window(self, record: Any) -> None:
+        data = _rolling_mapping(record, name="strategy_evidence_window")
+        identifier = _rolling_required_text(data, "evidence_window_id", name="evidence_window_id")
+        strategy_version_id = _rolling_required_text(
+            data,
+            "strategy_version_id",
+            name="strategy_version_id",
+        )
+        available_from = _rolling_timestamp(
+            data.get("available_from"),
+            name="available_from",
+            required=True,
+        )
+        available_through = _rolling_timestamp(
+            data.get("available_through"),
+            name="available_through",
+            required=True,
+        )
+        if _parse_datetime(available_through) < _parse_datetime(available_from):
+            raise ValueError("available_through must not precede available_from")
+        available_span_seconds = int(
+            (_parse_datetime(available_through) - _parse_datetime(available_from)).total_seconds()
+        )
+        requested_days = data.get("requested_days", data.get("requested_window_days"))
+        requested_days_value = _rolling_nonnegative_integer(
+            requested_days,
+            name="requested_days",
+        )
+        if requested_days_value not in {7, 30}:
+            raise ValueError("requested_days must be 7 or 30")
+        actual_coverage_raw = data.get("actual_coverage_seconds")
+        if actual_coverage_raw is None:
+            raise ValueError("actual_coverage_seconds is required")
+        actual_coverage_seconds = _rolling_nonnegative_integer(
+            actual_coverage_raw,
+            name="actual_coverage_seconds",
+        )
+        if actual_coverage_seconds > available_span_seconds:
+            raise ValueError("actual_coverage_seconds must not exceed available evidence span")
+        source_class = _rolling_required_text(
+            data,
+            "source_class",
+            "source_type",
+            name="source_class",
+        )
+        assumption_fields = (
+            ("paper_sizing_assumptions", ("paper_sizing",), "paper_sizing"),
+            (
+                "paper_fee_assumptions",
+                ("paper_fees", "fee_assumptions", "fee_assumption"),
+                "fee_assumption",
+            ),
+            (
+                "paper_slippage_assumptions",
+                ("paper_slippage", "slippage_assumptions", "slippage_assumption"),
+                "slippage_assumption",
+            ),
+        )
+        assumptions: list[dict[str, Any]] = []
+        for field_name, aliases, scalar_key in assumption_fields:
+            selected_name = field_name
+            value: Any = data.get(field_name)
+            if value is None:
+                for alias in aliases:
+                    candidate = data.get(alias)
+                    if candidate is not None:
+                        selected_name, value = alias, candidate
+                        break
+            if value is None:
+                value = {}
+            if isinstance(value, Mapping):
+                assumptions.append(dict(value))
+                continue
+            if selected_name != scalar_key:
+                raise ValueError(f"{field_name} must be a mapping")
+            _rolling_decimal(value, name=scalar_key, nonnegative=True)
+            assumptions.append({scalar_key: value})
+        if "drawdown_usd" in data:
+            raise ValueError("drawdown_usd is not supported; drawdown must be a dimensionless ratio")
+        drawdown_raw = data.get("drawdown")
+        if drawdown_raw is None:
+            raise ValueError("drawdown is required")
+        drawdown_value = _rolling_decimal(drawdown_raw, name="drawdown", nonnegative=True)
+        if drawdown_value > Decimal("1"):
+            raise ValueError("drawdown must be between 0 and 1")
+        monetary_aliases = (
+            ("allocated_capital_net_return", "allocated_capital_net_return_usd", "net_return"),
+            ("realized_pnl", "realized_pnl_usd"),
+            ("unrealized_pnl", "unrealized_pnl_usd"),
+            ("fees", "fees_usd"),
+            ("costs", "costs_usd"),
+        )
+        monetary: list[str] = []
+        for names in monetary_aliases:
+            raw = next((data.get(name) for name in names if data.get(name) is not None), "0")
+            monetary.append(_rolling_decimal_text(raw, name=names[0]))
+        monetary.append(format(drawdown_value, "f"))
+        completed_outcomes = _rolling_nonnegative_integer(
+            data.get("completed_outcomes"),
+            name="completed_outcomes",
+            default=0,
+        )
+        reliability_raw = data.get("reliability", "0")
+        reliability = _rolling_decimal_text(reliability_raw, name="reliability", nonnegative=True)
+        execution_feasibility = _rolling_optional_text(
+            data,
+            "execution_feasibility",
+            "execution_feasibility_status",
+        )
+        evidence_digest = _rolling_required_text(data, "evidence_digest", name="evidence_digest")
+        created_at = _rolling_timestamp(data.get("created_at"), name="created_at", default_now=True)
+        payload_data = dict(data)
+        if "costs" in payload_data:
+            payload_data.pop("slippage_costs", None)
+        payload_data.update(
+            {
+                "evidence_window_id": identifier,
+                "strategy_version_id": strategy_version_id,
+                "available_from": available_from,
+                "available_through": available_through,
+                "requested_days": requested_days_value,
+                "requested_window_days": requested_days_value,
+                "actual_coverage_seconds": actual_coverage_seconds,
+                "source_class": source_class,
+                "paper_sizing_assumptions": assumptions[0],
+                "paper_fee_assumptions": assumptions[1],
+                "paper_slippage_assumptions": assumptions[2],
+                "allocated_capital_net_return": monetary[0],
+                "realized_pnl": monetary[1],
+                "unrealized_pnl": monetary[2],
+                "fees": monetary[3],
+                "costs": monetary[4],
+                "drawdown": monetary[5],
+                "completed_outcomes": completed_outcomes,
+                "reliability": reliability,
+                "execution_feasibility": execution_feasibility,
+                "evidence_digest": evidence_digest,
+                "created_at": created_at,
+            }
+        )
+        payload_json = _rolling_dump(payload_data)
+        values = (
+            identifier,
+            strategy_version_id,
+            available_from,
+            available_through,
+            requested_days_value,
+            actual_coverage_seconds,
+            source_class,
+            _rolling_dump(assumptions[0]),
+            _rolling_dump(assumptions[1]),
+            _rolling_dump(assumptions[2]),
+            *monetary,
+            completed_outcomes,
+            reliability,
+            execution_feasibility,
+            evidence_digest,
+            payload_json,
+            created_at,
+        )
+        with self._write_context():
+            if self._conn.execute(
+                "SELECT 1 FROM strategy_versions WHERE strategy_version_id=?",
+                (strategy_version_id,),
+            ).fetchone() is None:
+                raise ValueError("evidence window strategy version does not exist")
+            existing = self._conn.execute(
+                "SELECT * FROM strategy_evidence_windows WHERE evidence_window_id=?",
+                (identifier,),
+            ).fetchone()
+            immutable_columns = (
+                "strategy_version_id",
+                "available_from",
+                "available_through",
+                "requested_days",
+                "actual_coverage_seconds",
+                "source_class",
+                "paper_sizing_assumptions_json",
+                "paper_fee_assumptions_json",
+                "paper_slippage_assumptions_json",
+                "allocated_capital_net_return",
+                "realized_pnl",
+                "unrealized_pnl",
+                "fees",
+                "costs",
+                "drawdown",
+                "completed_outcomes",
+                "reliability",
+                "execution_feasibility",
+                "evidence_digest",
+            )
+            expected = values[1:20]
+            if existing is not None:
+                actual = tuple(existing[column] for column in immutable_columns)
+                if actual != expected or not _rolling_payload_equal(
+                    _load(existing["payload_json"]),
+                    payload_data,
+                    ignored=frozenset({"created_at"}),
+                ):
+                    raise ValueError("strategy evidence window identity conflict")
+                return
+            self._conn.execute(
+                "INSERT INTO strategy_evidence_windows("
+                "evidence_window_id,strategy_version_id,available_from,available_through,"
+                "requested_days,actual_coverage_seconds,source_class,"
+                "paper_sizing_assumptions_json,paper_fee_assumptions_json,paper_slippage_assumptions_json,"
+                "allocated_capital_net_return,realized_pnl,unrealized_pnl,fees,costs,drawdown,"
+                "completed_outcomes,reliability,execution_feasibility,evidence_digest,payload_json,created_at"
+                ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                values,
+            )
+
+    def list_strategy_evidence_windows(
+        self,
+        strategy_version_id: str | None = None,
+        *,
+        limit: int | None = 100,
+    ) -> list[dict[str, Any]]:
+        limit_value = _rolling_limit(limit, default=100)
+        values: list[Any] = []
+        query = "SELECT * FROM strategy_evidence_windows"
+        if strategy_version_id is not None:
+            query += " WHERE strategy_version_id=?"
+            values.append(str(strategy_version_id))
+        query += " ORDER BY available_through DESC,available_from DESC,evidence_window_id DESC LIMIT ?"
+        values.append(limit_value)
+        with self._lock:
+            rows = self._conn.execute(query, values).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            payload = _load(row["payload_json"])
+            item = dict(payload) if isinstance(payload, Mapping) else {}
+            item.update(
+                {
+                    "evidence_window_id": row["evidence_window_id"],
+                    "strategy_version_id": row["strategy_version_id"],
+                    "available_from": row["available_from"],
+                    "available_through": row["available_through"],
+                    "requested_days": int(row["requested_days"]),
+                    "requested_window_days": int(row["requested_days"]),
+                    "actual_coverage_seconds": int(row["actual_coverage_seconds"]),
+                    "source_class": row["source_class"],
+                    "paper_sizing_assumptions": _load(row["paper_sizing_assumptions_json"]),
+                    "paper_fee_assumptions": _load(row["paper_fee_assumptions_json"]),
+                    "paper_slippage_assumptions": _load(row["paper_slippage_assumptions_json"]),
+                    "allocated_capital_net_return": row["allocated_capital_net_return"],
+                    "realized_pnl": row["realized_pnl"],
+                    "unrealized_pnl": row["unrealized_pnl"],
+                    "fees": row["fees"],
+                    "costs": row["costs"],
+                    "drawdown": row["drawdown"],
+                    "completed_outcomes": int(row["completed_outcomes"]),
+                    "reliability": row["reliability"],
+                    "execution_feasibility": row["execution_feasibility"],
+                    "evidence_digest": row["evidence_digest"],
+                    "created_at": row["created_at"],
+                }
+            )
+            item.pop("slippage_costs", None)
+            result.append(item)
+        return result
+
+    def _rolling_selection_record(
+        self,
+        row: sqlite3.Row,
+        *,
+        include_members: bool = True,
+    ) -> dict[str, Any]:
+        payload = _load(row["payload_json"])
+        result = dict(payload) if isinstance(payload, Mapping) else {}
+        result.update(
+            {
+                "portfolio_selection_id": row["portfolio_selection_id"],
+                "global_budget": row["global_budget"],
+                "k": int(row["k"]),
+                "policy_id": row["policy_id"],
+                "risk_config_id": row["risk_config_id"],
+                "active_risk_config_id": row["risk_config_id"],
+                "risk_config_generation": int(row["risk_config_generation"]),
+                "active_risk_config_generation": int(row["risk_config_generation"]),
+                "risk_config_hash": row["risk_config_hash"],
+                "active_risk_config_hash": row["risk_config_hash"],
+                "selected_at": row["selected_at"],
+                "review_due_at": row["review_due_at"],
+                "committed_at": row["committed_at"],
+            }
+        )
+        if include_members:
+            member_rows = self._conn.execute(
+                "SELECT * FROM portfolio_selection_members "
+                "WHERE portfolio_selection_id=? "
+                "ORDER BY CAST(score AS REAL) DESC,strategy_version_id",
+                (row["portfolio_selection_id"],),
+            ).fetchall()
+            members: list[dict[str, Any]] = []
+            for member in member_rows:
+                member_payload = _load(member["payload_json"])
+                item = dict(member_payload) if isinstance(member_payload, Mapping) else {}
+                item.update(
+                    {
+                        "portfolio_selection_id": member["portfolio_selection_id"],
+                        "strategy_version_id": member["strategy_version_id"],
+                        "allocation": member["allocation"],
+                        "status": member["status"],
+                        "score": member["score"],
+                        "reason": member["reason"],
+                        "evidence_window_id": member["evidence_window_id"],
+                        "overlap_key": member["overlap_key"],
+                        "created_at": member["created_at"],
+                    }
+                )
+                members.append(item)
+            result["members"] = members
+            result["k"] = len(members)
+        return result
+
+    def commit_portfolio_selection(self, selection: Any, members: Iterable[Any]) -> dict[str, Any]:
+        data = _rolling_mapping(selection, name="portfolio_selection")
+        identifier = _rolling_required_text(
+            data,
+            "portfolio_selection_id",
+            "selection_id",
+            name="portfolio_selection_id",
+        )
+        policy_id = _rolling_required_text(data, "policy_id", name="policy_id")
+        policy_version = _rolling_required_text(
+            data,
+            "policy_version",
+            "version",
+            name="policy_version",
+        )
+        risk_config_id = _rolling_required_text(
+            data,
+            "active_risk_config_id",
+            "risk_config_id",
+            "config_id",
+            name="active_risk_config_id",
+        )
+        risk_config_generation = _rolling_nonnegative_integer(
+            data.get(
+                "active_risk_config_generation",
+                data.get(
+                    "risk_config_generation",
+                    data.get("risk_generation", data.get("generation")),
+                ),
+            ),
+            name="active_risk_config_generation",
+            default=0,
+        )
+        risk_config_hash = _rolling_required_text(
+            data,
+            "active_risk_config_hash",
+            "risk_config_hash",
+            "config_hash",
+            name="active_risk_config_hash",
+        )
+        global_budget = _rolling_decimal_text(
+            data.get("global_budget", data.get("global_budget_usd", data.get("budget"))),
+            name="global_budget",
+            nonnegative=True,
+        )
+        selected_at = _rolling_timestamp(
+            data.get("selected_at"),
+            name="selected_at",
+            required=True,
+        )
+        review_due_at = _rolling_timestamp(
+            data.get("review_due_at"),
+            name="review_due_at",
+            required=True,
+        )
+        committed_at = _rolling_timestamp(
+            data.get("committed_at"),
+            name="committed_at",
+            default_now=True,
+        )
+        member_data = [_rolling_mapping(item, name="portfolio_selection_member") for item in members]
+        if not 0 <= len(member_data) <= 10:
+            raise ValueError("portfolio selection must contain between 0 and 10 members")
+        k_raw = data.get("k")
+        if k_raw is not None:
+            k_value = _rolling_nonnegative_integer(k_raw, name="k")
+            if k_value != len(member_data):
+                raise ValueError("portfolio selection k must equal member count")
+        else:
+            k_value = len(member_data)
+        allocations: list[Decimal] = []
+        seen_strategies: set[str] = set()
+        seen_funded_overlaps: set[str] = set()
+        normalized_members: list[dict[str, Any]] = []
+        for member in member_data:
+            strategy_version = _rolling_required_text(
+                member,
+                "strategy_version_id",
+                name="member strategy_version_id",
+            )
+            if strategy_version in seen_strategies:
+                raise ValueError("portfolio selection contains duplicate strategy member")
+            seen_strategies.add(strategy_version)
+            allocation = _rolling_decimal(
+                member.get("allocation"),
+                name="member allocation",
+                nonnegative=True,
+            )
+            allocations.append(allocation)
+            score = _rolling_decimal_text(member.get("score", "0"), name="member score")
+            status = _rolling_required_text(member, "status", name="member status")
+            reason = _rolling_optional_text(member, "reason")
+            evidence_window_id = _rolling_optional_text(member, "evidence_window_id") or None
+            overlap_key = _rolling_optional_text(member, "overlap_key")
+            funded_active = allocation > 0 and status.upper() in {"ACTIVE", "PAPER", "RETAINED"}
+            if funded_active and overlap_key:
+                if overlap_key in seen_funded_overlaps:
+                    raise ValueError("portfolio selection contains duplicate overlap_key")
+                seen_funded_overlaps.add(overlap_key)
+            normalized = dict(member)
+            normalized.update(
+                {
+                    "portfolio_selection_id": identifier,
+                    "strategy_version_id": strategy_version,
+                    "allocation": format(allocation, "f"),
+                    "status": status,
+                    "score": score,
+                    "reason": reason,
+                    "evidence_window_id": evidence_window_id,
+                    "overlap_key": overlap_key,
+                    "created_at": committed_at,
+                }
+            )
+            normalized_members.append(normalized)
+        if sum(allocations, Decimal("0")) > _rolling_decimal(
+            global_budget,
+            name="global_budget",
+            nonnegative=True,
+        ):
+            raise ValueError("portfolio member allocations exceed global budget")
+        payload_data = dict(data)
+        payload_data.update(
+            {
+                "portfolio_selection_id": identifier,
+                "selection_id": identifier,
+                "k": k_value,
+                "risk_config_id": risk_config_id,
+                "active_risk_config_id": risk_config_id,
+                "risk_config_generation": risk_config_generation,
+                "active_risk_config_generation": risk_config_generation,
+                "risk_config_hash": risk_config_hash,
+                "active_risk_config_hash": risk_config_hash,
+                "global_budget": global_budget,
+                "selected_at": selected_at,
+                "review_due_at": review_due_at,
+                "committed_at": committed_at,
+            }
+        )
+        payload_json = _rolling_dump(payload_data)
+        selection_values = (
+            identifier,
+            policy_id,
+            policy_version,
+            risk_config_id,
+            risk_config_generation,
+            risk_config_hash,
+            global_budget,
+            k_value,
+            selected_at,
+            review_due_at,
+            payload_json,
+            committed_at,
+        )
+        with self._write_context():
+            if self._conn.execute(
+                "SELECT 1 FROM admission_policies WHERE policy_id=? AND version=?",
+                (policy_id, policy_version),
+            ).fetchone() is None:
+                raise ValueError("portfolio selection admission policy does not exist")
+            for member in normalized_members:
+                if self._conn.execute(
+                    "SELECT 1 FROM strategy_versions WHERE strategy_version_id=?",
+                    (member["strategy_version_id"],),
+                ).fetchone() is None:
+                    raise ValueError("portfolio selection strategy version does not exist")
+                funded_active = (
+                    _rolling_decimal(member["allocation"], name="member allocation", nonnegative=True) > 0
+                    and str(member["status"]).upper() in {"ACTIVE", "PAPER", "RETAINED"}
+                )
+                if funded_active and member["evidence_window_id"] is None:
+                    raise ValueError("funded portfolio member requires an evidence window")
+                if member["evidence_window_id"] is not None:
+                    evidence = self._conn.execute(
+                        "SELECT strategy_version_id FROM strategy_evidence_windows "
+                        "WHERE evidence_window_id=?",
+                        (member["evidence_window_id"],),
+                    ).fetchone()
+                    if evidence is None:
+                        raise ValueError("portfolio selection evidence window does not exist")
+                    if str(evidence["strategy_version_id"]) != member["strategy_version_id"]:
+                        raise ValueError("portfolio member evidence window strategy mismatch")
+            existing = self._conn.execute(
+                "SELECT * FROM portfolio_selections WHERE portfolio_selection_id=?",
+                (identifier,),
+            ).fetchone()
+            if existing is not None:
+                immutable_columns = (
+                    "policy_id",
+                    "policy_version",
+                    "risk_config_id",
+                    "risk_config_generation",
+                    "risk_config_hash",
+                    "global_budget",
+                    "k",
+                    "selected_at",
+                    "review_due_at",
+                )
+                expected = selection_values[1:10]
+                if tuple(existing[column] for column in immutable_columns) != expected or not _rolling_payload_equal(
+                    _load(existing["payload_json"]),
+                    payload_data,
+                    ignored=frozenset({"committed_at"}),
+                ):
+                    raise ValueError("portfolio selection identity conflict")
+                existing_members = self._conn.execute(
+                    "SELECT * FROM portfolio_selection_members "
+                    "WHERE portfolio_selection_id=? ORDER BY strategy_version_id",
+                    (identifier,),
+                ).fetchall()
+                if len(existing_members) != len(normalized_members):
+                    raise ValueError("portfolio selection members conflict")
+                for stored, proposed in zip(
+                    existing_members,
+                    sorted(normalized_members, key=lambda item: item["strategy_version_id"]),
+                ):
+                    member_columns = (
+                        "strategy_version_id",
+                        "allocation",
+                        "status",
+                        "score",
+                        "reason",
+                        "evidence_window_id",
+                        "overlap_key",
+                    )
+                    if tuple(stored[column] for column in member_columns) != tuple(
+                        proposed[column] for column in member_columns
+                    ) or not _rolling_payload_equal(
+                        _load(stored["payload_json"]),
+                        proposed,
+                        ignored=frozenset({"created_at"}),
+                    ):
+                        raise ValueError("portfolio selection member identity conflict")
+                return self._rolling_selection_record(existing)
+            self._conn.execute(
+                "INSERT INTO portfolio_selections("
+                "portfolio_selection_id,policy_id,policy_version,risk_config_id,"
+                "risk_config_generation,risk_config_hash,global_budget,k,selected_at,review_due_at,"
+                "payload_json,committed_at"
+                ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                selection_values,
+            )
+            for member in normalized_members:
+                self._conn.execute(
+                    "INSERT INTO portfolio_selection_members("
+                    "portfolio_selection_id,strategy_version_id,allocation,status,score,reason,"
+                    "evidence_window_id,overlap_key,payload_json,created_at"
+                    ") VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        identifier,
+                        member["strategy_version_id"],
+                        member["allocation"],
+                        member["status"],
+                        member["score"],
+                        member["reason"],
+                        member["evidence_window_id"],
+                        member["overlap_key"],
+                        _rolling_dump(member),
+                        committed_at,
+                    ),
+                )
+            self._conn.execute(
+                "INSERT INTO portfolio_current_selection(pointer_id,portfolio_selection_id,committed_at) "
+                "VALUES ('current',?,?) "
+                "ON CONFLICT(pointer_id) DO UPDATE SET "
+                "portfolio_selection_id=excluded.portfolio_selection_id,committed_at=excluded.committed_at",
+                (identifier, committed_at),
+            )
+            row = self._conn.execute(
+                "SELECT * FROM portfolio_selections WHERE portfolio_selection_id=?",
+                (identifier,),
+            ).fetchone()
+            return self._rolling_selection_record(row)
+
+    def load_current_portfolio_selection(self) -> dict[str, Any] | None:
+        with self._lock:
+            pointer = self._conn.execute(
+                "SELECT portfolio_selection_id FROM portfolio_current_selection "
+                "WHERE pointer_id='current'",
+            ).fetchone()
+            if pointer is not None:
+                row = self._conn.execute(
+                    "SELECT * FROM portfolio_selections WHERE portfolio_selection_id=?",
+                    (pointer["portfolio_selection_id"],),
+                ).fetchone()
+            else:
+                row = self._conn.execute(
+                    "SELECT * FROM portfolio_selections "
+                    "ORDER BY committed_at DESC,rowid DESC LIMIT 1",
+                ).fetchone()
+        return self._rolling_selection_record(row) if row is not None else None
+
+    def list_portfolio_selections(self, *, limit: int | None = 100) -> list[dict[str, Any]]:
+        limit_value = _rolling_limit(limit, default=100)
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM portfolio_selections "
+                "ORDER BY committed_at DESC,rowid DESC LIMIT ?",
+                (limit_value,),
+            ).fetchall()
+            return [self._rolling_selection_record(row) for row in rows]
+
+    def save_portfolio_review_state(self, state: Any) -> dict[str, Any]:
+        data = _rolling_mapping(state, name="portfolio_review_state")
+        selection_id_raw = data.get("portfolio_selection_id", data.get("selection_id"))
+        selection_id = str(selection_id_raw).strip() if selection_id_raw is not None else None
+        review_due_at = _rolling_timestamp(
+            data.get("review_due_at"),
+            name="review_due_at",
+        )
+        reviewed_at = _rolling_timestamp(
+            data.get("reviewed_at"),
+            name="reviewed_at",
+        )
+        status = _rolling_optional_text(data, "status")
+        updated_at = _rolling_timestamp(
+            data.get("updated_at"),
+            name="updated_at",
+            default_now=True,
+        )
+        payload_data = dict(data)
+        payload_data.update(
+            {
+                "state_id": "current",
+                "portfolio_selection_id": selection_id,
+                "selection_id": selection_id,
+                "review_due_at": review_due_at,
+                "reviewed_at": reviewed_at,
+                "status": status,
+                "updated_at": updated_at,
+            }
+        )
+        with self._write_context():
+            if selection_id is not None and self._conn.execute(
+                "SELECT 1 FROM portfolio_selections WHERE portfolio_selection_id=?",
+                (selection_id,),
+            ).fetchone() is None:
+                raise ValueError("portfolio review selection does not exist")
+            self._conn.execute(
+                "INSERT INTO portfolio_review_state("
+                "state_id,portfolio_selection_id,review_due_at,reviewed_at,status,payload_json,updated_at"
+                ") VALUES ('current',?,?,?,?,?,?) "
+                "ON CONFLICT(state_id) DO UPDATE SET "
+                "portfolio_selection_id=excluded.portfolio_selection_id,"
+                "review_due_at=excluded.review_due_at,reviewed_at=excluded.reviewed_at,"
+                "status=excluded.status,payload_json=excluded.payload_json,updated_at=excluded.updated_at",
+                (
+                    selection_id,
+                    review_due_at,
+                    reviewed_at,
+                    status,
+                    _rolling_dump(payload_data),
+                    updated_at,
+                ),
+            )
+            row = self._conn.execute(
+                "SELECT * FROM portfolio_review_state WHERE state_id='current'",
+            ).fetchone()
+        payload = _load(row["payload_json"])
+        result = dict(payload) if isinstance(payload, Mapping) else {}
+        result.update(
+            {
+                "state_id": "current",
+                "portfolio_selection_id": row["portfolio_selection_id"],
+                "selection_id": row["portfolio_selection_id"],
+                "review_due_at": row["review_due_at"],
+                "reviewed_at": row["reviewed_at"],
+                "status": row["status"],
+                "updated_at": row["updated_at"],
+            }
+        )
+        return result
+
+    def load_portfolio_review_state(self) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM portfolio_review_state WHERE state_id='current'",
+            ).fetchone()
+        if row is None:
+            return None
+        payload = _load(row["payload_json"])
+        result = dict(payload) if isinstance(payload, Mapping) else {}
+        result.update(
+            {
+                "state_id": "current",
+                "portfolio_selection_id": row["portfolio_selection_id"],
+                "selection_id": row["portfolio_selection_id"],
+                "review_due_at": row["review_due_at"],
+                "reviewed_at": row["reviewed_at"],
+                "status": row["status"],
+                "updated_at": row["updated_at"],
+            }
+        )
+        return result
+
     # Strategy and experiment artifacts -------------------------------
     def save_strategy(self, strategy_id: str, strategy: Any, *, version: str = "1") -> None:
         try:
@@ -12478,6 +13641,132 @@ def _level_records(value: Any) -> tuple[OrderBookLevel, ...]:
         if isinstance(item, Mapping):
             result.append(OrderBookLevel(float(item["price"]), float(item["size"])))
     return tuple(result)
+def _rolling_mapping(record: Any, *, name: str) -> dict[str, Any]:
+    if isinstance(record, Mapping):
+        return {str(key): value for key, value in record.items()}
+    if is_dataclass(record):
+        return {
+            str(field): getattr(record, field)
+            for field in getattr(record, "__dataclass_fields__", {})
+        }
+    raise TypeError(f"{name} must be a mapping or dataclass")
+
+
+def _rolling_jsonable(value: Any) -> Any:
+    if isinstance(value, Decimal):
+        if not value.is_finite():
+            raise ValueError("rolling portfolio decimals must be finite")
+        return format(value, "f")
+    if isinstance(value, Enum):
+        return value.value
+    if isinstance(value, datetime):
+        return _iso(value)
+    if is_dataclass(value):
+        return {
+            str(name): _rolling_jsonable(getattr(value, name))
+            for name in getattr(value, "__dataclass_fields__", {})
+        }
+    if isinstance(value, Mapping):
+        return {str(key): _rolling_jsonable(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_rolling_jsonable(item) for item in value]
+    if isinstance(value, set):
+        return sorted(_rolling_jsonable(item) for item in value)
+    return value
+
+
+def _rolling_dump(value: Any) -> str:
+    return json.dumps(_rolling_jsonable(value), sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
+def _rolling_decimal(
+    value: Any,
+    *,
+    name: str,
+    nonnegative: bool = False,
+) -> Decimal:
+    return _risk_decimal(value, name=name, nonnegative=nonnegative)
+
+
+def _rolling_decimal_text(value: Any, *, name: str, nonnegative: bool = False) -> str:
+    return format(_rolling_decimal(value, name=name, nonnegative=nonnegative), "f")
+
+
+def _rolling_required_text(data: Mapping[str, Any], *names: str, name: str) -> str:
+    for field in names:
+        value = data.get(field)
+        normalized = _enum_value(value) if value is not None else None
+        if normalized is not None and str(normalized).strip():
+            return str(normalized).strip()
+    raise ValueError(f"{name} is required")
+
+
+def _rolling_optional_text(data: Mapping[str, Any], *names: str, default: str = "") -> str:
+    for field in names:
+        value = data.get(field)
+        if value is not None:
+            normalized = _enum_value(value)
+            return str(normalized if normalized is not None else value).strip()
+    return default
+
+
+def _rolling_timestamp(
+    value: Any,
+    *,
+    name: str,
+    required: bool = False,
+    default_now: bool = False,
+) -> str | None:
+    if value is None:
+        if default_now:
+            return _now_iso()
+        if required:
+            raise ValueError(f"{name} is required")
+        return None
+    parsed = _parse_datetime(value)
+    if parsed is None:
+        raise ValueError(f"{name} must be a valid timestamp")
+    return _iso(parsed)
+
+
+def _rolling_nonnegative_integer(value: Any, *, name: str, default: int | None = None) -> int:
+    if value is None and default is not None:
+        return int(default)
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a non-negative integer")
+    try:
+        number = _rolling_decimal(value, name=name, nonnegative=True)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a non-negative integer") from exc
+    if number != number.to_integral_value():
+        raise ValueError(f"{name} must be a non-negative integer")
+    return int(number)
+
+
+def _rolling_payload_equal(left: Any, right: Any, *, ignored: frozenset[str]) -> bool:
+    def scrub(value: Any) -> Any:
+        if isinstance(value, Mapping):
+            return {
+                str(key): scrub(item)
+                for key, item in value.items()
+                if str(key) not in ignored
+            }
+        if isinstance(value, (tuple, list)):
+            return [scrub(item) for item in value]
+        return value
+
+    try:
+        return _rolling_dump(scrub(left)) == _rolling_dump(scrub(right))
+    except (TypeError, ValueError):
+        return False
+
+
+def _rolling_limit(limit: Any, *, default: int = 100) -> int:
+    value = default if limit is None else limit
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError("limit must be a non-negative integer")
+    return int(value)
+
 
 
 def _book_from_record(record: Mapping[str, Any]) -> OrderBookSnapshot:
