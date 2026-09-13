@@ -8220,14 +8220,31 @@ class CanaryService:
         ).strip().lower()
 
         def observed_identity(value: Any) -> tuple[str | None, str | None]:
-            token_raw = mapping_value(value, "token_id", "tokenId", "token")
-            asset_raw = mapping_value(value, "asset_id", "assetId")
-            generic_asset = mapping_value(value, "asset")
-            token = str(token_raw or "").strip() or None
-            asset = str(asset_raw or "").strip() or None
-            if asset is None:
-                asset = str(generic_asset or "").strip() or None
-            return token, asset
+            def alias_values(names: Sequence[str]) -> list[str]:
+                values: list[str] = []
+                for name in names:
+                    if isinstance(value, Mapping) and name in value:
+                        text = str(value.get(name) or "").strip()
+                        if text:
+                            values.append(text)
+                return values
+
+            token_values = alias_values(("token_id", "tokenId", "token"))
+            asset_values = alias_values(("asset_id", "assetId"))
+            generic_values = alias_values(("asset",))
+            if len(set(token_values)) > 1 or len(set(asset_values)) > 1:
+                raise CanaryBlocked("CANARY_RECOVERY_TOKEN_MISMATCH")
+            if (
+                generic_values
+                and asset_values
+                and generic_values[0] != asset_values[0]
+            ):
+                raise CanaryBlocked("CANARY_RECOVERY_TOKEN_MISMATCH")
+            observed_token = token_values[0] if token_values else None
+            observed_asset = asset_values[0] if asset_values else None
+            if generic_values:
+                observed_asset = generic_values[0]
+            return observed_token, observed_asset
 
         observed_token, observed_asset = observed_identity(order)
         if (
@@ -8466,21 +8483,12 @@ class CanaryService:
         if _observed is None:
             if venue is None:
                 raise CanaryBlocked("CANARY_RECOVERY_READ_UNAVAILABLE")
-            order = self._recovery_method(
-                venue,
-                "get_order",
-                exchange_order_id,
-                market=str(signal.get("market_id") or "") or None,
-                market_version=str(binding_evidence.get("market_version") or "") or None,
-                asset_id=str(binding_evidence.get("resolved_asset_id") or "") or None,
-                token_id=str(ledger.get("token_id") or "") or None,
-            )
+            order = self._recovery_method(venue, "get_order", exchange_order_id)
             raw_trades = self._recovery_method(
                 venue,
                 "list_account_trades",
                 exchange_order_id,
                 market=str(signal.get("market_id") or "") or None,
-                market_version=str(binding_evidence.get("market_version") or "") or None,
                 asset_id=str(binding_evidence.get("resolved_asset_id") or "") or None,
                 token_id=str(ledger.get("token_id") or "") or None,
             )
@@ -8613,21 +8621,12 @@ class CanaryService:
                 raise CanaryBlocked("CANARY_RECOVERY_STALE_CONCURRENT_ATTACH") from exc
             expected_status = str(ledger.get("status") or "").upper()
         self.require_current_credential_binding()
-        order = self._recovery_method(
-            venue,
-            "get_order",
-            order_key,
-            market=str(signal.get("market_id") or "") or None,
-            market_version=str(binding_evidence.get("market_version") or "") or None,
-            asset_id=str(binding_evidence.get("resolved_asset_id") or "") or None,
-            token_id=str(ledger.get("token_id") or "") or None,
-        )
+        order = self._recovery_method(venue, "get_order", order_key)
         raw_trades = self._recovery_method(
             venue,
             "list_account_trades",
             order_key,
             market=str(signal.get("market_id") or "") or None,
-            market_version=str(binding_evidence.get("market_version") or "") or None,
             asset_id=str(binding_evidence.get("resolved_asset_id") or "") or None,
             token_id=str(ledger.get("token_id") or "") or None,
         )

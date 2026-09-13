@@ -476,6 +476,51 @@ class OperatorControlTests(unittest.TestCase):
         ).fetchone()
         self.assertEqual((row["status"], row["exchange_order_id"]), ("UNKNOWN", None))
 
+    def test_recovery_rejects_conflicting_v2_token_aliases(self) -> None:
+        self._seed_recovery_entry()
+        service = self._recovery_service()
+        venue = self._valid_recovery_venue()
+        venue.order["tokenId"] = "wrong-token"
+        with self.assertRaisesRegex(CanaryBlocked, "CANARY_RECOVERY_TOKEN_MISMATCH"):
+            service.recover_entry_intent(
+                "event-1",
+                "order-1",
+                signal_id="signal-1",
+                venue=venue,
+                confirmation=RECOVERY_CONFIRMATION,
+            )
+
+    def test_recovery_passes_only_supported_trade_scope_kwargs(self) -> None:
+        self._seed_recovery_entry()
+        service = self._recovery_service()
+        venue = self._valid_recovery_venue()
+        observed_scope: dict[str, object] = {}
+
+        def scoped_trades(
+            order_id: str,
+            *,
+            asset_id: str | None = None,
+            token_id: str | None = None,
+            market: str | None = None,
+        ) -> list[dict[str, object]]:
+            observed_scope.update(
+                {"asset_id": asset_id, "token_id": token_id, "market": market}
+            )
+            return RecoveryVenue.list_account_trades(venue, order_id)
+
+        venue.list_account_trades = scoped_trades  # type: ignore[method-assign]
+        service.recover_entry_intent(
+            "event-1",
+            "order-1",
+            signal_id="signal-1",
+            venue=venue,
+            confirmation=RECOVERY_CONFIRMATION,
+        )
+        self.assertEqual(
+            observed_scope,
+            {"asset_id": "position-1", "token_id": "token-1", "market": "market-1"},
+        )
+
     def test_recovery_rejects_lower_price_wrong_order_without_attachment(self) -> None:
         self._seed_recovery_entry()
         service = self._recovery_service()

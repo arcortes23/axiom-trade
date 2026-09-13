@@ -877,6 +877,162 @@ class CanaryPositionManagementTests(unittest.TestCase):
         self.assertEqual(marks_after, marks_before)
 
 
+    def test_legacy_v2_mixed_case_version_alias_is_canonicalized(self) -> None:
+        from axiom.canary_positions import _legacy_entry_identity
+
+        normalized, reason = _legacy_entry_identity(
+            {"token_id": "legacy-token"},
+            {
+                "marketVersion": "V2",
+                "asset_id": None,
+                "selected_token_id": "legacy-token",
+                "resolved_asset_id": "legacy-position",
+            },
+        )
+        self.assertIsNone(reason)
+        self.assertIsNotNone(normalized)
+        assert normalized is not None
+        self.assertEqual(normalized["market_version"], "v2")
+        self.assertNotIn("marketVersion", normalized)
+        self.assertEqual(normalized["resolved_asset_id"], "legacy-position")
+
+    def test_legacy_v2_fractional_outcome_index_is_rejected(self) -> None:
+        from axiom.canary_positions import _legacy_entry_identity
+
+        normalized, reason = _legacy_entry_identity(
+            {"token_id": "legacy-token"},
+            {
+                "market_version": "v2",
+                "outcome_index": 0.5,
+                "selected_token_id": "legacy-token",
+                "resolved_asset_id": "legacy-position",
+            },
+        )
+        self.assertIsNone(normalized)
+        self.assertEqual(reason, "CANARY_POSITION_IDENTITY_CONFLICT")
+
+    def test_legacy_v2_unindexed_bindings_collapse_to_selected_identity(self) -> None:
+        from axiom.canary_positions import _legacy_entry_identity
+
+        normalized, reason = _legacy_entry_identity(
+            {"token_id": "legacy-token"},
+            {
+                "market_version": "v2",
+                "selected_token_id": "legacy-token",
+                "resolved_asset_id": "legacy-position",
+                "identity_bindings": [
+                    {"token_id": "legacy-token", "position_id": "legacy-position"},
+                    {"token_id": "other-token", "position_id": "other-position"},
+                ],
+            },
+        )
+        self.assertIsNone(reason)
+        self.assertIsNotNone(normalized)
+        assert normalized is not None
+        self.assertTrue(normalized["legacy_identity_binding"])
+        self.assertEqual(
+            normalized["identity_bindings"],
+            [{"token_id": "legacy-token", "position_id": "legacy-position"}],
+        )
+
+    def test_legacy_terminal_settlement_is_not_overwritten(self) -> None:
+        from axiom.canary_positions import _ensure_schema
+
+        with self.store.connection:
+            self.store.connection.execute(
+                "INSERT INTO canary_ledger("
+                "event_id,signal_id,timestamp,candidate_id,venue,market_id,token_id,"
+                "side,requested_notional,paper_expected_price,max_price,submitted_quantity,"
+                "exchange_order_id,fill_quantity,actual_average_price,fees,status,evidence_json,"
+                "control_generation,settlement) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    "terminal-legacy-entry",
+                    "terminal-legacy-signal",
+                    self.now.isoformat(),
+                    "candidate-1",
+                    "polymarket",
+                    "market-1",
+                    "terminal-token",
+                    "BUY",
+                    "0.50",
+                    "0.50",
+                    "0.50",
+                    "1",
+                    "terminal-order",
+                    "1",
+                    "0.50",
+                    "0",
+                    "CONFIRMED",
+                    json.dumps(
+                        {
+                            "market_version": "v2",
+                            "selected_token_id": "terminal-token",
+                        },
+                        sort_keys=True,
+                    ),
+                    int(self.config["control_generation"]),
+                    "TERMINAL",
+                ),
+            )
+        _ensure_schema(self.service)
+        row = self.store.connection.execute(
+            "SELECT status,settlement,evidence_json FROM canary_ledger "
+            "WHERE event_id='terminal-legacy-entry'"
+        ).fetchone()
+        self.assertIsNotNone(row)
+        assert row is not None
+        self.assertEqual(row["status"], "CONFIRMED")
+        self.assertEqual(row["settlement"], "TERMINAL")
+        self.assertNotIn("legacy_migration", json.loads(row["evidence_json"]))
+
+    def test_pending_sell_blank_or_malformed_price_is_non_resumable(self) -> None:
+        from axiom.canary_positions import _ensure_schema, LEGACY_REQUEST_NON_RESUMABLE
+
+        with self.store.connection:
+            for request_id, requested_price in (
+                ("legacy-blank-price", " "),
+                ("legacy-malformed-price", "not-a-price"),
+            ):
+                self.store.connection.execute(
+                    "INSERT INTO canary_position_requests("
+                    "request_id,position_id,reservation_id,event_id,venue,market_id,"
+                    "token_id,asset_id,market_version,side,requested_quantity,"
+                    "requested_price,status,expected_generation,config_id,submitted_at,"
+                    "updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        request_id,
+                        "position-1",
+                        "legacy-reservation-" + request_id,
+                        request_id,
+                        "polymarket",
+                        "market-1",
+                        "token-yes",
+                        "token-yes",
+                        "v1",
+                        "SELL",
+                        "1",
+                        requested_price,
+                        "SUBMITTED",
+                        int(self.config["generation"]),
+                        str(self.config["config_id"]),
+                        self.now.isoformat(),
+                        self.now.isoformat(),
+                    ),
+                )
+        _ensure_schema(self.service)
+        statuses = self.store.connection.execute(
+            "SELECT request_id,status,last_error FROM canary_position_requests "
+            "WHERE request_id IN ('legacy-blank-price','legacy-malformed-price') "
+            "ORDER BY request_id"
+        ).fetchall()
+        self.assertEqual(
+            [(row["status"], row["last_error"]) for row in statuses],
+            [
+                (LEGACY_REQUEST_NON_RESUMABLE, "LEGACY_REQUEST_PRICE_UNAVAILABLE"),
+                (LEGACY_REQUEST_NON_RESUMABLE, "LEGACY_REQUEST_PRICE_UNAVAILABLE"),
+            ],
+        )
+
     def test_pre339_v2_buy_evidence_migrates_without_remote_identity_guess(self) -> None:
         from axiom.canary_positions import _ensure_schema
 
@@ -2125,6 +2281,8 @@ class CanaryPositionManagementTests(unittest.TestCase):
         self.venue.trades_by_order["late-entry-order"] = [
             {
                 "trade_id": "late-entry-fill-1",
+                "order_id": "entry-taker-order",
+                "maker_order_ids": ["late-entry-order"],
                 "quantity": "0.5",
                 "match_time": (self.now - timedelta(days=1)).isoformat(),
                 "price": "0.50",
@@ -2161,6 +2319,8 @@ class CanaryPositionManagementTests(unittest.TestCase):
         self.venue.trades_by_order["late-exit-order"] = [
             {
                 "trade_id": "late-exit-fill",
+                "order_id": "exit-taker-order",
+                "maker_order_ids": ["late-exit-order"],
                 "quantity": "0.5",
                 "price": "0.49",
                 "fee_rate_bps": "10",

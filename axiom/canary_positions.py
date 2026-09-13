@@ -441,6 +441,15 @@ def _identity_values(source: Mapping[str, Any], names: Sequence[str]) -> list[st
     return values
 
 
+def _strict_outcome_index(value: Any) -> int | None:
+    if value in (None, ""):
+        return None
+    if type(value) is int and value in (0, 1):
+        return value
+    if isinstance(value, str) and value in {"0", "1"}:
+        return int(value)
+    raise ValueError("outcome index must be canonical integer 0 or 1")
+
 def _legacy_entry_identity(
     row: Mapping[str, Any],
     evidence: Mapping[str, Any],
@@ -449,7 +458,10 @@ def _legacy_entry_identity(
     token = str(row.get("token_id") or "").strip()
     if not token:
         return None, "CANARY_POSITION_IDENTITY_UNAVAILABLE"
-    version_values = _identity_values(evidence, ("market_version", "marketVersion"))
+    version_values = [
+        value.lower()
+        for value in _identity_values(evidence, ("market_version", "marketVersion"))
+    ]
     version_hints = _identity_values(
         evidence,
         (
@@ -466,7 +478,7 @@ def _legacy_entry_identity(
     elif not version_values:
         return None, "CANARY_POSITION_IDENTITY_UNAVAILABLE"
     else:
-        version = version_values[0].lower()
+        version = version_values[0]
     if version not in {"v1", "v2"}:
         return None, "CANARY_POSITION_IDENTITY_CONFLICT"
 
@@ -491,6 +503,16 @@ def _legacy_entry_identity(
         if asset_values and asset_values[0] != selected_token:
             return None, "CANARY_POSITION_IDENTITY_CONFLICT"
         normalized = dict(evidence)
+        normalized.pop("marketVersion", None)
+        for alias in (
+            "asset_id",
+            "assetId",
+            "selected_position_id",
+            "selectedPositionId",
+            "position_id",
+            "positionId",
+        ):
+            normalized.pop(alias, None)
         normalized.update(
             {
                 "market_version": "v1",
@@ -502,15 +524,10 @@ def _legacy_entry_identity(
     if not asset_values:
         return None, "CANARY_POSITION_IDENTITY_UNAVAILABLE"
     selected_asset = asset_values[0]
-    raw_index = evidence.get("outcome_index")
-    outcome_index: int | None = None
-    if raw_index not in (None, ""):
-        if isinstance(raw_index, bool):
-            return None, "CANARY_POSITION_IDENTITY_CONFLICT"
-        try:
-            outcome_index = int(raw_index)
-        except (TypeError, ValueError, OverflowError):
-            return None, "CANARY_POSITION_IDENTITY_CONFLICT"
+    try:
+        outcome_index = _strict_outcome_index(evidence.get("outcome_index"))
+    except ValueError:
+        return None, "CANARY_POSITION_IDENTITY_CONFLICT"
     outcome = str(
         evidence.get("outcome", evidence.get("selected_outcome", "")) or ""
     ).strip().lower()
@@ -537,14 +554,10 @@ def _legacy_entry_identity(
             bound_asset = str(binding.get("position_id") or "").strip()
             if not bound_token or not bound_asset:
                 return None, "CANARY_POSITION_IDENTITY_CONFLICT"
-            index_raw = binding.get("index")
-            if isinstance(index_raw, bool) or index_raw in (None, ""):
-                index = None
-            else:
-                try:
-                    index = int(index_raw)
-                except (TypeError, ValueError, OverflowError):
-                    return None, "CANARY_POSITION_IDENTITY_CONFLICT"
+            try:
+                index = _strict_outcome_index(binding.get("index"))
+            except ValueError:
+                return None, "CANARY_POSITION_IDENTITY_CONFLICT"
             if (
                 index is not None and index in seen_indexes
             ) or bound_token in seen_tokens or bound_asset in seen_assets:
@@ -567,10 +580,18 @@ def _legacy_entry_identity(
         if len(matching) != 1 or matching[0].get("position_id") != selected_asset:
             return None, "CANARY_POSITION_IDENTITY_CONFLICT"
         bound_index = matching[0].get("index")
+        if outcome_index is not None and bound_index is None:
+            return None, "CANARY_POSITION_IDENTITY_CONFLICT"
         if bound_index is not None:
             if outcome_index is not None and int(bound_index) != outcome_index:
                 return None, "CANARY_POSITION_IDENTITY_CONFLICT"
             outcome_index = int(bound_index)
+        elif outcome_index is None:
+            # Legacy evidence may list several outcomes without indices, but
+            # the durable selected token/position identifies exactly one
+            # authenticated binding.  Keep only that binding so downstream
+            # legacy validation remains fail-closed and resumable.
+            normalized_bindings = [matching[0]]
     if not normalized_bindings:
         normalized_bindings = [
             {
@@ -580,6 +601,16 @@ def _legacy_entry_identity(
             }
         ]
     normalized = dict(evidence)
+    for alias in (
+        "asset_id",
+        "assetId",
+        "selected_position_id",
+        "selectedPositionId",
+        "position_id",
+        "positionId",
+    ):
+        normalized.pop(alias, None)
+    normalized.pop("marketVersion", None)
     normalized.update(
         {
             "market_version": "v2",
@@ -607,10 +638,16 @@ def _migrate_legacy_entry_rows(service: CanaryService, connection: Any) -> None:
     for source in rows:
         row = dict(source)
         evidence = _decode(row.get("evidence_json"))
-        if str(row.get("status") or "").upper() == LEGACY_ENTRY_NON_RESUMABLE:
-            continue
+        current_status = str(row.get("status") or "").strip().upper()
+        current_settlement = str(row.get("settlement") or "").strip().upper()
+        terminal_record = (
+            current_status in (_TERMINAL | _FINAL_SETTLEMENT | {"TRADE_STATUS_SETTLED"})
+            or current_settlement == "TERMINAL"
+        )
         normalized, reason = _legacy_entry_identity(row, evidence)
         if normalized is None:
+            if terminal_record:
+                continue
             marker = dict(evidence)
             marker["legacy_migration"] = {
                 "status": "NON_RESUMABLE",
@@ -852,18 +889,33 @@ def _ensure_schema(service: CanaryService) -> None:
         )
         _migrate_legacy_entry_rows(service, connection)
         _migrate_legacy_lots(connection)
-        connection.execute(
-            "UPDATE canary_position_requests SET status=?,last_error=? "
-            "WHERE UPPER(side)='SELL' AND requested_price IS NULL "
-            "AND UPPER(COALESCE(status,'')) IN ("
-            + ",".join("?" for _ in _PENDING)
+        pending_request_statuses = tuple(sorted(_PENDING))
+        pending_price_rows = connection.execute(
+            "SELECT request_id,requested_price FROM canary_position_requests "
+            "WHERE UPPER(side)='SELL' AND UPPER(COALESCE(status,'')) IN ("
+            + ",".join("?" for _ in pending_request_statuses)
             + ")",
-            (
-                LEGACY_REQUEST_NON_RESUMABLE,
-                "LEGACY_REQUEST_PRICE_UNAVAILABLE",
-                *_PENDING,
-            ),
-        )
+            pending_request_statuses,
+        ).fetchall()
+        for pending_price_row in pending_price_rows:
+            try:
+                _canonical_clob_price(
+                    pending_price_row["requested_price"],
+                    "CANARY_EXIT_PRICE_UNAVAILABLE",
+                )
+            except CanaryBlocked:
+                connection.execute(
+                    "UPDATE canary_position_requests SET status=?,last_error=? "
+                    "WHERE request_id=? AND UPPER(COALESCE(status,'')) IN ("
+                    + ",".join("?" for _ in _PENDING)
+                    + ")",
+                    (
+                        LEGACY_REQUEST_NON_RESUMABLE,
+                        "LEGACY_REQUEST_PRICE_UNAVAILABLE",
+                        pending_price_row["request_id"],
+                        *_PENDING,
+                    ),
+                )
 
 def _settings_fence(service: CanaryService, expected_generation: Any, config_id: Any) -> dict[str, Any]:
     if isinstance(expected_generation, bool):
@@ -1684,22 +1736,44 @@ def _validate_venue_identity(
 
     aggregate_quantity = ZERO
     for trade in trades:
-        trade_order = _canonical_order_identity(
-            _identity_alias(
-                trade,
-                (
-                    "order_id",
-                    "orderId",
-                    "taker_order_id",
-                    "takerOrderId",
-                    "exchange_order_id",
-                ),
-                missing="CANARY_TRADE_IDENTITY_UNAVAILABLE",
-                conflict="CANARY_TRADE_IDENTITY_CONFLICT",
-            ),
-            "CANARY_TRADE_IDENTITY_UNAVAILABLE",
+        def order_alias_values(names: Sequence[str]) -> list[str]:
+            values: list[str] = []
+            for name in names:
+                if not isinstance(trade, Mapping) or name not in trade:
+                    continue
+                canonical = _canonical_exchange_order_id(trade.get(name))
+                if canonical is None:
+                    raise CanaryBlocked("CANARY_TRADE_IDENTITY_UNAVAILABLE")
+                values.append(canonical)
+            return values
+
+        direct_order_values = order_alias_values(
+            ("order_id", "orderId", "exchange_order_id")
         )
-        if trade_order != expected_order:
+        taker_order_values = order_alias_values(
+            ("taker_order_id", "takerOrderId")
+        )
+        if len(set(direct_order_values)) > 1 or len(set(taker_order_values)) > 1:
+            raise CanaryBlocked("CANARY_TRADE_IDENTITY_CONFLICT")
+        maker_raw = mapping_value(trade, "maker_order_ids", "makerOrderIds")
+        maker_order_values: list[str] = []
+        if maker_raw is not None:
+            if not isinstance(maker_raw, Sequence) or isinstance(
+                maker_raw, (str, bytes, bytearray)
+            ):
+                raise CanaryBlocked("CANARY_TRADE_IDENTITY_CONFLICT")
+            for maker_order_id in maker_raw:
+                canonical = _canonical_exchange_order_id(maker_order_id)
+                if canonical is None or canonical in maker_order_values:
+                    raise CanaryBlocked("CANARY_TRADE_IDENTITY_CONFLICT")
+                maker_order_values.append(canonical)
+        if not (
+            expected_order in direct_order_values
+            or expected_order in taker_order_values
+            or expected_order in maker_order_values
+        ):
+            if not direct_order_values and not taker_order_values and not maker_order_values:
+                raise CanaryBlocked("CANARY_TRADE_IDENTITY_UNAVAILABLE")
             raise CanaryBlocked("CANARY_TRADE_IDENTITY_CONFLICT")
         observed_trade_side = _identity_alias(
             trade,
