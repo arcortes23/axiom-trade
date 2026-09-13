@@ -1025,6 +1025,88 @@ class OperationalHealthTests(unittest.TestCase):
             self.assertEqual(len(store.list_collection_errors("market-1")), 1)
 
 
+class _GeoblockResponse:
+    def __init__(self, payload: object) -> None:
+        self._body = (
+            payload
+            if isinstance(payload, bytes)
+            else json.dumps(payload).encode("utf-8")
+        )
+
+    def __enter__(self) -> "_GeoblockResponse":
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        return None
+
+    def read(self) -> bytes:
+        return self._body
+
+
+class PolymarketGeoblockSchemaTests(unittest.TestCase):
+    @staticmethod
+    def _read(payload: object) -> dict[str, object]:
+        response = _GeoblockResponse(payload)
+        with patch.dict(os.environ, {"AXIOM_EXECUTION_PROFILE": "production"}), patch(
+            "axiom.canary.urlopen",
+            return_value=response,
+        ):
+            return dict(PolymarketClobV2Venue().geoblock())
+
+    def test_geoblock_requires_explicit_boolean_authority(self) -> None:
+        malformed: list[tuple[str, object]] = [
+            ("missing blocked", {"close_only": False}),
+            ("missing close_only", {"blocked": False}),
+            ("null blocked", {"blocked": None, "close_only": False}),
+            ("null close_only", {"blocked": False, "close_only": None}),
+            ("zero blocked", {"blocked": 0, "close_only": False}),
+            ("one close_only", {"blocked": False, "close_only": 1}),
+            ("string blocked", {"blocked": "false", "close_only": False}),
+            ("string close_only", {"blocked": False, "close_only": "false"}),
+            ("container blocked", {"blocked": [], "close_only": False}),
+            ("container close_only", {"blocked": False, "close_only": {}}),
+            ("non-object payload", []),
+        ]
+        for label, payload in malformed:
+            with self.subTest(label=label):
+                with self.assertRaisesRegex(
+                    CanaryBlocked, "GEOBLOCK_RESPONSE_INVALID"
+                ):
+                    self._read(payload)
+
+    def test_geoblock_preserves_valid_boolean_authority(self) -> None:
+        for blocked, close_only in (
+            (False, False),
+            (True, False),
+            (False, True),
+        ):
+            with self.subTest(blocked=blocked, close_only=close_only):
+                result = self._read(
+                    {
+                        "blocked": blocked,
+                        "close_only": close_only,
+                        "country": "ZZ",
+                        "region": "T",
+                    }
+                )
+                self.assertIs(type(result["blocked"]), bool)
+                self.assertIs(type(result["close_only"]), bool)
+                self.assertEqual(result["blocked"], blocked)
+                self.assertEqual(result["close_only"], close_only)
+                self.assertEqual(result["country"], "ZZ")
+                self.assertEqual(result["region"], "T")
+
+    def test_geoblock_provider_error_is_a_local_block(self) -> None:
+        with patch.dict(
+            os.environ, {"AXIOM_EXECUTION_PROFILE": "production"}
+        ), patch(
+            "axiom.canary.urlopen",
+            side_effect=OSError("provider unavailable"),
+        ):
+            with self.assertRaisesRegex(CanaryBlocked, "GEOBLOCK_CHECK_FAILED"):
+                PolymarketClobV2Venue().geoblock()
+
+
 class CanaryReadinessTests(unittest.TestCase):
     def test_no_credential_connectivity_fails_closed_without_wallet_or_signer(self) -> None:
         with AxiomStore(":memory:") as store:
@@ -1348,6 +1430,8 @@ class CanaryReadinessTests(unittest.TestCase):
         }
         context = {
             "asset_id": "position-yes",
+            "token_id": "yes",
+            "position_id": "position-yes",
             "market_version": "v2",
             "neg_risk": False,
             "accepting_orders": True,
@@ -1560,6 +1644,8 @@ class CanaryReadinessTests(unittest.TestCase):
                 snapshot["settings_generation"] = settings_generation
                 context = {
                     "asset_id": "position-yes",
+                    "token_id": "yes",
+                    "position_id": "position-yes",
                     "market_version": "v2",
                     "neg_risk": False,
                     "accepting_orders": True,

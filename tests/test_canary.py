@@ -618,6 +618,8 @@ class CanaryTests(unittest.TestCase):
 
         context = {
             "asset_id": "position-yes",
+            "token_id": "yes",
+            "position_id": "position-yes",
             "market_version": "v2",
             "neg_risk": False,
             "accepting_orders": True,
@@ -2144,6 +2146,47 @@ class CanaryTests(unittest.TestCase):
     def test_geoblock_prevents_arming_and_submission(self):
         blocked=FakeVenue(blocked=True); self.assertBlocked("GEOGRAPHICALLY_BLOCKED",lambda:self.arm(venue=blocked))
         self.arm(); self.assertBlocked("GEOGRAPHICALLY_BLOCKED",lambda:self.submit(venue=blocked))
+    def test_geoblock_authority_requires_explicit_booleans_for_arm_and_submit(self):
+        class MalformedGeoblockVenue(FakeVenue):
+            def __init__(self, payload):
+                super().__init__()
+                self.payload = payload
+
+            def geoblock(self):
+                return self.payload
+
+        malformed = [
+            ("missing blocked", {"close_only": False}),
+            ("missing close_only", {"blocked": False}),
+            ("null blocked", {"blocked": None, "close_only": False}),
+            ("null close_only", {"blocked": False, "close_only": None}),
+            ("zero blocked", {"blocked": 0, "close_only": False}),
+            ("one close_only", {"blocked": False, "close_only": 1}),
+            ("string blocked", {"blocked": "false", "close_only": False}),
+            ("string close_only", {"blocked": False, "close_only": "false"}),
+            ("container blocked", {"blocked": [], "close_only": False}),
+            ("container close_only", {"blocked": False, "close_only": {}}),
+        ]
+        for label, payload in malformed:
+            with self.subTest(stage="arm", label=label):
+                self.assertBlocked(
+                    "GEOBLOCK_RESPONSE_INVALID",
+                    lambda payload=payload: self.arm(
+                        venue=MalformedGeoblockVenue(payload)
+                    ),
+                )
+
+        self.arm()
+        for index, (label, payload) in enumerate(malformed):
+            with self.subTest(stage="submit", label=label):
+                venue = MalformedGeoblockVenue(payload)
+                self.assertBlocked(
+                    "GEOBLOCK_RESPONSE_INVALID",
+                    lambda index=index, venue=venue: self.submit(
+                        f"malformed-geoblock-{index}", venue=venue
+                    ),
+                )
+                self.assertEqual(venue.submissions, [])
     def test_target_is_never_silently_increased(self): self.arm(); result=self.submit(); self.assertLessEqual(Decimal(result["requested_notional"]),Decimal("1.00"))
     def test_market_minimum_exceeding_target_skips(self): self.arm(); venue=FakeVenue(minimum="5",ask="0.50"); self.assertBlocked("VENUE_MINIMUM_EXCEEDS",lambda:self.submit(venue=venue)); self.assertFalse(venue.submissions)
 
@@ -2420,6 +2463,90 @@ class CanaryTests(unittest.TestCase):
         self.assertEqual(result["execution_status"], "MATCHED")
         self.assertEqual(result["status"], "matched")
         self.assertEqual(len(posted), 1)
+    def _assert_official_context_identity_blocked(
+        self,
+        signal_id,
+        context,
+        reason,
+    ):
+        self.arm()
+        venue = PolymarketClobV2Venue()
+        with patch.object(
+            PolymarketClobV2Venue,
+            "geoblock",
+            return_value={"blocked": False, "close_only": False},
+        ), patch.object(
+            PolymarketClobV2Venue,
+            "market_context",
+            return_value=context,
+        ):
+            self.assertBlocked(
+                reason,
+                lambda: self.submit(
+                    signal_id,
+                    venue=venue,
+                    allow_test_venue=False,
+                ),
+            )
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM canary_ledger"
+            ).fetchone()[0],
+            0,
+        )
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM canary_risk_reservations"
+            ).fetchone()[0],
+            0,
+        )
+
+    def test_official_context_rejects_wrong_v1_asset_before_reservation(self):
+        self._assert_official_context_identity_blocked(
+            "official-wrong-v1-asset",
+            {
+                "market_version": "v1",
+                "token_id": "yes",
+                "asset_id": "wrong-asset",
+            },
+            "MARKET_OUTCOME_ID_MISMATCH",
+        )
+
+    def test_official_context_rejects_wrong_v2_selected_token_before_reservation(self):
+        self._assert_official_context_identity_blocked(
+            "official-wrong-v2-token",
+            {
+                "market_version": "v2",
+                "token_id": "no",
+                "position_id": "position-no",
+                "asset_id": "position-no",
+            },
+            "MARKET_OUTCOME_ID_MISMATCH",
+        )
+
+    def test_official_context_rejects_conflicting_v2_position_before_reservation(self):
+        self._assert_official_context_identity_blocked(
+            "official-wrong-v2-position",
+            {
+                "market_version": "v2",
+                "token_id": "yes",
+                "position_id": "position-yes",
+                "asset_id": "other-position",
+            },
+            "MARKET_OUTCOME_ID_MISMATCH",
+        )
+
+    def test_official_context_rejects_missing_v2_identity_before_reservation(self):
+        self._assert_official_context_identity_blocked(
+            "official-missing-v2-position",
+            {
+                "market_version": "v2",
+                "token_id": "yes",
+                "asset_id": "position-yes",
+            },
+            "MARKET_OUTCOME_ID_UNAVAILABLE",
+        )
+
     def test_shared_signed_post_rechecks_credential_rotation_before_sink(self):
         class RotatingCredentials(FakeCredentials):
             def __init__(self):
@@ -2827,6 +2954,8 @@ class CanaryTests(unittest.TestCase):
 
         context = {
             "asset_id": "position-yes",
+            "token_id": "yes",
+            "position_id": "position-yes",
             "market_version": "v2",
             "neg_risk": False,
             "accepting_orders": True,
@@ -3076,6 +3205,8 @@ class CanaryTests(unittest.TestCase):
 
         context = {
             "asset_id": "position-yes",
+            "token_id": "yes",
+            "position_id": "position-yes",
             "market_version": "v2",
             "neg_risk": False,
             "accepting_orders": True,
@@ -3193,6 +3324,8 @@ class CanaryTests(unittest.TestCase):
 
         context = {
             "asset_id": "position-yes",
+            "token_id": "yes",
+            "position_id": "position-yes",
             "market_version": "v2",
             "neg_risk": False,
             "accepting_orders": True,

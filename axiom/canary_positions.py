@@ -122,7 +122,14 @@ def response_market(order: Any) -> str | None:
 
 
 def response_price(order: Any) -> Decimal:
-    return decimal_value(mapping_value(order, "price", "limit_price", "limitPrice"), "order price", positive=True)
+    parsed = decimal_value(
+        mapping_value(order, "price", "limit_price", "limitPrice"),
+        "order price",
+        positive=True,
+    )
+    if parsed >= Decimal("1"):
+        raise ValueError("invalid order price")
+    return parsed
 
 
 def response_quantity(order: Any) -> Decimal:
@@ -184,7 +191,14 @@ def trade_side(trade: Any) -> str:
 
 
 def trade_price(trade: Any) -> Decimal:
-    return decimal_value(mapping_value(trade, "price", "execution_price", "executionPrice"), "trade price", positive=True)
+    parsed = decimal_value(
+        mapping_value(trade, "price", "execution_price", "executionPrice"),
+        "trade price",
+        positive=True,
+    )
+    if parsed >= Decimal("1"):
+        raise ValueError("invalid trade price")
+    return parsed
 
 
 def trade_quantity(trade: Any) -> Decimal:
@@ -222,6 +236,7 @@ from .domain import ensure_utc, parse_timestamp, utc_now
 
 UTC = timezone.utc
 ZERO = Decimal("0")
+ONE = Decimal("1")
 DUST = Decimal("0.00000001")
 _MAX_ENTRY_RECONCILIATION = 100
 _MAX_ACTIVE_ENTRY_RECONCILIATION = 80
@@ -305,6 +320,14 @@ def _decimal(value: Any, default: Decimal = ZERO) -> Decimal:
     except (InvalidOperation, TypeError, ValueError, ArithmeticError):
         return default
     return result if result.is_finite() else default
+
+
+def _canonical_clob_price(value: Any, reason: str) -> Decimal:
+    """Parse one executable prediction-market probability price."""
+    result = _decimal(value, Decimal("-1"))
+    if not ZERO < result < ONE:
+        raise CanaryBlocked(reason)
+    return result
 
 
 def _stamp(value: Any, fallback: datetime | None = None) -> datetime:
@@ -577,25 +600,55 @@ def _control_generation(service: CanaryService) -> int | None:
 
 def _extract_book_price(context: Mapping[str, Any], *, side: str) -> Decimal:
     side = side.upper()
-    names = ("best_bid", "bid", "sell_price", "price") if side == "SELL" else ("best_ask", "ask", "buy_price", "price")
+    names = (
+        ("best_bid", "bid", "sell_price", "price")
+        if side == "SELL"
+        else ("best_ask", "ask", "buy_price", "price")
+    )
+    side_rows_name = "bids" if side == "SELL" else "asks"
+
+    # Every supplied price candidate is evidence from the remote CLOB.  Do
+    # not skip an invalid preferred field and fall back to a different quote:
+    # that would let malformed data select a mark or exit price.
+    direct_prices: dict[str, Decimal] = {}
     for name in names:
-        result = _decimal(context.get(name), ZERO)
-        if result > ZERO:
-            return result
+        raw = context.get(name)
+        if raw in (None, ""):
+            continue
+        direct_prices[name] = _canonical_clob_price(
+            raw,
+            "CANARY_EXIT_PRICE_UNAVAILABLE",
+        )
+
+    def parse_rows(raw_rows: Any) -> list[Decimal]:
+        if raw_rows in (None, ""):
+            return []
+        if not isinstance(raw_rows, Sequence) or isinstance(raw_rows, (str, bytes)):
+            raise CanaryBlocked("CANARY_EXIT_PRICE_UNAVAILABLE")
+        return [
+            _canonical_clob_price(
+                _value(row, "price", default=None),
+                "CANARY_EXIT_PRICE_UNAVAILABLE",
+            )
+            for row in raw_rows
+        ]
+
+    nested_rows: list[Decimal] = []
     books = context.get("order_book", context.get("book"))
-    if isinstance(books, Mapping):
-        rows = books.get("bids" if side == "SELL" else "asks")
-        if isinstance(rows, Sequence) and not isinstance(rows, (str, bytes)):
-            prices = [_decimal(_value(row, "price"), ZERO) for row in rows]
-            prices = [item for item in prices if item > ZERO]
-            if prices:
-                return max(prices) if side == "SELL" else min(prices)
-    direct_rows = context.get("bids" if side == "SELL" else "asks")
-    if isinstance(direct_rows, Sequence) and not isinstance(direct_rows, (str, bytes)):
-        prices = [_decimal(_value(row, "price"), ZERO) for row in direct_rows]
-        prices = [item for item in prices if item > ZERO]
-        if prices:
-            return max(prices) if side == "SELL" else min(prices)
+    if isinstance(books, Mapping) and side_rows_name in books:
+        nested_rows = parse_rows(books.get(side_rows_name))
+
+    direct_rows: list[Decimal] = []
+    if side_rows_name in context:
+        direct_rows = parse_rows(context.get(side_rows_name))
+
+    for name in names:
+        if name in direct_prices:
+            return direct_prices[name]
+    if nested_rows:
+        return max(nested_rows) if side == "SELL" else min(nested_rows)
+    if direct_rows:
+        return max(direct_rows) if side == "SELL" else min(direct_rows)
     raise CanaryBlocked("CANARY_EXIT_PRICE_UNAVAILABLE")
 
 
@@ -821,10 +874,7 @@ def _trade_price(trade: Mapping[str, Any], order: Mapping[str, Any]) -> Decimal:
         "fill_price",
         default=None,
     )
-    price = _decimal(raw_price, Decimal("-1"))
-    if price <= ZERO or price >= Decimal("1"):
-        raise CanaryBlocked("CANARY_TRADE_PRICE_UNAVAILABLE")
-    return price
+    return _canonical_clob_price(raw_price, "CANARY_TRADE_PRICE_UNAVAILABLE")
 
 
 def _trade_fee(trade: Mapping[str, Any], order: Mapping[str, Any]) -> Decimal:
@@ -923,6 +973,53 @@ def _identity_alias(
     if len(set(values)) != 1:
         raise CanaryBlocked(conflict)
     return values[0]
+def _validate_market_context_identity(
+    context: Any,
+    expected_token_id: Any,
+    *,
+    missing_reason: str,
+    conflict_reason: str,
+) -> tuple[str, str]:
+    """Return the canonical version and asset bound to one expected outcome."""
+    if not isinstance(context, Mapping):
+        raise CanaryBlocked(missing_reason)
+    expected_token = _required_identity(expected_token_id, missing_reason)
+    market_version = _identity_alias(
+        context,
+        ("market_version", "marketVersion"),
+        missing=missing_reason,
+        conflict=conflict_reason,
+    ).lower()
+    if market_version not in {"v1", "v2"}:
+        raise CanaryBlocked(conflict_reason)
+    selected_token = _identity_alias(
+        context,
+        ("token_id", "tokenId", "selected_token_id", "selectedTokenId"),
+        missing=missing_reason,
+        conflict=conflict_reason,
+    )
+    asset_id = _identity_alias(
+        context,
+        ("asset_id", "assetId"),
+        missing=missing_reason,
+        conflict=conflict_reason,
+    )
+    if selected_token != expected_token:
+        raise CanaryBlocked(conflict_reason)
+    if market_version == "v1":
+        if asset_id != selected_token:
+            raise CanaryBlocked(conflict_reason)
+    else:
+        position_id = _identity_alias(
+            context,
+            ("position_id", "positionId", "selected_position_id", "selectedPositionId"),
+            missing=missing_reason,
+            conflict=conflict_reason,
+        )
+        if asset_id != position_id:
+            raise CanaryBlocked(conflict_reason)
+    return market_version, asset_id
+
 
 
 def _validate_venue_identity(
@@ -1028,6 +1125,18 @@ def _validate_venue_identity(
         or observed_market != market
     ):
         raise CanaryBlocked("CANARY_ORDER_IDENTITY_CONFLICT")
+    raw_order_price = _value(
+        order,
+        "price",
+        "limit_price",
+        "limitPrice",
+        default=None,
+    )
+    if raw_order_price not in (None, ""):
+        try:
+            response_price(order)
+        except ValueError:
+            raise CanaryBlocked("CANARY_ORDER_PRICE_UNAVAILABLE") from None
     try:
         order_quantity = response_quantity(order)
     except ValueError:
@@ -1262,7 +1371,7 @@ def _sync_entry_lots(service: CanaryService, now: datetime) -> int:
             continue
         price = _decimal(raw_price, Decimal("-1"))
         fees = _decimal(raw_fees, Decimal("-1"))
-        if quantity <= DUST or price <= ZERO or fees < ZERO:
+        if quantity <= DUST or not ZERO < price < ONE or fees < ZERO:
             continue
         evidence = _decode(row.get("evidence_json"))
         execution_asset_id = str(
@@ -1709,11 +1818,28 @@ def _reconcile_entry_ledger(service: CanaryService, venue: Any, now: datetime) -
                 existing_quantity = _decimal(existing["quantity"], ZERO)
                 existing_price = _decimal(existing["price"], ZERO)
                 existing_fee = _decimal(existing["fee"], ZERO)
-                if existing_quantity <= ZERO or existing_price <= ZERO or existing_fee < ZERO:
+                if (
+                    existing_quantity <= ZERO
+                    or not ZERO < existing_price < ONE
+                    or existing_fee < ZERO
+                ):
                     raise CanaryBlocked("CANARY_TRADE_EVIDENCE_UNAVAILABLE")
                 quantity += existing_quantity
                 cost += existing_quantity * existing_price
                 fees += existing_fee
+            if quantity <= ZERO:
+                prior_status = str(row.get("status") or "").upper()
+                prior_price = _decimal(row.get("actual_average_price"), Decimal("-1"))
+                prior_fees = _decimal(row.get("fees"), Decimal("-1"))
+                if (
+                    prior_status in _OWNED_ENTRY_STATUSES
+                    and prior_quantity > ZERO
+                    and ZERO < prior_price < ONE
+                    and prior_fees >= ZERO
+                ):
+                    quantity = prior_quantity
+                    cost = prior_quantity * prior_price
+                    fees = prior_fees
             for (
                 _trade,
                 fill_id,
@@ -1809,7 +1935,7 @@ def _reconcile_entry_ledger(service: CanaryService, venue: Any, now: datetime) -
                 if (
                     prior_status in _OWNED_ENTRY_STATUSES
                     and prior_quantity > ZERO
-                    and prior_price > ZERO
+                    and ZERO < prior_price < ONE
                     and prior_fees >= ZERO
                 ):
                     quantity = prior_quantity
@@ -2025,9 +2151,14 @@ def submit_exit(service: CanaryService, position_id: str, venue: Any, *, expecte
     market_id = str(lot.get("market_id") or "").strip()
     token_id = str(lot.get("token_id") or "").strip()
     context = _call(_method(venue, "market_context"), market_id=market_id, token_id=token_id)
-    if not isinstance(context, Mapping):
-        raise CanaryBlocked("CANARY_EXIT_MARKET_CONTEXT_INVALID")
-    if context.get("accepting_orders") is False:
+    market_version, asset_id = _validate_market_context_identity(
+        context,
+        token_id,
+        missing_reason="CANARY_EXIT_MARKET_CONTEXT_INVALID",
+        conflict_reason="CANARY_EXIT_MARKET_CONTEXT_INVALID",
+    )
+    accepting_orders = context.get("accepting_orders")
+    if type(accepting_orders) is not bool or not accepting_orders:
         raise CanaryBlocked("CANARY_MARKET_NOT_ACCEPTING_ORDERS")
     min_size = _decimal(context.get("min_order_size"), ZERO)
     if min_size > ZERO and quantity + DUST < min_size:
@@ -2162,17 +2293,15 @@ def submit_exit(service: CanaryService, position_id: str, venue: Any, *, expecte
             service.require_current_credential_binding(expected_credential_fingerprint)
             return _call(
                 test_submit,
-                token_id=token_id,
+                token_id=asset_id,
                 side="SELL",
                 price=price,
                 size=quantity,
             )
         return service.submit_position_order(
-            market_version=context.get("market_version"),
+            market_version=market_version,
             neg_risk=context.get("neg_risk"),
-            asset_id=str(
-                context.get("asset_id") or context.get("position_id") or token_id
-            ),
+            asset_id=asset_id,
             side="SELL",
             price=price,
             size=quantity,

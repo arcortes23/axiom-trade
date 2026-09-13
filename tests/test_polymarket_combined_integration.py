@@ -92,6 +92,7 @@ class _PositionCanaryVenue:
             "market_id": market_id,
             "token_id": token_id,
             "asset_id": token_id,
+            "position_id": token_id,
             "market_version": "v2",
             "neg_risk": False,
             "accepting_orders": True,

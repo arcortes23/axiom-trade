@@ -1158,6 +1158,11 @@ def _read_only_operation(
             Decimal(allowance["available_base_units"])
             / (Decimal(10) ** POLYMARKET_COLLATERAL_DECIMALS)
         )
+        accepting_orders = _sdk_value(state, "accepting_orders", _UNSET)
+        if accepting_orders is _UNSET:
+            accepting_orders = _sdk_value(market, "accepting_orders", _UNSET)
+        if type(accepting_orders) is not bool:
+            raise CanaryBlocked("MARKET_CONTEXT_FAILED")
         return {
             "market_version": market_version,
             "neg_risk": canonical_neg_risk,
@@ -1165,13 +1170,7 @@ def _read_only_operation(
             "token_id": selected_token_id,
             "position_id": selected_position_id,
             "asset_id": asset_id,
-            "accepting_orders": bool(
-                _sdk_value(
-                    state,
-                    "accepting_orders",
-                    _sdk_value(market, "accepting_orders", False),
-                )
-            ),
+            "accepting_orders": accepting_orders,
             "min_order_size": str(_sdk_value(book, "min_order_size", "0")),
             "tick_size": str(canonical_tick),
             "size_increment": str(
@@ -1541,6 +1540,27 @@ class CredentialStore:
 
 
 
+def _validated_geoblock_response(payload: Any) -> dict[str, Any]:
+    """Require explicit JSON booleans for authoritative geoblock fields."""
+    if not isinstance(payload, Mapping):
+        raise CanaryBlocked("GEOBLOCK_RESPONSE_INVALID")
+    try:
+        blocked = payload["blocked"]
+        close_only = payload["close_only"]
+        country = payload.get("country")
+        region = payload.get("region")
+    except Exception as exc:
+        raise CanaryBlocked("GEOBLOCK_RESPONSE_INVALID") from exc
+    if type(blocked) is not bool or type(close_only) is not bool:
+        raise CanaryBlocked("GEOBLOCK_RESPONSE_INVALID")
+    return {
+        "blocked": blocked,
+        "close_only": close_only,
+        "country": country,
+        "region": region,
+    }
+
+
 class PolymarketClobV2Venue:
     """Official ``polymarket-client`` 0.9 read-only venue integration.
 
@@ -1630,16 +1650,17 @@ class PolymarketClobV2Venue:
             _OFFICIAL_GEOBLOCK_URL,
             headers={"Accept": "application/json", "User-Agent": "AXIOM-canary/1"},
         )
-        with urlopen(request, timeout=10) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-        if not isinstance(payload, Mapping):
-            raise CanaryBlocked("GEOBLOCK_RESPONSE_INVALID")
-        return {
-            "blocked": bool(payload.get("blocked", True)),
-            "close_only": bool(payload.get("close_only", False)),
-            "country": payload.get("country"),
-            "region": payload.get("region"),
-        }
+        try:
+            with urlopen(request, timeout=10) as response:
+                try:
+                    payload = json.loads(response.read().decode("utf-8"))
+                except (UnicodeDecodeError, TypeError, ValueError) as exc:
+                    raise CanaryBlocked("GEOBLOCK_RESPONSE_INVALID") from exc
+        except CanaryBlocked:
+            raise
+        except Exception as exc:
+            raise CanaryBlocked("GEOBLOCK_CHECK_FAILED") from exc
+        return _validated_geoblock_response(payload)
 
     def account(self) -> Mapping[str, Any]:
         """Return only non-sensitive account diagnostics."""
@@ -9038,8 +9059,14 @@ class CanaryService:
         if credentials_configured is False:
             raise CanaryBlocked("CREDENTIALS_NOT_CONFIGURED")
         _, credential_digest = self._load_credential_binding()
-        geo = venue.geoblock()
-        if geo.get("blocked") or geo.get("close_only"):
+        try:
+            raw_geo = venue.geoblock()
+        except CanaryBlocked:
+            raise
+        except Exception as exc:
+            raise CanaryBlocked("GEOBLOCK_CHECK_FAILED") from exc
+        geo = _validated_geoblock_response(raw_geo)
+        if geo["blocked"] or geo["close_only"]:
             raise CanaryBlocked("GEOGRAPHICALLY_BLOCKED")
         candidate_limits = limits
         if target_notional_usd is not None:
@@ -10250,13 +10277,16 @@ class CanaryService:
                 failures.append("COLLECTOR_DEGRADED")
         if venue is not None:
             try:
-                geo = dict(venue.geoblock())
+                raw_geo = venue.geoblock()
+                geo = _validated_geoblock_response(raw_geo)
                 diagnostics["geoblock"] = geo
-                if geo.get("blocked") or geo.get("close_only"):
+                if geo["blocked"] or geo["close_only"]:
                     failures.append("GEOGRAPHICALLY_BLOCKED")
             except CanaryBlocked as exc:
+                diagnostics["geoblock"] = {"status": "FAILED"}
                 failures.append(str(exc))
             except Exception:
+                diagnostics["geoblock"] = {"status": "FAILED"}
                 failures.append("GEOBLOCK_CHECK_FAILED")
             if credentials_configured:
                 try:
@@ -11159,15 +11189,34 @@ class CanaryService:
             Decimal,
             dict[str, Any],
         ]:
-            geo = dict(venue.geoblock())
-            if geo.get("blocked") or geo.get("close_only"):
+            try:
+                raw_geo = venue.geoblock()
+            except CanaryBlocked:
+                raise
+            except Exception as exc:
+                block("GEOBLOCK_CHECK_FAILED")
+            geo = _validated_geoblock_response(raw_geo)
+            if geo["blocked"] or geo["close_only"]:
                 block("GEOGRAPHICALLY_BLOCKED")
-            context = dict(venue.market_context(market_id, token_id))
-            context_asset_id = context.get("asset_id")
-            if is_official_venue and not context_asset_id:
+            raw_context = venue.market_context(market_id, token_id)
+            if not isinstance(raw_context, Mapping):
                 block("MARKET_OUTCOME_ID_UNAVAILABLE")
-            resolved_asset_id = str(context_asset_id or token_id)
-            if not context.get("accepting_orders"):
+            context = dict(raw_context)
+            if is_official_venue:
+                from .canary_positions import _validate_market_context_identity
+
+                market_version, resolved_asset_id = _validate_market_context_identity(
+                    context,
+                    token_id,
+                    missing_reason="MARKET_OUTCOME_ID_UNAVAILABLE",
+                    conflict_reason="MARKET_OUTCOME_ID_MISMATCH",
+                )
+                context["market_version"] = market_version
+            else:
+                market_version = context.get("market_version")
+                resolved_asset_id = str(context.get("asset_id") or token_id)
+            accepting_orders = context.get("accepting_orders")
+            if type(accepting_orders) is not bool or not accepting_orders:
                 block("MARKET_NOT_ACCEPTING_ORDERS")
             asks = context.get("asks") or []
             if side.upper() != "BUY":
@@ -11222,7 +11271,7 @@ class CanaryService:
                 "fee_exponent": str(fee_exponent),
                 "estimated_fees": str(estimated_fees),
                 "resolved_asset_id": resolved_asset_id,
-                "market_version": context.get("market_version"),
+                "market_version": market_version,
                 "selected_token_id": context.get("token_id"),
                 "selected_position_id": context.get("position_id"),
                 "geoblock": {

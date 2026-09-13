@@ -46,6 +46,9 @@ class OfflineOfficialVenue:
         self.settlement_order_id: str | None = None
         self.order_id = "exit-1"
         self.fail_reads = False
+        self.market_version = "v1"
+        self.position_id: str | None = None
+        self.asset_id: str | None = None
         self.trades: list[dict[str, str]] = []
         self.trades_by_order: dict[str, list[dict[str, str]]] = {}
 
@@ -53,11 +56,17 @@ class OfflineOfficialVenue:
         return {"blocked": False, "close_only": False, "country": "ZZ"}
 
     def market_context(self, market_id: str, token_id: str) -> dict[str, object]:
+        version = str(self.market_version or "").strip().lower()
+        position_id = self.position_id
+        asset_id = self.asset_id or (
+            position_id if version == "v2" else token_id
+        )
         return {
             "market_id": market_id,
             "token_id": token_id,
-            "asset_id": token_id,
-            "market_version": "v2",
+            "asset_id": asset_id,
+            "market_version": self.market_version,
+            "position_id": position_id,
             "neg_risk": False,
             "accepting_orders": True,
             "min_order_size": "0.1",
@@ -400,6 +409,228 @@ class CanaryPositionManagementTests(unittest.TestCase):
                 config_id=str(self.config["config_id"]),
             )
         )
+    def test_exit_requires_explicit_true_accepting_orders(self) -> None:
+        context = self.venue.market_context("market-1", "token-yes")
+        invalid_values = (False, None, 0, 1, "true", [], {})
+        for value in invalid_values:
+            with self.subTest(value=value):
+                invalid_context = {
+                    **context,
+                    "accepting_orders": value,
+                }
+                with patch.object(
+                    self.venue,
+                    "market_context",
+                    return_value=invalid_context,
+                ):
+                    with self.assertRaisesRegex(
+                        CanaryBlocked,
+                        "CANARY_MARKET_NOT_ACCEPTING_ORDERS",
+                    ):
+                        self._submit_exit()
+                self.assertEqual(self.post_calls, [])
+        submitted = self._submit_exit()
+        self.assertEqual(submitted["status"], "SUBMITTED")
+    def test_invalid_book_prices_block_mark_without_sink_or_loss_change(self) -> None:
+        context = self.venue.market_context("market-1", "token-yes")
+        before = self.store.canary_risk_accounting(self.now)
+        invalid_values = ("-1", "0", "2", "NaN", "Infinity")
+        for value in invalid_values:
+            with self.subTest(value=value):
+                with patch.object(
+                    self.venue,
+                    "market_context",
+                    return_value={**context, "best_bid": value},
+                ):
+                    marked = position_module._mark_owned_equity(
+                        self.service,
+                        self.venue,
+                        self.now,
+                    )
+                self.assertEqual(marked["status"], "UNKNOWN")
+                self.assertEqual(marked["marks"], [])
+                self.assertEqual(
+                    marked["blocked"],
+                    [
+                        {
+                            "position_id": "position-1",
+                            "reason": "CANARY_EXIT_PRICE_UNAVAILABLE",
+                        }
+                    ],
+                )
+                self.assertEqual(
+                    self.store.connection.execute(
+                        "SELECT COUNT(*) FROM canary_equity_marks"
+                    ).fetchone()[0],
+                    0,
+                )
+                after = self.store.canary_risk_accounting(self.now)
+                for key in (
+                    "aggregate_open_cost_usd",
+                    "aggregate_exposure_usd",
+                    "realized_loss_usd",
+                    "equity_loss_usd",
+                    "equity_status",
+                ):
+                    self.assertEqual(after[key], before[key], msg=f"value={value}")
+
+    def test_invalid_book_prices_block_exit_without_reservation_or_submission(self) -> None:
+        context = self.venue.market_context("market-1", "token-yes")
+        before = self.store.canary_risk_accounting(self.now)
+        invalid_values = ("-1", "0", "2", "NaN", "Infinity")
+        for value in invalid_values:
+            with self.subTest(value=value):
+                with patch.object(
+                    self.venue,
+                    "market_context",
+                    return_value={**context, "best_bid": value},
+                ):
+                    with self.assertRaisesRegex(
+                        CanaryBlocked,
+                        "CANARY_EXIT_PRICE_UNAVAILABLE",
+                    ):
+                        self._submit_exit()
+                self.assertEqual(self.post_calls, [])
+                self.assertEqual(
+                    self.store.connection.execute(
+                        "SELECT COUNT(*) FROM canary_position_requests "
+                        "WHERE side='SELL'"
+                    ).fetchone()[0],
+                    0,
+                )
+                self.assertEqual(
+                    self.store.connection.execute(
+                        "SELECT COUNT(*) FROM canary_risk_reservations "
+                        "WHERE side='SELL'"
+                    ).fetchone()[0],
+                    0,
+                )
+                lot = self._lot()
+                self.assertEqual(lot["status"], "OPEN")
+                self.assertEqual(lot["pending_exit_quantity"], "0")
+                after = self.store.canary_risk_accounting(self.now)
+                for key in (
+                    "aggregate_open_cost_usd",
+                    "aggregate_exposure_usd",
+                    "realized_loss_usd",
+                    "equity_loss_usd",
+                    "equity_status",
+                ):
+                    self.assertEqual(after[key], before[key], msg=f"value={value}")
+
+    def test_boundary_adjacent_book_prices_are_valid_for_marks(self) -> None:
+        context = self.venue.market_context("market-1", "token-yes")
+        for value in ("0.0001", "0.9999"):
+            with self.subTest(value=value):
+                with patch.object(
+                    self.venue,
+                    "market_context",
+                    return_value={**context, "best_bid": value},
+                ):
+                    marked = position_module._mark_owned_equity(
+                        self.service,
+                        self.venue,
+                        self.now,
+                    )
+                self.assertEqual(marked["status"], "KNOWN")
+                self.assertEqual(marked["blocked"], [])
+                self.assertEqual(marked["marks"][0]["mark_price"], value)
+
+    def test_upper_boundary_adjacent_book_price_is_valid_for_exit(self) -> None:
+        context = self.venue.market_context("market-1", "token-yes")
+        with patch.object(
+            self.venue,
+            "market_context",
+            return_value={**context, "best_bid": "0.9999"},
+        ):
+            submitted = self._submit_exit()
+        self.assertEqual(submitted["status"], "SUBMITTED")
+        self.assertEqual(self.post_calls[-1]["price"], Decimal("0.9999"))
+
+
+    def _assert_exit_context_blocked(
+        self,
+        context: dict[str, object],
+        reason: str = "CANARY_EXIT_MARKET_CONTEXT_INVALID",
+    ) -> None:
+        with patch.object(self.venue, "market_context", return_value=context):
+            with self.assertRaisesRegex(CanaryBlocked, reason):
+                self._submit_exit()
+        self.assertEqual(self.post_calls, [])
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM canary_position_requests WHERE side='SELL'"
+            ).fetchone()[0],
+            0,
+        )
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM canary_risk_reservations WHERE side='SELL'"
+            ).fetchone()[0],
+            0,
+        )
+        lot = self._lot()
+        self.assertEqual(lot["status"], "OPEN")
+        self.assertEqual(lot["pending_exit_quantity"], "0")
+
+    def test_exit_rejects_wrong_v1_asset_before_reservation(self) -> None:
+        context = self.venue.market_context("market-1", "token-yes")
+        self._assert_exit_context_blocked({**context, "asset_id": "wrong-asset"})
+
+    def test_exit_rejects_wrong_v2_selected_token_before_reservation(self) -> None:
+        context = self.venue.market_context("market-1", "token-yes")
+        self._assert_exit_context_blocked(
+            {
+                **context,
+                "market_version": "v2",
+                "token_id": "token-no",
+                "position_id": "position-no",
+                "asset_id": "position-no",
+            }
+        )
+
+    def test_exit_rejects_conflicting_v2_position_before_reservation(self) -> None:
+        context = self.venue.market_context("market-1", "token-yes")
+        self._assert_exit_context_blocked(
+            {
+                **context,
+                "market_version": "v2",
+                "position_id": "position-yes",
+                "asset_id": "other-position",
+            }
+        )
+
+    def test_exit_rejects_missing_context_identities_before_reservation(self) -> None:
+        context = self.venue.market_context("market-1", "token-yes")
+        for missing in (
+            {"market_version": "v1", "token_id": "token-yes", "asset_id": None},
+            {"market_version": "v2", "token_id": None, "position_id": "position-yes", "asset_id": "position-yes"},
+            {"market_version": "v2", "token_id": "token-yes", "position_id": None, "asset_id": "position-yes"},
+            {"market_version": "v2", "token_id": "token-yes", "position_id": "position-yes", "asset_id": None},
+        ):
+            with self.subTest(missing=missing):
+                self._assert_exit_context_blocked({**context, **missing})
+
+    def test_exit_rejects_unknown_market_version_before_reservation(self) -> None:
+        context = self.venue.market_context("market-1", "token-yes")
+        self._assert_exit_context_blocked({**context, "market_version": "v3"})
+
+    def test_valid_v1_exit_uses_lot_token_asset(self) -> None:
+        submitted = self._submit_exit()
+        self.assertEqual(submitted["status"], "SUBMITTED")
+        call = self.service.submit_position_order.call_args.kwargs
+        self.assertEqual(call["market_version"], "v1")
+        self.assertEqual(call["asset_id"], "token-yes")
+
+    def test_valid_v2_exit_uses_canonical_position_asset(self) -> None:
+        self.venue.market_version = "v2"
+        self.venue.position_id = "position-yes"
+        submitted = self._submit_exit()
+        self.assertEqual(submitted["status"], "SUBMITTED")
+        call = self.service.submit_position_order.call_args.kwargs
+        self.assertEqual(call["market_version"], "v2")
+        self.assertEqual(call["asset_id"], "position-yes")
+
 
     def _request(self) -> dict[str, object]:
         row = self.store.connection.execute(
