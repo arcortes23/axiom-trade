@@ -407,6 +407,31 @@ class PredictionDataQualityCacheTests(unittest.TestCase):
         self.assertEqual(store.attestation_load_calls, 1)
         self.assertEqual(store.scan_calls, 0)
 
+    def test_current_attestation_with_explicit_missing_ranges_fails_closed(self) -> None:
+        store = _AttestedQualityStore(
+            {
+                "dataset_id": DATASET_ID,
+                "dataset_version": DATASET_VERSION,
+                "source_type": "HISTORICAL",
+                "market_type": "prediction",
+                "row_count": 2,
+                "completeness": 1.0,
+                "execution_fidelity": PRICE_PROXY,
+                "contamination_result": "PASS",
+                "status": "CURRENT",
+            }
+        )
+        store.catalogs[DATASET_VERSION]["missing_ranges"] = [
+            {"start": "2025-01-01T00:00:00Z", "end": "2025-01-01T01:00:00Z"}
+        ]
+
+        quality = evaluate_prediction_data_quality(store, _payload(fidelity=PRICE_PROXY))
+
+        self.assertFalse(quality["historical_data_integrity_passed"])
+        self.assertFalse(quality["historical_provenance_complete"])
+        self.assertIn("HISTORICAL_PROVENANCE_INCOMPLETE", quality["reasons"])
+        self.assertEqual(store.scan_calls, 0)
+
     def test_current_attestation_is_reused_without_materializing_rows(self) -> None:
         store = _AttestedQualityStore(
             {

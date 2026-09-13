@@ -1545,6 +1545,7 @@ class HistoricalBootstrapper:
                 return default
             return parsed if parsed >= 0 else default
 
+        attempt_limit = max(1, int(self.max_attempts))
         discovered_ids = {
             str(item).strip()
             for item in state.get("discovered_market_ids", ())
@@ -1567,6 +1568,7 @@ class HistoricalBootstrapper:
         # Processed IDs are durable commit markers.  Discard legacy markers
         # without a non-empty immutable constituent catalog so an
         # interrupted/empty market can be resumed instead of being skipped.
+        frontier_changed = False
         for market_id in tuple(processed):
             catalog = self.store.load_dataset_catalog(f"prediction:{market_id}")
             try:
@@ -1576,6 +1578,7 @@ class HistoricalBootstrapper:
             if catalog is None or row_count <= 0:
                 processed.discard(market_id)
                 market_statuses.pop(market_id, None)
+                frontier_changed = True
         # Discovery is a resumable frontier, while processed IDs are durable
         # publication markers.  A legacy state or a query-scope migration may
         # have reset that frontier; never let it omit a valid published
@@ -1587,6 +1590,40 @@ class HistoricalBootstrapper:
             for key, value in raw_failed.items():
                 if isinstance(value, Mapping) and str(key).strip():
                     failed_markets[str(key)] = dict(value)
+        # Failed IDs are part of the discovered frontier even in legacy
+        # payloads that only persisted the retry map.
+        discovered_ids.update(failed_markets)
+        # Legacy producers kept retrying FAILED rows forever.  Reclassify an
+        # already exhausted row before any provider call and clear every
+        # retry timestamp.  Keep the original error as the gap reason while
+        # recording the terminal classification separately.
+        exhausted_migration = False
+        for market_id, failed in tuple(failed_markets.items()):
+            attempts = _positive_or_zero(failed.get("attempts"))
+            prior_market_status = str(failed.get("status") or "").strip().upper()
+            if (
+                attempts < attempt_limit
+                and prior_market_status not in {"EXHAUSTED", "PERMANENT_GAP"}
+            ):
+                continue
+            reason = str(failed.get("last_error") or "").strip()
+            if not reason:
+                reason = "historical market retry attempts exhausted"
+            exhausted = dict(failed)
+            exhausted.update(
+                {
+                    "attempts": attempts,
+                    "status": "EXHAUSTED",
+                    "last_error": reason,
+                    "exhaustion_reason": "MAX_ATTEMPTS_EXHAUSTED",
+                    "next_attempt_at": None,
+                    "retry_after": 0.0,
+                }
+            )
+            if exhausted != failed or market_statuses.get(market_id) != "EXHAUSTED":
+                exhausted_migration = True
+            failed_markets[market_id] = exhausted
+            market_statuses[market_id] = "EXHAUSTED"
         discovery_cursor = state.get("discovery_cursor")
         discovery_cursor = (
             str(discovery_cursor) if isinstance(discovery_cursor, str) and discovery_cursor else None
@@ -1597,6 +1634,7 @@ class HistoricalBootstrapper:
             discovery_complete = True
             discovered_ids.clear()
             processed.clear()
+
         errors: list[str] = []
         no_new_data_count = _positive_or_zero(state.get("no_new_data_count"))
         retry_count = _positive_or_zero(state.get("retry_count"))
@@ -1613,17 +1651,33 @@ class HistoricalBootstrapper:
         discovery_failed = False
         discovery_scope_reset = False
 
+        def _exhausted_ids() -> set[str]:
+            return {
+                market_id
+                for market_id in discovered_ids
+                if market_statuses.get(market_id) in {"EXHAUSTED", "PERMANENT_GAP"}
+                or str(failed_markets.get(market_id, {}).get("status") or "").upper()
+                in {"EXHAUSTED", "PERMANENT_GAP"}
+            }
+
+        def _unresolved_ids() -> set[str]:
+            return discovered_ids - processed - _exhausted_ids()
 
         def _coverage() -> dict[str, Any]:
+            exhausted = _exhausted_ids()
             return {
                 "market_limit": target_markets,
                 "market_budget": market_limit,
                 "request_budget": request_limit,
+                "max_attempts": attempt_limit,
                 "discovery_complete": discovery_complete,
                 "discovered_markets": len(discovered_ids),
                 "processed_markets": len(processed),
+                "exhausted_markets": len(exhausted),
+                "unresolved_markets": len(_unresolved_ids()),
                 "history_endpoint": "CLOB /prices-history for the aligned YES token",
             }
+
         def _completeness() -> float:
             # Unknown markets remain outside the observed universe whenever
             # discovery has not reached a clean terminal page.  Never expose
@@ -1644,6 +1698,17 @@ class HistoricalBootstrapper:
             ]
             values = [value for value in values if value is not None]
             return min(values) if values else None
+
+        # A terminal exhausted frontier is an idempotent durable no-op.  Do
+        # not rewrite its state/operator row merely because a scheduler tick
+        # arrived, and never let it reach the request loop.
+        terminal_noop = (
+            prior_status == "EXHAUSTED"
+            and discovery_complete
+            and not _unresolved_ids()
+            and not exhausted_migration
+            and not frontier_changed
+        )
 
         def _persist(
             status: str,
@@ -1689,6 +1754,7 @@ class HistoricalBootstrapper:
                 },
                 "request_budget": request_limit,
                 "market_budget": market_limit,
+                "max_attempts": attempt_limit,
                 "request_count": request_count,
                 "error_count": error_count,
                 "no_new_data_count": no_new_data_count,
@@ -1700,13 +1766,12 @@ class HistoricalBootstrapper:
                     or discovery_next_attempt_at
                     or _next_failed_at()
                 ),
-
                 "requested_coverage": _coverage(),
                 "honest_gaps": [
                     {
                         "market_id": key,
                         "status": value.get("status"),
-                        "reason": value.get("last_error"),
+                        "reason": value.get("last_error") or value.get("exhaustion_reason"),
                         "next_attempt_at": value.get("next_attempt_at"),
                     }
                     for key, value in sorted(failed_markets.items())
@@ -1716,9 +1781,14 @@ class HistoricalBootstrapper:
             }
             state.update(payload)
             self.store.save_dataset_bootstrap_state(POLYMARKET_DATASET_ID, payload)
+            terminal_job = (
+                str(status).upper() == "EXHAUSTED"
+                and discovery_complete
+                and not _unresolved_ids()
+            )
             job_payload = dict(payload)
             job_payload["job_kind"] = "POLYMARKET_HISTORICAL_REFRESH"
-            job_payload["resumable"] = True
+            job_payload["resumable"] = not terminal_job
             self.store.set_operator_job(
                 POLYMARKET_HISTORICAL_JOB_NAME,
                 str(status).upper(),
@@ -1726,9 +1796,10 @@ class HistoricalBootstrapper:
                 pid=None,
                 started_at=_stamp(state.get("started_at")) or now,
                 last_error=last_error or (errors[-1] if errors else None),
-                resumable=True,
+                resumable=not terminal_job,
                 timestamp=now,
             )
+
         def _record_market_failure(
             market_id: str,
             failed: Mapping[str, Any] | None,
@@ -1739,13 +1810,27 @@ class HistoricalBootstrapper:
             previous_attempts = _positive_or_zero(
                 failed.get("attempts") if failed else 0
             )
+            attempts = previous_attempts + 1
             retry_count += int(previous_attempts > 0)
+            exhausted = attempts >= attempt_limit
+            if exhausted:
+                failed_markets[market_id] = {
+                    "attempts": attempts,
+                    "status": "EXHAUSTED",
+                    "last_error": phase_error,
+                    "exhaustion_reason": "MAX_ATTEMPTS_EXHAUSTED",
+                    "retry_after": 0.0,
+                    "next_attempt_at": None,
+                }
+                market_statuses[market_id] = "EXHAUSTED"
+                _persist("EXHAUSTED", last_error=phase_error)
+                return
             delay = retry_after or min(
                 3600.0, self.backoff * (2**previous_attempts)
             )
             retry_at = now + timedelta(seconds=max(0.0, delay))
             failed_markets[market_id] = {
-                "attempts": previous_attempts + 1,
+                "attempts": attempts,
                 "status": "FAILED",
                 "last_error": phase_error,
                 "retry_after": retry_after,
@@ -1754,12 +1839,15 @@ class HistoricalBootstrapper:
             market_statuses[market_id] = "FAILED"
             _persist("FAILED", last_error=phase_error, next_attempt_at=retry_at)
 
-
         # A scheduled retry is not allowed to consume a request before its
-        # persisted Retry-After/backoff boundary.
-        scheduled_at = _stamp(state.get("next_attempt_at"))
-        if scheduled_at is not None and scheduled_at > now and (
-            prior_status in {"SCHEDULED", "FAILED", "PARTIAL"}
+        # persisted Retry-After/backoff boundary.  A legacy exhaustion
+        # migration clears that boundary before reaching this check.
+        scheduled_at = None if exhausted_migration else _stamp(state.get("next_attempt_at"))
+        if (
+            not terminal_noop
+            and scheduled_at is not None
+            and scheduled_at > now
+            and prior_status in {"SCHEDULED", "FAILED", "PARTIAL"}
         ):
             latest = self.store.load_dataset_catalog(POLYMARKET_DATASET_ID)
             retry_after = _coerce_retry_after(state.get("retry_after"))
@@ -1791,8 +1879,10 @@ class HistoricalBootstrapper:
                 },
             )
 
+        if not terminal_noop:
+            _persist("RUNNING")
 
-        _persist("RUNNING")
+
         def _request(operation: Callable[[], Any], context: str) -> _CallResult | None:
             nonlocal request_count, tick_requests, error_count, request_failed, budget_exhausted
             if tick_requests >= request_limit:
@@ -1900,6 +1990,16 @@ class HistoricalBootstrapper:
                         coverage_status = str(
                             getattr(page, "coverage_status", "")
                         ).strip().upper()
+                        coverage_status_invalid = coverage_status not in {
+                            "COMPLETE",
+                            "PARTIAL",
+                            "BUDGET_EXHAUSTED",
+                            "ERROR",
+                        }
+                        incomplete_without_cursor = (
+                            coverage_status in {"PARTIAL", "BUDGET_EXHAUSTED"}
+                            and returned_cursor is None
+                        )
                         if page_call.request_failed and not snapshots:
                             discovery_failed = True
                             discovery_retry_after = _coerce_retry_after(page_call.retry_after)
@@ -1909,19 +2009,30 @@ class HistoricalBootstrapper:
                                 )
                         if (
                             malformed_count > 0
-                            or coverage_status == "ERROR"
+                            or coverage_status_invalid
+                            or incomplete_without_cursor
                             or (page_call.request_failed and not snapshots)
                         ):
                             # Accepted identities remain durable and are
-                            # deduplicated on retry, but the malformed page is
-                            # the retry frontier: do not advance its cursor or
-                            # claim complete coverage.
+                            # deduplicated on retry, but a malformed or
+                            # incomplete page is the retry frontier: do not
+                            # advance its cursor or claim complete coverage.
                             reason = str(
                                 getattr(page, "error_reason", "") or
                                 (
                                     f"REJECTED_PAGE_ITEMS:{malformed_count}"
                                     if malformed_count > 0
-                                    else "MALFORMED_PAGE"
+                                    else (
+                                        (
+                                            f"INVALID_COVERAGE_STATUS:{coverage_status or 'MISSING'}"
+                                        )
+                                        if coverage_status_invalid
+                                        else (
+                                            "INCOMPLETE_PAGE"
+                                            if incomplete_without_cursor
+                                            else "MALFORMED_PAGE"
+                                        )
+                                    )
                                 )
                             ).strip()
                             errors.append(f"polymarket market discovery: {reason}")
@@ -2001,9 +2112,15 @@ class HistoricalBootstrapper:
         for market_id in sorted(discovered_ids):
             if market_id in processed:
                 continue
+            failed = failed_markets.get(market_id)
+            if (
+                market_statuses.get(market_id) in {"EXHAUSTED", "PERMANENT_GAP"}
+                or str((failed or {}).get("status") or "").upper()
+                in {"EXHAUSTED", "PERMANENT_GAP"}
+            ):
+                continue
             if attempted_markets >= market_limit:
                 break
-            failed = failed_markets.get(market_id)
             due_at = _stamp(failed.get("next_attempt_at")) if failed else None
             if due_at is not None and due_at > now:
                 continue
@@ -2365,7 +2482,7 @@ class HistoricalBootstrapper:
                 {
                     "market_id": key,
                     "status": value.get("status"),
-                    "reason": value.get("last_error"),
+                    "reason": value.get("last_error") or value.get("exhaustion_reason"),
                     "next_attempt_at": value.get("next_attempt_at"),
                 }
                 for key, value in sorted(failed_markets.items())
@@ -2417,17 +2534,18 @@ class HistoricalBootstrapper:
                 )
         else:
             aggregate_version = str(previous_aggregate.get("dataset_version", aggregate_version))
-        remaining = (
-            len(discovered_ids) < target_markets
-            or any(
-                market_id not in processed
-                for market_id in discovered_ids
-            )
-        )
+        exhausted_ids = _exhausted_ids()
+        unresolved_ids = _unresolved_ids()
+        frontier_terminal = discovery_complete and not unresolved_ids
+        remaining = not frontier_terminal
         if discovery_scope_reset:
             final_status = "SCHEDULED"
         elif discovery_failed:
             final_status = "PARTIAL"
+        elif frontier_terminal and exhausted_ids:
+            # A cleanly discovered frontier with permanent gaps is terminal,
+            # not a retryable failure.  The gap records remain authoritative.
+            final_status = "EXHAUSTED"
         elif request_failed:
             final_status = "FAILED"
         elif budget_exhausted and remaining:
@@ -2443,11 +2561,13 @@ class HistoricalBootstrapper:
         else:
             final_status = "NO_NEW_DATA"
         state["base_version"] = aggregate_version or state.get("base_version")
-        _persist(final_status)
+        if not terminal_noop:
+            _persist(final_status)
         completeness = _completeness()
         report_metadata: dict[str, Any] = {
             **aggregate_metadata,
             "job_name": POLYMARKET_HISTORICAL_JOB_NAME,
+            "max_attempts": attempt_limit,
             "request_count": request_count,
             "error_count": error_count,
             "no_new_data_count": no_new_data_count,
@@ -2456,6 +2576,8 @@ class HistoricalBootstrapper:
             "market_budget": market_limit,
             "discovery_cursor": discovery_cursor,
             "query_fingerprint": query_fingerprint,
+            "exhausted_market_ids": sorted(exhausted_ids),
+            "unresolved_market_ids": sorted(unresolved_ids),
             "next_attempt_at": discovery_next_attempt_at or _next_failed_at(),
             "retry_after": discovery_retry_after,
             "changed": bool(changed_aggregate),
@@ -2485,12 +2607,13 @@ class HistoricalBootstrapper:
             tuple(dict.fromkeys(errors)),
             report_metadata,
         )
-        self.store.save_report_if_absent(
-            f"historical-bootstrap:{POLYMARKET_DATASET_ID}:"
-            f"{aggregate_version or 'none'}:{final_status}:{request_count}",
-            report.as_record(),
-            experiment_id=POLYMARKET_DATASET_ID,
-        )
+        if not terminal_noop:
+            self.store.save_report_if_absent(
+                f"historical-bootstrap:{POLYMARKET_DATASET_ID}:"
+                f"{aggregate_version or 'none'}:{final_status}:{request_count}",
+                report.as_record(),
+                experiment_id=POLYMARKET_DATASET_ID,
+            )
         return report
     def publish_polymarket_forward_replay(
         self,

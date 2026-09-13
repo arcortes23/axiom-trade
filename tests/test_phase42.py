@@ -11,6 +11,7 @@ from urllib.request import urlopen
 from axiom.data.polymarket import MarketDiscoveryPage
 from axiom.bootstrap import (
     BTC_DATASET_IDS,
+    POLYMARKET_DATASET_ID,
     HistoricalBootstrapper,
     classify_market_category,
     label_btc_regimes,
@@ -448,6 +449,261 @@ class Phase42PolymarketTests(unittest.TestCase):
             assert final_state is not None
             self.assertTrue(final_state["discovery_complete"])
             self.assertEqual(provider.page_calls, [None, None])
+    def test_partial_discovery_without_cursor_never_claims_complete(self) -> None:
+        class IncompletePagePolymarket(FakePolymarket):
+            def market_page(
+                self,
+                limit: int,
+                *,
+                after_cursor: str | None = None,
+                closed: bool = False,
+            ) -> MarketDiscoveryPage:
+                values = tuple(self.markets_by_id.values())[:limit]
+                return MarketDiscoveryPage(
+                    snapshots=values,
+                    next_cursor=None,
+                    request_path="/markets/keyset",
+                    query={"limit": str(limit), "closed": str(closed).lower()},
+                    query_fingerprint="scope:incomplete-fixture",
+                    raw_count=len(values),
+                    unique_count=len(values),
+                    duplicate_count=0,
+                    malformed_count=0,
+                    coverage_status="PARTIAL",
+                )
+
+        with AxiomStore(":memory:") as store:
+            report = HistoricalBootstrapper(
+                store,
+                prediction_provider=IncompletePagePolymarket(),
+                sleep=lambda _: None,
+                max_attempts=1,
+            ).bootstrap_polymarket(max_markets=2, resume=True)
+            self.assertEqual(report.status, "PARTIAL")
+            self.assertEqual(report.completeness, 0.0)
+            state = store.load_dataset_bootstrap_state(POLYMARKET_DATASET_ID)
+            self.assertIsNotNone(state)
+            assert state is not None
+            self.assertFalse(state["discovery_complete"])
+            self.assertEqual(state["discovery_cursor"], None)
+            self.assertIn("polymarket market discovery: INCOMPLETE_PAGE", state["errors"])
+            aggregate = store.load_dataset_catalog(POLYMARKET_DATASET_ID)
+            self.assertIsNotNone(aggregate)
+            assert aggregate is not None
+            self.assertEqual(aggregate["completeness"], 0.0)
+            self.assertEqual(aggregate["metadata"]["coverage_status"], "PARTIAL")
+
+    def test_unknown_discovery_coverage_status_stays_partial(self) -> None:
+        class UnknownCoveragePolymarket(FakePolymarket):
+            def __init__(self, coverage_status: str) -> None:
+                super().__init__()
+                self.coverage_status = coverage_status
+
+            def market_page(
+                self,
+                limit: int,
+                *,
+                after_cursor: str | None = None,
+                closed: bool = False,
+            ) -> MarketDiscoveryPage:
+                values = tuple(self.markets_by_id.values())[:limit]
+                return MarketDiscoveryPage(
+                    snapshots=values,
+                    next_cursor=None,
+                    request_path="/markets/keyset",
+                    query={"limit": str(limit), "closed": str(closed).lower()},
+                    query_fingerprint="scope:unknown-status-fixture",
+                    raw_count=len(values),
+                    unique_count=len(values),
+                    duplicate_count=0,
+                    malformed_count=0,
+                    coverage_status=self.coverage_status,
+                )
+
+        for coverage_status, marker in (("", "MISSING"), ("UNEXPECTED", "UNEXPECTED")):
+            with self.subTest(coverage_status=coverage_status or "missing"):
+                with AxiomStore(":memory:") as store:
+                    report = HistoricalBootstrapper(
+                        store,
+                        prediction_provider=UnknownCoveragePolymarket(coverage_status),
+                        sleep=lambda _: None,
+                        max_attempts=1,
+                    ).bootstrap_polymarket(max_markets=2, resume=True)
+                    self.assertEqual(report.status, "PARTIAL")
+                    state = store.load_dataset_bootstrap_state(POLYMARKET_DATASET_ID)
+                    self.assertIsNotNone(state)
+                    assert state is not None
+                    self.assertFalse(state["discovery_complete"])
+                    self.assertIn(
+                        f"INVALID_COVERAGE_STATUS:{marker}",
+                        state["errors"][0],
+                    )
+
+    def test_over_cap_failed_markets_migrate_to_terminal_gaps_without_requests(self) -> None:
+        class NoRequestPolymarket(FakePolymarket):
+            def __init__(self) -> None:
+                super().__init__()
+                self.markets_by_id.update(
+                    {
+                        f"gap-{index}": self._market(
+                            f"gap-{index}",
+                            f"Gap question {index}",
+                            tags=("gap",),
+                        )
+                        for index in range(4)
+                    }
+                )
+                self.calls: list[str] = []
+
+            def markets(self, *args: object, **kwargs: object) -> object:
+                self.calls.append("markets")
+                raise AssertionError("exhausted gaps must not rediscover")
+
+            def market(self, market_id: str) -> object:
+                self.calls.append(f"market:{market_id}")
+                raise AssertionError("exhausted gaps must not request details")
+
+            def metadata(self, market_id: str) -> object:
+                self.calls.append(f"metadata:{market_id}")
+                raise AssertionError("exhausted gaps must not request metadata")
+
+            def price_history(self, market_id: str) -> object:
+                self.calls.append(f"history:{market_id}")
+                raise AssertionError("exhausted gaps must not request history")
+
+        gap_ids = [f"gap-{index}" for index in range(4)]
+        provider = NoRequestPolymarket()
+        with AxiomStore(":memory:") as store:
+            store.save_dataset_bootstrap_state(
+                POLYMARKET_DATASET_ID,
+                {
+                    "provider": provider.provider_name,
+                    "instrument": "POLYMARKET",
+                    "market_type": "prediction",
+                    "timeframe": "event",
+                    "status": "FAILED",
+                    "discovery_complete": True,
+                    "discovered_market_ids": gap_ids,
+                    "processed_market_ids": [],
+                    "market_statuses": {market_id: "FAILED" for market_id in gap_ids},
+                    "failed_markets": {
+                        market_id: {
+                            "attempts": 200,
+                            "status": "FAILED",
+                            "last_error": f"historical gap {market_id}",
+                            "retry_after": 60.0,
+                            "next_attempt_at": (T0 + timedelta(days=1)).isoformat(),
+                        }
+                        for market_id in gap_ids
+                    },
+                    "request_count": 2401,
+                    "retry_count": 796,
+                    "next_attempt_at": (T0 + timedelta(days=1)).isoformat(),
+                },
+            )
+            bootstrapper = HistoricalBootstrapper(
+                store,
+                prediction_provider=provider,
+                sleep=lambda _: None,
+                clock=lambda: T0,
+                max_attempts=3,
+            )
+            first = bootstrapper.bootstrap_polymarket(
+                max_markets=len(gap_ids),
+                resume=True,
+            )
+            self.assertEqual(first.status, "EXHAUSTED")
+            self.assertEqual(
+                [item["market_id"] for item in first.missing_ranges],
+                gap_ids,
+            )
+            self.assertEqual(provider.calls, [])
+            state = store.load_dataset_bootstrap_state(POLYMARKET_DATASET_ID)
+            self.assertIsNotNone(state)
+            assert state is not None
+            self.assertEqual(state["status"], "EXHAUSTED")
+            self.assertIsNone(state["next_attempt_at"])
+            self.assertEqual(
+                state["market_statuses"],
+                {market_id: "EXHAUSTED" for market_id in gap_ids},
+            )
+            self.assertEqual(
+                set(state["honest_gaps"][index]["market_id"] for index in range(4)),
+                set(gap_ids),
+            )
+            self.assertTrue(
+                all(
+                    item["status"] == "EXHAUSTED"
+                    and item["next_attempt_at"] is None
+                    for item in state["honest_gaps"]
+                )
+            )
+            catalog = store.load_dataset_catalog(POLYMARKET_DATASET_ID)
+            self.assertIsNotNone(catalog)
+            assert catalog is not None
+            version = catalog["dataset_version"]
+            before_state = state
+            before_version = version
+            second = bootstrapper.bootstrap_polymarket(
+                max_markets=len(gap_ids),
+                resume=True,
+            )
+            self.assertEqual(second.status, "EXHAUSTED")
+            self.assertEqual(provider.calls, [])
+            self.assertEqual(store.load_dataset_bootstrap_state(POLYMARKET_DATASET_ID), before_state)
+            self.assertEqual(
+                store.load_dataset_catalog(POLYMARKET_DATASET_ID)["dataset_version"],
+                before_version,
+            )
+
+    def test_below_cap_retry_then_terminal_exhaustion_stops_future_requests(self) -> None:
+        class FailingHistoryPolymarket(FakePolymarket):
+            def __init__(self) -> None:
+                super().__init__()
+                self.history_attempts = 0
+                self.history_calls: list[str] = []
+
+            def price_history(self, market_id: str) -> list[dict[str, object]]:
+                self.history_calls.append(market_id)
+                if market_id == "m-politics":
+                    self.history_attempts += 1
+                    return []
+                return super().price_history(market_id)
+
+        provider = FailingHistoryPolymarket()
+        with AxiomStore(":memory:") as store:
+            bootstrapper = HistoricalBootstrapper(
+                store,
+                prediction_provider=provider,
+                sleep=lambda _: None,
+                clock=lambda: T0,
+                max_attempts=2,
+                backoff=0,
+            )
+            first = bootstrapper.bootstrap_polymarket(max_markets=2, resume=True)
+            self.assertEqual(first.status, "SCHEDULED")
+            state = store.load_dataset_bootstrap_state(POLYMARKET_DATASET_ID)
+            self.assertIsNotNone(state)
+            assert state is not None
+            self.assertEqual(state["failed_markets"]["m-politics"]["attempts"], 1)
+            self.assertEqual(state["failed_markets"]["m-politics"]["status"], "FAILED")
+            self.assertIsNotNone(state["failed_markets"]["m-politics"]["next_attempt_at"])
+
+            before_retry_calls = len(provider.history_calls)
+            second = bootstrapper.bootstrap_polymarket(max_markets=2, resume=True)
+            self.assertEqual(second.status, "EXHAUSTED")
+            self.assertEqual(provider.history_calls[before_retry_calls:], ["m-politics"])
+            state = store.load_dataset_bootstrap_state(POLYMARKET_DATASET_ID)
+            self.assertIsNotNone(state)
+            assert state is not None
+            self.assertEqual(state["failed_markets"]["m-politics"]["attempts"], 2)
+            self.assertEqual(state["failed_markets"]["m-politics"]["status"], "EXHAUSTED")
+            self.assertIsNone(state["failed_markets"]["m-politics"]["next_attempt_at"])
+            calls_after_exhaustion = list(provider.history_calls)
+            third = bootstrapper.bootstrap_polymarket(max_markets=2, resume=True)
+            self.assertEqual(third.status, "EXHAUSTED")
+            self.assertEqual(provider.history_calls, calls_after_exhaustion)
+
     def test_malformed_legacy_discovery_shape_stays_partial(self) -> None:
         class MalformedLegacyPolymarket(FakePolymarket):
             def __init__(self) -> None:

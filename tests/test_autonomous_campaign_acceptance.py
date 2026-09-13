@@ -286,6 +286,60 @@ class AutonomousCampaignAcceptanceTests(unittest.TestCase):
             self.assertEqual(raised.exception.reason, "SOFTWARE_OR_INPUT_ERROR")
 
 
+    def test_explicit_missing_ranges_reject_attestation_and_campaign(self) -> None:
+        rows = _rows(midpoint=0.50)
+        metadata = {
+            "fixture_label": SYNTHETIC_LABEL,
+            "synthetic": True,
+            "provider": SYNTHETIC_LABEL,
+            "source_type": "HISTORICAL",
+            "market_type": "prediction",
+            "instrument": "POLYMARKET",
+            "research_quality": "PRICE_PROXY",
+        }
+        with AxiomStore(":memory:") as store:
+            store.save_dataset(
+                DATASET_ID,
+                "gapped-v1",
+                rows,
+                metadata=metadata,
+                quality="PRICE_PROXY",
+            )
+            store.save_dataset_catalog(
+                DATASET_ID,
+                "gapped-v1",
+                provider=SYNTHETIC_LABEL,
+                instrument="POLYMARKET",
+                market_type="prediction",
+                timeframe="event",
+                start_timestamp=T0,
+                end_timestamp=T0,
+                row_count=len(rows),
+                completeness=1.0,
+                missing_ranges=[{"start": T0.isoformat(), "end": T0.isoformat()}],
+                quality="PRICE_PROXY",
+                source_type="HISTORICAL",
+                snapshot_id=f"{SYNTHETIC_LABEL}:catalog:gapped-v1",
+                metadata=metadata,
+            )
+            attestation = store.verify_dataset_integrity_attestation(
+                DATASET_ID,
+                "gapped-v1",
+                force=True,
+            )
+            self.assertEqual(attestation["status"], "STALE")
+            self.assertEqual(attestation["reason"], "INCOMPLETE_DATASET")
+            processor = AutonomousResearchProcessor(store, clock=lambda: T0)
+            with self.assertRaises(AutonomousResearchError) as raised:
+                processor.start_polymarket_campaign(
+                    "gapped-campaign",
+                    dataset_id=DATASET_ID,
+                    dataset_version="gapped-v1",
+                    now=T0,
+                )
+            self.assertEqual(raised.exception.reason, "SOFTWARE_OR_INPUT_ERROR")
+            self.assertEqual(processor.bus.list_campaign_trials("gapped-campaign"), ())
+
     def test_campaign_start_deduplicates_prior_multi_parameter_plan(self) -> None:
         with AxiomStore(":memory:") as store:
             _save_catalog_attested_dataset(
@@ -545,6 +599,44 @@ class AutonomousCampaignAcceptanceTests(unittest.TestCase):
             )
             self.assertEqual(persisted_rows[0]["fixture_label"], SYNTHETIC_LABEL)
             self.assertTrue(persisted_rows[0]["synthetic"])
+
+    def test_reassessment_rejects_initial_boundary_attestation_identity(self) -> None:
+        with AxiomStore(":memory:") as store:
+            initial_attestation = _save_attested_dataset(store, "initial-v1", midpoint=0.50)
+            processor = AutonomousResearchProcessor(store, clock=lambda: T0)
+            campaign_id = "unchanged-evidence-campaign"
+            processor.start_polymarket_campaign(
+                campaign_id,
+                dataset_id=DATASET_ID,
+                dataset_version="initial-v1",
+                now=T0,
+            )
+            first_trial = processor.bus.list_campaign_trials(campaign_id, limit=10)[0]
+            processor._advance_campaign_after_result(
+                first_trial,
+                {
+                    "accepted": False,
+                    "reason_code": "INSUFFICIENT_DATA",
+                    "candidate_id": "unchanged-evidence-candidate",
+                },
+                now=T0 + timedelta(minutes=1),
+            )
+            before = processor.campaign_state(campaign_id)
+            self.assertEqual(before["status"], "WAITING_FOR_DATA")
+            self.assertEqual(before["reassessment_count"], 0)
+            queue_before = len(processor.bus.list_campaign_trials(campaign_id, limit=100))
+
+            after = processor.reassess_campaign(
+                campaign_id,
+                evidence_identity=str(initial_attestation["attestation_hash"]),
+                now=T0 + timedelta(minutes=2),
+            )
+            self.assertEqual(after["reassessment_count"], 0)
+            self.assertEqual(after["last_evidence_identity"], initial_attestation["attestation_hash"])
+            self.assertEqual(
+                len(processor.bus.list_campaign_trials(campaign_id, limit=100)),
+                queue_before,
+            )
 
     def test_final_assessment_rejects_zero_trades_with_sufficient_observations(self) -> None:
         campaign_grid = (

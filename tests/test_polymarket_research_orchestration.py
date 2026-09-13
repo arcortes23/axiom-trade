@@ -1044,6 +1044,49 @@ class PolymarketResearchOrchestrationTests(unittest.TestCase):
             )
             self.assertEqual(cycle.results[0]["reason_code"], "INSUFFICIENT_DATA")
 
+    def test_generated_queue_rejects_catalog_with_explicit_missing_ranges(self) -> None:
+        with AxiomStore(":memory:") as store:
+            _seed_predeclared_historical_dataset(store)
+            store.connection.execute(
+                "UPDATE dataset_catalog SET missing_ranges_json=? "
+                "WHERE dataset_id=? AND dataset_version=?",
+                (
+                    json.dumps([{"start": T0.isoformat(), "end": T0.isoformat()}]),
+                    "Polymarket-historical",
+                    "history-v1",
+                ),
+            )
+            store.connection.commit()
+            processor = AutonomousResearchProcessor(
+                store,
+                config=AutonomousResearchConfig(max_items_per_cycle=1),
+                clock=lambda: T0,
+            )
+            proposal = _legacy_prediction_predecessor(candidate_id="gapped-generated-proposal")
+            for field in ("source", "tests", "time_split", "paper_only", "candidate_id", "frozen_hash"):
+                proposal.pop(field, None)
+            proposal["dataset_version"] = "history-v1"
+            queued = processor.enqueue_predeclared_starting_set(
+                proposal,
+                strategies=(
+                    {"template": "momentum", "parameters": {"lookback": (1,), "threshold": (0.05,)}},
+                ),
+                available_at=T0,
+            )
+            self.assertEqual(len(queued), 1)
+
+            cycle = processor.process_pending(now=T0)
+            self.assertEqual(cycle.claimed, 1)
+            self.assertEqual(cycle.rejected, 1)
+            self.assertEqual(cycle.failed, 0)
+            result = cycle.results[0]
+            self.assertFalse(result["accepted"])
+            self.assertIn(
+                result["reason_code"],
+                {"DATASET_PROVENANCE_INVALID", "DATASET_ATTESTATION_STALE"},
+            )
+            self.assertNotIn("candidate_results", result)
+
     def test_sparse_predeclared_generated_payload_normalizes_before_marker(self) -> None:
         with AxiomStore(":memory:") as store:
             _seed_predeclared_historical_dataset(store)

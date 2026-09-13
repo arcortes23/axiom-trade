@@ -891,6 +891,10 @@ class AxiomStore:
                     "ELSE COALESCE(NULLIF(upper(source_type), ''), 'FORWARD_COLLECTED') END"
                 )
             self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_research_queue_updated "
+                "ON research_queue(updated_at DESC, created_at DESC, item_id DESC)"
+            )
+            self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_polymarket_markets_source_observed "
                 "ON polymarket_markets(source_type, observed_at, market_id)"
             )
@@ -4359,6 +4363,8 @@ class AxiomStore:
             reasons.append("ROW_COUNT_MISMATCH")
         if completeness < 1.0:
             reasons.append("INCOMPLETE_DATASET")
+        if catalog.get("missing_ranges"):
+            reasons.append("INCOMPLETE_DATASET")
         if expected_count and (start is None or end is None or observed_start != start or observed_end != end):
             reasons.append("BOUNDS_MISMATCH")
         if contaminated:
@@ -7452,10 +7458,16 @@ class AxiomStore:
         *,
         status: str | None = None,
         limit: int = 50,
+        _order_by: str = "priority DESC,created_at ASC,item_id ASC",
     ) -> list[dict[str, Any]]:
         """Project queue rows without materializing their JSON documents."""
         if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
             raise ValueError("limit must be a non-negative integer")
+        if _order_by not in {
+            "priority DESC,created_at ASC,item_id ASC",
+            "updated_at DESC,created_at DESC,item_id DESC",
+        }:
+            raise ValueError("unsupported research queue dashboard ordering")
         clauses = ""
         values: list[Any] = []
         if status is not None:
@@ -7532,7 +7544,7 @@ class AxiomStore:
             "CASE WHEN json_valid(result_json) THEN result_json ELSE '{}' END,"
             "'$.candidate_results') WHERE key<50),'[]') AS candidate_results_json "
             "FROM research_queue"
-            f"{clauses} ORDER BY priority DESC,created_at,item_id LIMIT ?"
+            f"{clauses} ORDER BY {_order_by} LIMIT ?"
         )
         values.append(int(limit))
         with self._lock:
@@ -7603,6 +7615,13 @@ class AxiomStore:
                 }
             )
         return result
+    def get_latest_research_item_dashboard(self) -> dict[str, Any] | None:
+        """Project the single most recently updated queue item for overview reads."""
+        rows = self.list_research_items_dashboard(
+            limit=1,
+            _order_by="updated_at DESC,created_at DESC,item_id DESC",
+        )
+        return rows[0] if rows else None
 
 
     def research_queue_stats(self) -> dict[str, int]:
@@ -11882,8 +11901,7 @@ class AxiomStore:
                     "market_id": row["market_id"],
                 }
             )
-        latest_queue_rows = self.list_research_items_dashboard(limit=1)
-        latest_queue = latest_queue_rows[0] if latest_queue_rows else None
+        latest_queue = self.get_latest_research_item_dashboard()
         return {
             "counts": counts,
             "catalog": catalog,

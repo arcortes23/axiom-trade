@@ -4205,7 +4205,19 @@ class DashboardData:
             if callable(queue_method)
             else records("list_research_items", limit=_RESEARCH_PROGRESS_LIMIT)
         )
-        latest_queue = aggregate.get("latest_queue_item")
+        latest_loader = getattr(self.store, "get_latest_research_item_dashboard", None)
+        if callable(latest_loader):
+            try:
+                latest_candidate = latest_loader()
+            except (AttributeError, TypeError, ValueError, sqlite3.Error):
+                latest_candidate = None
+            latest_queue = (
+                latest_candidate
+                if isinstance(latest_candidate, Mapping)
+                else None
+            )
+        else:
+            latest_queue = aggregate.get("latest_queue_item")
         if isinstance(latest_queue, Mapping):
             latest_id = text(latest_queue.get("item_id"))
             if latest_id and not any(text(item.get("item_id")) == latest_id for item in queue_items):

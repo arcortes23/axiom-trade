@@ -1325,6 +1325,9 @@ class AutonomousResearchProcessor:
             state["dataset_id"] = boundary.get("dataset_id")
         if "dataset_version" not in state:
             state["dataset_version"] = boundary.get("dataset_version")
+        if "last_evidence_identity" not in state:
+            initial_identity = str(boundary.get("attestation_hash", "")).strip()
+            state["last_evidence_identity"] = initial_identity or None
         if "budget_limit" not in state:
             state["budget_limit"] = protocol.get("budget_limit", CAMPAIGN_BUDGET_LIMIT)
         if "budget_used" not in state:
@@ -1511,6 +1514,11 @@ class AutonomousResearchProcessor:
                 "campaign queue protocol hash does not match the durable protocol",
             )
         boundary = self._campaign_trial_boundary(payload, protocol, trial)
+        if boundary.get("missing_ranges"):
+            raise AutonomousResearchError(
+                "CAMPAIGN_PROTOCOL_INVALID",
+                "campaign trial boundary contains explicit missing dataset ranges",
+            )
         expected_digest = str(
             boundary.get("ordered_row_manifest_digest", boundary.get("content_hash", ""))
         ).strip()
@@ -1697,6 +1705,13 @@ class AutonomousResearchProcessor:
                 return None
             protocol, protocol_hash = self._campaign_protocol_state(payload)
             plan = self._campaign_queue_plan(payload, next_trial)
+            boundary = self._campaign_trial_boundary(payload, protocol, next_trial)
+            self._validate_campaign_dataset_provenance(
+                str(boundary.get("dataset_id", "")).strip(),
+                str(boundary.get("dataset_version", "")).strip(),
+                boundary=boundary,
+                plan=plan,
+            )
             campaign_trial_id = str(next_trial.get("trial_id", "")).strip()
             queue_payload = {
                 "proposal_id": plan.hypothesis_id,
@@ -1984,6 +1999,7 @@ class AutonomousResearchProcessor:
             "protocol": protocol,
             "protocol_hash": protocol_hash,
             "reassessment_boundaries": {},
+            "last_evidence_identity": str(attestation.get("attestation_hash", "")).strip() or None,
             "base_proposal": source,
             "dataset_id": resolved_dataset_id,
             "dataset_version": resolved_dataset_version,
@@ -2466,7 +2482,17 @@ class AutonomousResearchProcessor:
         identity = str(evidence_identity).strip()
         if not identity:
             raise ValueError("evidence_identity is required")
-        previous_identity = str(payload.get("last_evidence_identity", "")).strip() or None
+        boundary = protocol.get("dataset_boundary")
+        boundary_identity = (
+            str(boundary.get("attestation_hash", "")).strip()
+            if isinstance(boundary, Mapping)
+            else ""
+        )
+        previous_identity = (
+            str(payload.get("last_evidence_identity", "")).strip()
+            or boundary_identity
+            or None
+        )
         if identity == previous_identity or int(payload.get("reassessment_count", 0)) >= 1:
             return payload
         waiting = [
@@ -5747,6 +5773,8 @@ class AutonomousResearchProcessor:
         catalog_version = str(catalog.get("dataset_version", catalog.get("version", ""))).strip()
         if catalog_id != identifier or catalog_version != version:
             invalid("campaign dataset catalog identity does not match its frozen boundary")
+        if catalog.get("missing_ranges"):
+            invalid("campaign dataset catalog contains explicit missing ranges")
         if str(catalog.get("market_type", "")).strip().lower() != MarketType.PREDICTION.value:
             invalid("campaign dataset catalog market_type is not prediction")
         catalog_source_type = str(catalog.get("source_type", "")).strip().upper()
@@ -5758,6 +5786,11 @@ class AutonomousResearchProcessor:
         catalog_instrument = str(catalog.get("instrument", "")).strip().upper()
         if catalog_instrument != "POLYMARKET":
             invalid("campaign dataset catalog instrument is not POLYMARKET")
+        if catalog.get("missing_ranges"):
+            raise AutonomousResearchError(
+                "DATASET_PROVENANCE_INVALID",
+                "persisted dataset catalog contains explicit missing ranges",
+            )
         metadata = catalog.get("metadata")
         metadata = metadata if isinstance(metadata, Mapping) else {}
         metadata_source_type = str(metadata.get("source_type", "")).strip().upper()

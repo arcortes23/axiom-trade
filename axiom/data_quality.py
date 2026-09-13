@@ -54,6 +54,8 @@ def _catalog_provenance_complete(catalog: Mapping[str, Any]) -> bool:
         return False
     if row_count <= 0 or not 0.0 <= completeness <= 1.0 or completeness < 1.0:
         return False
+    if catalog.get("missing_ranges"):
+        return False
     if not _nonempty(catalog.get("start_timestamp")) or not _nonempty(catalog.get("end_timestamp")):
         return False
     metadata = catalog.get("metadata")
