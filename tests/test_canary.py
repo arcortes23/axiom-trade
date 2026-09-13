@@ -279,6 +279,8 @@ class CanaryTests(unittest.TestCase):
         self._production_profile.start()
         self.addCleanup(self._production_profile.stop)
         self.store=HealthyStore(":memory:")
+        # Legacy worker coverage bypasses rolling selection; rolling acceptance has dedicated tests.
+        self.store.load_current_portfolio_selection = None
         self.store.save_dataset(
             "prediction-history",
             "v1",
@@ -2574,7 +2576,9 @@ class CanaryTests(unittest.TestCase):
         credentials = RotatingCredentials()
         self.service.credentials = credentials
         self.arm()
-        expected = self.service.require_current_credential_binding()
+
+        def rotate_before_post():
+            credentials.removed = True
 
         class SDKClient:
             def __init__(self):
@@ -2585,10 +2589,12 @@ class CanaryTests(unittest.TestCase):
                 return {"maker_amount": "1000000"}
 
             def get_balance_allowance(self, **kwargs):
-                return {
+                result = {
                     "balance": "2500000",
                     "allowances": {"0xexchange-v3": "1000000"},
                 }
+                rotate_before_post()
+                return result
 
             def post_order(self, signed):
                 self.post_calls.append(signed)
@@ -2605,28 +2611,54 @@ class CanaryTests(unittest.TestCase):
                 return client
 
         sdk = SimpleNamespace(ApiKeyCreds=FakeApiKeyCreds, SecureClient=SecureClient)
-
-        def rotate_before_post():
-            credentials.removed = True
-
+        context = {
+            "asset_id": "position-yes",
+            "token_id": "yes",
+            "position_id": "position-yes",
+            "market_version": "v2",
+            "outcome_index": 0,
+            "identity_bindings": [
+                {
+                    "index": 0,
+                    "outcome": "yes",
+                    "token_id": "yes",
+                    "position_id": "position-yes",
+                }
+            ],
+            "neg_risk": False,
+            "accepting_orders": True,
+            "min_order_size": "1",
+            "tick_size": "0.01",
+            "bids": [{"price": "0.49", "size": "100"}],
+            "asks": [{"price": "0.50", "size": "100"}],
+            "fee_bps": "0",
+        }
+        venue = PolymarketClobV2Venue()
         with patch.dict(sys.modules, {"polymarket": sdk}), patch.object(
             PolymarketClobV2Venue,
             "installed_sdk_version",
             return_value="0.9.0",
+        ), patch.object(
+            PolymarketClobV2Venue,
+            "geoblock",
+            return_value={"blocked": False, "close_only": False},
+        ), patch.object(
+            PolymarketClobV2Venue,
+            "market_context",
+            return_value=context,
+        ), patch.object(
+            PolymarketClobV2Venue,
+            "balance",
+            return_value=Decimal("10"),
         ):
             with self.assertRaisesRegex(CanaryBlocked, "CREDENTIALS_NOT_CONFIGURED"):
-                self.service.submit_position_order(
-                    market_version="v2",
-                    neg_risk=False,
-                    asset_id="position-yes",
-                    side="BUY",
-                    price=Decimal("0.50"),
-                    size=Decimal("1"),
-                    expected_credential_fingerprint=expected,
-                    before_post=rotate_before_post,
-                    on_send_started=lambda: None,
+                self.submit(
+                    "shared-signed-post",
+                    venue=venue,
+                    allow_test_venue=False,
                 )
 
+        self.assertTrue(credentials.removed)
         self.assertEqual(client.post_calls, [])
 
     def test_official_trade_settlement_status_is_preserved(self):

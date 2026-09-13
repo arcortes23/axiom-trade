@@ -38,6 +38,14 @@ _PRIVATE_FORWARD_TOKENS = frozenset(
     }
 )
 
+COMMON_PAPER_ASSUMPTIONS: Mapping[str, Any] = {
+    "version": "paper-assumptions-v1",
+    "currency": "USD",
+    "sizing": {"model": "fixed_allocated_capital", "allocated_capital": "100"},
+    "fees": {"model": "proportional", "fee_bps": "10"},
+    "slippage": {"model": "proportional", "slippage_bps": "5"},
+}
+
 
 def _validate_private_fields(value: Any, *, path: str = "value", depth: int = 0) -> None:
     if depth > 8:
@@ -65,6 +73,17 @@ def _validate_forward_config(config: Mapping[str, Any]) -> None:
     public: dict[str, Any] = {}
     for key, value in config.items():
         normalized = str(key).replace("-", "_").lower()
+        if normalized in {
+            "strategy_version_id",
+            "research_trial_id",
+            "portfolio_selection_id",
+            "admission_policy_id",
+            "admission_policy_version",
+            "risk_config_id",
+            "risk_config_generation",
+            "risk_config_hash",
+        }:
+            continue
         if normalized in {"live", "live_execution"}:
             if value is not None and (not isinstance(value, bool) or value):
                 raise ValueError("forward tests are paper-only")
@@ -102,6 +121,27 @@ def _canonical_scope_config(config: Mapping[str, Any]) -> dict[str, Any]:
         result[field] = expected
     result["market_scope"] = policy.as_dict()
     return result
+def _canonical_forward_config(config: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """Return the immutable paper config that a new forward test will carry.
+
+    This is intentionally separate from ``ForwardTestSpec`` loading.  Existing
+    persisted records may predate paper assumptions and must remain readable
+    without being rewritten during a migration.  New registrations use this
+    deterministic, idempotent representation before deriving any identity
+    hashes.
+    """
+    result = dict(config or {})
+    supplied_assumptions = result.get("paper_assumptions")
+    merged_assumptions = dict(COMMON_PAPER_ASSUMPTIONS)
+    if isinstance(supplied_assumptions, Mapping):
+        for key, value in supplied_assumptions.items():
+            if isinstance(value, Mapping) and isinstance(merged_assumptions.get(key), Mapping):
+                merged_assumptions[key] = {**dict(merged_assumptions[key]), **dict(value)}
+            else:
+                merged_assumptions[key] = value
+    result["paper_assumptions"] = merged_assumptions
+    return _canonical_scope_config(result)
+
 
 
 def _scope_allowed_markets(config: Mapping[str, Any]) -> tuple[str, ...] | None:
@@ -203,6 +243,14 @@ class ForwardTestRegistry:
         allowed_markets: Sequence[str] = (),
         risk_limits: Mapping[str, Any] | None = None,
         experiment_id: str | None = None,
+        strategy_version_id: str | None = None,
+        research_trial_id: str | None = None,
+        portfolio_selection_id: str | None = None,
+        admission_policy_id: str | None = None,
+        admission_policy_version: str | None = None,
+        risk_config_id: str | None = None,
+        risk_config_generation: int | None = None,
+        risk_config_hash: str | None = None,
     ) -> ForwardTestSpec:
         config_document = config.get("strategy_document") if isinstance(config, Mapping) else None
         config_model_document = config.get("model_document") if isinstance(config, Mapping) else None
@@ -215,12 +263,28 @@ class ForwardTestRegistry:
         model_value = config_model_document if isinstance(config_model_document, Mapping) else model_source
         strategy_hash = _content_hash(_normalized_strategy_document(strategy_value))
         model_hash = _content_hash(model_value)
+        config_record = dict(config or {})
+        lineage = {
+            "strategy_version_id": strategy_version_id,
+            "research_trial_id": research_trial_id,
+            "portfolio_selection_id": portfolio_selection_id,
+            "admission_policy_id": admission_policy_id,
+            "admission_policy_version": admission_policy_version,
+            "risk_config_id": risk_config_id,
+            "risk_config_generation": risk_config_generation,
+            "risk_config_hash": risk_config_hash,
+        }
+        for key, value in lineage.items():
+            if value is not None:
+                config_record.setdefault(key, value)
+        config_record = _canonical_forward_config(config_record)
+        _validate_forward_config(config_record)
         start = ensure_utc(start_timestamp or utc_now())
         normalized_markets = tuple(dict.fromkeys(str(item).strip() for item in allowed_markets if str(item).strip()))
         payload = {
             "strategy_hash": strategy_hash,
             "model_hash": model_hash,
-            "config": dict(config or {}),
+            "config": config_record,
             "start_timestamp": start.isoformat(),
             "registration_timestamp": start.isoformat(),
             "bankroll": float(bankroll),
@@ -239,6 +303,7 @@ class ForwardTestRegistry:
             self.store.save_forward_test(identifier, spec.as_record())
         self._specs[identifier] = spec
         return spec
+
     def register_forward_test(
         self,
         *,
@@ -251,6 +316,14 @@ class ForwardTestRegistry:
         allowed_markets: Sequence[str] = (),
         risk_limits: Mapping[str, Any] | None = None,
         experiment_id: str | None = None,
+        strategy_version_id: str | None = None,
+        research_trial_id: str | None = None,
+        portfolio_selection_id: str | None = None,
+        admission_policy_id: str | None = None,
+        admission_policy_version: str | None = None,
+        risk_config_id: str | None = None,
+        risk_config_generation: int | None = None,
+        risk_config_hash: str | None = None,
     ) -> ForwardTestSpec:
         """Register a genuinely forward test; historical starts are rejected."""
         current = ensure_utc(now or utc_now())
@@ -266,6 +339,14 @@ class ForwardTestRegistry:
             allowed_markets=allowed_markets,
             risk_limits=risk_limits,
             experiment_id=experiment_id,
+            strategy_version_id=strategy_version_id,
+            research_trial_id=research_trial_id,
+            portfolio_selection_id=portfolio_selection_id,
+            admission_policy_id=admission_policy_id,
+            admission_policy_version=admission_policy_version,
+            risk_config_id=risk_config_id,
+            risk_config_generation=risk_config_generation,
+            risk_config_hash=risk_config_hash,
         )
 
     def register_observation_intent(
@@ -447,4 +528,4 @@ def _plain(value: Any) -> Any:
     return json.loads(_canonical(value))
 
 
-__all__ = ["ForwardTestRegistry", "ForwardTestSpec"]
+__all__ = ["COMMON_PAPER_ASSUMPTIONS", "ForwardTestRegistry", "ForwardTestSpec"]

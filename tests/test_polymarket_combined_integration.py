@@ -106,6 +106,8 @@ class _PositionCanaryVenue:
             "neg_risk": False,
             "accepting_orders": True,
             "min_order_size": "0.01",
+            "size_increment": "0.01",
+            "min_notional": "0.001",
             "tick_size": "0.01",
             "fee_bps": "10",
             "bids": [{"price": "0.22", "size": "100"}],
@@ -477,7 +479,7 @@ def _seed_market(
 
 
 class PolymarketCombinedIntegrationTests(unittest.TestCase):
-    def _store(self):
+    def _store(self, *, legacy_worker: bool = False):
         directory = tempfile.TemporaryDirectory()
         try:
             store = AxiomStore(str(Path(directory.name) / "combined.sqlite"))
@@ -485,6 +487,9 @@ class PolymarketCombinedIntegrationTests(unittest.TestCase):
             directory.cleanup()
             raise
 
+        if legacy_worker:
+            # Legacy workers bypass rolling selection; rolling acceptance covers it.
+            store.load_current_portfolio_selection = None
         def cleanup() -> None:
             try:
                 store.close()
@@ -534,7 +539,7 @@ class PolymarketCombinedIntegrationTests(unittest.TestCase):
         self.assertEqual(_NoCredentialProbe.forbidden_calls, [])
 
     def test_worker_scans_eligible_candidates_without_persisted_ranking(self):
-        store = self._store()
+        store = self._store(legacy_worker=True)
         _historical_dataset(store)
         service = CanaryService(
             store,
@@ -626,7 +631,7 @@ class PolymarketCombinedIntegrationTests(unittest.TestCase):
         self.assertEqual(checked_count, worker._SCAN_CAP)
 
     def test_worker_surfaces_missing_executable_authority_after_binding_fence(self):
-        store = self._store()
+        store = self._store(legacy_worker=True)
         _historical_dataset(store)
         service = CanaryService(
             store,
@@ -948,9 +953,9 @@ class PolymarketCombinedIntegrationTests(unittest.TestCase):
             "WHERE event_id=?",
             (second_event["event_id"],),
         ).fetchone()
-        self.assertEqual(full_reservation["status"], "RELEASED")
+        self.assertEqual(full_reservation["status"], "FILLED")
         self.assertEqual(Decimal(full_reservation["remaining_cost"]), Decimal("0"))
-        self.assertIsNotNone(full_reservation["released_at"])
+        self.assertIsNone(full_reservation["released_at"])
         dashboard = DashboardData(store=store, control=service)
         canary_projection = dashboard.canary_data()
         self.assertGreaterEqual(

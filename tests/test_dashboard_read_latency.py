@@ -1128,6 +1128,10 @@ class LargeVersionCanaryReadLatencyTests(unittest.TestCase):
             return error.code, payload, body
 
     def test_warm_storage_only_canary_stays_below_two_seconds_at_history_scale(self) -> None:
+        expected_unresolved = [
+            f"candidate-validation-{index:02d}"
+            for index in range(LARGE_CANDIDATE_COUNT)
+        ]
         status, payload, _body = self._request("api/v2/canary")
         self.assertEqual(status, 200)
         self.assertIsInstance(payload, dict)
@@ -1135,9 +1139,9 @@ class LargeVersionCanaryReadLatencyTests(unittest.TestCase):
         first_evidence = payload["forward_evidence"]
         self.assertEqual(first_evidence["candidate_bound_markets"], [])
         self.assertEqual(first_evidence["required_market_count"], 0)
-        self.assertEqual(first_evidence["unresolved_candidates"], [])
-        self.assertEqual(first_evidence["reason_code"], "NO_PERSISTED_SCOPE_RESOLUTION")
-        self.assertEqual(first_evidence["reason_display"], "NO_PERSISTED_SCOPE_RESOLUTION")
+        self.assertEqual(first_evidence["unresolved_candidates"], expected_unresolved)
+        self.assertEqual(first_evidence["reason_code"], "CANDIDATE_FORWARD_MARKET_UNRESOLVED")
+        self.assertEqual(first_evidence["reason_display"], "CANDIDATE_FORWARD_MARKET_UNRESOLVED")
 
         started = time.perf_counter()
         status, payload, _body = self._request("api/v2/canary")
@@ -1150,9 +1154,9 @@ class LargeVersionCanaryReadLatencyTests(unittest.TestCase):
         evidence = payload["forward_evidence"]
         self.assertEqual(evidence["candidate_bound_markets"], [])
         self.assertEqual(evidence["required_market_count"], 0)
-        self.assertEqual(evidence["reason_code"], "NO_PERSISTED_SCOPE_RESOLUTION")
-        self.assertEqual(evidence["unresolved_candidates"], [])
-        self.assertEqual(evidence["reason_display"], "NO_PERSISTED_SCOPE_RESOLUTION")
+        self.assertEqual(evidence["reason_code"], "CANDIDATE_FORWARD_MARKET_UNRESOLVED")
+        self.assertEqual(evidence["unresolved_candidates"], expected_unresolved)
+        self.assertEqual(evidence["reason_display"], "CANDIDATE_FORWARD_MARKET_UNRESOLVED")
         self.assertEqual(evidence["market_diagnostics"], [])
 
 

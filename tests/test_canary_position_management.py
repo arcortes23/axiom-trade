@@ -91,6 +91,8 @@ class OfflineOfficialVenue:
             "neg_risk": False,
             "accepting_orders": True,
             "min_order_size": "0.1",
+            "size_increment": "0.01",
+            "min_notional": "0.01",
             "fee_bps": "10",
             "best_bid": "0.49",
         }
@@ -154,7 +156,7 @@ class OfflineOfficialVenue:
         return rows
 
     def submit_limit_order(self, **kwargs: object) -> dict[str, object]:
-        raise AssertionError("production exits must use CanaryService.submit_position_order")
+        raise AssertionError("production exits must use CanaryService._submit_position_order")
 
 
 class CanaryPositionManagementTests(unittest.TestCase):
@@ -185,7 +187,7 @@ class CanaryPositionManagementTests(unittest.TestCase):
         self._seed_owned_position()
         self.post_calls: list[dict[str, object]] = []
         self.next_order_id = "exit-1"
-        self.service.submit_position_order = Mock(side_effect=self._shared_position_submit)
+        self.service._submit_position_order = Mock(side_effect=self._shared_position_submit)
 
     def tearDown(self) -> None:
         self._venue_type_patch.stop()
@@ -556,6 +558,54 @@ class CanaryPositionManagementTests(unittest.TestCase):
                     "equity_status",
                 ):
                     self.assertEqual(after[key], before[key], msg=f"value={value}")
+    def test_exit_price_preflight_precedes_market_rule_validation(self) -> None:
+        context = self.venue.market_context("market-1", "token-yes")
+        for value in (None, "", "-1", "NaN"):
+            with self.subTest(value=value):
+                invalid_context = {
+                    **context,
+                    "best_bid": value,
+                    "size_increment": None,
+                }
+                with patch.object(
+                    self.venue,
+                    "market_context",
+                    return_value=invalid_context,
+                ):
+                    with self.assertRaisesRegex(
+                        CanaryBlocked,
+                        "CANARY_EXIT_PRICE_UNAVAILABLE",
+                    ):
+                        self._submit_exit()
+                self.assertEqual(self.post_calls, [])
+                self.assertEqual(
+                    self.store.connection.execute(
+                        "SELECT COUNT(*) FROM canary_position_requests "
+                        "WHERE side='SELL'"
+                    ).fetchone()[0],
+                    0,
+                )
+                self.assertEqual(
+                    self.store.connection.execute(
+                        "SELECT COUNT(*) FROM canary_risk_reservations "
+                        "WHERE side='SELL'"
+                    ).fetchone()[0],
+                    0,
+                )
+
+    def test_exit_rejects_missing_or_malformed_market_rules_before_reservation(
+        self,
+    ) -> None:
+        context = self.venue.market_context("market-1", "token-yes")
+        invalid_values = (None, "", "0", "-1", "NaN", "Infinity", False, [], {})
+        for field in ("min_order_size", "size_increment", "min_notional"):
+            for value in invalid_values:
+                with self.subTest(field=field, value=value):
+                    self._assert_exit_context_blocked(
+                        {**context, field: value},
+                        "CANARY_EXIT_MARKET_RULES_UNAVAILABLE",
+                    )
+
 
     def test_boundary_adjacent_book_prices_are_valid_for_marks(self) -> None:
         context = self.venue.market_context("market-1", "token-yes")
@@ -657,7 +707,7 @@ class CanaryPositionManagementTests(unittest.TestCase):
     def test_valid_v1_exit_uses_lot_token_asset(self) -> None:
         submitted = self._submit_exit()
         self.assertEqual(submitted["status"], "SUBMITTED")
-        call = self.service.submit_position_order.call_args.kwargs
+        call = self.service._submit_position_order.call_args.kwargs
         self.assertEqual(call["market_version"], "v1")
         self.assertEqual(call["asset_id"], "token-yes")
 
@@ -710,7 +760,7 @@ class CanaryPositionManagementTests(unittest.TestCase):
             )
         submitted = self._submit_exit()
         self.assertEqual(submitted["status"], "SUBMITTED")
-        call = self.service.submit_position_order.call_args.kwargs
+        call = self.service._submit_position_order.call_args.kwargs
         self.assertEqual(call["market_version"], "v2")
         self.assertEqual(call["asset_id"], "position-yes")
     def test_v2_buy_evidence_sync_preserves_lot_token_for_sell(self) -> None:
@@ -1236,7 +1286,7 @@ class CanaryPositionManagementTests(unittest.TestCase):
             on_send_started()
             return {"ok": True, "order_id": "exit-delayed", "status": "delayed"}
 
-        self.service.submit_position_order = Mock(side_effect=delayed_submit)
+        self.service._submit_position_order = Mock(side_effect=delayed_submit)
         submitted = self._submit_exit()
         self.assertEqual(submitted["status"], "SUBMITTED")
         self.assertEqual(submitted["order_id"], "exit-delayed")
@@ -1598,7 +1648,7 @@ class CanaryPositionManagementTests(unittest.TestCase):
         self.venue.trades = []
         retry = self._submit_exit()
         self.assertEqual(retry["order_id"], "exit-2")
-        self.assertEqual(self.service.submit_position_order.call_count, 2)
+        self.assertEqual(self.service._submit_position_order.call_count, 2)
 
     def test_authoritative_partial_settlement_releases_remainder_with_exact_open_basis(self) -> None:
         self.venue.order_status = "MATCHED"
@@ -1845,7 +1895,7 @@ class CanaryPositionManagementTests(unittest.TestCase):
         self.service.disarm()
         with self.assertRaisesRegex(CanaryBlocked, "CANARY_NOT_ARMED"):
             self._submit_exit()
-        self.service.submit_position_order.assert_not_called()
+        self.service._submit_position_order.assert_not_called()
         self.assertEqual(
             self.store.connection.execute(
                 "SELECT COUNT(*) FROM canary_risk_reservations WHERE side='SELL'"
@@ -1891,7 +1941,7 @@ class CanaryPositionManagementTests(unittest.TestCase):
             self.assertTrue(entered_transport.wait(1))
             raise TimeoutError("canary external submission timed out")
 
-        self.service.submit_position_order.side_effect = blocking_submit
+        self.service._submit_position_order.side_effect = blocking_submit
         try:
             with patch.object(
                 position_module,
@@ -1940,7 +1990,7 @@ class CanaryPositionManagementTests(unittest.TestCase):
         second = position_module.reconcile_pending(restarted, self.venue)
         self.assertEqual(second["status"], "RECONCILED")
         self.assertEqual(self._request()["status"], "MATCHED")
-        self.assertEqual(self.service.submit_position_order.call_count, 1)
+        self.assertEqual(self.service._submit_position_order.call_count, 1)
         self.assertEqual(
             self.store.connection.execute(
                 "SELECT COUNT(*) FROM canary_position_fills WHERE fill_id='stable-fill'"

@@ -2344,11 +2344,18 @@ class DashboardAndCliShapeTests(unittest.TestCase):
 
         for payload in (overview, canary):
             evidence = payload["forward_evidence"]
-            self.assertEqual(evidence["candidate_bound_markets"], ["required-market"])
-            self.assertEqual(evidence["reason_display"], health["reason_code"])
-            self.assertEqual(evidence["fresh"], ["required-market"])
-            self.assertEqual(evidence["grade"], "A")
-            self.assertEqual(evidence["reason_code"], "REQUIRED_MARKETS_FRESH")
+            self.assertEqual(evidence["candidate_bound_markets"], [])
+            self.assertEqual(evidence["scheduled"], [])
+            self.assertEqual(evidence["fresh"], [])
+            self.assertEqual(evidence["stale"], [])
+            self.assertEqual(evidence["missing"], [])
+            self.assertEqual(evidence["candidate_references"], {})
+            self.assertEqual(evidence["market_diagnostics"], [])
+            self.assertEqual(evidence["required_market_count"], 0)
+            self.assertEqual(evidence["reason_display"], "CANDIDATE_FORWARD_MARKET_UNRESOLVED")
+            self.assertEqual(evidence["unresolved_candidates"], [])
+            self.assertEqual(evidence["grade"], "D")
+            self.assertEqual(evidence["reason_code"], "CANDIDATE_FORWARD_MARKET_UNRESOLVED")
             for timestamp_key in (
                 "newest_required_source_timestamp",
                 "oldest_required_source_timestamp",
@@ -2356,10 +2363,6 @@ class DashboardAndCliShapeTests(unittest.TestCase):
                 "oldest_required_observed_at",
             ):
                 self.assertEqual(evidence[timestamp_key], health[timestamp_key])
-            self.assertEqual(
-                evidence["market_diagnostics"][0]["candidate_references"],
-                ["candidate-dashboard"],
-            )
 
     def test_cli_parser_has_required_readiness_commands_and_argument_shapes(self) -> None:
         parser = build_parser()

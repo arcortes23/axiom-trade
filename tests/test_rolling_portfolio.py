@@ -33,6 +33,7 @@ def _strategy(strategy_version_id: str = "sv-alpha", **overrides: object) -> dic
         "version": "1",
         "strategy_hash": f"sha256:{strategy_version_id}",
         "config_hash": f"config:{strategy_version_id}",
+        "candidate_id": f"candidate-{strategy_version_id}",
         "created_at": NOW.isoformat(),
         "payload": {"family": "mean-reversion", "parameters": {"lookback": 7}},
     }
@@ -42,12 +43,13 @@ def _strategy(strategy_version_id: str = "sv-alpha", **overrides: object) -> dic
 
 def _trial(
     strategy_version_id: str = "sv-alpha",
-    research_trial_id: str = "trial-alpha-1",
+    research_trial_id: str | None = None,
     **overrides: object,
 ) -> dict[str, object]:
     record: dict[str, object] = {
-        "research_trial_id": research_trial_id,
+        "research_trial_id": research_trial_id or f"trial-{strategy_version_id}",
         "strategy_version_id": strategy_version_id,
+        "candidate_id": f"candidate-{strategy_version_id}",
         "trial_kind": "ROLLING_RESEARCH",
         "status": "COMPLETED",
         "started_at": (NOW - timedelta(days=8)).isoformat(),
@@ -80,6 +82,17 @@ def _policy(policy_id: str = "rolling-default", **overrides: object) -> RollingA
     values.update(overrides)
     return RollingAdmissionPolicy.from_mapping(values)
 
+def _canonicalize_evidence(record: dict[str, object]) -> dict[str, object]:
+    canonical = dict(record)
+    canonical.pop("evidence_digest", None)
+    canonical.pop("digest", None)
+    if isinstance(canonical.get("execution_feasibility"), bool):
+        canonical["execution_feasibility"] = str(canonical["execution_feasibility"])
+    canonical["evidence_digest"] = RollingEvidence.from_mapping(canonical).evidence_digest
+    return canonical
+
+
+
 
 def _evidence(
     strategy_version_id: str = "sv-alpha",
@@ -98,11 +111,16 @@ def _evidence(
     record: dict[str, object] = {
         "strategy_version_id": strategy_version_id,
         "evidence_window_id": evidence_window_id,
+        "candidate_id": f"candidate-{strategy_version_id}",
+        "research_trial_id": f"trial-{strategy_version_id}",
         "available_from": available_from.isoformat(),
         "available_through": through.isoformat(),
         "requested_days": days,
         "actual_coverage_seconds": actual_days * 86400,
         "source_class": "HISTORICAL",
+        "observation_completeness": str(
+            min(Decimal("1"), Decimal(actual_days) / Decimal(days))
+        ),
         "paper_sizing": "10.00",
         "fee_assumption": "0.0025",
         "slippage_assumption": "0.0050",
@@ -115,13 +133,13 @@ def _evidence(
         "completed_outcomes": 12,
         "reliability": "0.90",
         "execution_feasibility": True,
-        "evidence_digest": f"sha256:{evidence_window_id}",
+        "evidence_digest": "",
         "overlap_key": overlap_key or f"overlap:{strategy_version_id}",
         "hard_failure": hard_failure,
         "failure_reason": "BROKEN_EXECUTION_FEASIBILITY" if hard_failure else None,
     }
     record.update(overrides)
-    return record
+    return _canonicalize_evidence(record)
 
 
 def _selection(
@@ -161,19 +179,48 @@ def _member(
     reason: str = "eligible",
     evidence_window_id: str | None = None,
     overlap_key: str | None = None,
+    candidate_id: str | None = None,
+    research_trial_id: str | None = None,
+    evidence_digest: str | None = None,
     position_management_state: dict[str, object] | None = None,
 ) -> dict[str, object]:
+    evidence_id = evidence_window_id or f"window-{strategy_version_id}-7"
+    member_candidate = (
+        f"candidate-{strategy_version_id}" if candidate_id is None else candidate_id
+    )
+    member_trial = (
+        f"trial-{strategy_version_id}"
+        if research_trial_id is None
+        else research_trial_id
+    )
+    member_overlap = overlap_key or f"overlap:{strategy_version_id}"
+    member_digest = evidence_digest
+    if member_digest is None:
+        member_digest = str(
+            _evidence(
+                strategy_version_id,
+                evidence_id,
+                candidate_id=member_candidate,
+                research_trial_id=member_trial,
+                overlap_key=member_overlap,
+            )["evidence_digest"]
+        )
     return {
         "portfolio_selection_id": selection_id,
         "strategy_version_id": strategy_version_id,
+        "candidate_id": member_candidate,
+        "research_trial_id": member_trial,
         "allocation": allocation,
         "status": status,
         "score": score,
         "reason": reason,
-        "evidence_window_id": evidence_window_id or f"window-{strategy_version_id}-7",
-        "overlap_key": overlap_key or f"overlap:{strategy_version_id}",
+        "evidence_window_id": evidence_id,
+        "evidence_digest": member_digest,
+        "overlap_key": member_overlap,
         "position_management_state": position_management_state or {},
     }
+
+
 
 
 def _decision_status(decision: object) -> str:
@@ -330,6 +377,10 @@ class TestRollingPortfolio(unittest.TestCase):
         with _store(self.tmp_path) as store:
             store.save_strategy_version(_strategy("sv-a"))
             store.save_strategy_version(_strategy("sv-b"))
+            store.save_research_trial(_trial("sv-a"))
+            store.save_research_trial(_trial("sv-b"))
+            store.save_strategy_evidence_window(_evidence("sv-a", "w-a"))
+            store.save_strategy_evidence_window(_evidence("sv-b", "w-b"))
             policy_for_storage = _policy()
             store.save_admission_policy(
                 {
@@ -376,7 +427,7 @@ class TestRollingPortfolio(unittest.TestCase):
             "strategy_version_id": "sv-incumbent",
             "score": "0.80",
             "status": "ACTIVE",
-            "members": [_member("sv-incumbent", selection_id="current-selection", score="0.80")],
+            "members": [_member("sv-incumbent", selection_id="current-selection", score="0.80", position_management_state={"open_lot": "lot-1"})],
         }
         evidence = [
             _evidence("sv-incumbent", "w-incumbent", score="0.55"),
@@ -386,7 +437,12 @@ class TestRollingPortfolio(unittest.TestCase):
         decision = evaluate_rolling_selection(policy, evidence, current, NOW + timedelta(hours=1))
         ids = [str(_member_value(member, "strategy_version_id")) for member in _decision_members(decision)]
         self.assertEqual(ids, ['sv-incumbent'])
-        self.assertIn(str(_member_value(_decision_members(decision)[0], 'status')), {'ACTIVE', 'RETAINED'})
+        incumbent = _decision_members(decision)[0]
+        self.assertEqual(_member_value(incumbent, 'strategy_version_id'), 'sv-incumbent')
+        self.assertIn(str(_member_value(incumbent, 'status')), {'ACTIVE', 'RETAINED'})
+        self.assertEqual(Decimal(str(_member_value(incumbent, 'allocation'))), Decimal('10.00'))
+        self.assertEqual(_member_value(incumbent, 'position_management_state')['open_lot'], 'lot-1')
+        self.assertIn(_decision_status(decision), {'ACTIVE', 'PAPER'})
         self.assertNotIn('loss', ' '.join((str(reason) for reason in getattr(decision, 'reasons', ()))).lower())
     
     
@@ -450,6 +506,8 @@ class TestRollingPortfolio(unittest.TestCase):
                 }
             )
             first.save_strategy_version(_strategy("sv-beta"))
+            first.save_research_trial(_trial("sv-beta"))
+            first.save_research_trial(_trial("sv-alpha"))
             first.save_strategy_evidence_window(_evidence("sv-alpha", "window-alpha-7"))
             first.save_strategy_evidence_window(_evidence("sv-beta", "window-beta-7"))
             first.commit_portfolio_selection(
@@ -465,7 +523,7 @@ class TestRollingPortfolio(unittest.TestCase):
 
         with AxiomStore(str(path)) as restarted:
             restarted.commit_portfolio_selection(
-                _selection("selection-2", selected_at=NOW + timedelta(days=1)),
+                _selection("selection-2", selected_at=NOW + timedelta(days=1), k=0),
                 [_member("sv-beta", selection_id="selection-2", status="PAPER", allocation="0", evidence_window_id="window-beta-7")],
             )
             current = restarted.load_current_portfolio_selection()
@@ -473,6 +531,89 @@ class TestRollingPortfolio(unittest.TestCase):
             self.assertEqual(current['portfolio_selection_id'], 'selection-2')
             self.assertEqual({row['portfolio_selection_id'] for row in history}, {'selection-1', 'selection-2'})
             self.assertEqual(len(history), 2)
+
+    def test_foreign_or_newer_trial_cannot_replace_selected_trial(self) -> None:
+        policy = _policy(max_members=1, experimental_allocation_enabled=True, cooldown_seconds=0)
+        selection_id = "selection-trial-lineage"
+        incumbent = _member(
+            "sv-alpha",
+            selection_id=selection_id,
+            research_trial_id="trial-alpha-old",
+            evidence_window_id="window-alpha",
+        )
+        current = {
+            **_selection(selection_id, k=1),
+            "members": [incumbent],
+        }
+        newer_evidence = _evidence(
+            "sv-alpha",
+            "window-alpha-new",
+            research_trial_id="trial-alpha-new",
+        )
+        decision = evaluate_rolling_selection(policy, [newer_evidence], current, NOW + timedelta(days=1))
+        selected = _decision_members(decision)[0]
+        self.assertEqual(_member_value(selected, "research_trial_id"), "trial-alpha-old")
+
+        with _store(self.tmp_path) as store:
+            store.save_admission_policy(
+                {
+                    "policy_id": policy.policy_id,
+                    "version": policy.version,
+                    "config_hash": policy.config_hash,
+                    "policy": policy,
+                    "created_at": NOW.isoformat(),
+                }
+            )
+            store.save_strategy_version(_strategy("sv-alpha"))
+            store.save_strategy_version(_strategy("sv-foreign"))
+            store.save_research_trial(_trial("sv-alpha", "trial-alpha-old"))
+            store.save_research_trial(_trial("sv-alpha", "trial-alpha-new"))
+            store.save_research_trial(_trial("sv-alpha", "trial-foreign"))
+            store.save_strategy_evidence_window(
+                _evidence(
+                    "sv-alpha",
+                    "window-alpha",
+                    research_trial_id="trial-alpha-old",
+                    candidate_id="candidate-sv-alpha",
+                )
+            )
+            store.save_strategy_evidence_window(
+                _evidence(
+                    "sv-alpha",
+                    "window-alpha-new",
+                    research_trial_id="trial-alpha-new",
+                    candidate_id="candidate-sv-alpha",
+                )
+            )
+            store.commit_portfolio_selection(_selection(selection_id, k=1), [incumbent])
+
+            with self.assertRaisesRegex(ValueError, "identity conflict"):
+                store.commit_portfolio_selection(
+                    _selection(selection_id, k=1),
+                    [
+                        _member(
+                            "sv-alpha",
+                            selection_id=selection_id,
+                            research_trial_id="trial-alpha-new",
+                            evidence_window_id="window-alpha-new",
+                        )
+                    ],
+                )
+            with self.assertRaisesRegex(ValueError, "evidence window lineage mismatch"):
+                store.commit_portfolio_selection(
+                    _selection(selection_id, k=1),
+                    [
+                        _member(
+                            "sv-alpha",
+                            selection_id=selection_id,
+                            research_trial_id="trial-foreign",
+                            evidence_window_id="window-alpha",
+                        )
+                    ],
+                )
+            loaded = store.load_current_portfolio_selection()
+            assert loaded is not None
+            self.assertEqual(loaded["members"][0]["research_trial_id"], "trial-alpha-old")
     
     
     def test_review_state_round_trips_without_mutating_selection_history(self) -> None:
@@ -489,6 +630,7 @@ class TestRollingPortfolio(unittest.TestCase):
             )
             store.save_strategy_version(_strategy("sv-alpha"))
             store.save_strategy_evidence_window(_evidence("sv-alpha", "window-alpha-7"))
+            store.save_research_trial(_trial("sv-alpha"))
             store.commit_portfolio_selection(
                 _selection("selection-review"),
                 [_member("sv-alpha", selection_id="selection-review", evidence_window_id="window-alpha-7")],
@@ -641,10 +783,11 @@ class TestRollingPortfolio(unittest.TestCase):
                 ("sv-observe-b", "w-observe-b"),
             ):
                 store.save_strategy_version(_strategy(strategy_id))
+                store.save_research_trial(_trial(strategy_id))
                 store.save_strategy_evidence_window(_evidence(strategy_id, window_id))
 
             committed = store.commit_portfolio_selection(
-                _selection("selection-observations", k=2),
+                _selection("selection-observations", k=0),
                 [
                     _member(
                         "sv-observe-a",
@@ -683,8 +826,8 @@ class TestRollingPortfolio(unittest.TestCase):
             "sv-coverage",
             "w-coverage-inflated",
             actual_days=7,
-            actual_coverage_seconds=7 * 86400 + 1,
         )
+        inflated["actual_coverage_seconds"] = 7 * 86400 + 1
         with self.assertRaises(ValueError):
             RollingEvidence.from_mapping(inflated)
 
@@ -706,6 +849,7 @@ class TestRollingPortfolio(unittest.TestCase):
                 }
             )
             store.save_strategy_version(_strategy("sv-funded"))
+            store.save_research_trial(_trial("sv-funded"))
             without_evidence = _member(
                 "sv-funded",
                 selection_id="selection-no-evidence",
@@ -774,11 +918,13 @@ class TestRollingPortfolio(unittest.TestCase):
         member = _decision_members(decision)[0]
         state = _member_value(member, "position_management_state")
 
+        self.assertEqual(str(_member_value(member, "strategy_version_id")), "sv-incumbent")
         self.assertIn(str(_member_value(member, "status")), {"ACTIVE", "RETAINED"})
         self.assertEqual(Decimal(str(_member_value(member, "allocation"))), Decimal("3.00"))
         self.assertEqual(state["position_id"], "position-1")
         self.assertEqual(state["open_quantity"], Decimal("2.5"))
         self.assertEqual(state["risk"]["stop_fraction"], Decimal("0.25"))
+        self.assertIn(_decision_status(decision), {'ACTIVE', 'PAPER'})
 
     def test_nested_assumptions_round_trip_into_canonical_evidence(self) -> None:
         record = _evidence("sv-assumptions", "w-assumptions")
@@ -801,6 +947,7 @@ class TestRollingPortfolio(unittest.TestCase):
                 },
             }
         )
+        record = _canonicalize_evidence(record)
 
         with _store(self.tmp_path) as store:
             store.save_strategy_version(_strategy("sv-assumptions"))
@@ -904,14 +1051,15 @@ class TestRollingPortfolio(unittest.TestCase):
             usd = _evidence("sv-drawdown", "w-drawdown-usd")
             usd.pop("drawdown")
             usd["drawdown_usd"] = "0.25"
+            usd = _canonicalize_evidence(usd)
             with self.assertRaises(ValueError):
                 store.save_strategy_evidence_window(usd)
 
             oversized = _evidence(
                 "sv-drawdown",
                 "w-drawdown-oversized",
-                drawdown="1.01",
             )
+            oversized["drawdown"] = "1.01"
             with self.assertRaises(ValueError):
                 store.save_strategy_evidence_window(oversized)
 
@@ -1011,6 +1159,213 @@ class TestRollingPortfolio(unittest.TestCase):
             }
             self.assertEqual(loaded, {"legacy-empty": 0, "legacy-one": 1, "legacy-two": 2})
 
+    def test_retained_allocation_does_not_exceed_global_budget(self) -> None:
+        policy = _policy(
+            max_members=2,
+            experimental_allocation_enabled=True,
+            cooldown_seconds=0,
+        )
+        current = {
+            **_selection(
+                "selection-current",
+                k=1,
+                selected_at=NOW - timedelta(days=2),
+                review_due_at=NOW - timedelta(days=1),
+            ),
+            "members": [
+                _member(
+                    "sv-incumbent",
+                    selection_id="selection-current",
+                    allocation="5.00",
+                    score="0.80",
+                    position_management_state={"position_id": "position-incumbent"},
+                )
+            ],
+        }
+        decision = evaluate_rolling_selection(
+            policy,
+            [
+                _evidence(
+                    "sv-incumbent",
+                    "w-incumbent-low",
+                    paper_sizing="1.00",
+                    allocated_capital_net_return="0.00",
+                ),
+                _evidence("sv-new", "w-new", score="0.90"),
+            ],
+            current,
+            NOW,
+        )
+        members = {
+            str(_member_value(member, "strategy_version_id")): member
+            for member in _decision_members(decision)
+        }
+        allocations = {
+            strategy_id: Decimal(str(_member_value(member, "allocation")))
+            for strategy_id, member in members.items()
+        }
+
+        self.assertEqual(set(members), {"sv-incumbent", "sv-new"})
+        self.assertIn(str(_member_value(members["sv-incumbent"], "status")), {"ACTIVE", "RETAINED"})
+        self.assertEqual(str(_member_value(members["sv-incumbent"], "strategy_version_id")), "sv-incumbent")
+        self.assertLessEqual(allocations["sv-incumbent"], Decimal("5.00"))
+        self.assertEqual(_member_value(members["sv-incumbent"], "position_management_state")["position_id"], "position-incumbent")
+        self.assertGreater(allocations["sv-new"], Decimal("0"))
+        self.assertLessEqual(sum(allocations.values(), Decimal("0")), Decimal("10.00"))
+        self.assertIn(_decision_status(decision), {'ACTIVE', 'PAPER'})
+
+    def test_daily_reviews_preserve_cooldown_anchor_until_day_seven_replacement(self) -> None:
+        policy = _policy(
+            max_members=1,
+            experimental_allocation_enabled=True,
+            replacement_margin="0",
+            cooldown_seconds=7 * 86400,
+        )
+        change_at = NOW
+        current = {
+            **_selection(
+                "selection-current",
+                k=1,
+                selected_at=change_at,
+                review_due_at=change_at,
+            ),
+            "last_membership_change_at": change_at.isoformat(),
+            "members": [
+                _member(
+                    "sv-incumbent",
+                    selection_id="selection-current",
+                    allocation="5.00",
+                    score="0.20",
+                )
+            ],
+        }
+        evidence = [
+            _evidence(
+                "sv-incumbent",
+                "w-incumbent-low",
+                paper_sizing="1.00",
+                allocated_capital_net_return="0.00",
+            ),
+            _evidence(
+                "sv-challenger",
+                "w-challenger",
+                paper_sizing="1.00",
+                allocated_capital_net_return="1.00",
+            ),
+        ]
+
+        def cooldown_anchor(value: object) -> datetime:
+            raw = getattr(value, "last_membership_change_at", None)
+            if raw is None and isinstance(value, dict):
+                raw = value.get("last_membership_change_at")
+            if raw is None:
+                raw = value.as_dict()["last_membership_change_at"]
+            if isinstance(raw, datetime):
+                return raw.astimezone(UTC)
+            return datetime.fromisoformat(str(raw).replace("Z", "+00:00")).astimezone(UTC)
+
+        reviewed: object = current
+        for day in range(1, 7):
+            reviewed = evaluate_rolling_selection(
+                policy,
+                evidence,
+                reviewed,
+                change_at + timedelta(days=day),
+            )
+            members = _decision_members(reviewed)
+            self.assertEqual(
+                [str(_member_value(member, "strategy_version_id")) for member in members],
+                ["sv-incumbent"],
+            )
+            self.assertLessEqual(
+                Decimal(str(_member_value(members[0], "allocation"))),
+                Decimal("5.00"),
+            )
+            self.assertEqual(cooldown_anchor(reviewed), change_at)
+
+        replaced = evaluate_rolling_selection(
+            policy,
+            evidence,
+            reviewed,
+            change_at + timedelta(days=7),
+        )
+        self.assertEqual(
+            [
+                str(_member_value(member, "strategy_version_id"))
+                for member in _decision_members(replaced)
+            ],
+            ["sv-challenger"],
+        )
+        self.assertEqual(
+            str(_member_value(_decision_members(replaced)[0], "status")),
+            "ACTIVE",
+        )
+        self.assertGreater(
+            Decimal(str(_member_value(_decision_members(replaced)[0], "allocation"))),
+            Decimal("0"),
+        )
+        self.assertEqual(cooldown_anchor(replaced), change_at + timedelta(days=7))
+
+    def test_newer_healthy_window_supersedes_older_hard_failure(self) -> None:
+        policy = _policy(max_members=1, experimental_allocation_enabled=True)
+        older_failure = _evidence(
+            "sv-recovering",
+            "w-recovering-failed",
+            hard_failure=True,
+        )
+        newer_healthy = _evidence(
+            "sv-recovering",
+            "w-recovering-healthy",
+            available_from=(NOW - timedelta(days=7) + timedelta(hours=1)).isoformat(),
+            available_through=(NOW + timedelta(hours=1)).isoformat(),
+            hard_failure=False,
+        )
+
+        decision = evaluate_rolling_selection(
+            policy,
+            [older_failure, newer_healthy],
+            None,
+            NOW + timedelta(hours=2),
+        )
+        members = _decision_members(decision)
+
+        self.assertEqual(len(members), 1)
+        self.assertEqual(
+            str(_member_value(members[0], "strategy_version_id")),
+            "sv-recovering",
+        )
+        self.assertEqual(
+            str(_member_value(members[0], "evidence_window_id")),
+            "w-recovering-healthy",
+        )
+        self.assertEqual(str(_member_value(members[0], "status")), "ACTIVE")
+        self.assertGreater(
+            Decimal(str(_member_value(members[0], "allocation"))),
+            Decimal("0"),
+        )
+
+    def test_unsupported_score_declarations_reject_and_default_provenance_matches(self) -> None:
+        with self.assertRaises(ValueError):
+            _policy(score_formula="unsupported-score-formula")
+        with self.assertRaises(ValueError):
+            _policy(formula_version="unsupported-score-version")
+
+        policy = default_rolling_admission_policy()
+        evidence = RollingEvidence.from_mapping(_evidence("sv-formula", "w-formula"))
+        decision = evaluate_rolling_selection(policy, [evidence], None, NOW)
+        member = _decision_members(decision)[0]
+        policy_payload = policy.as_dict()
+        decision_payload = decision.as_dict()
+
+        self.assertEqual(policy_payload["score_formula"], policy.score_formula)
+        self.assertEqual(policy_payload["formula_version"], policy.formula_version)
+        self.assertEqual(decision_payload["score_formula"], policy_payload["score_formula"])
+        self.assertEqual(decision_payload["formula_version"], policy_payload["formula_version"])
+        self.assertEqual(
+            Decimal(str(_member_value(member, "score"))),
+            evidence.score(policy),
+        )
+
     def test_terminal_finite_campaign_remains_independent_of_rolling_rows(self) -> None:
         with _store(self.tmp_path) as store:
             policy_for_storage = _policy()
@@ -1031,14 +1386,38 @@ class TestRollingPortfolio(unittest.TestCase):
             before = store.load_experiment("finite-campaign-1")
             store.save_strategy_version(_strategy("sv-rolling"))
             store.save_research_trial(_trial("sv-rolling", "trial-rolling"))
-            store.save_strategy_evidence_window(_evidence("sv-rolling", "w-rolling"))
+            store.save_strategy_evidence_window(
+                _evidence(
+                    "sv-rolling",
+                    "w-rolling",
+                    candidate_id="candidate-sv-rolling",
+                    research_trial_id="trial-rolling",
+                )
+            )
             store.commit_portfolio_selection(
                 _selection("selection-rolling"),
-                [_member("sv-rolling", selection_id="selection-rolling", evidence_window_id="w-rolling")],
+                [
+                    _member(
+                        "sv-rolling",
+                        selection_id="selection-rolling",
+                        candidate_id="candidate-sv-rolling",
+                        research_trial_id="trial-rolling",
+                        evidence_window_id="w-rolling",
+                    )
+                ],
             )
             after = store.load_experiment("finite-campaign-1")
-    
+
             self.assertEqual(after, before)
-            self.assertEqual(after['status'], 'COMPLETED')
-            self.assertEqual(store.connection.execute('SELECT COUNT(*) FROM experiments WHERE experiment_id=?', ('finite-campaign-1',)).fetchone()[0], 1)
-            self.assertEqual(store.load_current_portfolio_selection()['portfolio_selection_id'], 'selection-rolling')
+            self.assertEqual(after["status"], "COMPLETED")
+            self.assertEqual(
+                store.connection.execute(
+                    "SELECT COUNT(*) FROM experiments WHERE experiment_id=?",
+                    ("finite-campaign-1",),
+                ).fetchone()[0],
+                1,
+            )
+            self.assertEqual(
+                store.load_current_portfolio_selection()["portfolio_selection_id"],
+                "selection-rolling",
+            )

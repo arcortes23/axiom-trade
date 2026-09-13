@@ -58,10 +58,13 @@ class _FixtureCredentialStore(CredentialStore):
 
 
 class PolymarketTruthfulnessRegressionTests(unittest.TestCase):
-    def make_store(self) -> AxiomStore:
+    def make_store(self, *, legacy_worker: bool = False) -> AxiomStore:
         temporary_directory = tempfile.TemporaryDirectory()
         self.addCleanup(temporary_directory.cleanup)
         store = AxiomStore(Path(temporary_directory.name) / "truthfulness.sqlite")
+        if legacy_worker:
+            # Legacy workers bypass rolling selection; rolling acceptance covers it.
+            store.load_current_portfolio_selection = None
         self.addCleanup(store.close)
         return store
 
@@ -155,7 +158,7 @@ class PolymarketTruthfulnessRegressionTests(unittest.TestCase):
         )
 
     def test_unknown_submission_is_not_successful_and_is_not_resubmitted(self) -> None:
-        store = self.make_store()
+        store = self.make_store(legacy_worker=True)
         service = CanaryService(
             store,
             credentials=_FixtureCredentialStore(),

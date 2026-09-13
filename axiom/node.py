@@ -8,6 +8,7 @@ the production-live execution flag.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from collections import deque
 from itertools import islice
 from datetime import datetime, timedelta
 from logging.handlers import RotatingFileHandler
@@ -19,7 +20,7 @@ from pathlib import Path
 import re
 import subprocess
 import threading
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 import time
 import uuid
 from .collector import CollectionCycle, CollectorConfig, PolymarketCollector
@@ -384,6 +385,7 @@ class NodeConfig:
     max_log_bytes: int = 5_000_000
     backup_count: int = 3
     revision: str | None = None
+    rolling_review_interval_seconds: float = 86400.0
 
     def __post_init__(self) -> None:
         db_text = str(self.db_path).strip()
@@ -429,8 +431,11 @@ class NodeConfig:
         interval = float(self.interval_seconds)
         cooldown = float(self.failure_cooldown_seconds)
         auto_interval = float(self.auto_canary_interval_seconds)
+        rolling_interval = float(self.rolling_review_interval_seconds)
         if not math.isfinite(auto_interval) or auto_interval <= 0:
             raise ValueError("auto_canary_interval_seconds must be finite and positive")
+        if not math.isfinite(rolling_interval) or rolling_interval <= 0:
+            raise ValueError("rolling_review_interval_seconds must be finite and positive")
         if not math.isfinite(interval) or interval <= 0:
             raise ValueError("interval_seconds must be finite and positive")
         if isinstance(self.depth, bool) or not isinstance(self.depth, int) or self.depth <= 0:
@@ -506,16 +511,23 @@ class _PersistedStrategy:
     def signal(self, context: Mapping[str, Any]) -> Mapping[str, Any] | None:
         symbol = str(context.get("symbol", ""))
         persisted_history = context.get("history")
-        if isinstance(persisted_history, (list, tuple)):
-            history = list(persisted_history)
-            history.append(context.get("market", context.get("observation")))
-            history = history[-512:]
-            self._history[symbol] = history
-        else:
+        history: list[Any] | None = None
+        if isinstance(persisted_history, Sequence):
+            try:
+                history = list(persisted_history[-511:])
+            except (IndexError, TypeError):
+                history = None
+        if history is None and persisted_history is not None:
+            try:
+                history = list(deque(iter(persisted_history), maxlen=511))
+            except TypeError:
+                history = None
+        if history is None:
             history = self._history.setdefault(symbol, [])
-            history.append(context.get("market", context.get("observation")))
-            if len(history) > 512:
-                del history[:-512]
+        history.append(context.get("market", context.get("observation")))
+        if len(history) > 512:
+            del history[:-512]
+        self._history[symbol] = history
         signal = evaluate_signal_record(self.definition, {"observations": tuple(history)})
         if not signal.actionable:
             return None
@@ -652,6 +664,7 @@ class ResearchNode:
         self._health_thread: threading.Thread | None = None
         self._historical_refresh_thread: threading.Thread | None = None
         self._auto_canary_thread: threading.Thread | None = None
+        self._rolling_portfolio_thread: threading.Thread | None = None
         self._historical_thread: threading.Thread | None = None
         self._worker_runtime_lock = threading.RLock()
         self._worker_runtime: dict[str, dict[str, Any]] = {}
@@ -1228,6 +1241,16 @@ class ResearchNode:
                     "requires_attention": self._auto_canary_fatal,
                     "production_live_execution": False,
                 },
+                "rolling-portfolio": {
+                    "configured_interval_seconds": float(
+                        self.config.rolling_review_interval_seconds
+                    ),
+                    "next_work": "refresh_rolling_evidence",
+                    "worker_status": "SCHEDULED",
+                    "scheduled": True,
+                    "paper_only": True,
+                    "live_execution": False,
+                },
             }
             if self.config.historical_refresh_enabled:
                 worker_start_states[POLYMARKET_HISTORICAL_JOB_NAME] = {
@@ -1339,6 +1362,7 @@ class ResearchNode:
                 self._health_thread,
                 self._historical_refresh_thread,
                 self._auto_canary_thread,
+                self._rolling_portfolio_thread,
                 self._historical_thread,
             ):
                 if worker is not None:
@@ -1349,6 +1373,7 @@ class ResearchNode:
             self._health_thread = None
             self._historical_refresh_thread = None
             self._auto_canary_thread = None
+            self._rolling_portfolio_thread = None
             self._historical_thread = None
             try:
                 self._heartbeat(
@@ -1410,10 +1435,16 @@ class ResearchNode:
         if self.config.historical_refresh_enabled:
             self._historical_refresh_thread = threading.Thread(
                 target=self._historical_refresh_worker_loop,
+                args=(max_cycles,),
                 name=f"{self.config.worker_name}-historical-refresh",
                 daemon=True,
             )
         self._auto_canary_thread = None
+        self._rolling_portfolio_thread = threading.Thread(
+            target=self._rolling_portfolio_worker_loop,
+            name=f"{self.config.worker_name}-rolling-portfolio",
+            daemon=True,
+        )
         if self.config.mutation_enabled and not self._auto_canary_fatal:
             self._auto_canary_thread = threading.Thread(
                 target=self._auto_canary_worker_loop,
@@ -1428,6 +1459,8 @@ class ResearchNode:
             self._historical_refresh_thread.start()
         if self._auto_canary_thread is not None:
             self._auto_canary_thread.start()
+        if self._rolling_portfolio_thread is not None:
+            self._rolling_portfolio_thread.start()
     def _worker_thread_specs(self, max_cycles: int | None) -> dict[str, tuple[str, Callable[[], None]]]:
         specs: dict[str, tuple[str, Callable[[], None]]] = {
             "polymarket-collector": (
@@ -1440,8 +1473,12 @@ class ResearchNode:
         if self.config.historical_refresh_enabled:
             specs[POLYMARKET_HISTORICAL_JOB_NAME] = (
                 "_historical_refresh_thread",
-                self._historical_refresh_worker_loop,
+                lambda: self._historical_refresh_worker_loop(max_cycles),
             )
+        specs["rolling-portfolio"] = (
+            "_rolling_portfolio_thread",
+            self._rolling_portfolio_worker_loop,
+        )
         if self.config.mutation_enabled and not self._auto_canary_fatal:
             specs["autonomous-canary"] = (
                 "_auto_canary_thread",
@@ -1671,6 +1708,71 @@ class ResearchNode:
                         else None
                     ),
                 )
+
+    def _rolling_portfolio_worker_loop(self) -> None:
+        """Keep rolling evidence/review scheduled beyond finite campaigns."""
+        worker_name = "rolling-portfolio"
+        status = "idle"
+        try:
+            while not self.stop_event.is_set():
+                started = self._worker_tick_started(
+                    worker_name,
+                    next_work="review_rolling_portfolio",
+                )
+                result: Mapping[str, Any] = {}
+                successful = True
+                error: BaseException | str | None = None
+                try:
+                    review = getattr(self.research_processor, "review_rolling_portfolio", None)
+                    if not callable(review):
+                        raise RuntimeError("ROLLING_RESEARCH_API_UNAVAILABLE")
+                    reviewed = review(now=started, force=False)
+                    result = dict(reviewed) if isinstance(reviewed, Mapping) else {}
+                    status = "idle"
+                except BaseException as exc:
+                    successful = False
+                    error = exc
+                    status = "degraded"
+                    self._log(logging.WARNING, "rolling portfolio tick failed: %s", exc)
+                self._worker_tick_completed(
+                    worker_name,
+                    successful=successful,
+                    decision=str(result.get("decision") or "WAIT_FOR_ROLLING_REVIEW"),
+                    next_work="review_rolling_portfolio",
+                    error=error,
+                    extra={
+                        "rolling_portfolio": result,
+                        "configured_interval_seconds": float(
+                            self.config.rolling_review_interval_seconds
+                        ),
+                        "scheduled": True,
+                        "paper_only": True,
+                        "live_execution": False,
+                    },
+                )
+                if self.stop_event.wait(self.config.rolling_review_interval_seconds):
+                    break
+        except BaseException as exc:
+            status = "degraded"
+            self._worker_tick_failed(worker_name, exc, next_work="retry_rolling_review")
+        finally:
+            # A finite campaign may stop this process, but the durable rolling
+            # scheduler remains explicitly due for the next node invocation.
+            self._persist_worker_runtime(
+                worker_name,
+                "scheduled",
+                extra={
+                    "worker_status": "SCHEDULED",
+                    "scheduled": True,
+                    "next_work": "review_rolling_portfolio",
+                    "configured_interval_seconds": float(
+                        self.config.rolling_review_interval_seconds
+                    ),
+                    "last_loop_status": status,
+                    "paper_only": True,
+                    "live_execution": False,
+                },
+            )
 
     def _latest_eligible_historical_catalog(self) -> tuple[dict[str, Any] | None, Mapping[str, Any] | None, str]:
         """Return the newest non-empty, attested immutable Polymarket catalog."""
@@ -2679,9 +2781,10 @@ class ResearchNode:
             },
         )
 
-    def _historical_refresh_worker_loop(self) -> None:
+    def _historical_refresh_worker_loop(self, max_cycles: int | None) -> None:
         """Schedule bounded historical refresh ticks independently."""
         interval_seconds = max(0.1, float(self.config.historical_refresh_interval_seconds))
+        completed = 0
         status = "idle"
         try:
             self._persist_worker_runtime(
@@ -2695,7 +2798,9 @@ class ResearchNode:
                     "resumable": True,
                 },
             )
-            while not self.stop_event.is_set():
+            while not self.stop_event.is_set() and (
+                max_cycles is None or completed < max_cycles
+            ):
                 if self._external_stop_requested():
                     break
                 self._worker_tick_started(
@@ -2703,6 +2808,12 @@ class ResearchNode:
                     next_work="refresh_historical_data",
                 )
                 self._run_historical_refresh_tick()
+                with self._worker_condition:
+                    completed += 1
+                    self._historical_passes += 1
+                    self._worker_condition.notify_all()
+                if max_cycles is not None and completed >= max_cycles:
+                    break
                 if self.stop_event.is_set():
                     break
                 # Schedule from completion, rather than catching up missed
@@ -2722,7 +2833,11 @@ class ResearchNode:
             try:
                 self._persist_worker_runtime(
                     POLYMARKET_HISTORICAL_JOB_NAME,
-                    "stopped" if self.stop_event.is_set() else status,
+                    (
+                        "stopped"
+                        if self.stop_event.is_set() and max_cycles is None
+                        else status
+                    ),
                     extra={"next_work": "stopped"},
                 )
             except Exception:

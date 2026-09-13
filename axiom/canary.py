@@ -72,6 +72,110 @@ CANARY_SIGNAL_MAX_AGE_SECONDS = 60.0
 CANARY_READINESS_SNAPSHOT_MAX_AGE_SECONDS = 60.0
 CANARY_EXECUTION_MARKET_CAP = 8
 EXECUTION_FEASIBILITY_MARKET_CAP = "EXECUTION_FEASIBILITY_MARKET_CAP"
+_ROLLING_LINEAGE_FIELDS = (
+    "strategy_version_id",
+    "research_trial_id",
+    "portfolio_selection_id",
+    "admission_policy_id",
+    "admission_policy_version",
+    "risk_config_id",
+    "risk_config_generation",
+    "risk_config_hash",
+)
+_ROLLING_EVIDENCE_FIELDS = (
+    "evidence_window_id",
+    "evidence_digest",
+)
+_LEGACY_LINEAGE_TYPE = "LEGACY_FINITE_CAMPAIGN"
+_ROLLING_LINEAGE_TYPE = "ROLLING_PORTFOLIO"
+
+
+def _lineage_mapping(value: Any) -> dict[str, Any]:
+    """Return a bounded lineage mapping from a mapping or serializable record."""
+    if value is None:
+        return {}
+    if isinstance(value, Mapping):
+        return dict(value)
+    as_dict = getattr(value, "as_dict", None)
+    if callable(as_dict):
+        try:
+            candidate = as_dict()
+        except Exception:
+            candidate = None
+        if isinstance(candidate, Mapping):
+            return dict(candidate)
+    return {}
+
+
+def _normalize_lineage(
+    source: Any = None,
+    *,
+    lineage_type: Any = None,
+    strategy_version_id: Any = None,
+    research_trial_id: Any = None,
+    portfolio_selection_id: Any = None,
+    admission_policy_id: Any = None,
+    admission_policy_version: Any = None,
+    risk_config_id: Any = None,
+    risk_config_generation: Any = None,
+    risk_config_hash: Any = None,
+) -> dict[str, Any]:
+    """Normalize lineage without fabricating rolling identity for legacy rows."""
+    values = _lineage_mapping(source)
+    explicit = {
+        "strategy_version_id": strategy_version_id,
+        "research_trial_id": research_trial_id,
+        "portfolio_selection_id": portfolio_selection_id,
+        "admission_policy_id": admission_policy_id,
+        "admission_policy_version": admission_policy_version,
+        "risk_config_id": risk_config_id,
+        "risk_config_generation": risk_config_generation,
+        "risk_config_hash": risk_config_hash,
+    }
+    for field, value in explicit.items():
+        if value is not None:
+            values[field] = value
+    lineage_value = lineage_type if lineage_type is not None else values.get("lineage_type")
+    normalized_type = str(lineage_value or "").strip().upper()
+    # A rolling row is opt-in: legacy signals may carry optional candidate,
+    # policy, or evidence columns after schema propagation, but those fields
+    # are not proof that the submission belongs to the rolling portfolio.
+    rolling = normalized_type == _ROLLING_LINEAGE_TYPE
+    if not rolling:
+        return {
+            "lineage_type": _LEGACY_LINEAGE_TYPE,
+            **{field: None for field in _ROLLING_LINEAGE_FIELDS},
+            **{field: None for field in _ROLLING_EVIDENCE_FIELDS},
+        }
+    required = ("strategy_version_id", "portfolio_selection_id")
+    if any(str(values.get(field) or "").strip() == "" for field in required):
+        raise CanaryBlocked("ROLLING_LINEAGE_INCOMPLETE")
+    result: dict[str, Any] = {
+        "lineage_type": _ROLLING_LINEAGE_TYPE,
+    }
+    for field in _ROLLING_LINEAGE_FIELDS:
+        value = values.get(field)
+        if field == "risk_config_generation":
+            if value in (None, ""):
+                value = None
+            else:
+                if isinstance(value, bool):
+                    raise CanaryBlocked("ROLLING_LINEAGE_INVALID")
+                try:
+                    value = int(value)
+                except (TypeError, ValueError, OverflowError) as exc:
+                    raise CanaryBlocked("ROLLING_LINEAGE_INVALID") from exc
+                if value < 0:
+                    raise CanaryBlocked("ROLLING_LINEAGE_INVALID")
+        elif value not in (None, ""):
+            value = str(value).strip()
+        else:
+            value = None
+        result[field] = value
+    for field in _ROLLING_EVIDENCE_FIELDS:
+        value = values.get(field)
+        result[field] = str(value).strip() if value not in (None, "") else None
+    return result
 
 
 
@@ -3203,12 +3307,21 @@ class CanaryService:
               fill_quantity TEXT, actual_average_price TEXT, fees TEXT, status TEXT NOT NULL,
               latency_ms INTEGER, price_difference TEXT, fee_difference TEXT, slippage_difference TEXT,
               settlement TEXT, realized_pnl TEXT, evidence_json TEXT NOT NULL,
+              strategy_version_id TEXT, research_trial_id TEXT, portfolio_selection_id TEXT,
+              admission_policy_id TEXT, admission_policy_version TEXT, risk_config_id TEXT,
+              risk_config_generation INTEGER, risk_config_hash TEXT,
+              lineage_type TEXT NOT NULL DEFAULT 'LEGACY_FINITE_CAMPAIGN',
+              control_generation INTEGER NOT NULL DEFAULT 0,
               state_version INTEGER NOT NULL DEFAULT 0);
             CREATE TABLE IF NOT EXISTS canary_execution_events (
               execution_event_id TEXT PRIMARY KEY, canary_event_id TEXT NOT NULL,
               timestamp TEXT NOT NULL, exchange_order_id TEXT, status TEXT NOT NULL,
               fill_quantity TEXT, actual_average_price TEXT, fees TEXT,
               latency_ms INTEGER, evidence_json TEXT NOT NULL,
+              strategy_version_id TEXT, research_trial_id TEXT, portfolio_selection_id TEXT,
+              admission_policy_id TEXT, admission_policy_version TEXT, risk_config_id TEXT,
+              risk_config_generation INTEGER, risk_config_hash TEXT,
+              lineage_type TEXT NOT NULL DEFAULT 'LEGACY_FINITE_CAMPAIGN',
               FOREIGN KEY(canary_event_id) REFERENCES canary_ledger(event_id));
             CREATE INDEX IF NOT EXISTS idx_canary_execution_events_order
               ON canary_execution_events(canary_event_id, timestamp);
@@ -3225,6 +3338,10 @@ class CanaryService:
               source_snapshot_id TEXT NOT NULL, source_timestamp TEXT NOT NULL,
               generated_at TEXT NOT NULL, expires_at TEXT NOT NULL,
               status TEXT NOT NULL, reason TEXT, evidence_json TEXT NOT NULL,
+              strategy_version_id TEXT, research_trial_id TEXT, portfolio_selection_id TEXT,
+              admission_policy_id TEXT, admission_policy_version TEXT, risk_config_id TEXT,
+              risk_config_generation INTEGER, risk_config_hash TEXT,
+              lineage_type TEXT NOT NULL DEFAULT 'LEGACY_FINITE_CAMPAIGN',
               updated_at TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS idx_canary_signals_candidate_time
               ON canary_signals(candidate_id, generated_at, signal_id);
@@ -3234,7 +3351,11 @@ class CanaryService:
               evaluation_id TEXT PRIMARY KEY, candidate_id TEXT NOT NULL,
               cycle_id TEXT, evaluated_at TEXT NOT NULL, reason_code TEXT NOT NULL,
               market_id TEXT, signal_id TEXT, signal_json TEXT,
-              required_health_json TEXT NOT NULL, evidence_json TEXT NOT NULL);
+              required_health_json TEXT NOT NULL, evidence_json TEXT NOT NULL,
+              strategy_version_id TEXT, research_trial_id TEXT, portfolio_selection_id TEXT,
+              admission_policy_id TEXT, admission_policy_version TEXT, risk_config_id TEXT,
+              risk_config_generation INTEGER, risk_config_hash TEXT,
+              lineage_type TEXT NOT NULL DEFAULT 'LEGACY_FINITE_CAMPAIGN');
             CREATE INDEX IF NOT EXISTS idx_canary_signal_evaluations_candidate_time
               ON canary_signal_evaluations(candidate_id, evaluated_at, evaluation_id);
             CREATE INDEX IF NOT EXISTS idx_canary_signal_evaluations_cycle_time
@@ -3345,6 +3466,32 @@ class CanaryService:
                 self.store.connection.execute(
                     "ALTER TABLE canary_ledger ADD COLUMN state_version "
                     "INTEGER NOT NULL DEFAULT 0"
+                )
+            for table in (
+                "canary_signals",
+                "canary_signal_evaluations",
+                "canary_ledger",
+                "canary_execution_events",
+            ):
+                table_columns = {
+                    str(row["name"])
+                    for row in self.store.connection.execute(f"PRAGMA table_info({table})")
+                }
+                for column in _ROLLING_LINEAGE_FIELDS:
+                    if column not in table_columns:
+                        declaration = "INTEGER" if column == "risk_config_generation" else "TEXT"
+                        self.store.connection.execute(
+                            f"ALTER TABLE {table} ADD COLUMN {column} {declaration}"
+                        )
+                if "lineage_type" not in table_columns:
+                    self.store.connection.execute(
+                        f"ALTER TABLE {table} ADD COLUMN lineage_type TEXT "
+                        "NOT NULL DEFAULT 'LEGACY_FINITE_CAMPAIGN'"
+                    )
+                self.store.connection.execute(
+                    f"UPDATE {table} SET lineage_type=? "
+                    "WHERE lineage_type IS NULL OR TRIM(lineage_type)=''",
+                    (_LEGACY_LINEAGE_TYPE,),
                 )
             for table, additions in (
                 (
@@ -3700,6 +3847,7 @@ class CanaryService:
             "signal_scan_cycle_completed_at": None,
             "signal_scan_cycle_complete": 0,
             "signal_scan_checked_this_cycle": 0,
+            "signal_scan_remaining_this_cycle": 0,
             "signal_scan_coverage_percentage": 0.0,
             "signal_scan_skip_reasons_json": "{}",
             "signal_scan_reason_counts_json": "{}",
@@ -5833,6 +5981,448 @@ class CanaryService:
     def _settings_binding(self) -> tuple[str | None, int | None]:
         config_id, generation, _ = self._settings_identity()
         return config_id, generation
+    @staticmethod
+    def _rolling_identity_value(source: Mapping[str, Any], *names: str) -> str:
+        for name in names:
+            value = source.get(name)
+            if value not in (None, ""):
+                text = str(value).strip()
+                if text:
+                    return text
+        return ""
+
+    def validate_rolling_selection_fence(
+        self,
+        selection: Mapping[str, Any] | None = None,
+    ) -> Mapping[str, Any]:
+        """Require the persisted selection to match active policy and risk."""
+        if not isinstance(selection, Mapping):
+            loader = getattr(self.store, "load_current_portfolio_selection", None)
+            selection = loader() if callable(loader) else None
+        if not isinstance(selection, Mapping):
+            raise CanaryBlocked("ROLLING_SELECTION_UNAVAILABLE")
+        active_loader = getattr(self.store, "get_operator_config", None)
+        try:
+            active = (
+                active_loader("rolling_admission_policy_active", None)
+                if callable(active_loader)
+                else None
+            )
+        except Exception as exc:
+            raise CanaryBlocked("ROLLING_SELECTION_STALE") from exc
+        if not isinstance(active, Mapping):
+            raise CanaryBlocked("ROLLING_SELECTION_STALE")
+        active_policy = active.get("policy")
+        active_policy = active_policy if isinstance(active_policy, Mapping) else {}
+        active_policy_id = self._rolling_identity_value(
+            active,
+            "policy_id",
+            "id",
+        ) or self._rolling_identity_value(active_policy, "policy_id", "id")
+        active_policy_version = self._rolling_identity_value(
+            active,
+            "policy_version",
+            "version",
+        ) or self._rolling_identity_value(active_policy, "policy_version", "version")
+        active_policy_hash = self._rolling_identity_value(
+            active,
+            "policy_hash",
+            "config_hash",
+        ) or self._rolling_identity_value(
+            active_policy,
+            "policy_hash",
+            "config_hash",
+        )
+        if not active_policy_id or not active_policy_version or not active_policy_hash:
+            raise CanaryBlocked("ROLLING_SELECTION_STALE")
+        selection_policy_id = self._rolling_identity_value(
+            selection, "policy_id", "admission_policy_id"
+        )
+        selection_policy_version = self._rolling_identity_value(
+            selection, "policy_version", "admission_policy_version"
+        )
+        selection_policy_hash = self._rolling_identity_value(
+            selection, "policy_hash", "config_hash"
+        )
+        policy_config = selection.get("policy_config")
+        if not selection_policy_hash and isinstance(policy_config, Mapping):
+            selection_policy_hash = self._rolling_identity_value(
+                policy_config, "policy_hash", "config_hash"
+            )
+        persisted_loader = getattr(self.store, "load_admission_policy", None)
+        persisted = None
+        if callable(persisted_loader) and selection_policy_id and selection_policy_version:
+            try:
+                persisted = persisted_loader(
+                    selection_policy_id,
+                    selection_policy_version,
+                )
+            except Exception as exc:
+                raise CanaryBlocked("ROLLING_SELECTION_STALE") from exc
+            if not isinstance(persisted, Mapping):
+                raise CanaryBlocked("ROLLING_SELECTION_STALE")
+            persisted_hash = self._rolling_identity_value(
+                persisted, "config_hash", "policy_hash"
+            )
+            if not persisted_hash or persisted_hash != active_policy_hash:
+                raise CanaryBlocked("ROLLING_SELECTION_STALE")
+            if not selection_policy_hash:
+                selection_policy_hash = persisted_hash
+        if (
+            selection_policy_id != active_policy_id
+            or selection_policy_version != active_policy_version
+            or selection_policy_hash != active_policy_hash
+        ):
+            raise CanaryBlocked("ROLLING_SELECTION_STALE")
+        active_risk = active.get("risk", active.get("risk_config"))
+        active_risk = active_risk if isinstance(active_risk, Mapping) else active
+        risk_names = (
+            ("risk_config_id", "active_risk_config_id"),
+            ("risk_config_generation", "active_risk_config_generation"),
+            ("risk_config_hash", "active_risk_config_hash"),
+        )
+        expected_risk: dict[str, Any] = {}
+        selected_risk: dict[str, Any] = {}
+        for field, alias in risk_names:
+            expected = active_risk.get(field, active_risk.get(alias))
+            selected = selection.get(field, selection.get(alias))
+            if expected in (None, "") or selected in (None, ""):
+                raise CanaryBlocked("ROLLING_SELECTION_STALE")
+            expected_risk[field] = expected
+            selected_risk[field] = selected
+        try:
+            if int(expected_risk["risk_config_generation"]) <= 0 or int(
+                selected_risk["risk_config_generation"]
+            ) != int(expected_risk["risk_config_generation"]):
+                raise CanaryBlocked("ROLLING_SELECTION_STALE")
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise CanaryBlocked("ROLLING_SELECTION_STALE") from exc
+        for field in ("risk_config_id", "risk_config_hash"):
+            if str(selected_risk[field]).strip() != str(expected_risk[field]).strip():
+                raise CanaryBlocked("ROLLING_SELECTION_STALE")
+        settings_id, settings_generation, settings_hash = self._settings_identity()
+        try:
+            expected_generation = int(expected_risk["risk_config_generation"])
+            selected_generation = int(selected_risk["risk_config_generation"])
+            current_generation = (
+                int(settings_generation) if settings_generation is not None else 0
+            )
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise CanaryBlocked("ROLLING_SELECTION_STALE") from exc
+        if (
+            not settings_id
+            or current_generation <= 0
+            or not settings_hash
+            or str(settings_id).strip() != str(expected_risk["risk_config_id"]).strip()
+            or current_generation != expected_generation
+            or selected_generation != expected_generation
+            or str(settings_hash).strip() != str(expected_risk["risk_config_hash"]).strip()
+        ):
+            raise CanaryBlocked("ROLLING_SELECTION_STALE")
+        return {
+            "policy_id": active_policy_id,
+            "policy_version": active_policy_version,
+            "policy_hash": active_policy_hash,
+            **expected_risk,
+        }
+
+    def _validate_rolling_evidence(
+        self,
+        lineage: Mapping[str, Any],
+    ) -> Mapping[str, str]:
+        strategy = str(lineage.get("strategy_version_id") or "").strip()
+        trial = str(lineage.get("research_trial_id") or "").strip()
+        candidate = str(lineage.get("candidate_id") or "").strip()
+        window_id = str(lineage.get("evidence_window_id") or "").strip()
+        digest = str(lineage.get("evidence_digest") or "").strip()
+        if not strategy or not trial or not candidate or not window_id or not digest:
+            raise CanaryBlocked("ROLLING_EVIDENCE_INCOMPLETE")
+        loader = getattr(self.store, "list_strategy_evidence_windows", None)
+        if not callable(loader):
+            raise CanaryBlocked("ROLLING_EVIDENCE_UNAVAILABLE")
+        try:
+            rows = loader(strategy, limit=4096)
+        except TypeError:
+            rows = loader(strategy)
+        except Exception as exc:
+            raise CanaryBlocked("ROLLING_EVIDENCE_UNAVAILABLE") from exc
+        exact = next(
+            (
+                dict(row)
+                for row in rows
+                if isinstance(row, Mapping)
+                and str(row.get("evidence_window_id") or "").strip() == window_id
+            ),
+            None,
+        )
+        if exact is None:
+            raise CanaryBlocked("ROLLING_EVIDENCE_MISMATCH")
+        if str(exact.get("strategy_version_id") or "").strip() != strategy:
+            raise CanaryBlocked("ROLLING_EVIDENCE_MISMATCH")
+        payload = exact.get("payload")
+        if not isinstance(payload, Mapping):
+            raw_payload = exact.get("payload_json")
+            try:
+                payload = json.loads(str(raw_payload or "{}"))
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise CanaryBlocked("ROLLING_EVIDENCE_MISMATCH") from exc
+        payload = payload if isinstance(payload, Mapping) else {}
+        persisted_trial = str(
+            exact.get("research_trial_id")
+            or payload.get("research_trial_id")
+            or payload.get("trial_id")
+            or ""
+        ).strip()
+        persisted_candidate = str(
+            exact.get("candidate_id") or payload.get("candidate_id") or ""
+        ).strip()
+        source_class = str(
+            exact.get("source_class") or payload.get("source_class") or ""
+        ).strip()
+        persisted_digest = str(
+            exact.get("evidence_digest") or payload.get("evidence_digest") or ""
+        ).strip()
+        if (
+            not persisted_trial
+            or not persisted_candidate
+            or not source_class
+            or persisted_trial != trial
+            or persisted_candidate != candidate
+            or persisted_digest != digest
+        ):
+            raise CanaryBlocked("ROLLING_EVIDENCE_MISMATCH")
+        return {"evidence_window_id": window_id, "evidence_digest": digest}
+    def _rolling_lineage(
+        self,
+        source: Any = None,
+        *,
+        require_active: bool = False,
+        side: str | None = None,
+        strategy_version_id: Any = None,
+        research_trial_id: Any = None,
+        portfolio_selection_id: Any = None,
+        admission_policy_id: Any = None,
+        admission_policy_version: Any = None,
+        risk_config_id: Any = None,
+        risk_config_generation: Any = None,
+        risk_config_hash: Any = None,
+    ) -> dict[str, Any]:
+        """Fence rolling identity to the exact current selection and member."""
+        values = _lineage_mapping(source)
+        candidate_id = str(values.get("candidate_id") or "").strip()
+        explicit = _normalize_lineage(
+            values,
+            strategy_version_id=strategy_version_id if strategy_version_id is not None else values.get("strategy_version_id"),
+            research_trial_id=research_trial_id,
+            portfolio_selection_id=portfolio_selection_id,
+            admission_policy_id=admission_policy_id,
+            admission_policy_version=admission_policy_version,
+            risk_config_id=risk_config_id,
+            risk_config_generation=risk_config_generation,
+            risk_config_hash=risk_config_hash,
+        )
+        if explicit["lineage_type"] == _LEGACY_LINEAGE_TYPE:
+            return explicit
+        try:
+            current = self.store.load_current_portfolio_selection()
+        except Exception as exc:
+            raise CanaryBlocked("ROLLING_SELECTION_UNAVAILABLE") from exc
+        if not isinstance(current, Mapping):
+            raise CanaryBlocked("ROLLING_SELECTION_UNAVAILABLE")
+        self.validate_rolling_selection_fence(current)
+        checks = (
+            ("portfolio_selection_id", current.get("portfolio_selection_id")),
+            ("admission_policy_id", current.get("policy_id")),
+            ("admission_policy_version", current.get("policy_version")),
+            ("risk_config_id", current.get("risk_config_id", current.get("active_risk_config_id"))),
+            (
+                "risk_config_generation",
+                current.get("risk_config_generation", current.get("active_risk_config_generation")),
+            ),
+            ("risk_config_hash", current.get("risk_config_hash", current.get("active_risk_config_hash"))),
+        )
+        for field, expected in checks:
+            actual = explicit.get(field)
+            if actual is None:
+                if expected not in (None, ""):
+                    explicit[field] = expected
+                continue
+            if field == "risk_config_generation":
+                try:
+                    if int(actual) != int(expected):
+                        raise CanaryBlocked("ROLLING_SELECTION_CHANGED")
+                except (TypeError, ValueError, OverflowError) as exc:
+                    raise CanaryBlocked("ROLLING_SELECTION_CHANGED") from exc
+            elif str(actual).strip() != str(expected or "").strip():
+                raise CanaryBlocked("ROLLING_SELECTION_CHANGED")
+        strategy = str(explicit.get("strategy_version_id") or "").strip()
+        if not strategy:
+            raise CanaryBlocked("ROLLING_LINEAGE_INCOMPLETE")
+        trial = str(explicit.get("research_trial_id") or "").strip()
+        if not trial or not candidate_id:
+            raise CanaryBlocked("ROLLING_LINEAGE_INCOMPLETE")
+        member = next(
+            (
+                item
+                for item in current.get("members", ())
+                if isinstance(item, Mapping)
+                and str(item.get("strategy_version_id") or "").strip() == strategy
+            ),
+            None,
+        )
+        if member is None:
+            raise CanaryBlocked("ROLLING_STRATEGY_NOT_SELECTED")
+        member_trial = str(member.get("research_trial_id") or "").strip()
+        member_candidate = str(member.get("candidate_id") or "").strip()
+        if (
+            not member_trial
+            or not member_candidate
+            or trial != member_trial
+            or candidate_id != member_candidate
+        ):
+            raise CanaryBlocked("ROLLING_LINEAGE_CONFLICT")
+        explicit.update(
+            self._validate_rolling_evidence(
+                {
+                    **explicit,
+                    "candidate_id": candidate_id,
+                }
+            )
+        )
+        try:
+            trial_row = self.store.connection.execute(
+                "SELECT strategy_version_id FROM research_trials "
+                "WHERE research_trial_id=?",
+                (trial,),
+            ).fetchone()
+        except sqlite3.Error as exc:
+            raise CanaryBlocked("ROLLING_LINEAGE_INVALID") from exc
+        if (
+            trial_row is None
+            or str(trial_row["strategy_version_id"] or "").strip() != strategy
+        ):
+            raise CanaryBlocked("ROLLING_LINEAGE_INVALID")
+        normalized_side = str(side or values.get("side") or "").strip().upper()
+        if require_active and not normalized_side:
+            normalized_side = "BUY"
+        member_status = str(member.get("status") or "").strip().upper()
+        if normalized_side == "BUY":
+            try:
+                allocation = Decimal(str(member.get("allocation", "0")))
+            except (TypeError, ValueError, ArithmeticError) as exc:
+                raise CanaryBlocked("ROLLING_MEMBER_NOT_ACTIVE") from exc
+            if (
+                member_status != "ACTIVE"
+                or not allocation.is_finite()
+                or allocation <= 0
+            ):
+                raise CanaryBlocked("ROLLING_MEMBER_NOT_ACTIVE")
+        elif normalized_side == "SELL":
+            # A rolling SELL is an exit-only operation.  It may use a
+            # maintained member that is no longer funded, but only after the
+            # complete opening lineage above matched the current selection.
+            if member_status not in {"ACTIVE", "REDUCE", "PAUSED"}:
+                raise CanaryBlocked("ROLLING_MEMBER_NOT_EXITABLE")
+        elif require_active:
+            raise CanaryBlocked("ROLLING_MEMBER_NOT_ACTIVE")
+        return explicit
+    def _submission_lineage(
+        self,
+        signal: Mapping[str, Any],
+        *,
+        rolling_context: Mapping[str, Any] | None,
+        side: str,
+    ) -> dict[str, Any]:
+        """Validate the immutable lineage used by one canary submission."""
+        signal_values = dict(signal)
+        signal_evidence = signal.get("evidence")
+        if isinstance(signal_evidence, Mapping):
+            for field in _ROLLING_EVIDENCE_FIELDS:
+                if signal_values.get(field) in (None, ""):
+                    signal_values[field] = signal_evidence.get(field)
+        stored_type = str(signal_values.get("lineage_type") or "").strip().upper()
+        # Do not infer rolling identity from optional propagated columns.  Only
+        # a signal explicitly marked ROLLING_PORTFOLIO enters rolling fences.
+        stored_rolling = stored_type == _ROLLING_LINEAGE_TYPE
+        context_values = _lineage_mapping(rolling_context)
+        context_type = str(context_values.get("lineage_type") or "").strip().upper()
+        context_has_lineage = context_type == _ROLLING_LINEAGE_TYPE
+        if not stored_rolling:
+            if context_has_lineage:
+                raise CanaryBlocked("ROLLING_LINEAGE_CONFLICT")
+            return _normalize_lineage(
+                signal_values,
+                lineage_type=_LEGACY_LINEAGE_TYPE,
+            )
+        if not context_has_lineage:
+            raise CanaryBlocked("ROLLING_LINEAGE_INCOMPLETE")
+        persisted = _normalize_lineage(
+            signal_values,
+            lineage_type=_ROLLING_LINEAGE_TYPE,
+        )
+        supplied = _normalize_lineage(
+            context_values,
+            lineage_type=_ROLLING_LINEAGE_TYPE,
+        )
+        required = (*_ROLLING_LINEAGE_FIELDS, *_ROLLING_EVIDENCE_FIELDS)
+        if any(
+            persisted.get(field) in (None, "")
+            or supplied.get(field) in (None, "")
+            for field in required
+        ):
+            raise CanaryBlocked("ROLLING_LINEAGE_INCOMPLETE")
+        for field in required:
+            if field == "risk_config_generation":
+                if int(persisted[field]) != int(supplied[field]):
+                    raise CanaryBlocked("ROLLING_LINEAGE_CONFLICT")
+            elif str(persisted[field]).strip() != str(supplied[field]).strip():
+                raise CanaryBlocked("ROLLING_LINEAGE_CONFLICT")
+        candidate_id = str(signal.get("candidate_id") or "").strip()
+        validated = self._rolling_lineage(
+            {
+                **supplied,
+                "candidate_id": candidate_id,
+            },
+            require_active=str(side).strip().upper() == "BUY",
+            side=side,
+        )
+        current = self.store.load_current_portfolio_selection()
+        members = current.get("members", ()) if isinstance(current, Mapping) else ()
+        member = next(
+            (
+                item
+                for item in members
+                if isinstance(item, Mapping)
+                and str(item.get("strategy_version_id") or "").strip()
+                == str(validated.get("strategy_version_id") or "").strip()
+            ),
+            None,
+        )
+        if member is None:
+            raise CanaryBlocked("ROLLING_STRATEGY_NOT_SELECTED")
+        try:
+            member_allocation = Decimal(str(member.get("allocation") or "0"))
+        except (TypeError, ValueError, ArithmeticError) as exc:
+            raise CanaryBlocked("ROLLING_MEMBER_NOT_ACTIVE") from exc
+        if not member_allocation.is_finite() or member_allocation < 0:
+            raise CanaryBlocked("ROLLING_MEMBER_NOT_ACTIVE")
+        supplied_allocation = context_values.get("allocation")
+        if supplied_allocation not in (None, ""):
+            try:
+                context_allocation = Decimal(str(supplied_allocation))
+            except (TypeError, ValueError, ArithmeticError) as exc:
+                raise CanaryBlocked("ROLLING_LINEAGE_INVALID") from exc
+            if (
+                not context_allocation.is_finite()
+                or context_allocation < 0
+                or context_allocation != member_allocation
+            ):
+                raise CanaryBlocked("ROLLING_SELECTION_CHANGED")
+        validated["allocation"] = str(member_allocation)
+        return validated
+
+
+
 
     def invalidate_eligibility(
         self,
@@ -6918,6 +7508,7 @@ class CanaryService:
         evidence = result.get("evidence")
         if not isinstance(evidence, Mapping):
             evidence = {}
+        lineage = _normalize_lineage(result.get("lineage"))
         signal_json = (
             json.dumps(dict(signal), sort_keys=True, separators=(",", ":"), allow_nan=False)
             if isinstance(signal, Mapping)
@@ -6934,8 +7525,11 @@ class CanaryService:
             self.store.connection.execute(
                 "INSERT INTO canary_signal_evaluations("
                 "evaluation_id,candidate_id,cycle_id,evaluated_at,reason_code,"
-                "market_id,signal_id,signal_json,required_health_json,evidence_json) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                "market_id,signal_id,signal_json,required_health_json,evidence_json,"
+                "strategy_version_id,research_trial_id,portfolio_selection_id,"
+                "admission_policy_id,admission_policy_version,risk_config_id,"
+                "risk_config_generation,risk_config_hash,lineage_type) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     evaluation_id,
                     candidate_id,
@@ -6947,6 +7541,8 @@ class CanaryService:
                     signal_json,
                     health_json,
                     evidence_json,
+                    *(lineage[field] for field in _ROLLING_LINEAGE_FIELDS),
+                    lineage["lineage_type"],
                 ),
             )
             self.store.connection.execute(
@@ -6958,6 +7554,7 @@ class CanaryService:
             self._prune_canary_signals()
             self.store.connection.commit()
         persisted = dict(result)
+        persisted["lineage"] = lineage
         persisted["evaluation_id"] = evaluation_id
         return persisted
 
@@ -7017,9 +7614,11 @@ class CanaryService:
         expected_price: Decimal,
         token_id: str,
         now: datetime,
+        lineage: Mapping[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         source_snapshot_id = str(current_row.get("snapshot_id") or "").strip()
         source_timestamp = parse_timestamp(current_row.get("source_timestamp"))
+        lineage = _normalize_lineage(lineage)
         if not source_snapshot_id or source_timestamp is None:
             return None
         side = "BUY"
@@ -7169,14 +7768,23 @@ class CanaryService:
                         "scope_resolution_id": _canary_resolution_attr(
                             scope_resolution_row, "resolution_id"
                         ),
-                        "market_metadata_provenance": dict(scope_provenance),
                     }
+                    if lineage["lineage_type"] == _ROLLING_LINEAGE_TYPE:
+                        evidence.update(
+                            {
+                                field: lineage.get(field)
+                                for field in _ROLLING_EVIDENCE_FIELDS
+                            }
+                        )
                     self.store.connection.execute(
                         "INSERT INTO canary_signals("
                         "signal_id,candidate_id,frozen_hash,strategy_hash,model_hash,config_hash,"
                         "market_id,token_id,outcome,side,paper_expected_price,source_snapshot_id,"
-                        "source_timestamp,generated_at,expires_at,status,reason,evidence_json,updated_at) "
-                        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        "source_timestamp,generated_at,expires_at,status,reason,evidence_json,"
+                        "strategy_version_id,research_trial_id,portfolio_selection_id,"
+                        "admission_policy_id,admission_policy_version,risk_config_id,"
+                        "risk_config_generation,risk_config_hash,lineage_type,updated_at) "
+                        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                         (
                             signal_id,
                             binding["candidate_id"],
@@ -7196,6 +7804,8 @@ class CanaryService:
                             "READY",
                             None,
                             json.dumps(evidence, sort_keys=True, allow_nan=False),
+                            *(lineage[field] for field in _ROLLING_LINEAGE_FIELDS),
+                            lineage["lineage_type"],
                             now.isoformat(),
                         ),
                     )
@@ -7205,12 +7815,20 @@ class CanaryService:
         if existing_signal is not None:
             return existing_signal
         return self.get_signal(signal_id)
-
     def evaluate_signal(
         self,
         candidate_id: str,
         *,
         cycle_id: str | None = None,
+        rolling_context: Mapping[str, Any] | None = None,
+        strategy_version_id: str | None = None,
+        research_trial_id: str | None = None,
+        portfolio_selection_id: str | None = None,
+        admission_policy_id: str | None = None,
+        admission_policy_version: str | None = None,
+        risk_config_id: str | None = None,
+        risk_config_generation: int | None = None,
+        risk_config_hash: str | None = None,
     ) -> dict[str, Any]:
         """Evaluate one candidate from authorized persisted forward evidence."""
         now = ensure_utc(self.clock())
@@ -7218,6 +7836,19 @@ class CanaryService:
         if not identifier:
             identifier = str(candidate_id)
         evaluated_at = now.isoformat()
+        lineage_source = _lineage_mapping(rolling_context)
+        lineage_source["candidate_id"] = identifier
+        lineage = self._rolling_lineage(
+            lineage_source,
+            strategy_version_id=strategy_version_id,
+            research_trial_id=research_trial_id,
+            portfolio_selection_id=portfolio_selection_id,
+            admission_policy_id=admission_policy_id,
+            admission_policy_version=admission_policy_version,
+            risk_config_id=risk_config_id,
+            risk_config_generation=risk_config_generation,
+            risk_config_hash=risk_config_hash,
+        )
         cycle = str(cycle_id).strip() if cycle_id is not None else None
 
         def finish(
@@ -7239,6 +7870,7 @@ class CanaryService:
                     dict(required_health) if isinstance(required_health, Mapping) else {}
                 ),
                 "evidence": dict(evidence) if isinstance(evidence, Mapping) else {},
+                "lineage": lineage,
             }
             return self._persist_signal_evaluation(result)
 
@@ -7405,6 +8037,13 @@ class CanaryService:
             "required_health_reason_code": required_health.get("reason_code"),
             "required_market_count": required_health.get("required_market_count"),
         }
+        if lineage["lineage_type"] == _ROLLING_LINEAGE_TYPE:
+            evidence.update(
+                {
+                    field: lineage.get(field)
+                    for field in _ROLLING_EVIDENCE_FIELDS
+                }
+            )
         evidence.update(
             {
                 "plan_hash": scope_binding.get("plan_hash"),
@@ -7929,6 +8568,7 @@ class CanaryService:
                 expected_price=expected_price,
                 token_id=token_id,
                 now=now,
+                lineage=lineage,
             )
             if signal is None:
                 record_failure(
@@ -7960,8 +8600,6 @@ class CanaryService:
         # Keep exact diagnostics for declared targets that requirements
         # intentionally omitted, but never run snapshot/model/strategy
         # evaluation for them.  Append these after the executable loop so
-        # permitted-market order remains the tie-breaker for executable
-        # failures, matching the historical bounded-scan ordering.
         for declared_market_id in declared_market_ids:
             if declared_market_id in market_ids:
                 continue
@@ -8025,9 +8663,33 @@ class CanaryService:
             evidence=evidence,
         )
 
-    def generate_signal(self, candidate_id: str) -> Mapping[str, Any] | None:
+    def generate_signal(
+        self,
+        candidate_id: str,
+        *,
+        rolling_context: Mapping[str, Any] | None = None,
+        strategy_version_id: str | None = None,
+        research_trial_id: str | None = None,
+        portfolio_selection_id: str | None = None,
+        admission_policy_id: str | None = None,
+        admission_policy_version: str | None = None,
+        risk_config_id: str | None = None,
+        risk_config_generation: int | None = None,
+        risk_config_hash: str | None = None,
+    ) -> Mapping[str, Any] | None:
         """Compatibility wrapper around :meth:`evaluate_signal`."""
-        result = self.evaluate_signal(candidate_id)
+        result = self.evaluate_signal(
+            candidate_id,
+            rolling_context=rolling_context,
+            strategy_version_id=strategy_version_id,
+            research_trial_id=research_trial_id,
+            portfolio_selection_id=portfolio_selection_id,
+            admission_policy_id=admission_policy_id,
+            admission_policy_version=admission_policy_version,
+            risk_config_id=risk_config_id,
+            risk_config_generation=risk_config_generation,
+            risk_config_hash=risk_config_hash,
+        )
         signal = result.get("signal") if isinstance(result, Mapping) else None
         return dict(signal) if isinstance(signal, Mapping) else None
 
@@ -8137,6 +8799,7 @@ class CanaryService:
         signal_id: str,
         *,
         venue: CanaryVenue,
+        rolling_context: Mapping[str, Any] | None = None,
         allow_test_venue: bool = False,
         allow_environment: bool | None = None,
     ) -> dict[str, Any]:
@@ -8255,12 +8918,23 @@ class CanaryService:
             self._invalidate_signal(signal_id, "SCOPE_RESOLUTION_TOKEN_MISMATCH")
             raise CanaryBlocked("SCOPE_RESOLUTION_TOKEN_MISMATCH")
         control_snapshot = self.authoritative_status()
+        rolling_signal = (
+            str(signal.get("lineage_type") or "").strip().upper()
+            == _ROLLING_LINEAGE_TYPE
+        )
         if control_snapshot.get("micro_live_canary") == AUTONOMOUS_MICRO_LIVE:
             control_candidate = str(
                 control_snapshot.get("control_candidate") or ""
             ).strip()
             signal_candidate = str(signal.get("candidate_id") or "").strip()
-            if not control_candidate or not signal_candidate or control_candidate != signal_candidate:
+            if (
+                not rolling_signal
+                and (
+                    not control_candidate
+                    or not signal_candidate
+                    or control_candidate != signal_candidate
+                )
+            ):
                 self._invalidate_signal(signal_id, "AUTO_CANARY_CANDIDATE_NOT_SELECTED")
                 raise CanaryBlocked("AUTO_CANARY_CANDIDATE_NOT_SELECTED")
         requirements: Mapping[str, Any] = {
@@ -8405,6 +9079,11 @@ class CanaryService:
             )
             self._invalidate_signal(signal_id, reason)
             raise CanaryBlocked(reason)
+        submission_lineage = self._submission_lineage(
+            signal,
+            rolling_context=rolling_context,
+            side=str(signal["side"]),
+        )
         return self.submit(
             signal_id=str(signal["signal_id"]),
             candidate_id=str(signal["candidate_id"]),
@@ -8413,6 +9092,7 @@ class CanaryService:
             side=str(signal["side"]),
             paper_expected_price=Decimal(str(signal["paper_expected_price"])),
             venue=venue,
+            rolling_context=submission_lineage,
             allow_test_venue=allow_test_venue,
             allow_environment=allow_environment,
         )
@@ -9020,12 +9700,26 @@ class CanaryService:
                 connection.execute(
                     "INSERT INTO canary_execution_events("
                     "execution_event_id,canary_event_id,timestamp,exchange_order_id,status,"
-                    "fill_quantity,actual_average_price,fees,latency_ms,evidence_json) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,?)",
-                    (event_key + "-recovery", event_key, ensure_utc(self.clock()).isoformat(),
-                     order_key, RECOVERY_ATTACHED, observed["filled_quantity"],
-                     None, None, None,
-                     json.dumps(evidence, sort_keys=True, separators=(",", ":"))),
+                    "fill_quantity,actual_average_price,fees,latency_ms,evidence_json,"
+                    "strategy_version_id,research_trial_id,portfolio_selection_id,"
+                    "admission_policy_id,admission_policy_version,risk_config_id,"
+                    "risk_config_generation,risk_config_hash,lineage_type) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,"
+                    "?,?,?,?,?,?,?,?,?)",
+                    (
+                        event_key + "-recovery",
+                        event_key,
+                        ensure_utc(self.clock()).isoformat(),
+                        order_key,
+                        RECOVERY_ATTACHED,
+                        observed["filled_quantity"],
+                        None,
+                        None,
+                        None,
+                        json.dumps(evidence, sort_keys=True, separators=(",", ":")),
+                        *(ledger.get(field) for field in _ROLLING_LINEAGE_FIELDS),
+                        str(ledger.get("lineage_type") or _LEGACY_LINEAGE_TYPE),
+                    ),
                 )
                 connection.commit()
             except BaseException:
@@ -10198,6 +10892,7 @@ class CanaryService:
                 "SELECT last_tick_at,last_tick_started_at,last_tick_completed_at,"
                 "last_successful_tick,last_error_code,consecutive_failures,next_retry_at,"
                 "candidates_evaluated,signals_generated,orders_attempted,"
+                "candidates_ranked,candidates_signal_checked,candidates_no_signal,"
                 "actionable_candidates_found,selected_actionable_candidate,"
                 "selected_actionable_rank,selected_actionable_score,signal_scan_cursor,"
                 "signal_scan_ranking_run_id,next_signal_scan_start_rank,next_signal_scan_end_rank,"
@@ -10340,6 +11035,7 @@ class CanaryService:
                 "signal_scan_candidate_universe_hash",
                 "signal_scan_cycle_started_at",
                 "signal_scan_cycle_completed_at",
+                "signal_scan_cycle_complete",
                 "signal_scan_checked_this_cycle",
                 "signal_scan_remaining_this_cycle",
                 "signal_scan_coverage_percentage",
@@ -11021,6 +11717,7 @@ class CanaryService:
         side: str,
         paper_expected_price: Decimal,
         venue: CanaryVenue,
+        rolling_context: Mapping[str, Any] | None = None,
         allow_test_venue: bool = False,
         allow_environment: bool | None = None,
     ) -> Mapping[str, Any]:
@@ -11035,6 +11732,7 @@ class CanaryService:
         reservation_control_state: str | None = None
         reservation_control_candidate: str | None = None
         reservation_control_expiry: str | None = None
+        submission_lineage: dict[str, Any] | None = None
         reservation_control_generation: int | None = None
 
         def block(reason: str) -> None:
@@ -11082,6 +11780,9 @@ class CanaryService:
                     snapshot.get("control_candidate") or ""
                 ).strip()
                 candidate_matches = (
+                    submission_lineage is not None
+                    and submission_lineage.get("lineage_type") == _ROLLING_LINEAGE_TYPE
+                ) or (
                     bool(control_candidate)
                     and bool(str(candidate_id).strip())
                     and control_candidate == str(candidate_id).strip()
@@ -11528,7 +12229,7 @@ class CanaryService:
                         raise CanaryBlocked("CANARY_SUBMISSION_TIMEOUT")
                     network_send_started = True
 
-            return self.submit_position_order(
+            return self._submit_position_order(
                 market_version=market_version,
                 neg_risk=neg_risk,
                 asset_id=asset_id,
@@ -11538,6 +12239,12 @@ class CanaryService:
                 before_post=before_post,
                 on_send_started=mark_send_started,
                 expected_credential_fingerprint=expected_credential_fingerprint,
+                reservation_id=event_id,
+                control_generation=reservation_control_generation,
+                market_id=market_id,
+                token_id=token_id,
+                candidate_id=candidate_id,
+                lineage=submission_lineage,
             )
         def execution_parameters(
             limits: Mapping[str, Any],
@@ -11722,18 +12429,65 @@ class CanaryService:
                 "fee_rate": str(fee_rate),
                 "fee_exponent": str(fee_exponent),
                 "estimated_fees": str(estimated_fees),
-                "resolved_asset_id": resolved_asset_id,
-                "market_version": market_version,
-                "outcome_index": context.get("outcome_index"),
-                "identity_bindings": context.get("identity_bindings"),
-                "selected_token_id": context.get("token_id"),
-                "selected_position_id": context.get("position_id"),
                 "geoblock": {
                     "blocked": False,
                     "country": geo.get("country"),
                     "region": geo.get("region"),
                 },
             }
+            # Position identity is optional for legacy/test transports.  Only
+            # persist the complete identity tuple; a lone asset/token hint
+            # would make legacy migration require v1/v2 metadata it never had.
+            identity_version = str(market_version or "").strip().lower()
+            identity_token = str(
+                context.get("token_id")
+                or context.get("tokenId")
+                or context.get("selected_token_id")
+                or context.get("selectedTokenId")
+                or ""
+            ).strip()
+            identity_asset = str(
+                context.get("asset_id") or context.get("assetId") or ""
+            ).strip()
+            identity_position = str(
+                context.get("position_id")
+                or context.get("positionId")
+                or context.get("selected_position_id")
+                or context.get("selectedPositionId")
+                or ""
+            ).strip()
+            identity_bindings = context.get("identity_bindings")
+            identity_complete = (
+                identity_version in {"v1", "v2"}
+                and identity_token == str(token_id).strip()
+                and bool(identity_asset)
+                and (
+                    (
+                        identity_version == "v1"
+                        and identity_asset == identity_token
+                    )
+                    or (
+                        identity_version == "v2"
+                        and identity_position == identity_asset
+                        and context.get("outcome_index") not in (None, "")
+                        and not isinstance(context.get("outcome_index"), bool)
+                        and isinstance(identity_bindings, Sequence)
+                        and not isinstance(identity_bindings, (str, bytes, bytearray))
+                        and bool(identity_bindings)
+                    )
+                )
+            )
+            if identity_complete:
+                evidence.update(
+                    {
+                        "resolved_asset_id": resolved_asset_id,
+                        "market_version": market_version,
+                        "outcome_index": context.get("outcome_index"),
+                        "identity_bindings": context.get("identity_bindings"),
+                        "selected_token_id": context.get("token_id"),
+                        "selected_position_id": context.get("position_id"),
+                    }
+                )
             return (
                 geo,
                 context,
@@ -11755,6 +12509,11 @@ class CanaryService:
         # different candidate remains CANARY_SIGNAL_NOT_FOUND.
         enforce_controls(preflight_snapshot, state_only=True)
         stored_signal = lookup_candidate_signal()
+        submission_lineage = self._submission_lineage(
+            stored_signal,
+            rolling_context=rolling_context,
+            side=side,
+        )
         if preflight_snapshot.get("micro_live_canary") == AUTONOMOUS_MICRO_LIVE:
             stored_evidence = stored_signal.get("evidence", {})
             if (
@@ -11830,6 +12589,15 @@ class CanaryService:
                 config_generation=current_generation,
                 config_hash=current_config_hash,
                 control_generation=reservation_control_generation,
+                strategy_version_id=submission_lineage["strategy_version_id"],
+                research_trial_id=submission_lineage["research_trial_id"],
+                portfolio_selection_id=submission_lineage["portfolio_selection_id"],
+                admission_policy_id=submission_lineage["admission_policy_id"],
+                admission_policy_version=submission_lineage["admission_policy_version"],
+                risk_config_id=submission_lineage["risk_config_id"],
+                risk_config_generation=submission_lineage["risk_config_generation"],
+                risk_config_hash=submission_lineage["risk_config_hash"],
+                allocation=submission_lineage.get("allocation"),
                 detail={
                     "candidate_id": candidate_id,
                     "token_id": token_id,
@@ -11848,6 +12616,7 @@ class CanaryService:
                     event_id,
                     status=status,
                     timestamp=ensure_utc(self.clock()),
+                    detail={"candidate_id": candidate_id, "side": side.upper()},
                 )
             except Exception:
                 _LOGGER.exception(
@@ -11915,6 +12684,9 @@ class CanaryService:
                         locked_snapshot.get("control_candidate") or ""
                     ).strip()
                     candidate_matches = (
+                        submission_lineage is not None
+                        and submission_lineage.get("lineage_type") == _ROLLING_LINEAGE_TYPE
+                    ) or (
                         bool(control_candidate)
                         and bool(str(candidate_id).strip())
                         and control_candidate == str(candidate_id).strip()
@@ -11980,8 +12752,12 @@ class CanaryService:
                     "INSERT INTO canary_ledger("
                     "event_id,signal_id,timestamp,candidate_id,venue,market_id,"
                     "token_id,side,requested_notional,paper_expected_price,max_price,"
-                    "submitted_quantity,status,evidence_json,control_generation) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "submitted_quantity,status,evidence_json,control_generation,"
+                    "strategy_version_id,research_trial_id,portfolio_selection_id,"
+                    "admission_policy_id,admission_policy_version,risk_config_id,"
+                    "risk_config_generation,risk_config_hash,lineage_type) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,"
+                    "?,?,?,?,?,?,?,?,?)",
                     (
                         event_id,
                         signal_id,
@@ -11998,6 +12774,8 @@ class CanaryService:
                         "RESERVED",
                         json.dumps(evidence_record, sort_keys=True),
                         control_generation,
+                        *(submission_lineage[field] for field in _ROLLING_LINEAGE_FIELDS),
+                        submission_lineage["lineage_type"],
                     ),
                 )
                 if stored_signal is not None:
@@ -12049,9 +12827,15 @@ class CanaryService:
                         control["candidate_id"] or ""
                     ).strip()
                     if (
-                        not control_candidate
-                        or not str(candidate_id).strip()
-                        or control_candidate != str(candidate_id).strip()
+                        (
+                            submission_lineage is None
+                            or submission_lineage.get("lineage_type") != _ROLLING_LINEAGE_TYPE
+                        )
+                        and (
+                            not control_candidate
+                            or not str(candidate_id).strip()
+                            or control_candidate != str(candidate_id).strip()
+                        )
                     ):
                         block("AUTO_CANARY_CANDIDATE_NOT_SELECTED")
                 elif str(control["candidate_id"]) != candidate_id:
@@ -12174,6 +12958,15 @@ class CanaryService:
                 config_generation=current_generation,
                 config_hash=current_config_hash,
                 control_generation=reservation_control_generation,
+                strategy_version_id=submission_lineage["strategy_version_id"],
+                research_trial_id=submission_lineage["research_trial_id"],
+                portfolio_selection_id=submission_lineage["portfolio_selection_id"],
+                admission_policy_id=submission_lineage["admission_policy_id"],
+                admission_policy_version=submission_lineage["admission_policy_version"],
+                risk_config_id=submission_lineage["risk_config_id"],
+                risk_config_generation=submission_lineage["risk_config_generation"],
+                risk_config_hash=submission_lineage["risk_config_hash"],
+                allocation=submission_lineage.get("allocation"),
                 detail={"market_id": market_id, "candidate_id": candidate_id},
             )
         except Exception as exc:
@@ -12274,6 +13067,10 @@ class CanaryService:
                     if control_state != reservation_control_state:
                         block("CANARY_CONTROL_CHANGED")
                     if (
+                        control_state != AUTONOMOUS_MICRO_LIVE
+                        or submission_lineage is None
+                        or submission_lineage.get("lineage_type") != _ROLLING_LINEAGE_TYPE
+                    ) and (
                         control_candidate != (reservation_control_candidate or "")
                         or control_candidate != str(candidate_id).strip()
                     ):
@@ -12332,6 +13129,16 @@ class CanaryService:
                     if not isinstance(current_signal, Mapping):
                         block("CANARY_SIGNAL_NOT_FOUND")
                     try:
+                        final_lineage = self._submission_lineage(
+                            current_signal,
+                            rolling_context=rolling_context,
+                            side=side,
+                        )
+                        if any(
+                            final_lineage.get(field) != submission_lineage.get(field)
+                            for field in (*_ROLLING_LINEAGE_FIELDS, "allocation")
+                        ):
+                            block("ROLLING_LINEAGE_CONFLICT")
                         # Keep every signal/lifecycle/scope/token check in the
                         # same writer transaction as the control fence.
                         enforce_submission_fence(required_status="SUBMITTING")
@@ -12666,7 +13473,11 @@ class CanaryService:
                         "INSERT INTO canary_execution_events("
                         "execution_event_id,canary_event_id,timestamp,exchange_order_id,"
                         "status,fill_quantity,actual_average_price,fees,latency_ms,"
-                        "evidence_json) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                        "evidence_json,strategy_version_id,research_trial_id,"
+                        "portfolio_selection_id,admission_policy_id,admission_policy_version,"
+                        "risk_config_id,risk_config_generation,risk_config_hash,lineage_type) "
+                        "VALUES(?,?,?,?,?,?,?,?,?,?,"
+                        "?,?,?,?,?,?,?,?,?)",
                         (
                             event_id + "-submitted",
                             event_id,
@@ -12678,6 +13489,8 @@ class CanaryService:
                             str(actual_fees) if actual_fees is not None else None,
                             latency_ms,
                             json.dumps(evidence_event, sort_keys=True),
+                            *(submission_lineage[field] for field in _ROLLING_LINEAGE_FIELDS),
+                            submission_lineage["lineage_type"],
                         ),
                     )
                     connection.execute(
@@ -12708,12 +13521,49 @@ class CanaryService:
                     if connection.in_transaction:
                         connection.rollback()
                     raise
+            if (
+                side.upper() == "BUY"
+                and outcome in {
+                    "ACCEPTED",
+                    "MATCHED",
+                    "PARTIALLY_FILLED",
+                    "SETTLED",
+                }
+                and submission_lineage.get("lineage_type") == _ROLLING_LINEAGE_TYPE
+            ):
+                # The transport response can already be terminal.  Read the
+                # authoritative order/trade records now so a confirmed BUY
+                # establishes its lot before the next worker tick.
+                try:
+                    from .canary_positions import reconcile_immediate_entry
+
+                    reconcile_immediate_entry(
+                        self,
+                        venue,
+                        event_id=event_id,
+                        now=received_at,
+                    )
+                except Exception:
+                    # A failed read remains an unresolved obligation; the
+                    # durable ledger/reconciliation pass will retry it.
+                    _LOGGER.exception(
+                        "immediate canary BUY reconciliation failed event=%s",
+                        event_id,
+                    )
             if risk_reservation_created and outcome == "REJECTED":
                 try:
                     self.store.release_canary_capacity(
                         event_id,
                         status="REJECTED",
                         timestamp=received_at,
+                        detail={
+                            "candidate_id": candidate_id,
+                            **{
+                                name: submission_lineage.get(name)
+                                for name in _ROLLING_LINEAGE_FIELDS
+                            },
+                            "lineage_type": submission_lineage.get("lineage_type"),
+                        },
                     )
                 except Exception as exc:
                     durable_accounting_failure(exc)
@@ -12822,22 +13672,25 @@ class CanaryService:
                     "CANARY_CONTROL_CHANGED",
                     "CANARY_CONTROL_CORRUPT",
                     "CANARY_SETTINGS_GENERATION_CHANGED",
+                    "CANARY_SUBMISSION_CONTEXT_INVALID",
+                    "CANARY_RESERVATION_INVALID",
                     "AUTONOMOUS_RISK_ENVELOPE_CORRUPT",
                     "CANARY_KILLED",
                     "CANARY_RESERVATION_FAILED",
-                    "COLLECTOR_DEGRADED",
                     "DAILY_LOSS_LIMIT",
                     "DAILY_ORDER_LIMIT",
                     "OPEN_POSITION_LIMIT",
                     "EXPOSURE_LIMIT",
                     "AUTONOMOUS_TARGET_LIMIT",
                     "EXECUTION_FEASIBILITY_MARKET_CAP",
+                    "ROLLING_LINEAGE_INCOMPLETE",
+                    "ROLLING_LINEAGE_INVALID",
+                    "ROLLING_LINEAGE_CONFLICT",
+                    "ROLLING_SELECTION_CHANGED",
+                    "ROLLING_SELECTION_UNAVAILABLE",
+                    "ROLLING_STRATEGY_NOT_SELECTED",
+                    "ROLLING_MEMBER_NOT_ACTIVE",
                     "CANARY_NOT_ARMED",
-                    "AUTO_CANARY_CANDIDATE_NOT_SELECTED",
-                    "RESEARCH_ONLY",
-                    "INVALID_POLICY",
-                    "DEFERRED_MARKETS",
-                    "CURRENT_ORDER_BOOK_REQUIRED",
                 }
                 or code.startswith("CANARY_SIGNAL_")
                 or code.startswith("CANDIDATE_")
@@ -12888,7 +13741,145 @@ class CanaryService:
             "requested_notional": str(notional),
             "production_live_execution": False,
         }
-    def submit_position_order(
+    def _record_canary_equity_mark(
+        self,
+        *,
+        mark_id: str,
+        observed_at: datetime,
+        market_id: str,
+        token_id: str,
+        side: str,
+        quantity: Decimal,
+        mark_price: Decimal,
+        cost_basis_usd: Decimal,
+        mark_fee: Decimal,
+        source: str,
+        config_id: str,
+        config_generation: int,
+        config_hash: str,
+        control_generation: int,
+        position_id: str,
+        lineage: Mapping[str, Any],
+        detail: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        """Write one mark only after rechecking owned-lot fences."""
+        if str(side).upper() != "SELL":
+            raise CanaryBlocked("CANARY_EQUITY_MARK_INVALID")
+        market = str(market_id or "").strip()
+        token = str(token_id or "").strip()
+        position = str(position_id or "").strip()
+        if not market or not token or not position:
+            raise CanaryBlocked("CANARY_EQUITY_IDENTITY_UNAVAILABLE")
+        try:
+            quantity_value = Decimal(str(quantity))
+            mark_price_value = Decimal(str(mark_price))
+            cost_basis_value = Decimal(str(cost_basis_usd))
+            mark_fee_value = Decimal(str(mark_fee))
+            requested_generation = int(config_generation)
+            requested_control_generation = int(control_generation)
+        except (TypeError, ValueError, ArithmeticError) as exc:
+            raise CanaryBlocked("CANARY_EQUITY_MARK_INVALID") from exc
+        if (
+            not quantity_value.is_finite()
+            or quantity_value <= 0
+            or not mark_price_value.is_finite()
+            or mark_price_value <= 0
+            or not cost_basis_value.is_finite()
+            or cost_basis_value < 0
+            or not mark_fee_value.is_finite()
+            or mark_fee_value < 0
+            or requested_generation <= 0
+            or requested_control_generation <= 0
+        ):
+            raise CanaryBlocked("CANARY_EQUITY_MARK_INVALID")
+        requested_config_id = str(config_id or "").strip()
+        requested_config_hash = str(config_hash or "").strip()
+        if not requested_config_id or not requested_config_hash:
+            raise CanaryBlocked("CANARY_SETTINGS_GENERATION_CHANGED")
+        current_config_id, current_generation, current_hash = self._settings_identity()
+        if (
+            current_config_id != requested_config_id
+            or current_generation != requested_generation
+            or current_hash != requested_config_hash
+        ):
+            raise CanaryBlocked("CANARY_SETTINGS_GENERATION_CHANGED")
+        lineage_type = str(lineage.get("lineage_type") or _LEGACY_LINEAGE_TYPE).strip().upper()
+        if lineage_type == _ROLLING_LINEAGE_TYPE and any(
+            lineage.get(name) in (None, "") for name in _ROLLING_LINEAGE_FIELDS
+        ):
+            raise CanaryBlocked("ROLLING_LINEAGE_INCOMPLETE")
+        with self.store._lock:
+            control = self.store.connection.execute(
+                "SELECT control_generation FROM canary_control WHERE singleton=1"
+            ).fetchone()
+            if control is None:
+                raise CanaryBlocked("CANARY_CONTROL_CORRUPT")
+            try:
+                current_control_generation = int(control["control_generation"] or 0)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise CanaryBlocked("CANARY_CONTROL_CORRUPT") from exc
+            if (
+                current_control_generation <= 0
+                or current_control_generation != requested_control_generation
+            ):
+                raise CanaryBlocked("CANARY_CONTROL_CHANGED")
+            lot = self.store.connection.execute(
+                "SELECT * FROM canary_position_lots WHERE position_id=?",
+                (position,),
+            ).fetchone()
+            if lot is None:
+                raise CanaryBlocked("CANARY_POSITION_NOT_FOUND")
+            if (
+                str(lot["market_id"] or "").strip() != market
+                or str(lot["token_id"] or "").strip() != token
+                or str(lot["status"] or "").upper()
+                not in {"OPEN", "EXIT_PENDING", "MANAGEMENT_BLOCKED"}
+            ):
+                raise CanaryBlocked("CANARY_EQUITY_IDENTITY_CONFLICT")
+            try:
+                owned = Decimal(str(lot["quantity"] or "0")) - Decimal(
+                    str(lot["sold_quantity"] or "0")
+                )
+            except (TypeError, ValueError, ArithmeticError) as exc:
+                raise CanaryBlocked("CANARY_EQUITY_IDENTITY_UNAVAILABLE") from exc
+            if not owned.is_finite() or owned <= 0 or quantity_value > owned:
+                raise CanaryBlocked("CANARY_POSITION_UNAVAILABLE")
+            for name in _ROLLING_LINEAGE_FIELDS:
+                if lineage_type != _ROLLING_LINEAGE_TYPE:
+                    break
+                if str(lot[name] or "").strip() != str(lineage.get(name) or "").strip():
+                    raise CanaryBlocked("ROLLING_OPENING_LINEAGE_MISMATCH")
+        record_mark = getattr(self.store, "record_canary_equity_mark", None)
+        if not callable(record_mark):
+            raise CanaryBlocked("CANARY_EQUITY_MARK_UNAVAILABLE")
+        payload = dict(detail) if isinstance(detail, Mapping) else {}
+        payload.setdefault("position_id", position)
+        return record_mark(
+            mark_id=str(mark_id),
+            observed_at=observed_at,
+            market_id=market,
+            token_id=token,
+            side="SELL",
+            quantity=quantity_value,
+            mark_price=mark_price_value,
+            cost_basis_usd=cost_basis_value,
+            mark_fee=mark_fee_value,
+            source=str(source),
+            config_id=requested_config_id,
+            config_generation=requested_generation,
+            control_generation=requested_control_generation,
+            strategy_version_id=lineage.get("strategy_version_id"),
+            research_trial_id=lineage.get("research_trial_id"),
+            portfolio_selection_id=lineage.get("portfolio_selection_id"),
+            admission_policy_id=lineage.get("admission_policy_id"),
+            admission_policy_version=lineage.get("admission_policy_version"),
+            risk_config_id=lineage.get("risk_config_id"),
+            risk_config_generation=lineage.get("risk_config_generation"),
+            risk_config_hash=lineage.get("risk_config_hash"),
+            allocation=lineage.get("allocation"),
+            detail=payload,
+        )
+    def _submit_position_order(
         self,
         *,
         market_version: Any,
@@ -12900,14 +13891,91 @@ class CanaryService:
         before_post: Callable[[], None],
         on_send_started: Callable[[], None],
         expected_credential_fingerprint: str | None = None,
+        reservation_id: str,
+        control_generation: int,
+        market_id: str,
+        token_id: str,
+        candidate_id: str,
+        lineage: Mapping[str, Any],
     ) -> Mapping[str, Any]:
-        """Submit one already-fenced owned-position order through the SDK.
-
-        Position management performs ownership, settings, control, price, and
-        reservation fences.  This method is the shared signer/allowance/post
-        boundary for those exits; it never invokes SDK approval or credential
-        bootstrap flows.
-        """
+        """Submit only a reservation-bound, lineage-bound order."""
+        reservation = str(reservation_id or "").strip()
+        market = str(market_id or "").strip()
+        token = str(token_id or "").strip()
+        candidate = str(candidate_id or "").strip()
+        if not reservation or not market or not token:
+            raise CanaryBlocked("CANARY_SUBMISSION_CONTEXT_INVALID")
+        try:
+            requested_control_generation = int(control_generation)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise CanaryBlocked("CANARY_CONTROL_CORRUPT") from exc
+        if requested_control_generation <= 0 or not isinstance(lineage, Mapping):
+            raise CanaryBlocked("CANARY_SUBMISSION_CONTEXT_INVALID")
+        lineage_type = str(lineage.get("lineage_type") or _LEGACY_LINEAGE_TYPE).strip().upper()
+        if lineage_type == _ROLLING_LINEAGE_TYPE and any(
+            lineage.get(name) in (None, "") for name in _ROLLING_LINEAGE_FIELDS
+        ):
+            raise CanaryBlocked("ROLLING_LINEAGE_INCOMPLETE")
+        if lineage_type == _ROLLING_LINEAGE_TYPE and not candidate:
+            raise CanaryBlocked("ROLLING_LINEAGE_INCOMPLETE")
+        with self.store._lock:
+            control = self.store.connection.execute(
+                "SELECT control_generation FROM canary_control WHERE singleton=1"
+            ).fetchone()
+            if control is None:
+                raise CanaryBlocked("CANARY_CONTROL_CORRUPT")
+            try:
+                current_control_generation = int(control["control_generation"] or 0)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise CanaryBlocked("CANARY_CONTROL_CORRUPT") from exc
+            if current_control_generation != requested_control_generation:
+                raise CanaryBlocked("CANARY_CONTROL_CHANGED")
+            row = self.store.connection.execute(
+                "SELECT reservation_id,status,market_id,control_generation,"
+                "strategy_version_id,research_trial_id,portfolio_selection_id,"
+                "admission_policy_id,admission_policy_version,risk_config_id,"
+                "risk_config_generation,risk_config_hash,detail_json "
+                "FROM canary_risk_reservations WHERE reservation_id=?",
+                (reservation,),
+            ).fetchone()
+            if row is None:
+                raise CanaryBlocked("CANARY_RESERVATION_INVALID")
+            reservation_status = str(row["status"] or "").strip().upper()
+            if reservation_status in {
+                "RELEASED",
+                "REJECTED",
+                "CANCELED",
+                "CANCELLED",
+                "UNKNOWN",
+                "FILLED",
+                "SETTLED",
+            }:
+                raise CanaryBlocked("CANARY_RESERVATION_INVALID")
+            if str(row["market_id"] or "").strip() != market:
+                raise CanaryBlocked("CANARY_SUBMISSION_CONTEXT_INVALID")
+            try:
+                if int(row["control_generation"] or 0) != requested_control_generation:
+                    raise CanaryBlocked("CANARY_CONTROL_CHANGED")
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise CanaryBlocked("CANARY_CONTROL_CORRUPT") from exc
+            try:
+                reservation_detail = json.loads(row["detail_json"] or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise CanaryBlocked("CANARY_RESERVATION_INVALID") from exc
+            if (
+                not isinstance(reservation_detail, Mapping)
+                or str(reservation_detail.get("token_id") or "").strip() != token
+                or (
+                    lineage_type == _ROLLING_LINEAGE_TYPE
+                    and str(reservation_detail.get("candidate_id") or "").strip()
+                    != candidate
+                )
+            ):
+                raise CanaryBlocked("CANARY_SUBMISSION_CONTEXT_INVALID")
+            if lineage_type == _ROLLING_LINEAGE_TYPE:
+                for name in _ROLLING_LINEAGE_FIELDS:
+                    if str(row[name] or "").strip() != str(lineage.get(name) or "").strip():
+                        raise CanaryBlocked("ROLLING_LINEAGE_CONFLICT")
         _deny_isolated_real_transport()
         try:
             values = self.credentials.load(

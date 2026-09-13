@@ -258,7 +258,8 @@ class AutonomousWorkflowTests(unittest.TestCase):
         self._production_profile.start()
         self.addCleanup(self._production_profile.stop)
         self.store = HealthyStore(":memory:")
-        self.addCleanup(self.store.close)
+        # Keep this legacy-ranker suite on _legacy_tick; rolling authority is covered separately by rolling acceptance.
+        self.store.load_current_portfolio_selection = None
         self.store.save_dataset(
             "prediction-history",
             "v1",
@@ -715,8 +716,10 @@ class AutonomousWorkflowTests(unittest.TestCase):
             invalid = dashboard._candidate_status_fields(
                 self.store.load_candidate_lifecycle("gated")
             )
-        self.assertTrue(invalid["canary_eligible"])
+        self.assertFalse(invalid["canary_eligible"])
+        self.assertEqual(invalid["canary_status"], "NOT_ELIGIBLE")
         self.assertEqual(invalid["historical_gates"], "NOT_PASSED")
+        self.assertEqual(self.service.authoritative_status()["eligible_count"], 0)
     def test_price_proxy_is_limited_historical_fidelity(self):
         self.seed_candidate("proxy")
         quality = evaluate_prediction_data_quality(

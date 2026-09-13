@@ -54,6 +54,8 @@ class AutonomousCanaryWorker:
         self._consecutive_failures = 0
         self._next_retry_at: datetime | None = None
         self._unknown_signal_ids: set[str] = set()
+        self._rolling_cursor: dict[str, int] = {}
+        self._rolling_overlap_cursor: dict[str, tuple[str, str]] = {}
         self._last_scan_skip_reasons: dict[str, int] = {
             reason: 0 for reason in self._SCAN_SKIP_REASONS
         }
@@ -96,7 +98,8 @@ class AutonomousCanaryWorker:
             ).fetchone()
             lots = connection.execute(
                 "SELECT 1 FROM canary_position_lots "
-                "WHERE status IN ('OPEN','EXIT_PENDING') LIMIT 1"
+                "WHERE UPPER(COALESCE(status,'')) IN "
+                "('OPEN','EXIT_PENDING','MANAGEMENT_BLOCKED') LIMIT 1"
             ).fetchone()
             accounting_reader = getattr(service.store, "canary_risk_accounting", None)
             if callable(accounting_reader):
@@ -190,6 +193,8 @@ class AutonomousCanaryWorker:
                             break
         return any(item is not None for item in (ledger, reservations, attempts)) or orphan_inventory
     _SCAN_CAP = 10
+    _ROLLING_FORCE_EXIT_QUERY_LIMIT = 80
+    _ROLLING_CURSOR_MAX = 64
     _SIGNAL_REASON_CODES = (
         "READY_SIGNAL",
         "NO_STRATEGY_SIGNAL",
@@ -891,7 +896,7 @@ class AutonomousCanaryWorker:
         except Exception:
             return
 
-    def tick(self, *, now: datetime | None = None) -> dict[str, Any]:
+    def _legacy_tick(self, *, now: datetime | None = None) -> dict[str, Any]:
         """Rank once, then inspect one bounded diversity-aware signal window."""
         if not self._decision_lock.acquire(blocking=False):
             return {"status": "BUSY", "decision": "DECISION_ALREADY_IN_PROGRESS"}
@@ -1812,6 +1817,810 @@ class AutonomousCanaryWorker:
             }
         finally:
             self._decision_lock.release()
+
+    @staticmethod
+    def _rolling_member_context(
+        selection: Mapping[str, Any],
+        member: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Build the exact immutable lineage carried by every rolling action."""
+        strategy_version_id = str(member.get("strategy_version_id") or "").strip()
+        research_trial_id = str(member.get("research_trial_id") or "").strip()
+        candidate_id = str(member.get("candidate_id") or "").strip()
+        evidence_window_id = str(member.get("evidence_window_id") or "").strip()
+        evidence_digest = str(member.get("evidence_digest") or "").strip()
+        if not strategy_version_id or not research_trial_id or not candidate_id:
+            raise CanaryBlocked("ROLLING_LINEAGE_INCOMPLETE")
+        context: dict[str, Any] = {
+            "lineage_type": "ROLLING_PORTFOLIO",
+            "strategy_version_id": strategy_version_id,
+            "research_trial_id": research_trial_id,
+            "candidate_id": candidate_id,
+            "allocation": member.get("allocation"),
+            "evidence_window_id": evidence_window_id,
+            "evidence_digest": evidence_digest,
+            "portfolio_selection_id": str(
+                selection.get("portfolio_selection_id")
+                or selection.get("selection_id")
+                or ""
+            ).strip(),
+            "admission_policy_id": str(selection.get("policy_id") or "").strip(),
+            "admission_policy_version": str(
+                selection.get("policy_version") or ""
+            ).strip(),
+            "admission_policy_hash": str(
+                selection.get("policy_hash")
+                or selection.get("config_hash")
+                or (
+                    selection.get("policy_config", {}).get("config_hash")
+                    if isinstance(selection.get("policy_config"), Mapping)
+                    else ""
+                )
+                or ""
+            ).strip(),
+            "policy_hash": str(
+                selection.get("policy_hash")
+                or selection.get("config_hash")
+                or (
+                    selection.get("policy_config", {}).get("config_hash")
+                    if isinstance(selection.get("policy_config"), Mapping)
+                    else ""
+                )
+                or ""
+            ).strip(),
+            "risk_config_id": str(
+                selection.get("active_risk_config_id")
+                or selection.get("risk_config_id")
+                or ""
+            ).strip(),
+            "risk_config_generation": selection.get(
+                "active_risk_config_generation",
+                selection.get("risk_config_generation"),
+            ),
+            "risk_config_hash": str(
+                selection.get("active_risk_config_hash")
+                or selection.get("risk_config_hash")
+                or ""
+            ).strip(),
+        }
+        return context
+
+    @staticmethod
+    def _rolling_reduction_members(selection: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+        """Return bounded member identities whose opening lots must exit now."""
+        raw_members = selection.get("members", selection.get("selected_members", ()))
+        raw_removed = selection.get("removed_members", ())
+        candidates = (
+            list(raw_members) if isinstance(raw_members, (list, tuple)) else []
+        )
+        if isinstance(raw_removed, (list, tuple)):
+            candidates.extend(raw_removed)
+        reducing: list[Mapping[str, Any]] = []
+        for raw in candidates[:20]:
+            if not isinstance(raw, Mapping):
+                continue
+            status = str(raw.get("status") or "").strip().upper()
+            action = str(raw.get("action") or "").strip().upper()
+            reason = str(raw.get("reason") or "").strip().upper()
+            if (
+                action == "REDUCE"
+                or status in {"PAUSED", "REMOVED"}
+                or "OVERLAP" in reason
+                or "LOSER" in reason
+            ):
+                reducing.append(raw)
+        return reducing
+
+    @staticmethod
+    def _rolling_active_members(selection: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+        """Return only positive-allocation ACTIVE members eligible for entry."""
+        raw_members = selection.get("members", selection.get("selected_members", ()))
+        if not isinstance(raw_members, (list, tuple)):
+            return []
+        active: list[Mapping[str, Any]] = []
+        for raw in raw_members[:10]:
+            if not isinstance(raw, Mapping):
+                continue
+            try:
+                allocation = Decimal(str(raw.get("allocation") or "0"))
+            except (InvalidOperation, TypeError, ValueError, ArithmeticError):
+                continue
+            if not allocation.is_finite() or allocation <= Decimal("0"):
+                continue
+            if str(raw.get("status") or "").strip().upper() != "ACTIVE":
+                continue
+            # Keep malformed funded members in the bounded work set so the
+            # durable worker decision is BLOCKED, never silently executable.
+            active.append(raw)
+        return active
+
+    def _rolling_overlap_loser_members(
+        self,
+        service: CanaryService,
+        active_members: list[Mapping[str, Any]],
+        reducing_members: list[Mapping[str, Any]],
+        *,
+        selection_id: str | None = None,
+    ) -> list[Mapping[str, Any]]:
+        """Add a bounded, paged set of persisted lots absent from the funded set.
+
+        The current selection only contains the latest funded members.  An
+        older opening can therefore disappear from that selection while its
+        position lot remains open.  Match and carry the lot's immutable
+        opening identity directly, rather than reconstructing it from current
+        selection metadata.  The keyset cursor advances over every scanned lot
+        and wraps, so a fixed oldest page cannot starve later openings.
+        """
+        _ensure_schema(service)
+        identity_fields = ("strategy_version_id", "research_trial_id", "candidate_id")
+
+        def identity(row: Mapping[str, Any]) -> tuple[str, str, str]:
+            return tuple(str(row.get(name) or "").strip() for name in identity_fields)
+
+        funded = {identity(member) for member in active_members}
+        known = {identity(member) for member in reducing_members}
+        cursor_key = str(selection_id or "").strip() or "__missing__"
+        cursor: tuple[str, str] | None = self._rolling_overlap_cursor.get(cursor_key)
+        cursor_store = getattr(self.store, "get_operator_config", None)
+        if cursor is None and callable(cursor_store):
+            try:
+                stored_cursors = cursor_store("rolling_overlap_cursor", {})
+            except Exception:
+                stored_cursors = {}
+            if isinstance(stored_cursors, Mapping):
+                stored = stored_cursors.get(cursor_key)
+                if isinstance(stored, Mapping):
+                    opened_at = str(stored.get("opened_at") or "")
+                    position_id = str(stored.get("position_id") or "")
+                    if opened_at or position_id:
+                        cursor = (opened_at, position_id)
+                elif isinstance(stored, (list, tuple)) and len(stored) == 2:
+                    opened_at = str(stored[0] or "")
+                    position_id = str(stored[1] or "")
+                    if opened_at or position_id:
+                        cursor = (opened_at, position_id)
+
+        base_query = (
+            "SELECT strategy_version_id,research_trial_id,candidate_id,"
+            "portfolio_selection_id,admission_policy_id,admission_policy_version,"
+            "risk_config_id,risk_config_generation,risk_config_hash,lineage_type,"
+            "position_id,status,quantity,sold_quantity,pending_exit_quantity,"
+            "opened_at "
+            "FROM canary_position_lots "
+            "WHERE UPPER(COALESCE(lineage_type,''))='ROLLING_PORTFOLIO' "
+            "AND UPPER(COALESCE(status,'')) IN "
+            "('OPEN','EXIT_PENDING','MANAGEMENT_BLOCKED') "
+        )
+        with self.store._lock:
+            if cursor is None:
+                rows = self.store.connection.execute(
+                    base_query
+                    + "ORDER BY opened_at,position_id LIMIT ?",
+                    (self._ROLLING_FORCE_EXIT_QUERY_LIMIT,),
+                ).fetchall()
+            else:
+                rows = self.store.connection.execute(
+                    base_query
+                    + "AND (opened_at > ? OR "
+                    "(opened_at=? AND position_id>?)) "
+                    "ORDER BY opened_at,position_id LIMIT ?",
+                    (
+                        cursor[0],
+                        cursor[0],
+                        cursor[1],
+                        self._ROLLING_FORCE_EXIT_QUERY_LIMIT,
+                    ),
+                ).fetchall()
+                if len(rows) < self._ROLLING_FORCE_EXIT_QUERY_LIMIT:
+                    remaining = self._ROLLING_FORCE_EXIT_QUERY_LIMIT - len(rows)
+                    rows = list(rows) + list(
+                        self.store.connection.execute(
+                            base_query
+                            + "AND (opened_at < ? OR "
+                            "(opened_at=? AND position_id<=?)) "
+                            "ORDER BY opened_at,position_id LIMIT ?",
+                            (cursor[0], cursor[0], cursor[1], remaining),
+                        ).fetchall()
+                    )
+        if rows:
+            last = rows[-1]
+            next_cursor = (
+                str(last["opened_at"] or ""),
+                str(last["position_id"] or ""),
+            )
+            self._rolling_overlap_cursor.pop(cursor_key, None)
+            self._rolling_overlap_cursor[cursor_key] = next_cursor
+            while len(self._rolling_overlap_cursor) > self._ROLLING_CURSOR_MAX:
+                self._rolling_overlap_cursor.pop(next(iter(self._rolling_overlap_cursor)))
+            cursor_setter = getattr(self.store, "set_operator_config", None)
+            if callable(cursor_setter):
+                try:
+                    stored = (
+                        cursor_store("rolling_overlap_cursor", {})
+                        if callable(cursor_store)
+                        else {}
+                    )
+                    stored = dict(stored) if isinstance(stored, Mapping) else {}
+                    stored.pop(cursor_key, None)
+                    stored[cursor_key] = {
+                        "opened_at": next_cursor[0],
+                        "position_id": next_cursor[1],
+                    }
+                    while len(stored) > self._ROLLING_CURSOR_MAX:
+                        stored.pop(next(iter(stored)))
+                    cursor_setter("rolling_overlap_cursor", stored)
+                except Exception:
+                    pass
+        losers: list[Mapping[str, Any]] = []
+        for row in rows:
+            lot = dict(row)
+            lot_identity = identity(lot)
+            if (
+                not all(lot_identity)
+                or lot_identity in funded
+                or lot_identity in known
+            ):
+                continue
+            try:
+                remaining = Decimal(str(lot.get("quantity") or "0")) - Decimal(
+                    str(lot.get("sold_quantity") or "0")
+                )
+                pending = Decimal(str(lot.get("pending_exit_quantity") or "0"))
+            except (InvalidOperation, TypeError, ValueError, ArithmeticError):
+                continue
+            if not remaining.is_finite() or not pending.is_finite() or remaining <= pending:
+                continue
+            lot.update(
+                {
+                    "action": "REDUCE",
+                    "status": "REDUCE",
+                    "reason": "OVERLAP_LOSER",
+                }
+            )
+            losers.append(lot)
+            known.add(lot_identity)
+        return losers
+
+    @staticmethod
+    def _rolling_candidate_id(member: Mapping[str, Any]) -> str:
+        candidate_id = str(member.get("candidate_id") or "").strip()
+        if not candidate_id:
+            raise CanaryBlocked("ROLLING_LINEAGE_INCOMPLETE")
+        return candidate_id
+
+
+
+    @staticmethod
+    def _rolling_global_blocker(reason: Any) -> bool:
+        text = str(reason or "").strip().upper()
+        if not text:
+            return False
+        return any(
+            token in text
+            for token in (
+                "ACCOUNT",
+                "RISK",
+                "BUDGET",
+                "LIMIT",
+                "CONTROL",
+                "RECONCILIATION",
+                "POSITION_OBLIGATION",
+                "CREDENTIAL",
+                "LINEAGE",
+                "CANARY_KILLED",
+                "CANARY_NOT_ARMED",
+                "ENTRY_PAUSED",
+                "DISARMED",
+            )
+        )
+
+    def _rolling_selection(self) -> Mapping[str, Any] | None:
+        loader = getattr(self.store, "load_current_portfolio_selection", None)
+        if not callable(loader):
+            return None
+        result = loader()
+        return result if isinstance(result, Mapping) else None
+
+    def _remember_rolling_cursor(self, selection_id: str, cursor: int) -> None:
+        """Keep only the deterministic recent rolling-selection cursor window."""
+        if not selection_id:
+            return
+        # Reinsert existing IDs so recency is explicit and independent of
+        # whether the mapping implementation preserves assignment order.
+        self._rolling_cursor.pop(selection_id, None)
+        self._rolling_cursor[selection_id] = int(cursor)
+        while len(self._rolling_cursor) > self._ROLLING_CURSOR_MAX:
+            self._rolling_cursor.pop(next(iter(self._rolling_cursor)))
+
+    def _record_rolling_blocked(
+        self,
+        service: CanaryService,
+        *,
+        timestamp: datetime,
+        decision: str,
+        blocker: str,
+        status: str = "DEGRADED",
+        portfolio_selection_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Persist a fail-closed rolling decision and clear live truth."""
+        try:
+            with self.store._lock, self.store.connection:
+                row = self.store.connection.execute(
+                    "SELECT state,control_generation FROM canary_control "
+                    "WHERE singleton=1"
+                ).fetchone()
+                state = str(row["state"] or "").upper() if row is not None else ""
+                if state == "KILLED":
+                    decision, blocker, status = "KILL_LATCHED", "CANARY_KILLED", "KILLED"
+                elif state in {"ENTRY_PAUSED", "PAUSED"}:
+                    decision, blocker, status = "ENTRY_PAUSED", "ENTRY_PAUSED", "ENTRY_PAUSED"
+                elif state == "DISARMED":
+                    decision, blocker, status = "DISARMED", "CANARY_NOT_ARMED", "DISARMED"
+                if state == AUTONOMOUS_MICRO_LIVE:
+                    try:
+                        generation = int(row["control_generation"] or 0)
+                    except (TypeError, ValueError, OverflowError):
+                        generation = 0
+                    self.store.connection.execute(
+                        "UPDATE canary_control SET state='ENTRY_PAUSED',"
+                        "candidate_id=NULL,updated_at=?,control_generation=? "
+                        "WHERE singleton=1",
+                        (
+                            ensure_utc(timestamp).isoformat(),
+                            max(1, generation + 1),
+                        ),
+                    )
+            service.record_autonomous_decision(
+                next_decision=decision,
+                blocker=blocker,
+                worker_status=status,
+                timestamp=timestamp,
+                candidates_evaluated=0,
+                signals_generated=0,
+                orders_attempted=0,
+                candidates_ranked=0,
+                candidates_signal_checked=0,
+                actionable_candidates_found=0,
+                selected_actionable_candidate=None,
+                publish=True,
+            )
+        except Exception:
+            pass
+        return {
+            "status": status,
+            "decision": decision,
+            "blocker": blocker,
+            "portfolio_selection_id": portfolio_selection_id,
+            "active_members": 0,
+            "evaluated_members": 0,
+            "ready_members": 0,
+            "submissions": [],
+            "paper_only": True,
+            "live_execution": False,
+        }
+    def _rolling_tick(self, *, now: datetime | None = None) -> dict[str, Any]:
+        """Evaluate every active rolling member with a fair bounded cursor.
+
+        Rolling selection, rather than the historical singleton canary winner, is
+        the only execution authority on this path.  Every member is evaluated
+        once per bounded tick; a member-local blocker does not starve its peers.
+        """
+        if not self._decision_lock.acquire(blocking=False):
+            return {"status": "BUSY", "decision": "DECISION_ALREADY_IN_PROGRESS"}
+        timestamp = ensure_utc(now or self.clock())
+        service: CanaryService | None = None
+        selection: Mapping[str, Any] | None = None
+        position_reconciliation: Mapping[str, Any] = {}
+        position_management: Mapping[str, Any] = {}
+        position_blocker: str | None = None
+        evaluated: list[dict[str, Any]] = []
+        ready: list[tuple[Mapping[str, Any], Mapping[str, Any], dict[str, Any]]] = []
+        submissions: list[dict[str, Any]] = []
+        global_blocker: str | None = None
+        selection_blocker: str | None = None
+        try:
+            service = CanaryService(self.store, clock=self.clock)
+            selection_error_type: str | None = None
+            selection_missing = False
+            try:
+                selection = self._rolling_selection()
+            except Exception as exc:
+                selection = {}
+                selection_missing = True
+                selection_blocker = "ROLLING_SELECTION_UNAVAILABLE"
+                selection_error_type = type(exc).__name__
+            if selection is None:
+                selection = {}
+                selection_missing = True
+                selection_blocker = "ROLLING_SELECTION_MISSING"
+            active = self._rolling_active_members(selection)
+            selection_id = str(
+                selection.get("portfolio_selection_id")
+                or selection.get("selection_id")
+                or ""
+            ).strip()
+            if not selection_missing:
+                try:
+                    service.validate_rolling_selection_fence(selection)
+                except CanaryBlocked as exc:
+                    selection_blocker = str(exc) or "ROLLING_SELECTION_STALE"
+            if not active and selection_blocker is None:
+                selection_blocker = "ROLLING_SELECTION_EMPTY"
+            reducing = self._rolling_reduction_members(selection)
+            reducing.extend(
+                self._rolling_overlap_loser_members(
+                    service,
+                    active,
+                    reducing,
+                    selection_id=selection_id,
+                )
+            )
+            cursor = self._rolling_cursor.get(selection_id, 0)
+            cursor_store = getattr(self.store, "get_operator_config", None)
+            if callable(cursor_store):
+                try:
+                    stored_cursors = cursor_store("rolling_portfolio_cursor", {})
+                except Exception:
+                    stored_cursors = {}
+                if isinstance(stored_cursors, Mapping):
+                    try:
+                        cursor = int(stored_cursors.get(selection_id, cursor) or cursor)
+                    except (TypeError, ValueError):
+                        cursor = self._rolling_cursor.get(selection_id, 0)
+            if active:
+                cursor %= len(active)
+                ordered = active[cursor:] + active[:cursor]
+                self._remember_rolling_cursor(
+                    selection_id, (cursor + 1) % len(active)
+                )
+            else:
+                ordered = []
+                self._remember_rolling_cursor(selection_id, 0)
+            cursor_setter = getattr(self.store, "set_operator_config", None)
+            if callable(cursor_setter) and selection_id:
+                try:
+                    stored = (
+                        cursor_store("rolling_portfolio_cursor", {})
+                        if callable(cursor_store)
+                        else {}
+                    )
+                    stored = dict(stored) if isinstance(stored, Mapping) else {}
+                    stored.pop(selection_id, None)
+                    stored[selection_id] = self._rolling_cursor.get(selection_id, 0)
+                    while len(stored) > self._ROLLING_CURSOR_MAX:
+                        stored.pop(next(iter(stored)))
+                    cursor_setter("rolling_portfolio_cursor", stored)
+                except Exception:
+                    pass
+
+            if self._position_obligations(service):
+                try:
+                    service.require_current_credential_binding()
+                    venue_for_positions = self.venue_factory()
+                    position_reconciliation = reconcile_pending(
+                        service,
+                        venue_for_positions,
+                        allow_test_venue=self.allow_test_venue,
+                    )
+                    position_management = manage_positions(
+                        service,
+                        venue_for_positions,
+                        allow_test_venue=self.allow_test_venue,
+                        force_exit_members=reducing,
+                    )
+                    if str(position_reconciliation.get("status") or "").upper() == "DEGRADED":
+                        position_blocker = "CANARY_RECONCILIATION_PROVIDER_ERROR"
+                    elif str(position_management.get("status") or "").upper() == "BLOCKED":
+                        position_blocker = "CANARY_POSITION_MANAGEMENT_BLOCKED"
+                    elif self._unresolved_position_obligations(service):
+                        position_blocker = "CANARY_POSITION_OBLIGATION_UNRESOLVED"
+                except CanaryBlocked as exc:
+                    position_blocker = str(exc) or "CANARY_RECONCILIATION_BLOCKED"
+                    position_reconciliation = {
+                        "status": "DEGRADED",
+                        "blocked": 1,
+                        "requests": [{"status": "UNKNOWN", "reason": position_blocker}],
+                        "entries": [],
+                    }
+                    position_management = {
+                        "status": "BLOCKED",
+                        "blocked": position_blocker,
+                        "submitted": 0,
+                        "positions": [],
+                    }
+            else:
+                position_reconciliation = {
+                    "status": "IDLE",
+                    "reconciled": 0,
+                    "blocked": 0,
+                    "requests": [],
+                    "entries": [],
+                }
+                position_management = {
+                    "status": "IDLE",
+                    "submitted": 0,
+                    "blocked": [],
+                    "positions": [],
+                }
+            control = service.authoritative_status()
+            control_state = str(control.get("micro_live_canary") or "").upper()
+            enabled = control_state == AUTONOMOUS_MICRO_LIVE
+            control_blocker = (
+                "CANARY_KILLED"
+                if control_state == "KILLED"
+                else "ENTRY_PAUSED"
+                if control_state in {"ENTRY_PAUSED", "PAUSED"}
+                else "CANARY_NOT_ARMED"
+                if control_state != AUTONOMOUS_MICRO_LIVE
+                else None
+            )
+            if selection_blocker is not None and control_state == AUTONOMOUS_MICRO_LIVE:
+                # No current funded selection authorizes entries.  Reconcile
+                # and manage obligations first, then pause the live entry
+                # control without weakening DISARMED/KILLED precedence.
+                try:
+                    with self.store._lock, self.store.connection:
+                        row = self.store.connection.execute(
+                            "SELECT control_generation,state FROM canary_control "
+                            "WHERE singleton=1"
+                        ).fetchone()
+                        if (
+                            row is not None
+                            and str(row["state"] or "").upper()
+                            == AUTONOMOUS_MICRO_LIVE
+                        ):
+                            try:
+                                generation = int(row["control_generation"] or 0)
+                            except (TypeError, ValueError, OverflowError):
+                                generation = 0
+                            self.store.connection.execute(
+                                "UPDATE canary_control SET state='ENTRY_PAUSED',"
+                                "candidate_id=NULL,control_generation=?,updated_at=? "
+                                "WHERE singleton=1 AND state=?",
+                                (
+                                    max(1, generation + 1),
+                                    timestamp.isoformat(),
+                                    AUTONOMOUS_MICRO_LIVE,
+                                ),
+                            )
+                except Exception:
+                    pass
+            cycle_id = f"rolling-{uuid.uuid4().hex[:24]}"
+            members_to_evaluate = (
+                ordered
+                if control_blocker is None and selection_blocker is None
+                else ()
+            )
+            for member in members_to_evaluate:
+                row: dict[str, Any] = {
+                    "strategy_version_id": str(
+                        member.get("strategy_version_id") or ""
+                    ).strip(),
+                    "candidate_id": str(member.get("candidate_id") or "").strip(),
+                    "allocation": member.get("allocation"),
+                    "status": member.get("status"),
+                    "lineage": {},
+                }
+                try:
+                    context = self._rolling_member_context(selection, member)
+                    candidate_id = self._rolling_candidate_id(member)
+                    row.update(
+                        {
+                            "strategy_version_id": context["strategy_version_id"],
+                            "candidate_id": candidate_id,
+                            "lineage": dict(context),
+                        }
+                    )
+                    evaluation = service.evaluate_signal(
+                        candidate_id,
+                        cycle_id=cycle_id,
+                        rolling_context=context,
+                    )
+                except CanaryBlocked as exc:
+                    reason = str(exc) or "SIGNAL_BLOCKED"
+                    row.update({"status": "BLOCKED", "reason": reason})
+                    evaluated.append(row)
+                    if self._rolling_global_blocker(reason) and global_blocker is None:
+                        global_blocker = reason
+                    continue
+                except Exception as exc:
+                    row.update({"status": "ERROR", "reason": type(exc).__name__.upper()})
+                    evaluated.append(row)
+                    continue
+                signal = evaluation.get("signal") if isinstance(evaluation, Mapping) else None
+                row["evaluation"] = dict(evaluation) if isinstance(evaluation, Mapping) else {}
+                row["signal"] = dict(signal) if isinstance(signal, Mapping) else None
+                row["reason"] = (
+                    str((signal or {}).get("reason_code") or "").strip().upper()
+                    if isinstance(signal, Mapping)
+                    else str((evaluation or {}).get("reason_code") or "").strip().upper()
+                    if isinstance(evaluation, Mapping)
+                    else "NO_SIGNAL"
+                )
+                evaluated.append(row)
+                if (
+                    isinstance(signal, Mapping)
+                    and str(signal.get("status") or "").strip().upper() == "READY"
+                    and str(signal.get("signal_id") or "").strip()
+                ):
+                    ready.append((member, signal, context))
+
+            if control_blocker == "CANARY_KILLED":
+                decision = "KILL_LATCHED"
+                status = "KILLED"
+                global_blocker = "CANARY_KILLED"
+            elif control_blocker == "ENTRY_PAUSED":
+                decision = "ENTRY_PAUSED"
+                status = "ENTRY_PAUSED"
+                global_blocker = "ENTRY_PAUSED"
+            elif control_blocker == "CANARY_NOT_ARMED":
+                decision = "DISARMED" if control_state == "DISARMED" else "CANARY_NOT_ARMED"
+                status = "DISARMED" if control_state == "DISARMED" else "BLOCKED"
+                global_blocker = "CANARY_NOT_ARMED"
+            elif selection_blocker is not None:
+                decision = "ENTRY_PAUSED"
+                status = "ENTRY_PAUSED"
+                global_blocker = selection_blocker
+            elif not active:
+                decision = "WAIT_FOR_ACTIVE_ROLLING_MEMBER"
+                status = "NO_SELECTION"
+            elif position_blocker is not None:
+                decision = "POSITION_RECONCILIATION_BLOCKED"
+                status = "BLOCKED"
+                global_blocker = position_blocker
+            elif global_blocker is not None:
+                decision = global_blocker
+                status = "BLOCKED"
+            elif not ready:
+                decision = "WAIT_FOR_FRESH_ROLLING_SIGNAL"
+                status = "NO_SIGNAL"
+            else:
+                venue: Any | None = None
+                credentials_ok = True
+                credentials = getattr(service, "credentials", None)
+                configured = getattr(credentials, "configured", None)
+                if callable(configured):
+                    try:
+                        credentials_ok = bool(configured(allow_environment=False))
+                    except TypeError:
+                        credentials_ok = bool(configured())
+                if not credentials_ok:
+                    global_blocker = "CREDENTIALS_NOT_CONFIGURED"
+                else:
+                    try:
+                        service.require_current_credential_binding()
+                        venue = self.venue_factory()
+                    except CanaryBlocked as exc:
+                        global_blocker = str(exc) or "CREDENTIALS_NOT_CONFIGURED"
+                if global_blocker is None:
+                    for member, signal, context in ready:
+                        signal_id = str(signal.get("signal_id") or "").strip()
+                        candidate_id = str(context.get("candidate_id") or "").strip()
+                        if not candidate_id:
+                            raise CanaryBlocked("ROLLING_LINEAGE_INCOMPLETE")
+                        try:
+                            submitted = service.submit_signal(
+                                signal_id,
+                                venue=venue,
+                                allow_test_venue=self.allow_test_venue,
+                                rolling_context=context,
+                            )
+                        except CanaryBlocked as exc:
+                            reason = str(exc) or "ROLLING_SUBMISSION_BLOCKED"
+                            item = {
+                                "candidate_id": candidate_id,
+                                "strategy_version_id": context["strategy_version_id"],
+                                "signal_id": signal_id,
+                                "status": "BLOCKED",
+                                "reason": reason,
+                                "lineage": dict(context),
+                            }
+                            submissions.append(item)
+                            if self._rolling_global_blocker(reason):
+                                global_blocker = reason
+                                break
+                            continue
+                        outcome = (
+                            str(submitted.get("execution_status") or "").upper()
+                            if isinstance(submitted, Mapping)
+                            else ""
+                        )
+                        item = {
+                            "candidate_id": candidate_id,
+                            "strategy_version_id": context["strategy_version_id"],
+                            "signal_id": signal_id,
+                            "status": outcome or "UNKNOWN",
+                            "submission": dict(submitted) if isinstance(submitted, Mapping) else {},
+                            "lineage": dict(context),
+                        }
+                        submissions.append(item)
+                        if outcome not in self._SUBMISSION_SUCCESS_STATUSES and self._rolling_global_blocker(outcome):
+                            global_blocker = outcome
+                            break
+                status = "SUBMITTED" if any(
+                    item.get("status") in self._SUBMISSION_SUCCESS_STATUSES
+                    for item in submissions
+                ) else "BLOCKED"
+                decision = global_blocker or (
+                    "SUBMITTED" if status == "SUBMITTED" else "ROLLING_SUBMISSION_COMPLETE"
+                )
+            payload = {
+                "status": status,
+                "decision": decision,
+                "blocker": global_blocker,
+                "portfolio_selection_id": selection_id,
+                "active_members": len(active),
+                "reducing_members": len(reducing),
+                "evaluated_members": len(evaluated),
+                "ready_members": len(ready),
+                "evaluated": evaluated[: self._SCAN_CAP],
+                "submissions": submissions[: self._SCAN_CAP],
+                "position_reconciliation": dict(position_reconciliation),
+                "position_management": dict(position_management),
+                "position_blocker": position_blocker,
+                "rolling_cursor": self._rolling_cursor.get(selection_id, 0),
+                "lineage": {
+                    "portfolio_selection_id": selection_id,
+                    "admission_policy_id": selection.get("policy_id"),
+                    "admission_policy_version": selection.get("policy_version"),
+                    "admission_policy_hash": selection.get(
+                        "policy_hash",
+                        selection.get(
+                            "config_hash",
+                            selection.get("policy_config", {}).get("config_hash")
+                            if isinstance(selection.get("policy_config"), Mapping)
+                            else None,
+                        ),
+                    ),
+                    "risk_config_id": selection.get("active_risk_config_id", selection.get("risk_config_id")),
+                    "risk_config_generation": selection.get("active_risk_config_generation", selection.get("risk_config_generation")),
+                    "risk_config_hash": selection.get("active_risk_config_hash", selection.get("risk_config_hash")),
+                },
+                "paper_only": True,
+                "live_execution": False,
+            }
+            if selection_error_type is not None:
+                payload["error_type"] = selection_error_type
+            try:
+                service.record_autonomous_decision(
+                    next_decision=decision,
+                    selected_actionable_candidate=(
+                        str(ready[0][2].get("candidate_id") or "")
+                        if ready
+                        else None
+                    ),
+                    worker_status=(
+                        "KILLED"
+                        if decision == "KILL_LATCHED"
+                        else "DEGRADED" if global_blocker else "IDLE"
+                    ),
+                    timestamp=timestamp,
+                    candidates_evaluated=len(evaluated),
+                    signals_generated=sum(
+                        1 for row in evaluated if isinstance(row.get("signal"), Mapping)
+                    ),
+                    orders_attempted=len(submissions),
+                    candidates_ranked=len(active),
+                    candidates_signal_checked=len(evaluated),
+                    actionable_candidates_found=len(ready),
+                    publish=False,
+                )
+            except Exception:
+                pass
+            return payload
+        finally:
+            self._decision_lock.release()
+
+    def tick_rolling(self, *, now: datetime | None = None) -> dict[str, Any]:
+        """Evaluate the persisted rolling selection explicitly."""
+        return self._rolling_tick(now=now)
+
+    def tick(self, *, now: datetime | None = None) -> dict[str, Any]:
+        """Use only the durable rolling selection as execution authority."""
+        loader = getattr(self.store, "load_current_portfolio_selection", None)
+        if callable(loader):
+            return self.tick_rolling(now=now)
+        return self._legacy_tick(now=now)
 
     def run(self, stop_event: threading.Event) -> None:
         """Run immediately, then wait for the next bounded decision window."""

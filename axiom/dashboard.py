@@ -31,7 +31,7 @@ _LOGGER = logging.getLogger(__name__)
 
 from .director import research_summary
 from .domain import ensure_utc, parse_timestamp, to_record
-
+from .rolling_portfolio import _source_class
 def _reject_json_constant(value: str) -> Any:
     raise ValueError(f"non-finite JSON constant: {value}")
 
@@ -70,12 +70,38 @@ _ENDPOINTS = (
     "evidence-maturity",
     "strategy",
 )
-_V2_ENDPOINTS = ("overview-summary", "canary", "binance-canary", "datasets", "activity", "candidates", "polymarket", "hermes", "crypto-research", "crypto", "paper")
+_V2_ENDPOINTS = ("overview-summary", "canary", "rolling-portfolio", "binance-canary", "datasets", "activity", "candidates", "polymarket", "hermes", "crypto-research", "crypto", "paper")
 
 _DEFAULT_PAGE_SIZE = 25
 _PAGE_SIZE_OPTIONS = (10, 25, 50, 100)
 _MAX_PAGE_SIZE = 100
 _CANARY_ELIGIBLE_STAGES = frozenset({"FROZEN", "PAPER_FORWARD", "PAPER_PROMOTABLE"})
+_ROLLING_RISK_USAGE_FIELDS = (
+    "rolling_global_reserved_usd",
+    "rolling_global_budget_usd",
+    "rolling_strategy_reserved_usd",
+    "rolling_strategy_allocations",
+)
+_CANARY_USAGE_FIELDS = (
+    "submitted_orders",
+    "buy_filled_usd",
+    "buy_pending_usd",
+    "buy_unknown_usd",
+    "gross_daily_buy_usd",
+    "all_in_buy_reserved_usd",
+    "aggregate_open_cost_usd",
+    "aggregate_exposure_usd",
+    "open_positions",
+    "realized_loss_usd",
+    "today_realized_pnl_usd",
+    "equity_loss_usd",
+    "equity_status",
+    "risk_breaker",
+    "per_market_buy_usd",
+    "per_event_buy_usd",
+    "cumulative_buy_usd",
+    "external_flow_usd",
+)
 _PAPER_FORWARD_STAGES = frozenset({"PAPER_FORWARD", "PAPER_PROMOTABLE"})
 _BINANCE_HTTP_FORBIDDEN_ACTIONS = frozenset({"EXECUTION_PROBE", "RECONCILE_PROBE"})
 _MARKET_SCOPE_FUNNEL_STAGES = (
@@ -240,7 +266,7 @@ def _jsonable(value: Any) -> Any:
 
 def _bounded_value(value: Any, *, depth: int = 0) -> Any:
     """Compact nested persisted values before putting them on a dashboard row."""
-    if depth >= 4:
+    if depth >= 4 and isinstance(value, (Mapping, list, tuple, set, frozenset)):
         return "<truncated>"
     if isinstance(value, Mapping):
         return {
@@ -717,6 +743,24 @@ def _number_or_zero(value: Any) -> float:
         return 0.0
     return number if math.isfinite(number) else 0.0
 
+def _scan_count_is_zero(value: Any) -> bool:
+    if value is None or isinstance(value, bool):
+        return False
+    try:
+        return Decimal(str(value)) == Decimal("0")
+    except (TypeError, ValueError, ArithmeticError):
+        return False
+
+
+def _clear_stale_actionable_projection(projection: Mapping[str, Any]) -> dict[str, Any]:
+    result = dict(projection)
+    if _scan_count_is_zero(result.get("actionable_candidates_found")):
+        result["selected_actionable_candidate"] = None
+        result["selected_actionable_rank"] = None
+        result["selected_actionable_score"] = None
+    return result
+
+
 
 _CANARY_SELECTION_STATUSES = frozenset({"CURRENT", "STALE", "NONE", "UNKNOWN"})
 _CANARY_AUTONOMOUS_FIELDS = (
@@ -798,7 +842,7 @@ def _canary_autonomous_projection(
                 value = _bounded_value(candidate)
                 break
         projection[name] = value
-    return projection
+    return _clear_stale_actionable_projection(projection)
 
 
 def _canary_status_projection(status: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -2364,6 +2408,952 @@ class DashboardData:
             result = self._binance_testnet_projection(result, status_raw)
         return _binance_safe_value(result)
 
+    def rolling_portfolio_data(self) -> dict[str, Any]:
+        """Project bounded rolling controller/evidence/selection state."""
+        empty = {
+            "status": "UNKNOWN",
+            "controller_status": "UNKNOWN",
+            "k": 0,
+            "actual": 0,
+            "actual_k": 0,
+            "actionable": 0,
+            "policy": {},
+            "active_policy": {},
+            "reviewed_policy": {},
+            "risk": {},
+            "controller": {"status": "UNKNOWN"},
+            "evidence": {"status": "UNKNOWN"},
+            "selection": {"status": "UNKNOWN", "k": 0, "actual_k": 0},
+            "signal": {"status": "UNKNOWN"},
+            "execution": {"status": "UNKNOWN"},
+            "active_rows": [],
+            "global_limits": {},
+            "global_limits_usage": {},
+            "rolling_usage": {},
+            "canary_usage": {},
+            "events": [],
+            "event_history": [],
+            "reason_history": [],
+            "admission_reason_history": [],
+            "replacement_reason_history": [],
+            "next_jobs": [],
+            "cold_start_requirements": [],
+            "paper_only": True,
+            "live_execution": False,
+        }
+        if self.store is None:
+            return empty
+
+        def load(method_name: str, *args: Any, **kwargs: Any) -> Any:
+            method = getattr(self.store, method_name, None)
+            if not callable(method):
+                return None
+            try:
+                return method(*args, **kwargs)
+            except Exception:
+                return None
+
+        selection = load("load_current_portfolio_selection")
+        selection = selection if isinstance(selection, Mapping) else {}
+        review_state = load("load_portfolio_review_state")
+        review_state = review_state if isinstance(review_state, Mapping) else {}
+        workers = load("list_worker_states", limit=32)
+        workers = (
+            [item for item in workers if isinstance(item, Mapping)]
+            if isinstance(workers, (list, tuple))
+            else []
+        )
+        rolling_worker = next(
+            (
+                item
+                for item in workers
+                if str(item.get("worker_name") or "") == "rolling-portfolio"
+            ),
+            {},
+        )
+        worker_payload = (
+            rolling_worker.get("payload")
+            if isinstance(rolling_worker.get("payload"), Mapping)
+            else {}
+        )
+        worker_status = str(
+            worker_payload.get("worker_status")
+            or rolling_worker.get("status")
+            or "NOT_INITIALIZED"
+        ).upper()
+
+        def member_value(member: Mapping[str, Any], payload: Mapping[str, Any], key: str) -> Any:
+            value = member.get(key)
+            return value if value is not None else payload.get(key)
+
+        def text(value: Any) -> str | None:
+            result = str(value).strip() if value is not None else ""
+            return result or None
+
+        def plural(value: Any, fallback: Any = None) -> list[str]:
+            source = value
+            if source is None or source == "":
+                source = fallback
+            if isinstance(source, (list, tuple, set, frozenset)):
+                values = source
+            elif source is None or source == "":
+                values = ()
+            else:
+                values = (source,)
+            return [str(item).strip()[:512] for item in values if str(item).strip()][:16]
+
+        members = selection.get("members", selection.get("selected_members", []))
+        members = members if isinstance(members, (list, tuple)) else []
+        evidence_loader = getattr(self.store, "list_strategy_evidence_windows", None)
+        active_rows: list[dict[str, Any]] = []
+        evidence_count = 0
+        active_member_count = 0
+
+        def recent_chronological(
+            values: Sequence[Any],
+            *,
+            limit: int,
+            timestamp_keys: tuple[str, ...],
+        ) -> list[Mapping[str, Any]]:
+            source_values: Sequence[Any] = values
+            if len(values) > 128:
+                def boundary_stamp(item: Any) -> Any:
+                    if not isinstance(item, Mapping):
+                        return None
+                    for key in timestamp_keys:
+                        stamp = parse_timestamp(item.get(key))
+                        if stamp is not None:
+                            return stamp
+                    return None
+
+                first_stamp = boundary_stamp(values[0])
+                last_stamp = boundary_stamp(values[-1])
+                source_values = (
+                    values[:128]
+                    if first_stamp is not None
+                    and last_stamp is not None
+                    and first_stamp > last_stamp
+                    else values[-128:]
+                )
+            rows = [item for item in source_values if isinstance(item, Mapping)]
+            stamped: list[tuple[Any, int, Mapping[str, Any]]] = []
+            for index, item in enumerate(rows):
+                stamp = next(
+                    (
+                        parse_timestamp(item.get(key))
+                        for key in timestamp_keys
+                        if parse_timestamp(item.get(key)) is not None
+                    ),
+                    None,
+                )
+                if stamp is None:
+                    stamped = []
+                    break
+                stamped.append((stamp, index, item))
+            if stamped:
+                rows = [
+                    item
+                    for _, _, item in sorted(
+                        stamped,
+                        key=lambda value: (value[0], value[1]),
+                    )
+                ]
+            return rows[-max(0, limit):]
+
+        def exact_evidence(
+            strategy_id: str | None,
+            evidence_window_id: str | None,
+        ) -> Mapping[str, Any]:
+            """Load one immutable window by its id, never by newest-window order."""
+            if not strategy_id or not evidence_window_id:
+                return {}
+            for accessor_name in (
+                "get_strategy_evidence_window",
+                "load_strategy_evidence_window",
+                "get_evidence_window",
+                "load_evidence_window",
+            ):
+                accessor = getattr(self.store, accessor_name, None)
+                if not callable(accessor):
+                    continue
+                for args, kwargs in (
+                    ((strategy_id, evidence_window_id), {}),
+                    ((evidence_window_id,), {}),
+                    ((), {"strategy_version_id": strategy_id, "evidence_window_id": evidence_window_id}),
+                    ((), {"evidence_window_id": evidence_window_id}),
+                ):
+                    try:
+                        result = accessor(*args, **kwargs)
+                    except TypeError:
+                        continue
+                    except Exception:
+                        result = None
+                    if (
+                        isinstance(result, Mapping)
+                        and text(result.get("evidence_window_id")) == evidence_window_id
+                    ):
+                        return result
+                    if isinstance(result, (list, tuple)):
+                        for item in result:
+                            if (
+                                isinstance(item, Mapping)
+                                and text(item.get("evidence_window_id")) == evidence_window_id
+                            ):
+                                return item
+            connection = getattr(self.store, "connection", None)
+            execute = getattr(connection, "execute", None)
+            if callable(execute):
+                try:
+                    row = execute(
+                        "SELECT * FROM strategy_evidence_windows "
+                        "WHERE evidence_window_id=? LIMIT 1",
+                        (evidence_window_id,),
+                    ).fetchone()
+                except Exception:
+                    row = None
+                if row is not None:
+                    if isinstance(row, Mapping):
+                        return row
+                    try:
+                        keys = row.keys()
+                        return {key: row[key] for key in keys}
+                    except Exception:
+                        pass
+            if callable(evidence_loader):
+                try:
+                    rows = evidence_loader(strategy_id, limit=4096)
+                except TypeError:
+                    try:
+                        rows = evidence_loader(
+                            strategy_version_id=strategy_id,
+                            limit=4096,
+                        )
+                    except Exception:
+                        rows = []
+                except Exception:
+                    rows = []
+                if isinstance(rows, (list, tuple)):
+                    return next(
+                        (
+                            item
+                            for item in rows
+                            if isinstance(item, Mapping)
+                            and text(item.get("evidence_window_id")) == evidence_window_id
+                        ),
+                        {},
+                    )
+            return {}
+
+        def evidence_payload(
+            row: Mapping[str, Any],
+        ) -> tuple[Mapping[str, Any], str | None]:
+            payload = row.get("payload")
+            if isinstance(payload, Mapping):
+                return payload, None
+            raw_payload = row.get("payload_json")
+            if raw_payload in (None, ""):
+                return {}, None
+            try:
+                decoded = json.loads(str(raw_payload))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return {}, "evidence_payload_invalid"
+            return (
+                decoded if isinstance(decoded, Mapping) else {},
+                None,
+            )
+
+        def canonical_source(value: Any) -> str | None:
+            raw = text(value)
+            if not raw:
+                return None
+            try:
+                return _source_class(raw, required=False)
+            except (TypeError, ValueError):
+                return None
+
+        for member in members[:10]:
+            if not isinstance(member, Mapping):
+                continue
+            if (
+                str(member.get("status") or "").upper() != "ACTIVE"
+                or _number_or_zero(member.get("allocation")) <= 0
+            ):
+                continue
+            active_member_count += 1
+
+            payload = member.get("payload")
+            payload = payload if isinstance(payload, Mapping) else {}
+            strategy_id = text(member_value(member, payload, "strategy_version_id"))
+            research_trial_id = text(member_value(member, payload, "research_trial_id"))
+            candidate_id = text(member_value(member, payload, "candidate_id"))
+            evidence_window_id = text(member_value(member, payload, "evidence_window_id"))
+            member_digest = text(member_value(member, payload, "evidence_digest"))
+            # Keep the member payload digest as the lineage anchor; a persisted
+            # row digest must match it rather than silently replacing it.
+            member_source_class = text(member_value(member, payload, "source_class"))
+            normalized_member_source = canonical_source(member_source_class)
+            evidence = exact_evidence(strategy_id, evidence_window_id)
+            persisted_window_id = text(evidence.get("evidence_window_id"))
+            persisted_payload, payload_error = evidence_payload(evidence)
+            persisted_strategy = text(evidence.get("strategy_version_id"))
+            persisted_trial = text(
+                evidence.get("research_trial_id")
+                or persisted_payload.get("research_trial_id")
+                or persisted_payload.get("trial_id")
+            )
+            persisted_candidate = text(
+                evidence.get("candidate_id")
+                or persisted_payload.get("candidate_id")
+            )
+            persisted_digest = text(
+                evidence.get("evidence_digest")
+                or persisted_payload.get("evidence_digest")
+            )
+            persisted_source_class = text(
+                evidence.get("source_class")
+                or persisted_payload.get("source_class")
+            )
+            normalized_persisted_source = canonical_source(persisted_source_class)
+            reasons = plural(
+                member_value(member, payload, "reasons"),
+                member_value(member, payload, "reason"),
+            )
+            admission_reasons = plural(
+                member_value(member, payload, "admission_reasons"),
+                reasons,
+            )
+            replacement_reasons = plural(
+                member_value(member, payload, "replacement_reasons"),
+                member_value(member, payload, "replacement_reason"),
+            )
+            blockers = [
+                key
+                for key, value in (
+                    ("strategy_version_id", strategy_id),
+                    ("research_trial_id", research_trial_id),
+                    ("candidate_id", candidate_id),
+                    ("evidence_window_id", evidence_window_id),
+                    ("evidence_digest", member_digest),
+                )
+                if not value
+            ]
+            if member_source_class and normalized_member_source is None:
+                blockers.append("source_class_unsupported")
+            if not evidence:
+                blockers.append(
+                    "evidence_window_not_found"
+                    if evidence_window_id
+                    else "evidence_window_id_required"
+                )
+            else:
+                if not persisted_window_id:
+                    blockers.append("evidence_window_id_missing")
+                elif persisted_window_id != evidence_window_id:
+                    blockers.append("evidence_window_id_mismatch")
+                if payload_error:
+                    blockers.append(payload_error)
+                if not persisted_strategy:
+                    blockers.append("evidence_strategy_version_id_missing")
+                elif strategy_id and persisted_strategy != strategy_id:
+                    blockers.append("evidence_strategy_version_id_mismatch")
+                if not persisted_trial:
+                    blockers.append("evidence_research_trial_id_missing")
+                elif research_trial_id and persisted_trial != research_trial_id:
+                    blockers.append("evidence_research_trial_id_mismatch")
+                if not persisted_candidate:
+                    blockers.append("evidence_candidate_id_missing")
+                elif candidate_id and persisted_candidate != candidate_id:
+                    blockers.append("evidence_candidate_id_mismatch")
+                if not persisted_digest:
+                    blockers.append("evidence_digest_missing")
+                elif member_digest and persisted_digest != member_digest:
+                    blockers.append("evidence_digest_mismatch")
+                if not persisted_source_class:
+                    blockers.append("evidence_source_class_missing")
+                elif normalized_persisted_source is None:
+                    blockers.append("evidence_source_class_unsupported")
+                elif (
+                    normalized_member_source is not None
+                    and normalized_persisted_source != normalized_member_source
+                ):
+                    blockers.append("evidence_source_class_mismatch")
+            evidence_valid = bool(evidence) and not blockers
+            if evidence_valid:
+                evidence_count += 1
+            active_rows.append(
+                {
+                    "strategy_version_id": strategy_id,
+                    "research_trial_id": research_trial_id,
+                    "candidate_id": candidate_id,
+                    "evidence_window_id": evidence_window_id,
+                    "evidence_digest": member_digest or persisted_digest,
+                    "status": str(member.get("status") or "ACTIVE").upper(),
+                    "allocation": member.get("allocation"),
+                    "executable": evidence_valid,
+                    "blockers": blockers[:16],
+                    "evidence_status": (
+                        "AVAILABLE"
+                        if evidence_valid
+                        else "MISMATCH"
+                        if evidence
+                        else "MISSING_EXACT_WINDOW"
+                    ),
+                    "actual_coverage_seconds": evidence.get(
+                        "actual_coverage_seconds",
+                        member_value(member, payload, "actual_coverage_seconds"),
+                    ),
+                    "source_class": persisted_source_class or member_source_class,
+                    "net_return": evidence.get(
+                        "allocated_capital_net_return",
+                        evidence.get(
+                            "net_return",
+                            member_value(member, payload, "net_return"),
+                        ),
+                    ),
+                    "drawdown": evidence.get(
+                        "drawdown",
+                        member_value(member, payload, "drawdown"),
+                    ),
+                    "exposure": member_value(member, payload, "exposure")
+                    or member_value(member, payload, "position_management_state")
+                    or {},
+                    "reason": member_value(member, payload, "reason"),
+                    "reasons": reasons,
+                    "admission_reasons": admission_reasons,
+                    "replacement_reasons": replacement_reasons,
+                    "next_review": selection.get(
+                        "review_due_at",
+                        review_state.get("review_due_at"),
+                    ),
+                }
+            )
+        active_rows = active_rows[:10]
+
+        selections_loader = getattr(self.store, "list_portfolio_selections", None)
+        events_raw = []
+        if callable(selections_loader):
+            try:
+                events_raw = selections_loader(limit=32)
+            except Exception:
+                events_raw = []
+        events: list[dict[str, Any]] = []
+        for event in recent_chronological(
+            events_raw if isinstance(events_raw, (list, tuple)) else [],
+            limit=32,
+            timestamp_keys=("committed_at", "selected_at"),
+        ):
+            if not isinstance(event, Mapping):
+                continue
+            event_reasons = plural(event.get("reasons"), event.get("reason"))
+            admission_reasons = plural(event.get("admission_reasons"), event_reasons)
+            replacement_reasons = plural(
+                event.get("replacement_reasons"),
+                event.get("replacement_reason"),
+            )
+            events.append(
+                {
+                    "portfolio_selection_id": event.get("portfolio_selection_id"),
+                    "selected_at": event.get("selected_at"),
+                    "committed_at": event.get("committed_at"),
+                    "k": event.get("k", len(event.get("members", ()))),
+                    "status": event.get("status", review_state.get("status")),
+                    "reason": event.get("reason"),
+                    "reasons": event_reasons,
+                    "admission_reasons": admission_reasons,
+                    "replacement_reasons": replacement_reasons,
+                }
+            )
+        events = events[-32:]
+
+        state = dict(review_state)
+        policy = state.get("policy") if isinstance(state.get("policy"), Mapping) else {}
+        active_policy = load("get_operator_config", "rolling_admission_policy_active", {})
+        active_policy = active_policy if isinstance(active_policy, Mapping) else {}
+        reviewed_policy = load("get_operator_config", "rolling_admission_policy_review", {})
+        reviewed_policy = reviewed_policy if isinstance(reviewed_policy, Mapping) else {}
+        risk = self.risk_settings_data()
+        effective_limits = (
+            risk.get("effective_limits")
+            if isinstance(risk, Mapping)
+            else {}
+        )
+        if not isinstance(effective_limits, Mapping):
+            effective_limits = risk.get("limits", {}) if isinstance(risk, Mapping) else {}
+        effective_limits = effective_limits if isinstance(effective_limits, Mapping) else {}
+        risk_usage = risk.get("usage") if isinstance(risk, Mapping) else {}
+        risk_usage = risk_usage if isinstance(risk_usage, Mapping) else {}
+
+        # CanarySettingsService exposes generic canary counters in ``usage``.
+        # Rolling budget usage is a separate risk-accounting dimension and must
+        # never be inferred from those counters or from a worker's stale
+        # display-only allocation summary.
+        accounting: Mapping[str, Any] = {}
+        accounting_sources = (
+            risk_usage,
+            risk.get("rolling_usage") if isinstance(risk, Mapping) else None,
+            risk,
+        )
+        has_persisted_rolling_usage = any(
+            isinstance(source, Mapping)
+            and any(name in source for name in _ROLLING_RISK_USAGE_FIELDS)
+            for source in accounting_sources
+        )
+        accounting_method = getattr(self.store, "canary_risk_accounting", None)
+        if not has_persisted_rolling_usage and callable(accounting_method):
+            try:
+                loaded_accounting = accounting_method(now=self.clock())
+            except TypeError:
+                try:
+                    loaded_accounting = accounting_method(self.clock())
+                except Exception:
+                    loaded_accounting = {}
+            except Exception:
+                loaded_accounting = {}
+            if isinstance(loaded_accounting, Mapping):
+                accounting = loaded_accounting
+        rolling_sources: tuple[Mapping[str, Any], ...] = tuple(
+            source
+            for source in (
+                accounting,
+                risk.get("rolling_usage") if isinstance(risk, Mapping) else None,
+                risk_usage,
+                risk,
+            )
+            if isinstance(source, Mapping)
+        )
+        rolling_usage: dict[str, Any] = {}
+        for name in _ROLLING_RISK_USAGE_FIELDS:
+            for source in rolling_sources:
+                if name in source and source.get(name) is not None:
+                    rolling_usage[name] = source.get(name)
+                    break
+        if "rolling_global_reserved_usd" in rolling_usage:
+            rolling_usage.setdefault(
+                "rolling_global_open_capital_usd",
+                rolling_usage["rolling_global_reserved_usd"],
+            )
+        canary_sources = tuple(
+            source
+            for source in (risk_usage, accounting, risk)
+            if isinstance(source, Mapping)
+        )
+        canary_usage: dict[str, Any] = {}
+        for name in _CANARY_USAGE_FIELDS:
+            for source in canary_sources:
+                if name in source and source.get(name) is not None:
+                    canary_usage[name] = source.get(name)
+                    break
+        def rolling_identity(source: Mapping[str, Any], *names: str) -> str | None:
+            for name in names:
+                value = source.get(name)
+                if value in (None, ""):
+                    continue
+                normalized = str(value).strip()
+                if normalized:
+                    return normalized
+            return None
+
+        active_policy_document = (
+            active_policy.get("policy")
+            if isinstance(active_policy.get("policy"), Mapping)
+            else {}
+        )
+        active_policy_id = rolling_identity(
+            active_policy, "policy_id", "id"
+        ) or rolling_identity(active_policy_document, "policy_id", "id")
+        active_policy_version = rolling_identity(
+            active_policy, "policy_version", "version"
+        ) or rolling_identity(
+            active_policy_document, "policy_version", "version"
+        )
+        active_policy_hash = rolling_identity(
+            active_policy, "policy_hash", "config_hash"
+        ) or rolling_identity(
+            active_policy_document, "policy_hash", "config_hash"
+        )
+        selection_policy_id = rolling_identity(
+            selection, "policy_id", "admission_policy_id"
+        )
+        selection_policy_version = rolling_identity(
+            selection, "policy_version", "admission_policy_version"
+        )
+        selection_policy_hash = rolling_identity(
+            selection, "policy_hash", "config_hash"
+        )
+        selection_policy_config = selection.get("policy_config")
+        if (
+            not selection_policy_hash
+            and isinstance(selection_policy_config, Mapping)
+        ):
+            selection_policy_hash = rolling_identity(
+                selection_policy_config, "policy_hash", "config_hash"
+            )
+        selection_fence_blockers: list[str] = []
+
+        def fence_blocker(reason: str) -> None:
+            if reason not in selection_fence_blockers:
+                selection_fence_blockers.append(reason)
+
+        if not active_policy_id:
+            fence_blocker("active_policy_id_unavailable")
+        if not active_policy_version:
+            fence_blocker("active_policy_version_unavailable")
+        if not active_policy_hash:
+            fence_blocker("active_policy_hash_unavailable")
+        if not selection_policy_id:
+            fence_blocker("selection_policy_id_missing")
+        elif active_policy_id and selection_policy_id != active_policy_id:
+            fence_blocker("selection_policy_id_mismatch")
+        if not selection_policy_version:
+            fence_blocker("selection_policy_version_missing")
+        elif active_policy_version and selection_policy_version != active_policy_version:
+            fence_blocker("selection_policy_version_mismatch")
+        persisted_policy: Mapping[str, Any] = {}
+        persisted_policy_loader = getattr(self.store, "load_admission_policy", None)
+        if (
+            callable(persisted_policy_loader)
+            and selection_policy_id
+            and selection_policy_version
+        ):
+            try:
+                loaded_policy = persisted_policy_loader(
+                    selection_policy_id,
+                    selection_policy_version,
+                )
+            except Exception:
+                loaded_policy = None
+            if isinstance(loaded_policy, Mapping):
+                persisted_policy = loaded_policy
+            else:
+                fence_blocker("persisted_policy_unavailable")
+        persisted_policy_hash = rolling_identity(
+            persisted_policy, "config_hash", "policy_hash"
+        )
+        if not selection_policy_hash and persisted_policy_hash:
+            selection_policy_hash = persisted_policy_hash
+        if not selection_policy_hash:
+            fence_blocker("selection_policy_hash_missing")
+        elif active_policy_hash and selection_policy_hash != active_policy_hash:
+            fence_blocker("selection_policy_hash_mismatch")
+        if (
+            persisted_policy_hash
+            and active_policy_hash
+            and persisted_policy_hash != active_policy_hash
+        ):
+            fence_blocker("persisted_policy_hash_mismatch")
+
+        active_risk_source = (
+            active_policy.get("risk", active_policy.get("risk_config"))
+            if isinstance(active_policy, Mapping)
+            else {}
+        )
+        active_risk_source = (
+            active_risk_source
+            if isinstance(active_risk_source, Mapping)
+            else active_policy
+        )
+        risk_names = (
+            ("risk_config_id", "active_risk_config_id"),
+            ("risk_config_generation", "active_risk_config_generation"),
+            ("risk_config_hash", "active_risk_config_hash"),
+        )
+        current_risk_names = {
+            "risk_config_id": ("config_id", "active_config_id", "settings_config_id"),
+            "risk_config_generation": (
+                "generation",
+                "config_generation",
+                "settings_generation",
+            ),
+            "risk_config_hash": ("config_hash", "active_config_hash", "settings_hash"),
+        }
+        expected_risk: dict[str, str | None] = {}
+        selected_risk: dict[str, str | None] = {}
+        current_risk: dict[str, str | None] = {}
+        for field, alias in risk_names:
+            expected_risk[field] = rolling_identity(active_risk_source, field, alias)
+            selected_risk[field] = rolling_identity(selection, field, alias)
+            current_risk[field] = rolling_identity(
+                risk,
+                *current_risk_names[field],
+            )
+            if not expected_risk[field]:
+                expected_risk[field] = current_risk[field]
+            if not expected_risk[field]:
+                fence_blocker(f"active_{field}_unavailable")
+            if not selected_risk[field]:
+                fence_blocker(f"selection_{field}_missing")
+            elif expected_risk[field] and field != "risk_config_generation":
+                if selected_risk[field] != expected_risk[field]:
+                    fence_blocker(f"selection_{field}_mismatch")
+            if (
+                current_risk[field]
+                and expected_risk[field]
+                and field != "risk_config_generation"
+                and current_risk[field] != expected_risk[field]
+            ):
+                fence_blocker(f"active_{field}_stale")
+        for source_name, source in (
+            ("selection", selected_risk),
+            ("active", expected_risk),
+            ("current", current_risk),
+        ):
+            generation = source.get("risk_config_generation")
+            try:
+                parsed_generation = int(generation) if generation is not None else 0
+            except (TypeError, ValueError, OverflowError):
+                parsed_generation = 0
+            if parsed_generation <= 0:
+                fence_blocker(f"{source_name}_risk_config_generation_invalid")
+            elif (
+                source_name != "current"
+                and current_risk["risk_config_generation"]
+            ):
+                try:
+                    current_generation = int(current_risk["risk_config_generation"])
+                except (TypeError, ValueError, OverflowError):
+                    current_generation = 0
+                if parsed_generation != current_generation:
+                    fence_blocker(
+                        f"{source_name}_risk_config_generation_mismatch"
+                    )
+        if selection_fence_blockers:
+            if "rolling_selection_stale" not in selection_fence_blockers:
+                selection_fence_blockers.insert(0, "rolling_selection_stale")
+            for row in active_rows:
+                row_blockers: list[str] = []
+                for blocker in (
+                    *selection_fence_blockers,
+                    *(row.get("blockers") or ()),
+                ):
+                    if blocker not in row_blockers:
+                        row_blockers.append(blocker)
+                row["blockers"] = row_blockers[:16]
+                row["executable"] = False
+
+        selection_id = text(
+            selection.get("portfolio_selection_id")
+            or selection.get("selection_id")
+        )
+        actual_k = len(active_rows)
+        try:
+            selected_k = min(10, max(0, int(selection.get("k", len(members)) or 0)))
+        except (TypeError, ValueError):
+            selected_k = min(10, max(0, len(members)))
+        evidence_ready = (
+            active_member_count > 0
+            and evidence_count == active_member_count
+            and not selection_fence_blockers
+        )
+        cold_start = []
+        if not selection_id or not evidence_ready:
+            cold_start = [
+                "persist_strategy_versions",
+                "persist_research_trials",
+                "persist_actual_evidence_windows",
+                "bind_exact_selection_member_evidence_window_ids",
+                "review_and_activate_admission_policy",
+                "bind_active_risk_config",
+            ]
+            if selection_fence_blockers:
+                cold_start.append("selection_policy_or_risk_stale")
+            if active_member_count and any(
+                not row.get("candidate_id") or not row.get("research_trial_id")
+                for row in active_rows
+            ):
+                cold_start.append("bind_exact_candidate_and_research_trial_ids")
+            for source in (review_state, state):
+                persisted = source.get("cold_start_requirements") if isinstance(source, Mapping) else None
+                if isinstance(persisted, (list, tuple)):
+                    for requirement in persisted[:16]:
+                        if requirement not in cold_start:
+                            cold_start.append(requirement)
+                pending = source.get("pending") if isinstance(source, Mapping) else None
+                if isinstance(pending, (list, tuple)):
+                    for requirement in pending[:16]:
+                        if requirement not in cold_start:
+                            cold_start.append(requirement)
+            cold_start = cold_start[:32]
+        status = (
+            "COLD_START"
+            if not selection_id or not evidence_ready
+            else str(state.get("status") or "CURRENT").upper()
+        )
+
+
+        risk_binding: dict[str, Any] = {}
+        for source in (selection, active_policy):
+            if not isinstance(source, Mapping):
+                continue
+            for key in (
+                "risk_config_id",
+                "active_risk_config_id",
+                "risk_config_generation",
+                "active_risk_config_generation",
+                "risk_config_hash",
+                "active_risk_config_hash",
+            ):
+                if key in source and source.get(key) is not None:
+                    risk_binding.setdefault(key, source.get(key))
+        policy_document = dict(policy) if policy else dict(active_policy)
+        policy_id = selection_policy_id or active_policy_id
+        policy_version = selection_policy_version or active_policy_version
+        policy_hash = selection_policy_hash or active_policy_hash
+
+        reason_history_raw = review_state.get("event_history", [])
+        history_rows = recent_chronological(
+            reason_history_raw if isinstance(reason_history_raw, (list, tuple)) else [],
+            limit=128,
+            timestamp_keys=("at", "timestamp", "created_at"),
+        )
+        history_projection: list[dict[str, Any]] = []
+        for event in history_rows:
+            reasons = plural(event.get("reasons"), event.get("reason"))
+            admission_reasons = plural(event.get("admission_reasons"), reasons)
+            replacement_reasons = plural(
+                event.get("replacement_reasons"),
+                event.get("replacement_reason"),
+            )
+            history_projection.append(
+                {
+                    "at": event.get("at"),
+                    "status": event.get("status"),
+                    "reason": event.get("reason"),
+                    "reasons": reasons,
+                    "admission_reasons": admission_reasons,
+                    "replacement_reasons": replacement_reasons,
+                }
+            )
+        reason_history = history_projection[-32:]
+        admission_reason_history = [
+            item for item in history_projection if item.get("admission_reasons")
+        ][-32:]
+        replacement_reason_history = [
+            item for item in history_projection if item.get("replacement_reasons")
+        ][-32:]
+
+        next_jobs: Any = None
+        for source in (
+            state,
+            review_state,
+            worker_payload,
+            worker_payload.get("rolling_portfolio")
+            if isinstance(worker_payload.get("rolling_portfolio"), Mapping)
+            else {},
+        ):
+            if isinstance(source, Mapping) and source.get("next_jobs") is not None:
+                next_jobs = source.get("next_jobs")
+                break
+        if next_jobs is None:
+            next_jobs = []
+
+        return _bounded_value(
+            {
+                "status": status,
+                "controller_status": worker_status,
+                "k": selected_k,
+                "actual": actual_k,
+                "actual_k": actual_k,
+                "actionable": sum(
+                    1 for row in active_rows if row.get("executable")
+                ),
+                "policy": policy_document,
+                "active_policy": dict(active_policy),
+                "reviewed_policy": dict(reviewed_policy),
+                "policy_identity": {
+                    "policy_id": policy_id,
+                    "version": policy_version,
+                    "config_hash": policy_hash,
+                    "active_policy_id": active_policy_id,
+                    "active_policy_version": active_policy_version,
+                    "active_policy_hash": active_policy_hash,
+                },
+                "risk": risk_binding,
+                "controller": {
+                    "status": worker_status,
+                    "worker_status": worker_status,
+                    "scheduled": bool(worker_payload.get("scheduled", True)),
+                    "last_review_at": state.get("reviewed_at"),
+                    "next_review_at": state.get(
+                        "review_due_at",
+                        selection.get("review_due_at"),
+                    ),
+                    "interval_seconds": worker_payload.get(
+                        "configured_interval_seconds"
+                    ),
+                    "blocker": state.get("blocker"),
+                },
+                "evidence": {
+                    "status": "READY" if evidence_ready else "COLD_START",
+                    "actual_coverage": state.get("actual_coverage"),
+                    "available_windows": evidence_count,
+                    "required_windows": active_member_count,
+                    "source_classes": sorted(
+                        {
+                            str(row.get("source_class"))
+                            for row in active_rows
+                            if row.get("source_class")
+                        }
+                    )[:10],
+                },
+                "selection": {
+                    "status": state.get("selection_status", status),
+                    "portfolio_selection_id": selection_id,
+                    "k": selected_k,
+                    "actual_k": actual_k,
+                    "policy_id": policy_id,
+                    "version": policy_version,
+                    "policy_version": policy_version,
+                    "config_hash": policy_hash,
+                    "risk_config_id": selected_risk["risk_config_id"],
+                    "risk_config_generation": selected_risk[
+                        "risk_config_generation"
+                    ],
+                    "risk_config_hash": selected_risk["risk_config_hash"],
+                    "blockers": selection_fence_blockers[:32],
+                },
+                "signal": {
+                    "status": state.get(
+                        "signal_status",
+                        worker_payload.get("signal_status", "UNKNOWN"),
+                    ),
+                    "evaluated_members": state.get(
+                        "evaluated_members",
+                        worker_payload.get("evaluated_members", 0),
+                    ),
+                    "ready_members": state.get(
+                        "ready_members",
+                        worker_payload.get("ready_members", 0),
+                    ),
+                    "cursor": worker_payload.get("rolling_cursor"),
+                },
+                "execution": {
+                    "status": state.get(
+                        "execution_status",
+                        worker_payload.get("execution_status", "PAPER_ONLY"),
+                    ),
+                    "paper_only": True,
+                    "live_execution": False,
+                    "submissions": worker_payload.get("submissions", []),
+                },
+                "active_rows": active_rows,
+                "global_limits": dict(effective_limits),
+                "global_limits_usage": dict(rolling_usage),
+                "rolling_usage": dict(rolling_usage),
+                "canary_usage": dict(canary_usage),
+                "events": events,
+                "event_history": reason_history,
+                "reason_history": reason_history,
+                "admission_reason_history": admission_reason_history,
+                "replacement_reason_history": replacement_reason_history,
+                "next_jobs": next_jobs,
+                "selection_blockers": selection_fence_blockers[:32],
+                "cold_start_requirements": cold_start,
+                "risk_binding": risk_binding,
+                "paper_only": True,
+                "live_execution": False,
+            }
+        )
+
     def v2_snapshot(self, endpoint: str, params: Mapping[str, Any] | None = None) -> dict[str, Any]:
         name = endpoint.strip("/")
         if name.lower().startswith("datasets/"):
@@ -2405,6 +3395,7 @@ class DashboardData:
         handlers = {
             "overview-summary": lambda _params: self.overview_summary(),
             "canary": lambda _params: self.canary_data(),
+            "rolling-portfolio": lambda _params: self.rolling_portfolio_data(),
             "binance-canary": self.binance_canary_data,
             "datasets": self.paginate_dataset_catalog,
             "activity": self.paginate_research_activity,
@@ -3010,6 +4001,7 @@ class DashboardData:
             "market_diagnostics",
             "diagnostics",
             "required_market_count",
+            "unresolved_candidates",
         }
         for source in sources:
             if isinstance(source, Mapping) and health_keys.intersection(source):
@@ -3054,7 +4046,7 @@ class DashboardData:
 
 
     def _candidate_canary_eligibility(self, candidate_id: str) -> Mapping[str, Any] | None:
-        """Read and verify the persisted eligibility binding."""
+        """Read the persisted eligibility binding evidence."""
         if self.store is None or not candidate_id:
             return None
         connection = getattr(self.store, "connection", None)
@@ -3084,6 +4076,8 @@ class DashboardData:
         return {
             "candidate_id": eligibility.get("candidate_id"),
             "eligible_at": eligibility.get("eligible_at"),
+            "frozen_hash": eligibility.get("frozen_hash"),
+            "evidence_json": eligibility.get("evidence_json"),
         }
     def _candidate_canary_eligibility_count(self) -> int:
         """Count persisted bindings that still validate against lifecycle."""
@@ -3117,21 +4111,22 @@ class DashboardData:
             )
         )
 
-
     def _candidate_status_fields(self, item: Mapping[str, Any]) -> dict[str, Any]:
         """Project persisted lifecycle/eligibility state without qualification work.
 
-        Dashboard reads must never re-run canary qualification.  The lifecycle
-        stage and the presence of a persisted eligibility row are deliberately
-        only a display projection; authoritative decisions remain in the
-        canary execution paths.
+        Dashboard reads must never re-run canary qualification.  Eligibility is
+        displayed only when its persisted evidence remains authoritatively bound
+        to the current candidate lifecycle.
         """
         candidate_id = str(item.get("candidate_id") or "").strip()
         stage = str(item.get("stage") or "").strip().upper()
         payload = item.get("payload")
         payload = payload if isinstance(payload, Mapping) else {}
         eligibility = self._candidate_canary_eligibility(candidate_id)
-        canary_eligible = bool(eligibility) and stage in _CANARY_ELIGIBLE_STAGES
+        canary_eligible = (
+            eligibility is not None
+            and _canary_eligibility_is_bound(self.store, candidate_id, eligibility)
+        )
         persisted_gates = _nested_value(
             item,
             payload,
@@ -5138,6 +6133,15 @@ class DashboardData:
             if not isinstance(value, (list, tuple, set, frozenset)):
                 return []
             return list(value)[:limit]
+        candidate_filter = (
+            {
+                str(identifier).strip()
+                for identifier in candidate_ids
+                if str(identifier).strip()
+            }
+            if candidate_ids is not None
+            else None
+        )
 
         def health_list(name: str) -> list[Any]:
             return bounded_list(health.get(name))
@@ -5170,6 +6174,99 @@ class DashboardData:
                 candidate_references[market_id] = bounded_list(refs, limit=32)
             if diagnostic.get("candidate_bound") and market_id not in candidate_bound_markets:
                 candidate_bound_markets.append(market_id)
+        if candidate_filter is not None:
+            def current_candidate_refs(values: Any) -> list[str]:
+                return [
+                    str(value).strip()
+                    for value in bounded_list(values, limit=32)
+                    if str(value).strip() in candidate_filter
+                ]
+
+            filtered_references: dict[str, list[str]] = {}
+            for market_id, values in candidate_references.items():
+                refs = current_candidate_refs(values)
+                if refs:
+                    filtered_references[market_id] = refs
+            filtered_diagnostics: list[dict[str, Any]] = []
+            for diagnostic in diagnostics:
+                market_id = str(diagnostic["market_id"])
+                refs = current_candidate_refs(diagnostic.get("candidate_references"))
+                if not refs:
+                    refs = filtered_references.get(market_id, [])
+                if not refs:
+                    continue
+                bounded_diagnostic = dict(diagnostic)
+                bounded_diagnostic["candidate_references"] = refs
+                filtered_diagnostics.append(bounded_diagnostic)
+                filtered_references.setdefault(market_id, refs)
+            candidate_references = filtered_references
+            allowed_markets = set(candidate_references)
+
+            def current_markets(values: list[Any]) -> list[Any]:
+                return [
+                    value
+                    for value in values
+                    if str(value).strip() in allowed_markets
+                ]
+
+            candidate_bound_markets = current_markets(candidate_bound_markets)
+            scheduled = current_markets(scheduled)
+            fresh = current_markets(fresh)
+            stale = current_markets(stale)
+            missing = current_markets(missing)
+            diagnostics = filtered_diagnostics
+
+        def current_candidates(values: Any) -> list[str]:
+            return [
+                str(value).strip()
+                for value in bounded_list(values)
+                if candidate_filter is None or str(value).strip() in candidate_filter
+            ]
+
+        def ordered_candidate_ids(values: Any, *, limit: int | None = None) -> list[str]:
+            """Normalize candidate IDs while keeping persisted order deterministic."""
+            if not isinstance(values, (list, tuple, set, frozenset)):
+                return []
+            iterable = (
+                sorted(values, key=lambda value: str(value))
+                if isinstance(values, (set, frozenset))
+                else values
+            )
+            result: list[str] = []
+            seen: set[str] = set()
+            for value in iterable:
+                identifier = str(value).strip()
+                if not identifier or identifier in seen:
+                    continue
+                seen.add(identifier)
+                result.append(identifier)
+                if limit is not None and len(result) >= limit:
+                    break
+            return result
+
+        persisted_scope_candidates: set[str] = set()
+        if candidate_filter is not None:
+            # ``resolution_items`` is the bounded persisted canonical scope
+            # index.  The aliases keep direct/fake funnel projections
+            # compatible without inferring scope from aggregate counts.
+            for field in ("resolution_items", "resolutions", "items"):
+                for item in bounded_list(funnel.get(field)):
+                    if not isinstance(item, Mapping):
+                        continue
+                    identifier = str(item.get("candidate_id") or "").strip()
+                    if identifier in candidate_filter:
+                        persisted_scope_candidates.add(identifier)
+            # Candidate references are the persisted market-health binding
+            # for the canonical scope; only references surviving the exact
+            # current-candidate filter may satisfy this check.
+            for values in candidate_references.values():
+                persisted_scope_candidates.update(
+                    identifier
+                    for identifier in ordered_candidate_ids(values)
+                    if identifier in candidate_filter
+                )
+
+        candidate_ids_in_order = ordered_candidate_ids(candidate_ids)
 
         def first_health(*names: str) -> Any:
             for name in names:
@@ -5179,7 +6276,9 @@ class DashboardData:
             return None
 
         required_count = first_health("required_market_count")
-        if required_count is None:
+        if candidate_filter is not None:
+            required_count = len(candidate_bound_markets)
+        elif required_count is None:
             required_count = len(candidate_bound_markets)
         try:
             required_market_count = max(0, int(required_count or 0))
@@ -5199,17 +6298,67 @@ class DashboardData:
         closed = bounded_list(health.get("closed_candidates"))
         if "closed_candidates" not in health:
             closed = bounded_list(funnel.get("closed_candidates"))
-        reason_code = first_health("reason_code")
-        if reason_code is None:
-            reason_code = (
-                "CANDIDATE_FORWARD_MARKET_UNRESOLVED"
-                if unresolved
-                else None if funnel.get("available") else "NO_PERSISTED_SCOPE_RESOLUTION"
+        if candidate_filter is not None:
+            unresolved_source = (
+                health.get("unresolved_candidates")
+                if "unresolved_candidates" in health
+                else funnel.get("unresolved_candidates")
             )
-        reason_display = reason_code or first_health("reason_display")
+            persisted_unresolved = [
+                identifier
+                for identifier in ordered_candidate_ids(unresolved_source, limit=1000)
+                if identifier in candidate_filter
+            ]
+            missing_scope = [
+                identifier
+                for identifier in candidate_ids_in_order
+                if identifier not in persisted_scope_candidates
+            ]
+            # Prioritize current candidates so the existing 1000-item bound
+            # cannot hide an unresolved current scope behind stale health.
+            unresolved = ordered_candidate_ids(
+                [*missing_scope, *persisted_unresolved],
+                limit=1000,
+            )
+            closed = current_candidates(
+                health.get("closed_candidates")
+                if "closed_candidates" in health
+                else funnel.get("closed_candidates")
+            )
+        capacity_excluded = current_candidates(
+            health.get("capacity_excluded_candidates")
+            if "capacity_excluded_candidates" in health
+            else funnel.get("capacity_excluded_candidates")
+        )
+        reason_code = first_health("reason_code")
         grade = first_health("grade")
-        if grade is None:
-            grade = "CURRENT" if funnel.get("available") else "UNKNOWN"
+        if candidate_filter is not None:
+            if capacity_excluded:
+                grade, reason_code = "D", "COLLECTOR_CAPACITY_INSUFFICIENT"
+            elif unresolved:
+                grade, reason_code = "D", "CANDIDATE_FORWARD_MARKET_UNRESOLVED"
+            elif closed:
+                grade, reason_code = "D", "CANDIDATE_MARKET_CLOSED"
+            elif missing:
+                grade, reason_code = "D", "REQUIRED_MARKETS_MISSING"
+            elif stale:
+                grade, reason_code = "C", "REQUIRED_MARKETS_STALE"
+            elif required_market_count:
+                grade, reason_code = "A", "REQUIRED_MARKETS_FRESH"
+            else:
+                grade, reason_code = "D", "CANDIDATE_FORWARD_MARKET_UNRESOLVED"
+        else:
+            if reason_code is None:
+                reason_code = (
+                    "CANDIDATE_FORWARD_MARKET_UNRESOLVED"
+                    if unresolved
+                    else None if funnel.get("available") else "NO_PERSISTED_SCOPE_RESOLUTION"
+                )
+            if grade is None:
+                grade = "CURRENT" if funnel.get("available") else "UNKNOWN"
+        reason_display = reason_code or first_health("reason_display")
+        if candidate_filter is not None:
+            reason_display = reason_code
         blocker_counts = health.get("blocker_counts", funnel_blockers)
         if not isinstance(blocker_counts, Mapping):
             blocker_counts = funnel_blockers
@@ -5238,6 +6387,7 @@ class DashboardData:
             "required_market_count": required_market_count,
             "unresolved_candidates": unresolved,
             "closed_candidates": closed,
+            "capacity_excluded_candidates": capacity_excluded,
             "as_of": first_health("as_of") or funnel.get("as_of") or timestamps.get("as_of"),
             "market_scope_funnel": funnel,
             "blocker_counts": blocker_counts,
@@ -5258,6 +6408,8 @@ class DashboardData:
                     result["market_scope_funnel"] = self.market_scope_funnel_data()
                 if "campaign_progress" not in result:
                     result["campaign_progress"] = self._campaign_progress_projection()
+                if "rolling_portfolio" not in result:
+                    result["rolling_portfolio"] = self.rolling_portfolio_data()
             return result
         market_scope_funnel = self.market_scope_funnel_data()
         if self.store is None or not callable(getattr(self.store, "dashboard_overview_summary", None)):
@@ -5266,6 +6418,7 @@ class DashboardData:
                 str(item.get("candidate_id") or "").strip()
                 for item in candidate_records
                 if str(item.get("candidate_id") or "").strip()
+                and str(item.get("stage") or "").strip().upper() in _CANARY_ELIGIBLE_STAGES
             ]
             market_scope_funnel = self._research_order_funnel(
                 market_scope_funnel,
@@ -5294,6 +6447,7 @@ class DashboardData:
                 "market_scope_funnel": market_scope_funnel,
                 "campaign_progress": campaign_progress,
                 "signal_scan_reason_counts": {},
+                "rolling_portfolio": self.rolling_portfolio_data(),
                 "live_execution": False,
             }
         aggregate = self.store.dashboard_overview_summary(activity_limit=8)
@@ -5540,6 +6694,13 @@ class DashboardData:
             worker_section if isinstance(worker_section, Mapping) else None,
             canary_report,
         )
+        if _scan_count_is_zero(canary_status.get("actionable_candidates_found")) or _scan_count_is_zero(
+            autonomous.get("actionable_candidates_found")
+        ):
+            for target in (canary_status, autonomous):
+                target["selected_actionable_candidate"] = None
+                target["selected_actionable_rank"] = None
+                target["selected_actionable_score"] = None
         canary_status["blocker"] = blocker
         canary_status["last_cycle_blocker"] = raw_blocker
         canary_status["signal_scan_reason_counts"] = signal_scan_reason_counts
@@ -5554,6 +6715,7 @@ class DashboardData:
             str(item.get("candidate_id") or "").strip()
             for item in candidate_records
             if str(item.get("candidate_id") or "").strip()
+            and str(item.get("stage") or "").strip().upper() in _CANARY_ELIGIBLE_STAGES
         ]
         market_scope_funnel = self._research_order_funnel(
             market_scope_funnel,
@@ -5746,6 +6908,7 @@ class DashboardData:
             "latest_candidates": latest_candidates,
             "candidates": latest_candidates,
             "canary": canary_status,
+            "rolling_portfolio": self.rolling_portfolio_data(),
             "canary_signal": latest_signal,
             "forward_evidence": forward_evidence,
             "research_progress": research_progress,
@@ -5939,7 +7102,17 @@ class DashboardData:
             canary_report,
         )
         market_scope_funnel = self.market_scope_funnel_data()
-        forward_evidence = self._required_forward_evidence(market_scope_funnel)
+        candidate_records = self._bounded_candidate_lifecycle()
+        candidate_ids = [
+            str(item.get("candidate_id") or "").strip()
+            for item in candidate_records
+            if str(item.get("candidate_id") or "").strip()
+            and str(item.get("stage") or "").strip().upper() in _CANARY_ELIGIBLE_STAGES
+        ]
+        forward_evidence = self._required_forward_evidence(
+            market_scope_funnel,
+            candidate_ids=candidate_ids,
+        )
         canary["blocker"] = blocker
         canary["last_cycle_blocker"] = raw_blocker
         canary["signal_scan_reason_counts"] = signal_scan_reason_counts
@@ -5947,6 +7120,13 @@ class DashboardData:
         autonomous["last_cycle_blocker"] = raw_blocker
         autonomous["signal_scan_reason_counts"] = signal_scan_reason_counts
         canary["autonomous"] = autonomous
+        if _scan_count_is_zero(canary.get("actionable_candidates_found")) or _scan_count_is_zero(
+            autonomous.get("actionable_candidates_found")
+        ):
+            for target in (canary, autonomous):
+                target["selected_actionable_candidate"] = None
+                target["selected_actionable_rank"] = None
+                target["selected_actionable_score"] = None
         canary["latest_signal"] = signal
         canary["control_state"] = control_state
         canary.setdefault("display_state", canary.get("control_state"))
@@ -6045,6 +7225,7 @@ class DashboardData:
                 else {}
             ),
             "autonomous_canary": autonomous,
+            "rolling_portfolio": self.rolling_portfolio_data(),
             "canary_signal": signal,
             "connectivity": connectivity,
             "research_cards": {
@@ -6576,7 +7757,7 @@ def _dashboard_html(
 <body>
   <header><div class="topbar"><div><div class="eyebrow">Paper-first research operations</div><h1>AXIOM / operator console</h1><p class="subtitle">Historical evidence, forward observation, and paper lifecycle in one view.</p></div><div class="live-lock">Live trading <strong>Disabled</strong><br>Paper risk engine <strong>Active</strong></div></div>
     <nav aria-label="Research sections">
-      <button class="tab active" data-view="overview">Overview</button><button class="tab" data-view="datasets">DATASETS</button><button class="tab" data-view="activity">ACTIVITY</button><button class="tab" data-view="crypto">CRYPTO RESEARCH</button><button class="tab" data-view="polymarket">Polymarket</button><button class="tab" data-view="candidates">Candidates</button><button class="tab" data-view="hermes">Hermes</button><button class="tab" data-view="portfolio">Paper Portfolio</button><button class="tab" data-view="canary">Polymarket Canary</button><button class="tab" data-view="binance-canary">__BINANCE_NAV_LABEL__</button>
+      <button class="tab active" data-view="overview">Overview</button><button class="tab" data-view="datasets">DATASETS</button><button class="tab" data-view="activity">ACTIVITY</button><button class="tab" data-view="crypto">CRYPTO RESEARCH</button><button class="tab" data-view="polymarket">Polymarket</button><button class="tab" data-view="candidates">Candidates</button><button class="tab" data-view="hermes">Hermes</button><button class="tab" data-view="portfolio">Paper Portfolio</button><button class="tab" data-view="rolling-portfolio">Rolling Portfolio</button><button class="tab" data-view="canary">Polymarket Canary</button><button class="tab" data-view="binance-canary">__BINANCE_NAV_LABEL__</button>
     </nav>
   </header>
   <main>
@@ -6600,6 +7781,7 @@ def _dashboard_html(
     <article id="candidate-detail" class="panel"><div class="section-title"><h2>Candidate detail</h2><span class="muted">historical → forward → lifecycle</span></div><div class="empty">Select a candidate to inspect evidence.</div></article>
     <section id="view-hermes" class="view"><article class="panel"><div class="section-title"><h2>Hermes / research loop</h2><span class="badge">research only · no canary control</span></div><div id="hermes-summary"></div><div class="filters"><input id="hermes-filter" placeholder="Filter queue" aria-label="Filter Hermes queue"><select id="hermes-status"><option value="">All statuses</option><option>PENDING</option><option>TESTING</option><option>COMPLETED</option><option>ACCEPTED</option><option>REJECTED</option><option>FAILED</option><option>ERROR</option></select><select id="hermes-size"><option>25</option><option>50</option><option>100</option></select></div><div id="hermes-table" class="scroll"></div><div id="hermes-pager" class="pager"></div><div id="hermes-detail"></div></article></section>
     <section id="view-portfolio" class="view"><article class="panel"><div class="section-title"><h2>Paper Portfolio</h2><span class="badge warn">paper-only · no live execution</span></div><div class="filters"><input id="paper-filter" placeholder="Filter paper records" aria-label="Filter paper records"><select id="paper-status"><option value="">All statuses</option><option>OPEN</option><option>CLOSED</option><option>RESOLVED</option><option>UNKNOWN</option></select><select id="paper-size"><option>25</option><option>50</option><option>100</option></select></div><div id="portfolio-summary"></div><div id="portfolio-states" class="scroll"></div><div id="paper-pager" class="pager"></div></article></section>
+    <section id="view-rolling-portfolio" class="view"><article class="panel"><div class="section-title"><h2>Rolling Portfolio</h2><span id="rolling-status" class="badge warn">paper-only · no live execution</span></div><div id="rolling-summary"></div><div id="rolling-members" class="scroll"></div><div id="rolling-reasons"></div><div id="rolling-jobs"></div><p class="page-note">Rolling membership is append-only and each displayed member is bound to its persisted strategy, research trial, candidate, and exact evidence window. Missing lineage remains non-executable.</p></article></section>
     <section id="view-canary" class="view"><article class="panel" style="border-color:var(--red)"><div class="section-title"><h2>REAL CANARY MONEY</h2><span class="badge bad">PRODUCTION LIVE TRADING: DISABLED</span></div><div id="canary-action-result" class="page-note"></div><div id="canary-readiness-snapshot"></div><div id="canary-controls"></div><div id="risk-settings"></div><div id="canary-connectivity"></div><div id="canary-summary"></div><div id="canary-trades" class="scroll"></div><p class="notice">Autonomous canary is independent from paper research. No secrets are stored or displayed. It remains prediction-only, bounded by active settings, and killable from this console.</p></article></section>
     <article id="canary-recovery-form" class="panel"><div class="section-title"><h2>UNKNOWN ENTRY RECOVERY</h2><span class="badge warn">READ-ONLY · PRODUCTION PROFILE</span></div><p class="page-note">Attach only an operator-supplied canonical exchange order ID. This does not post, retry, activate, or release an entry.</p><div class="three-col"><label>Event ID<input id="canary-recovery-event" autocomplete="off"></label><label>Signal ID<input id="canary-recovery-signal" autocomplete="off"></label><label>Canonical exchange order ID<input id="canary-recovery-order" autocomplete="off"></label></div><label>Exact confirmation<input id="canary-recovery-confirm" placeholder="RECOVER UNKNOWN ENTRY" autocomplete="off"></label><p class="page-note"><button id="canary-recovery-submit" class="link">Recover and reconcile</button> <span id="canary-recovery-result"></span></p></article>
     <section id="view-binance-canary" class="view binance-view"><article class="panel" style="border-color:var(--amber)"><div class="section-title"><h2>BINANCE SPOT CANARY</h2><span class="badge warn">DEVELOPMENT / PAPER|TESTNET</span></div><p class="page-note">Separate from the Polymarket canary. <strong>POLYMARKET TRANSPORT: DISABLED</strong> · Binance Spot only · no implicit control-plane construction.</p><div id="binance-action-result" class="page-note"></div><div id="binance-identity"></div><div id="binance-connectivity"></div><div id="binance-qualification"></div><div id="binance-risk"></div><div id="binance-controls"></div><div id="binance-records" class="scroll"></div><details><summary>Full Binance projection and identifiers</summary><pre id="binance-raw"></pre></details><p class="notice">Credentials are never displayed. Connectivity checks are read-only; order validation is an explicit test action. No browser action can place an order.</p></article></section>
@@ -6689,6 +7871,14 @@ def _dashboard_html(
     function renderHermes(data) { const h=operator.hermes||{},latest=operator.hermes_latest_outcome||{}; $("hermes-summary").innerHTML=`<div class="three-col"><div class="key-value"><span class="key">Submitted</span><strong>${count(h.submitted)}</strong></div><div class="key-value"><span class="key">Accepted</span><strong>${count(h.accepted)}</strong></div><div class="key-value"><span class="key">Pending</span><strong>${count(h.pending)}</strong></div><div class="key-value"><span class="key">Latest outcome</span><strong>${safe(latest.outcome_label||latest.status||"—")}</strong></div><div class="key-value"><span class="key">Selected dataset</span><strong>${safe(latest.dataset_id||"—")} / ${safe(latest.dataset_version||"—")}</strong></div></div><p class="page-note">Hermes status reflects queue execution state, not integration availability. ${safe(h.reason||"")}</p>`; $("hermes-table").innerHTML=arr(data.items).length?`<table><thead><tr>${[["item_id","Item"],["item_type","Type"],["status","Status"],["created_at","Created"]].map(([k,l])=>`<th>${sortButton(k,l)}</th>`).join("")}</tr></thead><tbody>${arr(data.items).map(i=>`<tr><td><button class="link hermes-item" data-id="${encodeURIComponent(i.item_id||"")}">${safe(i.item_id)}</button></td><td>${safe(i.item_type)}</td><td><span class="badge ${statusClass(i.status)}">${safe(i.status)}</span></td><td>${safe(dateText(i.created_at||i.updated_at))}</td></tr>`).join("")}</tbody></table>`:empty("Hermes not initialized","Start the research node or submit a paper-only proposal."); pager("hermes",data); bindTable(); document.querySelectorAll(".hermes-item").forEach(b=>b.addEventListener("click",()=>loadHermes(decodeURIComponent(b.dataset.id)))); if(state.tab==="hermes"&&state.selected)loadHermes(state.selected,false); }
     async function loadCandidate(id,eventPage=1,persist=true) { state.selected=id; state.expanded=true; if(persist)saveState(true); try { const q=new URLSearchParams({page:String(eventPage),page_size:String(state.page_size)}),candidateResponse=await fetch(`/api/v2/candidates/${encodeURIComponent(id)}`,{cache:"no-store"}),r=await fetch(`/api/v2/candidates/${encodeURIComponent(id)}/events?${q}`,{cache:"no-store"}),candidate=candidateResponse.ok?await candidateResponse.json():{},d=await r.json(); const checks=[["Historical gates",candidate.historical_gates||"NOT_PASSED"],["Historical data integrity",candidate.historical_data_integrity||"FAIL"],["Historical execution fidelity",candidate.historical_execution_fidelity||"UNKNOWN"],["Canary data quality",candidate.canary_data_quality_gate||"NOT PASSED"],["Production evidence",candidate.production_evidence||"INSUFFICIENT"],["Micro-live canary",candidate.canary_status||"NOT_ELIGIBLE"],["Paper forward status",candidate.paper_forward_status||"NOT_STARTED"],["Paper promotable",candidate.paper_promotable_status||"NOT_YET"]]; const markup=`<div class="key-value"><span class="key">Candidate</span><strong>${safe(candidate.candidate_id||id)}</strong></div><div class="three-col">${checks.map(([label,value])=>`<div class="key-value"><span class="key">${safe(label)}</span><strong><span class="badge ${statusClass(value)}">${safe(value)}</span></strong></div>`).join("")}</div>${arr(d.items).length?`<table><thead><tr><th>Time</th><th>Stage</th><th>Reason</th></tr></thead><tbody>${arr(d.items).map(i=>`<tr><td>${safe(dateText(i.created_at||i.timestamp))}</td><td><span class="badge">${safe(i.stage||i.to_stage)}</span></td><td>${safe(i.reason||i.message)}</td></tr>`).join("")}</tbody></table>`:empty("No lifecycle events","No persisted lifecycle evidence exists for this candidate.")}<div id="candidate-events-pager" class="pager"></div>`; $("detail").innerHTML=markup; if(state.tab==="candidates")$("dataset-detail").innerHTML=markup; if($("candidate-events-pager")){const total=Number(d.total)||0,page=Number(d.page)||1,size=Number(d.page_size)||state.page_size,pages=Number(d.pages)||0,start=total?(page-1)*size+1:0,end=Math.min(page*size,total); $("candidate-events-pager").innerHTML=`<span>Showing ${start}–${end} of ${total}</span><span><button data-page="${page-1}" ${page<=1?"disabled":""}>Previous</button> <button data-page="${page+1}" ${!pages||page>=pages?"disabled":""}>Next</button></span>`; $("candidate-events-pager").querySelectorAll("button").forEach(b=>b.addEventListener("click",()=>loadCandidate(id,Number(b.dataset.page),false)));} } catch(e) { $("detail").innerHTML=empty("Candidate detail unavailable",e.message); } }
     function renderPaper(data) { const p=operator.paper_portfolio||{}; $("portfolio-summary").innerHTML=`<div class="card-grid"><div class="panel"><div class="metric">${p.state_count?Number(p.total_equity||0).toFixed(2):"—"}</div><div class="metric-label">paper equity</div></div><div class="panel"><div class="metric">${p.state_count?Number(p.total_pnl||0).toFixed(2):"—"}</div><div class="metric-label">paper P/L</div></div><div class="panel"><div class="metric">${count(data.total)}</div><div class="metric-label">paper records</div></div><div class="panel"><div class="metric">${p.state_count?`${(Number(p.win_rate||0)*100).toFixed(1)}%`:"—"}</div><div class="metric-label">win rate</div></div></div>`; $("portfolio-states").innerHTML=arr(data.items).length?`<table><thead><tr><th>${sortButton("timestamp","Time")}</th><th>${sortButton("record_type","Type")}</th><th>Experiment</th><th>Market</th><th>Status</th><th>Details</th></tr></thead><tbody>${arr(data.items).map(i=>`<tr><td>${safe(dateText(i.timestamp||i.created_at||i.updated_at))}</td><td>${safe(i.record_type)}</td><td>${safe(i.experiment_id)}</td><td>${safe(i.market_id||i.symbol)}</td><td><span class="badge ${statusClass(i.status)}">${safe(i.status)}</span></td><td><details><summary>view</summary><pre>${safe(json(i))}</pre></details></td></tr>`).join("")}</tbody></table>`:empty("Waiting for PAPER_FORWARD","Paper portfolio initializes only after a candidate enters PAPER_FORWARD and observations are persisted."); pager("paper",data); bindTable(); }
+    function renderRollingPortfolio(data) {
+      const status=String(data?.status||"UNKNOWN").toUpperCase(), identity=data?.policy_identity||{}, rows=arr(data?.active_rows), cold=arr(data?.cold_start_requirements);
+      const badge=$("rolling-status"); if(badge){badge.textContent=status==="COLD_START"?"COLD_START · requirements pending":`${status} · paper-only`;badge.className=`badge ${statusClass(status)}`;}
+      $("rolling-summary").innerHTML=`<div class="three-col"><div class="key-value"><span class="key">Controller</span><strong>${safe(status)}</strong></div><div class="key-value"><span class="key">Selected / active K</span><strong>${safe(data?.k)} / ${safe(data?.actual_k)}</strong></div><div class="key-value"><span class="key">Policy</span><strong>${safe(identity.policy_id)} / ${safe(identity.version)}</strong></div><div class="key-value"><span class="key">Policy hash</span><strong>${safe(identity.config_hash)}</strong></div><div class="key-value"><span class="key">Effective limits</span><strong>${safe(json(data?.global_limits||{}))}</strong></div><div class="key-value"><span class="key">Rolling risk usage (reserved/open capital)</span><strong>${safe(json(data?.rolling_usage||data?.global_limits_usage||{}))}</strong></div></div>`;
+      $("rolling-members").innerHTML=rows.length?`<table><thead><tr><th>Strategy version</th><th>Research trial</th><th>Candidate</th><th>Evidence window</th><th>Evidence digest</th><th>Status</th><th>Allocation</th><th>Coverage</th><th>Reason</th></tr></thead><tbody>${rows.map(row=>`<tr><td>${safe(row.strategy_version_id)}</td><td>${safe(row.research_trial_id)}</td><td>${safe(row.candidate_id)}</td><td>${safe(row.evidence_window_id)}</td><td>${safe(row.evidence_digest)}</td><td><span class="badge ${statusClass(row.executable?"ACTIVE":"BLOCKED")}">${safe(row.executable?"EXECUTABLE":"NON-EXECUTABLE")}</span></td><td>${safe(row.allocation)}</td><td>${safe(row.actual_coverage_seconds)}</td><td>${safe(arr(row.reasons).join(", ")||row.reason||arr(row.blockers).join(", "))}</td></tr>`).join("")}</tbody></table>`:empty("No executable rolling members","COLD_START: persist exact member lineage and evidence before selecting K members.");
+      $("rolling-reasons").innerHTML=`<article class="panel"><div class="section-title"><h3>Admission / replacement history</h3><span class="badge">${arr(data?.reason_history).length} retained</span></div>${arr(data?.reason_history).length?`<pre>${safe(json(arr(data.reason_history).slice(-32)))}</pre>`:empty("No rolling review history","Admission and replacement reasons are retained after members leave active K.")}</article>${cold.length?`<article class="panel"><div class="section-title"><h3>Cold-start requirements</h3><span class="badge warn">BLOCKED</span></div><ul>${cold.slice(0,16).map(item=>`<li>${safe(item)}</li>`).join("")}</ul></article>`:""}`;
+      const jobs=data?.next_jobs; $("rolling-jobs").innerHTML=jobs&&((Array.isArray(jobs)&&jobs.length)||(typeof jobs==="object"&&Object.keys(jobs).length))?`<article class="panel"><div class="section-title"><h3>Next rolling jobs</h3><span class="badge">durable</span></div><pre>${safe(json(jobs))}</pre></article>`:empty("No next rolling jobs","The durable worker has not persisted a next action.");
+    }
     function renderCanaryConnectivity(value) {
       const c=value||{}, checkedAt=c.checked_at, checkedPht=dateText(checkedAt), checkedMs=checkedAt?Date.parse(checkedAt):NaN, ageMs=Number.isFinite(checkedMs)?Date.now()-checkedMs:NaN, fresh=Number.isFinite(ageMs)&&ageMs>=0&&ageMs<=60000, displayedStatus=c.status==="READY"&&!fresh?"STALE":c.status, sdk=c.sdk||{}, credentials=c.credentials||{}, authentication=c.authentication||{}, account=c.account||{}, geo=c.geoblock||{}, balance=c.balance||{}, allowance=c.allowance||{}, market=c.market||{}, book=c.order_book||{};
       if(!value){ $("canary-connectivity").innerHTML=empty("No connectivity check persisted","Run Connectivity check to perform a read-only pre-arming check."); return; }
@@ -6834,7 +8024,14 @@ def _dashboard_html(
         ? `<ul>${diff.map(item=>`<li>${safe(item.label)}: ${safe(item.before??"")} → <strong>${safe(item.after??"")}</strong></li>`).join("")}</ul>`
         : `<p class="page-note">No saved changes are waiting for activation.</p>`;
       const status=String(snapshot.status||"CURRENT").toUpperCase();
+      const cumulativeUsage=snapshot.usage?.cumulative_buy_usd??"0.00";
+      const cumulativeCap=snapshot.cumulative_buy_cap_usd??activeValues.cumulative_buy_cap_usd??null;
+      const cumulativeRemaining=snapshot.remaining_cumulative_buy_usd??snapshot.remaining?.cumulative_buy_usd??null;
+      const cumulativeState=String(snapshot.cumulative_buy_cap_state||(cumulativeCap==null?"UNCONFIGURED":"UNKNOWN")).toUpperCase();
+      const cumulativeReason=snapshot.cumulative_buy_over_limit_reason||"";
+      const cumulativeMarkup=`<section class="panel" data-risk-capacity="cumulative-buy"><div class="section-title"><h3>CUMULATIVE BUY CAP</h3><span class="badge ${statusClass(cumulativeState)}">${safe(cumulativeState)}</span></div><div class="three-col"><div class="key-value"><span class="key">Cumulative BUY usage</span><strong>${safe(cumulativeUsage)}</strong></div><div class="key-value"><span class="key">Active cumulative BUY cap</span><strong>${safe(cumulativeCap??"—")}</strong></div><div class="key-value"><span class="key">Remaining cumulative BUY</span><strong>${safe(cumulativeRemaining??"—")}</strong></div></div>${cumulativeReason?`<p class="page-note">Over-limit reason: ${safe(cumulativeReason)}</p>`:""}</section>`;
       $("risk-settings").innerHTML=`<article class="panel"><div class="section-title"><h2>POLYMARKET RISK SETTINGS</h2><span class="badge ${statusClass(status)}">${safe(status)}</span></div><p class="page-note">Edit one bounded setting at a time, review the exact changes, then confirm activation. Active limits remain authoritative until activation succeeds.</p><div class="three-col"><label class="key-value"><span class="key">Submissions/day</span><select data-risk-field="max_submitted_orders_per_day" aria-label="Submissions per day"><option value="5"${submissionPreset==="5"?" selected":""}>5</option><option value="10"${submissionPreset==="10"?" selected":""}>10</option><option value="20"${submissionPreset==="20"?" selected":""}>20</option><option value="custom"${submissionPreset==="custom"?" selected":""}>Custom</option></select><input data-risk-submissions-custom aria-label="Custom submissions per day" value="${submissionPreset==="custom"?safe(submissionValue):""}" inputmode="numeric"${submissionPreset==="custom"?"":" hidden"}></label>${fields.map(([name,label,type])=>input(name,label,type,value(name))).join("")}</div><details><summary>Optional advanced limits</summary><div class="three-col">${advanced.map(([name,label,type])=>input(name,label,type,value(name))).join("")}</div></details><div class="filters"><label class="key-value"><span class="key">Operator</span><strong>Authenticated operator</strong></label><button class="risk-settings-action" data-risk-action="save">Review changes</button></div><div id="risk-review" class="page-note"><strong>Activation review</strong>${diffMarkup}</div>${riskReview.draft?`<p class="page-note"><button class="risk-settings-action" data-risk-action="activate">Confirm activation</button></p>`:""}</article>`;
+      $("risk-settings").firstElementChild?.insertAdjacentHTML("afterbegin",cumulativeMarkup);
       const submissions=$("[data-risk-field='max_submitted_orders_per_day']"),custom=$("[data-risk-submissions-custom]");
       submissions?.addEventListener("change",()=>{if(custom){custom.hidden=submissions.value!=="custom";if(submissions.value!=="custom")custom.value="";}});
     }
@@ -6892,12 +8089,14 @@ def _dashboard_html(
       const signalChecked=read("candidates_signal_checked");
       const noSignal=read("candidates_no_signal");
       const observed=actionableFound!=null||signalChecked!=null||noSignal!=null;
-      const hasActionable=actionableCandidate!=null&&String(actionableCandidate).trim()!=="";
+      const actionableCountNumber=actionableFound==null?NaN:Number(actionableFound);
+      const actionableCountIsZero=Number.isFinite(actionableCountNumber)&&actionableCountNumber===0;
+      const hasActionable=!actionableCountIsZero&&actionableCandidate!=null&&String(actionableCandidate).trim()!=="";
       const eligibleCount=c.eligible_count??auto.eligible_count,rankableCount=c.rankable_count??auto.rankable_count;
       const noEligible=eligibleCount!=null&&rankableCount!=null&&Number(eligibleCount)===0&&Number(rankableCount)===0;
-      const noAction=!hasActionable&&observed&&(
-        (actionableFound!=null&&Number(actionableFound)===0)||
-        (actionableFound==null&&noSignal!=null&&Number(noSignal)>0)
+      const noAction=observed&&(
+        actionableCountIsZero||
+        (!hasActionable&&actionableFound==null&&noSignal!=null&&Number(noSignal)>0)
       );
       const scanStatus=String(read("signal_scan_status")||"").toUpperCase();
       const status=noEligible?"NO_ELIGIBLE_CANDIDATES":scanStatus==="IN_PROGRESS"?"IN_PROGRESS":noAction?"NO ACTIONABLE SIGNAL":hasActionable?"ACTIONABLE SIGNAL":scanStatus==="UNKNOWN"?"DATA MISSING":"UNKNOWN";
@@ -6921,9 +8120,9 @@ def _dashboard_html(
     function renderCrypto(data) { const rows=arr(data.items),symbols=arr(data.symbols),summary={universe_version:data.universe_version,symbols:data.symbol_count??symbols.length,assets:data.asset_count??arr(data.assets).length,catalogs:data.total,reports:arr(data.reports).length}; $("crypto-summary").innerHTML=`<div class="three-col">${[["Universe version",summary.universe_version],["Symbols",summary.symbols],["Assets",summary.assets],["Catalogs",summary.catalogs],["Reports",summary.reports],["Families",arr(data.families).length]].map(([label,value])=>`<div class="key-value"><span class="key">${safe(label)}</span><strong>${safe(value)}</strong></div>`).join("")}</div>`; $("crypto-table").innerHTML=rows.length?`<table><thead><tr><th>Symbol</th><th>Dataset</th><th>Version</th><th>Source</th><th>Coverage</th><th>Strategies</th><th>Experiments</th><th>Validation</th><th>Families</th></tr></thead><tbody>${rows.map(i=>`<tr><td><button class="link crypto-symbol-row" data-symbol="${encodeURIComponent(i.symbol||"")}">${safe(i.symbol)}</button></td><td>${safe(i.dataset_id)}</td><td>${safe(i.dataset_version)}</td><td>${safe(i.source_type)}</td><td>${safe(json(i.coverage))}</td><td>${safe(json(i.strategies))}</td><td>${safe(json(i.experiments))}</td><td>${safe(json(i.validation))}</td><td>${safe(json(i.families))}</td></tr>`).join("")}</tbody></table>`:empty("No crypto catalogs","No crypto catalog or report has been persisted."); pager("crypto",data); document.querySelectorAll(".crypto-symbol-row").forEach(b=>b.addEventListener("click",()=>loadCrypto(decodeURIComponent(b.dataset.symbol)))); }
     function renderOutcomeCards(data) { const cards=data.research_cards||{}, latest=data.hermes_latest_outcome||cards.newest_hermes_outcome||{}, latestLabel=latest.outcome_label||latest.status||"—"; $("research-cards").innerHTML=[["experiments_run","Experiments run"],["active_hypotheses","Active hypotheses"],["candidates_alive","Candidates alive"],["candidate_rejected","Candidate Rejected"],["research_rejected","Research Rejected"],["canary_eligible","Canary eligible"],["paper_forward","Paper forward"],["paper_promotable","Paper promotable"]].map(([k,l])=>`<article class="panel"><div class="metric">${count(cards[k])}</div><div class="metric-label">${l}</div></article>`).join("")+`<article class="panel"><div class="metric">${safe(latestLabel)}</div><div class="metric-label">Newest Hermes outcome · ${safe(latest.item_id||"none")}</div><div class="page-note">Dataset: ${safe(latest.dataset_id||"—")} / ${safe(latest.dataset_version||"—")}</div>${latest.human_reason?`<p class="page-note">${safe(latest.human_reason)}</p>`:""}</article>`; }
     const _renderOverview=renderOverview; renderOverview=(data)=>{_renderOverview(data);renderOutcomeCards(data);};
-    const VIEW_ENDPOINT = {overview:"overview-summary",canary:"canary","binance-canary":"binance-canary",datasets:"datasets",activity:"activity",candidates:"candidates",polymarket:"polymarket",hermes:"hermes",crypto:"crypto-research",portfolio:"paper"};
-    const VIEW_TARGET = {datasets:"datasets-table",activity:"activity-table",candidates:"candidates-table",polymarket:"pm-markets",hermes:"hermes-table",crypto:"crypto-table",portfolio:"portfolio-states", "binance-canary":"binance-records"};
-    const VIEW_CADENCE = {overview:10000,canary:15000,"binance-canary":15000,datasets:30000,activity:15000,candidates:30000,polymarket:30000,hermes:30000,crypto:30000,portfolio:30000};
+    const VIEW_ENDPOINT = {overview:"overview-summary",canary:"canary","binance-canary":"binance-canary",datasets:"datasets",activity:"activity",candidates:"candidates",polymarket:"polymarket",hermes:"hermes",crypto:"crypto-research",portfolio:"paper","rolling-portfolio":"rolling-portfolio"};
+    const VIEW_TARGET = {datasets:"datasets-table",activity:"activity-table",candidates:"candidates-table",polymarket:"pm-markets",hermes:"hermes-table",crypto:"crypto-table",portfolio:"portfolio-states","rolling-portfolio":"rolling-members","binance-canary":"binance-records"};
+    const VIEW_CADENCE = {overview:10000,canary:15000,"binance-canary":15000,datasets:30000,activity:15000,candidates:30000,polymarket:30000,hermes:30000,crypto:30000,portfolio:30000,"rolling-portfolio":15000};
     let activeController = null, detailController = null, refreshGeneration = 0, nextRefreshAt = 0, slowRefreshTimer = null, startupPending = true;
     const REFRESH_TIMEOUT_MS = 75000;
     const lastGood = {overview:null,canary:null,"binance-canary":null,controls:null};
@@ -7152,14 +8351,14 @@ def _dashboard_html(
           const data=await fetchV2Bounded(VIEW_ENDPOINT[tab],controller.signal);
           if(generation!==refreshGeneration)return;
           lastGood[tab]=data; lastSuccessful=Date.now(); current=data;
-          ({datasets:renderDatasets,activity:renderActivity,candidates:renderCandidates,polymarket:renderPolymarket,hermes:renderHermes,crypto:renderCrypto,portfolio:renderPaper,"binance-canary":renderBinanceCanary}[tab])(data);
+          ({datasets:renderDatasets,activity:renderActivity,candidates:renderCandidates,polymarket:renderPolymarket,hermes:renderHermes,crypto:renderCrypto,portfolio:renderPaper,"rolling-portfolio":renderRollingPortfolio,"binance-canary":renderBinanceCanary}[tab])(data);
           refreshMessage(tab,`Updated · ${new Date().toLocaleTimeString()}`);
         }
       } catch(error) {
         if(generation===refreshGeneration&&error?.name!=="AbortError") {
           const cached=lastGood[tab];
           if(cached) {
-            ({overview:renderOverview,canary:renderCanary,datasets:renderDatasets,activity:renderActivity,candidates:renderCandidates,polymarket:renderPolymarket,hermes:renderHermes,crypto:renderCrypto,portfolio:renderPaper,"binance-canary":renderBinanceCanary}[tab])(cached);
+            ({overview:renderOverview,canary:renderCanary,datasets:renderDatasets,activity:renderActivity,candidates:renderCandidates,polymarket:renderPolymarket,hermes:renderHermes,crypto:renderCrypto,portfolio:renderPaper,"rolling-portfolio":renderRollingPortfolio,"binance-canary":renderBinanceCanary}[tab])(cached);
             refreshMessage(tab,`Refresh failed (${refreshError(error)}) · showing last successful content`,true);
           } else {
             refreshMessage(tab,`Refresh failed (${refreshError(error)}) · no cached dashboard snapshot available`,true);

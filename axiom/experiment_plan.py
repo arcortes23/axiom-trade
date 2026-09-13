@@ -1843,6 +1843,69 @@ class ExperimentPlan:
         except Exception as exc:
             raise ExperimentPlanError("UNSUPPORTED_STRATEGY_FAMILY", str(exc)) from exc
 
+    def canonical_strategy_for(self, parameters: Mapping[str, Any]) -> StrategyDefinition:
+        """Return the immutable strategy definition independent of candidate identity."""
+        definition = self.strategy_for(parameters, "")
+        document = definition.to_dict()
+        document.pop("strategy_id", None)
+        return load_strategy(document)
+
+    def strategy_version_material(self, parameters: Mapping[str, Any]) -> Mapping[str, Any]:
+        """Return canonical, content-addressed strategy-version material."""
+        definition = self.canonical_strategy_for(parameters)
+        document = definition.to_dict()
+        strategy_hash = "sha256:" + hashlib.sha256(_canonical(document).encode("utf-8")).hexdigest()
+        config = {
+            "market_type": document.get("market_type"),
+            "family": document.get("family"),
+            "parameters": document.get("parameters", {}),
+            "operations": document.get("operations", []),
+        }
+        config_hash = "sha256:" + hashlib.sha256(_canonical(config).encode("utf-8")).hexdigest()
+        strategy_version_id = "strategy-version-" + strategy_hash.removeprefix("sha256:")[:40]
+        return {
+            "strategy_version_id": strategy_version_id,
+            "strategy_id": definition.id,
+            "version": str(definition.version),
+            "code_hash": strategy_hash,
+            "config_hash": config_hash,
+            "strategy_hash": strategy_hash,
+            "strategy_document": document,
+            "canonical_strategy": document,
+            "plan_id": self.plan_id,
+            "plan_hash": self.plan_hash,
+            "variant_id": self.variant_id(parameters),
+            "paper_only": True,
+            "execution_authority": False,
+        }
+
+    def research_trial_material(
+        self,
+        parameters: Mapping[str, Any],
+        *,
+        research_trial_id: str | None = None,
+        status: str = "SCHEDULED",
+    ) -> Mapping[str, Any]:
+        """Bind a bounded rolling trial to one immutable strategy version."""
+        strategy = self.strategy_version_material(parameters)
+        trial_id = str(research_trial_id or "").strip()
+        if not trial_id:
+            trial_id = "research-trial:" + str(strategy["strategy_version_id"])
+        return {
+            "research_trial_id": trial_id,
+            "trial_id": trial_id,
+            "strategy_version_id": strategy["strategy_version_id"],
+            "status": str(status).strip().upper() or "SCHEDULED",
+            "trial_kind": "ROLLING_RESEARCH",
+            "strategy_hash": strategy["strategy_hash"],
+            "plan_id": self.plan_id,
+            "plan_hash": self.plan_hash,
+            "requested_window_days": [7, 30],
+            "source_classes": ["HISTORICAL", "REPLAY", "PAPER", "LIVE"],
+            "paper_only": True,
+            "execution_authority": False,
+        }
+
     def model_for(self) -> Mapping[str, Any] | None:
         if self.market_type is not MarketType.PREDICTION:
             return None

@@ -14,6 +14,7 @@ from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
 import inspect
+import json
 import math
 import time
 from typing import Any, Callable, Mapping, Sequence
@@ -236,6 +237,10 @@ class PolymarketCollector:
         self.clock = clock
         self.sleep = sleep
         self._discovery_continuation: Mapping[str, Any] | None = None
+        # A present rolling selection is a closed collection authority.  If a
+        # selected member has no exact scope resolution, discovery must not
+        # widen the cycle back to the public catalog.
+        self._rolling_scope_blocked = False
         # The nested continuation is assembled during scope discovery and
         # persisted with the root collector state at the end of the cycle.
         self._scope_inventory_continuation: Mapping[str, Any] | None = None
@@ -260,8 +265,9 @@ class PolymarketCollector:
             else None
         )
         requested = tuple(dict.fromkeys(str(item).strip() for item in (market_ids or ()) if str(item).strip()))
+        rolling_scope_ids = self._rolling_scope_market_ids()
         configured = requested or self.config.market_ids
-        configured_values = tuple(configured)
+        configured_values = tuple(dict.fromkeys([*configured, *rolling_scope_ids]))
         primary_candidate_ids = self._active_primary_candidate_ids() or []
         paper_ids = self._active_paper_forward_ids()
         observation_intent_ids = self._active_observation_intent_ids()
@@ -340,6 +346,9 @@ class PolymarketCollector:
                 for item in configured
                 if item in allowed_scope_ids and item not in configured_values
             )
+            # Rolling members are an independent market authority; retain their
+            # union even when legacy candidate scope resolution is populated.
+            configured_values = tuple(dict.fromkeys([*configured_values, *rolling_scope_ids]))
         if configured_values:
             candidate_bound = list(dict.fromkeys([*configured_values, *candidate_bound]))
             for identifier in configured_values:
@@ -419,6 +428,7 @@ class PolymarketCollector:
         if (
             not configured
             and not scope_candidate_set
+            and not self._rolling_scope_blocked
             and remaining > 0
             and self.config.discovery_budget_per_cycle > 0
         ):
@@ -452,7 +462,12 @@ class PolymarketCollector:
                 counters["errors"] += 1
                 discovery_coverage_status = "ERROR"
                 self.store.save_collection_error(None, started, "discovery", str(exc))
-        if not configured and not scope_candidate_set and remaining > len(discovery_scheduled):
+        if (
+            not configured
+            and not scope_candidate_set
+            and not self._rolling_scope_blocked
+            and remaining > len(discovery_scheduled)
+        ):
             try:
                 tracked = self.store.tracked_polymarket_markets(
                     active_only=self.config.active,
@@ -799,6 +814,251 @@ class PolymarketCollector:
             except (TypeError, ValueError):
                 result = method()
         return result if isinstance(result, Mapping) else {}
+
+    def _rolling_scope_market_ids(self) -> list[str]:
+        """Return bounded market ids from the current rolling scope authority.
+
+        Exact scopes are already explicit.  Rule scopes are never interpreted
+        by the collector: their immutable, current-market resolution is loaded
+        using the frozen candidate binding persisted with the research
+        artifact.  A selected member whose scope cannot be proven therefore
+        blocks rolling discovery rather than widening into the public catalog.
+        """
+        self._rolling_scope_blocked = False
+        selection_loader = getattr(self.store, "load_current_portfolio_selection", None)
+        if not callable(selection_loader):
+            return []
+        try:
+            selection = selection_loader()
+        except Exception:
+            self._rolling_scope_blocked = True
+            return []
+        if selection is None:
+            return []
+        if not isinstance(selection, Mapping):
+            self._rolling_scope_blocked = True
+            return []
+        members = selection.get("members", ())
+        if not isinstance(members, (list, tuple)):
+            self._rolling_scope_blocked = True
+            return []
+        if not members:
+            self._rolling_scope_blocked = True
+            return []
+
+        def normalized_ids(value: Any) -> list[str]:
+            if isinstance(value, str):
+                value = (value,)
+            if not isinstance(value, (list, tuple, set, frozenset)):
+                return []
+            return list(dict.fromkeys(str(item).strip() for item in value if str(item).strip()))
+
+
+        def consistent_text(documents: Sequence[Mapping[str, Any]], names: Sequence[str]) -> tuple[str | None, bool]:
+            values: list[str] = []
+            for document in documents:
+                for name in names:
+                    value = document.get(name)
+                    if value is not None and str(value).strip():
+                        values.append(str(value).strip())
+            unique = list(dict.fromkeys(values))
+            return (unique[0] if unique else None), len(unique) > 1
+
+        def resolve_rule(
+            candidate_id: str | None,
+            scope_hash: str | None,
+            scope_version: str | None,
+        ) -> list[str] | None:
+            if not candidate_id or not scope_hash or not scope_version:
+                return None
+            loader = getattr(self.store, "load_market_scope_resolution", None)
+            if not callable(loader):
+                return None
+            try:
+                try:
+                    resolution = loader(
+                        candidate_id,
+                        scope_hash=scope_hash,
+                        scope_version=scope_version,
+                    )
+                except TypeError:
+                    resolution = loader(candidate_id)
+            except Exception:
+                return None
+            try:
+                if hasattr(resolution, "as_dict") and callable(resolution.as_dict):
+                    resolution = resolution.as_dict()
+            except Exception:
+                return None
+            if not isinstance(resolution, Mapping):
+                return None
+            if (
+                str(resolution.get("candidate_id", "")).strip() != candidate_id
+                or str(resolution.get("scope_hash", "")).strip() != scope_hash
+                or str(
+                    resolution.get("scope_version", resolution.get("version", ""))
+                ).strip()
+                != scope_version
+                or str(resolution.get("status", "")).strip().upper() != "MATCHED"
+            ):
+                return None
+            matched = resolution.get("matched_markets", _UNSET)
+            if matched is _UNSET:
+                return None
+            ids: list[str] = []
+            if isinstance(matched, (list, tuple, set, frozenset)):
+                for market in matched:
+                    if isinstance(market, Mapping):
+                        value = market.get("market_id", market.get("id"))
+                    else:
+                        value = getattr(market, "market_id", market)
+                    text = str(value).strip() if value is not None else ""
+                    if text:
+                        ids.append(text)
+            return list(dict.fromkeys(ids)) if ids else None
+
+        result: list[str] = []
+        connection = getattr(self.store, "connection", None)
+        execute = getattr(connection, "execute", None)
+        if not callable(execute):
+            self._rolling_scope_blocked = True
+            return []
+
+        for member in members:
+            if not isinstance(member, Mapping):
+                self._rolling_scope_blocked = True
+                continue
+            strategy_version_id = str(member.get("strategy_version_id", "")).strip()
+            if not strategy_version_id:
+                self._rolling_scope_blocked = True
+                continue
+            try:
+                row = execute(
+                    "SELECT payload_json FROM strategy_versions WHERE strategy_version_id=?",
+                    (strategy_version_id,),
+                ).fetchone()
+            except Exception:
+                row = None
+            if row is None:
+                self._rolling_scope_blocked = True
+                continue
+            try:
+                payload = json.loads(row[0]) if isinstance(row[0], str) else row[0]
+            except Exception:
+                payload = None
+            if not isinstance(payload, Mapping):
+                self._rolling_scope_blocked = True
+                continue
+
+            documents: list[Mapping[str, Any]] = [payload]
+            for name in (
+                "payload",
+                "frozen_document",
+                "strategy_document",
+                "experiment_plan",
+                "market_scope",
+                "provenance",
+                "strategy",
+                "canonical_strategy",
+            ):
+                value = payload.get(name)
+                if isinstance(value, Mapping):
+                    documents.append(value)
+            candidate_values = [
+                str(value).strip()
+                for value in (member.get("candidate_id"), *[
+                    document.get("candidate_id") for document in documents
+                ])
+                if value is not None and str(value).strip()
+            ]
+            candidate_ids = list(dict.fromkeys(candidate_values))
+            if len(candidate_ids) > 1:
+                self._rolling_scope_blocked = True
+                continue
+            candidate_id = candidate_ids[0] if candidate_ids else None
+            scope_documents: list[Mapping[str, Any]] = []
+            legacy_ids: list[str] = []
+            canonical_scope_seen = False
+            member_ids: list[str] = []
+            member_scope_failed = False
+            for document in documents:
+                scopes: list[Mapping[str, Any]] = []
+                direct_scope = document.get("market_scope")
+                if isinstance(direct_scope, Mapping):
+                    scopes.append(direct_scope)
+                alias_scope = document.get("scope")
+                if isinstance(alias_scope, Mapping):
+                    scopes.append(alias_scope)
+                if str(document.get("mode", "")).strip():
+                    scopes.append(document)
+                plan = document.get("experiment_plan")
+                if isinstance(plan, Mapping) and isinstance(plan.get("market_scope"), Mapping):
+                    scopes.append(plan["market_scope"])
+                if scopes:
+                    scope_documents.extend(scopes)
+                else:
+                    values = document.get(
+                        "market_ids",
+                        document.get("markets", document.get("target_market_ids", ())),
+                    )
+                    legacy_ids.extend(normalized_ids(values))
+            if not scope_documents and legacy_ids:
+                member_ids.extend(legacy_ids)
+            for scope in scope_documents:
+                mode = str(scope.get("mode", "")).strip().upper()
+                values = scope.get(
+                    "market_ids",
+                    scope.get("markets", scope.get("target_market_ids", ())),
+                )
+                if mode == "RULE_BASED_MARKETS":
+                    canonical_scope_seen = True
+                    scope_hash, hash_conflict = consistent_text(
+                        [*documents, scope],
+                        ("market_scope_hash", "scope_hash"),
+                    )
+                    scope_version_values = [
+                        document.get(name)
+                        for document in [*documents, scope]
+                        for name in ("market_scope_version", "scope_version")
+                        if document.get(name) is not None and str(document.get(name)).strip()
+                    ]
+                    scope_version_values.extend(
+                        str(scope.get("version")).strip()
+                        for _ in (0,)
+                        if scope.get("version") is not None and str(scope.get("version")).strip()
+                    )
+                    scope_version_unique = list(dict.fromkeys(str(value).strip() for value in scope_version_values))
+                    scope_version = scope_version_unique[0] if scope_version_unique else None
+                    version_conflict = len(scope_version_unique) > 1
+                    if hash_conflict or version_conflict:
+                        member_scope_failed = True
+                        continue
+                    resolved = resolve_rule(candidate_id, scope_hash, scope_version)
+                    if resolved is None:
+                        member_scope_failed = True
+                    else:
+                        member_ids.extend(resolved)
+                elif mode == "EXACT_MARKETS":
+                    canonical_scope_seen = True
+                    exact_ids = normalized_ids(values)
+                    if exact_ids:
+                        member_ids.extend(exact_ids)
+                    else:
+                        member_scope_failed = True
+                elif mode == "RESEARCH_ONLY":
+                    canonical_scope_seen = True
+                    member_scope_failed = True
+                elif not mode:
+                    legacy_ids.extend(normalized_ids(values))
+                else:
+                    member_scope_failed = True
+            if member_scope_failed or (canonical_scope_seen and not member_ids):
+                self._rolling_scope_blocked = True
+                continue
+            if not canonical_scope_seen:
+                member_ids.extend(legacy_ids)
+            result.extend(member_ids)
+        return list(dict.fromkeys(result))[: self.config.max_markets]
 
     def _active_primary_candidate_ids(self) -> list[str] | None:
         """Return the currently selected/eligible ranking universe.

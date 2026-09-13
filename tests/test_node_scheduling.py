@@ -1292,24 +1292,30 @@ class MutationSchedulingTests(unittest.TestCase):
                     provider=InMemoryPredictionProvider([]),
                     store=store,
                 )
-                threads = [Mock(), Mock(), Mock()]
+                threads = [Mock(), Mock(), Mock(), Mock()]
                 with patch.object(node._auto_canary_worker, "tick") as tick, patch(
                     "axiom.node.threading.Thread", side_effect=threads
                 ) as thread_factory:
                     node._start_worker_threads(max_cycles=1)
                     self.assertIsNone(node._auto_canary_thread)
-                    self.assertEqual(thread_factory.call_count, 3)
+                    self.assertEqual(thread_factory.call_count, 4)
                     self.assertEqual(
                         [call.kwargs["name"] for call in thread_factory.call_args_list],
                         [
                             "axiom-node-collector",
                             "axiom-node-research",
                             "axiom-node-health",
+                            "axiom-node-rolling-portfolio",
                         ],
                     )
                     self.assertIs(node._collector_thread, threads[0])
                     self.assertIs(node._research_thread, threads[1])
                     self.assertIs(node._health_thread, threads[2])
+                    self.assertIs(node._rolling_portfolio_thread, threads[3])
+                    self.assertEqual(
+                        thread_factory.call_args_list[3].kwargs["target"].__name__,
+                        "_rolling_portfolio_worker_loop",
+                    )
                     self.assertNotIn(
                         "autonomous-canary",
                         node._worker_thread_specs(max_cycles=1),

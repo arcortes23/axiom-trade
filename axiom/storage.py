@@ -85,6 +85,9 @@ _DASHBOARD_PAYLOAD_MAX_KEYS = 128
 _DEFAULT_PAGE_SIZE = 25
 _PAGINATION_PAGE_SIZES = (10, 25, 50, 100)
 _POLYMARKET_SOURCE_TYPES = frozenset({"HISTORICAL", "FORWARD_COLLECTED"})
+_ROLLING_EVIDENCE_SOURCE_CLASSES = frozenset(
+    {"HISTORICAL", "PAPER", "FORWARD_COLLECTED"}
+)
 _DEFAULT_OPERATIONAL_WINDOW_SECONDS = 3_600.0
 _MAX_OPERATIONAL_WINDOW_SECONDS = 86_400.0
 SQLITE_CONNECTION_TIMEOUT_SECONDS = 45.0
@@ -1031,10 +1034,13 @@ class AxiomStore:
             CREATE TABLE IF NOT EXISTS strategy_evidence_windows (
                 evidence_window_id TEXT PRIMARY KEY,
                 strategy_version_id TEXT NOT NULL,
+                research_trial_id TEXT,
+                candidate_id TEXT,
                 available_from TEXT NOT NULL,
                 available_through TEXT NOT NULL,
                 requested_days INTEGER NOT NULL CHECK(requested_days IN (7, 30)),
                 actual_coverage_seconds INTEGER NOT NULL CHECK(actual_coverage_seconds >= 0),
+                observation_completeness TEXT NOT NULL DEFAULT '0',
                 source_class TEXT NOT NULL,
                 paper_sizing_assumptions_json TEXT NOT NULL DEFAULT '{}',
                 paper_fee_assumptions_json TEXT NOT NULL DEFAULT '{}',
@@ -1084,6 +1090,8 @@ class AxiomStore:
             CREATE TABLE IF NOT EXISTS portfolio_selection_members (
                 portfolio_selection_id TEXT NOT NULL,
                 strategy_version_id TEXT NOT NULL,
+                research_trial_id TEXT,
+                candidate_id TEXT,
                 allocation TEXT NOT NULL,
                 status TEXT NOT NULL,
                 score TEXT NOT NULL,
@@ -1121,6 +1129,54 @@ class AxiomStore:
                 ON portfolio_review_state(updated_at DESC);
             """
         )
+        evidence_columns = {
+            str(row["name"])
+            for row in self._conn.execute(
+                "PRAGMA table_info(strategy_evidence_windows)"
+            ).fetchall()
+        }
+        observation_completeness_added = False
+        for name, definition in (
+            ("research_trial_id", "TEXT"),
+            ("candidate_id", "TEXT"),
+            ("observation_completeness", "TEXT NOT NULL DEFAULT '0'"),
+        ):
+            if name not in evidence_columns:
+                self._conn.execute(
+                    f"ALTER TABLE strategy_evidence_windows ADD COLUMN {name} {definition}"
+                )
+                if name == "observation_completeness":
+                    observation_completeness_added = True
+        if observation_completeness_added:
+            for row in self._conn.execute(
+                "SELECT evidence_window_id,requested_days,actual_coverage_seconds "
+                "FROM strategy_evidence_windows"
+            ).fetchall():
+                try:
+                    requested_days = int(row["requested_days"])
+                    actual_coverage = int(row["actual_coverage_seconds"])
+                    if requested_days <= 0 or actual_coverage < 0:
+                        continue
+                    completeness = min(
+                        Decimal("1"),
+                        Decimal(actual_coverage) / Decimal(requested_days * 86400),
+                    )
+                except (InvalidOperation, TypeError, ValueError, ZeroDivisionError):
+                    continue
+                self._conn.execute(
+                    "UPDATE strategy_evidence_windows SET observation_completeness=? "
+                    "WHERE evidence_window_id=?",
+                    (format(completeness, "f"), row["evidence_window_id"]),
+                )
+        member_columns = {
+            str(row["name"])
+            for row in self._conn.execute("PRAGMA table_info(portfolio_selection_members)").fetchall()
+        }
+        for name in ("research_trial_id", "candidate_id"):
+            if name not in member_columns:
+                self._conn.execute(
+                    f"ALTER TABLE portfolio_selection_members ADD COLUMN {name} TEXT"
+                )
         selection_columns = {
             str(row["name"])
             for row in self._conn.execute("PRAGMA table_info(portfolio_selections)").fetchall()
@@ -1133,7 +1189,13 @@ class AxiomStore:
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='portfolio_selections'"
         ).fetchone()
         selection_sql = " ".join(str(selection_sql_row["sql"] or "").upper().split()) if selection_sql_row else ""
-        if "BETWEEN 1 AND 10" in selection_sql:
+        staged_selection_migration = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name IN ('portfolio_selection_members_legacy_k',"
+            "'portfolio_current_selection_legacy_k','portfolio_review_state_legacy_k',"
+            "'portfolio_selections_legacy_k') LIMIT 1"
+        ).fetchone() is not None
+        if "BETWEEN 1 AND 10" in selection_sql or staged_selection_migration:
             self._migrate_rolling_selection_k_constraint()
         self._conn.execute(
             "UPDATE portfolio_selections SET k=("
@@ -1153,125 +1215,416 @@ class AxiomStore:
                     "UPDATE portfolio_selections SET payload_json=? WHERE portfolio_selection_id=?",
                     (payload_json, row["portfolio_selection_id"]),
                 )
+        self._backfill_rolling_selection_member_bindings()
 
     def _migrate_rolling_selection_k_constraint(self) -> None:
-        """Rebuild legacy rolling tables so empty selections can persist.
+        """Rebuild rolling tables without losing orphan historical rows.
 
-        SQLite cannot alter a CHECK constraint in place.  Rebuild the small
-        rolling namespace while retaining every row and repairing child
-        foreign keys to point at the replacement selection table.
+        SQLite's ``executescript`` implicitly commits before running its
+        statements, which can strand renamed tables if a foreign-key copy
+        fails.  Use explicit statements in one transaction and recover any
+        staging names left by an older interrupted migration.  The replacement
+        tables intentionally omit foreign keys because prototype history may
+        reference parents that were never materialized; new commits enforce
+        those relationships in application code.
         """
-        for index_name in (
-            "idx_portfolio_selections_committed",
-            "idx_portfolio_selections_policy",
-            "idx_portfolio_selection_members_selection",
-            "idx_portfolio_selection_members_strategy",
-            "idx_portfolio_review_state_updated",
-        ):
-            self._conn.execute(f"DROP INDEX IF EXISTS {index_name}")
-        self._conn.executescript(
-            """
-            ALTER TABLE portfolio_selection_members RENAME TO portfolio_selection_members_legacy_k;
-            ALTER TABLE portfolio_current_selection RENAME TO portfolio_current_selection_legacy_k;
-            ALTER TABLE portfolio_review_state RENAME TO portfolio_review_state_legacy_k;
-            ALTER TABLE portfolio_selections RENAME TO portfolio_selections_legacy_k;
-            CREATE TABLE portfolio_selections (
-                portfolio_selection_id TEXT PRIMARY KEY,
-                policy_id TEXT NOT NULL,
-                policy_version TEXT NOT NULL,
-                risk_config_id TEXT NOT NULL,
-                risk_config_generation INTEGER NOT NULL,
-                risk_config_hash TEXT NOT NULL,
-                global_budget TEXT NOT NULL,
-                k INTEGER NOT NULL CHECK(k BETWEEN 0 AND 10),
-                selected_at TEXT NOT NULL,
-                review_due_at TEXT NOT NULL,
-                payload_json TEXT NOT NULL DEFAULT '{}',
-                committed_at TEXT NOT NULL,
-                CHECK(length(portfolio_selection_id) BETWEEN 1 AND 256),
-                CHECK(risk_config_generation >= 0),
-                FOREIGN KEY(policy_id, policy_version)
-                    REFERENCES admission_policies(policy_id, version)
-            );
-            INSERT INTO portfolio_selections(
-                portfolio_selection_id,policy_id,policy_version,risk_config_id,
-                risk_config_generation,risk_config_hash,global_budget,k,selected_at,
-                review_due_at,payload_json,committed_at
-            )
-            SELECT
-                legacy.portfolio_selection_id,legacy.policy_id,legacy.policy_version,legacy.risk_config_id,
-                legacy.risk_config_generation,legacy.risk_config_hash,legacy.global_budget,
-                (SELECT COUNT(*) FROM portfolio_selection_members_legacy_k members
-                 WHERE members.portfolio_selection_id=legacy.portfolio_selection_id),
-                legacy.selected_at,legacy.review_due_at,legacy.payload_json,legacy.committed_at
-            FROM portfolio_selections_legacy_k legacy;
-            CREATE TABLE portfolio_selection_members (
-                portfolio_selection_id TEXT NOT NULL,
-                strategy_version_id TEXT NOT NULL,
-                allocation TEXT NOT NULL,
-                status TEXT NOT NULL,
-                score TEXT NOT NULL,
-                reason TEXT NOT NULL,
-                evidence_window_id TEXT,
-                overlap_key TEXT NOT NULL DEFAULT '',
-                payload_json TEXT NOT NULL DEFAULT '{}',
-                created_at TEXT NOT NULL,
-                PRIMARY KEY(portfolio_selection_id, strategy_version_id),
-                FOREIGN KEY(portfolio_selection_id) REFERENCES portfolio_selections(portfolio_selection_id),
-                FOREIGN KEY(strategy_version_id) REFERENCES strategy_versions(strategy_version_id),
-                FOREIGN KEY(evidence_window_id) REFERENCES strategy_evidence_windows(evidence_window_id)
-            );
-            INSERT INTO portfolio_selection_members(
-                portfolio_selection_id,strategy_version_id,allocation,status,score,reason,
-                evidence_window_id,overlap_key,payload_json,created_at
-            )
-            SELECT portfolio_selection_id,strategy_version_id,allocation,status,score,reason,
-                   evidence_window_id,overlap_key,payload_json,created_at
-            FROM portfolio_selection_members_legacy_k;
-            CREATE TABLE portfolio_current_selection (
-                pointer_id TEXT PRIMARY KEY CHECK(pointer_id = 'current'),
-                portfolio_selection_id TEXT NOT NULL,
-                committed_at TEXT NOT NULL,
-                FOREIGN KEY(portfolio_selection_id) REFERENCES portfolio_selections(portfolio_selection_id)
-            );
-            INSERT INTO portfolio_current_selection(pointer_id,portfolio_selection_id,committed_at)
-            SELECT pointer_id,portfolio_selection_id,committed_at
-            FROM portfolio_current_selection_legacy_k;
-            CREATE TABLE portfolio_review_state (
-                state_id TEXT PRIMARY KEY CHECK(state_id = 'current'),
-                portfolio_selection_id TEXT,
-                review_due_at TEXT,
-                reviewed_at TEXT,
-                status TEXT NOT NULL DEFAULT '',
-                payload_json TEXT NOT NULL DEFAULT '{}',
-                updated_at TEXT NOT NULL,
-                FOREIGN KEY(portfolio_selection_id) REFERENCES portfolio_selections(portfolio_selection_id)
-            );
-            INSERT INTO portfolio_review_state(
-                state_id,portfolio_selection_id,review_due_at,reviewed_at,status,payload_json,updated_at
-            )
-            SELECT state_id,portfolio_selection_id,review_due_at,reviewed_at,status,payload_json,updated_at
-            FROM portfolio_review_state_legacy_k;
-            DROP TABLE portfolio_selection_members_legacy_k;
-            DROP TABLE portfolio_current_selection_legacy_k;
-            DROP TABLE portfolio_review_state_legacy_k;
-            DROP TABLE portfolio_selections_legacy_k;
-            """
+        bases = (
+            "portfolio_selection_members",
+            "portfolio_current_selection",
+            "portfolio_review_state",
+            "portfolio_selections",
         )
-        self._conn.executescript(
-            """
-            CREATE INDEX IF NOT EXISTS idx_portfolio_selections_committed
-                ON portfolio_selections(committed_at DESC, portfolio_selection_id DESC);
-            CREATE INDEX IF NOT EXISTS idx_portfolio_selections_policy
-                ON portfolio_selections(policy_id, policy_version, committed_at DESC);
-            CREATE INDEX IF NOT EXISTS idx_portfolio_selection_members_selection
-                ON portfolio_selection_members(portfolio_selection_id, score DESC, strategy_version_id);
-            CREATE INDEX IF NOT EXISTS idx_portfolio_selection_members_strategy
-                ON portfolio_selection_members(strategy_version_id, created_at DESC);
-            CREATE INDEX IF NOT EXISTS idx_portfolio_review_state_updated
-                ON portfolio_review_state(updated_at DESC);
-            """
-        )
+        staged = {name: f"{name}_legacy_k" for name in bases}
+
+        def exists(name: str) -> bool:
+            return self._conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                (name,),
+            ).fetchone() is not None
+
+        started_transaction = False
+        if not self._conn.in_transaction:
+            self._conn.execute("BEGIN IMMEDIATE")
+            started_transaction = True
+        try:
+            # Recover an interrupted pre-transaction migration.  Staging
+            # tables are the source of truth; a replacement table created
+            # before a crash is discarded so no partial copy can hide rows.
+            if any(exists(name) for name in staged.values()):
+                for name, legacy_name in staged.items():
+                    if not exists(legacy_name):
+                        if not exists(name):
+                            raise sqlite3.OperationalError(
+                                f"rolling migration staging table missing: {legacy_name}"
+                            )
+                        self._conn.execute(f"ALTER TABLE {name} RENAME TO {legacy_name}")
+                for name in (
+                    "portfolio_selection_members",
+                    "portfolio_current_selection",
+                    "portfolio_review_state",
+                    "portfolio_selections",
+                ):
+                    if exists(name):
+                        self._conn.execute(f"DROP TABLE {name}")
+            if not all(exists(name) for name in staged.values()):
+                if not all(exists(name) for name in bases):
+                    raise sqlite3.OperationalError("rolling migration source tables are incomplete")
+            for index_name in (
+                "idx_portfolio_selections_committed",
+                "idx_portfolio_selections_policy",
+                "idx_portfolio_selection_members_selection",
+                "idx_portfolio_selection_members_strategy",
+                "idx_portfolio_review_state_updated",
+            ):
+                self._conn.execute(f"DROP INDEX IF EXISTS {index_name}")
+            if all(exists(name) for name in bases):
+                for name in (
+                    "portfolio_selection_members",
+                    "portfolio_current_selection",
+                    "portfolio_review_state",
+                    "portfolio_selections",
+                ):
+                    self._conn.execute(f"ALTER TABLE {name} RENAME TO {staged[name]}")
+            legacy_member_columns = {
+                str(row["name"])
+                for row in self._conn.execute(
+                    f"PRAGMA table_info({staged['portfolio_selection_members']})"
+                ).fetchall()
+            }
+            legacy_research_trial = (
+                "legacy.research_trial_id"
+                if "research_trial_id" in legacy_member_columns
+                else "NULL"
+            )
+            legacy_candidate = (
+                "legacy.candidate_id"
+                if "candidate_id" in legacy_member_columns
+                else "NULL"
+            )
+
+            self._conn.execute(
+                """
+                CREATE TABLE portfolio_selections (
+                    portfolio_selection_id TEXT PRIMARY KEY,
+                    policy_id TEXT NOT NULL,
+                    policy_version TEXT NOT NULL,
+                    risk_config_id TEXT NOT NULL,
+                    risk_config_generation INTEGER NOT NULL,
+                    risk_config_hash TEXT NOT NULL,
+                    global_budget TEXT NOT NULL,
+                    k INTEGER NOT NULL CHECK(k BETWEEN 0 AND 10),
+                    selected_at TEXT NOT NULL,
+                    review_due_at TEXT NOT NULL,
+                    payload_json TEXT NOT NULL DEFAULT '{}',
+                    committed_at TEXT NOT NULL,
+                    CHECK(length(portfolio_selection_id) BETWEEN 1 AND 256),
+                    CHECK(risk_config_generation >= 0)
+                )
+                """
+            )
+            self._conn.execute(
+                """
+                INSERT INTO portfolio_selections(
+                    portfolio_selection_id,policy_id,policy_version,risk_config_id,
+                    risk_config_generation,risk_config_hash,global_budget,k,selected_at,
+                    review_due_at,payload_json,committed_at
+                )
+                SELECT
+                    legacy.portfolio_selection_id,legacy.policy_id,legacy.policy_version,
+                    legacy.risk_config_id,legacy.risk_config_generation,legacy.risk_config_hash,
+                    legacy.global_budget,
+                    (SELECT COUNT(*) FROM portfolio_selection_members_legacy_k members
+                     WHERE members.portfolio_selection_id=legacy.portfolio_selection_id),
+                    legacy.selected_at,legacy.review_due_at,legacy.payload_json,legacy.committed_at
+                FROM portfolio_selections_legacy_k legacy
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE TABLE portfolio_selection_members (
+                    portfolio_selection_id TEXT NOT NULL,
+                    strategy_version_id TEXT NOT NULL,
+                    research_trial_id TEXT,
+                    candidate_id TEXT,
+                    allocation TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    score TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    evidence_window_id TEXT,
+                    overlap_key TEXT NOT NULL DEFAULT '',
+                    payload_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY(portfolio_selection_id, strategy_version_id)
+                )
+                """
+            )
+            self._conn.execute(
+                f"""
+                INSERT INTO portfolio_selection_members(
+                    portfolio_selection_id,strategy_version_id,research_trial_id,candidate_id,
+                    allocation,status,score,reason,evidence_window_id,overlap_key,payload_json,created_at
+                )
+                SELECT legacy.portfolio_selection_id,legacy.strategy_version_id,
+                       {legacy_research_trial},{legacy_candidate},legacy.allocation,legacy.status,
+                       legacy.score,legacy.reason,legacy.evidence_window_id,legacy.overlap_key,
+                       legacy.payload_json,legacy.created_at
+                FROM portfolio_selection_members_legacy_k legacy
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE TABLE portfolio_current_selection (
+                    pointer_id TEXT PRIMARY KEY CHECK(pointer_id = 'current'),
+                    portfolio_selection_id TEXT NOT NULL,
+                    committed_at TEXT NOT NULL
+                )
+                """
+            )
+            self._conn.execute(
+                """
+                INSERT INTO portfolio_current_selection(pointer_id,portfolio_selection_id,committed_at)
+                SELECT pointer_id,portfolio_selection_id,committed_at
+                FROM portfolio_current_selection_legacy_k
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE TABLE portfolio_review_state (
+                    state_id TEXT PRIMARY KEY CHECK(state_id = 'current'),
+                    portfolio_selection_id TEXT,
+                    review_due_at TEXT,
+                    reviewed_at TEXT,
+                    status TEXT NOT NULL DEFAULT '',
+                    payload_json TEXT NOT NULL DEFAULT '{}',
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            self._conn.execute(
+                """
+                INSERT INTO portfolio_review_state(
+                    state_id,portfolio_selection_id,review_due_at,reviewed_at,status,payload_json,updated_at
+                )
+                SELECT state_id,portfolio_selection_id,review_due_at,reviewed_at,status,payload_json,updated_at
+                FROM portfolio_review_state_legacy_k
+                """
+            )
+            for legacy_name in staged.values():
+                self._conn.execute(f"DROP TABLE {legacy_name}")
+            self._conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_portfolio_selections_committed
+                    ON portfolio_selections(committed_at DESC, portfolio_selection_id DESC)
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_portfolio_selections_policy
+                    ON portfolio_selections(policy_id, policy_version, committed_at DESC)
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_portfolio_selection_members_selection
+                    ON portfolio_selection_members(portfolio_selection_id, score DESC, strategy_version_id)
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_portfolio_selection_members_strategy
+                    ON portfolio_selection_members(strategy_version_id, created_at DESC)
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_portfolio_review_state_updated
+                    ON portfolio_review_state(updated_at DESC)
+                """
+            )
+        except BaseException:
+            if started_transaction:
+                self._conn.rollback()
+            raise
+        else:
+            if started_transaction:
+                self._conn.commit()
+
+    def _backfill_rolling_selection_member_bindings(self) -> None:
+        """Backfill legacy member lineage only when its identity is unambiguous."""
+        member_rows = self._conn.execute(
+            "SELECT portfolio_selection_id,strategy_version_id,research_trial_id,"
+            "candidate_id,allocation,status,reason,payload_json "
+            "FROM portfolio_selection_members"
+        ).fetchall()
+        if not member_rows:
+            return
+
+        def text(value: Any) -> str | None:
+            if value is None:
+                return None
+            normalized = str(value).strip()
+            return normalized or None
+
+        def payload(value: Any) -> Mapping[str, Any]:
+            try:
+                parsed = _load(value)
+            except Exception:
+                return {}
+            return parsed if isinstance(parsed, Mapping) else {}
+
+        def payload_text(document: Mapping[str, Any], *names: str) -> str | None:
+            values: list[str] = []
+            for name in names:
+                candidate = text(document.get(name))
+                if candidate is not None:
+                    values.append(candidate)
+            binding = document.get("binding")
+            if isinstance(binding, Mapping):
+                for name in names:
+                    candidate = text(binding.get(name))
+                    if candidate is not None:
+                        values.append(candidate)
+            unique = sorted(set(values))
+            return unique[0] if len(unique) == 1 else None
+
+        def unique(values: Sequence[str | None]) -> str | None:
+            normalized = sorted({value for value in values if value is not None})
+            return normalized[0] if len(normalized) == 1 else None
+
+        strategy_payloads: dict[str, Mapping[str, Any]] = {}
+        trials_by_strategy: dict[str, list[sqlite3.Row]] = {}
+        trials_by_id: dict[str, sqlite3.Row] = {}
+        for trial_row in self._conn.execute(
+            "SELECT research_trial_id,strategy_version_id,payload_json FROM research_trials"
+        ).fetchall():
+            trial_id = text(trial_row["research_trial_id"])
+            strategy_id = text(trial_row["strategy_version_id"])
+            if trial_id is None or strategy_id is None:
+                continue
+            trials_by_strategy.setdefault(strategy_id, []).append(trial_row)
+            trials_by_id[trial_id] = trial_row
+
+        for row in member_rows:
+            selection_id = text(row["portfolio_selection_id"])
+            strategy_id = text(row["strategy_version_id"])
+            if selection_id is None or strategy_id is None:
+                continue
+            if strategy_id not in strategy_payloads:
+                strategy_row = self._conn.execute(
+                    "SELECT payload_json FROM strategy_versions WHERE strategy_version_id=?",
+                    (strategy_id,),
+                ).fetchone()
+                strategy_payloads[strategy_id] = (
+                    payload(strategy_row["payload_json"]) if strategy_row is not None else {}
+                )
+            member_payload = payload(row["payload_json"])
+            explicit_trial_values = [
+                value
+                for value in (
+                    text(row["research_trial_id"]),
+                    payload_text(member_payload, "research_trial_id", "trial_id"),
+                )
+                if value is not None
+            ]
+            trial_id = unique(explicit_trial_values)
+            explicit_trial_conflict = len(set(explicit_trial_values)) > 1
+            strategy_trials = trials_by_strategy.get(strategy_id, [])
+            trial_ids = sorted(
+                {
+                    text(trial_row["research_trial_id"])
+                    for trial_row in strategy_trials
+                    if text(trial_row["research_trial_id"]) is not None
+                }
+            )
+            if trial_id is None and not explicit_trial_conflict and len(trial_ids) == 1:
+                trial_id = trial_ids[0]
+            trial_row = trials_by_id.get(trial_id) if trial_id is not None else None
+            trial_is_exact = trial_row is not None and (
+                text(trial_row["strategy_version_id"]) == strategy_id
+            )
+            explicit_candidate_values = [
+                value
+                for value in (
+                    text(row["candidate_id"]),
+                    payload_text(
+                        member_payload,
+                        "candidate_id",
+                        "strategy_candidate_id",
+                    ),
+                )
+                if value is not None
+            ]
+            candidate_id = unique(explicit_candidate_values)
+            if candidate_id is None and not explicit_candidate_values:
+                inferred_candidates = [
+                    payload_text(
+                        strategy_payloads[strategy_id],
+                        "candidate_id",
+                        "strategy_candidate_id",
+                    ),
+                ]
+                if trial_row is not None:
+                    inferred_candidates.append(
+                        payload_text(
+                            payload(trial_row["payload_json"]),
+                            "candidate_id",
+                            "strategy_candidate_id",
+                        )
+                    )
+                candidate_id = unique(inferred_candidates)
+
+            try:
+                allocation = _risk_decimal(row["allocation"], nonnegative=True)
+            except (InvalidOperation, TypeError, ValueError):
+                allocation = Decimal("0")
+            status = str(row["status"] or "").strip().upper()
+            funded = allocation > 0 and status in {
+                "ACTIVE",
+                "RETAINED",
+                "REDUCE",
+                "PAPER",
+            }
+            executable = (
+                trial_id is not None
+                and trial_is_exact
+                and candidate_id is not None
+            )
+            next_status = status
+            next_allocation = str(row["allocation"])
+            if funded and not executable:
+                next_status = "OBSERVE"
+                next_allocation = "0"
+
+            next_payload = dict(member_payload)
+            if trial_id is not None:
+                next_payload["research_trial_id"] = trial_id
+            if candidate_id is not None:
+                next_payload["candidate_id"] = candidate_id
+            if next_status != status:
+                next_payload["status"] = next_status
+                next_payload["allocation"] = next_allocation
+            payload_json = _rolling_dump(next_payload)
+            if (
+                text(row["research_trial_id"]) != trial_id
+                or text(row["candidate_id"]) != candidate_id
+                or str(row["status"] or "") != next_status
+                or str(row["allocation"] or "") != next_allocation
+                or str(row["payload_json"] or "") != payload_json
+            ):
+                self._conn.execute(
+                    "UPDATE portfolio_selection_members SET research_trial_id=?,"
+                    "candidate_id=?,allocation=?,status=?,payload_json=? "
+                    "WHERE portfolio_selection_id=? AND strategy_version_id=?",
+                    (
+                        trial_id,
+                        candidate_id,
+                        next_allocation,
+                        next_status,
+                        payload_json,
+                        selection_id,
+                        strategy_id,
+                    ),
+                )
 
     def _initialize_canary_risk_schema(self) -> None:
         """Create versioned canary settings and append-only risk accounting.
@@ -1299,6 +1652,16 @@ class AxiomStore:
                 "config_hash": "TEXT",
                 "config_id": "TEXT",
                 "control_generation": "INTEGER",
+                "candidate_id": "TEXT",
+                "strategy_version_id": "TEXT",
+                "research_trial_id": "TEXT",
+                "portfolio_selection_id": "TEXT",
+                "admission_policy_id": "TEXT",
+                "admission_policy_version": "TEXT",
+                "risk_config_id": "TEXT",
+                "risk_config_generation": "INTEGER",
+                "risk_config_hash": "TEXT",
+                "allocation": "TEXT",
                 "detail_json": "TEXT NOT NULL DEFAULT '{}'",
                 "created_at": "TEXT NOT NULL DEFAULT ''",
                 "submitted_at": "TEXT",
@@ -1311,9 +1674,36 @@ class AxiomStore:
                 "attempted_at": "TEXT NOT NULL DEFAULT ''",
                 "status": "TEXT NOT NULL DEFAULT 'ATTEMPTED'",
                 "config_generation": "INTEGER",
-                "config_hash": "TEXT",
                 "config_id": "TEXT",
                 "control_generation": "INTEGER",
+                "candidate_id": "TEXT",
+                "strategy_version_id": "TEXT",
+                "research_trial_id": "TEXT",
+                "portfolio_selection_id": "TEXT",
+                "admission_policy_id": "TEXT",
+                "admission_policy_version": "TEXT",
+                "risk_config_id": "TEXT",
+                "risk_config_generation": "INTEGER",
+                "risk_config_hash": "TEXT",
+                "allocation": "TEXT",
+                "detail_json": "TEXT NOT NULL DEFAULT '{}'",
+            },
+            "canary_risk_fills": {
+                "quantity": "TEXT NOT NULL DEFAULT '0'",
+                "price": "TEXT NOT NULL DEFAULT '0'",
+                "cost": "TEXT NOT NULL DEFAULT '0'",
+                "fee": "TEXT NOT NULL DEFAULT '0'",
+                "filled_at": "TEXT NOT NULL DEFAULT ''",
+                "candidate_id": "TEXT",
+                "strategy_version_id": "TEXT",
+                "research_trial_id": "TEXT",
+                "portfolio_selection_id": "TEXT",
+                "admission_policy_id": "TEXT",
+                "admission_policy_version": "TEXT",
+                "risk_config_id": "TEXT",
+                "risk_config_generation": "INTEGER",
+                "risk_config_hash": "TEXT",
+                "allocation": "TEXT",
                 "detail_json": "TEXT NOT NULL DEFAULT '{}'",
             },
             "canary_equity_marks": {
@@ -1330,8 +1720,34 @@ class AxiomStore:
                 "config_id": "TEXT",
                 "config_generation": "INTEGER",
                 "control_generation": "INTEGER",
+                "candidate_id": "TEXT",
+                "strategy_version_id": "TEXT",
+                "research_trial_id": "TEXT",
+                "portfolio_selection_id": "TEXT",
+                "admission_policy_id": "TEXT",
+                "admission_policy_version": "TEXT",
+                "risk_config_id": "TEXT",
+                "risk_config_generation": "INTEGER",
+                "risk_config_hash": "TEXT",
+                "allocation": "TEXT",
                 "detail_json": "TEXT NOT NULL DEFAULT '{}'",
                 "created_at": "TEXT NOT NULL DEFAULT ''",
+            },
+            "canary_risk_cashflows": {
+                "kind": "TEXT NOT NULL DEFAULT 'EXTERNAL'",
+                "amount": "TEXT NOT NULL DEFAULT '0'",
+                "occurred_at": "TEXT NOT NULL DEFAULT ''",
+                "candidate_id": "TEXT",
+                "strategy_version_id": "TEXT",
+                "research_trial_id": "TEXT",
+                "portfolio_selection_id": "TEXT",
+                "admission_policy_id": "TEXT",
+                "admission_policy_version": "TEXT",
+                "risk_config_id": "TEXT",
+                "risk_config_generation": "INTEGER",
+                "risk_config_hash": "TEXT",
+                "allocation": "TEXT",
+                "detail_json": "TEXT NOT NULL DEFAULT '{}'",
             },
         }
         for table, columns in preflight_columns.items():
@@ -1401,6 +1817,16 @@ class AxiomStore:
                 config_hash TEXT,
                 config_id TEXT,
                 control_generation INTEGER,
+                candidate_id TEXT,
+                strategy_version_id TEXT,
+                research_trial_id TEXT,
+                portfolio_selection_id TEXT,
+                admission_policy_id TEXT,
+                admission_policy_version TEXT,
+                risk_config_id TEXT,
+                risk_config_generation INTEGER,
+                risk_config_hash TEXT,
+                allocation TEXT,
                 detail_json TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL,
                 submitted_at TEXT,
@@ -1421,6 +1847,16 @@ class AxiomStore:
                 config_hash TEXT,
                 config_id TEXT,
                 control_generation INTEGER,
+                candidate_id TEXT,
+                strategy_version_id TEXT,
+                research_trial_id TEXT,
+                portfolio_selection_id TEXT,
+                admission_policy_id TEXT,
+                admission_policy_version TEXT,
+                risk_config_id TEXT,
+                risk_config_generation INTEGER,
+                risk_config_hash TEXT,
+                allocation TEXT,
                 detail_json TEXT NOT NULL DEFAULT '{}'
             );
             CREATE INDEX IF NOT EXISTS idx_canary_submission_attempts_time
@@ -1433,6 +1869,16 @@ class AxiomStore:
                 cost TEXT NOT NULL,
                 fee TEXT NOT NULL DEFAULT '0',
                 filled_at TEXT NOT NULL,
+                candidate_id TEXT,
+                strategy_version_id TEXT,
+                research_trial_id TEXT,
+                portfolio_selection_id TEXT,
+                admission_policy_id TEXT,
+                admission_policy_version TEXT,
+                risk_config_id TEXT,
+                risk_config_generation INTEGER,
+                risk_config_hash TEXT,
+                allocation TEXT,
                 detail_json TEXT NOT NULL DEFAULT '{}'
             );
             CREATE UNIQUE INDEX IF NOT EXISTS idx_canary_risk_fills_reservation_fill
@@ -1450,9 +1896,18 @@ class AxiomStore:
                 mark_fee TEXT NOT NULL DEFAULT '0',
                 observed_at TEXT NOT NULL,
                 source TEXT NOT NULL,
-                config_id TEXT,
                 config_generation INTEGER,
                 control_generation INTEGER,
+                candidate_id TEXT,
+                strategy_version_id TEXT,
+                research_trial_id TEXT,
+                portfolio_selection_id TEXT,
+                admission_policy_id TEXT,
+                admission_policy_version TEXT,
+                risk_config_id TEXT,
+                risk_config_generation INTEGER,
+                risk_config_hash TEXT,
+                allocation TEXT,
                 detail_json TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL
             );
@@ -1461,40 +1916,37 @@ class AxiomStore:
                 kind TEXT NOT NULL,
                 amount TEXT NOT NULL,
                 occurred_at TEXT NOT NULL,
+                candidate_id TEXT,
+                strategy_version_id TEXT,
+                research_trial_id TEXT,
+                portfolio_selection_id TEXT,
+                admission_policy_id TEXT,
+                admission_policy_version TEXT,
+                risk_config_id TEXT,
+                risk_config_generation INTEGER,
+                risk_config_hash TEXT,
+                allocation TEXT,
                 detail_json TEXT NOT NULL DEFAULT '{}'
             );
             CREATE INDEX IF NOT EXISTS idx_canary_risk_cashflows_time
                 ON canary_risk_cashflows(occurred_at, kind, flow_id);
             """
         )
-        # A handful of early local prototypes created the config table without
-        # audit/activation columns.  Add only absent columns; never rewrite rows.
-        for table, columns in {
-            "canary_setting_configs": {
-                "activated_at": "TEXT",
-                "previous_config_id": "TEXT",
-            },
-            "canary_risk_reservations": {
-                "event_id": "TEXT",
-                "config_id": "TEXT",
-                "control_generation": "INTEGER",
-                "filled_cost": "TEXT NOT NULL DEFAULT '0'",
-                "remaining_cost": "TEXT NOT NULL DEFAULT '0'",
-                "quantity": "TEXT NOT NULL DEFAULT '0'",
-                "filled_quantity": "TEXT NOT NULL DEFAULT '0'",
-                "config_generation": "INTEGER",
-                "config_hash": "TEXT",
-                "detail_json": "TEXT NOT NULL DEFAULT '{}'",
-                "submitted_at": "TEXT",
-                "updated_at": "TEXT",
-                "released_at": "TEXT",
-            },
-            "canary_submission_attempts": {
-                "config_id": "TEXT",
-                "control_generation": "INTEGER",
-            },
-        }.items():
-            existing = {str(row["name"]) for row in self._conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        # A handful of early local prototypes created tables without
+        # activation or lineage columns.  Add only absent columns; never
+        # rewrite rows.  ``preflight_columns`` is also applied here so fresh
+        # tables created by the script and partially-created tables converge
+        # to the same additive shape.
+        migration_columns = dict(preflight_columns)
+        migration_columns["canary_setting_configs"] = {
+            "activated_at": "TEXT",
+            "previous_config_id": "TEXT",
+        }
+        for table, columns in migration_columns.items():
+            existing = {
+                str(row["name"])
+                for row in self._conn.execute(f"PRAGMA table_info({table})").fetchall()
+            }
             for name, definition in columns.items():
                 if name not in existing:
                     self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
@@ -1509,6 +1961,32 @@ class AxiomStore:
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_canary_equity_marks_observed "
             "ON canary_equity_marks(observed_at, mark_id)"
+        )
+        self._conn.executescript(
+            """
+            CREATE INDEX IF NOT EXISTS idx_canary_risk_reservations_lineage
+                ON canary_risk_reservations(
+                    portfolio_selection_id, strategy_version_id, status, updated_at
+                );
+            CREATE INDEX IF NOT EXISTS idx_canary_risk_reservations_strategy
+                ON canary_risk_reservations(strategy_version_id, side, status, updated_at);
+            CREATE INDEX IF NOT EXISTS idx_canary_submission_attempts_lineage
+                ON canary_submission_attempts(
+                    portfolio_selection_id, strategy_version_id, attempted_at, attempt_id
+                );
+            CREATE INDEX IF NOT EXISTS idx_canary_risk_fills_lineage
+                ON canary_risk_fills(
+                    portfolio_selection_id, strategy_version_id, filled_at, fill_id
+                );
+            CREATE INDEX IF NOT EXISTS idx_canary_equity_marks_lineage
+                ON canary_equity_marks(
+                    portfolio_selection_id, strategy_version_id, observed_at DESC, mark_id DESC
+                );
+            CREATE INDEX IF NOT EXISTS idx_canary_risk_cashflows_lineage
+                ON canary_risk_cashflows(
+                    portfolio_selection_id, strategy_version_id, occurred_at, flow_id
+                );
+            """
         )
 
     def save_canary_setting_config(
@@ -1775,10 +2253,10 @@ class AxiomStore:
                 "previous_config_hash": row["previous_config_hash"],
                 "new_config_id": row["new_config_id"],
                 "new_config_hash": row["new_config_hash"],
-                "previous_generation": int(row["previous_generation"]),
-                "new_generation": int(row["new_generation"]),
+                "previous_generation": row["previous_generation"],
+                "new_generation": row["new_generation"],
                 "timestamp": _parse_datetime(row["timestamp"]),
-                "detail": _load(row["detail_json"]),
+                "detail": _load(row["detail_json"]) if row["detail_json"] else {},
             }
             for row in rows
         ]
@@ -1866,6 +2344,382 @@ class AxiomStore:
             start_local.astimezone(UTC).isoformat(),
             (start_local + timedelta(days=1)).astimezone(UTC).isoformat(),
         )
+    def _rolling_open_buy_commitment_locked(self, row: sqlite3.Row) -> Decimal:
+        """Return one rolling BUY's still-open capital from canonical lot state."""
+        if str(row["side"] or "").strip().upper() != "BUY":
+            return Decimal("0")
+        lineage = _canary_lineage_from_row(row)
+        if not lineage.get("portfolio_selection_id") or not lineage.get("strategy_version_id"):
+            return Decimal("0")
+        status = str(row["status"] or "").strip().upper()
+        filled = _risk_decimal(row["filled_cost"], name="filled cost", nonnegative=True)
+        remaining = _risk_decimal(row["remaining_cost"], name="remaining cost", nonnegative=True)
+        expected_quantity = _risk_decimal(row["quantity"], name="quantity", nonnegative=True)
+        filled_quantity = _risk_decimal(
+            row["filled_quantity"], name="filled quantity", nonnegative=True
+        )
+        active = status in {
+            "HELD",
+            "RESERVED",
+            "SUBMITTING",
+            "SUBMITTED",
+            "ACKNOWLEDGED",
+            "UNKNOWN",
+            "PARTIAL",
+            "PARTIALLY_FILLED",
+            "OPEN",
+        }
+        if active or (
+            status == "FILLED"
+            and expected_quantity > 0
+            and filled_quantity < expected_quantity
+        ):
+            return filled + remaining
+        if status not in {"FILLED", "RELEASED", "SETTLED"}:
+            return Decimal("0")
+        try:
+            lot_rows = self._conn.execute(
+                "SELECT quantity,sold_quantity,cost_basis,fees,status,candidate_id,"
+                "strategy_version_id,research_trial_id,portfolio_selection_id "
+                "FROM canary_position_lots WHERE reservation_id=?",
+                (str(row["reservation_id"]),),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            try:
+                lot_rows = self._conn.execute(
+                    "SELECT quantity,sold_quantity,cost_basis,status,candidate_id,"
+                    "strategy_version_id,research_trial_id,portfolio_selection_id "
+                    "FROM canary_position_lots WHERE reservation_id=?",
+                    (str(row["reservation_id"]),),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                lot_rows = []
+        lot_commitment = Decimal("0")
+        saw_matching_lot = False
+        for lot in lot_rows:
+            if any(
+                str(lot[name] or "").strip()
+                and str(lot[name]).strip() != str(lineage.get(name) or "").strip()
+                for name in (
+                    "candidate_id",
+                    "strategy_version_id",
+                    "research_trial_id",
+                    "portfolio_selection_id",
+                )
+                if name in lot.keys()
+            ):
+                continue
+            lot_status = str(lot["status"] or "").strip().upper()
+            if lot_status in {"CLOSED", "DUST", "SETTLED", "RESOLVED"}:
+                saw_matching_lot = True
+                continue
+            quantity = _risk_decimal(lot["quantity"], name="lot quantity", nonnegative=True)
+            basis = _risk_decimal(lot["cost_basis"], name="lot cost basis", nonnegative=True)
+            sold = _risk_decimal(lot["sold_quantity"], name="lot sold quantity", nonnegative=True)
+            if quantity <= 0 or sold >= quantity:
+                saw_matching_lot = True
+                continue
+            saw_matching_lot = True
+            lot_commitment += basis * (quantity - sold) / quantity
+        if saw_matching_lot:
+            return max(Decimal("0"), lot_commitment)
+        return filled if status in {"FILLED", "RELEASED"} else Decimal("0")
+
+    def _canary_rolling_binding_locked(
+        self,
+        *,
+        lineage: Mapping[str, Any],
+        allow_exit: bool = False,
+    ) -> dict[str, Any] | None:
+        """Validate an exact rolling selection/member binding.
+
+        New BUY reservations must point at the current selection and a funded
+        ACTIVE member.  SELL exits may use an historical selection/member
+        lineage after rotation; exact lot ownership is authorized separately
+        by the persisted canary position request.
+        """
+        if not _canary_lineage_is_rolling(lineage):
+            return None
+        required = (
+            "strategy_version_id",
+            "research_trial_id",
+            "portfolio_selection_id",
+            "admission_policy_id",
+            "admission_policy_version",
+            "risk_config_id",
+            "risk_config_generation",
+            "risk_config_hash",
+        )
+        if any(lineage.get(name) in (None, "") for name in required):
+            raise ValueError("rolling reservation requires complete lineage")
+        if not allow_exit and lineage.get("allocation") in (None, ""):
+            raise ValueError("rolling BUY requires allocation")
+        selection_id = str(lineage["portfolio_selection_id"]).strip()
+        strategy_id = str(lineage["strategy_version_id"]).strip()
+        policy_id = str(lineage["admission_policy_id"]).strip()
+        policy_version = str(lineage["admission_policy_version"]).strip()
+        risk_id = str(lineage["risk_config_id"]).strip()
+        risk_hash = str(lineage["risk_config_hash"]).strip()
+        risk_generation = _canary_optional_lineage_generation(
+            lineage["risk_config_generation"],
+            name="risk_config_generation",
+        )
+        allocation = _risk_decimal(
+            lineage.get("allocation") or "0",
+            name="allocation",
+            nonnegative=True,
+        )
+        if not selection_id or not strategy_id or not policy_id or not policy_version:
+            raise ValueError("rolling reservation lineage identifiers are required")
+        if not risk_id or risk_generation is None or not risk_hash:
+            raise ValueError("rolling reservation requires funded lineage")
+        pointer = self._conn.execute(
+            "SELECT portfolio_selection_id FROM portfolio_current_selection "
+            "WHERE pointer_id='current'"
+        ).fetchone()
+        if (
+            not allow_exit
+            and (pointer is None or str(pointer["portfolio_selection_id"]) != selection_id)
+        ):
+            raise ValueError("rolling reservation selection is not current")
+        selection = self._conn.execute(
+            "SELECT * FROM portfolio_selections WHERE portfolio_selection_id=?",
+            (selection_id,),
+        ).fetchone()
+        if selection is None:
+            raise ValueError("rolling reservation selection does not exist")
+        selection_payload = _load(selection["payload_json"]) if selection["payload_json"] else {}
+        selection_payload = selection_payload if isinstance(selection_payload, Mapping) else {}
+        selection_identity = dict(selection)
+        selection_identity["payload"] = selection_payload
+        for aliases, label in (
+            (("policy_id", "admission_policy_id"), "policy"),
+            (("policy_version", "version"), "policy version"),
+            (
+                (
+                    "active_risk_config_id",
+                    "risk_config_id",
+                    "config_id",
+                ),
+                "risk config",
+            ),
+            (
+                (
+                    "active_risk_config_generation",
+                    "risk_config_generation",
+                    "risk_generation",
+                    "generation",
+                ),
+                "risk generation",
+            ),
+            (
+                ("active_risk_config_hash", "risk_config_hash", "config_hash"),
+                "risk config hash",
+            ),
+        ):
+            if _rolling_identity_conflict(selection_identity, *aliases):
+                raise ValueError(f"rolling reservation {label} identity conflicts")
+        if (
+            str(selection["policy_id"]) != policy_id
+            or str(selection["policy_version"]) != policy_version
+            or str(selection["risk_config_id"]) != risk_id
+            or int(selection["risk_config_generation"]) != risk_generation
+            or str(selection["risk_config_hash"]) != risk_hash
+        ):
+            raise ValueError("rolling reservation policy/risk binding is stale")
+        if self._conn.execute(
+            "SELECT 1 FROM admission_policies WHERE policy_id=? AND version=?",
+            (policy_id, policy_version),
+        ).fetchone() is None:
+            raise ValueError("rolling reservation admission policy does not exist")
+        trial = self._conn.execute(
+            "SELECT strategy_version_id,payload_json FROM research_trials "
+            "WHERE research_trial_id=?",
+            (str(lineage["research_trial_id"]).strip(),),
+        ).fetchone()
+        if trial is None or str(trial["strategy_version_id"]) != strategy_id:
+            raise ValueError("rolling reservation research trial binding is stale")
+        trial_payload = _load(trial["payload_json"]) if trial["payload_json"] else {}
+        trial_payload = trial_payload if isinstance(trial_payload, Mapping) else {}
+        if _rolling_identity_conflict(
+            trial_payload,
+            "research_trial_id",
+            "trial_id",
+        ) or _rolling_identity_conflict(
+            trial_payload,
+            "candidate_id",
+            "candidate",
+            "strategy_candidate_id",
+        ):
+            raise ValueError("rolling reservation research trial provenance conflicts")
+        trial_identity = _rolling_identity_value(
+            trial_payload,
+            "research_trial_id",
+            "trial_id",
+        )
+        if trial_identity is not None and trial_identity != str(lineage["research_trial_id"]).strip():
+            raise ValueError("rolling reservation research trial identity is stale")
+        trial_candidate = _rolling_identity_value(
+            trial_payload,
+            "candidate_id",
+            "candidate",
+            "strategy_candidate_id",
+        )
+        if trial_candidate is None:
+            raise ValueError("rolling reservation research trial candidate provenance is missing")
+        member = self._conn.execute(
+            "SELECT * FROM portfolio_selection_members "
+            "WHERE portfolio_selection_id=? AND strategy_version_id=?",
+            (selection_id, strategy_id),
+        ).fetchone()
+        if member is None:
+            raise ValueError("rolling reservation strategy is not selected")
+        member_payload = _load(member["payload_json"]) if member["payload_json"] else {}
+        member_payload = member_payload if isinstance(member_payload, Mapping) else {}
+        member_identity = dict(member)
+        member_identity["payload"] = member_payload
+        for aliases, label in (
+            (("research_trial_id", "trial_id"), "research trial"),
+            (("candidate_id", "candidate", "strategy_candidate_id"), "candidate"),
+            (("evidence_window_id", "evidence_id", "window_id"), "evidence"),
+            (("admission_policy_id", "policy_id"), "policy"),
+            (("admission_policy_version", "policy_version", "version"), "policy version"),
+            (
+                ("risk_config_id", "active_risk_config_id", "config_id"),
+                "risk config",
+            ),
+            (
+                (
+                    "risk_config_generation",
+                    "active_risk_config_generation",
+                    "risk_generation",
+                    "generation",
+                ),
+                "risk generation",
+            ),
+            (("risk_config_hash", "active_risk_config_hash", "config_hash"), "risk config hash"),
+        ):
+            if _rolling_identity_conflict(member_identity, *aliases):
+                raise ValueError(f"rolling reservation member {label} identity conflicts")
+        member_trial_id = _rolling_identity_value(
+            member_identity,
+            "research_trial_id",
+            "trial_id",
+        )
+        if member_trial_id != str(lineage["research_trial_id"]).strip():
+            raise ValueError("rolling reservation member research trial binding is stale")
+        member_candidate_id = _rolling_identity_value(
+            member_identity,
+            "candidate_id",
+            "candidate",
+            "strategy_candidate_id",
+        )
+        if not member_candidate_id or member_candidate_id != trial_candidate:
+            raise ValueError("rolling reservation member candidate binding is stale")
+        requested_candidate = str(lineage.get("candidate_id") or "").strip()
+        if requested_candidate and requested_candidate != member_candidate_id:
+            raise ValueError("rolling reservation candidate binding is stale")
+        evidence_id = _rolling_identity_value(
+            member_identity,
+            "evidence_window_id",
+            "evidence_id",
+            "window_id",
+        )
+        if not evidence_id:
+            raise ValueError("rolling reservation evidence binding is missing")
+        evidence = self._conn.execute(
+            "SELECT * FROM strategy_evidence_windows WHERE evidence_window_id=?",
+            (evidence_id,),
+        ).fetchone()
+        if evidence is None or str(evidence["strategy_version_id"]) != strategy_id:
+            raise ValueError("rolling reservation evidence binding is stale")
+        evidence_payload = _load(evidence["payload_json"]) if evidence["payload_json"] else {}
+        evidence_payload = evidence_payload if isinstance(evidence_payload, Mapping) else {}
+        evidence_identity = dict(evidence)
+        evidence_identity["payload"] = evidence_payload
+        if _rolling_identity_conflict(
+            evidence_identity,
+            "research_trial_id",
+            "trial_id",
+        ) or _rolling_identity_conflict(
+            evidence_identity,
+            "candidate_id",
+            "candidate",
+            "strategy_candidate_id",
+        ) or _rolling_identity_conflict(
+            evidence_identity,
+            "source_class",
+            "source_type",
+        ) or _rolling_identity_conflict(
+            evidence_identity,
+            "evidence_digest",
+            "digest",
+        ):
+            raise ValueError("rolling reservation evidence provenance conflicts")
+        evidence_trial = _rolling_identity_value(
+            evidence_identity,
+            "research_trial_id",
+            "trial_id",
+        )
+        evidence_candidate = _rolling_identity_value(
+            evidence_identity,
+            "candidate_id",
+            "candidate",
+            "strategy_candidate_id",
+        )
+        source_class = str(evidence["source_class"] or "").strip().upper()
+        if source_class not in _ROLLING_EVIDENCE_SOURCE_CLASSES:
+            raise ValueError("rolling reservation evidence source_class is invalid")
+        expected_digest = _rolling_evidence_digest(
+            _rolling_evidence_mapping_from_row(evidence, evidence_payload)
+        )
+        if str(evidence["evidence_digest"] or "").strip() != expected_digest:
+            raise ValueError("rolling reservation evidence digest is invalid")
+        if evidence_trial != member_trial_id or evidence_candidate != member_candidate_id:
+            raise ValueError("rolling reservation evidence binding is stale")
+        member_status = str(member["status"] or "").strip().upper()
+        member_allocation = _risk_decimal(
+            member["allocation"],
+            name="member allocation",
+            nonnegative=True,
+        )
+        if (not allow_exit and member_status != "ACTIVE") or (
+            not allow_exit and member_allocation <= 0
+        ):
+            raise ValueError("rolling reservation strategy is not ACTIVE")
+        if not allow_exit and member_allocation != allocation:
+            raise ValueError("rolling reservation allocation conflicts with selection")
+        if allow_exit and allocation > 0 and member_allocation > 0 and member_allocation != allocation:
+            raise ValueError("rolling exit allocation conflicts with opening member")
+        return {
+            "rolling": True,
+            "selection": selection,
+            "member": member,
+            "candidate_id": member_candidate_id,
+            "allocation": allocation,
+            "selection_payload": (
+                _load(selection["payload_json"]) if selection["payload_json"] else {}
+            ),
+        }
+    @staticmethod
+    def _canary_normalize_lineage(values: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        supplied = values or {}
+        normalized: dict[str, Any] = {
+            name: _canary_optional_lineage_text(supplied.get(name), name=name)
+            for name in _CANARY_LINEAGE_FIELDS
+            if name not in {"risk_config_generation", "allocation"}
+        }
+        normalized["risk_config_generation"] = _canary_optional_lineage_generation(
+            supplied.get("risk_config_generation"),
+            name="risk_config_generation",
+        )
+        allocation = supplied.get("allocation")
+        normalized["allocation"] = (
+            _risk_text(_risk_decimal(allocation, name="allocation", nonnegative=True))
+            if allocation not in (None, "")
+            else None
+        )
+        return normalized
 
     @staticmethod
     def _canary_identity_equal(
@@ -1882,8 +2736,16 @@ class AxiomStore:
         config_hash: str | None,
         config_id: str | None,
         control_generation: int | None,
+        lineage: Mapping[str, Any] | None = None,
         detail_json: str | None = None,
     ) -> bool:
+        expected_lineage = lineage or {name: None for name in _CANARY_LINEAGE_FIELDS}
+        stored_lineage = _canary_lineage_from_row(row)
+        lineage_matches = (
+            _canary_lineage_equal(stored_lineage, expected_lineage)
+            if _canary_lineage_is_rolling(stored_lineage)
+            else _canary_lineage_subset_equal(expected_lineage, stored_lineage)
+        )
         return (
             str(row["reservation_id"]) == reservation_id
             and str(row["side"]).upper() == side
@@ -1896,6 +2758,7 @@ class AxiomStore:
             and (row["config_hash"] or None) == config_hash
             and (row["config_id"] or None) == config_id
             and (row["control_generation"] or None) == control_generation
+            and lineage_matches
             and (detail_json is None or str(row["detail_json"] or "{}") == detail_json)
         )
 
@@ -1912,6 +2775,16 @@ class AxiomStore:
         config_hash: str | None = None,
         config_id: str | None = None,
         control_generation: int | None = None,
+        strategy_version_id: str | None = None,
+        research_trial_id: str | None = None,
+        candidate_id: str | None = None,
+        portfolio_selection_id: str | None = None,
+        admission_policy_id: str | None = None,
+        admission_policy_version: str | None = None,
+        risk_config_id: str | None = None,
+        risk_config_generation: int | None = None,
+        risk_config_hash: str | None = None,
+        allocation: Any | None = None,
         detail: Mapping[str, Any] | None = None,
     ) -> str:
         identifier = str(attempt_id or "").strip()
@@ -1920,10 +2793,69 @@ class AxiomStore:
         if not identifier or not intent or side_value not in {"BUY", "SELL"}:
             raise ValueError("attempt_id, intent_id, and side BUY/SELL are required")
         stamp = attempted_at or utc_now()
+        requested_lineage = self._canary_normalize_lineage(
+            {
+                "strategy_version_id": strategy_version_id,
+                "research_trial_id": research_trial_id,
+                "candidate_id": candidate_id,
+                "portfolio_selection_id": portfolio_selection_id,
+                "admission_policy_id": admission_policy_id,
+                "admission_policy_version": admission_policy_version,
+                "risk_config_id": risk_config_id,
+                "risk_config_generation": risk_config_generation,
+                "risk_config_hash": risk_config_hash,
+                "allocation": allocation,
+            }
+        )
         attempted_iso = _iso(stamp)
         status_value = str(status or "ATTEMPTED").strip().upper()
         detail_json = _dump(detail or {})
         with self.transaction(immediate=True):
+            prior_by_id = self._conn.execute(
+                "SELECT * FROM canary_submission_attempts WHERE attempt_id=?",
+                (identifier,),
+            ).fetchone()
+            if prior_by_id is not None:
+                prior_lineage = _canary_lineage_from_row(prior_by_id)
+                replay_lineage = dict(requested_lineage)
+                if _canary_lineage_is_rolling(prior_lineage):
+                    for name in _CANARY_LINEAGE_FIELDS:
+                        if replay_lineage.get(name) in (None, ""):
+                            replay_lineage[name] = prior_lineage.get(name)
+                    lineage_matches = _canary_lineage_equal(replay_lineage, prior_lineage)
+                else:
+                    lineage_matches = _canary_lineage_subset_equal(
+                        requested_lineage,
+                        prior_lineage,
+                    )
+                identity_matches = (
+                    str(prior_by_id["intent_id"]) == intent
+                    and str(prior_by_id["side"]).upper() == side_value
+                    and str(prior_by_id["attempted_at"]) == attempted_iso
+                    and str(prior_by_id["status"]).upper() == status_value
+                    and (
+                        config_generation is None
+                        or (prior_by_id["config_generation"] or None) == int(config_generation)
+                    )
+                    and (
+                        config_hash is None
+                        or str(prior_by_id["config_hash"]) == str(config_hash)
+                    )
+                    and (
+                        config_id is None
+                        or str(prior_by_id["config_id"]).strip() == str(config_id).strip()
+                    )
+                    and (
+                        control_generation is None
+                        or (prior_by_id["control_generation"] or None) == int(control_generation)
+                    )
+                    and str(prior_by_id["detail_json"] or "{}") == detail_json
+                    and lineage_matches
+                )
+                if not identity_matches:
+                    raise ValueError("submission attempt identity conflict")
+                return identifier
+
             authority = self._canary_authority_locked()
             if authority["config_id"] is None:
                 raise ValueError("active canary settings are unavailable")
@@ -1939,6 +2871,7 @@ class AxiomStore:
             ).fetchone()
             if reservation is None:
                 raise ValueError("risk reservation not found")
+            bound_lineage = _canary_lineage_from_row(reservation)
             if str(reservation["side"]).upper() != side_value:
                 raise ValueError("submission side conflicts with reservation")
             bound_generation = int(reservation["config_generation"])
@@ -1962,26 +2895,17 @@ class AxiomStore:
                 raise ValueError("config hash conflicts with reservation")
             if config_id is not None and str(config_id).strip() != bound_config_id:
                 raise ValueError("config id conflicts with reservation")
-            if control_generation is not None and int(control_generation) != bound_control_generation:
-                raise ValueError("control generation conflicts with reservation")
-            prior_by_id = self._conn.execute(
-                "SELECT * FROM canary_submission_attempts WHERE attempt_id=?",
-                (identifier,),
-            ).fetchone()
-            if prior_by_id is not None:
-                if (
-                    str(prior_by_id["intent_id"]) != intent
-                    or str(prior_by_id["side"]).upper() != side_value
-                    or str(prior_by_id["attempted_at"]) != attempted_iso
-                    or str(prior_by_id["status"]).upper() != status_value
-                    or (prior_by_id["config_generation"] or None) != bound_generation
-                    or (prior_by_id["config_hash"] or None) != bound_hash
-                    or (prior_by_id["config_id"] or None) != bound_config_id
-                    or (prior_by_id["control_generation"] or None) != bound_control_generation
-                    or str(prior_by_id["detail_json"] or "{}") != detail_json
-                ):
-                    raise ValueError("submission attempt identity conflict")
-                return identifier
+            if _canary_lineage_is_rolling(bound_lineage):
+                self._canary_rolling_binding_locked(
+                    lineage=bound_lineage,
+                    allow_exit=side_value == "SELL",
+                )
+                if requested_lineage["candidate_id"] is None:
+                    requested_lineage["candidate_id"] = bound_lineage["candidate_id"]
+                if not _canary_lineage_equal(requested_lineage, bound_lineage):
+                    raise ValueError("rolling submission requires exact reservation lineage")
+            elif not _canary_lineage_subset_equal(requested_lineage, bound_lineage):
+                raise ValueError("submission lineage conflicts with reservation")
             reservation_status = str(reservation["status"]).upper()
             reservation_quantity = _risk_decimal(reservation["quantity"])
             reservation_filled_quantity = _risk_decimal(reservation["filled_quantity"])
@@ -2031,8 +2955,10 @@ class AxiomStore:
             self._conn.execute(
                 "INSERT INTO canary_submission_attempts("
                 "attempt_id,intent_id,side,attempted_at,status,config_generation,config_hash,"
-                "config_id,control_generation,detail_json"
-                ") VALUES(?,?,?,?,?,?,?,?,?,?)",
+                "config_id,control_generation,strategy_version_id,research_trial_id,candidate_id,"
+                "portfolio_selection_id,admission_policy_id,admission_policy_version,"
+                "risk_config_id,risk_config_generation,risk_config_hash,allocation,detail_json"
+                ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     identifier,
                     intent,
@@ -2043,6 +2969,16 @@ class AxiomStore:
                     bound_hash,
                     bound_config_id,
                     bound_control_generation,
+                    bound_lineage["strategy_version_id"],
+                    bound_lineage["research_trial_id"],
+                    bound_lineage["candidate_id"],
+                    bound_lineage["portfolio_selection_id"],
+                    bound_lineage["admission_policy_id"],
+                    bound_lineage["admission_policy_version"],
+                    bound_lineage["risk_config_id"],
+                    bound_lineage["risk_config_generation"],
+                    bound_lineage["risk_config_hash"],
+                    bound_lineage["allocation"],
                     detail_json,
                 ),
             )
@@ -2060,6 +2996,16 @@ class AxiomStore:
         amount: Any,
         kind: str = "EXTERNAL",
         timestamp: datetime | None = None,
+        strategy_version_id: str | None = None,
+        research_trial_id: str | None = None,
+        candidate_id: str | None = None,
+        portfolio_selection_id: str | None = None,
+        admission_policy_id: str | None = None,
+        admission_policy_version: str | None = None,
+        risk_config_id: str | None = None,
+        risk_config_generation: int | None = None,
+        risk_config_hash: str | None = None,
+        allocation: Any | None = None,
         detail: Mapping[str, Any] | None = None,
     ) -> str:
         """Persist one idempotent cash/equity flow separately from trading."""
@@ -2067,6 +3013,20 @@ class AxiomStore:
         kind_value = str(kind or "").strip().upper()
         if not identifier or kind_value not in {"EXTERNAL", "DEPOSIT", "WITHDRAWAL", "EQUITY_LOSS"}:
             raise ValueError("flow_id and a supported flow kind are required")
+        lineage = self._canary_normalize_lineage(
+            {
+                "strategy_version_id": strategy_version_id,
+                "research_trial_id": research_trial_id,
+                "candidate_id": candidate_id,
+                "portfolio_selection_id": portfolio_selection_id,
+                "admission_policy_id": admission_policy_id,
+                "admission_policy_version": admission_policy_version,
+                "risk_config_id": risk_config_id,
+                "risk_config_generation": risk_config_generation,
+                "risk_config_hash": risk_config_hash,
+                "allocation": allocation,
+            }
+        )
         value = _risk_decimal(amount, name="flow amount")
         stamp = timestamp or utc_now()
         stamp_iso = _iso(stamp)
@@ -2082,14 +3042,37 @@ class AxiomStore:
                     or _risk_decimal(prior["amount"]) != value
                     or str(prior["occurred_at"]) != stamp_iso
                     or str(prior["detail_json"] or "{}") != detail_json
+                    or not _canary_lineage_equal(
+                        _canary_lineage_from_row(prior),
+                        lineage,
+                    )
                 ):
                     raise ValueError("cashflow identity conflict")
-                return identifier
-            self._conn.execute(
-                "INSERT INTO canary_risk_cashflows(flow_id,kind,amount,occurred_at,detail_json) "
-                "VALUES(?,?,?,?,?)",
-                (identifier, kind_value, _risk_text(value), stamp_iso, detail_json),
-            )
+            else:
+                self._conn.execute(
+                    "INSERT INTO canary_risk_cashflows("
+                    "flow_id,kind,amount,occurred_at,strategy_version_id,research_trial_id,candidate_id,"
+                    "portfolio_selection_id,admission_policy_id,admission_policy_version,"
+                    "risk_config_id,risk_config_generation,risk_config_hash,allocation,detail_json"
+                    ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        identifier,
+                        kind_value,
+                        _risk_text(value),
+                        stamp_iso,
+                        lineage["strategy_version_id"],
+                        lineage["research_trial_id"],
+                        lineage["candidate_id"],
+                        lineage["portfolio_selection_id"],
+                        lineage["admission_policy_id"],
+                        lineage["admission_policy_version"],
+                        lineage["risk_config_id"],
+                        lineage["risk_config_generation"],
+                        lineage["risk_config_hash"],
+                        lineage["allocation"],
+                        detail_json,
+                    ),
+                )
         return identifier
     def adopt_canary_legacy_reservation(
         self,
@@ -2137,6 +3120,7 @@ class AxiomStore:
         requested_value = _risk_decimal(requested_cost, name="requested_cost", nonnegative=True)
         expected_quantity = _risk_decimal(quantity, name="quantity", nonnegative=True)
         fee_value = _risk_decimal(fee_reserve, name="fee_reserve", nonnegative=True)
+        remaining = max(Decimal("0"), requested_value + fee_value)
         if expected_quantity <= 0:
             raise ValueError("legacy adoption quantity must be positive")
 
@@ -2201,18 +3185,18 @@ class AxiomStore:
                     or _risk_decimal(prior["requested_cost"]) != requested_value
                     or _risk_decimal(prior["fee_reserve"]) != fee_value
                     or _risk_decimal(prior["quantity"]) != expected_quantity
+                    or (str(prior["candidate_id"]).strip() if prior["candidate_id"] is not None else None) != candidate_value
                     or prior_identity_detail != reservation_detail
                 ):
                     raise ValueError("legacy adoption identity conflict")
                 row = prior
             else:
-                remaining = requested_value + fee_value
                 self._conn.execute(
                     "INSERT INTO canary_risk_reservations("
                     "reservation_id,intent_id,side,market_id,event_id,requested_cost,filled_cost,remaining_cost,"
                     "fee_reserve,quantity,filled_quantity,status,config_generation,config_hash,config_id,"
-                    "control_generation,detail_json,created_at,submitted_at,updated_at,released_at"
-                    ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "control_generation,candidate_id,detail_json,created_at,submitted_at,updated_at,released_at"
+                    ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         reservation,
                         intent,
@@ -2230,6 +3214,7 @@ class AxiomStore:
                         bound_config_hash,
                         bound_config_id,
                         bound_control_generation,
+                        candidate_value,
                         detail_json,
                         stamp_iso,
                         stamp_iso,
@@ -2259,6 +3244,16 @@ class AxiomStore:
         config_id: str | None = None,
         config_generation: int | None = None,
         control_generation: int | None = None,
+        strategy_version_id: str | None = None,
+        research_trial_id: str | None = None,
+        candidate_id: str | None = None,
+        portfolio_selection_id: str | None = None,
+        admission_policy_id: str | None = None,
+        admission_policy_version: str | None = None,
+        risk_config_id: str | None = None,
+        risk_config_generation: int | None = None,
+        risk_config_hash: str | None = None,
+        allocation: Any | None = None,
         detail: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Persist one exact-token, fee-aware mark for owned canary inventory."""
@@ -2295,6 +3290,20 @@ class AxiomStore:
             return int(decimal_value)
         config_generation_value = optional_generation(config_generation, "config generation")
         control_generation_value = optional_generation(control_generation, "control generation")
+        lineage = self._canary_normalize_lineage(
+            {
+                "strategy_version_id": strategy_version_id,
+                "research_trial_id": research_trial_id,
+                "candidate_id": candidate_id,
+                "portfolio_selection_id": portfolio_selection_id,
+                "admission_policy_id": admission_policy_id,
+                "admission_policy_version": admission_policy_version,
+                "risk_config_id": risk_config_id,
+                "risk_config_generation": risk_config_generation,
+                "risk_config_hash": risk_config_hash,
+                "allocation": allocation,
+            }
+        )
         config_id_value = str(config_id).strip() if config_id is not None else None
         with self.transaction(immediate=True):
             prior = self._conn.execute(
@@ -2315,6 +3324,10 @@ class AxiomStore:
                     or (str(prior["config_id"]).strip() if prior["config_id"] is not None else None) != config_id_value
                     or prior["config_generation"] != config_generation_value
                     or prior["control_generation"] != control_generation_value
+                    or not _canary_lineage_equal(
+                        _canary_lineage_from_row(prior),
+                        lineage,
+                    )
                     or str(prior["detail_json"] or "{}") != encoded_detail
                 ):
                     raise ValueError("equity mark identity conflict")
@@ -2323,8 +3336,11 @@ class AxiomStore:
                 self._conn.execute(
                     "INSERT INTO canary_equity_marks("
                     "mark_id,market_id,token_id,side,quantity,mark_price,cost_basis_usd,mark_fee,"
-                    "observed_at,source,config_id,config_generation,control_generation,detail_json,created_at"
-                    ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "observed_at,source,config_id,config_generation,control_generation,"
+                    "strategy_version_id,research_trial_id,candidate_id,portfolio_selection_id,"
+                    "admission_policy_id,admission_policy_version,risk_config_id,"
+                    "risk_config_generation,risk_config_hash,allocation,detail_json,created_at"
+                    ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         identifier,
                         market,
@@ -2339,6 +3355,16 @@ class AxiomStore:
                         config_id_value,
                         config_generation_value,
                         control_generation_value,
+                        lineage["strategy_version_id"],
+                        lineage["research_trial_id"],
+                        lineage["candidate_id"],
+                        lineage["portfolio_selection_id"],
+                        lineage["admission_policy_id"],
+                        lineage["admission_policy_version"],
+                        lineage["risk_config_id"],
+                        lineage["risk_config_generation"],
+                        lineage["risk_config_hash"],
+                        lineage["allocation"],
                         encoded_detail,
                         _iso(utc_now()),
                     ),
@@ -2361,10 +3387,20 @@ class AxiomStore:
         event_id: str | None = None,
         reservation_id: str | None = None,
         limits: Mapping[str, Any] | None = None,
+        config_id: str | None = None,
         config_generation: int | None = None,
         config_hash: str | None = None,
-        config_id: str | None = None,
         control_generation: int | None = None,
+        strategy_version_id: str | None = None,
+        research_trial_id: str | None = None,
+        candidate_id: str | None = None,
+        portfolio_selection_id: str | None = None,
+        admission_policy_id: str | None = None,
+        admission_policy_version: str | None = None,
+        risk_config_id: str | None = None,
+        risk_config_generation: int | None = None,
+        risk_config_hash: str | None = None,
+        allocation: Any | None = None,
         detail: Mapping[str, Any] | None = None,
         timestamp: datetime | None = None,
     ) -> dict[str, Any]:
@@ -2388,7 +3424,66 @@ class AxiomStore:
         market_key = str(market_id).strip() if market_id is not None and str(market_id).strip() else None
         event_key = str(event_id).strip() if event_id is not None and str(event_id).strip() else None
         encoded_detail = _dump(detail or {})
+        lineage = self._canary_normalize_lineage(
+            {
+                "strategy_version_id": strategy_version_id,
+                "research_trial_id": research_trial_id,
+                "candidate_id": candidate_id,
+                "portfolio_selection_id": portfolio_selection_id,
+                "admission_policy_id": admission_policy_id,
+                "admission_policy_version": admission_policy_version,
+                "risk_config_id": risk_config_id,
+                "risk_config_generation": risk_config_generation,
+                "risk_config_hash": risk_config_hash,
+                "allocation": allocation,
+            }
+        )
         with self.transaction(immediate=True):
+            existing = self._conn.execute(
+                "SELECT * FROM canary_risk_reservations WHERE intent_id=?",
+                (intent,),
+            ).fetchone()
+            if existing is not None:
+                stored_lineage = _canary_lineage_from_row(existing)
+                replay_lineage = dict(lineage)
+                if _canary_lineage_is_rolling(stored_lineage):
+                    for name in _CANARY_LINEAGE_FIELDS:
+                        if replay_lineage.get(name) in (None, ""):
+                            replay_lineage[name] = stored_lineage.get(name)
+                    lineage_matches = _canary_lineage_equal(replay_lineage, stored_lineage)
+                else:
+                    lineage_matches = _canary_lineage_subset_equal(lineage, stored_lineage)
+                identity_matches = (
+                    str(existing["reservation_id"]) == identifier
+                    and str(existing["side"]).upper() == side_value
+                    and (existing["market_id"] or None) == (market_key or None)
+                    and (existing["event_id"] or None) == (event_key or None)
+                    and _risk_decimal(existing["requested_cost"]) == requested
+                    and _risk_decimal(existing["fee_reserve"]) == fee
+                    and _risk_decimal(existing["quantity"]) == amount
+                    and (
+                        config_generation is None
+                        or int(existing["config_generation"]) == int(config_generation)
+                    )
+                    and (
+                        config_hash is None
+                        or str(existing["config_hash"]) == str(config_hash)
+                    )
+                    and (
+                        config_id is None
+                        or str(existing["config_id"]).strip() == str(config_id).strip()
+                    )
+                    and (
+                        control_generation is None
+                        or (existing["control_generation"] or None) == int(control_generation)
+                    )
+                    and lineage_matches
+                    and str(existing["detail_json"] or "{}") == encoded_detail
+                )
+                if not identity_matches:
+                    raise ValueError("reservation identity conflict")
+                return _canary_reservation_record(existing)
+
             authority = self._canary_authority_locked()
             if authority["config_id"] is None:
                 raise ValueError("active canary settings are unavailable")
@@ -2408,28 +3503,16 @@ class AxiomStore:
                 if int(control_generation) != int(authority["control_generation"]):
                     raise ValueError("canary control generation changed")
             bound_control_generation = authority["control_generation"]
-            existing = self._conn.execute(
-                "SELECT * FROM canary_risk_reservations WHERE intent_id=?",
-                (intent,),
-            ).fetchone()
-            if existing is not None:
-                if not self._canary_identity_equal(
-                    existing,
-                    reservation_id=identifier,
-                    side=side_value,
-                    market_id=market_key,
-                    event_id=event_key,
-                    requested=requested,
-                    fee=fee,
-                    quantity=amount,
-                    config_generation=int(authority["generation"]),
-                    config_hash=str(authority["config_hash"]),
-                    config_id=str(authority["config_id"]),
-                    control_generation=bound_control_generation,
-                    detail_json=encoded_detail,
-                ):
-                    raise ValueError("reservation identity conflict")
-                return _canary_reservation_record(existing)
+            rolling_binding = self._canary_rolling_binding_locked(
+                lineage=lineage,
+                allow_exit=side_value == "SELL",
+            )
+            bound_lineage = dict(lineage)
+            if rolling_binding is not None:
+                bound_lineage["candidate_id"] = rolling_binding["candidate_id"]
+                lineage["candidate_id"] = rolling_binding["candidate_id"]
+                bound_lineage["allocation"] = _risk_text(rolling_binding["allocation"])
+                lineage["allocation"] = bound_lineage["allocation"]
             prior_identifier = self._conn.execute(
                 "SELECT * FROM canary_risk_reservations WHERE reservation_id=?",
                 (identifier,),
@@ -2437,8 +3520,134 @@ class AxiomStore:
             if prior_identifier is not None:
                 raise ValueError("reservation id already belongs to another intent")
             usage = self.canary_risk_accounting(stamp)
-            effective = self._canary_effective_limits(authority["limits"], limits)
+            selection_limits: dict[str, Any] = {}
+            if rolling_binding is not None:
+                selection_payload = rolling_binding.get("selection_payload")
+                if isinstance(selection_payload, Mapping):
+                    for key in ("limits", "risk_limits", "risk"):
+                        candidate_limits = selection_payload.get(key)
+                        if isinstance(candidate_limits, Mapping):
+                            selection_limits.update(candidate_limits)
+            if limits:
+                selection_limits.update(dict(limits))
+            effective = self._canary_effective_limits(
+                authority["limits"],
+                selection_limits or None,
+            )
             all_in = requested + fee
+            if rolling_binding is not None and side_value == "BUY":
+                budget = _risk_decimal(
+                    rolling_binding["selection"]["global_budget"],
+                    name="rolling global budget",
+                    nonnegative=True,
+                )
+                strategy_id = str(bound_lineage["strategy_version_id"])
+                used_global = Decimal("0")
+                used_strategy = Decimal("0")
+                rolling_rows = self._conn.execute(
+                    "SELECT * FROM canary_risk_reservations "
+                    "WHERE UPPER(side)='BUY' AND portfolio_selection_id IS NOT NULL "
+                    "AND TRIM(portfolio_selection_id)<>''"
+                ).fetchall()
+                for rolling_row in rolling_rows:
+                    committed = self._rolling_open_buy_commitment_locked(rolling_row)
+                    if committed <= 0:
+                        continue
+                    used_global += committed
+                    if str(rolling_row["strategy_version_id"] or "") == strategy_id:
+                        used_strategy += committed
+                if all_in > budget or used_global + all_in > budget:
+                    raise ValueError("rolling global budget exceeded")
+                strategy_allocation = _risk_decimal(
+                    bound_lineage["allocation"],
+                    name="allocation",
+                    nonnegative=True,
+                )
+                if all_in > strategy_allocation or used_strategy + all_in > strategy_allocation:
+                    raise ValueError("rolling strategy allocation exceeded")
+                details = detail or {}
+                venue_minimum: Any = None
+                if isinstance(details, Mapping):
+                    for key in (
+                        "venue_minimum_cost",
+                        "venue_minimum_notional",
+                        "minimum_notional",
+                        "min_notional",
+                    ):
+                        if details.get(key) not in (None, ""):
+                            venue_minimum = details[key]
+                            break
+                    venue_context = details.get("venue")
+                    if venue_minimum in (None, "") and isinstance(venue_context, Mapping):
+                        venue_minimum = venue_context.get(
+                            "minimum_notional",
+                            venue_context.get("min_notional"),
+                        )
+                if venue_minimum not in (None, ""):
+                    minimum_value = _risk_decimal(
+                        venue_minimum,
+                        name="venue minimum",
+                        nonnegative=True,
+                    )
+                    market_cap = effective.get("per_market_buy_cap_usd")
+                    event_cap = effective.get("per_event_buy_cap_usd")
+                    if (
+                        minimum_value > strategy_allocation
+                        or (
+                            market_cap not in (None, "")
+                            and minimum_value > _risk_decimal(
+                                market_cap, name="per_market_buy_cap_usd", nonnegative=True
+                            )
+                        )
+                        or (
+                            event_cap not in (None, "")
+                            and minimum_value > _risk_decimal(
+                                event_cap, name="per_event_buy_cap_usd", nonnegative=True
+                            )
+                        )
+                    ):
+                        raise ValueError("venue minimum exceeds rolling allocation/cap")
+            incoming_token = ""
+            if isinstance(detail, Mapping):
+                incoming_token = str(
+                    detail.get("token_id") or detail.get("asset_id") or ""
+                ).strip()
+            if rolling_binding is not None and market_key and incoming_token:
+                opposite = "SELL" if side_value == "BUY" else "BUY"
+                opposite_rows = self._conn.execute(
+                    "SELECT side,status,quantity,filled_quantity,detail_json "
+                    "FROM canary_risk_reservations WHERE market_id=? AND UPPER(side)=?",
+                    (market_key, opposite),
+                ).fetchall()
+                for opposite_row in opposite_rows:
+                    opposite_status = str(opposite_row["status"] or "").upper()
+                    opposite_active = opposite_status in {
+                        "HELD", "RESERVED", "SUBMITTING", "ACKNOWLEDGED",
+                        "UNKNOWN", "PARTIAL", "PARTIALLY_FILLED", "OPEN", "SUBMITTED",
+                    } or (
+                        opposite_status == "FILLED"
+                        and _risk_decimal(opposite_row["filled_quantity"]) < _risk_decimal(
+                            opposite_row["quantity"]
+                        )
+                    )
+                    if not opposite_active:
+                        continue
+                    opposite_detail = (
+                        _load(opposite_row["detail_json"])
+                        if opposite_row["detail_json"]
+                        else {}
+                    )
+                    opposite_token = (
+                        str(
+                            opposite_detail.get("token_id")
+                            or opposite_detail.get("asset_id")
+                            or ""
+                        ).strip()
+                        if isinstance(opposite_detail, Mapping)
+                        else ""
+                    )
+                    if opposite_token == incoming_token:
+                        raise ValueError("conflicting opposite pending token order")
             if side_value == "BUY":
                 risk_breaker = str(usage.get("risk_breaker") or "").strip().upper()
                 if risk_breaker:
@@ -2559,8 +3768,10 @@ class AxiomStore:
                 "INSERT INTO canary_risk_reservations("
                 "reservation_id,intent_id,side,market_id,event_id,requested_cost,filled_cost,remaining_cost,"
                 "fee_reserve,quantity,filled_quantity,status,config_generation,config_hash,config_id,"
-                "control_generation,detail_json,created_at,submitted_at,updated_at,released_at"
-                ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "control_generation,candidate_id,strategy_version_id,research_trial_id,portfolio_selection_id,"
+                "admission_policy_id,admission_policy_version,risk_config_id,risk_config_generation,"
+                "risk_config_hash,allocation,detail_json,created_at,submitted_at,updated_at,released_at"
+                ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     identifier,
                     intent,
@@ -2578,6 +3789,16 @@ class AxiomStore:
                     str(authority["config_hash"]),
                     str(authority["config_id"]),
                     bound_control_generation,
+                    bound_lineage["candidate_id"],
+                    bound_lineage["strategy_version_id"],
+                    bound_lineage["research_trial_id"],
+                    bound_lineage["portfolio_selection_id"],
+                    bound_lineage["admission_policy_id"],
+                    bound_lineage["admission_policy_version"],
+                    bound_lineage["risk_config_id"],
+                    bound_lineage["risk_config_generation"],
+                    bound_lineage["risk_config_hash"],
+                    bound_lineage["allocation"],
                     encoded_detail,
                     _iso(stamp),
                     None,
@@ -2601,6 +3822,16 @@ class AxiomStore:
         cost: Any | None = None,
         fee: Any = "0",
         filled_at: datetime | None = None,
+        strategy_version_id: str | None = None,
+        research_trial_id: str | None = None,
+        candidate_id: str | None = None,
+        portfolio_selection_id: str | None = None,
+        admission_policy_id: str | None = None,
+        admission_policy_version: str | None = None,
+        risk_config_id: str | None = None,
+        risk_config_generation: int | None = None,
+        risk_config_hash: str | None = None,
+        allocation: Any | None = None,
         detail: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         fill = str(fill_id or "").strip()
@@ -2617,6 +3848,20 @@ class AxiomStore:
         stamp = filled_at or utc_now()
         stamp_iso = _iso(stamp)
         detail_json = _dump(detail or {})
+        lineage = self._canary_normalize_lineage(
+            {
+                "strategy_version_id": strategy_version_id,
+                "research_trial_id": research_trial_id,
+                "candidate_id": candidate_id,
+                "portfolio_selection_id": portfolio_selection_id,
+                "admission_policy_id": admission_policy_id,
+                "admission_policy_version": admission_policy_version,
+                "risk_config_id": risk_config_id,
+                "risk_config_generation": risk_config_generation,
+                "risk_config_hash": risk_config_hash,
+                "allocation": allocation,
+            }
+        )
         with self.transaction(immediate=True):
             reservation_row = self._conn.execute(
                 "SELECT * FROM canary_risk_reservations WHERE reservation_id=?",
@@ -2624,6 +3869,14 @@ class AxiomStore:
             ).fetchone()
             if reservation_row is None:
                 raise ValueError("risk reservation not found")
+            reservation_lineage = _canary_lineage_from_row(reservation_row)
+            if _canary_lineage_is_rolling(reservation_lineage):
+                if lineage["candidate_id"] is None:
+                    lineage["candidate_id"] = reservation_lineage["candidate_id"]
+                if not _canary_lineage_equal(lineage, reservation_lineage):
+                    raise ValueError("fill lineage conflicts with reservation")
+            elif not _canary_lineage_subset_equal(lineage, reservation_lineage):
+                raise ValueError("fill lineage conflicts with reservation")
             prior = self._conn.execute(
                 "SELECT * FROM canary_risk_fills WHERE fill_id=?",
                 (fill,),
@@ -2764,6 +4017,10 @@ class AxiomStore:
                     or _risk_decimal(prior["cost"]) != value
                     or _risk_decimal(prior["fee"]) != charge
                     or str(prior["filled_at"]) != stamp_iso
+                    or not _canary_lineage_equal(
+                        _canary_lineage_from_row(prior),
+                        reservation_lineage,
+                    )
                 ):
                     raise ValueError("fill identity conflict")
                 prior_detail = _load(prior["detail_json"]) if prior["detail_json"] else {}
@@ -2779,8 +4036,12 @@ class AxiomStore:
                     )
             else:
                 self._conn.execute(
-                    "INSERT INTO canary_risk_fills(fill_id,reservation_id,quantity,price,cost,fee,filled_at,detail_json) "
-                    "VALUES(?,?,?,?,?,?,?,?)",
+                    "INSERT INTO canary_risk_fills("
+                    "fill_id,reservation_id,quantity,price,cost,fee,filled_at,"
+                    "strategy_version_id,research_trial_id,candidate_id,portfolio_selection_id,"
+                    "admission_policy_id,admission_policy_version,risk_config_id,"
+                    "risk_config_generation,risk_config_hash,allocation,detail_json"
+                    ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         fill,
                         reservation,
@@ -2789,6 +4050,16 @@ class AxiomStore:
                         _risk_text(value),
                         _risk_text(charge),
                         stamp_iso,
+                        reservation_lineage["strategy_version_id"],
+                        reservation_lineage["research_trial_id"],
+                        reservation_lineage["candidate_id"],
+                        reservation_lineage["portfolio_selection_id"],
+                        reservation_lineage["admission_policy_id"],
+                        reservation_lineage["admission_policy_version"],
+                        reservation_lineage["risk_config_id"],
+                        reservation_lineage["risk_config_generation"],
+                        reservation_lineage["risk_config_hash"],
+                        reservation_lineage["allocation"],
                         detail_json,
                     ),
                 )
@@ -2827,6 +4098,10 @@ class AxiomStore:
             )
             settlement = _canary_fill_settlement_status(_load(detail_json) if detail_json else {})
             expected_quantity = _risk_decimal(reservation_row["quantity"])
+            if expected_quantity > 0 and total_quantity >= expected_quantity:
+                # Quantity completion exhausts the reservation, including any
+                # fee-reserve dust left by decimal rounding.
+                remaining = Decimal("0")
             if side_value == "BUY":
                 if settlement not in _CANARY_CONFIRMED_SETTLEMENT_STATUSES:
                     fill_status = "UNKNOWN"
@@ -2893,6 +4168,16 @@ class AxiomStore:
         *,
         status: str = "RELEASED",
         timestamp: datetime | None = None,
+        strategy_version_id: str | None = None,
+        research_trial_id: str | None = None,
+        candidate_id: str | None = None,
+        portfolio_selection_id: str | None = None,
+        admission_policy_id: str | None = None,
+        admission_policy_version: str | None = None,
+        risk_config_id: str | None = None,
+        risk_config_generation: int | None = None,
+        risk_config_hash: str | None = None,
+        allocation: Any | None = None,
         detail: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         identifier = str(reservation_id or "").strip()
@@ -2906,6 +4191,20 @@ class AxiomStore:
             raise ValueError("invalid risk reservation status")
         stamp = timestamp or utc_now()
         release_detail = dict(detail or {})
+        lineage = self._canary_normalize_lineage(
+            {
+                "strategy_version_id": strategy_version_id,
+                "research_trial_id": research_trial_id,
+                "candidate_id": candidate_id,
+                "portfolio_selection_id": portfolio_selection_id,
+                "admission_policy_id": admission_policy_id,
+                "admission_policy_version": admission_policy_version,
+                "risk_config_id": risk_config_id,
+                "risk_config_generation": risk_config_generation,
+                "risk_config_hash": risk_config_hash,
+                "allocation": allocation,
+            }
+        )
         with self._write_context():
             row = self._conn.execute(
                 "SELECT * FROM canary_risk_reservations WHERE reservation_id=?",
@@ -2913,6 +4212,14 @@ class AxiomStore:
             ).fetchone()
             if row is None:
                 raise ValueError("risk reservation not found")
+            stored_lineage = _canary_lineage_from_row(row)
+            if _canary_lineage_is_rolling(stored_lineage):
+                if lineage["candidate_id"] is None:
+                    lineage["candidate_id"] = stored_lineage["candidate_id"]
+                if not _canary_lineage_equal(lineage, stored_lineage):
+                    raise ValueError("release lineage conflicts with reservation")
+            elif not _canary_lineage_subset_equal(lineage, stored_lineage):
+                raise ValueError("release lineage conflicts with reservation")
             prior_state = str(row["status"] or "").strip().upper()
             reservation_side = str(row["side"] or "").strip().upper()
             reservation_quantity = _risk_decimal(
@@ -3027,9 +4334,37 @@ class AxiomStore:
                 (identifier,),
             ).fetchone()
         return _canary_reservation_record(row)
-    def canary_risk_accounting(self, now: datetime | None = None) -> dict[str, Any]:
+    def canary_risk_accounting(
+        self,
+        now: datetime | None = None,
+        *,
+        strategy_version_id: str | None = None,
+        research_trial_id: str | None = None,
+        candidate_id: str | None = None,
+        portfolio_selection_id: str | None = None,
+        admission_policy_id: str | None = None,
+        admission_policy_version: str | None = None,
+        risk_config_id: str | None = None,
+        risk_config_generation: int | None = None,
+        risk_config_hash: str | None = None,
+        allocation: Any | None = None,
+    ) -> dict[str, Any]:
         """Return exact Decimal usage while preserving both ledger generations."""
         observed = ensure_utc(now or utc_now())
+        lineage_filter = self._canary_normalize_lineage(
+            {
+                "strategy_version_id": strategy_version_id,
+                "research_trial_id": research_trial_id,
+                "candidate_id": candidate_id,
+                "portfolio_selection_id": portfolio_selection_id,
+                "admission_policy_id": admission_policy_id,
+                "admission_policy_version": admission_policy_version,
+                "risk_config_id": risk_config_id,
+                "risk_config_generation": risk_config_generation,
+                "risk_config_hash": risk_config_hash,
+                "allocation": allocation,
+            }
+        )
         start, end = self._canary_window(observed)
         accounting_day_pht = datetime.fromisoformat(start).astimezone(
             ZoneInfo("Asia/Manila")
@@ -3062,7 +4397,29 @@ class AxiomStore:
             "pending_sell_quantity_by_market": {},
             "open_market_ids": [],
             "open_lot_slots": 0,
+            "lineage": {
+                key: value
+                for key, value in lineage_filter.items()
+                if value not in (None, "")
+            },
+            "rolling_global_reserved_usd": Decimal("0"),
+            "rolling_global_budget_usd": Decimal("0"),
+            "rolling_strategy_reserved_usd": {},
+            "rolling_strategy_allocations": {},
         }
+        strict_candidate_scope = lineage_filter.get("candidate_id") not in (None, "")
+
+        def accounting_lineage_matches(row: sqlite3.Row | None) -> bool:
+            stored_lineage = _canary_lineage_from_row(row)
+            if strict_candidate_scope:
+                # Candidate-scoped reporting is a rolling query boundary, not
+                # an idempotent-write compatibility comparison: legacy rows
+                # and rows without the requested candidate are excluded.
+                if not _canary_lineage_is_rolling(stored_lineage):
+                    return False
+                if stored_lineage.get("candidate_id") != lineage_filter.get("candidate_id"):
+                    return False
+            return _canary_lineage_subset_equal(lineage_filter, stored_lineage)
 
         def add_map(name: str, key: str | None, value: Decimal) -> None:
             if key:
@@ -3114,6 +4471,19 @@ class AxiomStore:
             reservation_rows = self._conn.execute(
                 "SELECT * FROM canary_risk_reservations"
             ).fetchall()
+            if any(value not in (None, "") for value in lineage_filter.values()):
+                reservation_rows = [
+                    row for row in reservation_rows if accounting_lineage_matches(row)
+                ]
+                selected_intents = {
+                    str(row["intent_id"])
+                    for row in reservation_rows
+                }
+                result["submitted_orders"] = sum(
+                    1
+                    for row in attempt_rows
+                    if str(row["intent_id"]) in selected_intents
+                )
             reservation_by_id = {str(row["reservation_id"]): row for row in reservation_rows}
             new_event_ids = {
                 str(row["event_id"])
@@ -3304,6 +4674,9 @@ class AxiomStore:
             mark_rows = self._conn.execute(
                 "SELECT * FROM canary_equity_marks ORDER BY observed_at DESC,rowid DESC,mark_id DESC"
             ).fetchall()
+            scoped_lineage = any(value not in (None, "") for value in lineage_filter.values())
+            if scoped_lineage:
+                mark_rows = [mark for mark in mark_rows if accounting_lineage_matches(mark)]
             latest_marks: dict[tuple[str, str, str, str], sqlite3.Row] = {}
             authority = self._canary_authority_locked()
             for mark in mark_rows:
@@ -3518,12 +4891,11 @@ class AxiomStore:
                         loss = -pnl if pnl < 0 else Decimal("0")
                         if loss:
                             result["realized_loss_usd"] += loss
-
             legacy_rows: list[sqlite3.Row] = []
             legacy_table = self._conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='canary_ledger'"
             ).fetchone()
-            if legacy_table is not None:
+            if legacy_table is not None and not scoped_lineage:
                 legacy_rows = self._conn.execute("SELECT * FROM canary_ledger").fetchall()
             for row in legacy_rows:
                 event_id = str(row["event_id"]) if "event_id" in row.keys() and row["event_id"] else None
@@ -3703,8 +5075,10 @@ class AxiomStore:
                     )
 
             flow_rows = self._conn.execute(
-                "SELECT kind,amount FROM canary_risk_cashflows"
+                "SELECT * FROM canary_risk_cashflows"
             ).fetchall()
+            if any(value not in (None, "") for value in lineage_filter.values()):
+                flow_rows = [flow for flow in flow_rows if accounting_lineage_matches(flow)]
             for flow in flow_rows:
                 kind = str(flow["kind"]).upper()
                 amount = _risk_decimal(flow["amount"])
@@ -3778,6 +5152,62 @@ class AxiomStore:
                 for key, count in open_lot_counts.items()
                 if key in open_market_keys or key not in market_qty
             )
+            rolling_budgets: dict[str, Decimal] = {}
+            current_selection = None
+            if lineage_filter.get("portfolio_selection_id") in (None, ""):
+                current_selection = self._conn.execute(
+                    "SELECT selection.global_budget,selection.risk_config_id,"
+                    "selection.risk_config_generation,selection.risk_config_hash "
+                    "FROM portfolio_current_selection pointer "
+                    "JOIN portfolio_selections selection "
+                    "ON selection.portfolio_selection_id=pointer.portfolio_selection_id "
+                    "WHERE pointer.pointer_id='current'"
+                ).fetchone()
+            for row in reservation_rows:
+                if str(row["side"] or "").upper() != "BUY":
+                    continue
+                row_lineage = _canary_lineage_from_row(row)
+                selection_id = row_lineage.get("portfolio_selection_id")
+                strategy_id = row_lineage.get("strategy_version_id")
+                if not selection_id or not strategy_id:
+                    continue
+                committed = self._rolling_open_buy_commitment_locked(row)
+                if committed <= 0:
+                    continue
+                result["rolling_global_reserved_usd"] += committed
+                strategy_reserved = result["rolling_strategy_reserved_usd"]
+                strategy_reserved[strategy_id] = strategy_reserved.get(
+                    strategy_id, Decimal("0")
+                ) + committed
+                if row_lineage.get("allocation") not in (None, ""):
+                    result["rolling_strategy_allocations"].setdefault(
+                        strategy_id,
+                        _risk_decimal(
+                            row_lineage["allocation"],
+                            name="allocation",
+                            nonnegative=True,
+                        ),
+                    )
+                if selection_id not in rolling_budgets:
+                    selection = self._conn.execute(
+                        "SELECT global_budget FROM portfolio_selections "
+                        "WHERE portfolio_selection_id=?",
+                        (selection_id,),
+                    ).fetchone()
+                    rolling_budgets[selection_id] = (
+                        _risk_decimal(selection["global_budget"], nonnegative=True)
+                        if selection is not None
+                        else Decimal("0")
+                    )
+            if current_selection is not None:
+                result["rolling_global_budget_usd"] = _risk_decimal(
+                    current_selection["global_budget"],
+                    nonnegative=True,
+                )
+            elif rolling_budgets:
+                result["rolling_global_budget_usd"] = sum(
+                    rolling_budgets.values(), Decimal("0")
+                )
         for name in (
             "buy_filled_usd", "buy_pending_usd", "buy_unknown_usd", "gross_daily_buy_usd",
             "all_in_buy_reserved_usd", "aggregate_open_cost_usd", "aggregate_exposure_usd",
@@ -3785,6 +5215,16 @@ class AxiomStore:
             "external_flow_usd", "cumulative_buy_usd",
         ):
             result[name] = _risk_text(result[name])
+        result["rolling_global_reserved_usd"] = _risk_text(result["rolling_global_reserved_usd"])
+        result["rolling_global_budget_usd"] = _risk_text(result["rolling_global_budget_usd"])
+        result["rolling_strategy_reserved_usd"] = {
+            key: _risk_text(value)
+            for key, value in result["rolling_strategy_reserved_usd"].items()
+        }
+        result["rolling_strategy_allocations"] = {
+            key: _risk_text(value)
+            for key, value in result["rolling_strategy_allocations"].items()
+        }
         result["per_market_buy_usd"] = {
             key: _risk_text(value) for key, value in result["per_market_buy_usd"].items()
         }
@@ -7178,6 +8618,21 @@ class AxiomStore:
             "strategy_version_id",
             name="strategy_version_id",
         )
+        research_trial_id = _rolling_optional_text(
+            data,
+            "research_trial_id",
+            "trial_id",
+        ) or _rolling_identity_value(data, "research_trial_id", "trial_id")
+        candidate_id = _rolling_optional_text(
+            data,
+            "candidate_id",
+            "candidate",
+            "strategy_candidate_id",
+        ) or _rolling_identity_value(data, "candidate_id", "candidate", "strategy_candidate_id")
+        if _rolling_identity_conflict(data, "research_trial_id", "trial_id"):
+            raise ValueError("evidence research trial identity conflicts")
+        if _rolling_identity_conflict(data, "candidate_id", "candidate", "strategy_candidate_id"):
+            raise ValueError("evidence candidate identity conflicts")
         available_from = _rolling_timestamp(
             data.get("available_from"),
             name="available_from",
@@ -7209,12 +8664,35 @@ class AxiomStore:
         )
         if actual_coverage_seconds > available_span_seconds:
             raise ValueError("actual_coverage_seconds must not exceed available evidence span")
+        expected_completeness = min(
+            Decimal("1"),
+            Decimal(actual_coverage_seconds) / Decimal(requested_days_value * 86400),
+        )
+        completeness_raw = data.get("observation_completeness")
+        if completeness_raw is None:
+            observation_completeness = format(expected_completeness, "f")
+        else:
+            observation_completeness_value = _rolling_decimal(
+                completeness_raw,
+                name="observation_completeness",
+                nonnegative=True,
+            )
+            if observation_completeness_value > Decimal("1"):
+                raise ValueError("observation_completeness must be between 0 and 1")
+            if observation_completeness_value != expected_completeness:
+                raise ValueError("observation_completeness is inconsistent with actual coverage")
+            observation_completeness = format(observation_completeness_value, "f")
+        if _rolling_identity_conflict(data, "source_class", "source_type"):
+            raise ValueError("evidence source class aliases conflict")
         source_class = _rolling_required_text(
             data,
             "source_class",
             "source_type",
             name="source_class",
         )
+        if source_class.upper() not in _ROLLING_EVIDENCE_SOURCE_CLASSES:
+            raise ValueError("unsupported rolling evidence source_class")
+        source_class = source_class.upper()
         assumption_fields = (
             ("paper_sizing_assumptions", ("paper_sizing",), "paper_sizing"),
             (
@@ -7274,12 +8752,21 @@ class AxiomStore:
         )
         reliability_raw = data.get("reliability", "0")
         reliability = _rolling_decimal_text(reliability_raw, name="reliability", nonnegative=True)
+        if _risk_decimal(reliability, name="reliability", nonnegative=True) > Decimal("1"):
+            raise ValueError("reliability must be between 0 and 1")
         execution_feasibility = _rolling_optional_text(
             data,
             "execution_feasibility",
             "execution_feasibility_status",
         )
-        evidence_digest = _rolling_required_text(data, "evidence_digest", name="evidence_digest")
+        if _rolling_identity_conflict(data, "evidence_digest", "digest"):
+            raise ValueError("evidence digest aliases conflict")
+        supplied_evidence_digest = _rolling_optional_text(
+            data,
+            "evidence_digest",
+            "digest",
+        ) or None
+        evidence_digest = None
         created_at = _rolling_timestamp(data.get("created_at"), name="created_at", default_now=True)
         payload_data = dict(data)
         if "costs" in payload_data:
@@ -7288,11 +8775,14 @@ class AxiomStore:
             {
                 "evidence_window_id": identifier,
                 "strategy_version_id": strategy_version_id,
+                "research_trial_id": research_trial_id,
+                "candidate_id": candidate_id,
                 "available_from": available_from,
                 "available_through": available_through,
                 "requested_days": requested_days_value,
                 "requested_window_days": requested_days_value,
                 "actual_coverage_seconds": actual_coverage_seconds,
+                "observation_completeness": observation_completeness,
                 "source_class": source_class,
                 "paper_sizing_assumptions": assumptions[0],
                 "paper_fee_assumptions": assumptions[1],
@@ -7306,18 +8796,25 @@ class AxiomStore:
                 "completed_outcomes": completed_outcomes,
                 "reliability": reliability,
                 "execution_feasibility": execution_feasibility,
-                "evidence_digest": evidence_digest,
                 "created_at": created_at,
             }
         )
+        computed_evidence_digest = _rolling_evidence_digest(payload_data)
+        if supplied_evidence_digest is not None and supplied_evidence_digest != computed_evidence_digest:
+            raise ValueError("evidence_digest does not match canonical evidence")
+        evidence_digest = computed_evidence_digest
+        payload_data["evidence_digest"] = evidence_digest
         payload_json = _rolling_dump(payload_data)
         values = (
             identifier,
             strategy_version_id,
+            research_trial_id,
+            candidate_id,
             available_from,
             available_through,
             requested_days_value,
             actual_coverage_seconds,
+            observation_completeness,
             source_class,
             _rolling_dump(assumptions[0]),
             _rolling_dump(assumptions[1]),
@@ -7342,10 +8839,13 @@ class AxiomStore:
             ).fetchone()
             immutable_columns = (
                 "strategy_version_id",
+                "research_trial_id",
+                "candidate_id",
                 "available_from",
                 "available_through",
                 "requested_days",
                 "actual_coverage_seconds",
+                "observation_completeness",
                 "source_class",
                 "paper_sizing_assumptions_json",
                 "paper_fee_assumptions_json",
@@ -7361,7 +8861,7 @@ class AxiomStore:
                 "execution_feasibility",
                 "evidence_digest",
             )
-            expected = values[1:20]
+            expected = values[1:23]
             if existing is not None:
                 actual = tuple(existing[column] for column in immutable_columns)
                 if actual != expected or not _rolling_payload_equal(
@@ -7373,12 +8873,13 @@ class AxiomStore:
                 return
             self._conn.execute(
                 "INSERT INTO strategy_evidence_windows("
-                "evidence_window_id,strategy_version_id,available_from,available_through,"
-                "requested_days,actual_coverage_seconds,source_class,"
+                "evidence_window_id,strategy_version_id,research_trial_id,candidate_id,"
+                "available_from,available_through,requested_days,actual_coverage_seconds,"
+                "observation_completeness,source_class,"
                 "paper_sizing_assumptions_json,paper_fee_assumptions_json,paper_slippage_assumptions_json,"
                 "allocated_capital_net_return,realized_pnl,unrealized_pnl,fees,costs,drawdown,"
                 "completed_outcomes,reliability,execution_feasibility,evidence_digest,payload_json,created_at"
-                ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 values,
             )
 
@@ -7406,11 +8907,14 @@ class AxiomStore:
                 {
                     "evidence_window_id": row["evidence_window_id"],
                     "strategy_version_id": row["strategy_version_id"],
+                    "research_trial_id": row["research_trial_id"],
+                    "candidate_id": row["candidate_id"],
                     "available_from": row["available_from"],
                     "available_through": row["available_through"],
                     "requested_days": int(row["requested_days"]),
                     "requested_window_days": int(row["requested_days"]),
                     "actual_coverage_seconds": int(row["actual_coverage_seconds"]),
+                    "observation_completeness": row["observation_completeness"],
                     "source_class": row["source_class"],
                     "paper_sizing_assumptions": _load(row["paper_sizing_assumptions_json"]),
                     "paper_fee_assumptions": _load(row["paper_fee_assumptions_json"]),
@@ -7472,6 +8976,8 @@ class AxiomStore:
                     {
                         "portfolio_selection_id": member["portfolio_selection_id"],
                         "strategy_version_id": member["strategy_version_id"],
+                        "research_trial_id": member["research_trial_id"],
+                        "candidate_id": member["candidate_id"],
                         "allocation": member["allocation"],
                         "status": member["status"],
                         "score": member["score"],
@@ -7483,11 +8989,37 @@ class AxiomStore:
                 )
                 members.append(item)
             result["members"] = members
-            result["k"] = len(members)
+            # ``k`` is the maintained/funded count persisted on the selection;
+            # exit tombstones are intentionally included in ``members`` but
+            # must not redefine the selection cardinality.
+            result["k"] = int(row["k"])
         return result
 
     def commit_portfolio_selection(self, selection: Any, members: Iterable[Any]) -> dict[str, Any]:
         data = _rolling_mapping(selection, name="portfolio_selection")
+        for aliases, label in (
+            (("policy_id", "admission_policy_id"), "policy"),
+            (("policy_version", "version"), "policy version"),
+            (
+                ("active_risk_config_id", "risk_config_id", "config_id"),
+                "risk config",
+            ),
+            (
+                (
+                    "active_risk_config_generation",
+                    "risk_config_generation",
+                    "risk_generation",
+                    "generation",
+                ),
+                "risk generation",
+            ),
+            (
+                ("active_risk_config_hash", "risk_config_hash", "config_hash"),
+                "risk config hash",
+            ),
+        ):
+            if _rolling_identity_conflict(data, *aliases):
+                raise ValueError(f"portfolio selection {label} identity conflicts")
         identifier = _rolling_required_text(
             data,
             "portfolio_selection_id",
@@ -7541,21 +9073,26 @@ class AxiomStore:
             name="review_due_at",
             required=True,
         )
+        if (
+            selected_at is not None
+            and review_due_at is not None
+            and _parse_datetime(review_due_at) < _parse_datetime(selected_at)
+        ):
+            raise ValueError("portfolio selection review_due_at precedes selected_at")
         committed_at = _rolling_timestamp(
             data.get("committed_at"),
             name="committed_at",
             default_now=True,
         )
         member_data = [_rolling_mapping(item, name="portfolio_selection_member") for item in members]
-        if not 0 <= len(member_data) <= 10:
-            raise ValueError("portfolio selection must contain between 0 and 10 members")
+        if not 0 <= len(member_data) <= 32:
+            raise ValueError("portfolio selection member payload exceeds hard bound")
         k_raw = data.get("k")
-        if k_raw is not None:
-            k_value = _rolling_nonnegative_integer(k_raw, name="k")
-            if k_value != len(member_data):
-                raise ValueError("portfolio selection k must equal member count")
-        else:
-            k_value = len(member_data)
+        declared_k = (
+            _rolling_nonnegative_integer(k_raw, name="k")
+            if k_raw is not None
+            else None
+        )
         allocations: list[Decimal] = []
         seen_strategies: set[str] = set()
         seen_funded_overlaps: set[str] = set()
@@ -7578,9 +9115,59 @@ class AxiomStore:
             score = _rolling_decimal_text(member.get("score", "0"), name="member score")
             status = _rolling_required_text(member, "status", name="member status")
             reason = _rolling_optional_text(member, "reason")
-            evidence_window_id = _rolling_optional_text(member, "evidence_window_id") or None
+            for aliases, label in (
+                (("research_trial_id", "trial_id"), "research trial"),
+                (("candidate_id", "candidate", "strategy_candidate_id"), "candidate"),
+                (("evidence_window_id", "evidence_id", "window_id"), "evidence"),
+                (("admission_policy_id", "policy_id"), "policy"),
+                (("admission_policy_version", "policy_version", "version"), "policy version"),
+                (
+                    ("risk_config_id", "active_risk_config_id", "config_id"),
+                    "risk config",
+                ),
+                (
+                    (
+                        "risk_config_generation",
+                        "active_risk_config_generation",
+                        "risk_generation",
+                        "generation",
+                    ),
+                    "risk generation",
+                ),
+                (
+                    ("risk_config_hash", "active_risk_config_hash", "config_hash"),
+                    "risk config hash",
+                ),
+            ):
+                if _rolling_identity_conflict(member, *aliases):
+                    raise ValueError(f"portfolio selection member {label} identity conflicts")
+            research_trial_id = _rolling_identity_value(
+                member,
+                "research_trial_id",
+                "trial_id",
+            ) or None
+            candidate_id = _rolling_identity_value(
+                member,
+                "candidate_id",
+                "candidate",
+                "strategy_candidate_id",
+            ) or None
+            evidence_window_id = _rolling_identity_value(
+                member,
+                "evidence_window_id",
+                "evidence_id",
+                "window_id",
+            ) or None
             overlap_key = _rolling_optional_text(member, "overlap_key")
-            funded_active = allocation > 0 and status.upper() in {"ACTIVE", "PAPER", "RETAINED"}
+            status_upper = status.upper()
+            funding_statuses = {"ACTIVE", "PAPER", "RETAINED", "REDUCE"}
+            if allocation > 0 and status_upper not in funding_statuses:
+                raise ValueError("positive allocation requires a funding status")
+            funded_active = allocation > 0 and status_upper in funding_statuses
+            if funded_active and research_trial_id is None:
+                raise ValueError("funded portfolio member requires an exact research trial")
+            if funded_active and candidate_id is None:
+                raise ValueError("funded portfolio member requires a candidate binding")
             if funded_active and overlap_key:
                 if overlap_key in seen_funded_overlaps:
                     raise ValueError("portfolio selection contains duplicate overlap_key")
@@ -7590,6 +9177,8 @@ class AxiomStore:
                 {
                     "portfolio_selection_id": identifier,
                     "strategy_version_id": strategy_version,
+                    "research_trial_id": research_trial_id,
+                    "candidate_id": candidate_id,
                     "allocation": format(allocation, "f"),
                     "status": status,
                     "score": score,
@@ -7600,6 +9189,15 @@ class AxiomStore:
                 }
             )
             normalized_members.append(normalized)
+        maintained_member_count = sum(
+            1
+            for member in normalized_members
+            if _rolling_decimal(member["allocation"], name="member allocation", nonnegative=True) > 0
+            and str(member["status"]).upper() in {"ACTIVE", "REDUCE"}
+        )
+        if declared_k is not None and declared_k != maintained_member_count:
+            raise ValueError("portfolio selection k must equal maintained member count")
+        k_value = maintained_member_count
         if sum(allocations, Decimal("0")) > _rolling_decimal(
             global_budget,
             name="global_budget",
@@ -7640,26 +9238,173 @@ class AxiomStore:
             committed_at,
         )
         with self._write_context():
-            if self._conn.execute(
-                "SELECT 1 FROM admission_policies WHERE policy_id=? AND version=?",
+            policy_row = self._conn.execute(
+                "SELECT payload_json FROM admission_policies "
+                "WHERE policy_id=? AND version=?",
                 (policy_id, policy_version),
-            ).fetchone() is None:
+            ).fetchone()
+            if policy_row is None:
                 raise ValueError("portfolio selection admission policy does not exist")
+            policy_payload = _load(policy_row["payload_json"]) if policy_row["payload_json"] else {}
+            policy_payload = policy_payload if isinstance(policy_payload, Mapping) else {}
+            for aliases, label in (
+                (("global_budget", "global_budget_usd", "budget"), "global budget"),
+                (("max_members", "max_k", "k"), "max members"),
+                (("requested_window_days", "windows_days"), "required windows"),
+                (
+                    ("min_actual_coverage_seconds", "minimum_evidence_seconds"),
+                    "minimum coverage",
+                ),
+                (("minimum_coverage_ratio", "coverage_ratio"), "coverage ratio"),
+                (("min_completed_outcomes", "minimum_completed_outcomes"), "minimum outcomes"),
+                (("min_reliability", "minimum_reliability"), "minimum reliability"),
+            ):
+                if _rolling_identity_conflict(policy_payload, *aliases):
+                    raise ValueError(f"portfolio selection policy {label} identity conflicts")
+
+            def policy_value(*names: str, default: Any = None) -> Any:
+                values = _rolling_identity_raw_values(policy_payload, *names)
+                return values[0] if values else default
+
+            policy_budget = _rolling_decimal(
+                policy_value("global_budget", "global_budget_usd", "budget", default="0"),
+                name="policy global_budget",
+                nonnegative=True,
+            )
+            submitted_budget = _rolling_decimal(
+                global_budget,
+                name="portfolio selection global_budget",
+                nonnegative=True,
+            )
+            funded_allocation_total = sum(allocations, Decimal("0"))
+            if submitted_budget > policy_budget:
+                raise ValueError("portfolio selection global_budget exceeds policy global_budget")
+            if funded_allocation_total > policy_budget:
+                raise ValueError("portfolio member allocations exceed policy global_budget")
+            policy_max_members = _rolling_nonnegative_integer(
+                policy_value("max_members", "max_k", "k", default=5),
+                name="policy max_members",
+            )
+            if k_value > policy_max_members:
+                raise ValueError("portfolio selection maintained members exceed policy max_members")
+            policy_windows_raw = policy_value(
+                "requested_window_days",
+                "windows_days",
+                default=(7, 30),
+            )
+            if isinstance(policy_windows_raw, int):
+                policy_windows = (int(policy_windows_raw),)
+            elif isinstance(policy_windows_raw, (list, tuple, set, frozenset)):
+                policy_windows = tuple(int(item) for item in policy_windows_raw)
+            else:
+                raise ValueError("portfolio selection policy required windows are invalid")
+            if not policy_windows or any(day not in {7, 30} for day in policy_windows):
+                raise ValueError("portfolio selection policy required windows are invalid")
+            policy_min_coverage = _rolling_decimal(
+                policy_value(
+                    "min_actual_coverage_seconds",
+                    "minimum_evidence_seconds",
+                    default="0",
+                ),
+                name="policy minimum coverage",
+                nonnegative=True,
+            )
+            policy_min_ratio = _rolling_decimal(
+                policy_value(
+                    "minimum_coverage_ratio",
+                    "coverage_ratio",
+                    default="0.80",
+                ),
+                name="policy coverage ratio",
+                nonnegative=True,
+            )
+            if policy_min_ratio > Decimal("1"):
+                raise ValueError("portfolio selection policy coverage ratio is invalid")
+            policy_min_outcomes = _rolling_nonnegative_integer(
+                policy_value(
+                    "min_completed_outcomes",
+                    "minimum_completed_outcomes",
+                    default=5,
+                ),
+                name="policy minimum outcomes",
+            )
+            policy_min_reliability = _rolling_decimal(
+                policy_value(
+                    "min_reliability",
+                    "minimum_reliability",
+                    default="0.50",
+                ),
+                name="policy minimum reliability",
+                nonnegative=True,
+            )
+            if policy_min_reliability > Decimal("1"):
+                raise ValueError("portfolio selection policy minimum reliability is invalid")
             for member in normalized_members:
                 if self._conn.execute(
                     "SELECT 1 FROM strategy_versions WHERE strategy_version_id=?",
                     (member["strategy_version_id"],),
                 ).fetchone() is None:
                     raise ValueError("portfolio selection strategy version does not exist")
+                research_trial_id = member["research_trial_id"]
+                trial = None
+                trial_payload: Mapping[str, Any] = {}
+                if research_trial_id is not None:
+                    trial = self._conn.execute(
+                        "SELECT strategy_version_id,payload_json FROM research_trials "
+                        "WHERE research_trial_id=?",
+                        (research_trial_id,),
+                    ).fetchone()
+                    if trial is None:
+                        raise ValueError("portfolio selection research trial does not exist")
+                    if str(trial["strategy_version_id"]) != member["strategy_version_id"]:
+                        raise ValueError("portfolio member research trial strategy mismatch")
+                    parsed_trial = _load(trial["payload_json"]) if trial["payload_json"] else {}
+                    trial_payload = parsed_trial if isinstance(parsed_trial, Mapping) else {}
                 funded_active = (
                     _rolling_decimal(member["allocation"], name="member allocation", nonnegative=True) > 0
-                    and str(member["status"]).upper() in {"ACTIVE", "PAPER", "RETAINED"}
+                    and str(member["status"]).upper() in funding_statuses
                 )
+                trial_candidate = _rolling_identity_value(
+                    trial_payload,
+                    "candidate_id",
+                    "candidate",
+                    "strategy_candidate_id",
+                )
+                trial_identity = _rolling_identity_value(
+                    trial_payload,
+                    "research_trial_id",
+                    "trial_id",
+                )
+                if _rolling_identity_conflict(
+                    trial_payload,
+                    "research_trial_id",
+                    "trial_id",
+                ) or _rolling_identity_conflict(
+                    trial_payload,
+                    "candidate_id",
+                    "candidate",
+                    "strategy_candidate_id",
+                ):
+                    raise ValueError("portfolio member research trial provenance conflicts")
+                if (
+                    trial_identity is not None
+                    and trial_identity != str(research_trial_id).strip()
+                ):
+                    raise ValueError("portfolio member research trial identity conflicts")
+                if funded_active and (
+                    research_trial_id is None or member["candidate_id"] is None
+                ):
+                    raise ValueError("funded portfolio member lineage is incomplete")
+                if funded_active and (
+                    trial_candidate is None
+                    or trial_candidate != str(member["candidate_id"]).strip()
+                ):
+                    raise ValueError("portfolio member candidate is not in research trial provenance")
                 if funded_active and member["evidence_window_id"] is None:
                     raise ValueError("funded portfolio member requires an evidence window")
                 if member["evidence_window_id"] is not None:
                     evidence = self._conn.execute(
-                        "SELECT strategy_version_id FROM strategy_evidence_windows "
+                        "SELECT * FROM strategy_evidence_windows "
                         "WHERE evidence_window_id=?",
                         (member["evidence_window_id"],),
                     ).fetchone()
@@ -7667,6 +9412,96 @@ class AxiomStore:
                         raise ValueError("portfolio selection evidence window does not exist")
                     if str(evidence["strategy_version_id"]) != member["strategy_version_id"]:
                         raise ValueError("portfolio member evidence window strategy mismatch")
+                    evidence_payload = (
+                        _load(evidence["payload_json"])
+                        if evidence["payload_json"]
+                        else {}
+                    )
+                    evidence_payload = (
+                        evidence_payload if isinstance(evidence_payload, Mapping) else {}
+                    )
+                    evidence_identity = dict(evidence)
+                    evidence_identity["payload"] = evidence_payload
+                    if _rolling_identity_conflict(
+                        evidence_identity,
+                        "research_trial_id",
+                        "trial_id",
+                    ) or _rolling_identity_conflict(
+                        evidence_identity,
+                        "candidate_id",
+                        "candidate",
+                        "strategy_candidate_id",
+                    ) or _rolling_identity_conflict(
+                        evidence_identity,
+                        "source_class",
+                        "source_type",
+                    ) or _rolling_identity_conflict(
+                        evidence_identity,
+                        "evidence_digest",
+                        "digest",
+                    ):
+                        raise ValueError("portfolio member evidence provenance conflicts")
+                    evidence_trial = _rolling_identity_value(
+                        evidence_identity,
+                        "research_trial_id",
+                        "trial_id",
+                    )
+                    evidence_candidate = _rolling_identity_value(
+                        evidence_identity,
+                        "candidate_id",
+                        "candidate",
+                        "strategy_candidate_id",
+                    )
+                    source_class = str(evidence["source_class"] or "").strip().upper()
+                    if source_class not in _ROLLING_EVIDENCE_SOURCE_CLASSES:
+                        raise ValueError("portfolio member evidence source_class is invalid")
+                    expected_digest = _rolling_evidence_digest(
+                        _rolling_evidence_mapping_from_row(evidence, evidence_payload)
+                    )
+                    if str(evidence["evidence_digest"] or "").strip() != expected_digest:
+                        raise ValueError("portfolio member evidence digest is invalid")
+                    try:
+                        completeness = _risk_decimal(
+                            evidence["observation_completeness"],
+                            name="observation_completeness",
+                            nonnegative=True,
+                        )
+                        requested_window = int(evidence["requested_days"])
+                        actual_coverage = int(evidence["actual_coverage_seconds"])
+                        if requested_window not in {7, 30} or actual_coverage < 0:
+                            raise ValueError
+                        expected_completeness = min(
+                            Decimal("1"),
+                            Decimal(actual_coverage)
+                            / Decimal(requested_window * 86400),
+                        )
+                    except (TypeError, ValueError, InvalidOperation, ZeroDivisionError) as exc:
+                        raise ValueError("portfolio member evidence coverage is invalid") from exc
+                    if completeness > Decimal("1") or completeness != expected_completeness:
+                        raise ValueError("portfolio member evidence completeness is inconsistent")
+                    if requested_window not in policy_windows:
+                        raise ValueError("portfolio member evidence window is not required by policy")
+                    if funded_active:
+                        required_coverage = max(
+                            policy_min_coverage,
+                            Decimal(requested_window * 86400) * policy_min_ratio,
+                        )
+                        if (
+                            actual_coverage < required_coverage
+                            or completeness < policy_min_ratio
+                            or int(evidence["completed_outcomes"]) < policy_min_outcomes
+                            or _risk_decimal(
+                                evidence["reliability"],
+                                name="reliability",
+                                nonnegative=True,
+                            ) < policy_min_reliability
+                        ):
+                            raise ValueError("portfolio member evidence is below policy minimums")
+                        if (
+                            evidence_trial != str(research_trial_id).strip()
+                            or evidence_candidate != str(member["candidate_id"]).strip()
+                        ):
+                            raise ValueError("portfolio member evidence window lineage mismatch")
             existing = self._conn.execute(
                 "SELECT * FROM portfolio_selections WHERE portfolio_selection_id=?",
                 (identifier,),
@@ -7703,6 +9538,8 @@ class AxiomStore:
                 ):
                     member_columns = (
                         "strategy_version_id",
+                        "research_trial_id",
+                        "candidate_id",
                         "allocation",
                         "status",
                         "score",
@@ -7730,12 +9567,14 @@ class AxiomStore:
             for member in normalized_members:
                 self._conn.execute(
                     "INSERT INTO portfolio_selection_members("
-                    "portfolio_selection_id,strategy_version_id,allocation,status,score,reason,"
-                    "evidence_window_id,overlap_key,payload_json,created_at"
-                    ") VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    "portfolio_selection_id,strategy_version_id,research_trial_id,candidate_id,"
+                    "allocation,status,score,reason,evidence_window_id,overlap_key,payload_json,created_at"
+                    ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         identifier,
                         member["strategy_version_id"],
+                        member["research_trial_id"],
+                        member["candidate_id"],
                         member["allocation"],
                         member["status"],
                         member["score"],
@@ -13652,6 +15491,142 @@ def _rolling_mapping(record: Any, *, name: str) -> dict[str, Any]:
     raise TypeError(f"{name} must be a mapping or dataclass")
 
 
+def _rolling_evidence_digest(record: Mapping[str, Any]) -> str:
+    """Compute the rolling model's canonical evidence digest."""
+    from .rolling_portfolio import RollingEvidence
+
+    payload = dict(record)
+    payload.pop("evidence_digest", None)
+    payload.pop("digest", None)
+    return str(RollingEvidence.from_mapping(payload).evidence_digest)
+
+
+def _rolling_evidence_mapping_from_row(
+    row: sqlite3.Row,
+    payload: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    document = dict(payload or {})
+    document.update(
+        {
+            "strategy_version_id": row["strategy_version_id"],
+            "evidence_window_id": row["evidence_window_id"],
+            "research_trial_id": row["research_trial_id"],
+            "candidate_id": row["candidate_id"],
+            "available_from": row["available_from"],
+            "available_through": row["available_through"],
+            "requested_days": row["requested_days"],
+            "actual_coverage_seconds": row["actual_coverage_seconds"],
+            "observation_completeness": row["observation_completeness"],
+            "source_class": row["source_class"],
+            "paper_sizing_assumptions": _load(row["paper_sizing_assumptions_json"]),
+            "paper_fee_assumptions": _load(row["paper_fee_assumptions_json"]),
+            "paper_slippage_assumptions": _load(row["paper_slippage_assumptions_json"]),
+            "allocated_capital_net_return": row["allocated_capital_net_return"],
+            "realized_pnl": row["realized_pnl"],
+            "unrealized_pnl": row["unrealized_pnl"],
+            "fees": row["fees"],
+            "costs": row["costs"],
+            "drawdown": row["drawdown"],
+            "completed_outcomes": row["completed_outcomes"],
+            "reliability": row["reliability"],
+            "execution_feasibility": row["execution_feasibility"],
+            "overlap_key": document.get("overlap_key"),
+        }
+    )
+    return document
+
+
+def _rolling_identity_value(payload: Any, *names: str) -> str | None:
+    """Return one unambiguous immutable identity from nested rolling payloads."""
+    found: set[str] = set()
+
+    def visit(value: Any, depth: int = 0) -> None:
+        if depth > 4 or not isinstance(value, Mapping):
+            return
+        for name in names:
+            item = value.get(name)
+            if item not in (None, ""):
+                text = str(item).strip()
+                if text:
+                    found.add(text)
+        for key in (
+            "payload",
+            "policy",
+            "minimum_evidence",
+            "minimum",
+            "provenance",
+            "binding",
+            "lineage",
+            "source",
+        ):
+            child = value.get(key)
+            if isinstance(child, Mapping):
+                visit(child, depth + 1)
+
+    visit(payload)
+    return next(iter(found)) if len(found) == 1 else None
+
+
+def _rolling_identity_conflict(payload: Any, *names: str) -> bool:
+    """Detect conflicting copies of a rolling identity in nested payloads."""
+    found: set[str] = set()
+
+    def visit(value: Any, depth: int = 0) -> None:
+        if depth > 4 or not isinstance(value, Mapping):
+            return
+        for name in names:
+            item = value.get(name)
+            if item not in (None, ""):
+                text = str(item).strip()
+                if text:
+                    found.add(text)
+        for key in (
+            "payload",
+            "policy",
+            "minimum_evidence",
+            "minimum",
+            "provenance",
+            "binding",
+            "lineage",
+            "source",
+        ):
+            child = value.get(key)
+            if isinstance(child, Mapping):
+                visit(child, depth + 1)
+
+    visit(payload)
+    return len(found) > 1
+
+def _rolling_identity_raw_values(payload: Any, *names: str) -> list[Any]:
+    """Collect immutable identity values without stringifying sequences."""
+    found: list[Any] = []
+
+    def visit(value: Any, depth: int = 0) -> None:
+        if depth > 4 or not isinstance(value, Mapping):
+            return
+        for name in names:
+            item = value.get(name)
+            if item not in (None, ""):
+                found.append(item)
+        for key in (
+            "payload",
+            "policy",
+            "minimum_evidence",
+            "minimum",
+            "provenance",
+            "binding",
+            "lineage",
+            "source",
+        ):
+            child = value.get(key)
+            if isinstance(child, Mapping):
+                visit(child, depth + 1)
+
+    visit(payload)
+    return found
+
+
+
 def _rolling_jsonable(value: Any) -> Any:
     if isinstance(value, Decimal):
         if not value.is_finite():
@@ -13828,6 +15803,131 @@ def _settlement(value: Any) -> SettlementState:
 def _optional_float(value: Any) -> float | None:
     return float(value) if value is not None else None
 
+_CANARY_LINEAGE_FIELDS = (
+    "candidate_id",
+    "strategy_version_id",
+    "research_trial_id",
+    "portfolio_selection_id",
+    "admission_policy_id",
+    "admission_policy_version",
+    "risk_config_id",
+    "risk_config_generation",
+    "risk_config_hash",
+    "allocation",
+)
+
+
+def _canary_optional_lineage_text(value: Any, *, name: str) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _canary_optional_lineage_generation(value: Any, *, name: str) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be an integer")
+    number = _risk_decimal(value, name=name, nonnegative=True)
+    if number != number.to_integral_value():
+        raise ValueError(f"{name} must be an integer")
+    return int(number)
+
+
+def _canary_lineage_from_row(row: sqlite3.Row | None) -> dict[str, Any]:
+    if row is None:
+        return {name: None for name in _CANARY_LINEAGE_FIELDS}
+    values: dict[str, Any] = {}
+    for name in _CANARY_LINEAGE_FIELDS:
+        value = row[name] if name in row.keys() else None
+        if name == "risk_config_generation":
+            values[name] = (
+                int(value) if value is not None else None
+            )
+        elif name == "allocation":
+            values[name] = (
+                _risk_text(_risk_decimal(value, name="allocation", nonnegative=True))
+                if value not in (None, "")
+                else None
+            )
+        else:
+            values[name] = str(value).strip() if value not in (None, "") else None
+    return values
+
+
+def _canary_lineage_equal(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
+    for name in _CANARY_LINEAGE_FIELDS:
+        left_value = left.get(name)
+        right_value = right.get(name)
+        if name == "risk_config_generation":
+            if (
+                _canary_optional_lineage_generation(left_value, name=name)
+                != _canary_optional_lineage_generation(right_value, name=name)
+            ):
+                return False
+        elif name == "allocation":
+            if left_value in (None, "") or right_value in (None, ""):
+                if (left_value in (None, "")) != (right_value in (None, "")):
+                    return False
+            elif _risk_decimal(left_value, name=name, nonnegative=True) != _risk_decimal(
+                right_value, name=name, nonnegative=True
+            ):
+                return False
+        elif _canary_optional_lineage_text(left_value, name=name) != _canary_optional_lineage_text(
+            right_value, name=name
+        ):
+            return False
+    return True
+
+
+def _canary_lineage_is_rolling(lineage: Mapping[str, Any]) -> bool:
+    """Identify rolling rows from mandatory lineage, not optional candidates.
+
+    Legacy reservations may carry a candidate label copied from an older
+    canary ledger.  That label is descriptive only; candidate/trial/evidence
+    enforcement applies when the rolling portfolio lineage is present.
+    """
+    return any(
+        lineage.get(name) not in (None, "")
+        for name in _CANARY_LINEAGE_FIELDS[1:-1]
+    )
+def _canary_lineage_subset_equal(
+    supplied: Mapping[str, Any],
+    stored: Mapping[str, Any],
+) -> bool:
+    """Match supplied lineage while keeping legacy candidate labels optional."""
+    rolling = _canary_lineage_is_rolling(supplied) or _canary_lineage_is_rolling(stored)
+    for name in _CANARY_LINEAGE_FIELDS:
+        value = supplied.get(name)
+        if value in (None, ""):
+            continue
+        if name == "candidate_id" and not rolling:
+            # Candidate labels are descriptive on legacy rows.  They must not
+            # turn a partial legacy projection into an identity conflict.
+            continue
+        if name == "candidate_id":
+            if _canary_optional_lineage_text(value, name=name) != _canary_optional_lineage_text(
+                stored.get(name), name=name
+            ):
+                return False
+        elif name == "allocation":
+            if stored.get(name) in (None, ""):
+                return False
+            if _risk_decimal(value, name=name, nonnegative=True) != _risk_decimal(
+                stored.get(name), name=name, nonnegative=True
+            ):
+                return False
+        elif name == "risk_config_generation":
+            if _canary_optional_lineage_generation(value, name=name) != _canary_optional_lineage_generation(
+                stored.get(name), name=name
+            ):
+                return False
+        elif _canary_optional_lineage_text(value, name=name) != _canary_optional_lineage_text(
+            stored.get(name), name=name
+        ):
+            return False
+    return True
 
 def _fill_from_record(record: Mapping[str, Any]) -> Fill:
     try:
@@ -14023,6 +16123,16 @@ def _canary_equity_mark_record(row: sqlite3.Row | None) -> dict[str, Any]:
         "config_id": row["config_id"],
         "config_generation": row["config_generation"],
         "control_generation": row["control_generation"],
+        "strategy_version_id": row["strategy_version_id"],
+        "research_trial_id": row["research_trial_id"],
+        "candidate_id": row["candidate_id"],
+        "portfolio_selection_id": row["portfolio_selection_id"],
+        "admission_policy_id": row["admission_policy_id"],
+        "admission_policy_version": row["admission_policy_version"],
+        "risk_config_id": row["risk_config_id"],
+        "risk_config_generation": row["risk_config_generation"],
+        "risk_config_hash": row["risk_config_hash"],
+        "allocation": row["allocation"],
         "detail": _load(row["detail_json"]) if row["detail_json"] else {},
         "created_at": _parse_datetime(row["created_at"]),
     }
@@ -14047,6 +16157,16 @@ def _canary_reservation_record(row: sqlite3.Row | None) -> dict[str, Any]:
         "config_generation": row["config_generation"],
         "config_hash": row["config_hash"],
         "config_id": row["config_id"],
+        "strategy_version_id": row["strategy_version_id"],
+        "research_trial_id": row["research_trial_id"],
+        "candidate_id": row["candidate_id"],
+        "portfolio_selection_id": row["portfolio_selection_id"],
+        "admission_policy_id": row["admission_policy_id"],
+        "admission_policy_version": row["admission_policy_version"],
+        "risk_config_id": row["risk_config_id"],
+        "risk_config_generation": row["risk_config_generation"],
+        "risk_config_hash": row["risk_config_hash"],
+        "allocation": row["allocation"],
         "control_generation": row["control_generation"],
         "detail": _load(row["detail_json"]) if row["detail_json"] else {},
         "created_at": _parse_datetime(row["created_at"]),

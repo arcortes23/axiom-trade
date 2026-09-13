@@ -936,6 +936,11 @@ class CanarySettingsService:
             "effective_limits": None,
             "candidate_constraints": None,
             "usage": _canonical(self._usage_defaults()),
+            "cumulative_buy_cap_usd": None,
+            "remaining_cumulative_buy_usd": None,
+            "cumulative_buy_cap_state": "UNAVAILABLE",
+            "cumulative_buy_over_limit": False,
+            "cumulative_buy_over_limit_reason": None,
             "remaining": {},
             "entry_over_limit_dimensions": [],
             "entry_block_reasons": ["active canary settings are unavailable"],
@@ -998,6 +1003,33 @@ class CanarySettingsService:
         used["equity_status"] = equity_status
         risk_breaker = str(used.get("risk_breaker") or "").strip().upper() or None
         used["risk_breaker"] = risk_breaker
+        cumulative_cap_raw = effective.get("cumulative_buy_cap_usd")
+        if cumulative_cap_raw in (None, ""):
+            cumulative_cap: Decimal | None = None
+            remaining_cumulative_buy_usd: str | None = None
+            cumulative_buy_cap_state = "UNCONFIGURED"
+            cumulative_buy_over_limit = False
+            cumulative_buy_over_limit_reason: str | None = None
+        else:
+            cumulative_cap = Decimal(str(cumulative_cap_raw))
+            cumulative_used = Decimal(str(used["cumulative_buy_usd"]))
+            remaining_cumulative_buy_usd = format(
+                max(Decimal("0"), cumulative_cap - cumulative_used),
+                "f",
+            )
+            cumulative_buy_over_limit = cumulative_used > cumulative_cap
+            cumulative_buy_cap_state = (
+                "OVER_LIMIT"
+                if cumulative_buy_over_limit
+                else "AT_LIMIT"
+                if cumulative_used == cumulative_cap
+                else "WITHIN_LIMIT"
+            )
+            cumulative_buy_over_limit_reason = (
+                "BUY exceeds cumulative buy cap"
+                if cumulative_buy_over_limit
+                else None
+            )
         # ``max_all_in_buy_usd`` is the fee-inclusive maximum for one BUY,
         # not a shared aggregate budget.  Aggregate usage is reported through
         # the independent gross/open/exposure dimensions below.
@@ -1005,6 +1037,7 @@ class CanarySettingsService:
             "submitted_orders": max(0, int(effective["max_submitted_orders_per_day"]) - int(used["submitted_orders"])),
             "all_in_buy_usd": format(Decimal(effective["max_all_in_buy_usd"]), "f"),
             "gross_daily_buy_usd": format(max(Decimal("0"), Decimal(effective["max_gross_daily_buy_usd"]) - Decimal(used["gross_daily_buy_usd"])), "f"),
+            "cumulative_buy_usd": remaining_cumulative_buy_usd,
             "aggregate_open_cost_usd": format(max(Decimal("0"), Decimal(effective["max_aggregate_open_cost_usd"]) - Decimal(used["aggregate_open_cost_usd"])), "f"),
             "aggregate_exposure_usd": format(max(Decimal("0"), Decimal(effective["max_aggregate_exposure_usd"]) - Decimal(used["aggregate_exposure_usd"])), "f"),
             "positions": max(0, int(effective["max_positions"]) - int(used["open_positions"])),
@@ -1041,6 +1074,12 @@ class CanarySettingsService:
                     "used": format(used_value, "f") if isinstance(used_value, Decimal) else used_value,
                     "limit": format(limit_value, "f") if isinstance(limit_value, Decimal) else limit_value,
                 })
+        if cumulative_buy_over_limit and cumulative_cap is not None:
+            over_limit_dimensions.append({
+                "dimension": "cumulative_buy_usd",
+                "used": used["cumulative_buy_usd"],
+                "limit": format(cumulative_cap, "f"),
+            })
         try:
             control_generation = int(control["control_generation"])
         except (KeyError, TypeError, ValueError):
@@ -1054,6 +1093,8 @@ class CanarySettingsService:
         entry_block_reasons: list[str] = []
         if over_limit_dimensions:
             entry_block_reasons.append("existing commitments exceed current entry limits")
+        if cumulative_buy_over_limit_reason:
+            entry_block_reasons.append(cumulative_buy_over_limit_reason)
         if risk_breaker:
             entry_block_reasons.append(f"durable risk breaker active: {risk_breaker}")
         if equity_status in {"UNKNOWN", "MISSING", "STALE"}:
@@ -1074,6 +1115,13 @@ class CanarySettingsService:
             "risk_breaker": risk_breaker,
             "candidate_constraints": _canonical(candidate) if candidate else None,
             "usage": _canonical(used),
+            "cumulative_buy_cap_usd": (
+                format(cumulative_cap, "f") if cumulative_cap is not None else None
+            ),
+            "remaining_cumulative_buy_usd": remaining_cumulative_buy_usd,
+            "cumulative_buy_cap_state": cumulative_buy_cap_state,
+            "cumulative_buy_over_limit": cumulative_buy_over_limit,
+            "cumulative_buy_over_limit_reason": cumulative_buy_over_limit_reason,
             "remaining": _canonical(remaining),
             "entry_over_limit_dimensions": _canonical(over_limit_dimensions),
             "entry_block_reasons": _canonical(entry_block_reasons),

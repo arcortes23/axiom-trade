@@ -1736,8 +1736,8 @@ class DashboardPaginationEndpointTests(DashboardPaginationFixture):
             expected_total=CANDIDATE_COUNT,
         )
         stale = next(item for item in stale_page["items"] if item["candidate_id"] == "candidate-02")
-        self.assertTrue(stale["canary_eligible"])
-        self.assertEqual(stale["canary_status"], "ELIGIBLE")
+        self.assertFalse(stale["canary_eligible"])
+        self.assertEqual(stale["canary_status"], "NOT_ELIGIBLE")
         status, operator, _ = self._request("api/operator")
         self.assertEqual(status, 200)
         assert isinstance(operator, dict)

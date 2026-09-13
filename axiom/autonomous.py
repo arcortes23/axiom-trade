@@ -6,8 +6,9 @@ Every external boundary is persisted or rejected; no live execution path exists.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 import hashlib
 import json
 import math
@@ -18,7 +19,7 @@ from typing import Any, Callable, Iterable, Mapping, NoReturn, Sequence
 
 from .backtest import CryptoBacktester
 from .backtest.prediction import run_prediction_research_mode
-from .forward import ForwardTestRegistry, _content_hash
+from .forward import COMMON_PAPER_ASSUMPTIONS, ForwardTestRegistry, _canonical_forward_config, _content_hash
 from .director import compact_report, validate_hermes_proposal
 from .domain import Fill, MarketType, ResearchQuality, SettlementState, ensure_utc, parse_timestamp, utc_now
 from .evaluation import split_dataset
@@ -32,6 +33,13 @@ from .robustness import bootstrap_confidence_interval, minimum_sample_check, nei
 from .storage import AxiomStore
 from .data_quality import evaluate_prediction_data_quality, persisted_quality_fields
 from .strategy import StrategyDefinition, load_strategy
+from .rolling_portfolio import (
+    RollingAdmissionPolicy,
+    RollingEvidence,
+    RollingSelection,
+    default_rolling_admission_policy,
+    evaluate_rolling_selection,
+)
 from .strategy.signals import evaluate_model_document_probability
 from .experiment_plan import AUTONOMOUS_BUDGET_ID, ExperimentPlan, ExperimentPlanError, MAX_PLAN_VARIANTS
 
@@ -40,6 +48,45 @@ _MAX_QUEUE_RESULT_ITEMS = 64
 _MAX_DATASET_ROWS = 100_000
 _MAX_FORWARD_ROWS = 100_000
 _MAX_LEGACY_RECOVERY_ITEMS = 64
+_MAX_ROLLING_STRATEGIES = 128
+# Historical rolling evidence is preflighted before JSON decoding.  The fixed
+# 16 MiB/25,000-row boundary keeps immutable source material bounded while
+# the source-row projection below remains deterministic.
+_MAX_ROLLING_DATASET_PAYLOAD_BYTES = 16 * 1024 * 1024
+_MAX_ROLLING_SOURCE_ROWS = 25_000
+_MAX_ROLLING_EXIT_LINEAGE = 20
+_MAX_ROLLING_TOTAL_ROWS = 100_000
+_MAX_ROLLING_QUEUE_RESULTS = 64
+_MAX_ROLLING_HERMES_IDS = 32
+_MAX_ROLLING_HERMES_PAYLOAD_BYTES = 16_383
+_MAX_ROLLING_HERMES_ID_LENGTH = 4_096
+_MAX_ROLLING_STATE_ITEMS = 32
+_MAX_ROLLING_STATE_ID_LENGTH = 256
+_MAX_ROLLING_STATE_PAYLOAD_BYTES = 60_000
+_ROLLING_STATE_RESULT_KEYS = (
+    "strategy_version_id",
+    "research_trial_id",
+    "candidate_id",
+    "evidence_window_id",
+    "source_class",
+    "requested_days",
+    "status",
+    "reason",
+    "actual_coverage_seconds",
+    "observation_completeness",
+    "realized_pnl",
+    "unrealized_pnl",
+    "drawdown",
+    "completed_outcomes",
+    "reliability",
+    "evidence_digest",
+    "overlap_key",
+)
+_ROLLING_HERMES_ID_FIELDS = (
+    "strategy_version_ids",
+    "research_trial_ids",
+    "candidate_ids",
+)
 _LEGACY_RECOVERY_STATE_NAME = "autonomous-legacy-recovery"
 _MAX_AUTOMATIC_REASSESSMENTS = 3
 _MUTABLE_DATASET_VERSION_ALIASES = frozenset({"latest", "current", "default", "unversioned"})
@@ -337,6 +384,628 @@ def _canonical_binding(value: Any) -> str:
             return [plain(child) for child in sorted(item, key=str)]
         return item
     return json.dumps(plain(value), sort_keys=True, separators=(",", ":"), allow_nan=False, default=str)
+
+def _rolling_number(value: Any, default: Decimal = Decimal("0")) -> Decimal:
+    if isinstance(value, bool) or value is None:
+        return default
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return default
+    return parsed if parsed.is_finite() else default
+
+
+def _rolling_timestamp(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return ensure_utc(value)
+    if value is None:
+        return None
+    try:
+        return parse_timestamp(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _rolling_hash(value: Any) -> str:
+    return "sha256:" + hashlib.sha256(_canonical_binding(value).encode("utf-8")).hexdigest()
+def _rolling_state_ids(values: Iterable[Any]) -> list[str]:
+    """Project identifiers for durable state without retaining the full lineage."""
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        identifier = str(value or "").strip()
+        if not identifier:
+            continue
+        identifier = identifier[:_MAX_ROLLING_STATE_ID_LENGTH]
+        if identifier in seen:
+            continue
+        seen.add(identifier)
+        result.append(identifier)
+        if len(result) >= _MAX_ROLLING_STATE_ITEMS:
+            break
+    return result
+
+
+def _rolling_state_result(value: Any) -> dict[str, Any]:
+    """Keep only compact, scalar evidence fields in restart-facing state."""
+    if not isinstance(value, Mapping):
+        return {"value": str(value)[:_MAX_ROLLING_STATE_ID_LENGTH]}
+    result: dict[str, Any] = {}
+    for key in _ROLLING_STATE_RESULT_KEYS:
+        if key not in value:
+            continue
+        item = value[key]
+        if isinstance(item, (str, int, float, bool)) or item is None:
+            result[key] = item if not isinstance(item, str) else item[:_MAX_ROLLING_STATE_ID_LENGTH]
+        else:
+            result[key] = str(item)[:_MAX_ROLLING_STATE_ID_LENGTH]
+    return result
+
+
+def _rolling_state_payload(
+    *,
+    status: str,
+    scheduled_at: str,
+    queue_item_id: Any,
+    queue_status: Any,
+    strategies: Sequence[Mapping[str, Any]],
+    evidence_rows: Sequence[Mapping[str, Any]],
+    pending: Sequence[Mapping[str, Any]],
+    source_classes: Sequence[str],
+    requested_window_days: Sequence[int],
+    source_rows_total: int,
+) -> dict[str, Any]:
+    """Build a bounded operator-job payload for rolling refresh state."""
+    strategy_total = len(strategies)
+    evidence_total = len(evidence_rows)
+    pending_total = len(pending)
+    candidate_values = [item.get("candidate_id") for item in strategies if item.get("candidate_id")]
+    candidate_total = len(candidate_values)
+    strategy_ids = _rolling_state_ids(item.get("strategy_version_id") for item in strategies)
+    trial_ids = _rolling_state_ids(item.get("research_trial_id") for item in strategies)
+    candidate_ids = _rolling_state_ids(candidate_values)
+    evidence_sample = [_rolling_state_result(item) for item in evidence_rows[:_MAX_ROLLING_STATE_ITEMS]]
+    pending_sample = [_rolling_state_result(item) for item in pending[:_MAX_ROLLING_STATE_ITEMS]]
+    truncated = {
+        "strategy_versions": strategy_total > len(strategy_ids),
+        "research_trials": strategy_total > len(trial_ids),
+        "candidate_ids": candidate_total > len(candidate_ids),
+        "evidence_windows": evidence_total > len(evidence_sample),
+        "pending": pending_total > len(pending_sample),
+        "source_rows": source_rows_total >= _MAX_ROLLING_TOTAL_ROWS,
+    }
+    state: dict[str, Any] = {
+        "status": status,
+        "scheduled_at": scheduled_at,
+        "queue_item_id": str(queue_item_id or "")[:_MAX_ROLLING_STATE_ID_LENGTH],
+        "queue_status": str(queue_status or "")[:_MAX_ROLLING_STATE_ID_LENGTH],
+        "strategy_versions": strategy_ids,
+        "strategy_versions_total": strategy_total,
+        "strategy_versions_truncated": truncated["strategy_versions"],
+        "research_trials": trial_ids,
+        "research_trials_total": strategy_total,
+        "research_trials_truncated": truncated["research_trials"],
+        "candidate_ids": candidate_ids,
+        "candidate_ids_total": candidate_total,
+        "candidate_ids_truncated": truncated["candidate_ids"],
+        "evidence_windows": evidence_sample,
+        "evidence_windows_total": evidence_total,
+        "evidence_windows_truncated": truncated["evidence_windows"],
+        "evidence_window_count": evidence_total,
+        "pending": pending_sample,
+        "pending_total": pending_total,
+        "pending_truncated": truncated["pending"],
+        "source_rows_total": source_rows_total,
+        "source_rows_truncated": truncated["source_rows"],
+        "source_classes": list(source_classes),
+        "requested_window_days": list(requested_window_days),
+        "paper_only": True,
+        "truncated": any(truncated.values()),
+    }
+    while len(_canonical_binding(state).encode("utf-8")) > _MAX_ROLLING_STATE_PAYLOAD_BYTES:
+        removable = next(
+            (
+                name
+                for name in ("pending", "evidence_windows", "strategy_versions", "research_trials", "candidate_ids")
+                if state[name]
+            ),
+            None,
+        )
+        if removable is None:
+            break
+        state[removable].pop()
+        state[f"{removable}_truncated"] = True
+        state["truncated"] = True
+    return state
+
+
+
+
+def _rolling_unique_ids(values: Iterable[Any], *, limit: int = _MAX_ROLLING_HERMES_IDS) -> list[str]:
+    """Return deterministic, bounded identifiers for one Hermes request field."""
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        identifier = str(value or "").strip()
+        if (
+            not identifier
+            or len(identifier) > _MAX_ROLLING_HERMES_ID_LENGTH
+            or identifier in seen
+        ):
+            continue
+        seen.add(identifier)
+        result.append(identifier)
+        if len(result) >= limit:
+            break
+    return result
+
+
+def _rolling_hermes_payload(
+    strategies: Sequence[Mapping[str, Any]],
+    sources: Sequence[str],
+    current: datetime,
+) -> dict[str, Any]:
+    """Build a deduplicated rolling request below ResearchBus's byte limit."""
+    payload: dict[str, Any] = {
+        "rolling_research": True,
+        "strategy_version_ids": _rolling_unique_ids(
+            item.get("strategy_version_id") for item in strategies
+        ),
+        "research_trial_ids": _rolling_unique_ids(
+            item.get("research_trial_id") for item in strategies
+        ),
+        "candidate_ids": _rolling_unique_ids(
+            item.get("candidate_id") for item in strategies if item.get("candidate_id")
+        ),
+        "source_classes": list(sources),
+        "requested_window_days": [7, 30],
+        "paper_only": True,
+        "available_at": current.isoformat(),
+    }
+    while len(_canonical_binding(payload).encode("utf-8")) >= _MAX_ROLLING_HERMES_PAYLOAD_BYTES:
+        fields = [field for field in _ROLLING_HERMES_ID_FIELDS if payload[field]]
+        if not fields:
+            # The fixed metadata above is intentionally tiny; this fallback
+            # keeps the byte-bound invariant true even for pathological input.
+            payload = {
+                "rolling_research": True,
+                "source_classes": list(sources),
+                "requested_window_days": [7, 30],
+                "paper_only": True,
+                "available_at": current.isoformat(),
+            }
+            break
+        field = max(fields, key=lambda name: (len(payload[name]), name))
+        payload[field].pop()
+    return payload
+
+
+def _rolling_price(row: Mapping[str, Any]) -> Decimal | None:
+    payload = row.get("payload")
+    candidates: list[Any] = [row.get(name) for name in (
+        "yes_mid", "mid", "price", "yes_price", "mark", "close", "last_price",
+    )]
+    if isinstance(payload, Mapping):
+        candidates.extend(payload.get(name) for name in (
+            "yes_mid", "mid", "price", "yes_price", "mark", "close", "last_price",
+        ))
+        book = payload.get("order_book") or payload.get("yes_order_book")
+        if isinstance(book, Mapping):
+            candidates.extend(book.get(name) for name in ("mid", "price", "best_bid", "best_ask"))
+    for candidate in candidates:
+        value = _rolling_number(candidate, Decimal("-1"))
+        if Decimal("0") <= value <= Decimal("1"):
+            return value
+    return None
+
+
+def _rolling_row_time(row: Mapping[str, Any]) -> datetime | None:
+    for key in ("source_timestamp", "timestamp", "observed_at", "event_timestamp", "resolved_at", "time", "created_at"):
+        stamp = _rolling_timestamp(row.get(key))
+        if stamp is not None:
+            return stamp
+    return None
+
+
+def _rolling_source_name(value: Any) -> str:
+    text = str(value or "").strip().upper().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "FORWARD_COLLECTED": "LIVE",
+        "ORDER_BOOK_SIMULATED": "REPLAY",
+        "REPLAY_SIMULATED": "REPLAY",
+        "PRICE_PROXY": "HISTORICAL",
+        "PAPER_FORWARD": "PAPER",
+        "FORWARD_PAPER": "PAPER",
+    }
+    return aliases.get(text, text or "HISTORICAL")
+
+
+_ROLLING_PERSISTED_SOURCE_CLASSES: Mapping[str, str] = {
+    "HISTORICAL": "HISTORICAL",
+    "REPLAY": "HISTORICAL",
+    "PAPER": "PAPER",
+    "LIVE": "FORWARD_COLLECTED",
+}
+
+
+def _rolling_persisted_source_class(value: Any) -> str:
+    """Map a requested rolling source to the storage source class."""
+    source = _rolling_source_name(value)
+    return _ROLLING_PERSISTED_SOURCE_CLASSES.get(source, source)
+
+
+_ROLLING_SOURCE_TYPES: Mapping[str, frozenset[str]] = {
+    "HISTORICAL": frozenset({"HISTORICAL", "PRICE_PROXY"}),
+    "REPLAY": frozenset({"REPLAY", "REPLAY_SIMULATED", "ORDER_BOOK_SIMULATED", "HISTORICAL"}),
+    "PAPER": frozenset({"PAPER", "PAPER_FORWARD", "FORWARD_PAPER"}),
+    "LIVE": frozenset({"LIVE", "FORWARD_COLLECTED"}),
+}
+_ROLLING_SOURCE_QUERY_TYPES: Mapping[str, tuple[str, ...]] = {
+    # Storage persists only these source types.  Keep the public rolling class
+    # in evidence while translating only the query boundary.
+    "REPLAY": ("HISTORICAL",),
+    "LIVE": ("FORWARD_COLLECTED",),
+}
+_ROLLING_TERMINAL_VALUES = frozenset(
+    {
+        "RESOLVED",
+        "RESOLVED_YES",
+        "RESOLVED_NO",
+        "VOID",
+        "SETTLED",
+        "CLOSED",
+        "EXPIRED",
+        "FINAL",
+        "COMPLETE",
+        "COMPLETED",
+        "TERMINAL",
+    }
+)
+
+
+def _rolling_terminal_outcome(row: Mapping[str, Any]) -> bool:
+    view = _rolling_snapshot_view(row)
+    semantic_fields = (
+        "settlement_state",
+        "settlement_status",
+        "settlement",
+        "resolution",
+        "resolution_state",
+        "resolution_status",
+        "resolved",
+        "resolved_status",
+        "settled",
+        "terminal",
+        "outcome",
+    )
+    explicit_booleans = [
+        view[name]
+        for name in semantic_fields
+        if isinstance(view.get(name), bool)
+    ]
+    if explicit_booleans:
+        return any(explicit_booleans)
+    for name in (*semantic_fields, "status", "state"):
+        value = view.get(name)
+        if isinstance(value, str):
+            normalized = value.strip().upper().replace("-", "_").replace(" ", "_")
+            if normalized in _ROLLING_TERMINAL_VALUES and (
+                normalized not in {"CLOSED", "EXPIRED"} or name in semantic_fields
+            ):
+                return True
+    return False
+
+
+def _rolling_market_key(row: Mapping[str, Any]) -> str:
+    view = _rolling_snapshot_view(row)
+    for name in (
+        "market_id",
+        "condition_id",
+        "event_id",
+        "token_id",
+        "symbol",
+        "market",
+    ):
+        value = view.get(name)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    # A scope-bound historical stream may omit a row-level market id.  Keep
+    # those rows on one path; never manufacture adjacency across known markets.
+    return "__unknown_market__"
+
+
+def _rolling_source_binding(record: Mapping[str, Any]) -> dict[str, Any]:
+    """Extract one exact selector/scope binding and reject contradictions."""
+    containers: list[Mapping[str, Any]] = [record]
+    for name in ("payload", "provenance", "strategy_document", "strategy"):
+        child = record.get(name)
+        if isinstance(child, Mapping):
+            containers.append(child)
+            nested_provenance = child.get("provenance")
+            if isinstance(nested_provenance, Mapping):
+                containers.append(nested_provenance)
+    selectors: list[Mapping[str, Any]] = []
+    for container in containers:
+        raw = container.get("dataset_selector")
+        if isinstance(raw, Mapping):
+            selectors.append(raw)
+    fields = (
+        "dataset_id",
+        "dataset_version",
+        "version",
+        "market_scope",
+        "market_scope_hash",
+        "market_scope_version",
+        "scope",
+        "scope_hash",
+        "scope_version",
+        "market_id",
+        "market_ids",
+        "candidate_id",
+        "research_trial_id",
+        "trial_id",
+    )
+    binding: dict[str, Any] = {}
+    direct_fields = {
+        "dataset_id",
+        "dataset_version",
+        "market_scope",
+        "scope",
+        "market_scope_hash",
+        "market_scope_version",
+        "scope_hash",
+        "scope_version",
+        "market_id",
+        "market_ids",
+        "candidate_id",
+        "research_trial_id",
+        "trial_id",
+    }
+    for field in fields:
+        values: list[Any] = []
+        for selector in selectors:
+            value = selector.get(field)
+            if value is not None and value != "":
+                values.append(value)
+        for container in containers:
+            if field in direct_fields:
+                value = container.get(field)
+                if value is not None and value != "":
+                    values.append(value)
+        distinct = {_canonical_binding(value) for value in values}
+        if len(distinct) > 1:
+            raise ValueError(f"conflicting rolling dataset/scope selector: {field}")
+        if values:
+            binding[field] = values[0]
+    if "trial_id" in binding:
+        if (
+            "research_trial_id" in binding
+            and _canonical_binding(binding["research_trial_id"])
+            != _canonical_binding(binding["trial_id"])
+        ):
+            raise ValueError("conflicting rolling dataset/scope selector: research_trial_id")
+        binding.setdefault("research_trial_id", binding["trial_id"])
+    return binding
+
+
+
+def _rolling_rule_scope_market_ids(
+    store: Any,
+    record: Mapping[str, Any],
+    binding: Mapping[str, Any],
+    rows: Sequence[Mapping[str, Any]],
+    now: datetime,
+) -> set[str] | None:
+    """Return the exact market set authorized by a RULE_BASED_MARKETS scope."""
+    scope = binding.get("market_scope", binding.get("scope"))
+    if not isinstance(scope, Mapping):
+        return None
+    mode = str(scope.get("mode", "")).strip().upper()
+    if mode != "RULE_BASED_MARKETS":
+        return None
+    candidate_id = _binding_value(binding.get("candidate_id"))
+    scope_hash = _binding_value(
+        binding.get("market_scope_hash", binding.get("scope_hash"))
+    )
+    scope_version = _binding_value(
+        binding.get("market_scope_version", binding.get("scope_version"))
+    )
+    if not candidate_id or not scope_hash or not scope_version:
+        raise ValueError("RULE_BASED_MARKET_SCOPE_BINDING_REQUIRED")
+    loader = getattr(store, "load_market_scope_resolution", None)
+    resolution: Any = None
+    if callable(loader):
+        try:
+            resolution = loader(
+                candidate_id,
+                scope_hash=scope_hash,
+                scope_version=scope_version,
+            )
+        except TypeError:
+            try:
+                resolution = loader(candidate_id)
+            except Exception:
+                resolution = None
+        except Exception:
+            resolution = None
+    if resolution is not None:
+        if hasattr(resolution, "as_dict") and callable(resolution.as_dict):
+            resolution = resolution.as_dict()
+        if not isinstance(resolution, Mapping):
+            raise ValueError("RULE_BASED_MARKET_SCOPE_RESOLUTION_INVALID")
+        if (
+            _binding_value(resolution.get("candidate_id")) != candidate_id
+            or _binding_value(resolution.get("scope_hash")) != scope_hash
+            or _binding_value(resolution.get("scope_version")) != scope_version
+            or str(resolution.get("status", "")).strip().upper() != "MATCHED"
+        ):
+            raise ValueError("RULE_BASED_MARKET_SCOPE_RESOLUTION_INVALID")
+        matched = resolution.get("matched_markets", ())
+        if not isinstance(matched, (list, tuple)):
+            raise ValueError("RULE_BASED_MARKET_SCOPE_RESOLUTION_INVALID")
+        result: set[str] = set()
+        for market in matched:
+            if isinstance(market, Mapping):
+                market_id = _binding_value(
+                    market.get("market_id", market.get("id"))
+                )
+            else:
+                market_id = _binding_value(market)
+            if market_id:
+                result.add(market_id)
+        return result
+    # Custom stores may not persist resolutions.  Reuse the canonical resolver
+    # against their bounded inventory rather than implementing a second rule
+    # matcher here; unresolved or partial results fail closed.
+    try:
+        from .market_scope import resolve_market_scope
+    except (ImportError, AttributeError) as exc:
+        raise ValueError("RULE_BASED_MARKET_SCOPE_RESOLVER_UNAVAILABLE") from exc
+    inventory: dict[str, Mapping[str, Any]] = {}
+    for raw in rows:
+        if not isinstance(raw, Mapping):
+            continue
+        view = _rolling_snapshot_view(raw)
+        market_id = _binding_value(
+            view.get("market_id", view.get("condition_id", view.get("id")))
+        )
+        if market_id and market_id not in inventory:
+            inventory[market_id] = view
+    try:
+        resolved = resolve_market_scope(
+            candidate_id,
+            record,
+            tuple(inventory.values()),
+            resolved_at=now,
+        )
+    except Exception as exc:
+        raise ValueError("RULE_BASED_MARKET_SCOPE_RESOLUTION_FAILED") from exc
+    resolved_status = str(getattr(resolved, "status", "")).strip().upper()
+    if resolved_status != "MATCHED":
+        raise ValueError("RULE_BASED_MARKET_SCOPE_RESOLUTION_INCOMPLETE")
+    matched = getattr(resolved, "matched_markets", ())
+    return {
+        market_id
+        for market in matched
+        if (market_id := _binding_value(getattr(market, "market_id", None)))
+    }
+
+def _rolling_document_is_marked(value: Mapping[str, Any], provenance: Mapping[str, Any] | None = None) -> bool:
+    containers = [value]
+    if isinstance(provenance, Mapping):
+        containers.append(provenance)
+    for field_name in ("provenance", "strategy_document", "strategy", "canonical_strategy", "payload"):
+        nested = value.get(field_name)
+        if isinstance(nested, Mapping):
+            containers.append(nested)
+            if isinstance(nested.get("provenance"), Mapping):
+                containers.append(nested["provenance"])
+    for item in containers:
+        if item.get("rolling_research") is True or item.get("rolling") is True:
+            return True
+        if str(item.get("research_mode", "")).strip().upper() in {"ROLLING", "ROLLING_RESEARCH"}:
+            return True
+        if str(item.get("trial_kind", "")).strip().upper() == "ROLLING_RESEARCH":
+            return True
+        if str(item.get("source", "")).strip().lower() == "rolling":
+            return True
+    return False
+
+
+def _rolling_campaign_bound(value: Mapping[str, Any]) -> bool:
+    containers = [value]
+    for field_name in ("payload", "strategy_document", "strategy", "canonical_strategy", "provenance"):
+        nested = value.get(field_name)
+        if isinstance(nested, Mapping):
+            containers.append(nested)
+    for item in containers:
+        if any(str(item.get(name, "")).strip() for name in ("campaign_id", "campaign_trial_id", "campaign_configuration_id")):
+            return True
+        protocol = item.get("campaign_protocol")
+        if isinstance(protocol, Mapping) or str(item.get("source", "")).strip().lower() in {"axiom-finite-campaign", "finite-campaign"}:
+            return True
+    return False
+
+
+def _rolling_snapshot_view(row: Mapping[str, Any]) -> dict[str, Any]:
+    """Merge persisted snapshot/result payloads before terminal metric reads."""
+    result: dict[str, Any] = dict(row)
+    pending = [row.get(name) for name in ("payload", "snapshot", "data", "observation", "result", "outcome")]
+    seen: set[int] = set()
+    while pending:
+        value = pending.pop(0)
+        if not isinstance(value, Mapping) or id(value) in seen:
+            continue
+        seen.add(id(value))
+        for key, child in value.items():
+            if key not in result or result.get(key) in (None, ""):
+                result[str(key)] = child
+        pending.extend(value.get(name) for name in ("payload", "snapshot", "data", "observation", "result", "outcome"))
+    return result
+
+
+def _rolling_observation_interval(
+    row: Mapping[str, Any],
+    *,
+    previous_timestamp: datetime | None = None,
+    next_timestamp: datetime | None = None,
+) -> tuple[datetime, datetime] | None:
+    """Return an explicit or bounded interval for one point observation.
+
+    Persisted point snapshots commonly carry only one timestamp.  A point is
+    not itself evidence coverage, so use an explicit duration when present or
+    the adjacent deterministic sample interval.  A lone point remains
+    ineligible rather than claiming zero or synthetic coverage.
+    """
+    view = _rolling_snapshot_view(row)
+    start = _rolling_timestamp(
+        view.get("observation_start", view.get("interval_start", view.get("started_at")))
+    )
+    end = _rolling_timestamp(
+        view.get("observation_end", view.get("interval_end", view.get("completed_at")))
+    )
+    if start is not None and end is not None:
+        if end < start:
+            return None
+        if end > start:
+            return start, end
+    point = _rolling_row_time(view) or start or end
+    if point is None:
+        return None
+    for field_name in (
+        "observation_interval_seconds",
+        "interval_seconds",
+        "window_seconds",
+        "duration_seconds",
+    ):
+        raw_duration = _rolling_number(view.get(field_name), Decimal("0"))
+        if raw_duration <= Decimal("0"):
+            continue
+        bounded = min(raw_duration, Decimal(30 * 86400))
+        microseconds = int(bounded * Decimal(1_000_000))
+        if microseconds > 0:
+            return point, point + timedelta(microseconds=microseconds)
+    if next_timestamp is not None and next_timestamp > point:
+        return point, next_timestamp
+    if previous_timestamp is not None and previous_timestamp < point:
+        return previous_timestamp, point
+    return None
+
+
+def _rolling_overlap_key(rows: Sequence[Mapping[str, Any]]) -> str:
+    exposures: set[str] = set()
+    for raw in rows:
+        row = _rolling_snapshot_view(raw)
+        for key in ("market_id", "market_ids", "universe_id", "universe_version", "market_scope_hash", "scope_hash"):
+            value = row.get(key)
+            if isinstance(value, (list, tuple, set, frozenset)):
+                exposures.update(str(item).strip() for item in value if str(item).strip())
+            elif value is not None and str(value).strip():
+                exposures.add(str(value).strip())
+    if not exposures:
+        return "unknown"
+    return "exposure:" + _rolling_hash(sorted(exposures)).removeprefix("sha256:")[:40]
+
 _GENERATED_QUEUE_PROVENANCE_SCHEMA = "axiom-generated-queue-v1"
 _GENERATED_QUEUE_KINDS = frozenset({
     "predeclared_starting_set",
@@ -1061,6 +1730,1351 @@ class AutonomousResearchProcessor:
         self.clock = clock
         self.lifecycle = CandidateLifecycleManager(store, criteria=self.config.promotion_criteria)
         self._campaign_active_state: dict[str, Any] = {}
+
+    # Rolling portfolio -------------------------------------------------
+    def _rolling_strategy_documents(self) -> tuple[dict[str, Any], ...]:
+        """Discover immutable declarative strategy definitions without campaigns."""
+        found: dict[str, dict[str, Any]] = {}
+
+        def add(value: Any, provenance: Mapping[str, Any] | None = None) -> None:
+            if not isinstance(value, Mapping):
+                return
+            if _rolling_campaign_bound(value) or not _rolling_document_is_marked(value, provenance):
+                return
+            source = value.get("strategy_document", value.get("strategy"))
+            if not isinstance(source, Mapping):
+                source = value.get("canonical_strategy")
+            if not isinstance(source, Mapping):
+                return
+            try:
+                definition = load_strategy(source)
+            except Exception:
+                return
+            document = definition.to_dict()
+            # Candidate ids are lineage, not part of the immutable definition.
+            document.pop("strategy_id", None)
+            key = _rolling_hash(document)
+            item = {
+                "strategy_document": document,
+                "strategy_id": definition.id,
+                "version": str(definition.version),
+                "strategy_hash": key,
+                "config_hash": _rolling_hash(
+                    {
+                        "market_type": document.get("market_type"),
+                        "family": document.get("family"),
+                        "parameters": document.get("parameters", {}),
+                        "operations": document.get("operations", []),
+                        "paper_assumptions": dict(COMMON_PAPER_ASSUMPTIONS),
+                    }
+                ),
+            }
+            if isinstance(provenance, Mapping):
+                origin = dict(provenance)
+            else:
+                origin = {}
+            nested_plan = value.get("experiment_plan")
+            nested_plan = nested_plan if isinstance(nested_plan, Mapping) else {}
+            for field_name in (
+                "dataset_id",
+                "dataset_version",
+                "dataset_selector",
+                "market_scope",
+                "market_scope_hash",
+                "market_scope_version",
+            ):
+                field_value = value.get(field_name, nested_plan.get(field_name))
+                if field_value is not None:
+                    origin.setdefault(field_name, field_value)
+            if origin:
+                item["provenance"] = origin
+            prior = found.get(key)
+            if prior is None:
+                found[key] = item
+            elif isinstance(prior.get("provenance"), Mapping) and isinstance(provenance, Mapping):
+                merged = dict(prior["provenance"])
+                merged.update({str(k): v for k, v in provenance.items() if v is not None})
+                prior["provenance"] = merged
+
+        connection = getattr(self.store, "connection", None)
+        execute = getattr(connection, "execute", None)
+        read_budget = _MAX_ROLLING_STRATEGIES
+
+        def bounded_sql(query: str, values: Sequence[Any] = ()) -> tuple[Any, ...]:
+            nonlocal read_budget
+            if not callable(execute) or read_budget <= 0:
+                return ()
+            requested = read_budget
+            try:
+                fetched = execute(
+                    query + " LIMIT ?",
+                    (*tuple(values), requested),
+                ).fetchall()
+            except Exception:
+                return ()
+            rows = tuple(fetched or ())[:requested]
+            read_budget -= len(rows)
+            return rows
+
+        for row in bounded_sql(
+            "SELECT payload_json,strategy_version_id "
+            "FROM strategy_versions ORDER BY created_at,strategy_version_id"
+        ):
+            try:
+                payload = (
+                    json.loads(row["payload_json"])
+                    if isinstance(row["payload_json"], str)
+                    else row["payload_json"]
+                )
+            except Exception:
+                payload = {}
+            add(payload, {"strategy_version_id": row["strategy_version_id"]})
+
+        # Legacy strategy rows are read directly with the same shared budget.
+        # Calling list_strategies() here would materialize the complete table
+        # before the Python-side rolling cap could take effect.
+        for row in bounded_sql(
+            "SELECT strategy_id,version,payload_json,created_at "
+            "FROM strategies ORDER BY created_at,strategy_id,version"
+        ):
+            try:
+                payload = (
+                    json.loads(row["payload_json"])
+                    if isinstance(row["payload_json"], str)
+                    else row["payload_json"]
+                )
+            except Exception:
+                payload = {}
+            add(
+                payload,
+                {
+                    "strategy_id": row["strategy_id"],
+                    "source": "strategy_store",
+                },
+            )
+
+        # Custom stores without an exposed connection can still provide a
+        # bounded accessor; unbounded list-only adapters are intentionally
+        # ignored rather than trusted to enforce this boundary.
+        lister = getattr(self.store, "list_strategies", None)
+        if not callable(execute) and callable(lister) and read_budget > 0:
+            try:
+                rows = lister(limit=read_budget)
+            except Exception:
+                rows = ()
+            rows = tuple(rows or ())[:read_budget]
+            read_budget -= len(rows)
+            for row in rows:
+                payload = (
+                    row.get("strategy", row.get("payload", row))
+                    if isinstance(row, Mapping)
+                    else row
+                )
+                add(
+                    payload,
+                    {
+                        "strategy_id": row.get("strategy_id")
+                        if isinstance(row, Mapping)
+                        else None,
+                        "source": "strategy_store",
+                    },
+                )
+
+        lifecycle_loader = getattr(self.store, "load_candidate_lifecycle", None)
+        if callable(lifecycle_loader) and read_budget > 0:
+            try:
+                rows = lifecycle_loader(limit=read_budget)
+            except Exception:
+                rows = ()
+            rows = tuple(rows or ())[:read_budget]
+            read_budget -= len(rows)
+            for row in rows:
+                payload = row.get("payload") if isinstance(row, Mapping) else None
+                if isinstance(payload, Mapping):
+                    add(
+                        payload,
+                        {
+                            "candidate_id": row.get("candidate_id"),
+                            "plan_id": payload.get("plan_id"),
+                            "dataset_id": payload.get("dataset_id"),
+                            "dataset_version": payload.get("dataset_version"),
+                            "dataset_selector": payload.get("dataset_selector"),
+                            "market_scope": payload.get("market_scope"),
+                            "market_scope_hash": payload.get("market_scope_hash"),
+                            "market_scope_version": payload.get("market_scope_version"),
+                            "source": "candidate_lifecycle",
+                        },
+                    )
+
+        queue_lister = getattr(self.store, "list_research_items", None)
+        if callable(queue_lister) and read_budget > 0:
+            try:
+                rows = queue_lister(limit=read_budget)
+            except Exception:
+                rows = ()
+            rows = tuple(rows or ())[:read_budget]
+            read_budget -= len(rows)
+            for row in rows:
+                payload = row.get("payload") if isinstance(row, Mapping) else None
+                add(payload, {"source": "research_queue"})
+        ordered = sorted(found.values(), key=lambda item: (str(item.get("strategy_hash", "")), str(item.get("strategy_id", ""))))
+        return tuple(ordered[:_MAX_ROLLING_STRATEGIES])
+
+    def _rolling_persist_strategy_lineage(
+        self,
+        documents: Sequence[Mapping[str, Any]],
+        now: datetime,
+    ) -> tuple[dict[str, Any], ...]:
+        saver = getattr(self.store, "save_strategy_version", None)
+        trial_saver = getattr(self.store, "save_research_trial", None)
+        persisted: list[dict[str, Any]] = []
+        for item in documents:
+            document = dict(item["strategy_document"])
+            strategy_hash = str(item["strategy_hash"])
+            strategy_version_id = "strategy-version-" + strategy_hash.removeprefix("sha256:")[:40]
+            provenance = {
+                **dict(item.get("provenance") or {}),
+                "rolling_research": True,
+                "research_mode": "ROLLING_RESEARCH",
+            }
+            record = {
+                "strategy_version_id": strategy_version_id,
+                "strategy_id": str(item.get("strategy_id", "")).strip() or str(document.get("family", "strategy")),
+                "version": str(item.get("version", "1")),
+                "code_hash": strategy_hash,
+                "config_hash": str(item.get("config_hash", strategy_hash)),
+                "created_at": now.isoformat(),
+                "strategy_document": document,
+                "canonical_strategy": document,
+                "strategy_hash": strategy_hash,
+                "provenance": provenance,
+                "paper_only": True,
+            }
+            if callable(saver):
+                try:
+                    saver(record)
+                except (TypeError, ValueError):
+                    pass
+            trial_id = str(provenance.get("research_trial_id") or "").strip() or "research-trial:" + strategy_version_id
+            trial = {
+                "research_trial_id": trial_id,
+                "trial_id": trial_id,
+                "strategy_version_id": strategy_version_id,
+                "status": "SCHEDULED",
+                "created_at": now.isoformat(),
+                "trial_kind": "ROLLING_RESEARCH",
+                "strategy_hash": strategy_hash,
+                "source_classes": ["HISTORICAL", "REPLAY", "PAPER", "LIVE"],
+                "requested_window_days": [7, 30],
+                "rolling_research": True,
+                "paper_only": True,
+                "payload": {"strategy_document": document, "provenance": provenance},
+            }
+            if callable(trial_saver):
+                try:
+                    trial_saver(trial)
+                except (TypeError, ValueError):
+                    pass
+            persisted.append({**record, "research_trial_id": trial_id, "candidate_id": provenance.get("candidate_id")})
+        return tuple(persisted)
+
+    def _load_rolling_historical_dataset(
+        self,
+        dataset_id: str,
+        dataset_version: str,
+    ) -> Any | None:
+        """Preflight immutable JSON size/row metadata before ``load_dataset``.
+
+        The regular storage loader intentionally serves all dataset consumers.
+        Rolling evidence has a stricter source boundary, so inspect SQLite
+        metadata first and refuse oversized payloads before storage decodes the
+        JSON string or reconstructs catalog-backed records.
+        """
+        connection = getattr(self.store, "connection", None)
+        execute = getattr(connection, "execute", None)
+        if not callable(execute):
+            raise ValueError("HISTORICAL_DATASET_PREFLIGHT_UNAVAILABLE")
+        try:
+            payload_row = execute(
+                "SELECT LENGTH(CAST(payload_json AS BLOB)) AS payload_bytes,"
+                "json_extract(CASE WHEN json_valid(metadata_json) THEN metadata_json ELSE '{}' END,"
+                "'$.row_count') AS metadata_row_count,"
+                "json_array_length(CASE WHEN json_valid(payload_json) THEN payload_json ELSE '[]' END) "
+                "AS payload_row_count "
+                "FROM datasets WHERE dataset_id=? AND version=? LIMIT 1",
+                (str(dataset_id), str(dataset_version)),
+            ).fetchone()
+            catalog_row = execute(
+                "SELECT row_count FROM dataset_catalog "
+                "WHERE dataset_id=? AND dataset_version=? LIMIT 1",
+                (str(dataset_id), str(dataset_version)),
+            ).fetchone()
+        except Exception as exc:
+            raise ValueError("HISTORICAL_DATASET_PREFLIGHT_FAILED") from exc
+
+        def integer(value: Any, field: str) -> int | None:
+            if value is None:
+                return None
+            if isinstance(value, bool):
+                raise ValueError(f"{field} is invalid")
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(f"{field} is invalid") from exc
+            if parsed < 0:
+                raise ValueError(f"{field} is invalid")
+            return parsed
+
+        if payload_row is not None:
+            payload_bytes = integer(payload_row["payload_bytes"], "payload_bytes")
+            metadata_rows = integer(
+                payload_row["metadata_row_count"],
+                "metadata_row_count",
+            )
+            payload_rows = integer(
+                payload_row["payload_row_count"],
+                "payload_row_count",
+            )
+            if payload_bytes is None or payload_bytes > _MAX_ROLLING_DATASET_PAYLOAD_BYTES:
+                raise ValueError("HISTORICAL_DATASET_PAYLOAD_TOO_LARGE")
+            for row_count in (metadata_rows, payload_rows):
+                if row_count is not None and row_count > _MAX_ROLLING_SOURCE_ROWS:
+                    raise ValueError("HISTORICAL_DATASET_ROW_COUNT_TOO_LARGE")
+
+        if catalog_row is not None:
+            catalog_rows = integer(catalog_row["row_count"], "catalog_row_count")
+            if catalog_rows is None or catalog_rows > _MAX_ROLLING_SOURCE_ROWS:
+                raise ValueError("HISTORICAL_DATASET_ROW_COUNT_TOO_LARGE")
+        return self.store.load_dataset(dataset_id, dataset_version)
+
+    def _rolling_source_rows(
+        self,
+        record: Mapping[str, Any],
+        source_class: str,
+        now: datetime,
+    ) -> list[dict[str, Any]]:
+        source = _rolling_source_name(source_class)
+        if source not in _ROLLING_SOURCE_TYPES:
+            raise ValueError(f"unsupported rolling source class: {source_class}")
+        persisted_source = _rolling_persisted_source_class(source)
+        binding = _rolling_source_binding(record)
+        dataset_id = str(binding.get("dataset_id", "")).strip()
+        dataset_version = str(
+            binding.get("dataset_version", binding.get("version", ""))
+        ).strip()
+        rows: list[dict[str, Any]] = []
+        if source == "HISTORICAL":
+            # Historical evidence is valid only for an explicit immutable
+            # selector.  Never substitute the newest or first catalog entry.
+            if not dataset_id or not dataset_version:
+                raise ValueError("HISTORICAL_SELECTOR_REQUIRED")
+            loaded = self._load_rolling_historical_dataset(dataset_id, dataset_version)
+            if isinstance(loaded, Mapping):
+                loaded = loaded.get("records", loaded.get("rows", ()))
+            if isinstance(loaded, Sequence) and not isinstance(loaded, (str, bytes)):
+                rows = [dict(item) for item in loaded if isinstance(item, Mapping)]
+        elif source in {"REPLAY", "LIVE"}:
+            loader = getattr(self.store, "load_polymarket_snapshots", None)
+            if callable(loader):
+                persisted_types = _ROLLING_SOURCE_QUERY_TYPES[source]
+                for source_value in persisted_types:
+                    # The storage boundary accepts only persisted source types;
+                    # the requested rolling class remains canonical below.
+                    values = loader(source_type=source_value, limit=_MAX_FORWARD_ROWS)
+                    if isinstance(values, Mapping):
+                        values = values.get("records", values.get("rows", ()))
+                    rows.extend(dict(item) for item in values or () if isinstance(item, Mapping))
+        elif source == "PAPER":
+            registry = ForwardTestRegistry(self.store)
+            strategy_hash = _binding_value(record.get("strategy_hash"))
+            expected_candidate = _binding_value(binding.get("candidate_id"))
+            expected_trial = _binding_value(
+                binding.get("research_trial_id", binding.get("trial_id"))
+            )
+            if not strategy_hash or not expected_candidate or not expected_trial:
+                raise ValueError("PAPER_BINDING_REQUIRED")
+            try:
+                specs = registry.list()
+            except Exception as exc:
+                raise ValueError("PAPER_REGISTRY_UNAVAILABLE") from exc
+            for spec in specs:
+                if str(spec.strategy_hash).strip() != strategy_hash:
+                    continue
+                experiment_id = _binding_value(spec.experiment_id)
+                config = spec.config if isinstance(spec.config, Mapping) else {}
+                spec_binding = _rolling_source_binding({"payload": config})
+                spec_candidate = _binding_value(spec_binding.get("candidate_id"))
+                spec_trial = _binding_value(
+                    spec_binding.get("research_trial_id", spec_binding.get("trial_id"))
+                )
+                if (
+                    not experiment_id
+                    or spec_candidate != expected_candidate
+                    or spec_trial != expected_trial
+                ):
+                    raise ValueError("PAPER_SPEC_BINDING_MISMATCH")
+                for method_name in (
+                    "list_paper_observations",
+                    "list_paper_execution_events",
+                    "list_paper_bet_ledger",
+                ):
+                    loader = getattr(self.store, method_name, None)
+                    if not callable(loader):
+                        continue
+                    try:
+                        values = loader(experiment_id, limit=_MAX_ROLLING_SOURCE_ROWS)
+                    except Exception as exc:
+                        raise ValueError("PAPER_SOURCE_UNAVAILABLE") from exc
+                    for item in values or ():
+                        if not isinstance(item, Mapping):
+                            continue
+                        row = _rolling_snapshot_view(item)
+                        # The loader's experiment predicate is part of the
+                        # binding, but retain the row identity check so custom
+                        # stores cannot smuggle another experiment's payload.
+                        if _binding_value(row.get("experiment_id")) != experiment_id:
+                            raise ValueError("PAPER_EXPERIMENT_BINDING_UNPROVEN")
+                        row_binding = _rolling_source_binding(item)
+                        row_candidate = _binding_value(row_binding.get("candidate_id"))
+                        row_trial = _binding_value(
+                            row_binding.get("research_trial_id", row_binding.get("trial_id"))
+                        )
+                        if row_candidate and row_candidate != expected_candidate:
+                            raise ValueError("PAPER_CANDIDATE_BINDING_MISMATCH")
+                        if row_trial and row_trial != expected_trial:
+                            raise ValueError("PAPER_TRIAL_BINDING_MISMATCH")
+                        row["_paper_experiment_id"] = experiment_id
+                        rows.append(row)
+        resolved_scope_market_ids = _rolling_rule_scope_market_ids(
+            self.store,
+            record,
+            binding,
+            rows,
+            now,
+        )
+        normalized: list[dict[str, Any]] = []
+        allowed_source_types = _ROLLING_SOURCE_TYPES[source]
+        for raw in rows:
+            if not isinstance(raw, Mapping):
+                continue
+            row = _rolling_snapshot_view(raw)
+            declared_source = str(
+                row.get("source_type", row.get("source_class", ""))
+            ).strip().upper().replace("-", "_")
+            if source == "PAPER" and declared_source == "FORWARD_COLLECTED":
+                # ForwardPaperEngine persists its observation rows with the
+                # collection source type; this loader's canonical class is
+                # still PAPER and remains experiment-bound above.
+                declared_source = "PAPER"
+            if declared_source and declared_source not in allowed_source_types:
+                continue
+            if _rolling_campaign_bound(row):
+                continue
+            for field_name in ("dataset_id", "dataset_version", "version"):
+                expected = binding.get(field_name)
+                if expected is None or expected == "":
+                    continue
+                actual = row.get(field_name)
+                if actual is not None and actual != "" and _canonical_binding(actual) != _canonical_binding(expected):
+                    break
+            else:
+                scope = binding.get("market_scope", binding.get("scope"))
+                scope = scope if isinstance(scope, Mapping) else {}
+                if resolved_scope_market_ids is not None:
+                    expected_markets = resolved_scope_market_ids
+                else:
+                    expected_markets = scope.get(
+                        "market_ids",
+                        scope.get(
+                            "markets",
+                            binding.get("market_ids", binding.get("market_id", ())),
+                        ),
+                    )
+                    if isinstance(expected_markets, str):
+                        expected_markets = (expected_markets,)
+                    expected_markets = {
+                        str(item).strip()
+                        for item in (expected_markets or ())
+                        if str(item).strip()
+                    }
+                if resolved_scope_market_ids is not None and not expected_markets:
+                    continue
+                if expected_markets:
+                    actual_market = str(row.get("market_id", "")).strip()
+                    if actual_market not in expected_markets:
+                        continue
+                row["source_class"] = persisted_source
+                row["source_type"] = persisted_source
+                row["requested_source_class"] = source
+                row["requested_source_type"] = source
+                if _rolling_row_time(row) is not None:
+                    normalized.append(row)
+        normalized.sort(
+            key=lambda row: (
+                _rolling_row_time(row) or datetime.min.replace(tzinfo=timezone.utc),
+                str(row.get("market_id", "")),
+                str(row.get("snapshot_id", row.get("observation_id", ""))),
+            )
+        )
+        return normalized[-_MAX_ROLLING_SOURCE_ROWS:]
+
+    def _rolling_evidence_record(
+        self,
+        strategy: Mapping[str, Any],
+        rows: Sequence[Mapping[str, Any]],
+        source_class: str,
+        days: int,
+        now: datetime,
+    ) -> dict[str, Any] | None:
+        if days not in {7, 30} or not rows:
+            return None
+        requested_source = _rolling_source_name(source_class)
+        persisted_source = _rolling_persisted_source_class(requested_source)
+        normalized = [_rolling_snapshot_view(row) for row in rows if isinstance(row, Mapping)]
+        stamped = [(row, _rolling_row_time(row)) for row in normalized]
+        stamped = [(row, stamp) for row, stamp in stamped if stamp is not None]
+        if not stamped:
+            return None
+        stream_through = max(stamp for _, stamp in stamped)
+        requested_start = stream_through - timedelta(days=days)
+        window_rows = [
+            (row, stamp)
+            for row, stamp in stamped
+            if requested_start <= stamp <= stream_through
+        ]
+        if not window_rows:
+            return None
+
+        paths: dict[str, list[tuple[Mapping[str, Any], datetime]]] = {}
+        for row, stamp in window_rows:
+            paths.setdefault(_rolling_market_key(row), []).append((row, stamp))
+        for path_rows in paths.values():
+            path_rows.sort(
+                key=lambda item: (
+                    item[1],
+                    str(item[0].get("snapshot_id", item[0].get("observation_id", ""))),
+                )
+            )
+
+        path_intervals: dict[str, list[tuple[datetime, datetime]]] = {}
+        path_rates: list[Decimal] = []
+        path_pnls: list[tuple[Decimal, bool]] = []
+        path_drawdowns: list[Decimal] = []
+        path_price_rows: dict[str, list[tuple[datetime, Decimal]]] = {}
+        document = (
+            strategy.get("strategy_document")
+            if isinstance(strategy.get("strategy_document"), Mapping)
+            else {}
+        )
+        family = str(document.get("family", "")).strip().lower()
+        mean_reversion = family in {"mean_reversion", "mean-reversion", "dip", "rsi", "lottery_ticket", "tails"}
+        for path, path_rows in paths.items():
+            intervals: list[tuple[datetime, datetime]] = []
+            prices: list[tuple[datetime, Decimal]] = []
+            path_rate = Decimal("0")
+            previous_price: Decimal | None = None
+            for index, (row, _stamp) in enumerate(path_rows):
+                interval = _rolling_observation_interval(
+                    row,
+                    previous_timestamp=(
+                        path_rows[index - 1][1] if index > 0 else None
+                    ),
+                    next_timestamp=(
+                        path_rows[index + 1][1]
+                        if index + 1 < len(path_rows)
+                        else None
+                    ),
+                )
+                complete = row.get(
+                    "observation_complete",
+                    row.get("complete", row.get("is_complete", True)),
+                )
+                if interval is not None and complete is not False:
+                    start, end = interval
+                    intervals.append(
+                        (max(start, requested_start), min(end, stream_through))
+                    )
+                price = _rolling_price(row)
+                if price is not None:
+                    prices.append((_stamp, price))
+                    if previous_price is not None:
+                        step = price - previous_price
+                        path_rate += -step if mean_reversion else step
+                    previous_price = price
+            intervals = [(start, end) for start, end in intervals if end >= start]
+            if intervals:
+                intervals.sort()
+                merged: list[tuple[datetime, datetime]] = []
+                for start, end in intervals:
+                    if not merged or start > merged[-1][1]:
+                        merged.append((start, end))
+                    elif end > merged[-1][1]:
+                        merged[-1] = (merged[-1][0], end)
+                path_intervals[path] = merged
+                path_rates.append(path_rate)
+                path_pnls.append(
+                    (
+                        Decimal("100") * path_rate,
+                        _rolling_terminal_outcome(path_rows[-1][0]),
+                    )
+                )
+                path_price_rows[path] = prices
+                equity = Decimal("100")
+                peak = equity
+                drawdown = Decimal("0")
+                for (_previous_stamp, previous_price), (_stamp, price) in zip(prices, prices[1:]):
+                    step = price - previous_price
+                    equity += Decimal("100") * (-step if mean_reversion else step)
+                    peak = max(peak, equity)
+                    if peak > Decimal("0"):
+                        drawdown = max(drawdown, (peak - equity) / peak)
+                path_drawdowns.append(drawdown)
+        if not path_rates:
+            return None
+
+        all_intervals = [
+            interval
+            for intervals in path_intervals.values()
+            for interval in intervals
+        ]
+        if not all_intervals:
+            return None
+        all_intervals.sort()
+        merged_intervals: list[tuple[datetime, datetime]] = []
+        for start, end in all_intervals:
+            if not merged_intervals or start > merged_intervals[-1][1]:
+                merged_intervals.append((start, end))
+            elif end > merged_intervals[-1][1]:
+                merged_intervals[-1] = (merged_intervals[-1][0], end)
+        actual_coverage = sum(
+            int((end - start).total_seconds()) for start, end in merged_intervals
+        )
+        available_from = min(start for start, _end in all_intervals)
+        available_through = max(end for _start, end in all_intervals)
+        gross_rate = sum(path_rates, Decimal("0")) / Decimal(len(path_rates))
+        sizing = Decimal("100")
+        fee_rate = Decimal("0.001")
+        slippage_rate = Decimal("0.0005")
+        generated_fees = sizing * fee_rate
+        generated_costs = sizing * slippage_rate
+        persisted_fees = sum(
+            (
+                _rolling_number(row.get("fees", row.get("fee_costs")))
+                for row, _ in window_rows
+                if row.get("fees", row.get("fee_costs")) is not None
+            ),
+            Decimal("0"),
+        )
+        persisted_costs = sum(
+            (
+                _rolling_number(row.get("costs", row.get("slippage_costs")))
+                for row, _ in window_rows
+                if row.get("costs", row.get("slippage_costs")) is not None
+            ),
+            Decimal("0"),
+        )
+        fees = persisted_fees if persisted_fees > Decimal("0") else generated_fees
+        costs = persisted_costs if persisted_costs > Decimal("0") else generated_costs
+        net_return = sizing * gross_rate - fees - costs
+        path_count = len(path_pnls)
+        per_path_cost = (fees + costs) / Decimal(path_count) if path_count else Decimal("0")
+        realized_pnl = sum(
+            (
+                path_pnl / Decimal(path_count) - per_path_cost
+                for path_pnl, terminal in path_pnls
+                if terminal
+            ),
+            Decimal("0"),
+        )
+        unrealized_pnl = sum(
+            (
+                path_pnl / Decimal(path_count) - per_path_cost
+                for path_pnl, terminal in path_pnls
+                if not terminal
+            ),
+            Decimal("0"),
+        )
+        completed = sum(1 for _path_pnl, terminal in path_pnls if terminal)
+        reliability = (
+            Decimal(completed) / Decimal(path_count) if path_count else Decimal("0")
+        )
+        overlap_key = _rolling_overlap_key([row for row, _ in window_rows])
+        source_binding = _rolling_source_binding(strategy)
+        provenance = (
+            strategy.get("provenance")
+            if isinstance(strategy.get("provenance"), Mapping)
+            else {}
+        )
+        candidate_id = str(
+            strategy.get("candidate_id") or provenance.get("candidate_id") or ""
+        ).strip() or None
+        trial_id = str(
+            strategy.get("research_trial_id") or provenance.get("research_trial_id") or ""
+        ).strip() or None
+
+        def metric_inputs(row: Mapping[str, Any]) -> dict[str, Any]:
+            names = (
+                "settlement",
+                "settlement_state",
+                "settlement_status",
+                "resolution",
+                "resolution_state",
+                "resolution_status",
+                "resolved",
+                "resolved_status",
+                "settled",
+                "terminal",
+                "outcome",
+                "status",
+                "state",
+                "observation_complete",
+                "complete",
+                "is_complete",
+                "observation_completeness",
+                "reliability",
+            )
+            return {name: row.get(name) for name in names if name in row}
+
+        digest = _rolling_hash(
+            {
+                "strategy_version_id": strategy["strategy_version_id"],
+                "research_trial_id": trial_id,
+                "candidate_id": candidate_id,
+                "source_class": persisted_source,
+                "requested_source_class": requested_source,
+                "requested_source_type": requested_source,
+                "source_binding": source_binding,
+                "requested_days": days,
+                "available_from": available_from,
+                "available_through": available_through,
+                "actual_coverage_seconds": actual_coverage,
+                "market_paths": {
+                    path: [
+                        {
+                            "identity": str(
+                                row.get(
+                                    "snapshot_id",
+                                    row.get("observation_id", row.get("timestamp", index)),
+                                )
+                            ),
+                            "time": stamp,
+                            "price": _rolling_price(row),
+                            "terminal": _rolling_terminal_outcome(row),
+                            "inputs": metric_inputs(row),
+                        }
+                        for index, (row, stamp) in enumerate(paths[path])
+                    ]
+                    for path in sorted(paths)
+                },
+                "reliability": reliability,
+                "completed_outcomes": completed,
+                "observation_completeness": (
+                    min(
+                        (
+                            _rolling_number(
+                                row.get(
+                                    "observation_completeness",
+                                    row.get("completeness", 1),
+                                ),
+                                Decimal("1"),
+                            )
+                            for row, _ in window_rows
+                        ),
+                        default=Decimal("0"),
+                    )
+                ),
+            }
+        )
+        window_id = "rolling-window-" + digest.removeprefix("sha256:")[:40]
+        requested_seconds = Decimal(days) * Decimal(86400)
+        completeness = (
+            min(Decimal("1"), Decimal(actual_coverage) / requested_seconds)
+            if requested_seconds > 0
+            else Decimal("0")
+        )
+        record = {
+            "strategy_version_id": strategy["strategy_version_id"],
+            "candidate_id": candidate_id,
+            "research_trial_id": trial_id,
+            "evidence_window_id": window_id,
+            "available_from": available_from.isoformat(),
+            "available_through": available_through.isoformat(),
+            "requested_days": days,
+            "actual_coverage_seconds": actual_coverage,
+            "observation_completeness": str(completeness),
+            "source_class": persisted_source,
+            "requested_source_class": requested_source,
+            "requested_source_type": requested_source,
+            "dataset_selector": source_binding,
+            "paper_sizing_assumptions": {
+                "currency": "USD",
+                "allocated_capital": str(sizing),
+                "sizing_model": "fixed",
+            },
+            "paper_fee_assumptions": {"fee_rate": str(fee_rate), "fee_bps": "10"},
+            "paper_slippage_assumptions": {
+                "slippage_rate": str(slippage_rate),
+                "slippage_bps": "5",
+            },
+            "allocated_capital_net_return": str(net_return),
+            "realized_pnl": str(realized_pnl),
+            "unrealized_pnl": str(unrealized_pnl),
+            "fees": str(fees),
+            "costs": str(costs),
+            "drawdown": str(max(path_drawdowns, default=Decimal("0"))),
+            "completed_outcomes": completed,
+            "reliability": str(reliability),
+            "execution_feasibility": "TRUE",
+            "evidence_digest": "",
+            "overlap_key": overlap_key,
+            "market_path_count": len(path_rates),
+            "market_path_keys": sorted(path_price_rows),
+            "paper_only": True,
+            "rolling_research": True,
+            # The stream's immutable end is the measurement anchor.  Using
+            # ``now`` here would make a retry of the same window conflict.
+            "measured_at": available_through.isoformat(),
+        }
+        record["evidence_digest"] = RollingEvidence.from_mapping(record).evidence_digest
+        return record
+
+    def refresh_rolling_evidence(self, now: datetime | None = None) -> Mapping[str, Any]:
+        """Materialize bounded, source-separated rolling evidence and schedule retries."""
+        current = ensure_utc(now or self.clock())
+        documents = self._rolling_strategy_documents()
+        strategies = self._rolling_persist_strategy_lineage(documents, current)
+        sources = ("HISTORICAL", "REPLAY", "PAPER", "LIVE")
+        queue_payload = _rolling_hermes_payload(strategies, sources, current)
+        queue_item = self.bus.submit_review_request(
+            queue_payload,
+            dedupe_key="rolling-research:" + _rolling_hash(queue_payload),
+            available_at=current,
+        )
+        evidence_rows: list[dict[str, Any]] = []
+        pending: list[dict[str, Any]] = []
+        saver = getattr(self.store, "save_strategy_evidence_window", None)
+        source_cache: dict[str, list[dict[str, Any]]] = {}
+        source_cache_errors: dict[str, str] = {}
+        total_rows = 0
+
+        def add_pending(item: Mapping[str, Any]) -> None:
+            if len(pending) < _MAX_ROLLING_QUEUE_RESULTS:
+                pending.append(dict(item))
+
+        for strategy in strategies:
+            source_payload = dict(strategy)
+            source_payload["payload"] = {
+                **dict(strategy.get("provenance") or {}),
+                "strategy_document": strategy.get("strategy_document"),
+            }
+            for source in sources:
+                canonical_source = _rolling_source_name(source)
+                try:
+                    binding = _rolling_source_binding(source_payload)
+                    cache_key = _rolling_hash(
+                        {
+                            "source_class": canonical_source,
+                            "dataset_selector": binding,
+                            "strategy_hash": (
+                                str(strategy.get("strategy_hash", ""))
+                                if canonical_source == "PAPER"
+                                else None
+                            ),
+                        }
+                    )
+                except (TypeError, ValueError) as exc:
+                    add_pending(
+                        {
+                            "strategy_version_id": strategy["strategy_version_id"],
+                            "research_trial_id": strategy["research_trial_id"],
+                            "candidate_id": strategy.get("candidate_id"),
+                            "source_class": canonical_source,
+                            "requested_days": [7, 30],
+                            "status": "ERROR",
+                            "reason": "SOURCE_SELECTOR_INVALID",
+                            "error_type": type(exc).__name__,
+                            "error": str(exc)[:256],
+                        }
+                    )
+                    continue
+                rows: list[dict[str, Any]]
+                if cache_key in source_cache_errors:
+                    add_pending(
+                        {
+                            "strategy_version_id": strategy["strategy_version_id"],
+                            "research_trial_id": strategy["research_trial_id"],
+                            "candidate_id": strategy.get("candidate_id"),
+                            "source_class": canonical_source,
+                            "requested_days": [7, 30],
+                            "status": "ERROR",
+                            "reason": "SOURCE_LOAD_FAILED",
+                            "error": source_cache_errors[cache_key],
+                        }
+                    )
+                    continue
+                if cache_key not in source_cache:
+                    try:
+                        source_cache[cache_key] = self._rolling_source_rows(
+                            source_payload, canonical_source, current
+                        )
+                    except (TypeError, ValueError) as exc:
+                        source_cache_errors[cache_key] = (
+                            f"{type(exc).__name__}: {str(exc)[:256]}"
+                        )
+                        add_pending(
+                            {
+                                "strategy_version_id": strategy["strategy_version_id"],
+                                "research_trial_id": strategy["research_trial_id"],
+                                "candidate_id": strategy.get("candidate_id"),
+                                "source_class": canonical_source,
+                                "requested_days": [7, 30],
+                                "status": "ERROR",
+                                "reason": "SOURCE_LOAD_FAILED",
+                                "error": source_cache_errors[cache_key],
+                            }
+                        )
+                        continue
+                rows = source_cache[cache_key]
+                remaining = max(0, _MAX_ROLLING_TOTAL_ROWS - total_rows)
+                bounded_rows = list(rows[:remaining])
+                total_rows += len(bounded_rows)
+                for days in (7, 30):
+                    evidence = self._rolling_evidence_record(
+                        strategy, bounded_rows, canonical_source, days, current
+                    )
+                    if evidence is None:
+                        add_pending(
+                            {
+                                "strategy_version_id": strategy["strategy_version_id"],
+                                "research_trial_id": strategy["research_trial_id"],
+                                "candidate_id": strategy.get("candidate_id"),
+                                "source_class": canonical_source,
+                                "requested_days": days,
+                                "status": "SCHEDULED",
+                                "reason": (
+                                    "HISTORICAL_DATASET_EMPTY"
+                                    if canonical_source == "HISTORICAL"
+                                    else "INSUFFICIENT_EVIDENCE"
+                                ),
+                            }
+                        )
+                        continue
+                    if not callable(saver):
+                        add_pending(
+                            {
+                                "strategy_version_id": strategy["strategy_version_id"],
+                                "research_trial_id": strategy["research_trial_id"],
+                                "candidate_id": strategy.get("candidate_id"),
+                                "source_class": canonical_source,
+                                "requested_days": days,
+                                "status": "ERROR",
+                                "reason": "EVIDENCE_PERSISTENCE_UNAVAILABLE",
+                            }
+                        )
+                        continue
+                    try:
+                        saver(evidence)
+                    except (TypeError, ValueError) as exc:
+                        add_pending(
+                            {
+                                "strategy_version_id": strategy["strategy_version_id"],
+                                "research_trial_id": strategy["research_trial_id"],
+                                "candidate_id": strategy.get("candidate_id"),
+                                "source_class": canonical_source,
+                                "requested_days": days,
+                                "status": "ERROR",
+                                "reason": "EVIDENCE_PERSISTENCE_FAILED",
+                                "error_type": type(exc).__name__,
+                                "error": str(exc)[:256],
+                            }
+                        )
+                        continue
+                    evidence_rows.append(evidence)
+                if total_rows >= _MAX_ROLLING_TOTAL_ROWS:
+                    break
+            if total_rows >= _MAX_ROLLING_TOTAL_ROWS:
+                break
+        if not strategies:
+            pending.append({
+                "strategy_version_id": None,
+                "source_class": "ALL",
+                "requested_days": [7, 30],
+                "status": "SCHEDULED",
+                "reason": "NO_STRATEGY_DEFINITIONS",
+            })
+        state = _rolling_state_payload(
+            status="SCHEDULED" if pending else "READY",
+            scheduled_at=current.isoformat(),
+            queue_item_id=queue_item.item_id,
+            queue_status=queue_item.status.value,
+            strategies=strategies,
+            evidence_rows=evidence_rows,
+            pending=pending,
+            source_classes=sources,
+            requested_window_days=(7, 30),
+            source_rows_total=total_rows,
+        )
+        setter = getattr(self.store, "set_operator_job", None)
+        if callable(setter):
+            setter("rolling-research-evidence", "SCHEDULED" if pending else "COMPLETED", state, resumable=True)
+        return state
+
+    def _rolling_risk_binding(self, policy: RollingAdmissionPolicy) -> dict[str, Any]:
+        active_loader = getattr(self.store, "load_canary_setting_config", None)
+        if callable(active_loader):
+            try:
+                active = active_loader(state="ACTIVE")
+            except TypeError:
+                try:
+                    active = active_loader()
+                except Exception:
+                    active = None
+            except Exception:
+                active = None
+            if isinstance(active, Mapping):
+                values = active.get("values", active.get("settings", {}))
+                values = values if isinstance(values, Mapping) else {}
+                identifier = str(active.get("config_id", "")).strip()
+                generation = int(active.get("generation", 0) or 0)
+                digest = str(active.get("config_hash", "")).strip()
+                if identifier and generation > 0 and digest:
+                    budget = values.get("global_budget", values.get("max_notional", values.get("budget", policy.global_budget)))
+                    return {
+                        "risk_config_id": identifier,
+                        "risk_config_generation": generation,
+                        "risk_config_hash": digest,
+                        "global_budget": str(budget),
+                    }
+        for name in ("load_active_risk_config", "active_risk_config", "get_active_risk_config"):
+            loader = getattr(self.store, name, None)
+            if callable(loader):
+                try:
+                    value = loader()
+                except Exception:
+                    value = None
+                if isinstance(value, Mapping):
+                    identifier = str(value.get("risk_config_id", value.get("config_id", ""))).strip()
+                    if identifier:
+                        generation = int(value.get("risk_config_generation", value.get("generation", 0)) or 0)
+                        digest = str(value.get("risk_config_hash", value.get("config_hash", ""))).strip() or _rolling_hash(value)
+                        budget = value.get("global_budget", value.get("budget", policy.global_budget))
+                        return {
+                            "risk_config_id": identifier,
+                            "risk_config_generation": generation,
+                            "risk_config_hash": digest,
+                            "global_budget": str(budget),
+                        }
+        return {
+            "risk_config_id": "rolling-risk-default",
+            "risk_config_generation": 0,
+            "risk_config_hash": _rolling_hash({"risk_config_id": "rolling-risk-default", "global_budget": str(policy.global_budget)}),
+            "global_budget": str(policy.global_budget),
+        }
+
+    def _rolling_policy(self) -> RollingAdmissionPolicy:
+        default = default_rolling_admission_policy()
+        active_payload = None
+        config_loader = getattr(self.store, "get_operator_config", None)
+        if callable(config_loader):
+            try:
+                configured = config_loader("rolling_admission_policy_active", None)
+            except TypeError:
+                configured = config_loader("rolling_admission_policy_active")
+            except Exception:
+                configured = None
+            if isinstance(configured, Mapping) and any(
+                key in configured for key in ("policy_id", "version", "policy_version", "config_hash")
+            ):
+                active_payload = configured
+        if active_payload is None:
+            job_loader = getattr(self.store, "get_operator_job", None)
+            active_record = job_loader("rolling_admission_policy_active") if callable(job_loader) else None
+            active_payload = active_record.get("payload") if isinstance(active_record, Mapping) else None
+            if (
+                not isinstance(active_payload, Mapping)
+                and isinstance(active_record, Mapping)
+                and any(key in active_record for key in ("policy_id", "version", "policy_version", "config_hash"))
+            ):
+                active_payload = active_record
+        if isinstance(active_payload, Mapping) and isinstance(active_payload.get("policy"), Mapping):
+            active_payload = active_payload["policy"]
+        if active_payload is not None:
+            if not isinstance(active_payload, Mapping):
+                raise ValueError("active rolling admission policy payload is invalid")
+            policy_id = str(active_payload.get("policy_id", "")).strip()
+            version = str(active_payload.get("version", active_payload.get("policy_version", ""))).strip()
+            expected_hash = str(active_payload.get("config_hash", "")).strip()
+            if not policy_id or not version or not expected_hash:
+                raise ValueError("active rolling admission policy identity is incomplete")
+            loader = getattr(self.store, "load_admission_policy", None)
+            if not callable(loader):
+                raise ValueError("active rolling admission policy loader is unavailable")
+            stored = loader(policy_id, version)
+            if not isinstance(stored, Mapping):
+                raise ValueError("active rolling admission policy is missing")
+            policy = RollingAdmissionPolicy.from_mapping(stored)
+            if policy.policy_id != policy_id or policy.version != version or str(policy.config_hash) != expected_hash:
+                raise ValueError("active rolling admission policy identity mismatch")
+            return policy
+        loader = getattr(self.store, "load_admission_policy", None)
+        if callable(loader):
+            stored = loader(default.policy_id, default.version)
+            if isinstance(stored, Mapping):
+                return RollingAdmissionPolicy.from_mapping(stored)
+        saver = getattr(self.store, "save_admission_policy", None)
+        if callable(saver):
+            saver(default.as_dict())
+        return default
+
+    def review_rolling_portfolio(self, now: datetime | None = None, force: bool = False) -> Mapping[str, Any]:
+        """Review only persisted rolling evidence and commit an append-only selection."""
+        current = ensure_utc(now or self.clock())
+        refreshed = self.refresh_rolling_evidence(current)
+        policy = self._rolling_policy()
+        previous = self.active_portfolio_selection()
+        review_state_loader = getattr(self.store, "load_portfolio_review_state", None)
+        prior_state = review_state_loader() if callable(review_state_loader) else None
+        due = _rolling_timestamp(prior_state.get("review_due_at")) if isinstance(prior_state, Mapping) else None
+        if not force and due is not None and current < due and previous is not None:
+            return self.rolling_portfolio_state()
+        lister = getattr(self.store, "list_strategy_evidence_windows", None)
+        if callable(lister):
+            try:
+                evidence_rows = lister(limit=10_000)
+            except TypeError:
+                try:
+                    evidence_rows = lister()
+                except Exception:
+                    evidence_rows = ()
+            except Exception:
+                evidence_rows = ()
+        else:
+            evidence_rows = ()
+        evidence_rows = tuple(
+            row
+            for row in (evidence_rows or ())
+            if isinstance(row, Mapping)
+            and _rolling_document_is_marked(
+                row,
+                row.get("provenance") if isinstance(row.get("provenance"), Mapping) else None,
+            )
+            and not _rolling_campaign_bound(row)
+        )
+        risk = self._rolling_risk_binding(policy)
+        # Selection history is immutable lineage, not live capital.  Real
+        # obligations are enforced by storage reservations/commit fences; do not
+        # subtract every historical allocation on each rotation.
+        active_obligations = Decimal("0")
+        risk["active_obligations"] = str(active_obligations)
+        available_budget = max(Decimal("0"), _rolling_number(risk.get("global_budget")))
+        risk["available_budget"] = str(available_budget)
+        effective_policy = replace(policy, global_budget=available_budget, config_hash=policy.config_hash)
+        decision = evaluate_rolling_selection(effective_policy, evidence_rows, previous, current)
+        prior_event_history = (
+            list(prior_state.get("event_history", []))
+            if isinstance(prior_state, Mapping) and isinstance(prior_state.get("event_history"), list)
+            else []
+        )
+        event_history = (
+            prior_event_history
+            + [{"at": current.isoformat(), "status": decision.status, "reasons": list(decision.reasons)}]
+        )[-128:]
+        members = [
+            member.as_dict()
+            for member in decision.members
+            if member.candidate_id and member.research_trial_id
+        ]
+        # Removed members are not funded selection rows, but their immutable
+        # identities must remain in the committed payload until the runtime
+        # observes and completes the corresponding exit obligation.
+        removed_members: list[dict[str, Any]] = []
+        removed_ids: set[str] = set()
+
+        def preserve_removed(raw: Any) -> None:
+            if len(removed_members) >= _MAX_ROLLING_EXIT_LINEAGE or not isinstance(raw, Mapping):
+                return
+            strategy_id = str(raw.get("strategy_version_id", "")).strip()
+            if not strategy_id or strategy_id in removed_ids:
+                return
+            item = dict(raw)
+            item["status"] = "PAUSED"
+            item["action"] = "REDUCE"
+            item["allocation"] = "0"
+            removed_members.append(item)
+            removed_ids.add(strategy_id)
+
+        for member in decision.removed_members:
+            preserve_removed(member.as_dict())
+        if isinstance(previous, Mapping):
+            prior_removed = previous.get("removed_members", ())
+            if isinstance(prior_removed, (list, tuple)):
+                for raw in prior_removed:
+                    preserve_removed(raw)
+            prior_members = previous.get("members", previous.get("selected_members", ()))
+            if isinstance(prior_members, (list, tuple)):
+                for raw in prior_members:
+                    if isinstance(raw, Mapping) and (
+                        str(raw.get("status", "")).strip().upper() in {"REMOVED", "PAUSED"}
+                        or str(raw.get("action", "")).strip().upper() == "REDUCE"
+                    ):
+                        preserve_removed(raw)
+        selection_id = "rolling-selection-" + _rolling_hash({
+            "policy": policy.config_hash,
+            "risk": risk,
+            "at": current,
+            "members": members,
+            "removed_members": removed_members,
+            "status": decision.status,
+        }).removeprefix("sha256:")[:40]
+        selection = {
+            "portfolio_selection_id": selection_id,
+            "selection_id": selection_id,
+            "policy_id": policy.policy_id,
+            "policy_version": policy.version,
+            "risk_config_id": risk["risk_config_id"],
+            "active_risk_config_id": risk["risk_config_id"],
+            "risk_config_generation": risk["risk_config_generation"],
+            "active_risk_config_generation": risk["risk_config_generation"],
+            "risk_config_hash": risk["risk_config_hash"],
+            "active_risk_config_hash": risk["risk_config_hash"],
+            "global_budget": risk["global_budget"],
+            "selected_at": current.isoformat(),
+            "review_due_at": decision.review_due_at.isoformat() if decision.review_due_at else current.isoformat(),
+            "status": decision.status,
+            "reasons": list(decision.reasons),
+            "score_formula": decision.score_formula,
+            "formula_version": decision.formula_version,
+            "policy_config": decision.policy_config,
+            "removed_members": removed_members,
+            "removed_member_evidence_history": dict(decision.removed_member_evidence_history),
+            "last_membership_change_at": (
+                decision.last_membership_change_at.isoformat()
+                if decision.last_membership_change_at is not None
+                else None
+            ),
+            "paper_only": True,
+        }
+        members = [
+            {
+                **member,
+                "portfolio_selection_id": selection_id,
+                "admission_policy_id": policy.policy_id,
+                "admission_policy_version": policy.version,
+                "risk_config_id": risk["risk_config_id"],
+                "risk_config_generation": risk["risk_config_generation"],
+                "risk_config_hash": risk["risk_config_hash"],
+            }
+            for member in members
+        ]
+        committer = getattr(self.store, "commit_portfolio_selection", None)
+        committed = None
+        if callable(committer):
+            committed = committer(selection, members)
+        committed_selection = (
+            dict(committed)
+            if isinstance(committed, Mapping)
+            else {**selection, "members": members}
+        )
+        committed_selection.setdefault(
+            "last_membership_change_at",
+            selection["last_membership_change_at"],
+        )
+        committed_selection.setdefault("removed_members", removed_members)
+        state = {
+            "status": decision.status,
+            "controller_status": "SCHEDULED" if refreshed.get("pending") else "READY",
+            "portfolio_selection_id": selection_id,
+            "selection": committed_selection,
+            "event_history": event_history,
+            "removed_member_evidence_history": dict(decision.removed_member_evidence_history),
+            "last_membership_change_at": selection["last_membership_change_at"],
+            "k": len(members),
+            "actual": len(members),
+            "actionable": sum(
+                1
+                for member in members
+                if str(member.get("status", "")).upper() in {"ACTIVE", "PAPER", "REDUCE"}
+                and _rolling_number(member.get("allocation")) > 0
+            ),
+            "policy": policy.as_dict(),
+            "risk_binding": risk,
+            "reasons": list(decision.reasons),
+            "pending": refreshed.get("pending", []),
+            "cold_start_requirements": refreshed.get("pending", []),
+            "paper_only": True,
+        }
+        state_saver = getattr(self.store, "save_portfolio_review_state", None)
+        if callable(state_saver):
+            state_saver({
+                "portfolio_selection_id": selection_id,
+                "review_due_at": selection["review_due_at"],
+                "reviewed_at": current.isoformat(),
+                "status": decision.status,
+                "event_history": event_history,
+                "removed_member_evidence_history": dict(decision.removed_member_evidence_history),
+                "last_membership_change_at": selection["last_membership_change_at"],
+                "pending": refreshed.get("pending", []),
+                "updated_at": current.isoformat(),
+            })
+        return state
+
+    def rolling_portfolio_state(self) -> Mapping[str, Any]:
+        current = self.active_portfolio_selection()
+        review_loader = getattr(self.store, "load_portfolio_review_state", None)
+        review = review_loader() if callable(review_loader) else None
+        policy = self._rolling_policy()
+        risk = self._rolling_risk_binding(policy)
+        members = list(current.get("members", ())) if isinstance(current, Mapping) else []
+        pending = review.get("pending", []) if isinstance(review, Mapping) else []
+        return {
+            "controller_status": str(review.get("status", "COLD_START") if isinstance(review, Mapping) else "COLD_START"),
+            "portfolio_selection_id": current.get("portfolio_selection_id") if isinstance(current, Mapping) else None,
+            "last_membership_change_at": (
+                (
+                    current.get("last_membership_change_at")
+                    if isinstance(current, Mapping)
+                    else None
+                )
+                or (
+                    review.get("last_membership_change_at")
+                    if isinstance(review, Mapping)
+                    else None
+                )
+            ),
+            "k": int(current.get("k", len(members))) if isinstance(current, Mapping) else 0,
+            "actual": len(members),
+            "actionable": sum(
+                1
+                for member in members
+                if str(member.get("status", "")).upper() in {"ACTIVE", "PAPER", "REDUCE"}
+                and _rolling_number(member.get("allocation")) > 0
+            ),
+            "policy": policy.as_dict(),
+            "risk_binding": risk,
+            "active_rows": members,
+            "global_limits_usage": {
+                "global_budget": risk["global_budget"],
+                "allocated": str(sum((_rolling_number(member.get("allocation")) for member in members), Decimal("0"))),
+                "active_obligations": risk.get("active_obligations", "0"),
+                "available_budget": risk.get("available_budget", risk["global_budget"]),
+            },
+            "event_history": review.get("event_history", []) if isinstance(review, Mapping) else [],
+            "removed_member_evidence_history": review.get("removed_member_evidence_history", {}) if isinstance(review, Mapping) else {},
+            "next_jobs": [{"job_name": "rolling-research-evidence", "status": "SCHEDULED" if pending else "COMPLETED"}],
+            "cold_start_requirements": pending,
+            "paper_only": True,
+        }
+
+    def active_portfolio_selection(self) -> Mapping[str, Any] | None:
+        loader = getattr(self.store, "load_current_portfolio_selection", None)
+        if not callable(loader):
+            return None
+        try:
+            value = loader()
+        except Exception:
+            return None
+        return dict(value) if isinstance(value, Mapping) else None
+
     @staticmethod
     def campaign_job_name(campaign_id: str) -> str:
         value = str(campaign_id).strip()
@@ -6920,6 +8934,8 @@ class AutonomousResearchProcessor:
             }
             forward_config["exit_policy"] = dict(plan.exit_policy)
             forward_config["research_mode"] = plan.research_mode
+            if plan.market_type is not MarketType.CRYPTO_SPOT:
+                forward_config = _canonical_forward_config(forward_config)
             config_hash = _hash_document({"config": forward_config, "risk_limits": risk_snapshot})
             strategy_hash = _content_hash(strategy.to_dict())
             model_hash = _content_hash(model_document)

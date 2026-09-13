@@ -241,6 +241,95 @@ ONE = Decimal("1")
 DUST = Decimal("0.00000001")
 _MAX_ENTRY_RECONCILIATION = 100
 _MAX_ACTIVE_ENTRY_RECONCILIATION = 80
+_POSITION_LINEAGE_FIELDS = (
+    "strategy_version_id",
+    "research_trial_id",
+    "portfolio_selection_id",
+    "admission_policy_id",
+    "admission_policy_version",
+    "risk_config_id",
+    "risk_config_generation",
+    "risk_config_hash",
+)
+_LEGACY_LINEAGE_TYPE = "LEGACY_FINITE_CAMPAIGN"
+_ROLLING_LINEAGE_TYPE = "ROLLING_PORTFOLIO"
+
+def _lineage_from_row(row: Mapping[str, Any]) -> dict[str, Any]:
+    """Return only lineage explicitly established by a rolling opening."""
+    raw_type = (
+        row["lineage_type"]
+        if "lineage_type" in row.keys()
+        else _LEGACY_LINEAGE_TYPE
+    )
+    lineage_type = str(raw_type or _LEGACY_LINEAGE_TYPE).strip().upper()
+    if lineage_type != _ROLLING_LINEAGE_TYPE:
+        return {
+            "lineage_type": _LEGACY_LINEAGE_TYPE,
+            **{name: None for name in _POSITION_LINEAGE_FIELDS},
+        }
+    result = {
+        name: row[name] if name in row.keys() else None
+        for name in _POSITION_LINEAGE_FIELDS
+    }
+    result["lineage_type"] = _ROLLING_LINEAGE_TYPE
+    if result["risk_config_generation"] is not None:
+        result["risk_config_generation"] = int(result["risk_config_generation"])
+    return result
+
+
+def _opening_lot_lineage(service: CanaryService, lot: Mapping[str, Any]) -> dict[str, Any]:
+    """Return immutable lot lineage, including its opening allocation."""
+    lineage = _lineage_from_row(lot)
+    rolling = lineage["lineage_type"] == _ROLLING_LINEAGE_TYPE
+    candidate_id = str(lot.get("candidate_id") or "").strip()
+    lineage["candidate_id"] = (candidate_id or None) if rolling else None
+    if not rolling:
+        lineage["allocation"] = None
+        return lineage
+    allocation = lot.get("allocation")
+    if allocation in (None, ""):
+        opening_reservation_id = str(lot.get("reservation_id") or "").strip()
+        if opening_reservation_id:
+            with service.store._lock:
+                try:
+                    row = _connection(service).execute(
+                        "SELECT allocation FROM canary_risk_reservations "
+                        "WHERE reservation_id=? AND UPPER(side)='BUY'",
+                        (opening_reservation_id,),
+                    ).fetchone()
+                except sqlite3.OperationalError:
+                    row = None
+            if row is not None:
+                allocation = row["allocation"]
+    lineage["allocation"] = allocation
+    return lineage
+
+
+def _entry_lineage(
+    service: CanaryService,
+    row: Mapping[str, Any],
+    reservation_id: str,
+) -> dict[str, Any]:
+    """Return the exact persisted BUY lineage for risk-fill writes."""
+    lineage = _lineage_from_row(row)
+    rolling = lineage["lineage_type"] == _ROLLING_LINEAGE_TYPE
+    candidate_id = str(row.get("candidate_id") or "").strip()
+    lineage["candidate_id"] = (candidate_id or None) if rolling else None
+    lineage["allocation"] = row.get("allocation") if rolling else None
+    if rolling and lineage["allocation"] in (None, ""):
+        with service.store._lock:
+            try:
+                reservation = _connection(service).execute(
+                    "SELECT allocation FROM canary_risk_reservations "
+                    "WHERE reservation_id=?",
+                    (str(reservation_id),),
+                ).fetchone()
+            except sqlite3.OperationalError:
+                reservation = None
+        if reservation is not None:
+            lineage["allocation"] = reservation["allocation"]
+    return lineage
+
 
 _PENDING = frozenset({
     "PREPARED", "SUBMITTING", "SUBMITTED", "ACCEPTED", "ACKNOWLEDGED",
@@ -762,6 +851,15 @@ def _ensure_schema(service: CanaryService) -> None:
               model_hash TEXT,
               config_id TEXT,
               config_generation INTEGER,
+              strategy_version_id TEXT,
+              research_trial_id TEXT,
+              portfolio_selection_id TEXT,
+              admission_policy_id TEXT,
+              admission_policy_version TEXT,
+              risk_config_id TEXT,
+              risk_config_generation INTEGER,
+              risk_config_hash TEXT,
+              lineage_type TEXT NOT NULL DEFAULT 'LEGACY_FINITE_CAMPAIGN',
               exit_policy_json TEXT NOT NULL DEFAULT '{}',
               quantity TEXT NOT NULL DEFAULT '0',
               sold_quantity TEXT NOT NULL DEFAULT '0',
@@ -788,6 +886,15 @@ def _ensure_schema(service: CanaryService) -> None:
               asset_id TEXT,
               market_version TEXT,
               side TEXT NOT NULL,
+              strategy_version_id TEXT,
+              research_trial_id TEXT,
+              portfolio_selection_id TEXT,
+              admission_policy_id TEXT,
+              admission_policy_version TEXT,
+              risk_config_id TEXT,
+              risk_config_generation INTEGER,
+              risk_config_hash TEXT,
+              lineage_type TEXT NOT NULL DEFAULT 'LEGACY_FINITE_CAMPAIGN',
               order_id TEXT,
               requested_quantity TEXT NOT NULL,
               requested_price TEXT,
@@ -823,6 +930,15 @@ def _ensure_schema(service: CanaryService) -> None:
               fee TEXT NOT NULL DEFAULT '0',
               status TEXT NOT NULL,
               filled_at TEXT NOT NULL,
+              strategy_version_id TEXT,
+              research_trial_id TEXT,
+              portfolio_selection_id TEXT,
+              admission_policy_id TEXT,
+              admission_policy_version TEXT,
+              risk_config_id TEXT,
+              risk_config_generation INTEGER,
+              risk_config_hash TEXT,
+              lineage_type TEXT NOT NULL DEFAULT 'LEGACY_FINITE_CAMPAIGN',
               detail_json TEXT NOT NULL DEFAULT '{}'
             );
             CREATE INDEX IF NOT EXISTS idx_canary_position_fills_request
@@ -846,6 +962,40 @@ def _ensure_schema(service: CanaryService) -> None:
                 connection.execute(
                     f"ALTER TABLE canary_position_lots ADD COLUMN {name} TEXT"
                 )
+        lineage_fields = (
+            "strategy_version_id",
+            "research_trial_id",
+            "portfolio_selection_id",
+            "admission_policy_id",
+            "admission_policy_version",
+            "risk_config_id",
+            "risk_config_generation",
+            "risk_config_hash",
+        )
+        for table in (
+            "canary_position_lots",
+            "canary_position_requests",
+            "canary_position_fills",
+        ):
+            table_columns = {
+                str(row["name"])
+                for row in connection.execute(f"PRAGMA table_info({table})")
+            }
+            for name in lineage_fields:
+                if name not in table_columns:
+                    declaration = "INTEGER" if name == "risk_config_generation" else "TEXT"
+                    connection.execute(
+                        f"ALTER TABLE {table} ADD COLUMN {name} {declaration}"
+                    )
+            if "lineage_type" not in table_columns:
+                connection.execute(
+                    f"ALTER TABLE {table} ADD COLUMN lineage_type TEXT "
+                    "NOT NULL DEFAULT 'LEGACY_FINITE_CAMPAIGN'"
+                )
+            connection.execute(
+                f"UPDATE {table} SET lineage_type='LEGACY_FINITE_CAMPAIGN' "
+                "WHERE lineage_type IS NULL OR TRIM(lineage_type)=''"
+            )
         request_columns = {
             str(row["name"])
             for row in connection.execute(
@@ -1009,8 +1159,36 @@ def _extract_book_price(context: Mapping[str, Any], *, side: str) -> Decimal:
     if direct_rows:
         return max(direct_rows) if side == "SELL" else min(direct_rows)
     raise CanaryBlocked("CANARY_EXIT_PRICE_UNAVAILABLE")
-
-
+def _required_market_decimal(
+    context: Mapping[str, Any],
+    names: Sequence[str],
+    *,
+    reason: str,
+) -> Decimal:
+    raw: Any = None
+    found = False
+    sources: list[Mapping[str, Any]] = [context]
+    for name in ("market_rules", "rules", "order_book", "book"):
+        nested = context.get(name)
+        if isinstance(nested, Mapping):
+            sources.append(nested)
+    for source in sources:
+        for name in names:
+            if name in source and source.get(name) not in (None, ""):
+                raw = source.get(name)
+                found = True
+                break
+        if found:
+            break
+    if not found:
+        raise CanaryBlocked(reason)
+    try:
+        value = Decimal(str(raw))
+    except (TypeError, ValueError, ArithmeticError) as exc:
+        raise CanaryBlocked(reason) from exc
+    if not value.is_finite() or value <= ZERO:
+        raise CanaryBlocked(reason)
+    return value
 def _mark_fee(context: Mapping[str, Any], *, quantity: Decimal, price: Decimal) -> Decimal:
     """Derive an explicit fee for a current-book equity mark."""
     raw_fee = _value(context, "mark_fee", "fee", "fee_amount", default=None)
@@ -1045,7 +1223,7 @@ def _mark_owned_equity(
     identity.  Missing price or fee evidence is reported as UNKNOWN rather
     than being converted into a zero-valued mark.
     """
-    record_mark = getattr(service.store, "record_canary_equity_mark", None)
+    record_mark = getattr(service, "_record_canary_equity_mark", None)
     if not callable(record_mark):
         return {
             "status": "UNKNOWN",
@@ -1065,20 +1243,15 @@ def _mark_owned_equity(
     blocked: list[dict[str, Any]] = []
     assessment_config_id: str | None = None
     assessment_config_generation: int | None = None
-    settings = getattr(service, "settings", None)
-    if settings is not None:
-        try:
-            snapshot = settings.snapshot(now=now)
-        except Exception:
-            snapshot = {}
-        if isinstance(snapshot, Mapping):
-            assessment_config_id = str(snapshot.get("config_id") or "").strip() or None
-            raw_generation = snapshot.get("generation")
-            if raw_generation is not None:
-                try:
-                    assessment_config_generation = int(raw_generation)
-                except (TypeError, ValueError, OverflowError):
-                    assessment_config_generation = None
+    assessment_config_hash: str | None = None
+    try:
+        (
+            assessment_config_id,
+            assessment_config_generation,
+            assessment_config_hash,
+        ) = service._settings_identity()
+    except CanaryBlocked:
+        pass
     for lot in lots:
         position_id = str(lot.get("position_id") or "").strip()
         total_quantity = max(ZERO, _decimal(lot.get("quantity"), ZERO))
@@ -1093,8 +1266,8 @@ def _mark_owned_equity(
                 "position_id": position_id or None,
                 "reason": "CANARY_EQUITY_IDENTITY_UNAVAILABLE",
             })
-            continue
         try:
+            lot_lineage = _opening_lot_lineage(service, lot)
             context = _call(
                 _method(venue, "market_context"),
                 market_id=market_id,
@@ -1154,13 +1327,21 @@ def _mark_owned_equity(
                 cost_basis_usd=cost_basis,
                 mark_fee=mark_fee,
                 source="POLYMARKET_ORDER_BOOK",
-                config_id=config_id,
-                config_generation=config_generation,
+                config_id=assessment_config_id,
+                config_generation=assessment_config_generation,
+                config_hash=assessment_config_hash,
                 control_generation=control_generation,
+                position_id=position_id,
+                lineage=lot_lineage,
                 detail={
                     "position_id": position_id,
                     "venue": str(lot.get("venue") or "POLYMARKET"),
                     "quantity_source": "CANARY_POSITION_LOT",
+                    **{
+                        name: lot_lineage[name]
+                        for name in _POSITION_LINEAGE_FIELDS
+                    },
+                    "lineage_type": lot_lineage["lineage_type"],
                 },
             )
             marks.append({
@@ -2003,10 +2184,32 @@ def _sync_entry_lots(service: CanaryService, now: datetime) -> int:
             continue
         signal_id = str(row.get("signal_id") or "")
         with service.store._lock:
-            signal_row = connection.execute("SELECT strategy_hash,model_hash,config_hash FROM canary_signals WHERE signal_id=?", (signal_id,)).fetchone() if signal_id else None
+            signal_row = connection.execute(
+                "SELECT strategy_hash,model_hash,config_hash,"
+                "strategy_version_id,research_trial_id,portfolio_selection_id,"
+                "admission_policy_id,admission_policy_version,risk_config_id,"
+                "risk_config_generation,risk_config_hash,lineage_type "
+                "FROM canary_signals WHERE signal_id=?",
+                (signal_id,),
+            ).fetchone() if signal_id else None
+        lineage = _lineage_from_row(row)
         if signal_row is not None:
+            signal_lineage = _lineage_from_row(signal_row)
+            # A legacy BUY may point at a signal that later acquired rolling
+            # metadata.  That signal is not proof that the opening was
+            # rolling, so never promote the lot (or its risk fill) here.
+            if (
+                lineage["lineage_type"] == _ROLLING_LINEAGE_TYPE
+                and signal_lineage["lineage_type"] == _ROLLING_LINEAGE_TYPE
+            ):
+                for name in _POSITION_LINEAGE_FIELDS:
+                    if lineage.get(name) in (None, ""):
+                        lineage[name] = signal_lineage.get(name)
             evidence.setdefault("strategy_hash", signal_row["strategy_hash"])
             evidence.setdefault("model_hash", signal_row["model_hash"])
+            for name in _POSITION_LINEAGE_FIELDS:
+                if lineage.get(name) is not None:
+                    evidence.setdefault(name, lineage[name])
         lifecycle = service.store.load_candidate_lifecycle(str(row.get("candidate_id") or ""))
         lifecycle_payload = service._merged_lifecycle_payload(lifecycle) if isinstance(lifecycle, Mapping) else {}
         if isinstance(lifecycle_payload, Mapping):
@@ -2017,12 +2220,28 @@ def _sync_entry_lots(service: CanaryService, now: datetime) -> int:
         policy_status = "OPEN" if _valid_exit_policy(policy) else "MANAGEMENT_BLOCKED"
         candidate_id = str(row.get("candidate_id") or "")
         strategy_hash = str(evidence.get("strategy_hash") or "")
-        opened = _iso(row.get("timestamp"), now)
         with service.store._lock, connection:
-            existing = connection.execute("SELECT token_id,quantity,cost_basis,fees,status FROM canary_position_lots WHERE position_id=?", (position_id,)).fetchone()
+            existing = connection.execute(
+                "SELECT token_id,quantity,cost_basis,fees,status,"
+                "strategy_version_id,research_trial_id,portfolio_selection_id,"
+                "admission_policy_id,admission_policy_version,risk_config_id,"
+                "risk_config_generation,risk_config_hash,lineage_type "
+                "FROM canary_position_lots WHERE position_id=?",
+                (position_id,),
+            ).fetchone()
             if existing is not None:
                 existing_token = str(existing["token_id"] or "").strip()
                 if not existing_token or existing_token != str(row.get("token_id") or "").strip():
+                    continue
+                existing_lineage = _lineage_from_row(existing)
+                if (
+                    str(existing_lineage.get("lineage_type") or _LEGACY_LINEAGE_TYPE)
+                    == _ROLLING_LINEAGE_TYPE
+                    and any(
+                        existing_lineage.get(name) != lineage.get(name)
+                        for name in _POSITION_LINEAGE_FIELDS
+                    )
+                ):
                     continue
                 # Reconnect/reordered reads must never reduce owned inventory
                 # or rewrite a lot's immutable policy/version binding.  A
@@ -2055,13 +2274,17 @@ def _sync_entry_lots(service: CanaryService, now: datetime) -> int:
                     (str(next_quantity), str(next_cost), str(next_fees), next_status, _iso(now), position_id),
                 )
                 continue
+            opened = _iso(row.get("timestamp"), now)
             connection.execute(
                 "INSERT INTO canary_position_lots("
                 "position_id,reservation_id,event_id,venue,market_id,token_id,"
                 "asset_id,market_version,candidate_id,strategy_id,strategy_version,"
-                "strategy_hash,model_hash,config_id,config_generation,exit_policy_json,"
+                "strategy_hash,model_hash,config_id,config_generation,"
+                "strategy_version_id,research_trial_id,portfolio_selection_id,"
+                "admission_policy_id,admission_policy_version,risk_config_id,"
+                "risk_config_generation,risk_config_hash,lineage_type,exit_policy_json,"
                 "quantity,sold_quantity,cost_basis,fees,pending_exit_quantity,status,"
-                "opened_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "opened_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     position_id,
                     reservation_id,
@@ -2078,6 +2301,8 @@ def _sync_entry_lots(service: CanaryService, now: datetime) -> int:
                     evidence.get("model_hash"),
                     reservation_config_id,
                     reservation_config_generation,
+                    *(lineage.get(name) for name in _POSITION_LINEAGE_FIELDS),
+                    lineage.get("lineage_type") or _LEGACY_LINEAGE_TYPE,
                     _json(policy),
                     str(quantity),
                     "0",
@@ -2093,24 +2318,30 @@ def _sync_entry_lots(service: CanaryService, now: datetime) -> int:
     return created
 
 
-def _reconcile_entry_ledger(service: CanaryService, venue: Any, now: datetime) -> list[dict[str, Any]]:
+def _reconcile_entry_ledger(
+    service: CanaryService,
+    venue: Any,
+    now: datetime,
+    *,
+    target_event_id: str | None = None,
+) -> list[dict[str, Any]]:
     """Refresh pending BUY entries without posting or inventing aggregate fills."""
     connection = _connection(service)
+    target_key = str(target_event_id or "").strip()
     active_statuses = (
         "(UPPER(status) IN "
         "('ACCEPTED','SUBMITTED','SUBMITTING','ACKNOWLEDGED','LIVE','DELAYED',"
         "'UNKNOWN','PARTIAL','PARTIALLY_FILLED','MATCHED','FILLED','OPEN') "
         "OR (UPPER(status) IN ('CONFIRMED','TRADE_STATUS_CONFIRMED',"
         "'SETTLED','TRADE_STATUS_SETTLED') "
-        "AND COALESCE(settlement,'')='' "
-        "AND CAST(COALESCE(submitted_quantity,'0') AS NUMERIC) "
-        "> CAST(COALESCE(fill_quantity,'0') AS NUMERIC)) "
+        "AND COALESCE(settlement,'')='') "
         "OR COALESCE(settlement,'')='PENDING')"
     )
     eligible_entries = (
         "SELECT * FROM canary_ledger WHERE UPPER(side)='BUY' "
         "AND exchange_order_id IS NOT NULL "
-        "AND ("
+        + ("AND event_id=? " if target_key else "")
+        + "AND ("
         + active_statuses
         + " OR (UPPER(status) IN ('CANCELED','CANCELLED','EXPIRED','REJECTED','FAILED','ERROR') "
         "AND COALESCE(settlement,'')='')"
@@ -2126,17 +2357,18 @@ def _reconcile_entry_ledger(service: CanaryService, venue: Any, now: datetime) -
         known_entry_statuses = tuple(
             sorted(_KNOWN_ORDER_STATUSES | _OWNED_ENTRY_STATUSES)
         )
-        try:
-            connection.execute(
-                "UPDATE canary_ledger SET status='UNKNOWN' "
-                "WHERE UPPER(side)='BUY' AND exchange_order_id IS NOT NULL "
-                "AND UPPER(COALESCE(status,'')) NOT IN ("
-                + ",".join("?" for _ in known_entry_statuses)
-                + ")",
-                known_entry_statuses,
-            )
-        except sqlite3.OperationalError:
-            pass
+        if not target_key:
+            try:
+                connection.execute(
+                    "UPDATE canary_ledger SET status='UNKNOWN' "
+                    "WHERE UPPER(side)='BUY' AND exchange_order_id IS NOT NULL "
+                    "AND UPPER(COALESCE(status,'')) NOT IN ("
+                    + ",".join("?" for _ in known_entry_statuses)
+                    + ")",
+                    known_entry_statuses,
+                )
+            except sqlite3.OperationalError:
+                pass
         try:
             cursor = connection.execute(
                 "SELECT active_timestamp,active_event_id,"
@@ -2165,6 +2397,8 @@ def _reconcile_entry_ledger(service: CanaryService, venue: Any, now: datetime) -
             )
 
             def page(query: str, params: tuple[Any, ...]) -> list[dict[str, Any]]:
+                if target_key:
+                    params = (target_key, *params)
                 return [dict(row) for row in connection.execute(query, params).fetchall()]
 
             if active_cursor_timestamp:
@@ -2511,6 +2745,11 @@ def _reconcile_entry_ledger(service: CanaryService, venue: Any, now: datetime) -
                     and str(global_fill["reservation_id"]) != risk_reservation_id
                 ):
                     raise CanaryBlocked("CANARY_TRADE_ID_CONFLICT")
+            entry_lineage = _entry_lineage(
+                service,
+                row,
+                risk_reservation_id,
+            )
             for (
                 _trade,
                 fill_id,
@@ -2543,14 +2782,31 @@ def _reconcile_entry_ledger(service: CanaryService, venue: Any, now: datetime) -
                     cost=fill_quantity * fill_price + fill_fee,
                     fee=fill_fee,
                     filled_at=matched_at,
+                    strategy_version_id=entry_lineage["strategy_version_id"],
+                    research_trial_id=entry_lineage["research_trial_id"],
+                    candidate_id=entry_lineage.get("candidate_id"),
+                    portfolio_selection_id=entry_lineage["portfolio_selection_id"],
+                    admission_policy_id=entry_lineage["admission_policy_id"],
+                    admission_policy_version=entry_lineage["admission_policy_version"],
+                    risk_config_id=entry_lineage["risk_config_id"],
+                    risk_config_generation=entry_lineage["risk_config_generation"],
+                    risk_config_hash=entry_lineage["risk_config_hash"],
+                    allocation=entry_lineage.get("allocation"),
                     detail={
                         "event_id": event_id,
                         "order_id": order_id,
                         "market_id": str(row.get("market_id") or ""),
                         "token_id": execution_asset_id,
+                        "candidate_id": str(row.get("candidate_id") or ""),
                         "side": "BUY",
                         "settlement_status": "CONFIRMED",
                         "order_status": status,
+                        **{
+                            name: entry_lineage.get(name)
+                            for name in _POSITION_LINEAGE_FIELDS
+                            if entry_lineage.get(name) is not None
+                        },
+                        "lineage_type": entry_lineage["lineage_type"],
                     },
                 )
             requested_quantity = _decimal(row.get("submitted_quantity"), ZERO)
@@ -2615,7 +2871,10 @@ def _reconcile_entry_ledger(service: CanaryService, venue: Any, now: datetime) -
                 and quantity + DUST >= requested_quantity
             )
             terminal_outcomes_complete = (
-                (terminal_order or confirmed_quantity_complete)
+                (
+                    terminal_order
+                    or (confirmed_quantity_complete and settlement is not None)
+                )
                 and not provisional_trades
                 and not fill_over_plan
                 and not preserved_prior_ownership
@@ -2661,20 +2920,23 @@ def _reconcile_entry_ledger(service: CanaryService, venue: Any, now: datetime) -
                 )
             )
             if terminal_outcomes_complete:
-                release = getattr(service.store, "release_canary_capacity", None)
-                if not callable(release):
-                    raise CanaryBlocked("CANARY_RISK_RELEASE_UNAVAILABLE")
-                release_detail = None
-                if not has_confirmed_fill and not provisional_trades:
-                    release_detail = {
-                        "no_fill_confirmed": True,
-                        "terminal_status": status,
-                        "filled_quantity": "0",
-                        "source": "POLYMARKET_ORDER_STATUS",
-                        "trade_count": "0",
-                        "trade_ids": [],
-                    }
-                release(risk_reservation_id, status="RELEASED", timestamp=now, detail=release_detail)
+                release_detail = {
+                    "no_fill_confirmed": True,
+                    "terminal_status": status,
+                    "filled_quantity": "0",
+                    "source": "POLYMARKET_ORDER_STATUS",
+                    "trade_count": "0",
+                    "trade_ids": [],
+                } if not has_confirmed_fill and not provisional_trades else {}
+                _release_capacity(
+                    service,
+                    risk_reservation_id,
+                    status="RELEASED",
+                    timestamp=now,
+                    lineage=entry_lineage,
+                    candidate_id=row.get("candidate_id"),
+                    detail=release_detail,
+                )
             average = cost / quantity if quantity > ZERO else None
             with service.store._lock, connection:
                 connection.execute(
@@ -2741,7 +3003,118 @@ def _reconcile_entry_ledger(service: CanaryService, venue: Any, now: datetime) -
     return results
 
 
-def _reserve_exit(service: CanaryService, *, request_id: str, lot: Mapping[str, Any], quantity: Decimal, config: Mapping[str, Any], now: datetime) -> Mapping[str, Any]:
+def _release_capacity(
+    service: CanaryService,
+    reservation_id: str,
+    *,
+    status: str,
+    timestamp: datetime,
+    lineage: Mapping[str, Any],
+    candidate_id: Any = None,
+    detail: Mapping[str, Any] | None = None,
+) -> Mapping[str, Any]:
+    """Release/update a reservation with its exact opening lineage."""
+    release = getattr(service.store, "release_canary_capacity", None)
+    if not callable(release):
+        raise CanaryBlocked("CANARY_RISK_RELEASE_UNAVAILABLE")
+    opening_lineage = dict(lineage)
+    candidate_value = str(
+        candidate_id
+        if candidate_id is not None
+        else opening_lineage.get("candidate_id")
+        or ""
+    ).strip() or None
+    candidate = (
+        candidate_value
+        if opening_lineage.get("lineage_type") == _ROLLING_LINEAGE_TYPE
+        else None
+    )
+    if opening_lineage.get("allocation") in (None, ""):
+        with service.store._lock:
+            try:
+                reservation = _connection(service).execute(
+                    "SELECT allocation FROM canary_risk_reservations "
+                    "WHERE reservation_id=?",
+                    (str(reservation_id),),
+                ).fetchone()
+            except sqlite3.OperationalError:
+                reservation = None
+        if reservation is not None:
+            opening_lineage["allocation"] = reservation["allocation"]
+    release_detail = dict(detail or {})
+    release_detail["candidate_id"] = candidate_value or ""
+    for name in _POSITION_LINEAGE_FIELDS:
+        release_detail[name] = opening_lineage.get(name)
+    release_detail["lineage_type"] = (
+        opening_lineage.get("lineage_type") or _LEGACY_LINEAGE_TYPE
+    )
+    return release(
+        str(reservation_id),
+        status=status,
+        timestamp=timestamp,
+        strategy_version_id=opening_lineage.get("strategy_version_id"),
+        research_trial_id=opening_lineage.get("research_trial_id"),
+        candidate_id=candidate,
+        portfolio_selection_id=opening_lineage.get("portfolio_selection_id"),
+        admission_policy_id=opening_lineage.get("admission_policy_id"),
+        admission_policy_version=opening_lineage.get("admission_policy_version"),
+        risk_config_id=opening_lineage.get("risk_config_id"),
+        risk_config_generation=opening_lineage.get("risk_config_generation"),
+        risk_config_hash=opening_lineage.get("risk_config_hash"),
+        allocation=opening_lineage.get("allocation"),
+        detail=release_detail,
+    )
+def reconcile_immediate_entry(
+    service: CanaryService,
+    venue: Any,
+    *,
+    event_id: str,
+    now: datetime | None = None,
+) -> Mapping[str, Any] | None:
+    """Reconcile one just-submitted BUY before the next worker tick."""
+    service = _service(service)
+    _ensure_schema(service)
+    stamp = ensure_utc(now or service.clock())
+    event_key = str(event_id or "").strip()
+    if not event_key:
+        return None
+    with service.store._lock:
+        row = _connection(service).execute(
+            "SELECT * FROM canary_ledger WHERE event_id=?",
+            (event_key,),
+        ).fetchone()
+    if row is None or str(row["side"] or "").strip().upper() != "BUY":
+        return None
+    status = str(row["status"] or "").strip().upper()
+    if status in _FAILED_ORDER or status in _CANCELED_ORDER:
+        return None
+    results = _reconcile_entry_ledger(
+        service,
+        venue,
+        stamp,
+        target_event_id=event_key,
+    )
+    _sync_entry_lots(service, stamp)
+    for result in results:
+        if str(result.get("event_id") or "").strip() == event_key:
+            return result
+    return None
+
+def _reserve_exit(
+    service: CanaryService,
+    *,
+    request_id: str,
+    lot: Mapping[str, Any],
+    quantity: Decimal,
+    config: Mapping[str, Any],
+    now: datetime,
+    lineage: Mapping[str, Any] | None = None,
+) -> Mapping[str, Any]:
+    # The persisted lot is the sole authority for opening lineage.  A caller
+    # supplied mapping is retained for compatibility but must not be allowed
+    # to turn a legacy lot into a rolling reservation.
+    del lineage
+    opening_lineage = _opening_lot_lineage(service, lot)
     reserve = getattr(service.store, "reserve_canary_capacity", None)
     if not callable(reserve):
         raise CanaryBlocked("CANARY_RISK_RESERVATION_UNAVAILABLE")
@@ -2773,17 +3146,55 @@ def _reserve_exit(service: CanaryService, *, request_id: str, lot: Mapping[str, 
         config_generation=generation,
         config_hash=config_hash,
         control_generation=control_generation,
+        strategy_version_id=opening_lineage["strategy_version_id"],
+        research_trial_id=opening_lineage["research_trial_id"],
+        candidate_id=(
+            opening_lineage.get("candidate_id")
+            if opening_lineage.get("lineage_type") == _ROLLING_LINEAGE_TYPE
+            else None
+        ),
+        portfolio_selection_id=opening_lineage["portfolio_selection_id"],
+        admission_policy_id=opening_lineage["admission_policy_id"],
+        admission_policy_version=opening_lineage["admission_policy_version"],
+        risk_config_id=opening_lineage["risk_config_id"],
+        risk_config_generation=opening_lineage["risk_config_generation"],
+        risk_config_hash=opening_lineage["risk_config_hash"],
+        allocation=opening_lineage["allocation"],
         detail={
             "position_id": str(lot.get("position_id") or ""),
             "market_id": str(lot.get("market_id") or ""),
             "token_id": str(lot.get("token_id") or ""),
+            "candidate_id": str(lot.get("candidate_id") or ""),
             "event_id": request_id,
             "settlement_status": "PENDING",
+            **{
+                name: opening_lineage[name]
+                for name in _POSITION_LINEAGE_FIELDS
+            },
+            "lineage_type": opening_lineage["lineage_type"],
         },
     )
 
 
-def submit_exit(service: CanaryService, position_id: str, venue: Any, *, expected_generation: int, config_id: str, allow_test_venue: bool = False) -> Mapping[str, Any]:
+def submit_exit(
+    service: CanaryService,
+    position_id: str,
+    venue: Any,
+    *,
+    expected_generation: int,
+    config_id: str,
+    allow_test_venue: bool = False,
+    rolling_context: Mapping[str, Any] | None = None,
+    force_exit: bool = False,
+    strategy_version_id: str | None = None,
+    research_trial_id: str | None = None,
+    portfolio_selection_id: str | None = None,
+    admission_policy_id: str | None = None,
+    admission_policy_version: str | None = None,
+    risk_config_id: str | None = None,
+    risk_config_generation: int | None = None,
+    risk_config_hash: str | None = None,
+) -> Mapping[str, Any]:
     """Submit one bounded SELL for an AXIOM-owned, reconciled lot."""
     service = _service(service)
     expected_credential_fingerprint = service.require_current_credential_binding()
@@ -2805,23 +3216,70 @@ def submit_exit(service: CanaryService, position_id: str, venue: Any, *, expecte
     if lot is None:
         raise CanaryBlocked("CANARY_POSITION_NOT_FOUND")
     position_key = str(lot.get("position_id") or position_id)
+    lot_lineage = _opening_lot_lineage(service, lot)
+    requested_lineage = dict(rolling_context or {})
+    requested_lineage.update(
+        {
+            name: value
+            for name, value in {
+                "strategy_version_id": strategy_version_id,
+                "research_trial_id": research_trial_id,
+                "portfolio_selection_id": portfolio_selection_id,
+                "admission_policy_id": admission_policy_id,
+                "admission_policy_version": admission_policy_version,
+                "risk_config_id": risk_config_id,
+                "risk_config_generation": risk_config_generation,
+                "risk_config_hash": risk_config_hash,
+            }.items()
+            if value is not None
+        }
+    )
+    requested_lineage_type = requested_lineage.get("lineage_type")
+    if requested_lineage_type is not None and str(requested_lineage_type) != str(lot_lineage["lineage_type"]):
+        raise CanaryBlocked("ROLLING_OPENING_LINEAGE_MISMATCH")
+    if lot_lineage["lineage_type"] == _ROLLING_LINEAGE_TYPE:
+        lot_candidate = str(lot.get("candidate_id") or "").strip()
+        if not lot_candidate:
+            raise CanaryBlocked("ROLLING_OPENING_LINEAGE_INCOMPLETE")
+        if "candidate_id" not in requested_lineage:
+            requested_lineage["candidate_id"] = lot_candidate
+        requested_candidate = str(requested_lineage.get("candidate_id") or "").strip()
+        if requested_candidate != lot_candidate:
+            raise CanaryBlocked("ROLLING_OPENING_LINEAGE_MISMATCH")
+    for name in _POSITION_LINEAGE_FIELDS:
+        if name in requested_lineage and requested_lineage[name] not in (None, ""):
+            if str(requested_lineage[name]) != str(lot_lineage.get(name)):
+                raise CanaryBlocked("ROLLING_OPENING_LINEAGE_MISMATCH")
     total_quantity = _decimal(lot.get("quantity"), ZERO)
     sold_quantity = _decimal(lot.get("sold_quantity"), ZERO)
     pending_quantity = _decimal(lot.get("pending_exit_quantity"), ZERO)
     quantity = max(ZERO, total_quantity - sold_quantity - pending_quantity)
     lot_status = str(lot.get("status") or "").upper()
-    if lot_status == "MANAGEMENT_BLOCKED":
+    if lot_status == "MANAGEMENT_BLOCKED" and not force_exit:
         raise CanaryBlocked("CANARY_POSITION_MANAGEMENT_BLOCKED")
     if quantity <= DUST or lot_status in {"CLOSED", "DUST", "DISPUTED"}:
         raise CanaryBlocked("CANARY_POSITION_UNAVAILABLE")
-    if not _valid_exit_policy(_decode(lot.get("exit_policy_json"))):
+    if not force_exit and not _valid_exit_policy(_decode(lot.get("exit_policy_json"))):
         raise CanaryBlocked("CANARY_POSITION_MANAGEMENT_BLOCKED")
+    if (
+        lot_lineage["lineage_type"] == _ROLLING_LINEAGE_TYPE
+        and any(
+            lot_lineage.get(name) in (None, "")
+            for name in _POSITION_LINEAGE_FIELDS
+        )
+    ):
+        raise CanaryBlocked("ROLLING_OPENING_LINEAGE_INCOMPLETE")
     existing = _request_rows(service, position_key)
     if any(str(item.get("side") or "").upper() == "SELL" for item in existing):
         raise CanaryBlocked("DUPLICATE_EXIT_REQUEST")
     market_id = str(lot.get("market_id") or "").strip()
     token_id = str(lot.get("token_id") or "").strip()
     context = _call(_method(venue, "market_context"), market_id=market_id, token_id=token_id)
+    if not isinstance(context, Mapping):
+        raise CanaryBlocked("CANARY_EXIT_MARKET_CONTEXT_INVALID")
+    # Price is the first market preflight so malformed or missing bid data
+    # cannot be masked by a later market-rule failure.
+    price = _extract_book_price(context, side="SELL")
     market_version, asset_id = _validate_market_context_identity(
         context,
         token_id,
@@ -2843,15 +3301,47 @@ def submit_exit(service: CanaryService, position_id: str, venue: Any, *, expecte
     accepting_orders = context.get("accepting_orders")
     if type(accepting_orders) is not bool or not accepting_orders:
         raise CanaryBlocked("CANARY_MARKET_NOT_ACCEPTING_ORDERS")
-    min_size = _decimal(context.get("min_order_size"), ZERO)
-    if min_size > ZERO and quantity + DUST < min_size:
+    min_size = _required_market_decimal(
+        context,
+        ("min_order_size", "order_min_size", "minimum_order_size"),
+        reason="CANARY_EXIT_MARKET_RULES_UNAVAILABLE",
+    )
+    size_increment = _required_market_decimal(
+        context,
+        ("size_increment", "quantity_step", "step_size", "quantity_increment"),
+        reason="CANARY_EXIT_MARKET_RULES_UNAVAILABLE",
+    )
+    min_notional = _required_market_decimal(
+        context,
+        (
+            "min_notional",
+            "minimum_notional",
+            "venue_minimum_notional",
+            "venue_minimum_cost",
+            "minimum_cost",
+        ),
+        reason="CANARY_EXIT_MARKET_RULES_UNAVAILABLE",
+    )
+    if quantity + DUST < min_size:
         raise CanaryBlocked("CANARY_EXIT_BELOW_MINIMUM")
-    price = _extract_book_price(context, side="SELL")
+    remainder = quantity % size_increment
+    if remainder > DUST and size_increment - remainder > DUST:
+        raise CanaryBlocked("CANARY_EXIT_SIZE_INCREMENT_INVALID")
+    if quantity * price + DUST < min_notional:
+        raise CanaryBlocked("CANARY_EXIT_BELOW_MIN_NOTIONAL")
     # Validate a test transport before reserving capacity so a missing method
     # is a deterministic preflight blocker, not an UNKNOWN post-boundary state.
     test_submit = _method(venue, "submit_limit_order") if allow_test_venue else None
     request_id = "exit:" + position_key + ":" + str(expected_generation) + ":" + uuid.uuid4().hex
-    reservation = _reserve_exit(service, request_id=request_id, lot=lot, quantity=quantity, config=config, now=now)
+    reservation = _reserve_exit(
+        service,
+        request_id=request_id,
+        lot=lot,
+        quantity=quantity,
+        config=config,
+        now=now,
+        lineage=lot_lineage,
+    )
     reservation_id = str(reservation.get("reservation_id") or "").strip()
     if reservation_id != request_id:
         raise CanaryBlocked("CANARY_RISK_RESERVATION_ID_INVALID")
@@ -2861,7 +3351,14 @@ def submit_exit(service: CanaryService, position_id: str, venue: Any, *, expecte
         raise CanaryBlocked("CANARY_RISK_RELEASE_UNAVAILABLE")
 
     def reject_prepared(reason: str) -> None:
-        release(reservation_id, status="RELEASED", timestamp=ensure_utc(service.clock()))
+        _release_capacity(
+            service,
+            reservation_id,
+            status="RELEASED",
+            timestamp=ensure_utc(service.clock()),
+            lineage=lot_lineage,
+            candidate_id=lot_lineage.get("candidate_id"),
+        )
         with service.store._lock, _connection(service):
             _connection(service).execute(
                 "UPDATE canary_position_requests SET status='REJECTED',last_error=?,updated_at=? WHERE request_id=?",
@@ -2877,7 +3374,7 @@ def submit_exit(service: CanaryService, position_id: str, venue: Any, *, expecte
             updated = _connection(service).execute(
                 "UPDATE canary_position_lots SET pending_exit_quantity=?,"
                 "status='EXIT_PENDING',updated_at=? WHERE position_id=? "
-                "AND status IN ('OPEN','EXIT_PENDING')",
+                "AND status IN ('OPEN','EXIT_PENDING','MANAGEMENT_BLOCKED')",
                 (str(expected_pending + quantity), _iso(now), position_key),
             )
             if int(updated.rowcount or 0) != 1:
@@ -2885,9 +3382,11 @@ def submit_exit(service: CanaryService, position_id: str, venue: Any, *, expecte
             _connection(service).execute(
                 "INSERT INTO canary_position_requests("
                 "request_id,position_id,reservation_id,event_id,venue,market_id,"
-                "token_id,asset_id,market_version,side,requested_quantity,"
-                "requested_price,status,expected_generation,config_id,submitted_at,"
-                "updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "token_id,asset_id,market_version,strategy_version_id,research_trial_id,"
+                "portfolio_selection_id,admission_policy_id,admission_policy_version,"
+                "risk_config_id,risk_config_generation,risk_config_hash,lineage_type,"
+                "side,requested_quantity,requested_price,status,expected_generation,"
+                "config_id,submitted_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     request_id,
                     position_key,
@@ -2898,6 +3397,8 @@ def submit_exit(service: CanaryService, position_id: str, venue: Any, *, expecte
                     token_id,
                     asset_id,
                     market_version,
+                    *(lot_lineage.get(name) for name in _POSITION_LINEAGE_FIELDS),
+                    lot_lineage["lineage_type"],
                     "SELL",
                     str(quantity),
                     str(price),
@@ -2932,7 +3433,27 @@ def submit_exit(service: CanaryService, position_id: str, venue: Any, *, expecte
             config_generation=int(expected_generation),
             config_hash=str(config.get("config_hash") or ""),
             control_generation=control_generation,
-            detail={"position_id": position_key, "quantity": str(quantity), "venue": str(lot.get("venue") or "polymarket")},
+            strategy_version_id=lot_lineage["strategy_version_id"],
+            research_trial_id=lot_lineage["research_trial_id"],
+            portfolio_selection_id=lot_lineage["portfolio_selection_id"],
+            admission_policy_id=lot_lineage["admission_policy_id"],
+            admission_policy_version=lot_lineage["admission_policy_version"],
+            risk_config_id=lot_lineage["risk_config_id"],
+            risk_config_generation=lot_lineage["risk_config_generation"],
+            risk_config_hash=lot_lineage["risk_config_hash"],
+            allocation=lot_lineage["allocation"],
+            detail={
+                "position_id": position_key,
+                "quantity": str(quantity),
+                "venue": str(lot.get("venue") or "polymarket"),
+                "candidate_id": str(lot.get("candidate_id") or ""),
+                **{
+                    name: lot_lineage[name]
+                    for name in _POSITION_LINEAGE_FIELDS
+                    if lot_lineage.get(name) is not None
+                },
+                "lineage_type": lot_lineage["lineage_type"],
+            },
         )
         with service.store._lock, _connection(service):
             _connection(service).execute(
@@ -2957,16 +3478,40 @@ def submit_exit(service: CanaryService, position_id: str, venue: Any, *, expecte
                 (request_id,),
             ).fetchone()
             lot_check = _connection(service).execute(
-                "SELECT quantity,sold_quantity,status FROM canary_position_lots WHERE position_id=?",
+                "SELECT quantity,sold_quantity,status,candidate_id,"
+                "strategy_version_id,research_trial_id,portfolio_selection_id,"
+                "admission_policy_id,admission_policy_version,risk_config_id,"
+                "risk_config_generation,risk_config_hash,lineage_type "
+                "FROM canary_position_lots WHERE position_id=?",
                 (position_key,),
             ).fetchone()
         if row is None or str(row["status"] or "").upper() != "SUBMITTING":
             raise CanaryBlocked("CANARY_SUBMISSION_PHASE_CHANGED")
-        if lot_check is None or str(lot_check["status"] or "").upper() not in {"OPEN", "EXIT_PENDING"}:
+        allowed_lot_statuses = {"OPEN", "EXIT_PENDING"}
+        if force_exit:
+            allowed_lot_statuses.add("MANAGEMENT_BLOCKED")
+        if lot_check is None or str(lot_check["status"] or "").upper() not in allowed_lot_statuses:
             raise CanaryBlocked("CANARY_POSITION_UNAVAILABLE")
         owned = max(ZERO, _decimal(lot_check["quantity"], ZERO) - _decimal(lot_check["sold_quantity"], ZERO))
         if owned + DUST < quantity:
             raise CanaryBlocked("CANARY_POSITION_UNAVAILABLE")
+        current_lineage = _lineage_from_row(lot_check) if lot_check is not None else {}
+        if (
+            lot_lineage["lineage_type"] == _ROLLING_LINEAGE_TYPE
+            and (
+                lot_check is None
+                or any(
+                    current_lineage.get(name) != lot_lineage.get(name)
+                    for name in (*_POSITION_LINEAGE_FIELDS, "lineage_type")
+                )
+            )
+        ):
+            raise CanaryBlocked("ROLLING_OPENING_LINEAGE_MISMATCH")
+        if lot_lineage["lineage_type"] == _ROLLING_LINEAGE_TYPE and (
+            str(lot_check["candidate_id"] or "").strip()
+            != str(requested_lineage.get("candidate_id") or "").strip()
+        ):
+            raise CanaryBlocked("ROLLING_OPENING_LINEAGE_MISMATCH")
 
     transport_state_lock = threading.Lock()
     submission_cancelled = threading.Event()
@@ -3005,7 +3550,7 @@ def submit_exit(service: CanaryService, position_id: str, venue: Any, *, expecte
                 price=price,
                 size=quantity,
             )
-        return service.submit_position_order(
+        return service._submit_position_order(
             market_version=market_version,
             neg_risk=context.get("neg_risk"),
             asset_id=asset_id,
@@ -3015,6 +3560,12 @@ def submit_exit(service: CanaryService, position_id: str, venue: Any, *, expecte
             before_post=before_post,
             on_send_started=on_send_started,
             expected_credential_fingerprint=expected_credential_fingerprint,
+            reservation_id=reservation_id,
+            control_generation=control_generation,
+            market_id=market_id,
+            token_id=token_id,
+            candidate_id=str(lot_lineage.get("candidate_id") or ""),
+            lineage=lot_lineage,
         )
 
     def persist_submission_failure(status: str, error: str) -> None:
@@ -3026,27 +3577,16 @@ def submit_exit(service: CanaryService, position_id: str, venue: Any, *, expecte
                 "'CANCELED','CANCELLED','EXPIRED','REJECTED','FAILED','ERROR','FILLED')",
                 (status, error, _iso(ensure_utc(service.clock())), request_id),
             )
-            if status == "REJECTED":
-                _connection(service).execute(
-                    "UPDATE canary_position_lots SET status='OPEN',pending_exit_quantity=?,updated_at=? WHERE position_id=?",
-                    (
-                        str(expected_pending),
-                        _iso(ensure_utc(service.clock())),
-                        position_key,
-                    ),
-                )
-        if status == "REJECTED":
-            release(
-                reservation_id,
-                status="RELEASED",
-                timestamp=ensure_utc(service.clock()),
-            )
-        else:
-            release(
-                reservation_id,
-                status="UNKNOWN",
-                timestamp=ensure_utc(service.clock()),
-            )
+        release_status = "RELEASED" if status == "REJECTED" else "UNKNOWN"
+        _release_capacity(
+            service,
+            reservation_id,
+            status=release_status,
+            timestamp=ensure_utc(service.clock()),
+            lineage=lot_lineage,
+            candidate_id=lot_lineage.get("candidate_id"),
+            detail={"request_status": status},
+        )
 
     # PREPARED -> SUBMITTING is durable before this bounded transport call.
     try:
@@ -3075,6 +3615,13 @@ def submit_exit(service: CanaryService, position_id: str, venue: Any, *, expecte
             "CANARY_SETTINGS_GENERATION_CHANGED",
             "CANARY_MARKET_NOT_ACCEPTING_ORDERS",
             "CANARY_EXIT_BELOW_MINIMUM",
+            "CANARY_EXIT_BELOW_MIN_NOTIONAL",
+            "CANARY_EXIT_SIZE_INCREMENT_INVALID",
+            "CANARY_EXIT_MARKET_RULES_UNAVAILABLE",
+            "CANARY_SUBMISSION_CONTEXT_INVALID",
+            "CANARY_RESERVATION_INVALID",
+            "ROLLING_LINEAGE_INCOMPLETE",
+            "ROLLING_LINEAGE_CONFLICT",
             "CANARY_ALLOWANCE_INSUFFICIENT",
             "CANARY_ALLOWANCE_UNAVAILABLE",
             "CANARY_SPENDER_UNAVAILABLE",
@@ -3132,7 +3679,7 @@ def submit_exit(service: CanaryService, position_id: str, venue: Any, *, expecte
         status = "UNKNOWN"
         response_error = "CANARY_SUBMISSION_RESPONSE_INVALID"
     elif status_text in _FAILED_ORDER or status_text in _CANCELED_ORDER:
-        status = "REJECTED"
+        status = status_text
         response_error = None
     elif ok_value is True:
         if order_id is None:
@@ -3161,21 +3708,38 @@ def submit_exit(service: CanaryService, position_id: str, venue: Any, *, expecte
             "'CANCELED','CANCELLED','EXPIRED','REJECTED','FAILED','ERROR','FILLED')",
             (order_id, status, response_error, _iso(ensure_utc(service.clock())), request_id),
         )
-        if status == "REJECTED":
+        if status in _FAILED_ORDER or status in _CANCELED_ORDER:
             _connection(service).execute(
                 "UPDATE canary_position_lots SET status='OPEN',pending_exit_quantity=?,updated_at=? WHERE position_id=? "
                 "AND UPPER(COALESCE(status,'')) NOT IN ('CLOSED','DUST')",
                 (str(expected_pending), _iso(ensure_utc(service.clock())), position_key),
             )
-    reservation_status = "RELEASED" if status == "REJECTED" else (
-        "UNKNOWN" if status == "UNKNOWN" else "OPEN"
+    reservation_status = (
+        "RELEASED"
+        if status in _FAILED_ORDER or status in _CANCELED_ORDER
+        else "UNKNOWN"
+        if status == "UNKNOWN"
+        else "OPEN"
     )
-    release(
+    _release_capacity(
+        service,
         reservation_id,
         status=reservation_status,
         timestamp=ensure_utc(service.clock()),
+        lineage=lot_lineage,
+        candidate_id=lot_lineage.get("candidate_id"),
+        detail={"request_status": status},
     )
-    return {"request_id": request_id, "position_id": position_key, "reservation_id": reservation_id, "order_id": order_id, "status": status, "quantity": str(quantity), "price": str(price)}
+    return {
+        "request_id": request_id,
+        "position_id": position_key,
+        "reservation_id": reservation_id,
+        "order_id": order_id,
+        "status": status,
+        "quantity": str(quantity),
+        "price": str(price),
+        "lineage": lot_lineage,
+    }
 
 
 def _apply_reconciled_request(service: CanaryService, request: Mapping[str, Any], order: Mapping[str, Any], trades: Sequence[Mapping[str, Any]], now: datetime) -> dict[str, Any]:
@@ -3219,6 +3783,7 @@ def _apply_reconciled_request(service: CanaryService, request: Mapping[str, Any]
     if lot_row is None:
         raise CanaryBlocked("CANARY_POSITION_NOT_FOUND")
     lot_context = dict(lot_row)
+    opening_lineage = _opening_lot_lineage(service, lot_context)
     _validate_venue_identity(
         order=order,
         trades=trades,
@@ -3380,6 +3945,12 @@ def _apply_reconciled_request(service: CanaryService, request: Mapping[str, Any]
                 "proceeds_usd": str(net_proceeds),
                 "realized_pnl_usd": str(realized_pnl),
                 "exit_fee_usd": str(fee),
+                **{
+                    name: opening_lineage.get(name)
+                    for name in _POSITION_LINEAGE_FIELDS
+                    if opening_lineage.get(name) is not None
+                },
+                "lineage_type": opening_lineage["lineage_type"],
             }
             risk_fill(
                 fill_id=fill_id,
@@ -3389,12 +3960,25 @@ def _apply_reconciled_request(service: CanaryService, request: Mapping[str, Any]
                 cost=quantity * price + fee,
                 fee=fee,
                 filled_at=matched_at,
+                strategy_version_id=opening_lineage["strategy_version_id"],
+                research_trial_id=opening_lineage["research_trial_id"],
+                candidate_id=opening_lineage.get("candidate_id"),
+                portfolio_selection_id=opening_lineage["portfolio_selection_id"],
+                admission_policy_id=opening_lineage["admission_policy_id"],
+                admission_policy_version=opening_lineage["admission_policy_version"],
+                risk_config_id=opening_lineage["risk_config_id"],
+                risk_config_generation=opening_lineage["risk_config_generation"],
+                risk_config_hash=opening_lineage["risk_config_hash"],
+                allocation=opening_lineage.get("allocation"),
                 detail=risk_detail,
             )
             inserted_row = connection.execute(
                 "INSERT INTO canary_position_fills("
-                "fill_id,request_id,position_id,quantity,price,fee,status,"
-                "filled_at,detail_json) VALUES(?,?,?,?,?,?,?,?,?) "
+                "fill_id,request_id,position_id,quantity,price,fee,status,filled_at,"
+                "strategy_version_id,research_trial_id,portfolio_selection_id,"
+                "admission_policy_id,admission_policy_version,risk_config_id,"
+                "risk_config_generation,risk_config_hash,lineage_type,detail_json) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(fill_id) DO NOTHING",
                 (
                     fill_id,
@@ -3405,6 +3989,8 @@ def _apply_reconciled_request(service: CanaryService, request: Mapping[str, Any]
                     str(fee),
                     "CONFIRMED",
                     _iso(matched_at),
+                    *(opening_lineage.get(name) for name in _POSITION_LINEAGE_FIELDS),
+                    opening_lineage["lineage_type"],
                     _json(dict(trade)),
                 ),
             )
@@ -3828,14 +4414,14 @@ def _apply_reconciled_request(service: CanaryService, request: Mapping[str, Any]
         failed_result["blocker"] = "CANARY_RECONCILIATION_CAS_FAILED"
         return failed_result
     if terminal:
-        release = getattr(service.store, "release_canary_capacity", None)
-        if not callable(release):
-            raise CanaryBlocked("CANARY_RISK_RELEASE_UNAVAILABLE")
         if release_reservation_id:
-            release(
+            _release_capacity(
+                service,
                 release_reservation_id,
                 status="SETTLED" if settlement_status is not None else "RELEASED",
                 timestamp=now,
+                lineage=_opening_lot_lineage(service, lot_context),
+                candidate_id=lot_context.get("candidate_id"),
             )
     return result
 
@@ -3910,24 +4496,44 @@ def reconcile_pending(service: CanaryService, venue: Any, *, allow_test_venue: b
                 ).fetchone() is not None
         if request_status == "PREPARED" or (request_status == "EXIT_REQUESTED" and not attempted):
             reservation_id = str(request.get("reservation_id") or "").strip()
-            release = getattr(service.store, "release_canary_capacity", None)
-            if reservation_id and callable(release):
-                release(reservation_id, status="RELEASED", timestamp=now)
-            requested = _decimal(request.get("requested_quantity"), ZERO)
             position_id = str(request.get("position_id") or "")
+            with service.store._lock:
+                lot_identity_row = _connection(service).execute(
+                    "SELECT * FROM canary_position_lots WHERE position_id=?",
+                    (position_id,),
+                ).fetchone()
+            lot_identity = dict(lot_identity_row) if lot_identity_row is not None else {}
+            if reservation_id and lot_identity:
+                _release_capacity(
+                    service,
+                    reservation_id,
+                    status="RELEASED",
+                    timestamp=now,
+                    lineage=_opening_lot_lineage(service, lot_identity),
+                    candidate_id=lot_identity.get("candidate_id"),
+                )
+            requested = _decimal(request.get("requested_quantity"), ZERO)
             with service.store._lock, _connection(service):
                 lot = _connection(service).execute(
                     "SELECT pending_exit_quantity FROM canary_position_lots WHERE position_id=?",
                     (position_id,),
                 ).fetchone()
-                pending = max(ZERO, _decimal(lot["pending_exit_quantity"], ZERO) - requested) if lot is not None else ZERO
+                pending = max(
+                    ZERO,
+                    _decimal(lot["pending_exit_quantity"], ZERO) - requested,
+                ) if lot is not None else ZERO
                 _connection(service).execute(
                     "UPDATE canary_position_requests SET status='REJECTED',last_error=?,updated_at=? WHERE request_id=?",
                     ("CRASH_BEFORE_SUBMISSION", _iso(now), request_id),
                 )
                 _connection(service).execute(
                     "UPDATE canary_position_lots SET status=?,pending_exit_quantity=?,updated_at=? WHERE position_id=?",
-                    ("EXIT_PENDING" if pending > DUST else "OPEN", str(pending), _iso(now), position_id),
+                    (
+                        "EXIT_PENDING" if pending > DUST else "OPEN",
+                        str(pending),
+                        _iso(now),
+                        position_id,
+                    ),
                 )
             results.append({"request_id": request_id, "status": "REJECTED", "reason": "CRASH_BEFORE_SUBMISSION"})
         else:
@@ -4058,8 +4664,32 @@ def _policy_due(lot: Mapping[str, Any], now: datetime) -> bool:
     return seconds >= 0 and (now - opened).total_seconds() >= seconds
 
 
-def manage_positions(service: CanaryService, venue: Any, *, allow_test_venue: bool = False) -> Mapping[str, Any]:
-    """Admit only bounded exits for lots owned by AXIOM's canary ledger."""
+def _forced_exit_matches(lot: Mapping[str, Any], members: Sequence[Mapping[str, Any]]) -> bool:
+    """Match only the immutable opening identity of a reducing member."""
+    strategy = str(lot.get("strategy_version_id") or "").strip()
+    trial = str(lot.get("research_trial_id") or "").strip()
+    candidate = str(lot.get("candidate_id") or "").strip()
+    if not strategy or not trial or not candidate:
+        return False
+    for member in members:
+        if not isinstance(member, Mapping):
+            continue
+        if (
+            str(member.get("strategy_version_id") or "").strip() == strategy
+            and str(member.get("research_trial_id") or "").strip() == trial
+            and str(member.get("candidate_id") or "").strip() == candidate
+        ):
+            return True
+    return False
+
+def manage_positions(
+    service: CanaryService,
+    venue: Any,
+    *,
+    allow_test_venue: bool = False,
+    force_exit_members: Sequence[Mapping[str, Any]] = (),
+) -> Mapping[str, Any]:
+    """Admit bounded exits, including immediate exits for reducing members."""
     service = _service(service)
     try:
         service.require_current_credential_binding()
@@ -4079,6 +4709,9 @@ def manage_positions(service: CanaryService, venue: Any, *, allow_test_venue: bo
     if state not in {"ARMED", "AUTONOMOUS_MICRO_LIVE", "ENTRY_PAUSED", "PAUSED"}:
         return {"status": "BLOCKED", "submitted": 0, "blocked": "CANARY_NOT_ARMED", "positions": []}
     now = ensure_utc(service.clock())
+    forced_members = tuple(
+        member for member in force_exit_members if isinstance(member, Mapping)
+    )
     with service.store._lock:
         lots = [
             dict(row)
@@ -4091,13 +4724,14 @@ def manage_positions(service: CanaryService, venue: Any, *, allow_test_venue: bo
     submitted: list[Mapping[str, Any]] = []
     blocked: list[dict[str, Any]] = []
     for lot in lots:
-        if str(lot.get("status") or "").upper() == "MANAGEMENT_BLOCKED":
+        forced = _forced_exit_matches(lot, forced_members)
+        if not forced and str(lot.get("status") or "").upper() == "MANAGEMENT_BLOCKED":
             blocked.append({
                 "position_id": lot.get("position_id"),
                 "reason": "CANARY_POSITION_MANAGEMENT_BLOCKED",
             })
             continue
-        if not _valid_exit_policy(_decode(lot.get("exit_policy_json"))):
+        if not forced and not _valid_exit_policy(_decode(lot.get("exit_policy_json"))):
             blocked.append({
                 "position_id": lot.get("position_id"),
                 "reason": "CANARY_POSITION_MANAGEMENT_BLOCKED",
@@ -4109,11 +4743,20 @@ def manage_positions(service: CanaryService, venue: Any, *, allow_test_venue: bo
             - _decimal(lot.get("sold_quantity"), ZERO)
             - _decimal(lot.get("pending_exit_quantity"), ZERO),
         )
-        if available <= DUST or not _policy_due(lot, now):
+        if available <= DUST or (not forced and not _policy_due(lot, now)):
             continue
         try:
             config = service.settings.snapshot(now=now) if service.settings is not None else {}
-            result = submit_exit(service, str(lot["position_id"]), venue, expected_generation=int(config.get("generation", 0)), config_id=str(config.get("config_id") or ""), allow_test_venue=allow_test_venue)
+            result = submit_exit(
+                service,
+                str(lot["position_id"]),
+                venue,
+                expected_generation=int(config.get("generation", 0)),
+                config_id=str(config.get("config_id") or ""),
+                allow_test_venue=allow_test_venue,
+                rolling_context=_opening_lot_lineage(service, lot) if forced else None,
+                force_exit=forced,
+            )
             submitted.append(result)
         except CanaryBlocked as exc:
             blocked.append({"position_id": lot.get("position_id"), "reason": str(exc)})
@@ -4130,6 +4773,15 @@ class OwnedPosition:
     strategy_hash: str | None
     strategy_version: str | None
     exit_policy: Mapping[str, Any]
+    strategy_version_id: str | None = None
+    research_trial_id: str | None = None
+    portfolio_selection_id: str | None = None
+    admission_policy_id: str | None = None
+    admission_policy_version: str | None = None
+    risk_config_id: str | None = None
+    risk_config_generation: int | None = None
+    risk_config_hash: str | None = None
+    lineage_type: str = _LEGACY_LINEAGE_TYPE
 def list_positions(service: CanaryService, *, venue: str | None = None, include_closed: bool = False) -> list[OwnedPosition]:
     service = _service(service)
     _ensure_schema(service)
@@ -4156,6 +4808,15 @@ def list_positions(service: CanaryService, *, venue: str | None = None, include_
             strategy_hash=str(row["strategy_hash"]) if row["strategy_hash"] else None,
             strategy_version=str(row["strategy_version"]) if row["strategy_version"] else None,
             exit_policy=_decode(row["exit_policy_json"]),
+            strategy_version_id=str(row["strategy_version_id"]) if row["strategy_version_id"] else None,
+            research_trial_id=str(row["research_trial_id"]) if row["research_trial_id"] else None,
+            portfolio_selection_id=str(row["portfolio_selection_id"]) if row["portfolio_selection_id"] else None,
+            admission_policy_id=str(row["admission_policy_id"]) if row["admission_policy_id"] else None,
+            admission_policy_version=str(row["admission_policy_version"]) if row["admission_policy_version"] else None,
+            risk_config_id=str(row["risk_config_id"]) if row["risk_config_id"] else None,
+            risk_config_generation=int(row["risk_config_generation"]) if row["risk_config_generation"] is not None else None,
+            risk_config_hash=str(row["risk_config_hash"]) if row["risk_config_hash"] else None,
+            lineage_type=str(row["lineage_type"] or _LEGACY_LINEAGE_TYPE),
         )
         for row in rows
     ]
@@ -4172,8 +4833,19 @@ class CanaryPositionManager:
     def reconcile_pending(self, venue: Any, *, allow_test_venue: bool = False) -> Mapping[str, Any]:
         return reconcile_pending(self.service, venue, allow_test_venue=allow_test_venue)
 
-    def manage_positions(self, venue: Any, *, allow_test_venue: bool = False) -> Mapping[str, Any]:
-        return manage_positions(self.service, venue, allow_test_venue=allow_test_venue)
+    def manage_positions(
+        self,
+        venue: Any,
+        *,
+        allow_test_venue: bool = False,
+        force_exit_members: Sequence[Mapping[str, Any]] = (),
+    ) -> Mapping[str, Any]:
+        return manage_positions(
+            self.service,
+            venue,
+            allow_test_venue=allow_test_venue,
+            force_exit_members=force_exit_members,
+        )
 
 
 PositionManager = CanaryPositionManager

@@ -37,6 +37,7 @@ from .canary_positions import (
     recovery_identifier,
 )
 from .canary_settings import CanarySettingsService
+from .rolling_portfolio import RollingAdmissionPolicy, default_rolling_admission_policy
 from .bootstrap import BTC_HISTORY_START, HistoricalBootstrapper
 from .crypto_universe import load_crypto_universe
 from .data import BinanceAdapter
@@ -86,8 +87,29 @@ _ALLOWED_ACTIONS = frozenset(
         "canary.settings.activate_draft",
         "risk.settings.save_draft",
         "risk.settings.activate_draft",
+        "rolling.admission.review",
+        "rolling.admission.activate",
+        "rolling.policy.review",
+        "rolling.policy.activate",
+        "admission_policy.review",
+        "admission_policy.activate",
     }
 )
+_ROLLING_ACTION_ALIASES = {
+    "rolling.admission.review": "rolling.admission.review",
+    "rolling.policy.review": "rolling.admission.review",
+    "admission_policy.review": "rolling.admission.review",
+    "rolling.admission.activate": "rolling.admission.activate",
+    "rolling.policy.activate": "rolling.admission.activate",
+    "admission_policy.activate": "rolling.admission.activate",
+}
+_SETTINGS_ACTION_ALIASES = {
+    "canary.settings.save_draft": "risk.settings.save_draft",
+    "risk.settings.save_draft": "risk.settings.save_draft",
+    "canary.settings.activate_draft": "risk.settings.activate_draft",
+    "risk.settings.activate_draft": "risk.settings.activate_draft",
+}
+_ACTION_ALIASES = {**_ROLLING_ACTION_ALIASES, **_SETTINGS_ACTION_ALIASES}
 _CONFIRMATIONS = {
     "canary.eligibility.mark": "MARK CANARY ELIGIBLE",
     "canary.arm": "ARM",
@@ -99,6 +121,12 @@ _CONFIRMATIONS = {
     "canary.settings.activate_draft": "ACTIVATE RISK SETTINGS DRAFT",
     "risk.settings.save_draft": "SAVE RISK SETTINGS DRAFT",
     "risk.settings.activate_draft": "ACTIVATE RISK SETTINGS DRAFT",
+    "rolling.admission.review": "REVIEW ROLLING ADMISSION POLICY",
+    "rolling.admission.activate": "ACTIVATE ROLLING ADMISSION POLICY",
+    "rolling.policy.review": "REVIEW ROLLING ADMISSION POLICY",
+    "rolling.policy.activate": "ACTIVATE ROLLING ADMISSION POLICY",
+    "admission_policy.review": "REVIEW ROLLING ADMISSION POLICY",
+    "admission_policy.activate": "ACTIVATE ROLLING ADMISSION POLICY",
 }
 _ISOLATED_OPERATOR_BLOCKED_ACTIONS = frozenset(
     {
@@ -798,6 +826,271 @@ def _safe_value(value: Any, *, depth: int = 0) -> Any:
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value if not isinstance(value, str) or len(value) <= 1024 else value[:1021] + "..."
     return str(value)[:1024]
+def _rolling_policy_identity(
+    value: Any,
+    *,
+    require_hash: bool = True,
+) -> dict[str, str]:
+    """Normalize a persisted rolling-policy identity without version fallbacks."""
+    if not isinstance(value, Mapping):
+        raise OperatorControlError("ROLLING_POLICY_IDENTITY_REQUIRED")
+    policy_id_value = str(value.get("policy_id") or "").strip()
+    id_alias = str(value.get("id") or "").strip()
+    if policy_id_value and id_alias and policy_id_value != id_alias:
+        raise OperatorControlError("ROLLING_POLICY_IDENTITY_AMBIGUOUS")
+    policy_id = policy_id_value or id_alias
+    version = str(value.get("version") or "").strip()
+    policy_version = str(value.get("policy_version") or "").strip()
+    if version and policy_version and version != policy_version:
+        raise OperatorControlError("ROLLING_POLICY_IDENTITY_AMBIGUOUS")
+    version = version or policy_version
+    config_hash = str(value.get("config_hash") or "").strip()
+    if not policy_id or not version or (require_hash and not config_hash):
+        raise OperatorControlError("ROLLING_POLICY_IDENTITY_REQUIRED")
+    return {
+        "policy_id": policy_id,
+        "version": version,
+        "config_hash": config_hash,
+    }
+def _rolling_text(value: Any) -> str:
+    return str(value).strip() if value is not None else ""
+
+
+def _rolling_decimal(value: Any) -> Decimal | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        parsed = Decimal(str(value).strip())
+    except (ArithmeticError, TypeError, ValueError):
+        return None
+    return parsed if parsed.is_finite() else None
+
+
+def _rolling_identity_value(source: Mapping[str, Any], *keys: str) -> str:
+    for key in keys:
+        value = _rolling_text(source.get(key))
+        if value:
+            return value
+    return ""
+
+
+def _rolling_actionability(
+    member: Mapping[str, Any],
+    selection: Mapping[str, Any],
+    active_policy: Mapping[str, Any] | None,
+    evidence_loader: Callable[..., Any] | None,
+) -> tuple[bool, list[str]]:
+    """Mirror the rolling worker's funded-member gate and lineage fence."""
+    payload = member.get("payload")
+    payload = payload if isinstance(payload, Mapping) else {}
+    blockers: list[str] = []
+
+    status = _rolling_text(member.get("status") or payload.get("status")).upper()
+    if status not in {"ACTIVE", "REDUCE"}:
+        blockers.append(f"STATUS_{status or 'MISSING'}")
+    allocation = _rolling_decimal(member.get("allocation", payload.get("allocation")))
+    if allocation is None:
+        blockers.append("ALLOCATION_INVALID")
+    elif allocation <= 0:
+        blockers.append("ALLOCATION_REQUIRED")
+
+    strategy_id = _rolling_identity_value(member, "strategy_version_id")
+    if not strategy_id:
+        strategy_id = _rolling_identity_value(payload, "strategy_version_id")
+    candidate_id = _rolling_identity_value(member, "candidate_id", "candidate", "strategy_candidate_id")
+    if not candidate_id:
+        candidate_id = _rolling_identity_value(payload, "candidate_id", "candidate", "strategy_candidate_id")
+    trial_id = _rolling_identity_value(member, "research_trial_id", "trial_id")
+    if not trial_id:
+        trial_id = _rolling_identity_value(payload, "research_trial_id", "trial_id")
+    evidence_id = _rolling_identity_value(member, "evidence_window_id")
+    if not evidence_id:
+        evidence_id = _rolling_identity_value(payload, "evidence_window_id")
+    digest = _rolling_identity_value(member, "evidence_digest")
+    if not digest:
+        digest = _rolling_identity_value(payload, "evidence_digest")
+    for value, reason in (
+        (strategy_id, "STRATEGY_VERSION_ID_REQUIRED"),
+        (candidate_id, "CANDIDATE_ID_REQUIRED"),
+        (trial_id, "RESEARCH_TRIAL_ID_REQUIRED"),
+        (evidence_id, "EVIDENCE_WINDOW_ID_REQUIRED"),
+        (digest, "EVIDENCE_DIGEST_REQUIRED"),
+    ):
+        if not value:
+            blockers.append(reason)
+
+    selection_id = _rolling_identity_value(selection, "portfolio_selection_id", "selection_id")
+    member_selection_id = _rolling_identity_value(member, "portfolio_selection_id", "selection_id")
+    if not selection_id:
+        blockers.append("PORTFOLIO_SELECTION_ID_REQUIRED")
+    elif member_selection_id and member_selection_id != selection_id:
+        blockers.append("PORTFOLIO_SELECTION_ID_MISMATCH")
+
+    policy_config = selection.get("policy_config")
+    policy_config = policy_config if isinstance(policy_config, Mapping) else {}
+    policy_id = _rolling_identity_value(selection, "policy_id", "admission_policy_id")
+    policy_version = _rolling_identity_value(
+        selection,
+        "policy_version",
+        "version",
+        "admission_policy_version",
+    )
+    policy_hash = _rolling_identity_value(selection, "policy_hash", "config_hash")
+    if not policy_hash:
+        policy_hash = _rolling_identity_value(policy_config, "config_hash", "policy_hash")
+    for value, reason in (
+        (policy_id, "POLICY_ID_REQUIRED"),
+        (policy_version, "POLICY_VERSION_REQUIRED"),
+        (policy_hash, "POLICY_HASH_REQUIRED"),
+    ):
+        if not value:
+            blockers.append(reason)
+    if not isinstance(active_policy, Mapping) or not active_policy:
+        blockers.append("ACTIVE_POLICY_REQUIRED")
+    else:
+        try:
+            active_identity = _rolling_policy_identity(active_policy)
+        except OperatorControlError:
+            blockers.append("ACTIVE_POLICY_IDENTITY_INVALID")
+        else:
+            if (
+                policy_id
+                and policy_version
+                and policy_hash
+                and (
+                    active_identity["policy_id"] != policy_id
+                    or active_identity["version"] != policy_version
+                    or active_identity["config_hash"] != policy_hash
+                )
+            ):
+                blockers.append("POLICY_IDENTITY_MISMATCH")
+
+    risk_id = _rolling_identity_value(
+        selection,
+        "active_risk_config_id",
+        "risk_config_id",
+    )
+    risk_hash = _rolling_identity_value(
+        selection,
+        "active_risk_config_hash",
+        "risk_config_hash",
+    )
+    risk_generation_raw = selection.get(
+        "active_risk_config_generation",
+        selection.get("risk_config_generation"),
+    )
+    risk_generation = _rolling_decimal(risk_generation_raw)
+    if not risk_id:
+        blockers.append("RISK_CONFIG_ID_REQUIRED")
+    if risk_generation is None or risk_generation != risk_generation.to_integral_value() or risk_generation <= 0:
+        blockers.append("RISK_CONFIG_GENERATION_REQUIRED")
+    if not isinstance(active_policy, Mapping) or not active_policy:
+        blockers.append("ACTIVE_RISK_CONFIG_REQUIRED")
+    else:
+        active_risk_id = _rolling_identity_value(
+            active_policy,
+            "active_risk_config_id",
+            "risk_config_id",
+        )
+        active_risk_hash = _rolling_identity_value(
+            active_policy,
+            "active_risk_config_hash",
+            "risk_config_hash",
+        )
+        active_generation = _rolling_decimal(
+            active_policy.get(
+                "active_risk_config_generation",
+                active_policy.get("risk_config_generation"),
+            )
+        )
+        for value, reason in (
+            (active_risk_id, "ACTIVE_RISK_CONFIG_ID_REQUIRED"),
+            (active_risk_hash, "ACTIVE_RISK_CONFIG_HASH_REQUIRED"),
+        ):
+            if not value:
+                blockers.append(reason)
+        if (
+            active_generation is None
+            or active_generation != active_generation.to_integral_value()
+            or active_generation <= 0
+        ):
+            blockers.append("ACTIVE_RISK_CONFIG_GENERATION_REQUIRED")
+        if active_risk_id and risk_id and active_risk_id != risk_id:
+            blockers.append("RISK_CONFIG_IDENTITY_MISMATCH")
+        if active_risk_hash and risk_hash and active_risk_hash != risk_hash:
+            blockers.append("RISK_CONFIG_IDENTITY_MISMATCH")
+        if (
+            active_generation is not None
+            and risk_generation is not None
+            and active_generation != risk_generation
+        ):
+            blockers.append("RISK_CONFIG_IDENTITY_MISMATCH")
+
+    evidence: Mapping[str, Any] | None = None
+    nested_evidence = member.get("evidence")
+    if not isinstance(nested_evidence, Mapping):
+        nested_evidence = payload.get("evidence")
+    if isinstance(nested_evidence, Mapping):
+        evidence = nested_evidence
+    if evidence_loader is not None and strategy_id and evidence_id:
+        try:
+            rows = evidence_loader(strategy_id, limit=64)
+        except TypeError:
+            try:
+                rows = evidence_loader(strategy_id)
+            except TypeError:
+                try:
+                    rows = evidence_loader(strategy_version_id=strategy_id, limit=64)
+                except Exception:
+                    rows = ()
+            except Exception:
+                rows = ()
+        except Exception:
+            rows = ()
+        if isinstance(rows, Mapping):
+            rows = (rows,)
+        if isinstance(rows, (list, tuple)):
+            evidence = next(
+                (
+                    row
+                    for row in rows[:64]
+                    if isinstance(row, Mapping)
+                    and _rolling_text(row.get("evidence_window_id")) == evidence_id
+                ),
+                evidence,
+            )
+    if evidence is None:
+        blockers.append("EVIDENCE_WINDOW_UNAVAILABLE")
+    else:
+        evidence_payload = evidence.get("payload")
+        evidence_payload = evidence_payload if isinstance(evidence_payload, Mapping) else {}
+        exact_strategy = _rolling_identity_value(evidence, "strategy_version_id") or _rolling_identity_value(
+            evidence_payload, "strategy_version_id"
+        )
+        exact_candidate = _rolling_identity_value(evidence, "candidate_id", "candidate") or _rolling_identity_value(
+            evidence_payload, "candidate_id", "candidate"
+        )
+        exact_trial = _rolling_identity_value(evidence, "research_trial_id", "trial_id") or _rolling_identity_value(
+            evidence_payload, "research_trial_id", "trial_id"
+        )
+        exact_digest = _rolling_identity_value(evidence, "evidence_digest", "digest") or _rolling_identity_value(
+            evidence_payload, "evidence_digest", "digest"
+        )
+        source_class = _rolling_identity_value(evidence, "source_class") or _rolling_identity_value(
+            evidence_payload, "source_class"
+        )
+        if not exact_strategy or exact_strategy != strategy_id:
+            blockers.append("EVIDENCE_STRATEGY_MISMATCH")
+        if not exact_candidate or exact_candidate != candidate_id:
+            blockers.append("EVIDENCE_CANDIDATE_MISMATCH")
+        if not exact_trial or exact_trial != trial_id:
+            blockers.append("EVIDENCE_TRIAL_MISMATCH")
+        if not source_class:
+            blockers.append("EVIDENCE_SOURCE_CLASS_REQUIRED")
+        if not exact_digest or not digest or exact_digest != digest:
+            blockers.append("EVIDENCE_DIGEST_MISMATCH")
+
+    return not blockers, list(dict.fromkeys(blockers))[:32]
 def _operator_value_missing(value: Any) -> bool:
     return value is None or (isinstance(value, str) and not value.strip())
 def _operator_signal_projection(value: Any) -> dict[str, Any] | None:
@@ -1146,6 +1439,7 @@ class OperatorControlPlane:
             initialize=False,
             settings=self.settings,
         )
+        self._research_processor = AutonomousResearchProcessor(self.store, clock=utc_now)
     def risk_settings_snapshot(self) -> dict[str, Any]:
         """Return the bounded persisted active/draft risk settings projection."""
         snapshot = self.settings.snapshot()
@@ -1190,6 +1484,355 @@ class OperatorControlPlane:
             raise OperatorControlError("RISK_SETTINGS_ACTIVATE_FAILED")
         return dict(projected)
 
+
+    def rolling_portfolio_state(self) -> dict[str, Any]:
+        """Return persisted rolling state without mutating read/status paths."""
+        state_loader = getattr(self.store, "load_portfolio_review_state", None)
+        state = state_loader() if callable(state_loader) else None
+        result = dict(state) if isinstance(state, Mapping) else {}
+        selection_loader = getattr(self.store, "load_current_portfolio_selection", None)
+        loaded_selection = selection_loader() if callable(selection_loader) else None
+        selection = (
+            dict(loaded_selection)
+            if isinstance(loaded_selection, Mapping)
+            else (
+                dict(result.get("selection"))
+                if isinstance(result.get("selection"), Mapping)
+                else {}
+            )
+        )
+        if selection:
+            result["selection"] = dict(selection)
+            result.setdefault(
+                "portfolio_selection_id",
+                selection.get("portfolio_selection_id", selection.get("selection_id")),
+            )
+            members_value = selection.get("members", selection.get("selected_members", ()))
+            members = (
+                list(members_value)
+                if isinstance(members_value, (list, tuple))
+                else []
+            )
+            result.setdefault("k", selection.get("k", len(members)))
+            result.setdefault("actual", len(members))
+        else:
+            members = []
+
+        get_config = getattr(self.store, "get_operator_config", None)
+        active = get_config("rolling_admission_policy_active", {}) if callable(get_config) else {}
+        active = dict(active) if isinstance(active, Mapping) else {}
+        if active:
+            result["active_policy"] = dict(active)
+            result.setdefault("policy", dict(active))
+            result.setdefault(
+                "risk",
+                {
+                    key: active.get(key)
+                    for key in (
+                        "risk_config_id",
+                        "risk_config_generation",
+                        "risk_config_hash",
+                    )
+                    if active.get(key) is not None
+                },
+            )
+        reviewed = get_config("rolling_admission_policy_review", {}) if callable(get_config) else {}
+        for label, value in (("active", active), ("reviewed", reviewed)):
+            if not isinstance(value, Mapping):
+                continue
+            try:
+                identity = _rolling_policy_identity(value)
+            except OperatorControlError as exc:
+                identity = {
+                    "status": "INVALID",
+                    "blocker": exc.code,
+                }
+            else:
+                identity.update(
+                    {
+                        "reviewed_at": value.get("reviewed_at"),
+                        "active_at": value.get("active_at"),
+                        "status": value.get("status") or value.get("review_status"),
+                    }
+                )
+            result[f"{label}_policy_identity"] = identity
+            result[f"{label}_policy"] = dict(value)
+
+        # ``actual_k`` remains the persisted-member count.  Actionability is a
+        # separate, fail-closed projection of the runtime funded-member gate.
+        result.setdefault("actual_k", result.get("actual", 0))
+        evidence_loader = getattr(self.store, "list_strategy_evidence_windows", None)
+        actionable_count = 0
+        blocker_rows: list[dict[str, Any]] = []
+        reason_counts: dict[str, int] = {}
+        for index, raw_member in enumerate(members[:64]):
+            if not isinstance(raw_member, Mapping):
+                reasons = ["MEMBER_MAPPING_REQUIRED"]
+                member_id = ""
+                status = ""
+                actionable = False
+            else:
+                actionable, reasons = _rolling_actionability(
+                    raw_member,
+                    selection,
+                    active,
+                    evidence_loader if callable(evidence_loader) else None,
+                )
+                member_id = _rolling_identity_value(raw_member, "strategy_version_id")[:256]
+                status = _rolling_text(raw_member.get("status")).upper()[:32]
+            if actionable:
+                actionable_count += 1
+                continue
+            for reason in reasons:
+                if len(reason_counts) >= 32 and reason not in reason_counts:
+                    continue
+                reason_counts[reason] = reason_counts.get(reason, 0) + 1
+            if len(blocker_rows) < 32:
+                blocker_rows.append(
+                    {
+                        "index": index,
+                        "strategy_version_id": member_id,
+                        "status": status,
+                        "blockers": reasons[:16],
+                    }
+                )
+        result["actionable"] = actionable_count
+        result["actionable_blockers"] = blocker_rows
+        result["actionable_reasons"] = reason_counts
+        result.setdefault(
+            "controller_status",
+            str(result.get("status") or ("CURRENT" if selection else "COLD_START")).upper(),
+        )
+        result.setdefault("paper_only", True)
+        result.setdefault("live_execution", False)
+        result.setdefault("execution_authority", False)
+
+        return result
+    def _rolling_risk_binding(self) -> dict[str, Any]:
+        snapshot = self.risk_settings_snapshot()
+        active = snapshot.get("active") if isinstance(snapshot, Mapping) else {}
+        active = active if isinstance(active, Mapping) else {}
+        config_id = str(
+            snapshot.get("config_id") or active.get("config_id") or ""
+        ).strip()
+        config_hash = str(
+            snapshot.get("config_hash") or active.get("config_hash") or ""
+        ).strip()
+        try:
+            generation = int(snapshot.get("generation") or active.get("generation") or 0)
+        except (TypeError, ValueError):
+            generation = 0
+        if not config_id or not config_hash or generation <= 0:
+            raise OperatorControlError("ACTIVE_RISK_CONFIG_REQUIRED")
+        return {
+            "risk_config_id": config_id,
+            "risk_config_generation": generation,
+            "risk_config_hash": config_hash,
+            "active_risk_config_id": config_id,
+            "active_risk_config_generation": generation,
+            "active_risk_config_hash": config_hash,
+        }
+
+    def review_rolling_admission_policy(
+        self,
+        values: Mapping[str, Any] | None = None,
+        *,
+        actor: str = "operator",
+    ) -> dict[str, Any]:
+        """Persist an immutable policy review tied to the current active risk."""
+        if values is not None and not isinstance(values, Mapping):
+            raise OperatorControlError("ROLLING_POLICY_REQUIRED")
+        raw = dict(values or {})
+        actor_value = _safe_identifier(actor, "actor")
+        binding = self._rolling_risk_binding()
+        base = dict(raw)
+        nested = base.get("policy")
+        nested_mapping = (
+            nested.as_dict()
+            if isinstance(nested, RollingAdmissionPolicy)
+            else nested
+            if isinstance(nested, Mapping)
+            else {}
+        )
+        if nested_mapping:
+            # Nested policy documents are the custom-policy source of truth.
+            # Flatten them before parsing so stale outer aliases cannot create
+            # an identity conflict or be persisted beside the canonical shape.
+            policy_input = {key: value for key, value in base.items() if key != "policy"}
+            policy_input.update(dict(nested_mapping))
+            policy_input.pop("policy", None)
+            for canonical, aliases in (
+                ("policy_id", ("policy_id", "id")),
+                ("version", ("version", "policy_version")),
+                ("config_hash", ("config_hash",)),
+            ):
+                selected = next(
+                    (
+                        nested_mapping.get(alias)
+                        for alias in aliases
+                        if nested_mapping.get(alias) is not None
+                        and str(nested_mapping.get(alias)).strip()
+                    ),
+                    None,
+                )
+                if selected is None:
+                    selected = next(
+                        (
+                            base.get(alias)
+                            for alias in aliases
+                            if base.get(alias) is not None and str(base.get(alias)).strip()
+                        ),
+                        None,
+                    )
+                for alias in aliases:
+                    policy_input.pop(alias, None)
+                if selected is not None:
+                    policy_input[canonical] = selected
+        else:
+            policy_input = dict(base)
+            policy_input.pop("policy", None)
+        for canonical, aliases in (
+            ("policy_id", ("policy_id", "id")),
+            ("version", ("version", "policy_version")),
+            ("config_hash", ("config_hash",)),
+        ):
+            selected = next(
+                (
+                    policy_input.get(alias)
+                    for alias in aliases
+                    if policy_input.get(alias) is not None
+                    and str(policy_input.get(alias)).strip()
+                ),
+                None,
+            )
+            for alias in aliases:
+                policy_input.pop(alias, None)
+            if selected is not None:
+                policy_input[canonical] = selected
+        if not str(policy_input.get("policy_id") or "").strip():
+            policy_input["policy_id"] = "rolling-default"
+        if not str(policy_input.get("version") or policy_input.get("policy_version") or "").strip():
+            policy_input["version"] = "rolling-admission-v1"
+        try:
+            policy = RollingAdmissionPolicy.from_mapping(policy_input)
+        except (TypeError, ValueError) as exc:
+            raise OperatorControlError("ROLLING_POLICY_INVALID", str(exc)) from exc
+        reviewed_at = utc_now().isoformat()
+        policy_document = policy.as_dict()
+        document = {
+            **policy_document,
+            **binding,
+            "reviewed_at": reviewed_at,
+            "reviewed_by": actor_value,
+            "review_status": "REVIEWED",
+            "paper_only": True,
+        }
+        # Admission policy rows are immutable.  Persist only the canonical
+        # policy document; review/risk metadata belongs to operator config and
+        # must not make a pre-seeded policy look like a different identity.
+        self.store.save_admission_policy(policy_document)
+        self.store.set_operator_config(
+            "rolling_admission_policy_review",
+            {
+                "policy_id": policy.policy_id,
+                "version": policy.version,
+                "policy_version": policy.version,
+                "config_hash": policy.config_hash,
+                **binding,
+                "reviewed_at": reviewed_at,
+                "reviewed_by": actor_value,
+                "status": "REVIEWED",
+                "paper_only": True,
+            },
+        )
+        processor_review = getattr(self._research_processor, "review_rolling_portfolio", None)
+        result = (
+            processor_review(now=utc_now(), force=True)
+            if callable(processor_review)
+            else self.rolling_portfolio_state()
+        )
+        return {
+            "policy": _safe_value(document),
+            "review": _safe_value(result) if isinstance(result, Mapping) else {},
+            "status": "REVIEWED",
+            "paper_only": True,
+            "live_execution": False,
+        }
+
+    def activate_rolling_admission_policy(
+        self,
+        policy_id: Any,
+        policy_version: Any,
+        *,
+        actor: str = "operator",
+    ) -> dict[str, Any]:
+        """Activate only a previously reviewed immutable policy/risk binding."""
+        policy_value = _safe_identifier(policy_id, "policy ID")
+        version_value = _safe_identifier(policy_version, "policy version")
+        actor_value = _safe_identifier(actor, "actor")
+        binding = self._rolling_risk_binding()
+        reviewed = self.store.get_operator_config("rolling_admission_policy_review", {})
+        if not isinstance(reviewed, Mapping):
+            raise OperatorControlError("ROLLING_POLICY_REVIEW_REQUIRED")
+        try:
+            reviewed_identity = _rolling_policy_identity(reviewed)
+        except OperatorControlError as exc:
+            raise OperatorControlError("ROLLING_POLICY_REVIEW_INVALID", str(exc)) from exc
+        if (
+            reviewed_identity["policy_id"] != policy_value
+            or reviewed_identity["version"] != version_value
+            or str(reviewed.get("status") or reviewed.get("review_status") or "").upper()
+            != "REVIEWED"
+            or any(reviewed.get(key) != binding.get(key) for key in binding)
+        ):
+            raise OperatorControlError("ROLLING_POLICY_REVIEW_STALE")
+        policy = self.store.load_admission_policy(policy_value, version_value)
+        if not isinstance(policy, Mapping):
+            raise OperatorControlError("ROLLING_POLICY_NOT_FOUND")
+        try:
+            persisted_identity = _rolling_policy_identity(policy)
+        except OperatorControlError as exc:
+            raise OperatorControlError("ROLLING_POLICY_INVALID", str(exc)) from exc
+        if persisted_identity != reviewed_identity:
+            raise OperatorControlError("ROLLING_POLICY_REVIEW_STALE")
+        reviewed_at = str(reviewed.get("reviewed_at") or "").strip()
+        if not reviewed_at:
+            raise OperatorControlError("ROLLING_POLICY_REVIEW_INVALID")
+        active_at = utc_now().isoformat()
+        active = {
+            "policy_id": persisted_identity["policy_id"],
+            "version": persisted_identity["version"],
+            "policy_version": persisted_identity["version"],
+            "config_hash": persisted_identity["config_hash"],
+            **binding,
+            "reviewed_at": reviewed_at,
+            "active_at": active_at,
+            # Preserve the pre-cutover names for read-only clients while
+            # keeping the canonical identity above singular and exact.
+            "activated_at": active_at,
+            "activated_by": actor_value,
+            "status": "ACTIVE",
+            "paper_only": True,
+        }
+        self.store.set_operator_config("rolling_admission_policy_active", active)
+        job_saver = getattr(self.store, "set_operator_job", None)
+        if callable(job_saver):
+            try:
+                job_saver(
+                    "rolling_admission_policy_active",
+                    "ACTIVE",
+                    active,
+                    resumable=True,
+                )
+            except TypeError:
+                job_saver("rolling_admission_policy_active", "ACTIVE", active)
+        return {
+            "policy": _safe_value(policy),
+            "active": active,
+            "status": "ACTIVE",
+            "paper_only": True,
+            "live_execution": False,
+        }
 
     def _cached_pid_matches_node(self, pid: int) -> bool:
         """Bound the Windows CIM/process identity work used by status reads."""
@@ -2030,6 +2673,17 @@ class OperatorControlPlane:
         if isinstance(effective_settings, Mapping):
             canary_status["risk_limits"] = dict(effective_settings)
             canary_status["risk_envelope"] = dict(effective_settings)
+        try:
+            rolling_state = self.rolling_portfolio_state()
+        except Exception as exc:
+            rolling_state = {
+                "status": "ERROR",
+                "blocker": type(exc).__name__.upper(),
+            }
+        rolling_worker = worker("rolling-portfolio")
+        rolling_worker["scheduled"] = True
+        rolling_worker["paper_only"] = True
+        rolling_worker["live_execution"] = False
         canary_submit = (
             "AUTONOMOUS_WORKER"
             if autonomous_state.get("enabled")
@@ -2049,6 +2703,8 @@ class OperatorControlPlane:
             "paper": {**worker("paper-engine"), "read_only": True, "live_execution": False},
             "research": worker("research-engine"),
             "autonomous_canary_worker": worker_status,
+            "rolling_portfolio": dict(rolling_state),
+            "rolling_portfolio_worker": rolling_worker,
             "market_scope_funnel": market_scope_funnel,
             "credentials": credentials,
             "canary": {
@@ -2103,12 +2759,16 @@ class OperatorControlPlane:
         confirm: str = "",
         payload: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
-        action_value = str(action or "").strip()
+        requested_action_value = str(action or "").strip()
+        action_value = _ACTION_ALIASES.get(
+            requested_action_value,
+            requested_action_value,
+        )
         target_value = str(target or "").strip()
         if payload is not None and not isinstance(payload, Mapping):
             return {
                 "ok": False,
-                "action": action_value,
+                "action": requested_action_value,
                 "target": target_value,
                 "reason": "INVALID_ACTION_PAYLOAD",
                 "paper_only": True,
@@ -2123,7 +2783,7 @@ class OperatorControlPlane:
                 if duplicate is not None:
                     return {
                         "ok": False,
-                        "action": action_value,
+                        "action": requested_action_value,
                         "target": target_value,
                         "action_id": action_id,
                         "action_status": "RUNNING",
@@ -2151,6 +2811,23 @@ class OperatorControlPlane:
                     action_payload.get("expected_generation"),
                     "RISK_SETTINGS_GENERATION_REQUIRED",
                 )
+            elif action_value == "rolling.admission.review":
+                allowed = {"policy", "values", "actor"}
+                if set(action_payload) - allowed:
+                    raise OperatorControlError("UNSUPPORTED_ROLLING_POLICY_FIELDS")
+                policy_values = action_payload.get("policy", action_payload.get("values"))
+                if policy_values is not None and not isinstance(policy_values, Mapping):
+                    raise OperatorControlError("ROLLING_POLICY_REQUIRED")
+            elif action_value == "rolling.admission.activate":
+                allowed = {"policy_id", "policy_version", "actor"}
+                if set(action_payload) - allowed:
+                    raise OperatorControlError("UNSUPPORTED_ROLLING_POLICY_FIELDS")
+                if not isinstance(action_payload.get("policy_id"), str):
+                    raise OperatorControlError("ROLLING_POLICY_ID_REQUIRED")
+                if not isinstance(action_payload.get("policy_version"), str):
+                    raise OperatorControlError("ROLLING_POLICY_VERSION_REQUIRED")
+                _safe_identifier(action_payload["policy_id"], "policy ID")
+                _safe_identifier(action_payload["policy_version"], "policy version")
             if action_value == RECOVERY_ACTION:
                 allowed = {"event_id", "signal_id", "exchange_order_id"}
                 if set(action_payload) - allowed:
@@ -2186,6 +2863,10 @@ class OperatorControlPlane:
                 target_value = _safe_identifier(
                     action_payload.get("config_id"),
                     "risk settings config ID",
+                )
+            if action_value == "rolling.admission.activate":
+                target_value = (
+                    f"{action_payload['policy_id']}:{action_payload['policy_version']}"
                 )
             if action_value in {"canary.eligibility.verify", "canary.eligibility.mark", "canary.generate_signal", "canary.arm"}:
                 target_value = _safe_identifier(target_value, "candidate ID")
@@ -2242,6 +2923,21 @@ class OperatorControlPlane:
                         action_payload["config_id"],
                         actor=action_payload.get("actor", "operator"),
                         expected_generation=action_payload.get("expected_generation"),
+                    )
+                }
+            elif action_value == "rolling.admission.review":
+                result = {
+                    "rolling_policy": self.review_rolling_admission_policy(
+                        action_payload.get("policy", action_payload.get("values")),
+                        actor=action_payload.get("actor", "operator"),
+                    )
+                }
+            elif action_value == "rolling.admission.activate":
+                result = {
+                    "rolling_policy": self.activate_rolling_admission_policy(
+                        action_payload["policy_id"],
+                        action_payload["policy_version"],
+                        actor=action_payload.get("actor", "operator"),
                     )
                 }
             elif action_value == RECOVERY_ACTION:
@@ -2454,7 +3150,7 @@ class OperatorControlPlane:
             audit_id = self._audit(action_value, target_value, success=True, result=public)
             response = {
                 "ok": True,
-                "action": action_value,
+                "action": requested_action_value,
                 "target": target_value,
                 "action_id": action_id or audit_id,
                 "action_status": "COMPLETE",
@@ -2479,7 +3175,7 @@ class OperatorControlPlane:
         )
         failure = {
             "ok": False,
-            "action": action_value,
+            "action": requested_action_value,
             "target": target_value,
             "action_id": action_id,
             "action_status": "FAILED" if action_id else None,
