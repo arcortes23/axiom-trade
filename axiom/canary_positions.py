@@ -1092,6 +1092,7 @@ def _submission_fence(
     expected_generation: int,
     config_id: str,
     expected_control_generation: int,
+    expected_credential_fingerprint: str | None = None,
 ) -> None:
     """Re-read control/settings immediately before an exit transmission."""
     _settings_fence(service, expected_generation, config_id)
@@ -1105,6 +1106,8 @@ def _submission_fence(
         raise CanaryBlocked("CANARY_CONTROL_CORRUPT")
     if current != int(expected_control_generation):
         raise CanaryBlocked("CANARY_CONTROL_CHANGED")
+    if expected_credential_fingerprint is not None:
+        service.require_current_credential_binding(expected_credential_fingerprint)
 _REQUEST_NONDEGRADABLE = frozenset(
     {
         "FILLED",
@@ -1986,7 +1989,7 @@ def _reserve_exit(service: CanaryService, *, request_id: str, lot: Mapping[str, 
 def submit_exit(service: CanaryService, position_id: str, venue: Any, *, expected_generation: int, config_id: str, allow_test_venue: bool = False) -> Mapping[str, Any]:
     """Submit one bounded SELL for an AXIOM-owned, reconciled lot."""
     service = _service(service)
-    service.require_current_credential_binding()
+    expected_credential_fingerprint = service.require_current_credential_binding()
     _check_venue(venue, allow_test_venue=allow_test_venue)
     _ensure_schema(service)
     now = ensure_utc(service.clock())
@@ -2108,6 +2111,7 @@ def submit_exit(service: CanaryService, position_id: str, venue: Any, *, expecte
             expected_generation=int(expected_generation),
             config_id=str(config_id),
             expected_control_generation=control_generation,
+            expected_credential_fingerprint=expected_credential_fingerprint,
         )
         with service.store._lock:
             row = _connection(service).execute(
@@ -2152,8 +2156,10 @@ def submit_exit(service: CanaryService, position_id: str, venue: Any, *, expecte
                 expected_generation=int(expected_generation),
                 config_id=str(config_id),
                 expected_control_generation=control_generation,
+                expected_credential_fingerprint=expected_credential_fingerprint,
             )
             on_send_started()
+            service.require_current_credential_binding(expected_credential_fingerprint)
             return _call(
                 test_submit,
                 token_id=token_id,
@@ -2172,6 +2178,7 @@ def submit_exit(service: CanaryService, position_id: str, venue: Any, *, expecte
             size=quantity,
             before_post=before_post,
             on_send_started=on_send_started,
+            expected_credential_fingerprint=expected_credential_fingerprint,
         )
 
     def persist_submission_failure(status: str, error: str) -> None:
@@ -2238,6 +2245,8 @@ def submit_exit(service: CanaryService, position_id: str, venue: Any, *, expecte
             "CANARY_BALANCE_UNAVAILABLE",
             "INSUFFICIENT_BALANCE",
             "CREDENTIALS_NOT_CONFIGURED",
+            "CREDENTIAL_BINDING_MISSING",
+            "CREDENTIAL_BINDING_MISMATCH",
             "UNSUPPORTED_POLYMARKET_SDK",
             "OFFICIAL_POLYMARKET_SDK_NOT_INSTALLED",
             "OFFICIAL_POLYMARKET_SDK_NOT_READONLY_COMPATIBLE",

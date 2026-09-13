@@ -5774,9 +5774,18 @@ class CanaryService:
         ):
             raise CanaryBlocked("CREDENTIAL_BINDING_MISMATCH")
         return persisted
-    def require_current_credential_binding(self) -> str:
+    def require_current_credential_binding(
+        self,
+        expected_fingerprint: str | None = None,
+    ) -> str:
         """Load current credentials and require the durable control binding."""
         _, current_fingerprint = self._load_credential_binding()
+        if expected_fingerprint is not None:
+            expected = _valid_credential_fingerprint(expected_fingerprint)
+            if expected is None or not hmac.compare_digest(
+                expected, current_fingerprint
+            ):
+                raise CanaryBlocked("CREDENTIAL_BINDING_MISMATCH")
         try:
             with self.store._lock:
                 row = self.store.connection.execute(
@@ -11022,7 +11031,7 @@ class CanaryService:
         ) -> Mapping[str, Any]:
             def before_post() -> None:
                 enforce_submission_fence(required_status="SUBMITTING")
-                final_submission_fence()
+                final_submission_fence(expected_credential_fingerprint)
                 fresh_id, fresh_generation, _ = self._settings_identity()
                 if (
                     fresh_id != request_settings_config_id
@@ -11046,6 +11055,7 @@ class CanaryService:
                 size=size,
                 before_post=before_post,
                 on_send_started=mark_send_started,
+                expected_credential_fingerprint=expected_credential_fingerprint,
             )
         def execution_parameters(
             limits: Mapping[str, Any],
@@ -11261,7 +11271,7 @@ class CanaryService:
             block("UNSUPPORTED_VENUE")
         if not self.credentials.configured(allow_environment=environment):
             block("CREDENTIALS_NOT_CONFIGURED")
-        self.require_current_credential_binding()
+        expected_credential_fingerprint = self.require_current_credential_binding()
         (
             geo,
             context,
@@ -11720,7 +11730,9 @@ class CanaryService:
 
         submitted_at = ensure_utc(self.clock())
 
-        def final_submission_fence() -> None:
+        def final_submission_fence(
+            expected_fingerprint: str,
+        ) -> None:
             """Re-read every persisted authority immediately before posting."""
             with self.store._lock:
                 if connection.in_transaction:
@@ -11862,6 +11874,7 @@ class CanaryService:
                     if connection.in_transaction:
                         connection.rollback()
                     raise
+            self.require_current_credential_binding(expected_fingerprint)
 
         def external_submission() -> Mapping[str, Any]:
             nonlocal network_send_started
@@ -11884,7 +11897,7 @@ class CanaryService:
             # official sink. ``allow_test_venue`` changes transport identity,
             # never the control, signal, scope, risk, or expiry guarantees.
             enforce_submission_fence(required_status="SUBMITTING")
-            final_submission_fence()
+            final_submission_fence(expected_credential_fingerprint)
             fresh_id, fresh_generation, _ = self._settings_identity()
             if (
                 fresh_id != request_settings_config_id
@@ -11895,6 +11908,7 @@ class CanaryService:
                 if submission_cancelled.is_set():
                     block("CANARY_SUBMISSION_TIMEOUT")
                 network_send_started = True
+            self.require_current_credential_binding(expected_credential_fingerprint)
             return venue.submit_limit_order(
                 token_id=resolved_asset_id,
                 side=side.upper(),
@@ -12211,6 +12225,8 @@ class CanaryService:
                     "CANARY_SPENDER_UNAVAILABLE",
                     "INSUFFICIENT_BALANCE",
                     "CREDENTIALS_NOT_CONFIGURED",
+                    "CREDENTIAL_BINDING_MISSING",
+                    "CREDENTIAL_BINDING_MISMATCH",
                     "CLOB_API_CREDENTIALS_NOT_CONFIGURED",
                     "CLOB_API_CREDENTIALS_INVALID",
                     "OFFICIAL_POLYMARKET_SDK_NOT_INSTALLED",
@@ -12296,6 +12312,7 @@ class CanaryService:
         size: Decimal,
         before_post: Callable[[], None],
         on_send_started: Callable[[], None],
+        expected_credential_fingerprint: str | None = None,
     ) -> Mapping[str, Any]:
         """Submit one already-fenced owned-position order through the SDK.
 
@@ -12323,6 +12340,15 @@ class CanaryService:
             for name in _SECRET_NAMES
         }
         current_fingerprint = credential_fingerprint(normalized_values)
+        if expected_credential_fingerprint is not None:
+            expected = _valid_credential_fingerprint(expected_credential_fingerprint)
+            if expected is None or not hmac.compare_digest(
+                expected, current_fingerprint
+            ):
+                raise CanaryBlocked("CREDENTIAL_BINDING_MISMATCH")
+        submission_fingerprint = (
+            expected_credential_fingerprint or current_fingerprint
+        )
         control_row = self.store.connection.execute(
             "SELECT credential_fingerprint FROM canary_control WHERE singleton=1"
         ).fetchone()
@@ -12378,6 +12404,7 @@ class CanaryService:
             # Recheck after transitioning the timeout state and immediately
             # before the irreversible transport call.
             before_post()
+            self.require_current_credential_binding(submission_fingerprint)
             try:
                 response = client.post_order(signed)
             except CanaryBlocked:

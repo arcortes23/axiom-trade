@@ -2420,6 +2420,72 @@ class CanaryTests(unittest.TestCase):
         self.assertEqual(result["execution_status"], "MATCHED")
         self.assertEqual(result["status"], "matched")
         self.assertEqual(len(posted), 1)
+    def test_shared_signed_post_rechecks_credential_rotation_before_sink(self):
+        class RotatingCredentials(FakeCredentials):
+            def __init__(self):
+                super().__init__(True)
+                self.removed = False
+
+            def load(self, **kwargs):
+                return {} if self.removed else super().load(**kwargs)
+
+        credentials = RotatingCredentials()
+        self.service.credentials = credentials
+        self.arm()
+        expected = self.service.require_current_credential_binding()
+
+        class SDKClient:
+            def __init__(self):
+                self.post_calls = []
+                self._ctx = {"environment_config": {"exchange_v3": "0xexchange-v3"}}
+
+            def create_limit_order(self, **kwargs):
+                return {"maker_amount": "1000000"}
+
+            def get_balance_allowance(self, **kwargs):
+                return {
+                    "balance": "2500000",
+                    "allowances": {"0xexchange-v3": "1000000"},
+                }
+
+            def post_order(self, signed):
+                self.post_calls.append(signed)
+                return {"ok": True, "order_id": "stable-order", "status": "matched"}
+
+            def close(self):
+                pass
+
+        client = SDKClient()
+
+        class SecureClient:
+            @staticmethod
+            def _create(**kwargs):
+                return client
+
+        sdk = SimpleNamespace(ApiKeyCreds=FakeApiKeyCreds, SecureClient=SecureClient)
+
+        def rotate_before_post():
+            credentials.removed = True
+
+        with patch.dict(sys.modules, {"polymarket": sdk}), patch.object(
+            PolymarketClobV2Venue,
+            "installed_sdk_version",
+            return_value="0.9.0",
+        ):
+            with self.assertRaisesRegex(CanaryBlocked, "CREDENTIALS_NOT_CONFIGURED"):
+                self.service.submit_position_order(
+                    market_version="v2",
+                    neg_risk=False,
+                    asset_id="position-yes",
+                    side="BUY",
+                    price=Decimal("0.50"),
+                    size=Decimal("1"),
+                    expected_credential_fingerprint=expected,
+                    before_post=rotate_before_post,
+                    on_send_started=lambda: None,
+                )
+
+        self.assertEqual(client.post_calls, [])
 
     def test_official_trade_settlement_status_is_preserved(self):
         calls: list[dict[str, object]] = []
