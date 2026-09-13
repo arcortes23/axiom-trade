@@ -985,6 +985,58 @@ class CanaryPositionManagementTests(unittest.TestCase):
         self.assertEqual(row["settlement"], "TERMINAL")
         self.assertNotIn("legacy_migration", json.loads(row["evidence_json"]))
 
+    def test_legacy_terminal_status_without_settlement_is_quarantined(self) -> None:
+        from axiom.canary_positions import (
+            LEGACY_ENTRY_NON_RESUMABLE,
+            _ensure_schema,
+        )
+
+        with self.store.connection:
+            self.store.connection.execute(
+                "INSERT INTO canary_ledger("
+                "event_id,signal_id,timestamp,candidate_id,venue,market_id,token_id,"
+                "side,requested_notional,paper_expected_price,max_price,submitted_quantity,"
+                "exchange_order_id,fill_quantity,actual_average_price,fees,status,evidence_json,"
+                "control_generation) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    "terminal-status-no-settlement",
+                    "terminal-status-signal",
+                    self.now.isoformat(),
+                    "candidate-1",
+                    "polymarket",
+                    "market-1",
+                    "terminal-token",
+                    "BUY",
+                    "0.50",
+                    "0.50",
+                    "0.50",
+                    "1",
+                    "terminal-status-order",
+                    "0",
+                    None,
+                    "0",
+                    "CANCELED",
+                    json.dumps(
+                        {
+                            "market_version": "v2",
+                            "selected_token_id": "terminal-token",
+                        },
+                        sort_keys=True,
+                    ),
+                    int(self.config["control_generation"]),
+                ),
+            )
+        _ensure_schema(self.service)
+        row = self.store.connection.execute(
+            "SELECT status,settlement,evidence_json FROM canary_ledger "
+            "WHERE event_id='terminal-status-no-settlement'"
+        ).fetchone()
+        self.assertIsNotNone(row)
+        assert row is not None
+        self.assertEqual(row["status"], LEGACY_ENTRY_NON_RESUMABLE)
+        self.assertEqual(row["settlement"], "MANUAL_RESOLUTION_REQUIRED")
+        self.assertTrue(json.loads(row["evidence_json"])["non_resumable"])
+
     def test_pending_sell_blank_or_malformed_price_is_non_resumable(self) -> None:
         from axiom.canary_positions import _ensure_schema, LEGACY_REQUEST_NON_RESUMABLE
 

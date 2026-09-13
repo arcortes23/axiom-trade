@@ -228,6 +228,7 @@ from .canary import (
     CanaryBlocked,
     CanaryService,
     PolymarketClobV2Venue,
+    _account_trade_binding,
     _call_with_timeout,
     _canonical_exchange_order_id,
     _validate_trade_history_coverage,
@@ -638,12 +639,8 @@ def _migrate_legacy_entry_rows(service: CanaryService, connection: Any) -> None:
     for source in rows:
         row = dict(source)
         evidence = _decode(row.get("evidence_json"))
-        current_status = str(row.get("status") or "").strip().upper()
         current_settlement = str(row.get("settlement") or "").strip().upper()
-        terminal_record = (
-            current_status in (_TERMINAL | _FINAL_SETTLEMENT | {"TRADE_STATUS_SETTLED"})
-            or current_settlement == "TERMINAL"
-        )
+        terminal_record = current_settlement == "TERMINAL"
         normalized, reason = _legacy_entry_identity(row, evidence)
         if normalized is None:
             if terminal_record:
@@ -1223,6 +1220,26 @@ def _trade_id(trade: Mapping[str, Any], order_id: str, index: int) -> str:
     return str(value)
 
 
+def _account_trade_projection(
+    trade: Mapping[str, Any],
+    expected_order_id: Any,
+) -> Mapping[str, Any]:
+    """Project one fill onto the exact account order role and economics."""
+    binding = _account_trade_binding(trade, expected_order_id)
+    if binding is None:
+        raise CanaryBlocked("CANARY_TRADE_IDENTITY_CONFLICT")
+    projected = dict(trade)
+    projected["account_order_side"] = binding["account_order_side"]
+    maker_order = binding.get("maker_order")
+    if maker_order is not None:
+        for field in ("asset_id", "price", "size", "fee_rate_bps", "fee"):
+            if field in maker_order:
+                projected[field] = maker_order[field]
+            else:
+                projected.pop(field, None)
+        projected["quantity"] = maker_order["size"]
+    return projected
+
 def _trade_quantity(trade: Mapping[str, Any]) -> Decimal:
     return max(ZERO, _decimal(_value(
         trade,
@@ -1735,52 +1752,23 @@ def _validate_venue_identity(
         raise CanaryBlocked("CANARY_ORDER_QUANTITY_CONFLICT")
 
     aggregate_quantity = ZERO
-    for trade in trades:
-        def order_alias_values(names: Sequence[str]) -> list[str]:
-            values: list[str] = []
-            for name in names:
-                if not isinstance(trade, Mapping) or name not in trade:
-                    continue
-                canonical = _canonical_exchange_order_id(trade.get(name))
-                if canonical is None:
-                    raise CanaryBlocked("CANARY_TRADE_IDENTITY_UNAVAILABLE")
-                values.append(canonical)
-            return values
-
-        direct_order_values = order_alias_values(
-            ("order_id", "orderId", "exchange_order_id")
-        )
-        taker_order_values = order_alias_values(
-            ("taker_order_id", "takerOrderId")
-        )
-        if len(set(direct_order_values)) > 1 or len(set(taker_order_values)) > 1:
+    for raw_trade in trades:
+        if not isinstance(raw_trade, Mapping):
+            raise CanaryBlocked("CANARY_TRADE_RESPONSE_INVALID")
+        trade = _account_trade_projection(raw_trade, expected_order)
+        binding = _account_trade_binding(trade, expected_order)
+        if binding is None:
             raise CanaryBlocked("CANARY_TRADE_IDENTITY_CONFLICT")
-        maker_raw = mapping_value(trade, "maker_order_ids", "makerOrderIds")
-        maker_order_values: list[str] = []
-        if maker_raw is not None:
-            if not isinstance(maker_raw, Sequence) or isinstance(
-                maker_raw, (str, bytes, bytearray)
-            ):
-                raise CanaryBlocked("CANARY_TRADE_IDENTITY_CONFLICT")
-            for maker_order_id in maker_raw:
-                canonical = _canonical_exchange_order_id(maker_order_id)
-                if canonical is None or canonical in maker_order_values:
-                    raise CanaryBlocked("CANARY_TRADE_IDENTITY_CONFLICT")
-                maker_order_values.append(canonical)
+        direct_order_values = binding["direct_order_ids"]
+        taker_order_values = binding["taker_order_ids"]
+        maker_order_values = binding["maker_order_ids"]
         if not (
             expected_order in direct_order_values
             or expected_order in taker_order_values
             or expected_order in maker_order_values
         ):
-            if not direct_order_values and not taker_order_values and not maker_order_values:
-                raise CanaryBlocked("CANARY_TRADE_IDENTITY_UNAVAILABLE")
             raise CanaryBlocked("CANARY_TRADE_IDENTITY_CONFLICT")
-        observed_trade_side = _identity_alias(
-            trade,
-            ("side", "order_side"),
-            missing="CANARY_TRADE_IDENTITY_UNAVAILABLE",
-            conflict="CANARY_TRADE_IDENTITY_CONFLICT",
-        ).upper()
+        observed_trade_side = binding["account_order_side"]
         observed_trade_token, observed_trade_asset = observed_identity(
             trade,
             missing="CANARY_TRADE_IDENTITY_UNAVAILABLE",
@@ -2331,6 +2319,10 @@ def _reconcile_entry_ledger(service: CanaryService, venue: Any, now: datetime) -
                 expected_market_version=market_version,
                 expected_price=row.get("max_price"),
             )
+            raw_trades = [
+                _account_trade_projection(trade, order_id)
+                for trade in raw_trades
+            ]
             failed_trade = any(
                 str(_value(trade, "status", "state", default="")).upper()
                 in {"FAILED", "TRADE_STATUS_FAILED"}
@@ -3241,6 +3233,10 @@ def _apply_reconciled_request(service: CanaryService, request: Mapping[str, Any]
         lot=lot_context,
         prior_request_quantity=current_request.get("filled_quantity"),
     )
+    trades = [
+        _account_trade_projection(trade, order_id)
+        for trade in trades
+    ]
     order_status = _order_status(order)
     entry_quantity = _decimal(lot_context["quantity"], ZERO)
     entry_cost_basis = _decimal(lot_context["cost_basis"], ZERO)
@@ -3510,6 +3506,10 @@ def _apply_reconciled_request(service: CanaryService, request: Mapping[str, Any]
                     lot=lot_context,
                     prior_request_quantity=current_request.get("filled_quantity"),
                 )
+                trades = [
+                    _account_trade_projection(trade, current_order_id)
+                    for trade in trades
+                ]
                 request_status_before = str(
                     current_request.get("status") or ""
                 ).strip().upper()

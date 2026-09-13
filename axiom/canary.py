@@ -391,6 +391,288 @@ def _canonical_exchange_order_id(value: Any) -> str | None:
     return text if _ORDER_ID_PATTERN.fullmatch(text) is not None else None
 
 
+def _trade_alias_values(
+    source: Any,
+    names: Sequence[str],
+    *,
+    canonical_order_id: bool = False,
+) -> tuple[bool, list[str]]:
+    """Return present alias values while rejecting malformed aliases."""
+    present = False
+    values: list[str] = []
+    for name in names:
+        raw = _sdk_value(source, name, _UNSET)
+        if raw is _UNSET:
+            continue
+        present = True
+        if canonical_order_id:
+            canonical = _canonical_exchange_order_id(raw)
+            if canonical is None:
+                raise CanaryBlocked("CANARY_TRADE_IDENTITY_CONFLICT")
+            text = canonical
+        else:
+            text = str(raw or "").strip()
+            if not text:
+                raise CanaryBlocked("CANARY_TRADE_IDENTITY_UNAVAILABLE")
+        values.append(text)
+    if len(set(values)) > 1:
+        raise CanaryBlocked("CANARY_TRADE_IDENTITY_CONFLICT")
+    return present, values
+
+
+def _trade_side_alias(
+    source: Any,
+    names: Sequence[str],
+    *,
+    required: bool,
+) -> str | None:
+    present, values = _trade_alias_values(source, names)
+    if not values:
+        if present or required:
+            raise CanaryBlocked("CANARY_TRADE_IDENTITY_UNAVAILABLE")
+        return None
+    side = values[0].upper()
+    if side not in {"BUY", "SELL"}:
+        raise CanaryBlocked("CANARY_TRADE_IDENTITY_CONFLICT")
+    return side
+
+
+def _normalize_nested_maker_orders(
+    source: Any,
+) -> tuple[list[str], list[dict[str, Any]] | None]:
+    """Normalize maker order IDs and nested side/economic evidence."""
+    id_aliases: list[tuple[str, list[str]]] = []
+    for name in ("maker_order_ids", "makerOrderIds"):
+        raw = _sdk_value(source, name, _UNSET)
+        if raw is _UNSET:
+            continue
+        if not isinstance(raw, Sequence) or isinstance(
+            raw, (str, bytes, bytearray)
+        ):
+            raise CanaryBlocked("CANARY_TRADE_IDENTITY_CONFLICT")
+        normalized: list[str] = []
+        for value in raw:
+            canonical = _canonical_exchange_order_id(value)
+            if canonical is None or canonical in normalized:
+                raise CanaryBlocked("CANARY_TRADE_IDENTITY_CONFLICT")
+            normalized.append(canonical)
+        id_aliases.append((name, normalized))
+    if len(id_aliases) == 2 and id_aliases[0][1] != id_aliases[1][1]:
+        raise CanaryBlocked("CANARY_TRADE_IDENTITY_CONFLICT")
+    maker_ids = id_aliases[0][1] if id_aliases else []
+
+    order_aliases: list[tuple[str, list[dict[str, Any]]]] = []
+    for name in ("maker_orders", "makerOrders"):
+        raw = _sdk_value(source, name, _UNSET)
+        if raw is _UNSET:
+            continue
+        if not isinstance(raw, Sequence) or isinstance(
+            raw, (str, bytes, bytearray)
+        ):
+            raise CanaryBlocked("CANARY_TRADE_IDENTITY_CONFLICT")
+        normalized_orders: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        for maker_order in raw:
+            _, order_ids = _trade_alias_values(
+                maker_order,
+                ("order_id", "orderId", "id", "exchange_order_id"),
+                canonical_order_id=True,
+            )
+            if not order_ids:
+                raise CanaryBlocked("CANARY_TRADE_IDENTITY_UNAVAILABLE")
+            order_id = order_ids[0]
+            if order_id in seen_ids:
+                raise CanaryBlocked("CANARY_TRADE_IDENTITY_CONFLICT")
+            side = _trade_side_alias(
+                maker_order, ("side", "order_side"), required=True
+            )
+            assert side is not None
+            normalized_order: dict[str, Any] = {
+                "order_id": order_id,
+                "side": side,
+            }
+            for output_name, aliases, numeric in (
+                (
+                    "asset_id",
+                    ("asset_id", "assetId", "asset", "token_id", "tokenId"),
+                    False,
+                ),
+                (
+                    "price",
+                    ("price", "execution_price", "executionPrice"),
+                    True,
+                ),
+                (
+                    "size",
+                    (
+                        "matched_amount",
+                        "matchedAmount",
+                        "matched_size",
+                        "matchedSize",
+                        "size",
+                        "quantity",
+                        "qty",
+                        "amount",
+                    ),
+                    True,
+                ),
+                (
+                    "fee_rate_bps",
+                    ("fee_rate_bps", "feeRateBps", "fee_rate", "feeRate"),
+                    True,
+                ),
+                (
+                    "fee",
+                    ("fee", "fees", "fee_amount", "commission"),
+                    True,
+                ),
+            ):
+                _present, values = _trade_alias_values(maker_order, aliases)
+                if not values:
+                    continue
+                if numeric:
+                    try:
+                        parsed = Decimal(values[0])
+                    except (ArithmeticError, TypeError, ValueError):
+                        raise CanaryBlocked(
+                            "CANARY_TRADE_IDENTITY_CONFLICT"
+                        ) from None
+                    if not parsed.is_finite() or parsed < 0:
+                        raise CanaryBlocked("CANARY_TRADE_IDENTITY_CONFLICT")
+                normalized_order[output_name] = values[0]
+            normalized_orders.append(normalized_order)
+            seen_ids.add(order_id)
+        order_aliases.append((name, normalized_orders))
+    if len(order_aliases) == 2:
+        first_ids = [row["order_id"] for row in order_aliases[0][1]]
+        second_ids = [row["order_id"] for row in order_aliases[1][1]]
+        if first_ids != second_ids or order_aliases[0][1] != order_aliases[1][1]:
+            raise CanaryBlocked("CANARY_TRADE_IDENTITY_CONFLICT")
+    maker_orders = order_aliases[0][1] if order_aliases else None
+    nested_ids = (
+        [row["order_id"] for row in maker_orders]
+        if maker_orders is not None
+        else []
+    )
+    if maker_orders is not None:
+        if maker_ids and maker_ids != nested_ids:
+            raise CanaryBlocked("CANARY_TRADE_IDENTITY_CONFLICT")
+        maker_ids = nested_ids
+    return maker_ids, maker_orders
+
+
+def _account_trade_binding(
+    trade: Any,
+    expected_order_id: Any,
+    *,
+    allow_missing_account_side: bool = False,
+) -> dict[str, Any] | None:
+    """Resolve one account trade's exact role and account-side evidence."""
+    direct_present, direct_values = _trade_alias_values(
+        trade,
+        ("order_id", "orderId", "exchange_order_id"),
+        canonical_order_id=True,
+    )
+    taker_present, taker_values = _trade_alias_values(
+        trade,
+        ("taker_order_id", "takerOrderId"),
+        canonical_order_id=True,
+    )
+    top_ids = list(dict.fromkeys(direct_values + taker_values))
+    if len(top_ids) > 1:
+        raise CanaryBlocked("CANARY_TRADE_IDENTITY_CONFLICT")
+    maker_ids, maker_orders = _normalize_nested_maker_orders(trade)
+    _role_present, role_values = _trade_alias_values(
+        trade, ("trader_side", "traderSide")
+    )
+    role = role_values[0].upper() if role_values else None
+    if role not in {None, "MAKER", "TAKER"}:
+        raise CanaryBlocked("CANARY_TRADE_IDENTITY_CONFLICT")
+    top_side = _trade_side_alias(trade, ("side", "order_side"), required=False)
+    account_side = _trade_side_alias(
+        trade, ("account_order_side", "accountOrderSide"), required=False
+    )
+    expected = _canonical_exchange_order_id(expected_order_id)
+    if expected is None:
+        raise CanaryBlocked("CANARY_ORDER_IDENTITY_UNAVAILABLE")
+    in_top = expected in top_ids
+    matching_makers = [
+        maker for maker in (maker_orders or ()) if maker["order_id"] == expected
+    ]
+    in_maker = bool(matching_makers or expected in maker_ids)
+    resolved_side: str | None = None
+    maker_order: dict[str, Any] | None = None
+    if role == "MAKER":
+        if in_top and in_maker:
+            raise CanaryBlocked("CANARY_TRADE_IDENTITY_CONFLICT")
+        if not in_maker:
+            return None
+        if len(matching_makers) != 1:
+            raise CanaryBlocked("CANARY_TRADE_IDENTITY_UNAVAILABLE")
+        maker_order = matching_makers[0]
+        if any(
+            field not in maker_order
+            for field in ("asset_id", "price", "size", "fee_rate_bps")
+        ):
+            raise CanaryBlocked("CANARY_TRADE_IDENTITY_UNAVAILABLE")
+        resolved_side = maker_order["side"]
+    elif role == "TAKER":
+        if in_top and in_maker:
+            raise CanaryBlocked("CANARY_TRADE_IDENTITY_CONFLICT")
+        if not in_top:
+            if in_maker:
+                raise CanaryBlocked("CANARY_TRADE_IDENTITY_CONFLICT")
+            return None
+        if top_side is None and not allow_missing_account_side:
+            raise CanaryBlocked("CANARY_TRADE_IDENTITY_UNAVAILABLE")
+        resolved_side = top_side
+    else:
+        if in_top == in_maker:
+            if not in_top:
+                return None
+            raise CanaryBlocked("CANARY_TRADE_IDENTITY_CONFLICT")
+        if in_top:
+            if top_side is None and not allow_missing_account_side:
+                raise CanaryBlocked("CANARY_TRADE_IDENTITY_UNAVAILABLE")
+            resolved_side = top_side
+        else:
+            if len(matching_makers) != 1:
+                # Legacy transports exposed only maker_order_ids.  When the
+                # requested association is otherwise unambiguous, their
+                # account-side field remains authoritative.
+                if (
+                    maker_orders is None
+                    and expected in maker_ids
+                    and top_side is not None
+                ):
+                    resolved_side = top_side
+                else:
+                    raise CanaryBlocked("CANARY_TRADE_IDENTITY_UNAVAILABLE")
+            else:
+                maker_order = matching_makers[0]
+                if any(
+                    field not in maker_order
+                    for field in ("asset_id", "price", "size", "fee_rate_bps")
+                ):
+                    raise CanaryBlocked("CANARY_TRADE_IDENTITY_UNAVAILABLE")
+                resolved_side = maker_order["side"]
+        if maker_order is not None:
+            resolved_side = maker_order["side"]
+    if account_side is not None and account_side != resolved_side:
+        raise CanaryBlocked("CANARY_TRADE_IDENTITY_CONFLICT")
+    return {
+        "role": role,
+        "direct_order_ids": direct_values,
+        "taker_order_ids": taker_values,
+        "maker_order_ids": maker_ids,
+        "maker_orders": maker_orders,
+        "maker_order": maker_order,
+        "top_side": top_side,
+        "account_order_side": resolved_side,
+        "direct_present": direct_present,
+        "taker_present": taker_present,
+    }
+
 def _is_explicit_rejection_code(value: Any) -> bool:
     return (
         isinstance(value, str)
@@ -1080,33 +1362,41 @@ def _read_only_operation(
                             "account_address",
                         ),
                     )
-                    maker_orders = _sdk_value(value, "maker_orders", ())
-                    maker_order_ids: list[str] = []
-                    if isinstance(maker_orders, Sequence) and not isinstance(
-                        maker_orders, (str, bytes, bytearray)
-                    ):
-                        maker_order_ids = [
-                            str(identifier)
-                            for maker_order in maker_orders
-                            if (
-                                identifier := _sdk_value(
-                                    maker_order, "order_id", None
-                                )
-                            ) is not None
-                        ]
-                        if maker_order_ids:
-                            record["maker_order_ids"] = maker_order_ids
+                    maker_order_ids, normalized_maker_orders = (
+                        _normalize_nested_maker_orders(value)
+                    )
+                    if maker_order_ids:
+                        record["maker_order_ids"] = maker_order_ids
+                    if normalized_maker_orders is not None:
+                        record["maker_orders"] = normalized_maker_orders
                     if order_id is not None:
-                        requested_order_id = str(order_id)
-                        direct_order_id = (
-                            record.get("taker_order_id") or record.get("order_id")
+                        binding = _account_trade_binding(
+                            value,
+                            str(order_id),
+                            allow_missing_account_side=True,
                         )
-                        if (
-                            str(direct_order_id or "") != requested_order_id
-                            and requested_order_id not in maker_order_ids
-                        ):
+                        if binding is None:
                             sequence += 1
                             continue
+                        if binding["account_order_side"] is not None:
+                            record["account_order_side"] = binding[
+                                "account_order_side"
+                            ]
+                        maker_order = binding.get("maker_order")
+                        if maker_order is not None:
+                            # Account-facing economics come from the exact
+                            # nested maker order, never the top-level taker.
+                            for field in (
+                                "asset_id",
+                                "price",
+                                "size",
+                                "fee_rate_bps",
+                                "fee",
+                            ):
+                                if field in maker_order:
+                                    record[field] = maker_order[field]
+                                else:
+                                    record.pop(field, None)
                     durable_id = record.get("trade_id") or record.get("id")
                     if durable_id is not None:
                         record["trade_id"] = str(durable_id)
@@ -8298,20 +8588,30 @@ class CanaryService:
         safe_trade_count = 0
         trade_provenance: list[dict[str, Any]] = []
         for trade in trades:
-            direct_trade_order_id = trade_order_id(trade)
-            maker_order_ids = mapping_value(
-                trade, "maker_order_ids", "makerOrderIds"
+            binding = _account_trade_binding(trade, exchange_order_id)
+            if binding is None:
+                raise CanaryBlocked("CANARY_RECOVERY_TRADE_ORDER_ID_MISMATCH")
+            maker_order = binding.get("maker_order")
+            if maker_order is not None:
+                trade = dict(trade)
+                trade["account_order_side"] = binding["account_order_side"]
+                for field in (
+                    "asset_id",
+                    "price",
+                    "size",
+                    "fee_rate_bps",
+                    "fee",
+                ):
+                    if field in maker_order:
+                        trade[field] = maker_order[field]
+                    else:
+                        trade.pop(field, None)
+                trade["quantity"] = maker_order["size"]
+            bound_order_ids = set(
+                binding["direct_order_ids"]
+                + binding["taker_order_ids"]
+                + binding["maker_order_ids"]
             )
-            bound_order_ids = {
-                str(identifier).strip()
-                for identifier in (
-                    [direct_trade_order_id] + list(maker_order_ids)
-                    if isinstance(maker_order_ids, Sequence)
-                    and not isinstance(maker_order_ids, (str, bytes, bytearray))
-                    else [direct_trade_order_id]
-                )
-                if str(identifier or "").strip()
-            }
             if exchange_order_id not in bound_order_ids:
                 raise CanaryBlocked("CANARY_RECOVERY_TRADE_ORDER_ID_MISMATCH")
             observed_trade_token, observed_trade_asset = observed_identity(trade)
@@ -8339,7 +8639,7 @@ class CanaryService:
             trade_state = str(
                 mapping_value(trade, "status", "state") or ""
             ).strip().upper()
-            if trade_side(trade) != "BUY":
+            if binding["account_order_side"] != "BUY":
                 raise CanaryBlocked("CANARY_RECOVERY_TRADE_SIDE_MISMATCH")
             try:
                 trade_price_value = trade_price(trade)
