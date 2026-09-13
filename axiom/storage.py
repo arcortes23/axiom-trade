@@ -4676,6 +4676,68 @@ class AxiomStore:
             for row in rows
             if (state := self.load_dataset_bootstrap_state(row["dataset_id"])) is not None
         ]
+    def list_dataset_bootstrap_states_dashboard(self, *, limit: int = 20) -> list[dict[str, Any]]:
+        """Return bootstrap card fields without hydrating persisted payloads."""
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+            raise ValueError("limit must be a non-negative integer")
+        fields = (
+            ("selected_symbol", "$.selected_symbol"),
+            ("symbol", "$.symbol"),
+            ("instrument", "$.instrument"),
+            ("timeframe", "$.timeframe"),
+            ("status", "$.status"),
+            ("requested_start", "$.requested_start"),
+            ("requested_end", "$.requested_end"),
+            ("next_timestamp", "$.next_timestamp"),
+            ("progress", "$.progress"),
+            ("progress_fraction", "$.progress_fraction"),
+            ("errors", "$.errors"),
+            ("dataset_id", "$.dataset_id"),
+        )
+        paths = ",".join(repr(path) for _, path in fields)
+        query = (
+            "SELECT dataset_id,provider,instrument,market_type,timeframe,requested_start,"
+            "requested_end,next_timestamp,base_version,status,updated_at,"
+            "json_extract(CASE WHEN json_valid(payload_json) THEN payload_json ELSE '{}' END,"
+            f"{paths}) AS projected_fields_json "
+            "FROM dataset_bootstrap_state ORDER BY updated_at DESC,dataset_id DESC LIMIT ?"
+        )
+        with self._lock:
+            rows = self._conn.execute(query, (int(limit),)).fetchall()
+
+        def decode(value: Any) -> Any:
+            try:
+                return json.loads(value) if value is not None else None
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return None
+
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            values = decode(row["projected_fields_json"])
+            values = values if isinstance(values, list) else []
+            payload = {
+                key: value
+                for (key, _), value in zip(fields, values)
+                if value is not None
+            }
+            result.append(
+                {
+                    **payload,
+                    "dataset_id": row["dataset_id"],
+                    "provider": row["provider"],
+                    "instrument": row["instrument"],
+                    "market_type": row["market_type"],
+                    "timeframe": row["timeframe"],
+                    "requested_start": row["requested_start"],
+                    "requested_end": row["requested_end"],
+                    "next_timestamp": row["next_timestamp"],
+                    "base_version": row["base_version"],
+                    "status": row["status"],
+                    "updated_at": _parse_datetime(row["updated_at"]),
+                }
+            )
+        return result
+
 
     def save_dataset_staging_bars(self, dataset_id: str, bars: Iterable[OHLCVBar]) -> dict[str, int]:
         identifier = str(dataset_id).strip()
@@ -5710,7 +5772,13 @@ class AxiomStore:
             row = self._conn.execute(
                 "SELECT state_json FROM collector_state WHERE collector_name=?", (str(collector_name),)
             ).fetchone()
-        return _load(row["state_json"]) if row else None
+        if row is None:
+            return None
+        try:
+            state = json.loads(row["state_json"])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {}
+        return state if isinstance(state, Mapping) else {}
 
     def set_collector_state(self, collector_name: str, state: Mapping[str, Any]) -> None:
         with self._write_context():
@@ -5724,7 +5792,13 @@ class AxiomStore:
             row = self._conn.execute(
                 "SELECT state_json FROM scheduler_state WHERE scheduler_name=?", (str(scheduler_name),)
             ).fetchone()
-        return _load(row["state_json"]) if row else None
+        if row is None:
+            return None
+        try:
+            state = json.loads(row["state_json"])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {}
+        return state if isinstance(state, Mapping) else {}
 
     def set_scheduler_state(self, scheduler_name: str, state: Mapping[str, Any]) -> None:
         if not str(scheduler_name).strip() or not isinstance(state, Mapping):
@@ -5930,13 +6004,16 @@ class AxiomStore:
             if row["last_result_json"] is not None:
                 raw_last_result = row["last_result_json"]
                 try:
-                    loaded = _load(raw_last_result)
-                except (TypeError, ValueError):
+                    loaded = json.loads(raw_last_result)
+                except (TypeError, ValueError, json.JSONDecodeError):
                     loaded = raw_last_result
                 payload["last_result"] = loaded
             if row["qualified_json"] is not None:
-                loaded = _load(row["qualified_json"])
-                payload["qualified_candidate_ids"] = loaded
+                try:
+                    loaded = json.loads(row["qualified_json"])
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    loaded = []
+                payload["qualified_candidate_ids"] = loaded if isinstance(loaded, list) else []
             if row["trial_count"] is not None:
                 payload["_trial_count"] = int(row["trial_count"] or 0)
                 payload["_completed_trial_count"] = int(row["completed_trial_count"] or 0)
@@ -6156,11 +6233,11 @@ class AxiomStore:
                 "experiment_id": row["experiment_id"],
                 "strategy_hash": row["strategy_hash"],
                 "model_hash": row["model_hash"],
-                "config": _load(row["config_json"]),
+                "config": json.loads(row["config_json"]),
                 "start_timestamp": _parse_datetime(row["start_timestamp"]),
                 "bankroll": float(row["bankroll"]),
-                "allowed_markets": _load(row["allowed_markets_json"]),
-                "risk_limits": _load(row["risk_limits_json"]),
+                "allowed_markets": json.loads(row["allowed_markets_json"]),
+                "risk_limits": json.loads(row["risk_limits_json"]),
                 "quality": row["quality"],
                 "created_at": _parse_datetime(row["created_at"]),
             }
@@ -7065,7 +7142,7 @@ class AxiomStore:
                 "collector_name": row["collector_name"],
                 "started_at": _parse_datetime(row["started_at"]),
                 "ended_at": _parse_datetime(row["ended_at"]),
-                "payload": _load(row["payload_json"]),
+                "payload": json.loads(row["payload_json"]),
                 "created_at": _parse_datetime(row["created_at"]),
             }
             for row in rows
@@ -7370,6 +7447,163 @@ class AxiomStore:
         with self._lock:
             rows = self._conn.execute(query, values).fetchall()
         return [_research_queue_record(row) for row in rows]
+    def list_research_items_dashboard(
+        self,
+        *,
+        status: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """Project queue rows without materializing their JSON documents."""
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+            raise ValueError("limit must be a non-negative integer")
+        clauses = ""
+        values: list[Any] = []
+        if status is not None:
+            clauses = " WHERE status=?"
+            values.append(str(status).upper())
+        payload_fields = (
+            ("candidate_id", "$.candidate_id"),
+            ("dataset_id", "$.dataset_id"),
+            ("dataset_version", "$.dataset_version"),
+            ("market_id", "$.market_id"),
+            ("source_type", "$.source_type"),
+            ("experiment_family", "$.experiment_family"),
+            ("strategy_id", "$.strategy_id"),
+            ("hypothesis_id", "$.hypothesis_id"),
+            ("plan_id", "$.plan_id"),
+            ("plan_hash", "$.plan_hash"),
+            ("forward_test_id", "$.forward_test_id"),
+            ("paper_observation_intent_id", "$.paper_observation_intent_id"),
+            ("stage", "$.stage"),
+            ("blocker", "$.blocker"),
+            ("reason_code", "$.reason_code"),
+            ("market_scope_hash", "$.market_scope_hash"),
+            ("market_scope_version", "$.market_scope_version"),
+            ("dataset_selector", "$.dataset_selector"),
+            ("experiment_plan", "$.experiment_plan"),
+            ("provenance", "$.provenance"),
+            ("market_scope", "$.market_scope"),
+        )
+        result_fields = (
+            ("accepted", "$.accepted"),
+            ("candidate_id", "$.candidate_id"),
+            ("dataset_id", "$.dataset_id"),
+            ("dataset_version", "$.dataset_version"),
+            ("source_type", "$.source_type"),
+            ("experiment_family", "$.experiment_family"),
+            ("strategy_id", "$.strategy_id"),
+            ("hypothesis_id", "$.hypothesis_id"),
+            ("plan_id", "$.plan_id"),
+            ("plan_hash", "$.plan_hash"),
+            ("forward_test_id", "$.forward_test_id"),
+            ("paper_observation_intent_id", "$.paper_observation_intent_id"),
+            ("stage", "$.stage"),
+            ("blocker", "$.blocker"),
+            ("reason_code", "$.reason_code"),
+            ("reason", "$.reason"),
+            ("validation_expectancy", "$.validation_expectancy"),
+            ("validation_sample_count", "$.validation_sample_count"),
+            ("validation_trade_count", "$.validation_trade_count"),
+            ("raw_observations", "$.raw_observations"),
+            ("sample_count", "$.sample_count"),
+            ("trade_count", "$.trade_count"),
+            ("min_samples", "$.min_samples"),
+            ("min_trades", "$.min_trades"),
+            ("required_samples", "$.required_samples"),
+            ("required_trades", "$.required_trades"),
+            ("dataset_selector", "$.dataset_selector"),
+            ("experiment_plan", "$.experiment_plan"),
+            ("minimum_sample_check", "$.minimum_sample_check"),
+            ("validation", "$.validation"),
+            ("forward_evidence", "$.forward_evidence"),
+            ("historical_evidence", "$.historical_evidence"),
+        )
+        payload_paths = ",".join(repr(path) for _, path in payload_fields)
+        result_paths = ",".join(repr(path) for _, path in result_fields)
+        query = (
+            "SELECT item_id,item_type,dedupe_key,status,priority,source,author,"
+            "schema_version,created_at,updated_at,available_at,lease_until,lease_owner,"
+            "attempts,last_error,"
+            "json_extract(CASE WHEN json_valid(payload_json) THEN payload_json ELSE '{}' END,"
+            f"{payload_paths}) AS payload_fields_json,"
+            "json_extract(CASE WHEN json_valid(result_json) THEN result_json ELSE '{}' END,"
+            f"{result_paths}) AS result_fields_json,"
+            "COALESCE((SELECT json_group_array(value) FROM json_each("
+            "CASE WHEN json_valid(result_json) THEN result_json ELSE '{}' END,"
+            "'$.candidate_results') WHERE key<50),'[]') AS candidate_results_json "
+            "FROM research_queue"
+            f"{clauses} ORDER BY priority DESC,created_at,item_id LIMIT ?"
+        )
+        values.append(int(limit))
+        with self._lock:
+            rows = self._conn.execute(query, values).fetchall()
+
+        def decode(value: Any) -> Any:
+            try:
+                return json.loads(value) if value is not None else None
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return None
+
+        def mapping(values_json: Any, fields: Sequence[tuple[str, str]]) -> dict[str, Any]:
+            values = decode(values_json)
+            if not isinstance(values, list):
+                return {}
+            return {
+                key: value
+                for (key, _), value in zip(fields, values)
+                if value is not None
+            }
+
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            payload_values = mapping(row["payload_fields_json"], payload_fields)
+            result_values = mapping(row["result_fields_json"], result_fields)
+            for target, source in (
+                (payload_values, "dataset_selector"),
+                (payload_values, "experiment_plan"),
+                (payload_values, "provenance"),
+                (payload_values, "market_scope"),
+            ):
+                decoded = decode(target.get(source))
+                if decoded is not None:
+                    target[source] = decoded
+            for target, source in (
+                (result_values, "dataset_selector"),
+                (result_values, "experiment_plan"),
+                (result_values, "minimum_sample_check"),
+                (result_values, "validation"),
+                (result_values, "forward_evidence"),
+                (result_values, "historical_evidence"),
+            ):
+                decoded = decode(target.get(source))
+                if decoded is not None:
+                    target[source] = decoded
+            candidates = decode(row["candidate_results_json"])
+            if isinstance(candidates, list):
+                result_values["candidate_results"] = candidates
+            result.append(
+                {
+                    "item_id": row["item_id"],
+                    "item_type": row["item_type"],
+                    "dedupe_key": row["dedupe_key"],
+                    "status": row["status"],
+                    "priority": int(row["priority"] or 0),
+                    "payload": payload_values,
+                    "result": result_values,
+                    "source": row["source"],
+                    "author": row["author"],
+                    "schema_version": row["schema_version"],
+                    "created_at": _parse_datetime(row["created_at"]),
+                    "updated_at": _parse_datetime(row["updated_at"]),
+                    "available_at": _parse_datetime(row["available_at"]),
+                    "lease_until": _parse_datetime(row["lease_until"]),
+                    "lease_owner": row["lease_owner"],
+                    "attempts": int(row["attempts"] or 0),
+                    "last_error": row["last_error"],
+                }
+            )
+        return result
+
 
     def research_queue_stats(self) -> dict[str, int]:
         with self._lock:
@@ -7540,7 +7774,11 @@ class AxiomStore:
             else None
         )
 
-        scheduler_state = _load(scheduler_row["state_json"]) if scheduler_row is not None else {}
+        scheduler_state = (
+            json.loads(scheduler_row["state_json"])
+            if scheduler_row is not None and scheduler_row["state_json"]
+            else {}
+        )
         scheduler_state = scheduler_state if isinstance(scheduler_state, Mapping) else {}
 
         def _safe_job_id(value: Any) -> str | None:
@@ -7567,7 +7805,7 @@ class AxiomStore:
         if not trigger:
             trigger = "after_each_collection"
         worker_payload = (
-            _load(worker_row["payload_json"])
+            json.loads(worker_row["payload_json"])
             if worker_row is not None and worker_row["payload_json"]
             else {}
         )
@@ -7580,7 +7818,11 @@ class AxiomStore:
             or scheduler_state.get("last_run_at")
         )
 
-        budget_payload = _load(budget_row["payload_json"]) if budget_row is not None else {}
+        budget_payload = (
+            json.loads(budget_row["payload_json"])
+            if budget_row is not None and budget_row["payload_json"]
+            else {}
+        )
         budget_payload = budget_payload if isinstance(budget_payload, Mapping) else {}
 
         def _nonnegative_int(value: Any, default: int = 0) -> int:
@@ -7898,11 +8140,13 @@ class AxiomStore:
         # authority, not every historical reevaluation.
         query = (
             "WITH ranked AS ("
-            "SELECT r.*,ROW_NUMBER() OVER (PARTITION BY candidate_id "
+            "SELECT candidate_id,status,reason,scope_hash,scope_version,resolved_at,resolution_id,"
+            "ROW_NUMBER() OVER (PARTITION BY candidate_id "
             "ORDER BY resolved_at DESC,resolution_id DESC) AS row_number "
-            "FROM market_scope_resolutions AS r "
+            "FROM market_scope_resolutions "
             + clauses
-            + ") SELECT * FROM ranked WHERE row_number=1 "
+            + ") SELECT candidate_id,status,reason,scope_hash,scope_version,resolved_at,resolution_id "
+            "FROM ranked WHERE row_number=1 "
             "ORDER BY resolved_at DESC,resolution_id DESC LIMIT ?"
         )
         values.append(int(limit))
@@ -8121,6 +8365,92 @@ class AxiomStore:
             }
             for row in rows
         ]
+
+    def list_candidate_lifecycle_dashboard(self, *, limit: int = 50) -> list[dict[str, Any]]:
+        """Return candidate card/progress fields without loading full payloads."""
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+            raise ValueError("limit must be a non-negative integer")
+        fields = (
+            ("candidate_id", "$.candidate_id"),
+            ("strategy_id", "$.strategy_id"),
+            ("experiment_family", "$.experiment_family"),
+            ("family", "$.family"),
+            ("market_type", "$.market_type"),
+            ("market", "$.market"),
+            ("dataset_id", "$.dataset_id"),
+            ("dataset_version", "$.dataset_version"),
+            ("plan_hash", "$.plan_hash"),
+            ("frozen_hash", "$.frozen_hash"),
+            ("qualification_hash", "$.qualification_hash"),
+            ("stage", "$.stage"),
+            ("blocker", "$.blocker"),
+            ("reason_code", "$.reason_code"),
+            ("validation_sample_count", "$.validation_sample_count"),
+            ("validation_trade_count", "$.validation_trade_count"),
+            ("raw_observations", "$.raw_observations"),
+            ("sample_count", "$.sample_count"),
+            ("trade_count", "$.trade_count"),
+            ("required_samples", "$.required_samples"),
+            ("required_trades", "$.required_trades"),
+            ("dataset_selector", "$.dataset_selector"),
+            ("dataset_provenance", "$.dataset_provenance"),
+            ("provenance", "$.provenance"),
+            ("market_scope", "$.market_scope"),
+            ("experiment_plan", "$.experiment_plan"),
+            ("minimum_sample_check", "$.minimum_sample_check"),
+            ("validation", "$.validation"),
+            ("forward_evidence", "$.forward_evidence"),
+            ("historical_evidence", "$.historical_evidence"),
+        )
+        paths = ",".join(repr(path) for _, path in fields)
+        query = (
+            "SELECT candidate_id,stage,updated_at,"
+            "json_extract(CASE WHEN json_valid(payload_json) THEN payload_json ELSE '{}' END,"
+            f"{paths}) AS projected_fields_json "
+            "FROM candidate_lifecycle ORDER BY updated_at DESC,candidate_id ASC LIMIT ?"
+        )
+        with self._lock:
+            rows = self._conn.execute(query, (int(limit),)).fetchall()
+
+        def decode(value: Any) -> Any:
+            try:
+                return json.loads(value) if value is not None else None
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return None
+
+        nested = {
+            "dataset_selector",
+            "dataset_provenance",
+            "provenance",
+            "market_scope",
+            "experiment_plan",
+            "minimum_sample_check",
+            "validation",
+            "forward_evidence",
+            "historical_evidence",
+        }
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            values = decode(row["projected_fields_json"])
+            values = values if isinstance(values, list) else []
+            payload = {
+                key: value
+                for (key, _), value in zip(fields, values)
+                if value is not None
+            }
+            for key in nested:
+                decoded = decode(payload.get(key))
+                if decoded is not None:
+                    payload[key] = decoded
+            result.append(
+                {
+                    "candidate_id": row["candidate_id"],
+                    "stage": row["stage"],
+                    "payload": payload,
+                    "updated_at": _parse_datetime(row["updated_at"]),
+                }
+            )
+        return result
 
     def load_candidate_lifecycle_page(
         self,
@@ -9131,6 +9461,121 @@ class AxiomStore:
             "heartbeat_at": _parse_datetime(row["heartbeat_at"]),
             "updated_at": _parse_datetime(row["updated_at"]),
         }
+
+
+    def list_worker_states_dashboard(self, *, limit: int = 32) -> list[dict[str, Any]]:
+        """Return worker liveness scalars without transferring raw payloads.
+
+        Worker diagnostics are append-only JSON and may contain multi-megabyte
+        histories.  Overview cards only need scalar liveness/progress fields,
+        so extract those fields in SQLite and never materialize ``payload_json``
+        in the dashboard process.
+        """
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+            raise ValueError("limit must be a non-negative integer")
+        scalar_fields = (
+            ("worker_identity_valid", "$.worker_identity_valid"),
+            ("stale_after_seconds", "$.stale_after_seconds"),
+            ("degrading_reason", "$.degrading_reason"),
+            ("reason_code", "$.reason_code"),
+            ("last_error", "$.last_error"),
+            ("grade", "$.grade"),
+            ("configured_interval_seconds", "$.configured_interval_seconds"),
+            ("effective_collection_cadence_seconds", "$.effective_collection_cadence_seconds"),
+            ("last_cycle_duration_seconds", "$.last_cycle_duration_seconds"),
+            ("last_cycle_started_at", "$.last_cycle_started_at"),
+            ("last_cycle_ended_at", "$.last_cycle_ended_at"),
+            ("last_cycle_markets_attempted", "$.last_cycle_markets_attempted"),
+            ("last_cycle_markets_successful", "$.last_cycle_markets_successful"),
+            ("last_cycle_markets_failed", "$.last_cycle_markets_failed"),
+            ("last_successful_collection_at", "$.last_successful_collection_at"),
+            ("last_successful_tick", "$.last_successful_tick"),
+            ("next_scheduled_collection_at", "$.next_scheduled_collection_at"),
+            ("worker_heartbeat_at", "$.worker_heartbeat_at"),
+            ("collection_errors", "$.collection_errors"),
+            ("stale_market_count", "$.stale_market_count"),
+            ("gap_count", "$.gap_count"),
+            ("markets_attempted", "$.markets_attempted"),
+            ("markets_successful", "$.markets_successful"),
+            ("markets_failed", "$.markets_failed"),
+            ("passes", "$.passes"),
+            ("queue_items_processed", "$.queue_items_processed"),
+            ("processed_candidates", "$.processed_candidates"),
+            ("remaining_candidates", "$.remaining_candidates"),
+            ("worker_status", "$.worker_status"),
+            ("last_tick_at", "$.last_tick_at"),
+            ("last_tick_started_at", "$.last_tick_started_at"),
+            ("last_tick_completed_at", "$.last_tick_completed_at"),
+            ("last_error_code", "$.last_error_code"),
+            ("consecutive_failures", "$.consecutive_failures"),
+            ("next_retry_at", "$.next_retry_at"),
+            ("candidates_evaluated", "$.candidates_evaluated"),
+            ("signals_generated", "$.signals_generated"),
+            ("orders_attempted", "$.orders_attempted"),
+            ("next_decision", "$.next_decision"),
+            ("blocker", "$.blocker"),
+            ("last_signal_id", "$.last_signal_id"),
+            ("cycle_status", "$.last_cycle.status"),
+            ("cycle_completed_at", "$.last_cycle.completed_at"),
+            ("cycle_ended_at", "$.last_cycle.ended_at"),
+            ("cycle_last_completion_at", "$.last_cycle.last_completion_at"),
+            ("cycle_last_completed_at", "$.last_cycle.last_completed_at"),
+            ("cycle_cycle_ended_at", "$.last_cycle.cycle_ended_at"),
+            ("crypto_enabled", "$.crypto_paper.enabled"),
+            ("crypto_last_error", "$.crypto_paper.last_error"),
+        )
+        projection_paths = ",".join(repr(path) for _, path in scalar_fields)
+        query = (
+            "SELECT worker_name,status,heartbeat_at,updated_at,LENGTH(payload_json) AS payload_bytes,"
+            "json_extract(CASE WHEN LENGTH(payload_json)<=262144 AND json_valid(payload_json) "
+            "THEN payload_json ELSE '{}' END,"
+            f"{projection_paths}) AS projected_fields_json "
+            "FROM worker_state "
+            "ORDER BY CASE WHEN worker_name IN "
+            "('polymarket-collector','paper-engine','research-engine','health-monitor','axiom-node') "
+            "THEN 0 ELSE 1 END,updated_at DESC,worker_name ASC LIMIT ?"
+        )
+        with self._lock:
+            rows = self._conn.execute(query, (int(limit),)).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                values = json.loads(row["projected_fields_json"] or "[]")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                values = []
+            values = values if isinstance(values, list) else []
+            payload = {
+                key: value
+                for (key, _), value in zip(scalar_fields, values)
+                if value is not None
+            }
+            cycle = {
+                key.removeprefix("cycle_"): value
+                for key, _ in scalar_fields
+                for value in (payload.pop(key, None),)
+                if key.startswith("cycle_") and value is not None
+            }
+            if cycle:
+                payload["last_cycle"] = cycle
+            crypto = {
+                key.removeprefix("crypto_"): value
+                for key, _ in scalar_fields
+                for value in (payload.pop(key, None),)
+                if key.startswith("crypto_") and value is not None
+            }
+            if crypto:
+                payload["crypto_paper"] = crypto
+            result.append(
+                {
+                    "worker_name": row["worker_name"],
+                    "status": row["status"],
+                    "payload": payload,
+                    "payload_bytes": int(row["payload_bytes"] or 0),
+                    "heartbeat_at": _parse_datetime(row["heartbeat_at"]),
+                    "updated_at": _parse_datetime(row["updated_at"]),
+                }
+            )
+        return result
 
 
     def list_worker_states(self, *, limit: int = 256) -> list[dict[str, Any]]:
@@ -11302,19 +11747,21 @@ class AxiomStore:
         if isinstance(activity_limit, bool) or not isinstance(activity_limit, int) or not 1 <= activity_limit <= 32:
             raise ValueError("activity_limit must be between 1 and 32")
         count_tables = (
-            ("dataset_catalog", "dataset_catalog"),
-            ("polymarket_snapshots", "polymarket_snapshots"),
-            ("polymarket_trades", "polymarket_trades"),
-            ("collection_errors", "collection_errors"),
-            ("collection_cycles", "collection_cycles"),
-            ("research_queue", "research_queue"),
-            ("candidate_lifecycle", "candidate_lifecycle"),
-            ("reports", "reports"),
-            ("experiments", "experiments"),
-            ("paper_state", "paper_state"),
-            ("paper_observations", "paper_observations"),
-            ("paper_execution_events", "paper_execution_events"),
-            ("paper_bet_ledger", "paper_bet_ledger"),
+            ("dataset_catalog", "dataset_catalog", None),
+            ("polymarket_snapshots", "polymarket_snapshots", "idx_polymarket_snapshots_dashboard"),
+            # Trades are append-only; scanning their payload-bearing table for COUNT(*) makes
+            # a cold dashboard read proportional to the full historical tape.
+            ("polymarket_trades", "polymarket_trades", "__append_only_rowid__"),
+            ("collection_errors", "collection_errors", "idx_collection_errors_observed"),
+            ("collection_cycles", "collection_cycles", "idx_collection_cycles_time"),
+            ("research_queue", "research_queue", None),
+            ("candidate_lifecycle", "candidate_lifecycle", None),
+            ("reports", "reports", None),
+            ("experiments", "experiments", None),
+            ("paper_state", "paper_state", "idx_paper_state_updated"),
+            ("paper_observations", "paper_observations", "idx_paper_observations_dashboard"),
+            ("paper_execution_events", "paper_execution_events", "idx_paper_execution_events_dashboard"),
+            ("paper_bet_ledger", "paper_bet_ledger", None),
         )
         activity_cte = """
             WITH activity(
@@ -11370,10 +11817,18 @@ class AxiomStore:
             )
         """
         with self._lock:
-            counts = {
-                label: int(self._conn.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()["n"])
-                for table, label in count_tables
-            }
+            counts = {}
+            for table, label, index in count_tables:
+                if index == "__append_only_rowid__":
+                    count_row = self._conn.execute(
+                        f"SELECT COALESCE(MAX(rowid),0) AS n FROM {table}"
+                    ).fetchone()
+                else:
+                    source = table if index is None else f"{table} INDEXED BY {index}"
+                    count_row = self._conn.execute(
+                        f"SELECT COUNT(*) AS n FROM {source}"
+                    ).fetchone()
+                counts[label] = int(count_row["n"])
             bars_row = self._conn.execute(
                 "SELECT COALESCE(SUM(row_count),0) AS n FROM dataset_catalog "
                 "WHERE lower(market_type)='crypto_spot'"
@@ -11393,21 +11848,13 @@ class AxiomStore:
             bootstrap_rows = self._conn.execute(
                 "SELECT status,COUNT(*) AS n FROM dataset_bootstrap_state GROUP BY status ORDER BY status"
             ).fetchall()
-            worker_rows = self._conn.execute(
-                "SELECT worker_name,status,payload_json,heartbeat_at,updated_at "
-                "FROM worker_state "
-                "ORDER BY CASE WHEN worker_name IN ('polymarket-collector','paper-engine','research-engine','health-monitor','axiom-node') THEN 0 ELSE 1 END, "
-                "updated_at DESC,worker_name ASC LIMIT 32"
-            ).fetchall()
-            latest_queue_row = self._conn.execute(
-                "SELECT * FROM research_queue ORDER BY updated_at DESC,item_id DESC LIMIT 1"
-            ).fetchone()
             activity_rows = self._conn.execute(
                 f"{activity_cte} SELECT kind,timestamp,event_id,message,details_json,source,source_type,"
                 "status,item_type,market_id FROM activity "
                 "ORDER BY timestamp DESC,event_id ASC LIMIT ?",
                 (activity_limit,),
             ).fetchall()
+        workers = self.list_worker_states_dashboard(limit=32)
         catalog = {
             str(row["source_type"] or "unknown"): {
                 "datasets": int(row["dataset_count"]),
@@ -11417,7 +11864,10 @@ class AxiomStore:
         }
         activity = []
         for row in activity_rows:
-            details = _load(row["details_json"]) if row["details_json"] else {}
+            try:
+                details = json.loads(row["details_json"]) if row["details_json"] else {}
+            except (TypeError, ValueError, json.JSONDecodeError):
+                details = {}
             activity.append(
                 {
                     "kind": row["kind"],
@@ -11432,17 +11882,8 @@ class AxiomStore:
                     "market_id": row["market_id"],
                 }
             )
-        workers = [
-            {
-                "worker_name": row["worker_name"],
-                "status": row["status"],
-                "payload": _load(row["payload_json"]) if row["payload_json"] else {},
-                "heartbeat_at": _parse_datetime(row["heartbeat_at"]),
-                "updated_at": _parse_datetime(row["updated_at"]),
-            }
-            for row in worker_rows
-        ]
-        latest_queue = _research_queue_record(latest_queue_row) if latest_queue_row is not None else None
+        latest_queue_rows = self.list_research_items_dashboard(limit=1)
+        latest_queue = latest_queue_rows[0] if latest_queue_rows else None
         return {
             "counts": counts,
             "catalog": catalog,

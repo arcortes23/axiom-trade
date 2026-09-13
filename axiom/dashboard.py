@@ -2747,6 +2747,49 @@ class DashboardData:
 
 
     @staticmethod
+    def _bounded_health_from_activity(aggregate: Mapping[str, Any] | None) -> dict[str, Any]:
+        """Preserve current collector errors when no persisted health projection exists."""
+        if not isinstance(aggregate, Mapping):
+            return {}
+        activity = aggregate.get("latest_activity")
+        if not isinstance(activity, (list, tuple)):
+            return {}
+        failures: list[dict[str, Any]] = []
+        for item in activity[:32]:
+            if not isinstance(item, Mapping) or str(item.get("kind") or "").lower() != "collection_error":
+                continue
+            details = item.get("details")
+            details = details if isinstance(details, Mapping) else {}
+            failure = {
+                "error_id": item.get("event_id"),
+                "market_id": item.get("market_id"),
+                "observed_at": item.get("timestamp"),
+                "kind": item.get("status") or details.get("kind") or "COLLECTION_ERROR",
+                "detail": details.get("detail") or item.get("message"),
+            }
+            failure["reason_code"] = str(failure["kind"] or "COLLECTION_ERROR").upper()
+            failure["reason"] = str(failure["detail"] or "Current collector failure retained.")
+            failures.append(failure)
+        if not failures:
+            return {}
+        reason = {
+            "code": "CURRENT_COLLECTION_FAILURES",
+            "reason": f"{len(failures)} current collector failure(s) are retained.",
+        }
+        return {
+            "status": "DEGRADED",
+            "grade": "B",
+            "grade_scope": "collector_health",
+            "reason_code": reason["code"],
+            "reasons": [reason],
+            "current_failures": failures,
+            "collection_errors": len(failures),
+            "historical_error_count": 0,
+            "source_type": "FORWARD_COLLECTED",
+        }
+
+
+    @staticmethod
     def _operator_health_fields(
         health: Mapping[str, Any],
     ) -> tuple[str | None, str, Any, list[Any], str | None, str | None, str | None, Any]:
@@ -2893,6 +2936,13 @@ class DashboardData:
                     bounded_limit,
                 )
             )
+
+        dashboard_lister = getattr(self.store, "list_candidate_lifecycle_dashboard", None)
+        if callable(dashboard_lister):
+            try:
+                return bounded_records(dashboard_lister(limit=bounded_limit))
+            except (AttributeError, TypeError, ValueError, sqlite3.Error):
+                pass
 
         paginator = getattr(self.store, "paginate_candidate_lifecycle", None)
         if callable(paginator):
@@ -3462,11 +3512,18 @@ class DashboardData:
     def _bootstrap_progress_rows(self, states: Any | None = None, *, limit: int = 20) -> list[dict[str, Any]]:
         """Expose bounded, per-dataset bootstrap cursors for operator clients."""
         if states is None:
-            states = (
-                self.store.list_dataset_bootstrap_states(limit=20)
-                if self.store is not None and callable(getattr(self.store, "list_dataset_bootstrap_states", None))
-                else []
-            )
+            dashboard_lister = getattr(self.store, "list_dataset_bootstrap_states_dashboard", None)
+            if callable(dashboard_lister):
+                try:
+                    states = dashboard_lister(limit=limit)
+                except (AttributeError, TypeError, ValueError, sqlite3.Error):
+                    states = []
+            else:
+                states = (
+                    self.store.list_dataset_bootstrap_states(limit=limit)
+                    if self.store is not None and callable(getattr(self.store, "list_dataset_bootstrap_states", None))
+                    else []
+                )
         if not isinstance(states, (list, tuple)):
             return []
         rows: list[dict[str, Any]] = []
@@ -4142,7 +4199,12 @@ class DashboardData:
                         return value
             return None
 
-        queue_items = records("list_research_items", limit=_RESEARCH_PROGRESS_LIMIT)
+        queue_method = getattr(self.store, "list_research_items_dashboard", None)
+        queue_items = (
+            records("list_research_items_dashboard", limit=_RESEARCH_PROGRESS_LIMIT)
+            if callable(queue_method)
+            else records("list_research_items", limit=_RESEARCH_PROGRESS_LIMIT)
+        )
         latest_queue = aggregate.get("latest_queue_item")
         if isinstance(latest_queue, Mapping):
             latest_id = text(latest_queue.get("item_id"))
@@ -4512,27 +4574,30 @@ class DashboardData:
         )
 
         scheduler = mapping_call("get_scheduler_state", "hermes-control")
-        exact_worker_method = getattr(self.store, "get_worker_state", None)
-        research_worker: Mapping[str, Any] = {}
-        if callable(exact_worker_method):
-            # Prefer the durable queue boundary, retaining the local engine
-            # name for stores written before the queue worker was introduced.
-            research_worker = mapping_call("get_worker_state", "research-queue")
-            if not research_worker:
-                research_worker = mapping_call("get_worker_state", "research-engine")
 
-        # This bounded page remains necessary for the other worker projections
-        # (notably the collector) and for stores that predate get_worker_state.
-        worker_rows = records("list_worker_states", limit=32)
+        # Keep dashboard worker reads on the bounded SQL projection.  The
+        # generic single-worker accessor decodes the persisted payload in full.
+        worker_method = getattr(self.store, "list_worker_states_dashboard", None)
+        worker_rows = (
+            records("list_worker_states_dashboard", limit=32)
+            if callable(worker_method)
+            else records("list_worker_states", limit=32)
+        )
         worker_map = {
             text(item.get("worker_name")): item
             for item in worker_rows
             if text(item.get("worker_name"))
         }
+        research_worker: Mapping[str, Any] = worker_map.get("research-queue", {})
         if not research_worker:
-            research_worker = worker_map.get("research-queue", {})
-            if not research_worker:
-                research_worker = worker_map.get("research-engine", {})
+            research_worker = worker_map.get("research-engine", {})
+        if not research_worker:
+            exact_worker_method = getattr(self.store, "get_worker_state", None)
+            if callable(exact_worker_method):
+                # Retain compatibility with stores predating the bounded page.
+                research_worker = mapping_call("get_worker_state", "research-queue")
+                if not research_worker:
+                    research_worker = mapping_call("get_worker_state", "research-engine")
         research_payload = research_worker.get("payload")
         research_payload = research_payload if isinstance(research_payload, Mapping) else {}
         worker_cycle = research_payload.get("last_cycle")
@@ -5269,6 +5334,18 @@ class DashboardData:
         health_payload = health_worker.get("payload", {}) if isinstance(health_worker, Mapping) else {}
         health_payload = health_payload if isinstance(health_payload, Mapping) else {}
         health = self._health_for_operator(health_payload)
+        activity_fallback = self._bounded_health_from_activity(aggregate)
+        if activity_fallback:
+            if not health:
+                health = activity_fallback
+            else:
+                health = {
+                    **activity_fallback,
+                    **health,
+                    "reason_code": health.get("reason_code") or activity_fallback["reason_code"],
+                    "reasons": health.get("reasons") or activity_fallback["reasons"],
+                    "current_failures": health.get("current_failures") or activity_fallback["current_failures"],
+                }
         if not health:
             # No persisted health monitor row is evidence of unknown/stale
             # readiness, not permission to rebuild health synchronously.

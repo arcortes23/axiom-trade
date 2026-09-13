@@ -138,6 +138,33 @@ class DashboardScaleFixtureTests(unittest.TestCase):
                 store.close()
 
 
+    def test_overview_skips_deserializing_oversized_worker_payloads(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database_path = Path(temporary_directory) / "dashboard-oversized-worker.sqlite3"
+            store = AxiomStore(str(database_path))
+            try:
+                store.save_worker_state(
+                    "polymarket-historical-refresh",
+                    "RUNNING",
+                    {"unrelated": "x" * 1_100_000},
+                    heartbeat_at=T0,
+                )
+                dashboard = DashboardData(store=store)
+
+                def reject_oversized_load(encoded: str) -> object:
+                    if len(encoded) > 1_000_000:
+                        raise AssertionError("oversized worker payload was deserialized")
+                    return json.loads(encoded)
+
+                with patch("axiom.storage._load", side_effect=reject_oversized_load):
+                    overview = dashboard.overview_summary()
+
+                self.assertTrue(overview["available"])
+                workers = overview["research_progress"].get("worker_status", {})
+                self.assertIsInstance(workers, dict)
+            finally:
+                store.close()
+
     @staticmethod
     def _seed_catalog(store: AxiomStore, count: int) -> None:
         rows = []
