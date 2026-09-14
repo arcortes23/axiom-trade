@@ -46,6 +46,7 @@ from .autonomous import (
     AutonomousResearchProcessor,
     CAMPAIGN_PROTOCOL_V1_ID,
     CAMPAIGN_PROTOCOL_V2_ID,
+    _rolling_hash,
 )
 from .research_bus import DurableResearchBus
 from .lifecycle import PromotionCriteria
@@ -385,6 +386,7 @@ class NodeConfig:
     max_log_bytes: int = 5_000_000
     backup_count: int = 3
     revision: str | None = None
+    rolling_evidence_interval_seconds: float = 300.0
     rolling_review_interval_seconds: float = 86400.0
 
     def __post_init__(self) -> None:
@@ -431,9 +433,12 @@ class NodeConfig:
         interval = float(self.interval_seconds)
         cooldown = float(self.failure_cooldown_seconds)
         auto_interval = float(self.auto_canary_interval_seconds)
+        rolling_evidence_interval = float(self.rolling_evidence_interval_seconds)
         rolling_interval = float(self.rolling_review_interval_seconds)
         if not math.isfinite(auto_interval) or auto_interval <= 0:
             raise ValueError("auto_canary_interval_seconds must be finite and positive")
+        if not math.isfinite(rolling_evidence_interval) or rolling_evidence_interval <= 0:
+            raise ValueError("rolling_evidence_interval_seconds must be finite and positive")
         if not math.isfinite(rolling_interval) or rolling_interval <= 0:
             raise ValueError("rolling_review_interval_seconds must be finite and positive")
         if not math.isfinite(interval) or interval <= 0:
@@ -1243,6 +1248,12 @@ class ResearchNode:
                 },
                 "rolling-portfolio": {
                     "configured_interval_seconds": float(
+                        self.config.rolling_evidence_interval_seconds
+                    ),
+                    "evidence_interval_seconds": float(
+                        self.config.rolling_evidence_interval_seconds
+                    ),
+                    "review_interval_seconds": float(
                         self.config.rolling_review_interval_seconds
                     ),
                     "next_work": "refresh_rolling_evidence",
@@ -1713,21 +1724,131 @@ class ResearchNode:
         """Keep rolling evidence/review scheduled beyond finite campaigns."""
         worker_name = "rolling-portfolio"
         status = "idle"
+        next_scheduled_work = "review_rolling_portfolio"
         try:
             while not self.stop_event.is_set():
                 started = self._worker_tick_started(
                     worker_name,
-                    next_work="review_rolling_portfolio",
+                    next_work="refresh_rolling_evidence",
                 )
                 result: Mapping[str, Any] = {}
                 successful = True
                 error: BaseException | str | None = None
+                review_due = True
                 try:
                     review = getattr(self.research_processor, "review_rolling_portfolio", None)
-                    if not callable(review):
+                    refresh = getattr(self.research_processor, "refresh_rolling_evidence", None)
+                    if not callable(review) or not callable(refresh):
                         raise RuntimeError("ROLLING_RESEARCH_API_UNAVAILABLE")
-                    reviewed = review(now=started, force=False)
-                    result = dict(reviewed) if isinstance(reviewed, Mapping) else {}
+                    review_state_loader = getattr(self.store, "load_portfolio_review_state", None)
+                    review_state = review_state_loader() if callable(review_state_loader) else None
+                    previous_loader = getattr(self.research_processor, "active_portfolio_selection", None)
+                    previous = previous_loader() if callable(previous_loader) else None
+                    enrollment_changed = False
+                    strategy_loader = getattr(
+                        self.research_processor, "_rolling_strategy_documents", None
+                    )
+                    identity = (
+                        review_state.get("refresh_identity")
+                        if isinstance(review_state, Mapping)
+                        else None
+                    )
+                    previous_ids = {
+                        str(value).strip()
+                        for value in (
+                            identity.get("strategy_versions", ())
+                            if isinstance(identity, Mapping)
+                            else ()
+                        )
+                        if str(value).strip()
+                    }
+                    current_snapshot_available = False
+                    current_ids: tuple[str, ...] = ()
+                    current_digest: str | None = None
+                    current_total: int | None = None
+                    if callable(strategy_loader):
+                        try:
+                            documents = strategy_loader()
+                        except BaseException:
+                            # An unavailable loader is not an empty snapshot:
+                            # retain the normal cadence and avoid a false
+                            # membership transition.
+                            documents = None
+                        else:
+                            if isinstance(documents, Mapping):
+                                documents = documents.get("records", documents.get("rows", ()))
+                            if isinstance(documents, (list, tuple)):
+                                current_snapshot_available = True
+                                current_ids = tuple(
+                                    sorted(
+                                        {
+                                            str(item.get("strategy_version_id", "")).strip()
+                                            for item in documents
+                                            if isinstance(item, Mapping)
+                                            and str(item.get("strategy_version_id", "")).strip()
+                                        }
+                                    )
+                                )
+                                current_digest = _rolling_hash(current_ids)
+                                current_total = len(current_ids)
+                    prior_digest: Any = None
+                    prior_total: Any = None
+                    if isinstance(identity, Mapping):
+                        for name in (
+                            "enrolled_strategy_versions_digest",
+                            "strategy_digest",
+                        ):
+                            if identity.get(name) is not None:
+                                prior_digest = identity.get(name)
+                                break
+                        for name in (
+                            "enrolled_strategy_versions_total",
+                            "strategy_versions_total",
+                        ):
+                            if identity.get(name) is not None:
+                                prior_total = identity.get(name)
+                                break
+                    # A full digest/total pair is authoritative.  Older
+                    # snapshots carried only a truncated display tuple, so
+                    # use that tuple only when either full field is absent.
+                    has_full_prior_snapshot = (
+                        isinstance(identity, Mapping)
+                        and prior_digest is not None
+                        and prior_total is not None
+                    )
+                    if current_snapshot_available and has_full_prior_snapshot:
+                        digest_changed = str(prior_digest) != str(current_digest)
+                        try:
+                            total_changed = int(prior_total) != int(current_total or 0)
+                        except (TypeError, ValueError, OverflowError):
+                            total_changed = True
+                        enrollment_changed = digest_changed or total_changed
+                    elif current_snapshot_available and isinstance(identity, Mapping):
+                        enrollment_changed = set(current_ids) != previous_ids
+                    due_at = (
+                        parse_timestamp(review_state.get("review_due_at"))
+                        if isinstance(review_state, Mapping)
+                        else None
+                    )
+                    review_due = (
+                        previous is None
+                        or due_at is None
+                        or started >= due_at
+                        or enrollment_changed
+                    )
+                    next_scheduled_work = (
+                        "review_rolling_portfolio"
+                        if review_due
+                        else "refresh_rolling_evidence"
+                    )
+                    if review_due:
+                        reviewed = review(now=started, force=False)
+                        result = dict(reviewed) if isinstance(reviewed, Mapping) else {}
+                    else:
+                        refreshed = refresh(now=started)
+                        result = dict(refreshed) if isinstance(refreshed, Mapping) else {}
+                        result["decision"] = "WAIT_FOR_ROLLING_REVIEW"
+                        result["review_due_at"] = due_at.isoformat()
                     status = "idle"
                 except BaseException as exc:
                     successful = False
@@ -1738,11 +1859,17 @@ class ResearchNode:
                     worker_name,
                     successful=successful,
                     decision=str(result.get("decision") or "WAIT_FOR_ROLLING_REVIEW"),
-                    next_work="review_rolling_portfolio",
+                    next_work=next_scheduled_work,
                     error=error,
                     extra={
                         "rolling_portfolio": result,
                         "configured_interval_seconds": float(
+                            self.config.rolling_evidence_interval_seconds
+                        ),
+                        "evidence_interval_seconds": float(
+                            self.config.rolling_evidence_interval_seconds
+                        ),
+                        "review_interval_seconds": float(
                             self.config.rolling_review_interval_seconds
                         ),
                         "scheduled": True,
@@ -1750,7 +1877,7 @@ class ResearchNode:
                         "live_execution": False,
                     },
                 )
-                if self.stop_event.wait(self.config.rolling_review_interval_seconds):
+                if self.stop_event.wait(self.config.rolling_evidence_interval_seconds):
                     break
         except BaseException as exc:
             status = "degraded"
@@ -1764,8 +1891,14 @@ class ResearchNode:
                 extra={
                     "worker_status": "SCHEDULED",
                     "scheduled": True,
-                    "next_work": "review_rolling_portfolio",
+                    "next_work": next_scheduled_work,
                     "configured_interval_seconds": float(
+                        self.config.rolling_evidence_interval_seconds
+                    ),
+                    "evidence_interval_seconds": float(
+                        self.config.rolling_evidence_interval_seconds
+                    ),
+                    "review_interval_seconds": float(
                         self.config.rolling_review_interval_seconds
                     ),
                     "last_loop_status": status,

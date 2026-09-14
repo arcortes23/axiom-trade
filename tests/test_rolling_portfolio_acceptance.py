@@ -12,7 +12,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from axiom.autonomous import AutonomousResearchProcessor
+from axiom.autonomous import AutonomousResearchProcessor, _rolling_window_rows
 from axiom.auto_canary import AutonomousCanaryWorker
 from axiom.canary import CanaryService, CredentialStore, credential_fingerprint
 from axiom.canary_positions import CanaryPositionManager, list_positions
@@ -895,6 +895,253 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
         removed = list(getattr(decision, "removed_members", ()))
         self.assertEqual([_value(row, "strategy_version_id") for row in removed], ["sv-old"])
 
+    def test_review_recomputes_removed_member_runtime_obligation(self) -> None:
+        policy = _policy(
+            "policy-runtime-rotation",
+            max_members=1,
+            global_budget="10.00",
+            experimental_allocation_enabled=True,
+            replacement_margin="0.10",
+        )
+        with self._store() as store:
+            self._seed_artifacts(
+                store,
+                policy,
+                ("sv-old", "sv-new"),
+                evidence=[
+                    _evidence("sv-old", net_return="8.00"),
+                    _evidence("sv-new", net_return="20.00"),
+                ],
+            )
+            active_policy = {**policy.as_dict(), "status": "ACTIVE"}
+            store.set_operator_config("rolling_admission_policy_active", active_policy)
+            store.set_operator_job(
+                "rolling_admission_policy_active",
+                "ACTIVE",
+                active_policy,
+                resumable=True,
+                timestamp=NOW,
+            )
+            old_member = _member(
+                "sv-old",
+                "selection-runtime-old",
+                allocation="5.00",
+                score="0.80",
+            )
+            store.commit_portfolio_selection(
+                _selection(
+                    "selection-runtime-old",
+                    policy,
+                    selected_at=NOW - timedelta(days=2),
+                    members=[old_member],
+                ),
+                [old_member],
+            )
+            with patch.object(
+                store,
+                "canary_risk_accounting",
+                return_value={
+                    "rolling_global_reserved_usd": "4.00",
+                    "rolling_strategy_reserved_usd": {"sv-old": "4.00"},
+                },
+            ) as accounting:
+                state = AutonomousResearchProcessor(store, clock=lambda: NOW).review_rolling_portfolio(
+                    now=NOW,
+                    force=True,
+                )
+            accounting.assert_called_once()
+            self.assertEqual(accounting.call_args.kwargs["now"], NOW)
+            selection = store.load_current_portfolio_selection()
+            self.assertIsNotNone(selection)
+            assert selection is not None
+            self.assertEqual(selection["members"][0]["strategy_version_id"], "sv-new")
+            self.assertEqual(selection["members"][0]["allocation"], "6.00")
+            self.assertEqual(state["external_obligations"], "4.00")
+            self.assertEqual(state["uncovered_obligations"], "4.00")
+            self.assertEqual(state["available_budget"], "6.00")
+
+    def test_missing_runtime_reservation_detail_fails_closed(self) -> None:
+        policy = _policy(
+            "policy-runtime-missing-detail",
+            max_members=1,
+            global_budget="10.00",
+            experimental_allocation_enabled=True,
+            replacement_margin="0",
+        )
+        with self._store("rolling-runtime-missing-detail.sqlite3") as store:
+            self._seed_artifacts(
+                store,
+                policy,
+                ("sv-runtime-missing-detail",),
+                evidence=[_evidence("sv-runtime-missing-detail", net_return="20.00")],
+            )
+            active_policy = {**policy.as_dict(), "status": "ACTIVE"}
+            store.set_operator_config("rolling_admission_policy_active", active_policy)
+            store.set_operator_job(
+                "rolling_admission_policy_active",
+                "ACTIVE",
+                active_policy,
+                resumable=True,
+                timestamp=NOW,
+            )
+            with patch.object(
+                store,
+                "canary_risk_accounting",
+                return_value={"rolling_global_reserved_usd": "4.00"},
+            ) as accounting:
+                state = AutonomousResearchProcessor(store, clock=lambda: NOW).review_rolling_portfolio(
+                    now=NOW,
+                    force=True,
+                )
+            accounting.assert_called_once()
+            self.assertEqual(state["external_obligations"], "10.00")
+            self.assertEqual(state["available_budget"], "0")
+            self.assertEqual(
+                state["runtime_accounting_unavailable_reason"],
+                "ROLLING_STRATEGY_RESERVATIONS_UNAVAILABLE",
+            )
+            selection = store.load_current_portfolio_selection()
+            self.assertIsNotNone(selection)
+            assert selection is not None
+            self.assertEqual(selection["members"][0]["status"], "OBSERVE")
+            self.assertEqual(selection["members"][0]["allocation"], "0")
+            self.assertEqual(
+                selection["runtime_accounting_unavailable_reason"],
+                "ROLLING_STRATEGY_RESERVATIONS_UNAVAILABLE",
+            )
+            self.assertIn(
+                "EXTERNAL_OBLIGATIONS_EXCEED_GLOBAL_BUDGET",
+                selection["members"][0]["reason"],
+            )
+
+    def test_empty_runtime_reservation_accounting_fails_closed(self) -> None:
+        policy = _policy(
+            "policy-runtime-empty-accounting",
+            max_members=1,
+            global_budget="10.00",
+            experimental_allocation_enabled=True,
+            replacement_margin="0",
+        )
+        with self._store("rolling-runtime-empty-accounting.sqlite3") as store:
+            self._seed_artifacts(
+                store,
+                policy,
+                ("sv-runtime-empty-accounting",),
+                evidence=[_evidence("sv-runtime-empty-accounting", net_return="20.00")],
+            )
+            active_policy = {**policy.as_dict(), "status": "ACTIVE"}
+            store.set_operator_config("rolling_admission_policy_active", active_policy)
+            store.set_operator_job(
+                "rolling_admission_policy_active",
+                "ACTIVE",
+                active_policy,
+                resumable=True,
+                timestamp=NOW,
+            )
+            with patch.object(store, "canary_risk_accounting", return_value={}) as accounting:
+                state = AutonomousResearchProcessor(store, clock=lambda: NOW).review_rolling_portfolio(
+                    now=NOW,
+                    force=True,
+                )
+            accounting.assert_called_once()
+            self.assertEqual(state["external_obligations"], "10.00")
+            self.assertEqual(state["available_budget"], "0")
+            self.assertEqual(
+                state["runtime_accounting_unavailable_reason"],
+                "ROLLING_STRATEGY_RESERVATIONS_UNAVAILABLE",
+            )
+            selection = store.load_current_portfolio_selection()
+            self.assertIsNotNone(selection)
+            assert selection is not None
+            self.assertEqual(selection["members"][0]["status"], "OBSERVE")
+            self.assertEqual(selection["members"][0]["allocation"], "0")
+            self.assertEqual(
+                selection["runtime_accounting_unavailable_reason"],
+                "ROLLING_STRATEGY_RESERVATIONS_UNAVAILABLE",
+            )
+
+    def test_retained_runtime_reservation_is_not_double_counted(self) -> None:
+        policy = _policy(
+            "policy-retained-runtime",
+            max_members=2,
+            global_budget="10.00",
+            experimental_allocation_enabled=True,
+        )
+        current = _selection(
+            "selection-retained-runtime",
+            policy,
+            selected_at=NOW - timedelta(days=2),
+            members=[_member("sv-retained", "selection-retained-runtime", allocation="6.00")],
+        )
+        decision = evaluate_rolling_selection(
+            policy,
+            [
+                _evidence("sv-retained", net_return="8.00"),
+                _evidence("sv-new-retained", net_return="7.00"),
+            ],
+            current,
+            NOW,
+            external_obligations="0.00",
+        )
+        members = _member_map(decision)
+        self.assertEqual(Decimal(str(_value(members["sv-retained"], "allocation"))), Decimal("6.00"))
+        self.assertEqual(Decimal(str(_value(members["sv-new-retained"], "allocation"))), Decimal("4.00"))
+
+    def test_excess_retained_runtime_reservation_reduces_new_allocation(self) -> None:
+        policy = _policy(
+            "policy-excess-runtime",
+            max_members=2,
+            global_budget="10.00",
+            experimental_allocation_enabled=True,
+        )
+        current = _selection(
+            "selection-excess-runtime",
+            policy,
+            selected_at=NOW - timedelta(days=2),
+            members=[_member("sv-retained-excess", "selection-excess-runtime", allocation="5.00")],
+        )
+        decision = evaluate_rolling_selection(
+            policy,
+            [
+                _evidence("sv-retained-excess", net_return="8.00"),
+                _evidence("sv-new-excess", net_return="7.00"),
+            ],
+            current,
+            NOW,
+            external_obligations="3.00",
+        )
+        members = _member_map(decision)
+        self.assertEqual(Decimal(str(_value(members["sv-retained-excess"], "allocation"))), Decimal("5.00"))
+        self.assertEqual(Decimal(str(_value(members["sv-new-excess"], "allocation"))), Decimal("2.00"))
+        self.assertEqual(
+            sum((Decimal(str(_value(member, "allocation"))) for member in members.values()), Decimal("0"))
+            + Decimal("3.00"),
+            Decimal("10.00"),
+        )
+
+    def test_external_obligation_and_selection_allocations_never_exceed_budget(self) -> None:
+        policy = _policy(
+            "policy-external-total",
+            max_members=2,
+            global_budget="10.00",
+            experimental_allocation_enabled=True,
+        )
+        decision = evaluate_rolling_selection(
+            policy,
+            [
+                _evidence("sv-external-a", net_return="8.00"),
+                _evidence("sv-external-b", net_return="7.00"),
+            ],
+            None,
+            NOW,
+            external_obligations="4.00",
+        )
+        allocations = [
+            Decimal(str(_value(member, "allocation")))
+            for member in _member_map(decision).values()
+        ]
+        self.assertEqual(sum(allocations, Decimal("0")) + Decimal("4.00"), Decimal("10.00"))
+
     def test_shared_budget_rejects_final_dollar_contention_atomically(self) -> None:
         policy = _policy("policy-budget", max_members=1, global_budget="10.00")
         with self._store() as store:
@@ -1541,6 +1788,32 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
         rotated_score = RollingEvidence.from_mapping(_evidence("sv-new-costly", net_return="0.00", costs="8.00")).score(policy)
         self.assertGreater(no_rotation_score, rotated_score)
 
+    def test_rolling_horizon_excludes_outside_seven_day_outcomes_but_keeps_thirty_day(self) -> None:
+        rows = [
+            {
+                "market_id": "resolved-ten-days-ago",
+                "timestamp": (NOW - timedelta(days=10)).isoformat(),
+                "outcome": "resolved_yes",
+            },
+            {
+                "market_id": "resolved-two-days-ago",
+                "timestamp": (NOW - timedelta(days=2)).isoformat(),
+                "outcome": "resolved_no",
+            },
+        ]
+        seven_day, seven_rejections = _rolling_window_rows(rows, 7, NOW)
+        thirty_day, thirty_rejections = _rolling_window_rows(rows, 30, NOW)
+        self.assertEqual(
+            [row["market_id"] for row in seven_day],
+            ["resolved-two-days-ago"],
+        )
+        self.assertEqual(
+            [row["market_id"] for row in thirty_day],
+            ["resolved-ten-days-ago", "resolved-two-days-ago"],
+        )
+        self.assertEqual(seven_rejections, ())
+        self.assertEqual(thirty_rejections, ())
+
     def test_source_class_separation_keeps_historical_and_forward_rows_distinct(self) -> None:
         policy = _policy()
         with self._store() as store:
@@ -1841,7 +2114,7 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
                 return True
 
         first_selection_id: str | None = None
-        for _ in range(2):
+        for instance in range(2):
             with AxiomStore(str(path)) as store:
                 node = ResearchNode(
                     NodeConfig(
@@ -1871,7 +2144,14 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
                 self.assertEqual(review["portfolio_selection_id"], selection_id)
                 self.assertEqual(worker_state["status"], "scheduled")
                 self.assertTrue(worker_state["payload"]["scheduled"])
-                self.assertEqual(worker_state["payload"]["next_work"], "review_rolling_portfolio")
+                self.assertEqual(
+                    worker_state["payload"]["next_work"],
+                    (
+                        "review_rolling_portfolio"
+                        if instance == 0
+                        else "refresh_rolling_evidence"
+                    ),
+                )
 
     def test_operator_review_creates_bounded_non_active_draft(self) -> None:
         with self._store("rolling-policy-review.sqlite3") as store:

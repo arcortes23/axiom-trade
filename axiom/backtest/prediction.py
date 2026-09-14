@@ -559,6 +559,12 @@ class PredictionMarketBacktester:
             observation_horizon,
             holding_period,
         )
+        if mode is not None and isinstance(normalized_exit_policy, Mapping):
+            # The horizon is the scheduler's source of truth when callers use
+            # the backward-compatible one-observation defaults.  Keep the
+            # persisted exit metadata in lockstep with that effective delay.
+            normalized_exit_policy = dict(normalized_exit_policy)
+            normalized_exit_policy["holding_period"] = holding_period
         normalized_rows = [_normalize_row(row) for row in snapshots]
         if mode is not None:
             _validate_temporal_rows(normalized_rows)
@@ -1082,6 +1088,7 @@ def run_prediction_research_mode(
         model=model,
         model_document=model_document,
         observation_horizon=observation_horizon,
+        holding_period=holding_period,
         exit_policy=exit_policy,
     )
 __all__ = [

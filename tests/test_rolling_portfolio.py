@@ -8,8 +8,11 @@ from pathlib import Path
 import sqlite3
 import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from axiom.rolling_portfolio import (
+    MAX_REASON_LENGTH,
     RollingEvidence,
     RollingAdmissionPolicy,
     default_rolling_admission_policy,
@@ -19,7 +22,10 @@ from axiom.experiment_plan import normalize_market_scope
 from axiom.storage import AxiomStore
 from axiom.autonomous import (
     AutonomousResearchProcessor,
+    _rolling_cursor_index,
+    _rolling_cursor_record,
     _rolling_inject_source_binding,
+    _rolling_work_items,
 )
 
 
@@ -251,6 +257,414 @@ class TestRollingPortfolio(unittest.TestCase):
         self.addCleanup(self._temporary_directory.cleanup)
         self.tmp_path = Path(self._temporary_directory.name)
 
+    def test_cursor_round_robin_wrap_persists_next_tuple(self) -> None:
+        items = _rolling_work_items((_strategy("sv-beta"), _strategy("sv-alpha")))
+        self.assertEqual(len(items), 16)
+        cursor = _rolling_cursor_record(None, items[-1], items[0], NOW)
+
+        self.assertEqual(_rolling_cursor_index(cursor, items), 0)
+        self.assertEqual(cursor["next_strategy_version_id"], items[0][0]["strategy_version_id"])
+        self.assertEqual(cursor["next_requested_days"], items[0][1])
+        self.assertEqual(cursor["next_source_class"], items[0][2])
+        self.assertEqual(next(iter(cursor["attempts"].values())), 1)
+
+    def test_blocker_skip_is_scoped_to_immutable_prerequisite_fingerprint(self) -> None:
+        record = {
+            "work_key": "work-a",
+            "strategy_version_id": "sv-alpha",
+            "research_trial_id": "trial-alpha",
+            "candidate_id": "candidate-sv-alpha",
+            "requested_days": 7,
+            "source_class": "HISTORICAL",
+            "prerequisite_fingerprint": "fp-a",
+            "blocker": "SOURCE_LOAD_FAILED",
+            "last_attempted_at": NOW.isoformat(),
+        }
+        with _store(self.tmp_path) as store:
+            self.assertTrue(store.save_rolling_evidence_blocker(record))
+            self.assertIsNotNone(
+                store.load_rolling_evidence_blocker(
+                    work_key="work-a",
+                    prerequisite_fingerprint="fp-a",
+                )
+            )
+            self.assertIsNone(
+                store.load_rolling_evidence_blocker(
+                    work_key="work-a",
+                    prerequisite_fingerprint="fp-b",
+                )
+            )
+            self.assertTrue(
+                store.save_rolling_evidence_blocker(
+                    {**record, "prerequisite_fingerprint": "fp-b"}
+                )
+            )
+            latest = store.load_rolling_evidence_blocker(work_key="work-a")
+            self.assertEqual(latest["prerequisite_fingerprint"], "fp-b")
+
+    def test_fixed_holding_exit_uses_canonical_pnl_for_wins_and_losses(self) -> None:
+        processor = AutonomousResearchProcessor.__new__(AutonomousResearchProcessor)
+        rows = [
+            {
+                "snapshot_id": "snapshot-accounting",
+                "timestamp": NOW.isoformat(),
+                "order_book": {"bids": [], "asks": []},
+                "_rolling_lineage_proven": True,
+            }
+        ]
+        strategy = {"strategy_document": {"family": "fixture"}}
+        for final_equity, expected_pnl in (("102.00", "2.00"), ("98.00", "-2.00")):
+            result = SimpleNamespace(
+                fills=(
+                    SimpleNamespace(
+                        market_id="market-fixed-holding",
+                        symbol="market-fixed-holding",
+                        quantity=Decimal("10"),
+                        price=Decimal("0.40"),
+                        fees=Decimal("0.10"),
+                        slippage=Decimal("0.02"),
+                        metadata={"execution_kind": "entry"},
+                    ),
+                    SimpleNamespace(
+                        market_id="market-fixed-holding",
+                        symbol="market-fixed-holding",
+                        quantity=Decimal("10"),
+                        price=Decimal("0.60"),
+                        fees=Decimal("0.10"),
+                        slippage=Decimal("0.02"),
+                        metadata={"execution_kind": "exit"},
+                    ),
+                ),
+                outcomes={"market-fixed-holding": "RESOLVED_YES"},
+                metrics={
+                    "initial_equity": Decimal("100.00"),
+                    "final_equity": Decimal(final_equity),
+                    "portfolio": {
+                        "realized_pnl": Decimal(expected_pnl),
+                        "unrealized_pnl": Decimal("0"),
+                    },
+                },
+                equity_curve=(),
+                unresolved=(),
+                research_quality=None,
+            )
+            with self.subTest(final_equity=final_equity), patch(
+                "axiom.autonomous.load_strategy", return_value=object()
+            ), patch(
+                "axiom.autonomous.run_prediction_research_mode", return_value=result
+            ):
+                evaluation = processor._rolling_canonical_evaluation(
+                    strategy, rows, "HISTORICAL"
+                )
+            self.assertIsNotNone(evaluation)
+            assert evaluation is not None
+            self.assertEqual(evaluation["realized_pnl"], Decimal(expected_pnl))
+            self.assertEqual(evaluation["unrealized_pnl"], Decimal("0"))
+            self.assertEqual(evaluation["fills"], 2)
+            self.assertEqual(evaluation["capital_at_risk"], Decimal("4.00"))
+
+    def test_unsupported_snapshot_loader_fails_closed(self) -> None:
+        class UnsupportedStore:
+            def load_polymarket_snapshots(self) -> list[dict[str, object]]:
+                return []
+
+        processor = AutonomousResearchProcessor.__new__(AutonomousResearchProcessor)
+        processor.store = UnsupportedStore()
+        record = {
+            "strategy_hash": "sha256:strategy-alpha",
+            "strategy_version_id": "sv-alpha",
+            "research_trial_id": "trial-alpha",
+            "candidate_id": "candidate-sv-alpha",
+        }
+        with self.assertRaisesRegex(ValueError, "SOURCE_LOADER_UNSUPPORTED"):
+            processor._rolling_source_rows(record, "LIVE", NOW)
+
+
+
+    def test_partial_accounting_reports_available_rows_but_cannot_admit(self) -> None:
+        strategy = _strategy("sv-partial", research_trial_id="trial-partial")
+        accounting = {
+            "_available_from": NOW - timedelta(days=7),
+            "_available_through": NOW,
+            "allocated_capital": "10",
+            "allocated_capital_net_return": "1",
+            "realized_pnl": "1",
+            "unrealized_pnl": "0",
+            "fees": "0",
+            "costs": "0",
+            "drawdown": "0",
+            "completed_outcomes": 1,
+            "reliability": "1",
+        }
+        rows = [
+            {"timestamp": NOW.isoformat(), "_rolling_accounting": accounting},
+            {
+                "timestamp": NOW.isoformat(),
+                "_rolling_accounting_rejection": "SOURCE_BINDING_UNPROVEN",
+            },
+        ]
+        processor = AutonomousResearchProcessor.__new__(AutonomousResearchProcessor)
+        record = processor._rolling_evidence_record(
+            strategy,
+            rows,
+            "HISTORICAL",
+            7,
+            NOW,
+            evaluation={
+                "available_from": (NOW - timedelta(days=7)).isoformat(),
+                "available_through": NOW.isoformat(),
+                "accounting_available": False,
+                "accounting_unavailable_reason": "SOURCE_BINDING_UNPROVEN",
+            },
+        )
+        self.assertEqual(record["requested_rows"], 2)
+        self.assertEqual(record["available_rows"], 1)
+        self.assertEqual(record["evaluated_rows"], 1)
+        self.assertTrue(record["source_digest"])
+        self.assertTrue(record["accounting_digest"])
+        self.assertFalse(record["accounting_available"])
+        self.assertFalse(record["accounting_complete"])
+        self.assertTrue(record["accounting_partial"])
+        self.assertFalse(record["admitted"])
+        self.assertEqual(record["admission_reasons"], ["ACCOUNTING_UNAVAILABLE"])
+
+    def test_evidence_provenance_digest_roundtrip_and_failure_reason_validation(self) -> None:
+        base = _evidence(
+            "sv-provenance",
+            "window-provenance",
+            source_digest="sha256:source-a",
+            accounting_digest="sha256:accounting-a",
+            accounting_available=True,
+            accounting_complete=True,
+            accounting_partial=False,
+            requested_rows=4,
+            available_rows=4,
+            evaluated_rows=4,
+        )
+        first = RollingEvidence.from_mapping(base)
+        second = RollingEvidence.from_mapping(
+            {**base, "source_digest": "sha256:source-b"}
+        )
+        self.assertNotEqual(first.evidence_digest, second.evidence_digest)
+
+        restored = RollingEvidence.from_mapping(
+            json.loads(json.dumps(first.as_dict()))
+        )
+        self.assertEqual(restored.evidence_digest, first.evidence_digest)
+        self.assertEqual(restored.source_digest, "sha256:source-a")
+        self.assertEqual(restored.accounting_digest, "sha256:accounting-a")
+        self.assertTrue(restored.accounting_available)
+        self.assertTrue(restored.accounting_complete)
+        self.assertFalse(restored.accounting_partial)
+        self.assertEqual(
+            (restored.requested_rows, restored.available_rows, restored.evaluated_rows),
+            (4, 4, 4),
+        )
+
+        legacy_payload = {
+            key: value
+            for key, value in base.items()
+            if key
+            not in {
+                "source_digest",
+                "accounting_digest",
+                "accounting_available",
+                "accounting_complete",
+                "accounting_partial",
+                "requested_rows",
+                "available_rows",
+                "evaluated_rows",
+            }
+        }
+        legacy = RollingEvidence.from_mapping(legacy_payload)
+        self.assertIsNone(legacy.source_digest)
+        self.assertIsNone(legacy.accounting_available)
+
+        normalized = RollingEvidence.from_mapping(
+            {**base, "failure_reason": "  malformed accounting  "}
+        )
+        self.assertEqual(normalized.failure_reason, "malformed accounting")
+        with self.assertRaises(ValueError):
+            RollingEvidence.from_mapping(
+                {**base, "failure_reason": "x" * (MAX_REASON_LENGTH + 1)}
+            )
+
+    def test_accounting_quality_flags_block_selection_even_when_numeric_thresholds_pass(self) -> None:
+        policy = _policy(
+            requested_window_days=(7,),
+            min_actual_coverage_seconds=0,
+            min_completed_outcomes=0,
+            min_reliability="0",
+            experimental_allocation_enabled=True,
+            global_budget="100",
+        )
+        for field, value in (
+            ("accounting_available", False),
+            ("accounting_complete", False),
+            ("accounting_partial", True),
+        ):
+            with self.subTest(field=field):
+                decision = evaluate_rolling_selection(
+                    policy,
+                    [
+                        _evidence(
+                            f"sv-{field}",
+                            f"window-{field}",
+                            source_digest="sha256:source",
+                            accounting_digest="sha256:accounting",
+                            **{field: value},
+                        )
+                    ],
+                    None,
+                    NOW,
+                )
+                member = _decision_members(decision)[0]
+                self.assertNotEqual(_member_value(member, "status"), "ACTIVE")
+                self.assertEqual(
+                    Decimal(str(_member_value(member, "allocation"))),
+                    Decimal("0"),
+                )
+                expected_reason = {
+                    "accounting_available": "accounting_unavailable",
+                    "accounting_complete": "accounting_incomplete",
+                    "accounting_partial": "accounting_partial",
+                }[field]
+                self.assertIn(expected_reason, _member_value(member, "reason"))
+
+        initial = evaluate_rolling_selection(
+            policy,
+            [_evidence("sv-incumbent", "window-incumbent")],
+            None,
+            NOW,
+        )
+        reviewed = evaluate_rolling_selection(
+            policy,
+            [
+                _evidence(
+                    "sv-incumbent",
+                    "window-incumbent-partial",
+                    source_digest="sha256:source",
+                    accounting_digest="sha256:accounting",
+                    accounting_partial=True,
+                )
+            ],
+            initial,
+            NOW + timedelta(hours=1),
+        )
+        incumbent = _decision_members(reviewed)[0]
+        self.assertNotEqual(_member_value(incumbent, "status"), "ACTIVE")
+        self.assertEqual(
+            Decimal(str(_member_value(incumbent, "allocation"))),
+            Decimal("0"),
+        )
+
+    def test_producer_persists_canonical_provenance_and_row_counts(self) -> None:
+        strategy = _strategy("sv-producer", research_trial_id="trial-producer")
+        accounting = {
+            "_available_from": NOW - timedelta(days=7),
+            "_available_through": NOW,
+            "allocated_capital": "10",
+            "allocated_capital_net_return": "1",
+            "realized_pnl": "1",
+            "unrealized_pnl": "0",
+            "fees": "0",
+            "costs": "0",
+            "drawdown": "0",
+            "completed_outcomes": 1,
+            "reliability": "1",
+        }
+        processor = AutonomousResearchProcessor.__new__(AutonomousResearchProcessor)
+        record = processor._rolling_evidence_record(
+            strategy,
+            [
+                {"timestamp": NOW.isoformat(), "_rolling_accounting": accounting},
+                {"timestamp": NOW.isoformat(), "_rolling_accounting": accounting},
+            ],
+            "PAPER",
+            7,
+            NOW,
+            evaluation={
+                "available_from": (NOW - timedelta(days=7)).isoformat(),
+                "available_through": NOW.isoformat(),
+                "source_digest": "sha256:canonical-source",
+                "accounting_digest": "sha256:canonical-accounting",
+                "accounting_available": True,
+                "accounting_complete": True,
+                "accounting_partial": False,
+                "requested_rows": 2,
+                "available_rows": 2,
+                "evaluated_rows": 2,
+            },
+        )
+        assert record is not None
+        self.assertEqual(record["source_digest"], "sha256:canonical-source")
+        self.assertEqual(record["accounting_digest"], "sha256:canonical-accounting")
+        self.assertTrue(record["accounting_available"])
+        self.assertTrue(record["accounting_complete"])
+        self.assertFalse(record["accounting_partial"])
+        self.assertEqual(
+            (record["requested_rows"], record["available_rows"], record["evaluated_rows"]),
+            (2, 2, 2),
+        )
+
+    def test_paper_loader_rejects_foreign_identity_in_nested_accounting_ledger(self) -> None:
+        strategy_hash = "sha256:strategy-alpha"
+        record = {
+            "strategy_hash": strategy_hash,
+            "strategy_version_id": "strategy-version-alpha",
+            "research_trial_id": "research-trial-alpha",
+            "candidate_id": "candidate-alpha",
+        }
+        class PaperStore:
+            def load_forward_tests(self, *, limit: int = 1000):
+                return [
+                    {
+                        "experiment_id": "forward-alpha",
+                        "strategy_hash": strategy_hash,
+                        "config": {
+                            "candidate_id": "candidate-alpha",
+                            "research_trial_id": "research-trial-alpha",
+                            "strategy_version_id": "strategy-version-alpha",
+                        },
+                    }
+                ]
+
+            def list_paper_bet_ledger(self, experiment_id: str, *, limit: int = 1000):
+                return [
+                    {
+                        "experiment_id": experiment_id,
+                        "strategy_id": strategy_hash,
+                        "market_id": "m1",
+                        "accounting": {
+                            "allocated_capital": "10",
+                            "net_return": "1",
+                            "realized_pnl": "1",
+                            "unrealized_pnl": "0",
+                            "fees": "0",
+                            "costs": "0",
+                            "drawdown": "0",
+                            "completed_outcomes": 1,
+                            "reliability": "1",
+                            "ledger": {
+                                "resolved_bet": {
+                                    "strategy_id": "sha256:foreign",
+                                }
+                            },
+                        },
+                        "timestamp": NOW.isoformat(),
+                        "available_from": (NOW - timedelta(days=7)).isoformat(),
+                        "available_through": NOW.isoformat(),
+                    }
+                ]
+
+        processor = AutonomousResearchProcessor.__new__(AutonomousResearchProcessor)
+        processor.store = PaperStore()
+        rows = processor._rolling_source_rows(record, "PAPER", NOW)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(
+            rows[0]["_rolling_accounting_rejection"],
+            "PAPER_STRATEGY_BINDING_CONFLICT",
+        )
 
     def test_source_loader_binding_injection_and_conflict_rejection(self) -> None:
         expected = {
@@ -292,7 +706,7 @@ class TestRollingPortfolio(unittest.TestCase):
         )
         self.assertEqual(conflict["_rolling_accounting_rejection"], "SOURCE_BINDING_CONFLICT")
 
-    def test_historical_loader_injects_verified_source_binding_before_accounting(self) -> None:
+    def test_historical_loader_does_not_fabricate_strategy_lineage(self) -> None:
         record = {
             "dataset_id": "dataset-alpha",
             "dataset_version": "v1",
@@ -323,9 +737,10 @@ class TestRollingPortfolio(unittest.TestCase):
         processor._load_rolling_historical_dataset = lambda _dataset, _version: [source_row]
         rows = processor._rolling_source_rows(record, "HISTORICAL", NOW)
         self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["candidate_id"], record["candidate_id"])
-        self.assertEqual(rows[0]["research_trial_id"], record["research_trial_id"])
-        self.assertIsInstance(rows[0]["_rolling_accounting"], dict)
+        self.assertNotIn("candidate_id", rows[0])
+        self.assertNotIn("research_trial_id", rows[0])
+        self.assertFalse(rows[0]["_rolling_lineage_proven"])
+        self.assertNotIn("_rolling_accounting", rows[0])
 
     def test_paper_loader_requires_exact_registry_lineage_for_resolved_bet(self) -> None:
         strategy_hash = "sha256:strategy-alpha"
@@ -388,6 +803,72 @@ class TestRollingPortfolio(unittest.TestCase):
         rows = processor._rolling_source_rows(record, "PAPER", NOW)
         self.assertEqual(len(rows), 1)
         self.assertIsInstance(rows[0]["_rolling_accounting"], dict)
+
+    def test_paper_loader_rejects_nested_foreign_strategy_identity(self) -> None:
+        strategy_hash = "sha256:strategy-alpha"
+        record = {
+            "strategy_hash": strategy_hash,
+            "strategy_version_id": "strategy-version-alpha",
+            "research_trial_id": "research-trial-alpha",
+            "candidate_id": "candidate-alpha",
+        }
+        class PaperStore:
+            def load_forward_tests(self, *, limit: int = 1000):
+                return [
+                    {
+                        "experiment_id": "forward-alpha",
+                        "strategy_hash": strategy_hash,
+                        "model_hash": "sha256:model",
+                        "config": {
+                            "candidate_id": "candidate-alpha",
+                            "research_trial_id": "research-trial-alpha",
+                            "strategy_version_id": "strategy-version-alpha",
+                        },
+                        "start_timestamp": NOW.isoformat(),
+                        "bankroll": 10_000,
+                        "allowed_markets": ["m1"],
+                        "risk_limits": {},
+                        "quality": "PAPER_FORWARD",
+                    }
+                ]
+
+            def list_paper_bet_ledger(self, experiment_id: str, *, limit: int = 1000):
+                return [
+                    {
+                        "experiment_id": experiment_id,
+                        "strategy_id": strategy_hash,
+                        "market_id": "m1",
+                        "payload": {
+                            "resolved_bet": {
+                                "experiment_id": experiment_id,
+                                "strategy_id": "sha256:foreign",
+                                "resolution": "resolved_yes",
+                                "closed": True,
+                                "capital_at_risk": "10",
+                                "net_pnl": "1",
+                                "realized_pnl": "1",
+                                "unrealized_pnl": "0",
+                                "fees": "0",
+                                "slippage": "0",
+                                "drawdown": "0",
+                                "completed_outcomes": 1,
+                                "reliability": "1",
+                            }
+                        },
+                        "timestamp": NOW.isoformat(),
+                        "available_from": (NOW - timedelta(days=7)).isoformat(),
+                        "available_through": NOW.isoformat(),
+                    }
+                ]
+
+        processor = AutonomousResearchProcessor.__new__(AutonomousResearchProcessor)
+        processor.store = PaperStore()
+        rows = processor._rolling_source_rows(record, "PAPER", NOW)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(
+            rows[0]["_rolling_accounting_rejection"],
+            "PAPER_STRATEGY_BINDING_CONFLICT",
+        )
 
     def test_accounting_rejects_nonfinite_and_price_proxy_rows(self) -> None:
         expected = {

@@ -30,13 +30,18 @@ from axiom.domain import (
     Side,
     TradePrint,
 )
-from axiom.forward import ForwardTestRegistry
+from axiom.forward import COMMON_PAPER_ASSUMPTIONS, ForwardTestRegistry
 from axiom.lifecycle import CandidateLifecycleManager, CandidateStage, PromotionCriteria
 from axiom.mutations import DeterministicMutationEngine, ExperimentBudget
 from axiom.node import NodeConfig, ResearchNode
 from axiom.portfolio import Portfolio
 from axiom.paper import PredictionPaperTrader
-from axiom.paper_engine import ForwardPaperEngine, historical_replay_id, run_forward_paper, run_historical_replay
+from axiom.paper_engine import (
+    ForwardPaperEngine,
+    historical_replay_id,
+    run_forward_paper,
+    run_historical_replay,
+)
 from axiom.research_bus import DurableResearchBus, ResearchBusPermissionError, ResearchQueueStatus
 from axiom.risk import RiskEngine, RiskLimits
 from axiom.storage import AxiomStore
@@ -1079,6 +1084,234 @@ class Phase3PaperAndRiskTests(unittest.TestCase):
             self.assertEqual(len(store.load_fills(strategy_id=spec.strategy_hash)), 1)
             state = store.load_paper_state(spec.experiment_id)
             self.assertEqual(state["state"]["fill_count"], 1)
+    def test_forward_assumptions_are_materialized_into_execution_and_identity(self) -> None:
+        strategy = _BuyStrategy()
+        model = {"id": "model"}
+        with AxiomStore(":memory:") as store:
+            spec = ForwardTestRegistry(store).freeze(
+                strategy=strategy,
+                model=model,
+                config={
+                    "paper_assumptions": {
+                        "fees": {"fee_bps": "20"},
+                        "slippage": {"slippage_bps": "7"},
+                        "sizing": {"allocated_capital": "100"},
+                    }
+                },
+                start_timestamp=T0,
+                allowed_markets=("m",),
+            )
+            with self.assertRaises(TypeError):
+                COMMON_PAPER_ASSUMPTIONS["fees"]["fee_bps"] = "999"  # type: ignore[index]
+            engine = ForwardPaperEngine(
+                spec,
+                store=store,
+                strategy=strategy,
+                model=model,
+            )
+            cycle = engine.run(
+                [
+                    {
+                        "timestamp": T0 + timedelta(minutes=1),
+                        "yes_mid": 0.4,
+                        "yes_bid": 0.39,
+                        "yes_ask": 0.41,
+                        "settlement": "OPEN",
+                    }
+                ],
+                now=T0 + timedelta(minutes=1),
+            )
+            self.assertEqual(cycle.fills_inserted, 1)
+            fills = store.load_fills(strategy_id=spec.strategy_hash)
+            self.assertEqual(len(fills), 1)
+            self.assertGreater(fills[0].fees, 0.0)
+            self.assertNotEqual(fills[0].quantity, 1.0)
+            self.assertAlmostEqual(fills[0].quantity * 0.41, 100.0, places=6)
+            self.assertGreater(fills[0].slippage, 0.0)
+
+    def test_observation_intent_is_idempotent_and_rejects_binding_conflicts(self) -> None:
+        config = {
+            "strategy_document": {"id": "strategy"},
+            "model_document": {"id": "model"},
+        }
+        with AxiomStore(":memory:") as store:
+            registry = ForwardTestRegistry(store)
+            first = registry.register_observation_intent(
+                strategy=_BuyStrategy(),
+                model={"id": "model"},
+                config=config,
+                registration_timestamp=T0,
+                candidate_id="candidate-a",
+                strategy_version_id="sv-a",
+                research_trial_id="trial-a",
+            )
+            second = registry.register_observation_intent(
+                strategy=_BuyStrategy(),
+                model={"id": "model"},
+                config=config,
+                registration_timestamp=T0,
+                candidate_id="candidate-a",
+                strategy_version_id="sv-a",
+                research_trial_id="trial-a",
+            )
+            self.assertEqual(first.as_record(), second.as_record())
+            with self.assertRaisesRegex(ValueError, "strategy_version_id"):
+                registry.register_observation_intent(
+                    strategy=_BuyStrategy(),
+                    model={"id": "model"},
+                    config=config,
+                    registration_timestamp=T0,
+                    candidate_id="candidate-a",
+                    strategy_version_id="sv-conflict",
+                    research_trial_id="trial-a",
+                )
+
+    def test_rule_scope_materialization_requires_matching_resolution_proof(self) -> None:
+        scope = normalize_market_scope(
+            {
+                "schema_version": "1",
+                "mode": "RULE_BASED_MARKETS",
+                "instrument": "POLYMARKET",
+                "categories": ["politics"],
+                "filters": {"min_liquidity": 1},
+                "regime_restrictions": {},
+                "provenance": "canonical",
+            }
+        )
+        config = {
+            "market_scope": scope.as_dict(),
+            "strategy_document": {"id": "strategy"},
+            "model_document": {"id": "model"},
+        }
+        with AxiomStore(":memory:") as store:
+            registry = ForwardTestRegistry(store)
+            intent = registry.register_observation_intent(
+                strategy=_BuyStrategy(),
+                model={"id": "model"},
+                config=config,
+                registration_timestamp=T0,
+                candidate_id="candidate-rule-proof",
+                strategy_version_id="sv-rule-proof",
+                research_trial_id="trial-rule-proof",
+            )
+            with self.assertRaisesRegex(ValueError, "RULE_BASED_MARKET_SCOPE_RESOLUTION_REQUIRED"):
+                registry.materialize_observation_intent(
+                    intent,
+                    allowed_markets=("market-1",),
+                    registration_timestamp=T0,
+                    now=T0,
+                    candidate_id="candidate-rule-proof",
+                )
+            proof = {
+                "candidate_id": "candidate-rule-proof",
+                "scope_hash": scope.scope_hash,
+                "scope_version": scope.scope_version,
+                "status": "MATCHED",
+                "matched_markets": [{"market_id": "market-1"}],
+            }
+            materialized = registry.materialize_observation_intent(
+                intent,
+                allowed_markets=("market-1",),
+                registration_timestamp=T0,
+                now=T0,
+                candidate_id="candidate-rule-proof",
+                scope_resolution=proof,
+            )
+            self.assertEqual(materialized.allowed_markets, ("market-1",))
+            self.assertTrue(materialized.config["market_authority_required"])
+
+    def test_legacy_paper_state_without_binding_is_migrated(self) -> None:
+        with AxiomStore(":memory:") as store:
+            spec = ForwardTestRegistry(store).freeze(
+                strategy=_BuyStrategy(),
+                model={"id": "model"},
+                start_timestamp=T0,
+                allowed_markets=("m",),
+            )
+            store.save_paper_state(
+                spec.experiment_id,
+                {"experiment_id": spec.experiment_id, "processed_observations": []},
+                timestamp=T0,
+            )
+            engine = ForwardPaperEngine(
+                spec,
+                store=store,
+                strategy=_BuyStrategy(),
+                model={"id": "model"},
+            )
+            self.assertIsNone(engine.compatibility_blocker)
+            self.assertEqual(
+                engine.state["execution_binding"],
+                engine.execution_binding,
+            )
+
+    def test_unmaterialized_intent_and_terminal_first_cannot_execute_or_close(self) -> None:
+        config = {
+            "strategy_document": {"id": "strategy"},
+            "model_document": {"id": "model"},
+        }
+        with AxiomStore(":memory:") as store:
+            registry = ForwardTestRegistry(store)
+            intent = registry.register_observation_intent(
+                strategy=_BuyStrategy(),
+                model={"id": "model"},
+                config=config,
+                registration_timestamp=T0,
+                candidate_id="candidate-unmaterialized",
+            )
+            blocked = ForwardPaperEngine(
+                intent,
+                store=store,
+                strategy=_BuyStrategy(),
+                model={"id": "model"},
+            ).run([], now=T0)
+            self.assertEqual(blocked.blocker, "PAPER_OBSERVATION_AUTHORITY_REQUIRED")
+            spec = registry.freeze(
+                strategy=_BuyStrategy(),
+                model={"id": "model"},
+                start_timestamp=T0,
+                allowed_markets=("m",),
+                experiment_id="terminal-first",
+            )
+            store.save_fill(
+                Fill(
+                    timestamp=T0 + timedelta(minutes=1),
+                    market_type=MarketType.PREDICTION,
+                    symbol="m",
+                    side=Side.BUY,
+                    quantity=1.0,
+                    price=0.4,
+                    fees=0.001,
+                    slippage=0.001,
+                    strategy_id=spec.strategy_hash,
+                    order_id="stale-fill",
+                    market_id="m",
+                    metadata={
+                        "paper_experiment_id": spec.experiment_id,
+                        "outcome": "yes",
+                        "reference_price": 0.4,
+                    },
+                ),
+                fill_id="paper-fill-stale-fill",
+            )
+            terminal = ForwardPaperEngine(
+                spec,
+                store=store,
+                strategy=_BuyStrategy(),
+                model={"id": "model"},
+            ).run(
+                [
+                    {
+                        "market_id": "m",
+                        "timestamp": T0 + timedelta(minutes=2),
+                        "yes_mid": 0.4,
+                        "settlement": "RESOLVED_YES",
+                    }
+                ],
+                now=T0 + timedelta(minutes=2),
+            )
+            self.assertEqual(terminal.settlements, 1)
+            self.assertEqual(store.list_paper_bet_ledger(spec.experiment_id), [])
     def test_forward_engine_processes_equal_timestamp_source_pages(self) -> None:
         with AxiomStore(":memory:") as store:
             spec = ForwardTestRegistry(store).freeze(

@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 import re
+from types import MappingProxyType
 from typing import Any, Mapping, Sequence
 
 from .domain import ResearchQuality, ensure_utc, parse_timestamp, utc_now
@@ -38,13 +39,57 @@ _PRIVATE_FORWARD_TOKENS = frozenset(
     }
 )
 
-COMMON_PAPER_ASSUMPTIONS: Mapping[str, Any] = {
-    "version": "paper-assumptions-v1",
-    "currency": "USD",
-    "sizing": {"model": "fixed_allocated_capital", "allocated_capital": "100"},
-    "fees": {"model": "proportional", "fee_bps": "10"},
-    "slippage": {"model": "proportional", "slippage_bps": "5"},
-}
+COMMON_PAPER_ASSUMPTIONS: Mapping[str, Any] = MappingProxyType(
+    {
+        "version": "paper-assumptions-v1",
+        "currency": "USD",
+        "sizing": MappingProxyType(
+            {"model": "fixed_allocated_capital", "allocated_capital": "100"}
+        ),
+        "fees": MappingProxyType({"model": "proportional", "fee_bps": "10"}),
+        "slippage": MappingProxyType({"model": "proportional", "slippage_bps": "5"}),
+    }
+)
+
+_SUPPORTED_PAPER_SIZING_MODELS = frozenset({"fixed_allocated_capital"})
+
+
+def _paper_assumptions_explicit(config: Mapping[str, Any]) -> bool:
+    """Return whether a caller explicitly froze paper assumptions.
+
+    Older persisted forward records contain the backfilled ``paper_assumptions``
+    document but no marker.  They remain legacy-compatible; only a marker
+    written while freezing a new intent makes the assumptions authoritative.
+    """
+    marker = config.get("paper_assumptions_explicit")
+    if marker is not None and not isinstance(marker, bool):
+        raise ValueError("paper_assumptions_explicit must be a boolean")
+    return bool(marker)
+
+
+def _paper_assumption_costs(config: Mapping[str, Any]) -> tuple[float, float] | None:
+    if not _paper_assumptions_explicit(config):
+        return None
+    assumptions = config.get("paper_assumptions")
+    if not isinstance(assumptions, Mapping):
+        raise ValueError("explicit paper assumptions must be a mapping")
+    fees = assumptions.get("fees")
+    slippage = assumptions.get("slippage")
+    if not isinstance(fees, Mapping) or not isinstance(slippage, Mapping):
+        raise ValueError("explicit paper assumptions require fees and slippage")
+    try:
+        fee_bps = float(fees.get("fee_bps"))
+        slippage_bps = float(slippage.get("slippage_bps"))
+    except (TypeError, ValueError):
+        raise ValueError("explicit paper assumption costs must be numeric") from None
+    if (
+        not math.isfinite(fee_bps)
+        or not math.isfinite(slippage_bps)
+        or fee_bps < 0
+        or slippage_bps < 0
+    ):
+        raise ValueError("explicit paper assumption costs must be finite and non-negative")
+    return fee_bps / 10_000.0, slippage_bps
 
 
 def _validate_private_fields(value: Any, *, path: str = "value", depth: int = 0) -> None:
@@ -98,15 +143,29 @@ def _validate_forward_config(config: Mapping[str, Any]) -> None:
     except (ResearchBusPermissionError, TypeError, ValueError) as exc:
         raise ValueError("forward test config contains forbidden private or execution fields") from exc
 def _canonical_scope_config(config: Mapping[str, Any]) -> dict[str, Any]:
-    """Validate one canonical scope binding carried by a frozen forward test."""
+    """Validate and canonicalize both accepted scope aliases."""
     result = dict(config)
-    scope = result.get("market_scope")
-    if scope is None:
+    supplied_scope = result.get("scope")
+    supplied_market_scope = result.get("market_scope")
+    if supplied_scope is not None and supplied_market_scope is not None:
+        try:
+            from .experiment_plan import normalize_market_scope
+
+            scope_policy = normalize_market_scope(supplied_scope)
+            market_scope_policy = normalize_market_scope(supplied_market_scope)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("forward test scope is not canonical") from exc
+        if scope_policy.scope_hash != market_scope_policy.scope_hash:
+            raise ValueError("forward test scope and market_scope conflict")
+        supplied_market_scope = market_scope_policy.as_dict()
+    elif supplied_market_scope is None and supplied_scope is not None:
+        supplied_market_scope = supplied_scope
+    if supplied_market_scope is None:
         return result
     try:
         from .experiment_plan import normalize_market_scope
 
-        policy = normalize_market_scope(scope)
+        policy = normalize_market_scope(supplied_market_scope)
     except (TypeError, ValueError) as exc:
         raise ValueError("forward test market_scope is not canonical") from exc
     for field, expected in (
@@ -119,29 +178,142 @@ def _canonical_scope_config(config: Mapping[str, Any]) -> dict[str, Any]:
         if supplied is not None and str(supplied).strip() != expected:
             raise ValueError(f"forward test {field} does not match canonical market scope")
         result[field] = expected
-    result["market_scope"] = policy.as_dict()
+    canonical_scope = policy.as_dict()
+    result["market_scope"] = canonical_scope
+    if "scope" in result:
+        result["scope"] = canonical_scope
     return result
-def _canonical_forward_config(config: Mapping[str, Any] | None = None) -> dict[str, Any]:
-    """Return the immutable paper config that a new forward test will carry.
 
-    This is intentionally separate from ``ForwardTestSpec`` loading.  Existing
-    persisted records may predate paper assumptions and must remain readable
-    without being rewritten during a migration.  New registrations use this
-    deterministic, idempotent representation before deriving any identity
-    hashes.
-    """
-    result = dict(config or {})
+
+def _plain_json(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {str(key): _plain_json(child) for key, child in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain_json(child) for child in value]
+    return value
+
+
+def _canonical_forward_config(config: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """Return the immutable paper config carried by a new forward test."""
+    result = _plain_json(dict(config or {}))
+    supplied = "paper_assumptions" in result
     supplied_assumptions = result.get("paper_assumptions")
-    merged_assumptions = dict(COMMON_PAPER_ASSUMPTIONS)
+    if supplied and not isinstance(supplied_assumptions, Mapping):
+        raise ValueError("paper_assumptions must be a mapping")
+    merged_assumptions = _plain_json(COMMON_PAPER_ASSUMPTIONS)
     if isinstance(supplied_assumptions, Mapping):
         for key, value in supplied_assumptions.items():
             if isinstance(value, Mapping) and isinstance(merged_assumptions.get(key), Mapping):
                 merged_assumptions[key] = {**dict(merged_assumptions[key]), **dict(value)}
             else:
                 merged_assumptions[key] = value
+    sizing = merged_assumptions.get("sizing")
+    sizing = sizing if isinstance(sizing, Mapping) else {}
+    sizing_model = sizing.get("model", merged_assumptions.get("sizing_model"))
+    if str(sizing_model).strip() not in _SUPPORTED_PAPER_SIZING_MODELS:
+        raise ValueError(f"unsupported paper sizing model: {sizing_model!r}")
     result["paper_assumptions"] = merged_assumptions
-    return _canonical_scope_config(result)
+    if supplied:
+        result["paper_assumptions_explicit"] = True
+    elif "paper_assumptions_explicit" in result:
+        _paper_assumptions_explicit(result)
+    return _plain_json(_canonical_scope_config(result))
 
+
+def _merge_exact_observation_bindings(
+    config: Mapping[str, Any] | None,
+    *,
+    candidate_id: str | None = None,
+    strategy_version_id: str | None = None,
+    research_trial_id: str | None = None,
+    source_strategy_hash: str | None = None,
+    rolling_strategy_hash: str | None = None,
+    dataset_selector: Mapping[str, Any] | None = None,
+    scope: Mapping[str, Any] | None = None,
+    market_scope: Mapping[str, Any] | None = None,
+) -> tuple[dict[str, Any], bool]:
+    """Merge caller-provided rolling bindings without weakening immutability."""
+    result = _canonical_scope_config(dict(config or {}))
+    rolling = False
+
+    def text(name: str, value: Any) -> str | None:
+        if value is None:
+            return None
+        normalized = str(value).strip()
+        if not normalized:
+            raise ValueError(f"{name} must be non-empty")
+        return normalized
+
+    def bind_text(name: str, value: Any) -> None:
+        nonlocal rolling
+        normalized = text(name, value)
+        if normalized is None:
+            return
+        existing = result.get(name)
+        if existing not in (None, "") and str(existing).strip() != normalized:
+            raise ValueError(f"observation intent binding conflicts for {name}")
+        result[name] = normalized
+        rolling = True
+
+    bind_text("candidate_id", candidate_id)
+    bind_text("strategy_version_id", strategy_version_id)
+    bind_text("research_trial_id", research_trial_id)
+    bind_text("source_strategy_hash", source_strategy_hash)
+    bind_text("rolling_strategy_hash", rolling_strategy_hash)
+
+    if dataset_selector is not None:
+        if not isinstance(dataset_selector, Mapping):
+            raise ValueError("dataset_selector must be a mapping")
+        supplied = _plain(dataset_selector)
+        current = result.get("dataset_selector")
+        if current not in (None, {}) and _canonical(current) != _canonical(supplied):
+            raise ValueError("observation intent binding conflicts for dataset_selector")
+        result["dataset_selector"] = supplied
+        rolling = True
+    if scope is not None and market_scope is not None:
+        try:
+            from .experiment_plan import normalize_market_scope
+
+            scope_compare = normalize_market_scope(scope).as_dict()
+            market_scope_compare = normalize_market_scope(market_scope).as_dict()
+        except (TypeError, ValueError) as exc:
+            raise ValueError("scope is not canonical") from exc
+        if _canonical(scope_compare) != _canonical(market_scope_compare):
+            raise ValueError("observation intent binding conflicts for scope")
+    scope = scope if scope is not None else market_scope
+    if scope is not None:
+        if not isinstance(scope, Mapping):
+            raise ValueError("scope must be a mapping")
+        supplied = _plain(scope)
+        current = result.get("market_scope", result.get("scope"))
+        if current not in (None, {}):
+            try:
+                from .experiment_plan import normalize_market_scope
+
+                current_compare = normalize_market_scope(current).as_dict()
+                supplied_compare = normalize_market_scope(supplied).as_dict()
+            except (TypeError, ValueError) as exc:
+                raise ValueError("scope is not canonical") from exc
+            if _canonical(current_compare) != _canonical(supplied_compare):
+                raise ValueError("observation intent binding conflicts for scope")
+        result["scope"] = supplied
+        result["market_scope"] = supplied
+        rolling = True
+    elif "scope" in result and "market_scope" not in result:
+        result["market_scope"] = result["scope"]
+
+    rolling = any(
+        value is not None
+        for value in (
+            strategy_version_id,
+            research_trial_id,
+            source_strategy_hash,
+            rolling_strategy_hash,
+            dataset_selector,
+            scope,
+        )
+    )
+    return result, rolling
 
 
 def _scope_allowed_markets(config: Mapping[str, Any]) -> tuple[str, ...] | None:
@@ -155,6 +327,74 @@ def _scope_allowed_markets(config: Mapping[str, Any]) -> tuple[str, ...] | None:
     if not isinstance(values, (list, tuple, set, frozenset)):
         return ()
     return tuple(dict.fromkeys(str(item).strip() for item in values if str(item).strip()))
+
+
+def _scope_resolution_mapping(value: Any) -> Mapping[str, Any] | None:
+    """Return a bounded immutable scope-resolution proof mapping."""
+    if isinstance(value, Mapping):
+        return value
+    as_dict = getattr(value, "as_dict", None)
+    if callable(as_dict):
+        try:
+            resolved = as_dict()
+        except Exception:
+            return None
+        return resolved if isinstance(resolved, Mapping) else None
+    return None
+
+
+def _scope_resolution_market_ids(value: Mapping[str, Any]) -> tuple[str, ...]:
+    """Extract only resolver-authoritative matched market identities."""
+    matched = value.get("matched_markets", value.get("resolved_markets", ()))
+    if not isinstance(matched, (list, tuple, set, frozenset)):
+        matched = value.get("matched_market_ids", value.get("resolved_market_ids", ()))
+    if isinstance(matched, str):
+        matched = (matched,)
+    if not isinstance(matched, (list, tuple, set, frozenset)):
+        return ()
+    result: list[str] = []
+    for item in matched:
+        if isinstance(item, Mapping):
+            item = item.get("market_id", item.get("id"))
+        else:
+            item = getattr(item, "market_id", item)
+        text = str(item).strip() if item is not None else ""
+        if text and text not in result:
+            result.append(text)
+    return tuple(result)
+
+
+def _require_rule_scope_resolution(
+    source_config: Mapping[str, Any],
+    source_candidate: str,
+    allowed_markets: Sequence[str],
+    supplied: Any,
+) -> None:
+    """Reject rule-scope materialization without matching complete authority."""
+    try:
+        from .experiment_plan import normalize_market_scope
+
+        scope = source_config.get("market_scope", source_config.get("scope"))
+        policy = normalize_market_scope(scope)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("RULE_BASED_MARKET_SCOPE_POLICY_INVALID") from exc
+    if str(policy.mode).strip().upper() != "RULE_BASED_MARKETS":
+        return
+    proof = _scope_resolution_mapping(supplied)
+    if proof is None:
+        raise ValueError("RULE_BASED_MARKET_SCOPE_RESOLUTION_REQUIRED")
+    status = str(proof.get("status", "")).strip().upper()
+    if status not in {"MATCHED", "COMPLETE"} or proof.get("complete") is False:
+        raise ValueError("RULE_BASED_MARKET_SCOPE_RESOLUTION_INCOMPLETE")
+    if str(proof.get("candidate_id", "")).strip() != source_candidate:
+        raise ValueError("RULE_BASED_MARKET_SCOPE_RESOLUTION_CANDIDATE_MISMATCH")
+    if str(proof.get("scope_hash", proof.get("market_scope_hash", ""))).strip() != policy.scope_hash:
+        raise ValueError("RULE_BASED_MARKET_SCOPE_RESOLUTION_HASH_MISMATCH")
+    if str(proof.get("scope_version", proof.get("market_scope_version", proof.get("version", "")))).strip() != policy.scope_version:
+        raise ValueError("RULE_BASED_MARKET_SCOPE_RESOLUTION_VERSION_MISMATCH")
+    resolved_ids = set(_scope_resolution_market_ids(proof))
+    if not resolved_ids or any(str(item).strip() not in resolved_ids for item in allowed_markets):
+        raise ValueError("RULE_BASED_MARKET_SCOPE_RESOLUTION_MARKET_MISMATCH")
 
 @dataclass(frozen=True, slots=True)
 class ForwardTestSpec:
@@ -275,8 +515,12 @@ class ForwardTestRegistry:
             "risk_config_hash": risk_config_hash,
         }
         for key, value in lineage.items():
-            if value is not None:
-                config_record.setdefault(key, value)
+            if value is None:
+                continue
+            existing = config_record.get(key)
+            if existing not in (None, "") and _canonical(existing) != _canonical(value):
+                raise ValueError(f"forward test lineage conflicts for {key}")
+            config_record[key] = value
         config_record = _canonical_forward_config(config_record)
         _validate_forward_config(config_record)
         start = ensure_utc(start_timestamp or utc_now())
@@ -359,29 +603,121 @@ class ForwardTestRegistry:
         bankroll: float = 10_000.0,
         risk_limits: Mapping[str, Any] | None = None,
         candidate_id: str,
+        strategy_version_id: str | None = None,
+        research_trial_id: str | None = None,
+        source_strategy_hash: str | None = None,
+        rolling_strategy_hash: str | None = None,
+        dataset_selector: Mapping[str, Any] | None = None,
+        scope: Mapping[str, Any] | None = None,
+        market_scope: Mapping[str, Any] | None = None,
+        scope_resolution: Mapping[str, Any] | Any | None = None,
     ) -> ForwardTestSpec:
-        """Persist a bounded paper observation intent before qualification.
+        """Persist one immutable paper/research observation intent.
 
-        An intent is immutable evidence configuration, not a candidate
-        lifecycle transition or an executable forward authority.  It is kept
-        out of the paper scheduler until the collector materializes a bounded
-        current-market registry entry.
+        Rolling bindings are part of the frozen config.  The intent identity
+        is derived from those bindings rather than accepted from a caller.
+        Legacy callers that provide only ``candidate_id`` retain their
+        candidate-derived identifier.
         """
         identifier = str(candidate_id).strip()
         if not identifier:
             raise ValueError("candidate_id is required for an observation intent")
-        intent_config = dict(config)
+        intent_config, rolling = _merge_exact_observation_bindings(
+            config,
+            candidate_id=identifier,
+            strategy_version_id=strategy_version_id,
+            research_trial_id=research_trial_id,
+            source_strategy_hash=source_strategy_hash,
+            rolling_strategy_hash=rolling_strategy_hash,
+            dataset_selector=dataset_selector,
+            scope=scope,
+            market_scope=market_scope,
+        )
+        if not rolling and "candidate_id" not in config:
+            # Legacy intents historically carried candidate identity only in
+            # their deterministic experiment id; do not rewrite their frozen
+            # config on an idempotent retry.
+            intent_config.pop("candidate_id", None)
         intent_config["observation_intent"] = True
         intent_config["market_authority_required"] = False
+        # Observation intents must retain the immutable source documents.  A
+        # later materialization may not index caller configuration for them.
+        intent_config.setdefault(
+            "strategy_document", _normalized_strategy_document(strategy)
+        )
+        source_model_document = getattr(model, "document", model)
+        if "model_document" not in intent_config and isinstance(
+            source_model_document, Mapping
+        ):
+            intent_config["model_document"] = dict(source_model_document)
+        if scope_resolution is not None:
+            proof = _scope_resolution_mapping(scope_resolution)
+            if proof is None:
+                raise ValueError("scope_resolution must be a mapping or immutable resolution")
+            intent_config.setdefault("scope_resolution", dict(proof))
+        # ``freeze`` computes the canonical strategy hash.  A supplied
+        # rolling hash is an assertion about that exact document, never an
+        # alternate execution identity.
+        computed_strategy_hash = _content_hash(
+            _normalized_strategy_document(
+                intent_config.get("strategy_document")
+                if isinstance(intent_config.get("strategy_document"), Mapping)
+                else strategy
+            )
+        )
+        if rolling_strategy_hash is not None and str(rolling_strategy_hash).strip() != computed_strategy_hash:
+            raise ValueError("rolling_strategy_hash does not match strategy")
+        normalized_config = _canonical_forward_config(intent_config)
+        identity_material = {
+            "candidate_id": identifier,
+            "strategy_hash": computed_strategy_hash,
+            "model_hash": _content_hash(
+                intent_config.get("model_document")
+                if isinstance(intent_config.get("model_document"), Mapping)
+                else getattr(model, "document", model)
+            ),
+            "config": normalized_config,
+            "bankroll": float(bankroll),
+            "risk_limits": dict(risk_limits or {}),
+        }
+        experiment_id = (
+            "observation-intent-" + identifier
+            if not rolling
+            else "observation-intent-"
+            + hashlib.sha256(_canonical(identity_material).encode("utf-8")).hexdigest()[:24]
+        )
+        # The deterministic id changes when provenance changes, but reusing a
+        # candidate with different frozen identity must still fail closed.
+        for existing in self.list_observation_intents():
+            existing_config = (
+                existing.config if isinstance(existing.config, Mapping) else {}
+            )
+            if str(existing_config.get("candidate_id", "")).strip() != identifier:
+                continue
+            for key in (
+                "strategy_version_id",
+                "research_trial_id",
+                "source_strategy_hash",
+                "rolling_strategy_hash",
+            ):
+                if str(existing_config.get(key, "")).strip() != str(
+                    intent_config.get(key, "")
+                ).strip():
+                    raise ValueError(f"observation intent {key} conflicts")
+            for key in ("dataset_selector", "scope", "market_scope"):
+                existing_value = existing_config.get(key)
+                expected_value = intent_config.get(key)
+                if _canonical(existing_value) != _canonical(expected_value):
+                    raise ValueError(f"observation intent {key} conflicts")
         return self.freeze(
             strategy=strategy,
             model=model,
-            config=intent_config,
+            config=normalized_config,
             start_timestamp=registration_timestamp or utc_now(),
             bankroll=bankroll,
             allowed_markets=(),
             risk_limits=risk_limits,
-            experiment_id="observation-intent-" + identifier,
+            experiment_id=experiment_id,
         )
 
     def list_observation_intents(self) -> tuple[ForwardTestSpec, ...]:
@@ -400,36 +736,109 @@ class ForwardTestRegistry:
         registration_timestamp: datetime | None = None,
         now: datetime | None = None,
         candidate_id: str | None = None,
+        strategy_version_id: str | None = None,
+        research_trial_id: str | None = None,
+        source_strategy_hash: str | None = None,
+        rolling_strategy_hash: str | None = None,
+        dataset_selector: Mapping[str, Any] | None = None,
+        scope: Mapping[str, Any] | None = None,
+        market_scope: Mapping[str, Any] | None = None,
+        scope_resolution: Mapping[str, Any] | Any | None = None,
     ) -> ForwardTestSpec:
-        """Create the immutable bounded forward spec after collector resolution."""
+        """Create the immutable bounded forward spec after authority resolution."""
         source = intent if isinstance(intent, ForwardTestSpec) else self.get(str(intent))
         if source is None:
             raise ValueError("observation intent is missing")
         source_config = dict(source.config) if isinstance(source.config, Mapping) else {}
         if not bool(source_config.get("observation_intent")):
             raise ValueError("forward spec is not an observation intent")
+        strategy_document = source_config.get("strategy_document")
+        if not isinstance(strategy_document, Mapping):
+            strategy_document = source_config.get("strategy", source_config.get("canonical_strategy"))
+        model_document = source_config.get("model_document")
+        if not isinstance(model_document, Mapping):
+            model_document = source_config.get("model")
+        if not isinstance(strategy_document, Mapping):
+            raise ValueError("observation intent strategy document is missing")
+        if not isinstance(model_document, Mapping):
+            raise ValueError("observation intent model document is missing")
+        source_candidate = str(source_config.get("candidate_id", "")).strip()
+        if not source_candidate:
+            source_candidate = source.experiment_id.removeprefix("observation-intent-").strip()
+        if not source_candidate:
+            raise ValueError("observation intent has no candidate identity")
+        if candidate_id is not None and str(candidate_id).strip() != source_candidate:
+            raise ValueError("observation intent candidate_id conflicts with frozen binding")
         markets = tuple(dict.fromkeys(str(item).strip() for item in allowed_markets if str(item).strip()))
         if not markets or len(markets) > 100:
             raise ValueError("collector must materialize a non-empty bounded market set")
+        source_config, rolling_binding = _merge_exact_observation_bindings(
+            source_config,
+            candidate_id=source_candidate,
+            strategy_version_id=strategy_version_id,
+            research_trial_id=research_trial_id,
+            source_strategy_hash=source_strategy_hash,
+            rolling_strategy_hash=rolling_strategy_hash,
+            dataset_selector=dataset_selector,
+            scope=scope,
+            market_scope=market_scope,
+        )
+        scope_document = source_config.get("market_scope", source_config.get("scope"))
+        if isinstance(scope_document, Mapping):
+            _require_rule_scope_resolution(
+                source_config,
+                source_candidate,
+                markets,
+                scope_resolution
+                if scope_resolution is not None
+                else source_config.get("scope_resolution"),
+            )
         source_config["market_authority_required"] = True
-        identifier = str(candidate_id or source_config.get("candidate_id") or "").strip()
-        if not identifier:
-            identifier = source.experiment_id.removeprefix("observation-intent-").strip()
-        if not identifier:
-            raise ValueError("observation intent has no candidate identity")
         current = ensure_utc(now or utc_now())
         registration = ensure_utc(registration_timestamp or current)
+        complete_exact_identity = all(
+            str(source_config.get(field) or "").strip()
+            for field in (
+                "strategy_version_id",
+                "research_trial_id",
+                "source_strategy_hash",
+                "rolling_strategy_hash",
+            )
+        )
+        rolling_only = bool(
+            rolling_binding
+            or (
+                source_config.get("rolling_research") is True
+                and complete_exact_identity
+            )
+        )
+        if rolling_only:
+            binding_digest = hashlib.sha256(
+                _canonical(
+                    {
+                        "source_experiment_id": source.experiment_id,
+                        "config": source_config,
+                        "allowed_markets": markets,
+                    }
+                ).encode("utf-8")
+            ).hexdigest()[:24]
+            source_config["materialized_binding_hash"] = "sha256:" + binding_digest
+            experiment_id = "forward-" + source_candidate + "-" + binding_digest
+        else:
+            # Keep the original collector/legacy identity unchanged.
+            experiment_id = "forward-" + source_candidate
         return self.register_forward_test(
-            strategy=dict(source_config["strategy_document"]),
-            model=dict(source_config["model_document"]),
+            strategy=dict(strategy_document),
+            model=dict(model_document),
             registration_timestamp=registration,
             now=current,
             config=source_config,
             bankroll=source.bankroll,
             allowed_markets=markets,
             risk_limits=dict(source.risk_limits),
-            experiment_id="forward-" + identifier,
+            experiment_id=experiment_id,
         )
+
 
 
     def list(self) -> tuple[ForwardTestSpec, ...]:

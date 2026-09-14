@@ -1413,6 +1413,21 @@ class MutationSchedulingTests(unittest.TestCase):
                     processor._rolling_source_rows = lambda *_args: []  # type: ignore[method-assign]
                     node.stop_event = StopAfterOneWait()
                     node._rolling_portfolio_worker_loop()
+                    worker = store.get_worker_state("rolling-portfolio")
+                    self.assertIsNotNone(worker)
+                    assert worker is not None
+                    self.assertEqual(
+                        worker["payload"]["evidence_interval_seconds"],
+                        node.config.rolling_evidence_interval_seconds,
+                    )
+                    self.assertEqual(
+                        worker["payload"]["review_interval_seconds"],
+                        node.config.rolling_review_interval_seconds,
+                    )
+                    self.assertNotEqual(
+                        worker["payload"]["evidence_interval_seconds"],
+                        worker["payload"]["review_interval_seconds"],
+                    )
                     review = store.load_portfolio_review_state()
                     selection = store.load_current_portfolio_selection()
                     self.assertIsNotNone(review)

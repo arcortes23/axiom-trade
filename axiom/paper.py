@@ -261,6 +261,13 @@ class PaperTrader:
         return normalized, quantity
     @staticmethod
     def _signal_outcome(signal: Any) -> str | None:
+        if isinstance(signal, str):
+            normalized = signal.strip().lower()
+            if normalized in {"yes", "buy_yes", "sell_yes"}:
+                return "yes"
+            if normalized in {"no", "buy_no", "sell_no"}:
+                return "no"
+            return None
         if isinstance(signal, Mapping):
             explicit = signal.get("outcome", signal.get("token"))
             if explicit is not None and str(explicit).strip().lower() in {"yes", "no"}:
@@ -470,6 +477,7 @@ class PaperTrader:
         timestamp: datetime,
         reference: float,
         quantity: float | None = None,
+        allocated_capital: float | None = None,
         market_id: str | None = None,
         signal_observation: Any | None = None,
         signal_history: Sequence[Any] | None = None,
@@ -714,7 +722,24 @@ class PaperTrader:
             if executable is not None:
                 risk_price = executable
         context["risk_price"] = risk_price
-        quantity = self._quantity(signal, context, quantity if quantity is not None else indicated_quantity)
+        allocation_quantity = indicated_quantity
+        if allocated_capital is not None:
+            try:
+                capital = float(allocated_capital)
+            except (TypeError, ValueError):
+                capital = 0.0
+            if math.isfinite(capital) and capital > 0 and execution_reference > 0:
+                # The signal selects the outcome before this point, so this is
+                # the selected outcome's executable quote, not max(YES, NO).
+                # Frozen allocated-capital sizing owns quantity even when a
+                # caller also supplied an explicit quantity.
+                allocation_quantity = capital / execution_reference
+            else:
+                allocation_quantity = 0.0
+            sizing_quantity = allocation_quantity
+        else:
+            sizing_quantity = quantity if quantity is not None else allocation_quantity
+        quantity = self._quantity(signal, context, sizing_quantity)
         if self.portfolio is not None:
             if side is Side.BUY:
                 cash = getattr(self.portfolio, "cash", None)

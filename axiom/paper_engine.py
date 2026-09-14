@@ -27,7 +27,14 @@ from .domain import (
     to_record,
     utc_now,
 )
-from .forward import ForwardTestSpec, _content_hash, _normalized_strategy_document
+from .forward import (
+    ForwardTestSpec,
+    _content_hash,
+    _normalized_strategy_document,
+    _paper_assumption_costs,
+    _paper_assumptions_explicit,
+    _SUPPORTED_PAPER_SIZING_MODELS,
+)
 from .paper import PaperTrader, PaperTradingConfig
 from .portfolio import Portfolio
 from .risk import RiskEngine, RiskLimits
@@ -39,7 +46,88 @@ from .strategy.signals import (
 
 _MAX_RUN_OBSERVATIONS = 100_000
 PAPER_STATE_EXECUTION_BINDING_MISMATCH = "PAPER_STATE_EXECUTION_BINDING_MISMATCH"
+PAPER_OBSERVATION_AUTHORITY_REQUIRED = "PAPER_OBSERVATION_AUTHORITY_REQUIRED"
+def _paper_config_from_spec(
+    spec: ForwardTestSpec,
+    config: PaperTradingConfig | None,
+) -> tuple[PaperTradingConfig, float | None]:
+    """Materialize immutable nested assumptions for paper execution.
 
+    New forward specs carry fees, slippage, and sizing under
+    ``paper_assumptions``.  A caller-supplied execution config may repeat the
+    cost values, but it cannot override the frozen assumptions.
+    """
+    supplied = config
+    effective = config or PaperTradingConfig()
+    spec_config = spec.config if isinstance(spec.config, Mapping) else {}
+    if not _paper_assumptions_explicit(spec_config):
+        # Persisted records from before explicit assumptions remain readable;
+        # their backfilled assumptions are descriptive, not execution authority.
+        return effective, None
+    assumptions = spec_config.get("paper_assumptions")
+    if not isinstance(assumptions, Mapping):
+        raise ValueError("explicit paper assumptions must be a mapping")
+
+    def number(value: Any, name: str) -> float:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            raise ValueError(f"paper_assumptions.{name} must be numeric") from None
+        if not math.isfinite(parsed) or parsed < 0:
+            raise ValueError(f"paper_assumptions.{name} must be finite and non-negative")
+        return parsed
+
+    expected_fee_rate, expected_slippage_bps = _paper_assumption_costs(spec_config) or (
+        None,
+        None,
+    )
+    if supplied is not None:
+        if (
+            expected_fee_rate is not None
+            and float(supplied.fee_rate) != expected_fee_rate
+        ):
+            raise ValueError("paper fee_rate conflicts with frozen assumptions")
+        if (
+            expected_slippage_bps is not None
+            and float(supplied.slippage_bps) != expected_slippage_bps
+        ):
+            raise ValueError("paper slippage_bps conflicts with frozen assumptions")
+    elif expected_fee_rate is not None or expected_slippage_bps is not None:
+        effective = PaperTradingConfig(
+            fee_rate=(
+                expected_fee_rate
+                if expected_fee_rate is not None
+                else effective.fee_rate
+            ),
+            slippage_bps=(
+                expected_slippage_bps
+                if expected_slippage_bps is not None
+                else effective.slippage_bps
+            ),
+            depth=effective.depth,
+            quality=effective.quality,
+            live=effective.live,
+        )
+
+    allocated_capital: float | None = None
+    sizing = assumptions.get("sizing")
+    sizing = sizing if isinstance(sizing, Mapping) else {}
+    model = str(sizing.get("model", assumptions.get("sizing_model", ""))).strip().lower()
+    if model not in _SUPPORTED_PAPER_SIZING_MODELS:
+        raise ValueError(f"unsupported paper sizing model: {model!r}")
+    if sizing.get("allocated_capital") is None:
+        raise ValueError(
+            "paper_assumptions.sizing.allocated_capital is required"
+        )
+    allocated_capital = number(
+        sizing["allocated_capital"],
+        "sizing.allocated_capital",
+    )
+    if allocated_capital <= 0:
+        raise ValueError(
+            "paper_assumptions.sizing.allocated_capital must be positive"
+        )
+    return effective, allocated_capital
 
 def paper_execution_binding(
     spec: ForwardTestSpec,
@@ -51,7 +139,7 @@ def paper_execution_binding(
     """Build the immutable binding used by one paper execution namespace."""
     if not isinstance(spec, ForwardTestSpec):
         raise TypeError("spec must be a ForwardTestSpec")
-    paper_config = config or PaperTradingConfig()
+    paper_config, _ = _paper_config_from_spec(spec, config)
     run_id = str(storage_namespace or spec.experiment_id).strip()
     if not run_id:
         raise ValueError("storage_namespace must be non-empty")
@@ -195,7 +283,7 @@ class ForwardPaperEngine:
         self.provider = provider
         self.model = model
         self.strategy = strategy
-        self.config = config or PaperTradingConfig()
+        self.config, self._allocated_capital = _paper_config_from_spec(spec, config)
         self._run_id = str(storage_namespace or spec.experiment_id).strip()
         if not self._run_id:
             raise ValueError("storage_namespace must be non-empty")
@@ -216,10 +304,41 @@ class ForwardPaperEngine:
         raw_state = loaded_state.get("state", {}) if loaded_state is not None else {}
         self._state = dict(raw_state) if isinstance(raw_state, Mapping) else {}
         persisted_binding = self._state.get("execution_binding")
-        self._compatibility_blocker = paper_state_binding_blocker(
-            persisted_binding,
-            self._execution_binding,
-        ) if loaded_state is not None else None
+        self._compatibility_blocker = None
+        if loaded_state is not None and persisted_binding is None:
+            # States written before execution bindings are valid when their
+            # durable identity agrees with this namespace.  Adopt the current
+            # binding and let the next checkpoint persist the migration.
+            legacy_experiment = str(self._state.get("experiment_id", "")).strip()
+            legacy_mode = str(self._state.get("research_mode", "")).strip()
+            legacy_strategy = str(self._state.get("execution_strategy_id", "")).strip()
+            if (
+                legacy_experiment not in {"", self._run_id}
+                or legacy_mode not in {"", self._research_mode}
+                or legacy_strategy not in {"", self._execution_strategy_id}
+            ):
+                self._compatibility_blocker = paper_state_binding_blocker(
+                    persisted_binding,
+                    self._execution_binding,
+                )
+            else:
+                self._state["execution_binding"] = dict(self._execution_binding)
+                persisted_binding = self._execution_binding
+        if self._compatibility_blocker is None and loaded_state is not None:
+            self._compatibility_blocker = paper_state_binding_blocker(
+                persisted_binding,
+                self._execution_binding,
+            )
+        config_view = spec.config if isinstance(spec.config, Mapping) else {}
+        if (
+            self._compatibility_blocker is None
+            and bool(config_view.get("observation_intent"))
+            and not bool(config_view.get("market_authority_required"))
+        ):
+            self._compatibility_blocker = {
+                "blocker": PAPER_OBSERVATION_AUTHORITY_REQUIRED,
+                "retryable": False,
+            }
         if self._compatibility_blocker is not None:
             # Do not hydrate any mutable state from a stale namespace.  In
             # particular, restoring its ledger or risk status would mutate a
@@ -258,6 +377,34 @@ class ForwardPaperEngine:
             for key, value in raw_open_times.items()
             if (parsed := parse_timestamp(value)) is not None
         } if isinstance(raw_open_times, Mapping) else {}
+        if loaded_state is not None and not self._observation_open_by_market:
+            # Pre-binding states only retained the last 512 signal inputs.
+            # Reconstruct the true opening boundary from the durable ledger
+            # before falling back to that bounded history.
+            try:
+                persisted_observations = self.store.list_paper_observations(
+                    self._run_id,
+                    limit=None,
+                )
+            except Exception:
+                persisted_observations = ()
+            for item in persisted_observations:
+                if not isinstance(item, Mapping):
+                    continue
+                payload = item.get("payload")
+                market_id = str(
+                    item.get(
+                        "market_id",
+                        payload.get("market_id", "") if isinstance(payload, Mapping) else "",
+                    )
+                ).strip()
+                stamp = parse_timestamp(item.get("timestamp"))
+                if stamp is None and isinstance(payload, Mapping):
+                    stamp = _observation_timestamp(payload)
+                if market_id and stamp is not None:
+                    previous = self._observation_open_by_market.get(market_id)
+                    if previous is None or stamp < previous:
+                        self._observation_open_by_market[market_id] = stamp
         raw_source_cursors = self._state.get("source_cursor_by_market", {})
         self._source_cursor: dict[str, tuple[datetime, str]] = {
             str(key): (parsed, str(value.get("snapshot_id")).strip())
@@ -508,7 +655,14 @@ class ForwardPaperEngine:
                 skipped += 1
                 errors.append(f"future observation deferred: {stamp.isoformat()}")
                 continue
-            normalized = _normalize_observation(raw)
+            normalized = _normalize_observation(
+                raw,
+                default_market_id=(
+                    self.spec.allowed_markets[0]
+                    if len(self.spec.allowed_markets) == 1
+                    else None
+                ),
+            )
             if normalized is None:
                 skipped += 1
                 errors.append("malformed prediction observation")
@@ -722,12 +876,16 @@ class ForwardPaperEngine:
                                 no_book=no_book,
                                 timestamp=stamp,
                                 reference=price,
+                                allocated_capital=self._allocated_capital,
                                 market_id=market_id,
                                 signal_history=history_before,
                             )
                         if fill is not None:
                             fill = self._bind_fill(fill)
-                            if self.store.save_fill(fill, fill_id="paper-fill-" + self._run_id + "-" + fill.order_id):
+                            if self.store.save_fill(
+                                fill,
+                                fill_id="paper-fill-" + self._run_id + "-" + fill.order_id,
+                            ):
                                 fill_saved = True
                         execution_event = dict(
                             execution_event
@@ -743,18 +901,26 @@ class ForwardPaperEngine:
                             "REPLAY" if self._execution_mode == "historical_replay" else "FORWARD"
                         )
                         execution_event["retrospective_replay"] = self._execution_mode == "historical_replay"
+                        execution_event["execution_binding"] = dict(self._execution_binding)
                         if replay_missing_book or missing_execution_quote:
                             execution_event["execution_blocked"] = True
                         if strategy_evaluation is not None:
+                            evaluation_record = strategy_evaluation.as_record()
+                            execution_event["evaluation"] = evaluation_record
                             execution_event["reason_code"] = strategy_evaluation.reason_code
                             execution_event["evaluation_reason"] = strategy_evaluation.reason_code
                             execution_event["evaluation_evidence"] = dict(strategy_evaluation.evidence)
+                            execution_event["evaluation_actionable"] = bool(strategy_evaluation.actionable)
                         elif fill is not None:
                             execution_event["reason_code"] = "SIGNAL_PRODUCED"
                         elif str(execution_event.get("status", "")).upper() == "RESOLUTION":
                             execution_event["reason_code"] = "RESOLUTION"
                         else:
                             execution_event["reason_code"] = "STRATEGY_EVALUATED_DECLINED"
+                        if fill is not None:
+                            execution_event["fill"] = to_record(fill)
+                            execution_event["fill_id"] = fill.order_id
+                            execution_event["fill_is_opening"] = not terminal
                         if model_evaluation is not None:
                             execution_event["model_evaluation"] = model_evaluation.as_record()
                         event_status = str(execution_event.get("status", "NO_SIGNAL")).strip().upper() or "NO_SIGNAL"
@@ -774,35 +940,33 @@ class ForwardPaperEngine:
                             self._settlement_by_market[market_id] = str(observation.get("settlement"))
                             if self.risk is not None:
                                 self.risk.reconcile_market(market_id, fills=self.portfolio.fills)
-                            ledger = build_resolved_bet(
-                                experiment_id=self._run_id,
-                                market_id=market_id,
-                                strategy_id=self._execution_strategy_id,
-                                settlement=_settlement_value(observation.get("settlement")) or str(observation.get("settlement")),
-                                resolved_at=stamp,
-                                fills=self._stored_fills_for_market(market_id),
-                            )
-                            if ledger is not None:
-                                open_timestamp = self._observation_open_by_market.get(market_id)
-                                if open_timestamp is not None:
-                                    open_iso = open_timestamp.isoformat()
-                                    ledger.update(
-                                        {
-                                            "observation_open_timestamp": open_iso,
-                                            "available_from": open_iso,
-                                            "coverage_from": open_iso,
-                                        }
-                                    )
-                                self.store.save_paper_bet_ledger(
-                                    ledger["bet_id"],
-                                    self._run_id,
-                                    market_id,
-                                    self._execution_strategy_id,
-                                    ledger["outcome"],
-                                    ledger["resolution"],
-                                    stamp,
-                                    ledger,
+                            open_timestamp = self._observation_open_by_market.get(market_id)
+                            # A terminal snapshot can be the first observation
+                            # for a market.  It establishes no completed
+                            # forward outcome, even if a stale fill exists.
+                            if open_timestamp is not None and open_timestamp < stamp:
+                                ledger = build_resolved_bet(
+                                    experiment_id=self._run_id,
+                                    market_id=market_id,
+                                    strategy_id=self._execution_strategy_id,
+                                    settlement=_settlement_value(observation.get("settlement")) or str(observation.get("settlement")),
+                                    resolved_at=stamp,
+                                    fills=self._stored_fills_for_market(market_id),
+                                    observation_open_timestamp=open_timestamp,
                                 )
+                                if ledger is not None:
+                                    ledger["execution_binding"] = dict(self._execution_binding)
+                                    ledger["paper_experiment_id"] = self._run_id
+                                    self.store.save_paper_bet_ledger(
+                                        ledger["bet_id"],
+                                        self._run_id,
+                                        market_id,
+                                        self._execution_strategy_id,
+                                        ledger["outcome"],
+                                        ledger["resolution"],
+                                        stamp,
+                                        ledger,
+                                    )
                         self._cursor[market_id] = max(self._cursor.get(market_id, stamp), stamp)
                         source_snapshot_id = str(observation.get("source_snapshot_id", "")).strip()
                         if source_snapshot_id:
@@ -1149,6 +1313,7 @@ def build_resolved_bet(
     settlement: Any,
     resolved_at: datetime,
     fills: Iterable[Fill],
+    observation_open_timestamp: datetime | None = None,
 ) -> dict[str, Any] | None:
     """Aggregate one resolved prediction market into one independent bet.
 
@@ -1156,13 +1321,20 @@ def build_resolved_bet(
     from reference-price cash flows, subtracts simulated slippage and fees for
     net PnL, and counts all fills for one market as one independent bet.
     """
-
     resolution = _settlement_value(settlement)
     if resolution not in {
         SettlementState.RESOLVED_YES.value,
         SettlementState.RESOLVED_NO.value,
         SettlementState.VOID.value,
     }:
+        return None
+    resolved_timestamp = ensure_utc(resolved_at)
+    open_timestamp = (
+        ensure_utc(observation_open_timestamp)
+        if observation_open_timestamp is not None
+        else None
+    )
+    if open_timestamp is not None and open_timestamp >= resolved_timestamp:
         return None
     ordered = sorted(
         (
@@ -1171,6 +1343,10 @@ def build_resolved_bet(
             if isinstance(fill, Fill)
             and fill.market_type is MarketType.PREDICTION
             and str(fill.market_id or fill.symbol) == str(market_id)
+            and (
+                open_timestamp is None
+                or open_timestamp <= ensure_utc(fill.timestamp) < resolved_timestamp
+            )
         ),
         key=lambda fill: (fill.timestamp, fill.order_id),
     )
@@ -1259,14 +1435,14 @@ def build_resolved_bet(
         if expected_edge_weight > 0
         else None
     )
-    return {
+    record = {
         "bet_id": f"{experiment_id}:{market_id}",
         "experiment_id": str(experiment_id),
         "market_id": str(market_id),
         "strategy_id": str(strategy_id),
         "outcome": outcome,
         "resolution": resolution,
-        "resolved_at": ensure_utc(resolved_at).isoformat(),
+        "resolved_at": resolved_timestamp.isoformat(),
         "fills": len(ordered),
         "order_attempts": len(seen_order_ids),
         "partial_fills": len(partial_order_ids),
@@ -1277,6 +1453,13 @@ def build_resolved_bet(
         "slippage": slippage,
         "net_pnl": net_pnl,
         "capital_at_risk": capital_at_risk,
+        "allocated_capital": capital_at_risk,
+        "realized_pnl": net_pnl,
+        "unrealized_pnl": 0.0,
+        "costs": slippage,
+        "completed_outcomes": 1.0,
+        "reliability": 1.0,
+        "drawdown": min(1.0, max(0.0, -net_pnl / capital_at_risk)) if capital_at_risk > 0 else 0.0,
         "roi": net_pnl / capital_at_risk if capital_at_risk > 0 else 0.0,
         "expected_probability_at_entry": expected_probability,
         "expected_edge_at_entry": expected_edge,
@@ -1289,6 +1472,20 @@ def build_resolved_bet(
         "closed": True,
         "paper_only": True,
     }
+    if open_timestamp is not None:
+        coverage_seconds = (resolved_timestamp - open_timestamp).total_seconds()
+        record.update(
+            {
+                "observation_open_timestamp": open_timestamp.isoformat(),
+                "available_from": open_timestamp.isoformat(),
+                "coverage_from": open_timestamp.isoformat(),
+                "available_through": resolved_timestamp.isoformat(),
+                "coverage_through": resolved_timestamp.isoformat(),
+                "observation_coverage_seconds": coverage_seconds,
+                "actual_coverage_seconds": coverage_seconds,
+            }
+        )
+    return record
 
 
 def _raw_observation_book(raw: Any, outcome: str) -> Any:
@@ -1305,25 +1502,32 @@ def _raw_observation_book(raw: Any, outcome: str) -> Any:
         )
     return source.get("no_order_book", raw.get("no_order_book"))
 
-
 def _explicit_book_timestamp(value: Any) -> bool:
     if isinstance(value, OrderBookSnapshot):
         return parse_timestamp(value.timestamp) is not None
     return isinstance(value, Mapping) and parse_timestamp(value.get("timestamp")) is not None
 
 
-def _normalize_observation(raw: Any) -> tuple[str, dict[str, Any], OrderBookSnapshot | None, OrderBookSnapshot | None] | None:
+def _normalize_observation(
+    raw: Any,
+    *,
+    default_market_id: str | None = None,
+) -> tuple[str, dict[str, Any], OrderBookSnapshot | None, OrderBookSnapshot | None] | None:
     if isinstance(raw, PredictionMarketSnapshot):
         observation = dict(to_record(raw))
         return raw.market_id, observation, raw.order_book, None
     if not isinstance(raw, Mapping):
         return None
     nested = raw.get("snapshot") if isinstance(raw.get("snapshot"), Mapping) else raw
-    market_id = str(nested.get("market_id", raw.get("market_id", ""))).strip()
+    market_id = str(
+        nested.get("market_id", raw.get("market_id", default_market_id or ""))
+    ).strip()
     stamp = parse_timestamp(nested.get("timestamp", raw.get("observed_at")))
     if not market_id or stamp is None:
         return None
     observation = dict(nested)
+    if "market_id" not in observation:
+        observation["market_id"] = market_id
     observation["timestamp"] = stamp
     for key in (
         "settlement",
@@ -1640,6 +1844,7 @@ def run_historical_replay(
 
 __all__ = [
     "ForwardPaperEngine",
+    "PAPER_OBSERVATION_AUTHORITY_REQUIRED",
     "PAPER_STATE_EXECUTION_BINDING_MISMATCH",
     "PaperEngineCycle",
     "build_resolved_bet",

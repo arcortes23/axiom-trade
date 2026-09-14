@@ -708,6 +708,48 @@ class MarketScopeCollectorTests(unittest.TestCase):
             ],
         )
 
+    def test_keyset_scope_match_keeps_required_market_from_earlier_page(self) -> None:
+        required = market("required-earlier", category="politics")
+        unrelated = market("unrelated-later", category="economics")
+        provider = _PagedProvider(
+            (required, unrelated),
+            (
+                {"snapshots": (required,), "next_cursor": "opaque-1"},
+                {"snapshots": (unrelated,), "next_cursor": None},
+            ),
+        )
+        store = _ScopeStore(
+            {
+                "candidate": {
+                    "experiment_plan": {
+                        "market_scope": scope(
+                            "EXACT_MARKETS",
+                            market_ids=("required-earlier",),
+                        )
+                    }
+                }
+            }
+        )
+        collector = self._collector(provider, store, ("candidate",), max_markets=1)
+
+        first = collector.collect_once(now=T0)
+        self.assertEqual(first.candidate_bound_scheduled, ())
+        self.assertEqual(store.resolutions, [])
+        self.assertEqual(provider.book_calls, [])
+
+        second = collector.collect_once(now=T0)
+        self.assertEqual(
+            [call["after_cursor"] for call in provider.page_calls],
+            [None, "opaque-1"],
+        )
+        self.assertEqual(len(store.resolutions), 1)
+        self.assertEqual(
+            [item.market_id for item in store.resolutions[0].matched_markets],
+            ["required-earlier"],
+        )
+        self.assertEqual(list(second.candidate_bound_scheduled), ["required-earlier"])
+        self.assertEqual(provider.book_calls, ["required-earlier"])
+
     def test_keyset_scope_continuation_is_opaque_and_budgeted(self) -> None:
         first = market("page-one", category="politics")
         second = market("page-two", category="politics")
@@ -724,9 +766,12 @@ class MarketScopeCollectorTests(unittest.TestCase):
         )
         collector = self._collector(provider, store, ("candidate",), max_markets=1)
 
-        collector.collect_once(now=T0)
-        collector.collect_once(now=T0)
+        first_cycle = collector.collect_once(now=T0)
+        self.assertEqual(first_cycle.candidate_bound_scheduled, ())
+        self.assertEqual(store.resolutions, [])
+        self.assertEqual(provider.book_calls, [])
 
+        second_cycle = collector.collect_once(now=T0)
         self.assertEqual([call["after_cursor"] for call in provider.page_calls], [None, "opaque-1"])
         self.assertEqual(provider.page_calls[0]["closed"], False)
         continuation = store.states["polymarket"]["scope_inventory_continuation"]
@@ -737,7 +782,11 @@ class MarketScopeCollectorTests(unittest.TestCase):
             "duplicate_count": 0,
             "malformed_count": 0,
         })
-        self.assertEqual(len(provider.book_calls), 2)
+        # The first page was retained only as continuation; collection starts
+        # after the complete inventory proves scope authority.  The scheduler
+        # still starts with the earlier-page market, not just the terminal page.
+        self.assertEqual(list(second_cycle.candidate_bound_scheduled), ["page-one"])
+        self.assertEqual(provider.book_calls, ["page-one"])
 
     def test_scope_pushdown_is_shared_and_never_uses_price_or_spread(self) -> None:
         rich = replace(
@@ -912,14 +961,10 @@ class MarketScopeCollectorTests(unittest.TestCase):
         self.assertEqual(state_after_error["coverage_status"], "ERROR")
         self.assertEqual(state_after_error["error_reason"], "REPEATED_CURSOR")
         self.assertEqual(state_after_error["seen_cursor_history"], [])
-        self.assertEqual(
-            [item.candidate_id for item in store.resolutions],
-            ["candidate", "candidate"],
-        )
-        self.assertEqual(
-            provider.book_calls,
-            ["cycle-first", "cycle-second"],
-        )
+        # No incomplete page can authorize a scope.  The compromised page is
+        # discarded and the next rebased page starts a new bounded inventory.
+        self.assertEqual([item.candidate_id for item in store.resolutions], [])
+        self.assertEqual(provider.book_calls, [])
 
         collector.collect_once(now=T0)
 
@@ -927,7 +972,7 @@ class MarketScopeCollectorTests(unittest.TestCase):
             [call["after_cursor"] for call in provider.page_calls],
             [None, "cursor-a", "cursor-b", None],
         )
-        self.assertEqual(provider.book_calls, ["cycle-first", "cycle-second", "cycle-rebased"])
+        self.assertEqual(provider.book_calls, ["cycle-rebased"])
 
 
     def test_complete_terminal_restart_rebases_seen_ids_and_counts(self) -> None:
@@ -1020,6 +1065,10 @@ class MarketScopeCollectorTests(unittest.TestCase):
         self.assertEqual(first_cycle.errors, 0)
         self.assertEqual(second_cycle.errors, 1)
 
+        self.assertEqual(first_cycle.candidate_bound_scheduled, ())
+        self.assertEqual(store.resolutions, [])
+        self.assertEqual(provider.book_calls, [])
+
         reset = store.states["polymarket"]["scope_inventory_continuation"]
         self.assertEqual([call["after_cursor"] for call in provider.page_calls], [None, "opaque-1"])
         self.assertEqual(reset["coverage_status"], "ERROR")
@@ -1030,10 +1079,10 @@ class MarketScopeCollectorTests(unittest.TestCase):
         self.assertIsNone(reset["after_cursor"])
         self.assertEqual(reset["cumulative_unique_count"], 0)
         self.assertEqual(reset["seen_market_ids"], [])
-        self.assertEqual(len(store.resolutions), 1)
-        self.assertEqual(provider.book_calls, ["fingerprint-first"])
+        self.assertEqual(len(store.resolutions), 0)
+        self.assertEqual(provider.book_calls, [])
 
-        collector.collect_once(now=T0)
+        rebased_cycle = collector.collect_once(now=T0)
 
         continuation = store.states["polymarket"]["scope_inventory_continuation"]
         self.assertEqual(
@@ -1042,8 +1091,9 @@ class MarketScopeCollectorTests(unittest.TestCase):
         )
         self.assertEqual(continuation["cumulative_unique_count"], 1)
         self.assertEqual(continuation["seen_market_ids"], ["fingerprint-rebased"])
-        self.assertEqual(len(store.resolutions), 2)
-        self.assertEqual(provider.book_calls, ["fingerprint-first", "fingerprint-rebased"])
+        self.assertEqual(rebased_cycle.candidate_bound_scheduled, ("fingerprint-rebased",))
+        self.assertEqual(len(store.resolutions), 1)
+        self.assertEqual(provider.book_calls, ["fingerprint-rebased"])
     def test_non_string_next_cursor_is_integrity_error_and_rebases(self) -> None:
         rejected = market("invalid-cursor", category="politics")
         accepted = market("after-invalid-cursor", category="politics")
@@ -1138,12 +1188,15 @@ class MarketScopeCollectorTests(unittest.TestCase):
         continuation = store.states["polymarket"]["scope_inventory_continuation"]
         self.assertEqual(first_cycle.errors, 0)
         self.assertEqual(second_cycle.errors, 0)
+        self.assertEqual(first_cycle.candidate_bound_scheduled, ())
         self.assertEqual(
             [call["after_cursor"] for call in provider.page_calls],
             ["cursor-start", "cursor-after-start"],
         )
         self.assertEqual(continuation["provider_query_fingerprint"], "provider-generation-a")
-        self.assertEqual(provider.book_calls, ["optional-fingerprint-first", "optional-fingerprint-second"])
+        self.assertEqual(second_cycle.candidate_bound_scheduled, ("optional-fingerprint-first",))
+        self.assertEqual(len(store.resolutions), 1)
+        self.assertEqual(provider.book_calls, ["optional-fingerprint-first"])
 
     def test_provider_query_metadata_is_bounded_json_without_losing_cursor(self) -> None:
         first = market("metadata-first", category="politics")
@@ -1182,7 +1235,7 @@ class MarketScopeCollectorTests(unittest.TestCase):
             [call["after_cursor"] for call in provider.page_calls],
             [None, "metadata-cursor"],
         )
-        self.assertEqual(provider.book_calls, ["metadata-first", "metadata-second"])
+        self.assertEqual(provider.book_calls, ["metadata-first"])
 
 
 if __name__ == "__main__":

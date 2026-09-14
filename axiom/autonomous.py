@@ -39,6 +39,7 @@ from .rolling_portfolio import (
     RollingSelection,
     default_rolling_admission_policy,
     evaluate_rolling_selection,
+    REASON_EXTERNAL_OBLIGATIONS_EXCEED_BUDGET,
 )
 from .strategy.signals import evaluate_model_document_probability
 from .experiment_plan import AUTONOMOUS_BUDGET_ID, ExperimentPlan, ExperimentPlanError, MAX_PLAN_VARIANTS, normalize_market_scope
@@ -104,9 +105,23 @@ _ROLLING_STATE_RESULT_KEYS = (
     "observation_completeness",
     "realized_pnl",
     "unrealized_pnl",
+    "fees",
+    "costs",
+    "slippage",
+    "capital_at_risk",
     "drawdown",
     "completed_outcomes",
-    "reliability",
+    "evaluated_rows",
+    "signals",
+    "declined_evaluations",
+    "positions",
+    "openings",
+    "accounting_available",
+    "accounting_unavailable_reason",
+    "admitted",
+    "admission_reasons",
+    "source_digest",
+    "accounting_digest",
     "evidence_digest",
     "overlap_key",
 )
@@ -118,6 +133,67 @@ _ROLLING_HERMES_ID_FIELDS = (
 _LEGACY_RECOVERY_STATE_NAME = "autonomous-legacy-recovery"
 _MAX_AUTOMATIC_REASSESSMENTS = 3
 _MUTABLE_DATASET_VERSION_ALIASES = frozenset({"latest", "current", "default", "unversioned"})
+# Source-loader failures with a deterministic prerequisite must remain
+# observable as non-retryable blockers.  A changed prerequisite produces a new
+# fingerprint and therefore gets a fresh chance without weakening this gate.
+_ROLLING_IMMUTABLE_SOURCE_BLOCKERS = frozenset(
+    {
+        "SOURCE_SELECTOR_INVALID",
+        "SOURCE_SELECTOR_CONFLICT",
+        "HISTORICAL_SELECTOR_REQUIRED",
+        "HISTORICAL_SOURCE_BINDING_REQUIRED",
+        "HISTORICAL_DATASET_BINDING_REQUIRED",
+        "HISTORICAL_DATASET_PREFLIGHT_UNAVAILABLE",
+        "HISTORICAL_DATASET_METADATA_MISSING",
+        "HISTORICAL_DATASET_PAYLOAD_TOO_LARGE",
+        "HISTORICAL_DATASET_ROW_COUNT_TOO_LARGE",
+        "HISTORICAL_DATASET_ROW_COUNT_MISMATCH",
+        "HISTORICAL_DATASET_ROW_COUNT_UNAVAILABLE",
+        "REPLAY_SOURCE_BINDING_REQUIRED",
+        "REPLAY_DATASET_BINDING_REQUIRED",
+        "LIVE_SOURCE_BINDING_REQUIRED",
+        "SOURCE_LOADER_UNAVAILABLE",
+        "SOURCE_LOADER_UNSUPPORTED",
+        "PAPER_OBSERVATION_BINDING_INCOMPLETE",
+        "PAPER_SPEC_BINDING_MISMATCH",
+        "PAPER_IDENTITY_UNPROVEN",
+        "PRICE_PROXY_ACCOUNTING_UNAVAILABLE",
+    }
+)
+_ROLLING_PAPER_IDENTITY_MAX_DEPTH = 8
+_ROLLING_PAPER_IDENTITY_MAX_NODES = 8192
+
+
+def _rolling_reason_is_immutable(reason: Any) -> bool:
+    normalized = str(reason or "").strip().upper()
+    if not normalized:
+        return False
+    if normalized in _ROLLING_IMMUTABLE_SOURCE_BLOCKERS:
+        return True
+    if normalized.startswith("ACCOUNTING_"):
+        return True
+    if normalized.startswith("RULE_BASED_MARKET_SCOPE_"):
+        return True
+    if normalized.startswith("PAPER_RESOLVED_BET_"):
+        return True
+    if normalized.endswith("_BINDING_CONFLICT") or normalized.endswith(
+        "_BINDING_MISMATCH"
+    ):
+        return True
+    if normalized.startswith("PAPER_") and normalized.endswith("_CONFLICT"):
+        return True
+    return False
+
+
+def _rolling_source_exception_reason(exc: BaseException) -> str:
+    raw = str(exc).strip()
+    normalized = raw.upper()
+    if normalized.startswith("CONFLICTING ROLLING DATASET/SCOPE SELECTOR"):
+        return "SOURCE_SELECTOR_CONFLICT"
+    reason = normalized.split(":", 1)[0].strip()
+    return reason if _rolling_reason_is_immutable(reason) else "SOURCE_LOAD_FAILED"
+
+
 CAMPAIGN_PROTOCOL_V1_ID = "polymarket-paper-campaign-v1"
 CAMPAIGN_PROTOCOL_V2_ID = "polymarket-paper-campaign-v2"
 CAMPAIGN_SCHEMA_V1 = "polymarket-finite-campaign-v1"
@@ -684,21 +760,306 @@ def _rolling_state_result(value: Any) -> dict[str, Any]:
         if key not in value:
             continue
         item = value[key]
-        if key == "requested_days" and isinstance(item, (list, tuple)):
+        if key in {"requested_days", "admission_reasons"} and isinstance(item, (list, tuple)):
             result[key] = [
-                int(day)
-                for day in item[:2]
-                if isinstance(day, int) and not isinstance(day, bool)
+                int(day) if key == "requested_days" and isinstance(day, int) and not isinstance(day, bool)
+                else str(day)[:_MAX_ROLLING_STATE_ID_LENGTH]
+                for day in item[:16]
+                if day is not None
             ]
         elif isinstance(item, (str, int, float, bool)) or item is None:
             result[key] = item if not isinstance(item, str) else item[:_MAX_ROLLING_STATE_ID_LENGTH]
         else:
             result[key] = str(item)[:_MAX_ROLLING_STATE_ID_LENGTH]
     return result
+
+
+def _rolling_pending_state_result(value: Any) -> dict[str, Any]:
+    """Project pending work to its first-class retry identity only.
+
+    Pending records can carry per-attempt diagnostics and exception payloads.
+    Those details belong in durable blocker records, not the bounded operator
+    snapshot; retaining them would evict otherwise useful pending records.
+    """
+    projected = _rolling_state_result(value)
+    if not isinstance(projected, Mapping):
+        return {"value": str(projected)[:_MAX_ROLLING_STATE_ID_LENGTH]}
+    result: dict[str, Any] = {}
+    for key in (
+        "strategy_version_id",
+        "research_trial_id",
+        "candidate_id",
+        "source_class",
+        "requested_days",
+        "status",
+        "reason",
+        "next_job",
+    ):
+        if key not in projected:
+            continue
+        item = projected[key]
+        if isinstance(item, str):
+            # Identifiers may use the normal state bound; status/reason/job
+            # text gets a smaller bound so diagnostics cannot evict records.
+            limit = (
+                _MAX_ROLLING_STATE_ID_LENGTH
+                if key.endswith("_id")
+                else 128
+            )
+            item = item[:limit]
+        result[key] = item
+    return result
+
+
+def _rolling_work_key(
+    strategy: Mapping[str, Any],
+    requested_days: int,
+    source_class: str,
+) -> str:
+    """Return the stable identity of one strategy/window/source attempt."""
+    return _rolling_hash(
+        {
+            "strategy_version_id": strategy.get("strategy_version_id"),
+            "research_trial_id": strategy.get("research_trial_id"),
+            "candidate_id": strategy.get("candidate_id"),
+            "requested_days": int(requested_days),
+            "source_class": _rolling_source_name(source_class),
+        }
+    )
+
+
+def _rolling_prerequisite_fingerprint(
+    strategy: Mapping[str, Any],
+    source_class: str,
+    *,
+    source_rows: Sequence[Mapping[str, Any]] = (),
+) -> str:
+    """Fingerprint immutable inputs used to suppress unchanged blockers."""
+    provenance = strategy.get("provenance")
+    provenance = provenance if isinstance(provenance, Mapping) else {}
+    binding = _rolling_source_binding(strategy)
+    row_material = []
+    for row in source_rows[:_MAX_ROLLING_SOURCE_ROWS]:
+        if not isinstance(row, Mapping):
+            continue
+        view = _rolling_snapshot_view(row)
+        row_material.append(
+            {
+                "identity": view.get(
+                    "snapshot_id",
+                    view.get("source_snapshot_id", view.get("observation_id")),
+                ),
+                "timestamp": _rolling_row_time(view),
+                "lineage": {
+                    name: view.get(name)
+                    for name in (
+                        "dataset_id",
+                        "dataset_version",
+                        "source_timestamp",
+                        "strategy_hash",
+                        "strategy_version_id",
+                        "research_trial_id",
+                        "candidate_id",
+                    )
+                },
+                "source_digest": view.get("source_digest"),
+                "accounting_digest": view.get("accounting_digest"),
+                "accounting_available": view.get("accounting_available"),
+                "accounting_complete": view.get("accounting_complete"),
+                "accounting_partial": view.get("accounting_partial"),
+                "requested_rows": view.get("requested_rows"),
+                "available_rows": view.get("available_rows"),
+                "row_digest": _rolling_hash(view),
+            }
+        )
+    return _rolling_hash(
+        {
+            "schema": "rolling-prerequisites-v1",
+            "strategy_hash": strategy.get("strategy_hash"),
+            "strategy_version_id": strategy.get("strategy_version_id"),
+            "research_trial_id": strategy.get("research_trial_id"),
+            "candidate_id": strategy.get("candidate_id"),
+            "dataset_id": binding.get("dataset_id", provenance.get("dataset_id")),
+            "dataset_version": binding.get(
+                "dataset_version",
+                binding.get("version", provenance.get("dataset_version")),
+            ),
+            "strategy_state": {
+                name: strategy.get(name)
+                for name in (
+                    "strategy_document",
+                    "model_document",
+                    "config",
+                    "paper_assumptions",
+                    "materialized_experiment_id",
+                    "observation_intent_id",
+                )
+                if strategy.get(name) is not None
+            },
+            "source_class": _rolling_source_name(source_class),
+            "source_binding": binding,
+            "source_bounds": {
+                "from": min(
+                    (
+                        _rolling_row_time(row)
+                        for row in source_rows
+                        if isinstance(row, Mapping)
+                        and _rolling_row_time(row) is not None
+                    ),
+                    default=None,
+                ),
+                "through": max(
+                    (
+                        _rolling_row_time(row)
+                        for row in source_rows
+                        if isinstance(row, Mapping)
+                        and _rolling_row_time(row) is not None
+                    ),
+                    default=None,
+                ),
+            },
+            "source_rows": row_material,
+        }
+    )
+
+
+def _rolling_work_items(
+    strategies: Sequence[Mapping[str, Any]],
+) -> tuple[tuple[Mapping[str, Any], int, str], ...]:
+    """Build stable candidate-order work for all 7/30-day source windows."""
+    ordered = sorted(
+        (item for item in strategies if isinstance(item, Mapping)),
+        key=lambda item: (
+            str(item.get("candidate_id", "")),
+            str(item.get("strategy_version_id", "")),
+            str(item.get("research_trial_id", "")),
+        ),
+    )
+    return tuple(
+        (strategy, days, source)
+        for strategy in ordered
+        for days in (7, 30)
+        for source in ("HISTORICAL", "REPLAY", "PAPER", "LIVE")
+    )
+
+
+def _rolling_cursor_index(
+    cursor: Mapping[str, Any] | None,
+    work_items: Sequence[tuple[Mapping[str, Any], int, str]],
+) -> int:
+    if not work_items:
+        return 0
+    if not isinstance(cursor, Mapping):
+        return 0
+    next_key = {
+        "strategy_version_id": cursor.get("next_strategy_version_id"),
+        "research_trial_id": cursor.get("next_research_trial_id"),
+        "candidate_id": cursor.get("next_candidate_id"),
+        "requested_days": cursor.get("next_requested_days"),
+        "source_class": _rolling_source_name(cursor.get("next_source_class")),
+    }
+    for index, (strategy, days, source) in enumerate(work_items):
+        if (
+            str(strategy.get("strategy_version_id", "")) == str(next_key["strategy_version_id"] or "")
+            and str(strategy.get("research_trial_id", "")) == str(next_key["research_trial_id"] or "")
+            and str(strategy.get("candidate_id", "")) == str(next_key["candidate_id"] or "")
+            and int(days) == int(next_key["requested_days"] or 0)
+            and source == next_key["source_class"]
+        ):
+            return index
+    return 0
+
+
+def _rolling_cursor_record(
+    current: Mapping[str, Any] | None,
+    item: tuple[Mapping[str, Any], int, str],
+    next_item: tuple[Mapping[str, Any], int, str] | None,
+    now: datetime,
+) -> dict[str, Any]:
+    strategy, days, source = item
+    next_values = next_item or item
+    next_strategy, next_days, next_source = next_values
+    attempts = dict(current.get("attempts", {})) if isinstance(current, Mapping) else {}
+    timestamps = dict(current.get("attempt_timestamps", {})) if isinstance(current, Mapping) else {}
+    key = _rolling_work_key(strategy, days, source)
+    attempts[key] = int(attempts.get(key, 0) or 0) + 1
+    timestamps[key] = now.isoformat()
+    return {
+        "last_strategy_version_id": strategy.get("strategy_version_id"),
+        "last_research_trial_id": strategy.get("research_trial_id"),
+        "last_candidate_id": strategy.get("candidate_id"),
+        "last_requested_days": days,
+        "last_source_class": source,
+        "next_strategy_version_id": next_strategy.get("strategy_version_id"),
+        "next_research_trial_id": next_strategy.get("research_trial_id"),
+        "next_candidate_id": next_strategy.get("candidate_id"),
+        "next_requested_days": next_days,
+        "next_source_class": next_source,
+        "attempts": attempts,
+        "attempt_timestamps": timestamps,
+        "updated_at": now.isoformat(),
+    }
+
+def _rolling_enrolled_strategy_version_ids(
+    store: Any,
+    strategies: Sequence[Mapping[str, Any]],
+) -> tuple[str, ...]:
+    """Return every accepted strategy-version id, not a display sample."""
+    fallback_ids: set[str] = {
+        str(item.get("strategy_version_id", "")).strip()
+        for item in strategies
+        if isinstance(item, Mapping) and str(item.get("strategy_version_id", "")).strip()
+    }
+    identifiers: set[str] = set()
+    authoritative = False
+    connection = getattr(store, "connection", None)
+    execute = getattr(connection, "execute", None)
+    if callable(execute):
+        try:
+            rows = execute(
+                "SELECT DISTINCT strategy_version_id "
+                "FROM rolling_strategy_enrollments "
+                "WHERE status='ACCEPTED' AND strategy_version_id IS NOT NULL "
+                "AND TRIM(strategy_version_id) <> '' ORDER BY strategy_version_id"
+            ).fetchall()
+        except Exception:
+            rows = None
+        if rows is not None:
+            authoritative = True
+            for row in rows:
+                try:
+                    value = row[0]
+                except (IndexError, KeyError, TypeError):
+                    value = row.get("strategy_version_id") if isinstance(row, Mapping) else None
+                value = str(value or "").strip()
+                if value:
+                    identifiers.add(value)
+    lister = getattr(store, "list_rolling_enrollments", None)
+    if callable(lister) and not authoritative:
+        try:
+            values = lister(status="ACCEPTED", limit=_MAX_ROLLING_DISCOVERY_SCAN)
+        except (TypeError, ValueError, RuntimeError):
+            values = None
+        if values is not None:
+            authoritative = True
+            for item in values:
+                if not isinstance(item, Mapping):
+                    continue
+                value = str(item.get("strategy_version_id", "")).strip()
+                if value:
+                    identifiers.add(value)
+    # The strategy-document loader already returns validated rolling records.
+    # If an in-memory/legacy store has no enrollment rows, retain those
+    # validated document ids instead of turning a successful load into an
+    # empty identity.
+    return tuple(sorted(identifiers or fallback_ids))
+
+
 def _rolling_refresh_identity(
     strategies: Sequence[Mapping[str, Any]],
     evidence_rows: Sequence[Mapping[str, Any]],
     pending: Sequence[Mapping[str, Any]],
+    enrolled_strategy_version_ids: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     """Build an exact, bounded identity for one rolling refresh.
 
@@ -761,30 +1122,45 @@ def _rolling_refresh_identity(
         (shortage_identity(item) for item in pending if isinstance(item, Mapping)),
         key=_canonical_binding,
     )
+    enrolled_ids = tuple(
+        sorted(
+            {
+                str(value).strip()
+                for value in (
+                    enrolled_strategy_version_ids
+                    if enrolled_strategy_version_ids is not None
+                    else (
+                        item.get("strategy_version_id") for item in strategy_values
+                    )
+                )
+                if str(value).strip()
+            }
+        )
+    )
+    strategy_digest = _rolling_hash(enrolled_ids)
+    evidence_digest = _rolling_hash(evidence_values)
+    shortage_digest = _rolling_hash(shortage_values)
     material = {
-        "schema_version": "rolling-refresh-identity-v1",
-        "strategies": strategy_values,
+        "schema_version": "rolling-refresh-identity-v2",
+        "strategy_version_ids": enrolled_ids,
         "evidence": evidence_values,
         "shortages": shortage_values,
     }
-    strategy_digest = _rolling_hash(strategy_values)
-    evidence_digest = _rolling_hash(evidence_values)
-    shortage_digest = _rolling_hash(shortage_values)
     return {
         "schema_version": material["schema_version"],
         "digest": _rolling_hash(material),
         "strategy_digest": strategy_digest,
+        "enrolled_strategy_versions_digest": strategy_digest,
         "evidence_digest": evidence_digest,
         "shortage_digest": shortage_digest,
-        "strategy_versions_total": len(strategy_values),
+        "strategy_versions_total": len(enrolled_ids),
+        "enrolled_strategy_versions_total": len(enrolled_ids),
         "research_trials_total": sum(
             1 for item in strategy_values if item.get("research_trial_id")
         ),
         "evidence_windows_total": len(evidence_values),
         "pending_total": len(shortage_values),
-        "strategy_versions": _rolling_state_ids(
-            item.get("strategy_version_id") for item in strategy_values
-        ),
+        "strategy_versions": list(enrolled_ids[:_MAX_ROLLING_STATE_ITEMS]),
         "research_trials": _rolling_state_ids(
             item.get("research_trial_id") for item in strategy_values
         ),
@@ -900,18 +1276,39 @@ def _rolling_state_payload(
     source_classes: Sequence[str],
     requested_window_days: Sequence[int],
     source_rows_total: int,
+    pending_total: int | None = None,
+    enrolled_strategy_version_ids: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     """Build a bounded operator-job payload for rolling refresh state."""
-    strategy_total = len(strategies)
+    enrolled_ids = tuple(
+        sorted(
+            {
+                str(value).strip()
+                for value in (
+                    enrolled_strategy_version_ids
+                    if enrolled_strategy_version_ids is not None
+                    else (
+                        item.get("strategy_version_id") for item in strategies
+                    )
+                )
+                if str(value).strip()
+            }
+        )
+    )
+    strategy_total = len(enrolled_ids)
     evidence_total = len(evidence_rows)
-    pending_total = len(pending)
+    pending_count = len(pending)
+    pending_total = max(pending_count, int(pending_total)) if pending_total is not None else pending_count
     candidate_values = [item.get("candidate_id") for item in strategies if item.get("candidate_id")]
     candidate_total = len(candidate_values)
-    strategy_ids = _rolling_state_ids(item.get("strategy_version_id") for item in strategies)
+    strategy_ids = list(enrolled_ids[:_MAX_ROLLING_STATE_ITEMS])
     trial_ids = _rolling_state_ids(item.get("research_trial_id") for item in strategies)
     candidate_ids = _rolling_state_ids(candidate_values)
     evidence_sample = [_rolling_state_result(item) for item in evidence_rows[:_MAX_ROLLING_STATE_ITEMS]]
-    pending_sample = [_rolling_state_result(item) for item in pending[:_MAX_ROLLING_STATE_ITEMS]]
+    pending_sample = [
+        _rolling_pending_state_result(item)
+        for item in pending[:_MAX_ROLLING_STATE_ITEMS]
+    ]
     truncated = {
         "strategy_versions": strategy_total > len(strategy_ids),
         "research_trials": strategy_total > len(trial_ids),
@@ -920,7 +1317,12 @@ def _rolling_state_payload(
         "pending": pending_total > len(pending_sample),
         "source_rows": source_rows_total >= _MAX_ROLLING_TOTAL_ROWS,
     }
-    refresh_identity = _rolling_refresh_identity(strategies, evidence_rows, pending)
+    refresh_identity = _rolling_refresh_identity(
+        strategies,
+        evidence_rows,
+        pending,
+        enrolled_strategy_version_ids=enrolled_ids,
+    )
     state: dict[str, Any] = {
         "status": status,
         "scheduled_at": scheduled_at,
@@ -942,9 +1344,12 @@ def _rolling_state_payload(
         "pending": pending_sample,
         "next_jobs": sorted(
             {
-                str(item.get("next_job")).strip()
-                for item in pending
-                if str(item.get("next_job", "")).strip()
+                "rolling-research-evidence",
+                *(
+                    str(item.get("next_job")).strip()
+                    for item in pending
+                    if str(item.get("next_job", "")).strip()
+                ),
             }
         ),
         "pending_total": pending_total,
@@ -962,7 +1367,7 @@ def _rolling_state_payload(
         removable = next(
             (
                 name
-                for name in ("pending", "evidence_windows", "strategy_versions", "research_trials", "candidate_ids")
+                for name in ("pending", "evidence_windows", "research_trials")
                 if state[name]
             ),
             None,
@@ -975,6 +1380,297 @@ def _rolling_state_payload(
     return state
 
 
+
+
+def _rolling_bound_cursor_state(cursor: Mapping[str, Any]) -> dict[str, Any]:
+    """Project durable cursor telemetry without copying unbounded attempt maps."""
+    bounded = dict(cursor)
+    for name in ("attempts", "attempt_timestamps"):
+        values = bounded.get(name)
+        if not isinstance(values, Mapping):
+            continue
+        ordered = list(values.items())
+        bounded[f"{name}_total"] = len(ordered)
+        if len(ordered) > _MAX_ROLLING_STATE_ITEMS:
+            bounded[name] = dict(ordered[-_MAX_ROLLING_STATE_ITEMS:])
+            bounded[f"{name}_truncated"] = True
+        else:
+            bounded[name] = dict(ordered)
+    return bounded
+
+
+def _rolling_bound_operator_state(state: Mapping[str, Any]) -> dict[str, Any]:
+    """Keep operator state within Hermes' byte limit without losing identity.
+
+    ``strategy_versions`` and ``candidate_ids`` are the restart identity
+    samples.  They are normalized once, kept in deterministic first-seen order,
+    and never cardinality-reduced.  Everything else is telemetry or retry
+    detail and may be collapsed to its authoritative total/truncated marker.
+    """
+    bounded = dict(state)
+    protected = {"strategy_versions", "candidate_ids"}
+
+    def values_as_list(value: Any) -> list[Any] | None:
+        if isinstance(value, (list, tuple)):
+            return list(value)
+        if isinstance(value, (set, frozenset)):
+            return sorted(value, key=str)
+        return None
+
+    def mark_truncated(name: str, total: int | None = None) -> None:
+        if total is not None and f"{name}_total" not in bounded:
+            bounded[f"{name}_total"] = total
+        bounded[f"{name}_truncated"] = True
+        bounded["truncated"] = True
+
+    def compact_identity(name: str) -> None:
+        values = values_as_list(bounded.get(name))
+        if values is None:
+            return
+        bounded[name] = _rolling_state_ids(values)
+        if len(values) > len(bounded[name]):
+            mark_truncated(name, len(values))
+
+    # These two fields are protected for the entire compaction pass.
+    compact_identity("strategy_versions")
+    compact_identity("candidate_ids")
+
+    pending_values = values_as_list(bounded.get("pending"))
+    if pending_values is not None:
+        bounded["pending"] = [
+            _rolling_pending_state_result(item)
+            for item in pending_values[:_MAX_ROLLING_STATE_ITEMS]
+        ]
+        if "pending_total" not in bounded:
+            bounded["pending_total"] = len(pending_values)
+        if len(pending_values) > len(bounded["pending"]):
+            mark_truncated("pending")
+
+    # Refresh identity keeps exact digests/totals authoritative.  Its arrays
+    # duplicate operator samples and are therefore disposable telemetry.
+    identity = bounded.get("refresh_identity")
+    if isinstance(identity, Mapping):
+        compact_identity_payload = dict(identity)
+        for name in ("strategy_versions", "research_trials", "evidence_windows"):
+            values = values_as_list(compact_identity_payload.get(name))
+            if values is not None:
+                compact_identity_payload[name] = _rolling_state_ids(values)
+        bounded["refresh_identity"] = compact_identity_payload
+
+    def collapse_collection(name: str) -> bool:
+        value = bounded.get(name)
+        values = values_as_list(value)
+        if values is not None and values:
+            bounded[name] = []
+            mark_truncated(name, len(values))
+            return True
+        if isinstance(value, Mapping) and value:
+            bounded[name] = {}
+            mark_truncated(name, len(value))
+            return True
+        return False
+
+    def drop_detail(name: str) -> bool:
+        if name not in bounded:
+            return False
+        value = bounded.pop(name)
+        if isinstance(value, (Mapping, list, tuple, set, frozenset)):
+            mark_truncated(name, len(value))
+        else:
+            bounded["truncated"] = True
+        return True
+
+    def drop_cursor_detail() -> bool:
+        cursor = bounded.get("rolling_cursor")
+        if not isinstance(cursor, Mapping):
+            return False
+        compact_cursor = dict(cursor)
+        for name in (
+            "attempts",
+            "attempt_timestamps",
+            "errors",
+            "error",
+            "samples",
+            "cursor_samples",
+            "history",
+            "events",
+            "details",
+            "diagnostics",
+        ):
+            if name not in compact_cursor:
+                continue
+            value = compact_cursor.pop(name)
+            if isinstance(value, (Mapping, list, tuple, set, frozenset)):
+                compact_cursor[f"{name}_total"] = len(value)
+            compact_cursor[f"{name}_truncated"] = True
+            bounded["rolling_cursor"] = compact_cursor
+            bounded["rolling_cursor_truncated"] = True
+            bounded["truncated"] = True
+            return True
+        return False
+
+    def compact_cursor() -> bool:
+        cursor = bounded.get("rolling_cursor")
+        if not isinstance(cursor, Mapping):
+            return False
+        allowed_prefixes = ("last_", "next_")
+        compact_cursor_payload = {
+            key: value
+            for key, value in cursor.items()
+            if key.startswith(allowed_prefixes)
+            or key in {"updated_at"}
+            or key.endswith("_total")
+            or key.endswith("_truncated")
+        }
+        if compact_cursor_payload == dict(cursor):
+            return False
+        bounded["rolling_cursor"] = compact_cursor_payload
+        bounded["rolling_cursor_truncated"] = True
+        bounded["truncated"] = True
+        return True
+
+    # Removal priority deliberately keeps identity samples last: attempt/error
+    # maps, blocker diagnostics, cursor samples, and verbose state go first.
+    detail_fields = (
+        "attempts",
+        "attempt_timestamps",
+        "errors",
+        "error",
+        "error_details",
+        "blocker",
+        "blocker_detail",
+        "blocker_details",
+        "cursor_samples",
+        "samples",
+        "diagnostics",
+        "verbose",
+        "details",
+        "trace",
+        "logs",
+        "event_history",
+        "measured_counters",
+    )
+    identity_sample_fields = ("strategy_versions", "research_trials", "evidence_windows")
+    optional_collections = (
+        "terminal_blockers",
+        "blocker_records",
+        "evidence_windows",
+        "research_trials",
+        "next_jobs",
+        "source_classes",
+        "requested_window_days",
+        "pending",
+    )
+    pending_text_fields = ("reason", "next_job", "status", "source_class")
+    identity_lengths = (64, 32, 16, 8, 4, 1)
+
+    while len(_canonical_binding(bounded).encode("utf-8")) > _MAX_ROLLING_HERMES_PAYLOAD_BYTES:
+        changed = drop_cursor_detail()
+        if changed:
+            continue
+        changed = any(drop_detail(name) for name in detail_fields)
+        if changed:
+            continue
+
+        identity = bounded.get("refresh_identity")
+        if isinstance(identity, Mapping):
+            compact_identity_payload = dict(identity)
+            removed = False
+            for name in identity_sample_fields:
+                if name in compact_identity_payload:
+                    compact_identity_payload.pop(name)
+                    removed = True
+                    break
+            if removed:
+                bounded["refresh_identity"] = compact_identity_payload
+                bounded["truncated"] = True
+                continue
+
+        changed = any(collapse_collection(name) for name in optional_collections)
+        if changed:
+            continue
+        changed = compact_cursor()
+        if changed:
+            continue
+
+        pending = bounded.get("pending")
+        if isinstance(pending, list):
+            stripped = False
+            for field_name in pending_text_fields:
+                if any(isinstance(item, Mapping) and field_name in item for item in pending):
+                    for item in pending:
+                        if isinstance(item, dict):
+                            item.pop(field_name, None)
+                    stripped = True
+                    break
+            if stripped:
+                bounded["truncated"] = True
+                continue
+
+        # Remove or collapse any unrecognized optional field before touching
+        # the protected identity arrays.  Canonical total/truncated counters
+        # remain, so cardinality is still observable after this reduction.
+        fallback_names = sorted(
+            name
+            for name, value in bounded.items()
+            if name not in protected
+            and not name.endswith("_total")
+            and not name.endswith("_truncated")
+            and name not in {"truncated", "rolling_review_identity"}
+            and isinstance(value, (Mapping, list, tuple, set, frozenset, str))
+        )
+        changed = False
+        for name in fallback_names:
+            value = bounded.get(name)
+            if isinstance(value, (Mapping, list, tuple, set, frozenset)):
+                changed = collapse_collection(name)
+            elif isinstance(value, str) and len(value) > 64:
+                bounded[name] = value[:64]
+                bounded["truncated"] = True
+                changed = True
+            if changed:
+                break
+        if changed:
+            continue
+
+        # Preserve all identity records, shortening only their display strings
+        # as a final pathological-size fallback.  The sample cardinality and
+        # order remain unchanged.
+        shortened = False
+        for limit in identity_lengths:
+            for name in ("strategy_versions", "candidate_ids"):
+                values = bounded.get(name)
+                if not isinstance(values, list):
+                    continue
+                compact_values = [
+                    (value[:limit] if isinstance(value, str) else str(value)[:limit])
+                    for value in values
+                ]
+                if compact_values != values:
+                    bounded[name] = compact_values
+                    shortened = True
+            if shortened:
+                break
+        if shortened:
+            bounded["truncated"] = True
+            continue
+
+        # Keep the protected samples, exact totals, and identity digests even
+        # when an unknown scalar is pathological.  This final projection is
+        # deterministic and makes the byte bound an invariant, not a best
+        # effort.
+        compact_state = {
+            name: value
+            for name, value in bounded.items()
+            if name in protected
+            or name.endswith("_total")
+            or name.endswith("_truncated")
+            or name in {"truncated", "rolling_review_identity"}
+        }
+        bounded = compact_state
+        break
+
+    return bounded
 
 
 def _rolling_unique_ids(values: Iterable[Any], *, limit: int = _MAX_ROLLING_HERMES_IDS) -> list[str]:
@@ -1037,11 +1733,37 @@ def _rolling_hermes_payload(
 
 
 def _rolling_row_time(row: Mapping[str, Any]) -> datetime | None:
+    # Source/observation timestamps are an ordered canonical projection.  Once
+    # an upstream source explicitly supplies one, malformed data must not be
+    # hidden by falling back to a less authoritative field.
     for key in ("source_timestamp", "timestamp", "observed_at", "event_timestamp", "resolved_at", "time", "created_at"):
-        stamp = _rolling_timestamp(row.get(key))
-        if stamp is not None:
-            return stamp
+        if key in row:
+            return _rolling_timestamp(row.get(key))
     return None
+
+
+def _rolling_window_rows(
+    rows: Sequence[Mapping[str, Any]],
+    days: int,
+    current: datetime,
+) -> tuple[list[Mapping[str, Any]], tuple[str, ...]]:
+    """Select only rows observed in the requested current-time window."""
+    start = ensure_utc(current) - timedelta(days=days)
+    through = ensure_utc(current)
+    selected: list[Mapping[str, Any]] = []
+    rejected: set[str] = set()
+    for row in rows:
+        if not isinstance(row, Mapping):
+            rejected.add("SOURCE_TIMESTAMP_UNPARSEABLE")
+            continue
+        stamp = _rolling_row_time(row)
+        if stamp is None:
+            rejected.add("SOURCE_TIMESTAMP_UNPARSEABLE")
+        elif stamp > through:
+            rejected.add("SOURCE_TIMESTAMP_FUTURE")
+        elif stamp >= start:
+            selected.append(row)
+    return selected, tuple(sorted(rejected))
 
 
 def _rolling_source_name(value: Any) -> str:
@@ -1237,6 +1959,106 @@ def _rolling_inject_source_binding(
             return row
         row.setdefault("experiment_id", expected_experiment)
     return row
+def _rolling_nested_paper_identity_conflict(
+    value: Mapping[str, Any],
+    *,
+    strategy_hashes: set[str],
+    expected: Mapping[str, Any],
+) -> str | None:
+    """Reject foreign nested identity before flattening a paper ledger row.
+
+    Every mapping/list value is traversed, not just known payload keys.  The
+    traversal is deliberately bounded: a cycle is harmless, but an oversized
+    or too-deep payload is unproven and therefore rejected rather than skipped.
+    """
+    aliases: tuple[tuple[str, tuple[str, ...], set[str]], ...] = (
+        (
+            "strategy_hash",
+            ("strategy_hash", "strategy_id", "rolling_strategy_hash"),
+            strategy_hashes,
+        ),
+        (
+            "source_strategy_hash",
+            ("source_strategy_hash",),
+            {_binding_value(expected.get("source_strategy_hash")) or ""},
+        ),
+        (
+            "strategy_version_id",
+            ("strategy_version_id",),
+            {_binding_value(expected.get("strategy_version_id")) or ""},
+        ),
+        (
+            "research_trial_id",
+            ("research_trial_id", "trial_id"),
+            {_binding_value(expected.get("research_trial_id")) or ""},
+        ),
+        (
+            "candidate_id",
+            ("candidate_id",),
+            {_binding_value(expected.get("candidate_id")) or ""},
+        ),
+        (
+            "experiment_id",
+            ("experiment_id", "paper_experiment_id"),
+            {_binding_value(expected.get("experiment_id")) or ""},
+        ),
+    )
+    values: dict[str, set[str]] = {name: set() for name, _keys, _allowed in aliases}
+    visited: set[int] = set()
+    node_count = 0
+    unproven = False
+
+    def visit(item: Any, depth: int = 0) -> None:
+        nonlocal node_count, unproven
+        if not isinstance(item, (Mapping, list, tuple)):
+            if node_count >= _ROLLING_PAPER_IDENTITY_MAX_NODES:
+                unproven = True
+            else:
+                node_count += 1
+            return
+        marker = id(item)
+        if marker in visited:
+            return
+        if depth > _ROLLING_PAPER_IDENTITY_MAX_DEPTH:
+            unproven = True
+            return
+        if node_count >= _ROLLING_PAPER_IDENTITY_MAX_NODES:
+            unproven = True
+            return
+        try:
+            item_size = len(item)
+        except TypeError:
+            item_size = 0
+        if item_size > _ROLLING_PAPER_IDENTITY_MAX_NODES:
+            unproven = True
+            return
+        visited.add(marker)
+        node_count += 1
+        if isinstance(item, Mapping):
+            for key, child in item.items():
+                normalized_key = str(key).strip().lower().replace("-", "_")
+                for name, keys, _allowed in aliases:
+                    if normalized_key in keys:
+                        normalized = _binding_value(child)
+                        if normalized is not None:
+                            values[name].add(normalized)
+                # Do not assume payload field names: identity may be hidden
+                # under any nested mapping/list value.
+                visit(child, depth + 1)
+        else:
+            for child in item:
+                visit(child, depth + 1)
+
+    visit(value)
+    for name, _keys, allowed in aliases:
+        observed = values[name]
+        if not observed:
+            continue
+        if not allowed or any(item not in allowed for item in observed):
+            return name
+        if len(observed) > 1:
+            return name
+    return "identity_unproven" if unproven else None
 
 
 
@@ -1368,7 +2190,8 @@ def _rolling_campaign_bound(value: Mapping[str, Any]) -> bool:
     not campaign authority; treating their length as a campaign marker would
     incorrectly reject otherwise valid frozen candidates.
     """
-    seen: set[int] = set()
+    active: set[int] = set()
+    completed: set[int] = set()
     visited = 0
 
     def direct_marker(item: Mapping[str, Any]) -> bool:
@@ -1392,42 +2215,63 @@ def _rolling_campaign_bound(value: Mapping[str, Any]) -> bool:
         if isinstance(item, (list, tuple)):
             if parent_key in _ROLLING_NON_AUTHORITATIVE_ARRAY_KEYS:
                 return False
-            if depth > _ROLLING_MAX_PROVENANCE_DEPTH:
+            marker = id(item)
+            if marker in active:
+                # Recursive list/tuple payloads are also unproven and must
+                # remain fail-closed instead of recursing indefinitely.
                 return True
-            if len(item) > 128:
-                # Unknown bulk arrays remain fail-closed.  Known observation
-                # arrays are handled above and are intentionally ignored.
-                return True
-            return any(visit(child, depth + 1, parent_key) for child in item)
+            if marker in completed:
+                return False
+            active.add(marker)
+            try:
+                if depth > _ROLLING_MAX_PROVENANCE_DEPTH:
+                    return True
+                if len(item) > 128:
+                    # Unknown bulk arrays remain fail-closed.  Known observation
+                    # arrays are handled above and are intentionally ignored.
+                    return True
+                return any(visit(child, depth + 1, parent_key) for child in item)
+            finally:
+                active.discard(marker)
+                completed.add(marker)
         if not isinstance(item, Mapping):
             return False
         marker = id(item)
-        if marker in seen:
+        if marker in active:
+            # The same object on the current ancestry path is a real cycle;
+            # fail closed rather than allowing a recursive campaign payload.
             return True
-        seen.add(marker)
-        visited += 1
-        if visited > 512 or depth > _ROLLING_MAX_PROVENANCE_DEPTH:
-            return True
-        if direct_marker(item):
-            return True
-        # Check this authoritative container first.  This prevents a large
-        # unrelated field encountered earlier in insertion order from hiding
-        # a campaign marker nested in the plan.
-        plan = item.get("experiment_plan")
-        if isinstance(plan, Mapping) and visit(plan, depth + 1, "experiment_plan"):
-            return True
-        children = list(item.items())
-        if len(children) > 512:
-            return True
-        for key, child in children:
-            key_name = str(key).strip().lower()
-            if key_name == "experiment_plan":
-                continue
-            if isinstance(child, (list, tuple)) and key_name in _ROLLING_NON_AUTHORITATIVE_ARRAY_KEYS:
-                continue
-            if visit(child, depth + 1, key_name):
+        if marker in completed:
+            # A benign alias to a container already traversed is not a cycle.
+            return False
+        active.add(marker)
+        try:
+            visited += 1
+            if visited > 512 or depth > _ROLLING_MAX_PROVENANCE_DEPTH:
                 return True
-        return False
+            if direct_marker(item):
+                return True
+            # Check this authoritative container first.  This prevents a large
+            # unrelated field encountered earlier in insertion order from hiding
+            # a campaign marker nested in the plan.
+            plan = item.get("experiment_plan")
+            if isinstance(plan, Mapping) and visit(plan, depth + 1, "experiment_plan"):
+                return True
+            children = list(item.items())
+            if len(children) > 512:
+                return True
+            for key, child in children:
+                key_name = str(key).strip().lower()
+                if key_name == "experiment_plan":
+                    continue
+                if isinstance(child, (list, tuple)) and key_name in _ROLLING_NON_AUTHORITATIVE_ARRAY_KEYS:
+                    continue
+                if visit(child, depth + 1, key_name):
+                    return True
+            return False
+        finally:
+            active.discard(marker)
+            completed.add(marker)
 
     return visit(value)
 
@@ -1445,7 +2289,28 @@ def _rolling_snapshot_view(row: Mapping[str, Any]) -> dict[str, Any]:
         for key, child in value.items():
             if key not in result or result.get(key) in (None, ""):
                 result[str(key)] = child
-        pending.extend(value.get(name) for name in ("payload", "snapshot", "data", "observation", "result", "outcome"))
+        pending.extend(
+            value.get(name)
+            for name in (
+                "payload",
+                "snapshot",
+                "data",
+                "observation",
+                "result",
+                "outcome",
+                "ledger",
+                "ledgers",
+                "accounting",
+                "canonical_accounting",
+                "strategy_accounting",
+                "resolved_bet",
+                "resolved_bets",
+                "fills",
+                "fill",
+                "position",
+                "positions",
+            )
+        )
     return result
 
 
@@ -3381,6 +4246,22 @@ class AutonomousResearchProcessor:
         strategy: Mapping[str, Any],
     ) -> Mapping[str, Any] | None:
         """Return validated explicit strategy accounting, never infer it from prices."""
+        existing_rejection = row.get("_rolling_accounting_rejection")
+        if existing_rejection and existing_rejection not in (
+            "ACCOUNTING_COVERAGE_MISSING",
+            "ACCOUNTING_COVERAGE_INVALID",
+        ):
+            # Source loaders retain rejected rows for auditability, but a
+            # permanently contaminated row is never eligible for accounting
+            # projection. Coverage rejections are derived from timestamps and
+            # must be reevaluated when the payload changes.
+            return None
+        if existing_rejection in (
+            "ACCOUNTING_COVERAGE_MISSING",
+            "ACCOUNTING_COVERAGE_INVALID",
+        ):
+            row.pop("_rolling_accounting_rejection", None)
+            row.pop("_rolling_accounting_metric", None)
         view = _rolling_snapshot_view(row)
         quality = str(
             view.get("research_quality", view.get("quality", view.get("source_type", "")))
@@ -3712,10 +4593,153 @@ class AutonomousResearchProcessor:
         if result["_available_from"] is None or result["_available_through"] is None:
             reject("ACCOUNTING_COVERAGE_MISSING")
             return None
-        if result["_available_through"] < result["_available_from"]:
+        if result["_available_through"] <= result["_available_from"]:
             reject("ACCOUNTING_COVERAGE_INVALID")
             return None
         return result
+
+    def _ensure_rolling_paper_observation(
+        self,
+        strategy: Mapping[str, Any],
+        now: datetime,
+        *,
+        market_ids: Sequence[str] = (),
+    ) -> Mapping[str, Any] | None:
+        """Idempotently bind each accepted rolling identity to paper work."""
+        candidate_id = _binding_value(strategy.get("candidate_id"))
+        strategy_version_id = _binding_value(strategy.get("strategy_version_id"))
+        trial_id = _binding_value(strategy.get("research_trial_id"))
+        strategy_document = strategy.get("strategy_document", strategy.get("canonical_strategy"))
+        if not candidate_id or not strategy_version_id or not trial_id or not isinstance(strategy_document, Mapping):
+            raise ValueError("PAPER_OBSERVATION_BINDING_INCOMPLETE")
+        registry = ForwardTestRegistry(self.store)
+        model_document = strategy.get("model_document")
+        if not isinstance(model_document, Mapping):
+            model_document = strategy_document.get("model_document", strategy_document.get("model", {}))
+        source_binding = _rolling_source_binding(strategy)
+        scope = source_binding.get("market_scope", source_binding.get("scope", {}))
+        scope = scope if isinstance(scope, Mapping) else {}
+        scope_resolution = strategy.get("scope_resolution")
+        if scope_resolution is None:
+            loader = getattr(self.store, "load_market_scope_resolution", None)
+            if callable(loader) and scope:
+                try:
+                    scope_policy = normalize_market_scope(scope)
+                    try:
+                        scope_resolution = loader(
+                            candidate_id,
+                            scope_hash=scope_policy.scope_hash,
+                            scope_version=scope_policy.scope_version,
+                        )
+                    except TypeError:
+                        scope_resolution = loader(candidate_id)
+                except (TypeError, ValueError, AttributeError):
+                    scope_resolution = None
+        if hasattr(scope_resolution, "as_dict") and callable(scope_resolution.as_dict):
+            try:
+                scope_resolution = scope_resolution.as_dict()
+            except Exception:
+                scope_resolution = None
+        selector = {
+            key: source_binding[key]
+            for key in ("dataset_id", "dataset_version")
+            if source_binding.get(key) not in (None, "")
+        }
+        config = {
+            "observation_intent": True,
+            "market_authority_required": False,
+            "candidate_id": candidate_id,
+            "strategy_version_id": strategy_version_id,
+            "research_trial_id": trial_id,
+            "source_strategy_hash": strategy.get("strategy_hash"),
+            "rolling_strategy_hash": strategy.get("strategy_hash"),
+            "strategy_document": dict(strategy_document),
+            "model_document": dict(model_document) if isinstance(model_document, Mapping) else {},
+            "dataset_selector": selector,
+            "dataset_id": selector.get("dataset_id"),
+            "dataset_version": selector.get("dataset_version"),
+            "market_scope": dict(scope),
+            "rolling_research": True,
+            "research_mode": "ROLLING_RESEARCH",
+            "paper_only": True,
+        }
+        if isinstance(scope_resolution, Mapping):
+            config["scope_resolution"] = dict(scope_resolution)
+        expected_config = _canonical_forward_config(config)
+        expected_strategy_hash = _content_hash(
+            _normalized_strategy_document(strategy_document)
+        )
+        expected_model_hash = _content_hash(
+            dict(model_document) if isinstance(model_document, Mapping) else {}
+        )
+        intent = None
+        for existing in registry.list_observation_intents():
+            existing_config = existing.config if isinstance(existing.config, Mapping) else {}
+            if _binding_value(existing_config.get("candidate_id")) != candidate_id:
+                continue
+            # Reuse is valid only for the complete immutable identity.  A
+            # changed document, paper assumption, selector, scope, or hash
+            # intentionally gets a new deterministic observation intent.
+            try:
+                existing_canonical = _canonical_forward_config(existing_config)
+            except (TypeError, ValueError):
+                continue
+            if (
+                str(existing.strategy_hash).strip() != expected_strategy_hash
+                or str(existing.model_hash).strip() != expected_model_hash
+                or _canonical(existing_canonical) != _canonical(expected_config)
+            ):
+                continue
+            intent = existing
+            break
+        if intent is None:
+            intent = registry.register_observation_intent(
+                strategy=dict(strategy_document),
+                model=dict(model_document) if isinstance(model_document, Mapping) else {},
+                config=config,
+                registration_timestamp=now,
+                candidate_id=candidate_id,
+                strategy_version_id=strategy_version_id,
+                research_trial_id=trial_id,
+                source_strategy_hash=_binding_value(strategy.get("strategy_hash")),
+                rolling_strategy_hash=_binding_value(strategy.get("strategy_hash")),
+                dataset_selector=selector,
+                scope=scope,
+                scope_resolution=scope_resolution,
+            )
+        identifiers = list(
+            dict.fromkeys(str(item).strip() for item in market_ids if str(item).strip())
+        )
+        if not identifiers:
+            scoped = scope.get("market_ids", scope.get("markets", ()))
+            if isinstance(scoped, str):
+                scoped = (scoped,)
+            identifiers = list(
+                dict.fromkeys(str(item).strip() for item in (scoped or ()) if str(item).strip())
+            )
+        materialize = getattr(registry, "materialize_observation_intent", None)
+        if identifiers and callable(materialize):
+            materialize(
+                intent,
+                allowed_markets=identifiers,
+                registration_timestamp=now,
+                now=now,
+                candidate_id=candidate_id,
+                strategy_version_id=strategy_version_id,
+                research_trial_id=trial_id,
+                source_strategy_hash=_binding_value(strategy.get("strategy_hash")),
+                rolling_strategy_hash=_binding_value(strategy.get("strategy_hash")),
+                dataset_selector=selector,
+                scope=scope,
+                scope_resolution=scope_resolution,
+            )
+        return {
+            "intent_id": intent.experiment_id,
+            "candidate_id": candidate_id,
+            "strategy_version_id": strategy_version_id,
+            "research_trial_id": trial_id,
+            "market_ids": identifiers,
+        }
 
     def _rolling_source_rows(
         self,
@@ -3744,102 +4768,112 @@ class AutonomousResearchProcessor:
         )
         rows: list[dict[str, Any]] = []
         if source == "HISTORICAL":
-            # Historical evidence is valid only for an explicit immutable
-            # selector.  Never substitute the newest or first catalog entry.
+            # Dataset identity alone is not strategy/accounting lineage.
+            # Unbound rows remain usable input for canonical evaluation but
+            # must not be silently converted into pre-bound accounting.
             loaded = self._load_rolling_historical_dataset(dataset_id, dataset_version)
             if isinstance(loaded, Mapping):
                 loaded = loaded.get("records", loaded.get("rows", ()))
             if isinstance(loaded, Sequence) and not isinstance(loaded, (str, bytes)):
-                rows = [
-                    _rolling_inject_source_binding(item, source_binding)
-                    for item in loaded
-                    if isinstance(item, Mapping)
-                ]
+                for item in loaded:
+                    if not isinstance(item, Mapping):
+                        continue
+                    try:
+                        row_binding = _rolling_source_binding(item)
+                    except (TypeError, ValueError):
+                        row_binding = {}
+                    missing = any(
+                        _binding_value(row_binding.get(field)) is None
+                        for field in (
+                            "strategy_hash",
+                            "strategy_version_id",
+                            "research_trial_id",
+                            "candidate_id",
+                        )
+                    )
+                    if missing:
+                        row = dict(item)
+                        row["_rolling_lineage_proven"] = False
+                        rows.append(row)
+                    else:
+                        row = _rolling_inject_source_binding(item, source_binding)
+                        row["_rolling_lineage_proven"] = True
+                        rows.append(row)
         elif source in {"REPLAY", "LIVE"}:
             loader = getattr(self.store, "load_polymarket_snapshots", None)
-            if callable(loader):
-                persisted_types = _ROLLING_SOURCE_QUERY_TYPES[source]
-                for source_value in persisted_types:
-                    # The storage boundary accepts only persisted source types;
-                    # the requested rolling class remains canonical below.
-                    # The storage boundary accepts only persisted source
-                    # types; the requested rolling class remains canonical.
-                    loader_binding_proven = True
+            if not callable(loader):
+                raise ValueError("SOURCE_LOADER_UNAVAILABLE")
+            persisted_types = _ROLLING_SOURCE_QUERY_TYPES[source]
+            for source_value in persisted_types:
+                # ``load_polymarket_snapshots`` has a deliberately narrow,
+                # public signature.  Never retry a TypeError with weaker
+                # arguments: an unbound source row is not pre-bound accounting.
+                try:
+                    values = loader(source_type=source_value, limit=_MAX_FORWARD_ROWS)
+                except TypeError as exc:
+                    raise ValueError("SOURCE_LOADER_UNSUPPORTED") from exc
+                except Exception as exc:
+                    raise ValueError("SOURCE_LOAD_FAILED") from exc
+                if isinstance(values, Mapping):
+                    values = values.get("records", values.get("rows", ()))
+                for item_index, item in enumerate(values or ()):
+                    if item_index >= _MAX_FORWARD_ROWS:
+                        break
+                    if not isinstance(item, Mapping):
+                        continue
                     try:
-                        values = loader(
-                            source_type=source_value,
-                            dataset_id=dataset_id or None,
-                            dataset_version=dataset_version or None,
-                            strategy_version_id=source_binding["strategy_version_id"],
-                            research_trial_id=source_binding["research_trial_id"],
-                            candidate_id=source_binding["candidate_id"],
-                            limit=_MAX_FORWARD_ROWS,
+                        row_binding = _rolling_source_binding(item)
+                    except (TypeError, ValueError):
+                        row_binding = {}
+                    required_fields = (
+                        "strategy_hash",
+                        "strategy_version_id",
+                        "research_trial_id",
+                        "candidate_id",
+                    )
+                    missing = any(
+                        _binding_value(row_binding.get(field)) is None
+                        for field in required_fields
+                    )
+                    conflict = any(
+                        (
+                            _binding_value(row_binding.get(field)) is not None
+                            and _binding_value(row_binding.get(field))
+                            != _binding_value(source_binding.get(field))
                         )
-                    except TypeError:
-                        loader_binding_proven = False
-                        values = loader(source_type=source_value, limit=_MAX_FORWARD_ROWS)
-                    if isinstance(values, Mapping):
-                        values = values.get("records", values.get("rows", ()))
-                    for item_index, item in enumerate(values or ()):
-                        if item_index >= _MAX_FORWARD_ROWS:
-                            break
-                        if not isinstance(item, Mapping):
+                        for field in required_fields
+                    )
+                    if conflict:
+                        row = dict(item)
+                        row["_rolling_accounting_rejection"] = "SOURCE_BINDING_CONFLICT"
+                        rows.append(row)
+                        continue
+                    if source == "REPLAY":
+                        row_dataset = _binding_value(row_binding.get("dataset_id"))
+                        row_version = _binding_value(
+                            row_binding.get("dataset_version", row_binding.get("version"))
+                        )
+                        if (
+                            row_dataset is not None
+                            and row_dataset != dataset_id
+                            or row_version is not None
+                            and row_version != dataset_version
+                        ):
+                            row = dict(item)
+                            row["_rolling_accounting_rejection"] = "SOURCE_BINDING_CONFLICT"
+                            rows.append(row)
                             continue
-                        if not loader_binding_proven and source in {"REPLAY", "LIVE"}:
-                            try:
-                                row_binding = _rolling_source_binding(item)
-                            except (TypeError, ValueError):
-                                row_binding = {}
-                                rejection = "SOURCE_BINDING_CONFLICT"
-                            else:
-                                required_fields = (
-                                    "strategy_hash",
-                                    "strategy_version_id",
-                                    "research_trial_id",
-                                    "candidate_id",
-                                )
-                                missing = any(
-                                    _binding_value(row_binding.get(field)) is None
-                                    for field in required_fields
-                                )
-                                conflict = any(
-                                    (
-                                        _binding_value(row_binding.get(field)) is not None
-                                        and _binding_value(row_binding.get(field))
-                                        != _binding_value(source_binding.get(field))
-                                    )
-                                    for field in required_fields
-                                )
-                                rejection = (
-                                    "SOURCE_BINDING_CONFLICT"
-                                    if conflict
-                                    else "SOURCE_BINDING_UNPROVEN"
-                                    if missing
-                                    else None
-                                )
-                            if rejection is not None:
-                                row = dict(item)
-                                row["_rolling_accounting_rejection"] = rejection
-                                rows.append(row)
-                                continue
-                            if source == "REPLAY":
-                                row_dataset = _binding_value(
-                                    row_binding.get("dataset_id")
-                                )
-                                row_version = _binding_value(
-                                    row_binding.get(
-                                        "dataset_version",
-                                        row_binding.get("version"),
-                                    )
-                                )
-                                if row_dataset != dataset_id or row_version != dataset_version:
-                                    row = dict(item)
-                                    row["_rolling_accounting_rejection"] = (
-                                        "SOURCE_BINDING_CONFLICT"
-                                    )
-                                    rows.append(row)
-                                    continue
-                        rows.append(_rolling_inject_source_binding(item, source_binding))
+                    if missing:
+                        # This row may still be attributable to a newly
+                        # evaluated canonical strategy, but it cannot be
+                        # represented as pre-bound accounting.
+                        row = dict(item)
+                        row["_rolling_lineage_proven"] = False
+                        rows.append(row)
+                    else:
+                        row = _rolling_inject_source_binding(item, source_binding)
+                        row["_rolling_lineage_proven"] = True
+                        rows.append(row)
         elif source == "PAPER":
             registry_loader = getattr(self.store, "load_forward_tests", None)
             if not callable(registry_loader):
@@ -3868,6 +4902,20 @@ class AutonomousResearchProcessor:
                 experiment_id = _binding_value(spec.get("experiment_id"))
                 config = spec.get("config")
                 config = config if isinstance(config, Mapping) else {}
+                # An observation intent is not a PAPER source.  It becomes
+                # eligible only after immutable current-market authority has
+                # been materialized; never let an unscoped intent match an
+                # otherwise identical rolling lineage.
+                if bool(config.get("observation_intent")) and (
+                    config.get("market_authority_required") is not True
+                    or not isinstance(spec.get("allowed_markets"), (list, tuple))
+                    or not tuple(
+                        str(item).strip()
+                        for item in spec.get("allowed_markets", ())
+                        if str(item).strip()
+                    )
+                ):
+                    continue
                 source_strategy_hash = _binding_value(
                     config.get("source_strategy_hash")
                 ) or spec_strategy_hash
@@ -3915,6 +4963,30 @@ class AutonomousResearchProcessor:
                     if item_index >= _MAX_ROLLING_SOURCE_ROWS:
                         break
                     if not isinstance(item, Mapping):
+                        continue
+                    nested_conflict = _rolling_nested_paper_identity_conflict(
+                        item,
+                        strategy_hashes={strategy_hash, spec_strategy_hash},
+                        expected={
+                            **source_binding,
+                            "source_strategy_hash": spec_strategy_hash,
+                            "strategy_hash": strategy_hash,
+                            "strategy_version_id": expected_strategy_version,
+                            "research_trial_id": expected_trial,
+                            "candidate_id": expected_candidate,
+                            "experiment_id": experiment_id,
+                        },
+                    )
+                    if nested_conflict is not None:
+                        rejected = dict(item)
+                        rejected["_rolling_accounting_rejection"] = (
+                            "PAPER_IDENTITY_UNPROVEN"
+                            if nested_conflict == "identity_unproven"
+                            else "PAPER_STRATEGY_BINDING_CONFLICT"
+                            if nested_conflict == "strategy_hash"
+                            else f"PAPER_{nested_conflict.upper()}_BINDING_CONFLICT"
+                        )
+                        rows.append(rejected)
                         continue
                     raw_view = _rolling_snapshot_view(item)
                     raw_strategy_values = (
@@ -3993,6 +5065,15 @@ class AutonomousResearchProcessor:
             if not isinstance(raw, Mapping):
                 continue
             row = _rolling_snapshot_view(raw)
+            if row.get("_rolling_accounting_rejection"):
+                # Rejected source rows remain observable even when their
+                # nested payload declares an incompatible source class.
+                row["source_class"] = persisted_source
+                row["source_type"] = persisted_source
+                row["requested_source_class"] = source
+                row["requested_source_type"] = source
+                normalized.append(row)
+                continue
             declared_source = str(
                 row.get("source_type", row.get("source_class", ""))
             ).strip().upper().replace("-", "_")
@@ -4005,7 +5086,19 @@ class AutonomousResearchProcessor:
                 continue
             if _rolling_campaign_bound(row):
                 continue
-            if row.get("_rolling_accounting_rejection"):
+            if (
+                source != "PAPER"
+                and row.get("_rolling_lineage_proven") is False
+            ):
+                row["_rolling_accounting_rejection"] = "SOURCE_BINDING_UNPROVEN"
+                row["source_class"] = persisted_source
+                row["source_type"] = persisted_source
+                row["requested_source_class"] = source
+                row["requested_source_type"] = source
+                normalized.append(row)
+                continue
+            if _rolling_row_time(row) is None:
+                row["_rolling_timestamp_rejection"] = "SOURCE_TIMESTAMP_UNPARSEABLE"
                 row["source_class"] = persisted_source
                 row["source_type"] = persisted_source
                 row["requested_source_class"] = source
@@ -4070,6 +5163,12 @@ class AutonomousResearchProcessor:
             row["requested_source_type"] = source
             if _rolling_row_time(row) is not None:
                 normalized.append(row)
+            else:
+                # Keep malformed rows visible to the work-item window filter
+                # so the scheduler emits an explicit pending reason instead of
+                # silently dropping source material.
+                row["_rolling_timestamp_rejection"] = "SOURCE_TIMESTAMP_UNPARSEABLE"
+                normalized.append(row)
         normalized.sort(
             key=lambda row: (
                 _rolling_row_time(row) or datetime.min.replace(tzinfo=timezone.utc),
@@ -4079,6 +5178,233 @@ class AutonomousResearchProcessor:
         )
         return normalized[-_MAX_ROLLING_SOURCE_ROWS:]
 
+    def _rolling_canonical_evaluation(
+        self,
+        strategy: Mapping[str, Any],
+        rows: Sequence[Mapping[str, Any]],
+        source_class: str,
+    ) -> Mapping[str, Any] | None:
+        """Run the canonical recorded-book evaluator for attributable inputs."""
+        requested_source = _rolling_source_name(source_class)
+        if requested_source not in {"HISTORICAL", "REPLAY", "LIVE"}:
+            return None
+        usable_rows = [
+            dict(row)
+            for row in rows
+            if isinstance(row, Mapping)
+            and not row.get("_rolling_accounting_rejection")
+            and (
+                isinstance(row.get("order_book"), Mapping)
+                or isinstance(row.get("yes_order_book"), Mapping)
+                or isinstance(row.get("no_order_book"), Mapping)
+                or (
+                    requested_source != "LIVE"
+                    and isinstance(row.get("payload"), Mapping)
+                )
+            )
+        ]
+        # Forward-collected rows without recorded-book material still use the
+        # validated LIVE ledger projection.  Once a LIVE row carries recorded
+        # book data, it follows the same canonical path as historical/replay.
+        if requested_source == "LIVE" and not usable_rows:
+            return None
+        if not usable_rows:
+            return None
+        document = strategy.get("strategy_document", strategy.get("canonical_strategy"))
+        if not isinstance(document, Mapping):
+            return None
+        try:
+            definition = load_strategy(document)
+            model_document = strategy.get("model_document")
+            if not isinstance(model_document, Mapping):
+                model_document = document.get("model_document", document.get("model"))
+            result = run_prediction_research_mode(
+                usable_rows,
+                definition,
+                mode="RECORDED_BOOK_REPLAY",
+                model_document=model_document if isinstance(model_document, Mapping) else None,
+                holding_period=int(strategy.get("holding_period", 1) or 1),
+                exit_policy=strategy.get("exit_policy", "fixed_holding_period"),
+            )
+        except (TypeError, ValueError, RuntimeError, KeyError):
+            return None
+        fills = tuple(getattr(result, "fills", ()) or ())
+        outcomes = getattr(result, "outcomes", {})
+        outcomes = outcomes if isinstance(outcomes, Mapping) else {}
+        terminal_values = {
+            "resolved_yes",
+            "resolved_no",
+            "void",
+        }
+        terminal_markets = {
+            str(market)
+            for market, value in outcomes.items()
+            if str(value).strip().lower() in terminal_values
+        }
+        opening_markets = {
+            str(getattr(fill, "market_id", None) or getattr(fill, "symbol", ""))
+            for fill in fills
+            if str((getattr(fill, "metadata", {}) or {}).get("execution_kind", "entry")).lower()
+            not in {"exit", "close"}
+        }
+        completed = len(terminal_markets & opening_markets)
+        fees = Decimal("0")
+        costs = Decimal("0")
+        capital = Decimal("0")
+        for fill in fills:
+            quantity = _rolling_number(getattr(fill, "quantity", 0))
+            price = _rolling_number(getattr(fill, "price", 0))
+            fees += _rolling_number(getattr(fill, "fees", 0))
+            costs += _rolling_number(getattr(fill, "slippage", 0))
+            metadata = getattr(fill, "metadata", {})
+            metadata = metadata if isinstance(metadata, Mapping) else {}
+            execution_kind = str(metadata.get("execution_kind", "entry")).lower()
+            if execution_kind not in {"exit", "close"}:
+                capital += quantity * price
+        metrics = getattr(result, "metrics", {})
+        metrics = metrics if isinstance(metrics, Mapping) else {}
+        curve = tuple(
+            item
+            for item in (getattr(result, "equity_curve", ()) or ())
+            if isinstance(item, Mapping)
+        )
+        def canonical_metric(*names: str) -> Decimal | None:
+            sources: list[Mapping[str, Any]] = [metrics]
+            if curve:
+                sources.append(curve[-1])
+            for source in tuple(sources):
+                for child_name in (
+                    "portfolio",
+                    "portfolio_metrics",
+                    "cashflows",
+                    "cash_flows",
+                    "cashflow",
+                ):
+                    child = source.get(child_name)
+                    if isinstance(child, Mapping):
+                        sources.append(child)
+            for source in sources:
+                for name in names:
+                    if name not in source or source.get(name) is None:
+                        continue
+                    value = _rolling_number(source.get(name), Decimal("NaN"))
+                    if value.is_finite():
+                        return value
+            return None
+
+        # PnL is authoritative only when emitted by the canonical portfolio
+        # metrics/cashflow projection.  Fills remain execution evidence for
+        # counts, allocated capital, fees, and slippage; in particular an exit
+        # fill is never treated as another entry-at-resolution payoff.
+        realized = canonical_metric("realized_pnl", "realized", "realized_profit")
+        unrealized = canonical_metric("unrealized_pnl", "unrealized", "unrealized_profit")
+        net_pnl = canonical_metric(
+            "net_pnl",
+            "total_pnl",
+            "net_return",
+            "net_profit",
+            "total_profit",
+            "profit_loss",
+            "pnl",
+        )
+        pnl_authoritative = realized is not None or net_pnl is not None
+        if realized is None and net_pnl is not None:
+            realized = net_pnl - unrealized if unrealized is not None else net_pnl
+        if realized is None:
+            realized = Decimal("0")
+        if unrealized is None:
+            if net_pnl is not None and pnl_authoritative:
+                unrealized = net_pnl - realized
+            else:
+                unrealized = Decimal("0")
+        unresolved = tuple(getattr(result, "unresolved", ()) or ())
+        source_times = [
+            _rolling_row_time(row)
+            for row in usable_rows
+            if _rolling_row_time(row) is not None
+        ]
+        if not source_times:
+            return None
+        lineage_proven = bool(usable_rows) and all(
+            row.get("_rolling_lineage_proven") is True for row in usable_rows
+        )
+        # The recorded-book evaluator is authoritative for historical/replay
+        # accounting.  Strategy lineage remains separately reported and must
+        # not make evaluator-produced fills disappear.
+        accounting_available = capital > Decimal("0") and pnl_authoritative
+        curve = tuple(
+            item
+            for item in (getattr(result, "equity_curve", ()) or ())
+            if isinstance(item, Mapping)
+        )
+
+        def curve_side(item: Mapping[str, Any]) -> str:
+            return str(
+                getattr(item.get("side"), "value", item.get("side", ""))
+            ).strip().lower()
+
+        actionable_sides = {"buy", "sell", "entry", "exit", "long", "short"}
+        signal_count = sum(1 for item in curve if curve_side(item) in actionable_sides)
+        declined_count = len(curve) - signal_count
+        return {
+            "evaluator": "evaluate_signal_evaluation:v1",
+            "source_digest": _rolling_hash(usable_rows),
+            "accounting_digest": _rolling_hash(
+                {
+                    "fills": [
+                        {
+                            "order_id": getattr(fill, "order_id", ""),
+                            "market_id": getattr(fill, "market_id", None),
+                            "quantity": getattr(fill, "quantity", 0),
+                            "price": getattr(fill, "price", 0),
+                            "fees": getattr(fill, "fees", 0),
+                            "slippage": getattr(fill, "slippage", 0),
+                        }
+                        for fill in fills
+                    ],
+                    "aggregate": {
+                        "capital_at_risk": capital,
+                        "realized_pnl": realized,
+                        "unrealized_pnl": unrealized,
+                        "fees": fees,
+                        "costs": costs,
+                        "completed_outcomes": completed,
+                        "outcomes": dict(outcomes),
+                    },
+                }
+            ),
+            "available_from": min(source_times),
+            "available_through": max(source_times),
+            "evaluated_rows": len(usable_rows),
+            "available_rows": len(usable_rows),
+            "signals": signal_count,
+            "declined_evaluations": declined_count,
+            "fills": len(fills),
+            "positions": len(unresolved),
+            "open_positions": list(unresolved)[:64],
+            "openings": len(opening_markets),
+            "completed_outcomes": completed,
+            "realized_pnl": realized,
+            "unrealized_pnl": unrealized,
+            "fees": fees,
+            "costs": costs,
+            "capital_at_risk": capital,
+            "accounting_available": accounting_available,
+            "accounting_complete": accounting_available,
+            "accounting_partial": not accounting_available,
+            "requested_rows": len(rows),
+            "accounting_unavailable_reason": (
+                None
+                if accounting_available
+                else "CANONICAL_PNL_UNAVAILABLE"
+                if not pnl_authoritative
+                else "NO_EVALUATED_FILLS"
+            ),
+            "lineage_proven": lineage_proven,
+            "outcomes": dict(outcomes),
+            "research_quality": str(getattr(getattr(result, "research_quality", None), "value", "") or ""),
+        }
+
     def _rolling_evidence_record(
         self,
         strategy: Mapping[str, Any],
@@ -4086,23 +5412,235 @@ class AutonomousResearchProcessor:
         source_class: str,
         days: int,
         now: datetime,
+        evaluation: Mapping[str, Any] | None = None,
     ) -> dict[str, Any] | None:
-        """Aggregate explicit strategy accounting; prices are never PnL input."""
+        """Aggregate accounting and persist partial canonical progress."""
         if days not in {7, 30} or not rows:
             return None
         requested_source = _rolling_source_name(source_class)
         persisted_source = _rolling_persisted_source_class(requested_source)
+        if evaluation is None:
+            evaluation = self._rolling_canonical_evaluation(
+                strategy, rows, requested_source
+            )
+        recorded_book = any(
+            isinstance(_rolling_snapshot_view(row).get(name), Mapping)
+            for row in rows
+            if isinstance(row, Mapping)
+            for name in ("order_book", "yes_order_book", "no_order_book")
+        )
+        canonical_required = requested_source in {"HISTORICAL", "REPLAY"} or (
+            requested_source == "LIVE" and recorded_book
+        )
+        evaluator_authoritative = (
+            canonical_required
+            and isinstance(evaluation, Mapping)
+            and bool(evaluation.get("evaluator"))
+        )
+        if canonical_required and not evaluator_authoritative:
+            # Historical/replay (and recorded LIVE) rows must never fall back
+            # to a row's private accounting projection when the canonical
+            # evaluator is unavailable.  Persist a partial canonical record so
+            # the missing prerequisite remains retryable and visible.
+            prior_reason = (
+                str(evaluation.get("accounting_unavailable_reason", "")).strip().upper()
+                if isinstance(evaluation, Mapping)
+                else ""
+            )
+            evaluation = dict(evaluation) if isinstance(evaluation, Mapping) else {}
+            evaluation["evaluator"] = "evaluate_signal_evaluation:v1"
+            evaluation["accounting_available"] = False
+            evaluation["accounting_complete"] = False
+            evaluation["accounting_partial"] = True
+            evaluation["accounting_unavailable_reason"] = (
+                "PNL_UNAVAILABLE" if "PNL" in prior_reason else "CANONICAL_EVALUATION_UNAVAILABLE"
+            )
+            evaluator_authoritative = True
         projected: list[tuple[Mapping[str, Any], Mapping[str, Any]]] = []
-        for row in rows:
-            if not isinstance(row, Mapping):
-                continue
-            accounting = row.get("_rolling_accounting")
-            if not isinstance(accounting, Mapping):
-                accounting = self._rolling_accounting_projection(row, strategy)
-            if isinstance(accounting, Mapping):
-                projected.append((row, accounting))
-        if not projected:
-            return None
+        missing_accounting = False
+
+        def has_raw_accounting(row: Mapping[str, Any]) -> bool:
+            view = _rolling_snapshot_view(row)
+            return any(
+                isinstance(view.get(name), Mapping)
+                for name in (
+                    "canonical_accounting",
+                    "strategy_accounting",
+                    "accounting",
+                    "resolved_bet",
+                )
+            )
+
+        if evaluator_authoritative:
+            raw_accounting_rows = sum(
+                1 for row in rows if isinstance(row, Mapping) and has_raw_accounting(row)
+            )
+            if 0 < raw_accounting_rows < len(rows):
+                evaluation = dict(evaluation)
+                evaluation.update(
+                    {
+                        "accounting_available": False,
+                        "accounting_complete": False,
+                        "accounting_partial": True,
+                        "accounting_unavailable_reason": "MIXED_RAW_ACCOUNTING",
+                    }
+                )
+            partial_accounting = (
+                evaluation.get("accounting_available") is not True
+                or evaluation.get("accounting_complete") is False
+                or evaluation.get("accounting_partial") is True
+            )
+            evaluation_from = evaluation.get("available_from")
+            evaluation_through = evaluation.get("available_through")
+            row_times = [
+                _rolling_row_time(row)
+                for row in rows
+                if isinstance(row, Mapping) and _rolling_row_time(row) is not None
+            ]
+            start = _rolling_timestamp(evaluation_from) or (
+                min(row_times) if row_times else None
+            )
+            through = _rolling_timestamp(evaluation_through) or (
+                max(row_times) if row_times else None
+            )
+            if start is None or through is None or through < start:
+                return None
+            accounting = {
+                "_available_from": start,
+                "_available_through": through,
+                "allocated_capital": (
+                    evaluation.get("capital_at_risk", 0) if not partial_accounting else 0
+                ),
+                "allocated_capital_net_return": (
+                    evaluation.get("realized_pnl", 0) if not partial_accounting else 0
+                ),
+                "realized_pnl": (
+                    evaluation.get("realized_pnl", 0) if not partial_accounting else 0
+                ),
+                "unrealized_pnl": (
+                    evaluation.get("unrealized_pnl", 0) if not partial_accounting else 0
+                ),
+                "fees": evaluation.get("fees", 0) if not partial_accounting else 0,
+                "costs": evaluation.get("costs", 0) if not partial_accounting else 0,
+                "drawdown": evaluation.get("drawdown", 0) if not partial_accounting else 0,
+                "completed_outcomes": (
+                    evaluation.get("completed_outcomes", 0)
+                    if not partial_accounting
+                    else 0
+                ),
+                "reliability": (
+                    evaluation.get("reliability", 1)
+                    if not partial_accounting
+                    else 0
+                ),
+                "execution_feasibility": evaluation.get("execution_feasibility"),
+            }
+            projected.append(({"_rolling_partial": True}, accounting))
+            missing_accounting = partial_accounting
+        else:
+            if isinstance(evaluation, Mapping) and (
+                evaluation.get("accounting_available") is False
+                or evaluation.get("accounting_complete") is False
+                or evaluation.get("accounting_partial") is True
+            ):
+                missing_accounting = True
+            for row in rows:
+                if not isinstance(row, Mapping):
+                    missing_accounting = True
+                    continue
+                accounting = row.get("_rolling_accounting")
+                if not isinstance(accounting, Mapping):
+                    accounting = self._rolling_accounting_projection(row, strategy)
+                if isinstance(accounting, Mapping):
+                    projected.append((row, accounting))
+                else:
+                    missing_accounting = True
+            partial_accounting = (
+                missing_accounting
+                or (
+                    isinstance(evaluation, Mapping)
+                    and (
+                        evaluation.get("accounting_complete") is False
+                        or evaluation.get("accounting_partial") is True
+                        or evaluation.get("accounting_available") is False
+                    )
+                )
+            )
+            if not projected:
+                evaluation_from = (
+                    evaluation.get("available_from") if isinstance(evaluation, Mapping) else None
+                )
+                evaluation_through = (
+                    evaluation.get("available_through") if isinstance(evaluation, Mapping) else None
+                )
+                row_times = [
+                    _rolling_row_time(row)
+                    for row in rows
+                    if isinstance(row, Mapping) and _rolling_row_time(row) is not None
+                ]
+                start = _rolling_timestamp(evaluation_from) or (
+                    min(row_times) if row_times else None
+                )
+                through = _rolling_timestamp(evaluation_through) or (
+                    max(row_times) if row_times else None
+                )
+                if start is None or through is None or through < start:
+                    return None
+                partial_accounting = (
+                    missing_accounting
+                    or (
+                        isinstance(evaluation, Mapping)
+                        and (
+                            evaluation.get("accounting_complete") is False
+                            or evaluation.get("accounting_partial") is True
+                            or evaluation.get("accounting_available") is not True
+                        )
+                    )
+                )
+                accounting = {
+                    "_available_from": start,
+                    "_available_through": through,
+                    "allocated_capital": (
+                        evaluation.get("capital_at_risk", 0)
+                        if isinstance(evaluation, Mapping) and not partial_accounting
+                        else 0
+                    ),
+                    "allocated_capital_net_return": (
+                        evaluation.get("realized_pnl", 0)
+                        if isinstance(evaluation, Mapping) and not partial_accounting
+                        else 0
+                    ),
+                    "realized_pnl": (
+                        evaluation.get("realized_pnl", 0)
+                        if isinstance(evaluation, Mapping) and not partial_accounting
+                        else 0
+                    ),
+                    "unrealized_pnl": (
+                        evaluation.get("unrealized_pnl", 0)
+                        if isinstance(evaluation, Mapping) and not partial_accounting
+                        else 0
+                    ),
+                    "fees": (
+                        evaluation.get("fees", 0)
+                        if isinstance(evaluation, Mapping) and not partial_accounting
+                        else 0
+                    ),
+                    "costs": (
+                        evaluation.get("costs", 0)
+                        if isinstance(evaluation, Mapping) and not partial_accounting
+                        else 0
+                    ),
+                    "drawdown": 0,
+                    "completed_outcomes": (
+                        evaluation.get("completed_outcomes", 0)
+                        if isinstance(evaluation, Mapping) and not partial_accounting
+                        else 0
+                    ),
+                    "reliability": (
+                        1 if isinstance(evaluation, Mapping) and not partial_accounting else 0
+                    ),
+                }
+                projected.append(({"_rolling_partial": True}, accounting))
         stream_through = max(
             accounting["_available_through"]
             for _row, accounting in projected
@@ -4231,6 +5769,60 @@ class AutonomousResearchProcessor:
             }
             for row, accounting in selected
         ]
+        rolling_accounting_digest = _rolling_hash(accounting_digest)
+        evaluation_source_digest = (
+            evaluation.get("source_digest")
+            if isinstance(evaluation, Mapping)
+            else None
+        )
+        source_digest = (
+            str(evaluation_source_digest)
+            if evaluation_source_digest not in (None, "")
+            else _rolling_hash(rows)
+        )
+        evaluation_accounting_digest = (
+            evaluation.get("accounting_digest")
+            if isinstance(evaluation, Mapping)
+            else None
+        )
+        persisted_accounting_digest = (
+            str(evaluation_accounting_digest)
+            if evaluation_accounting_digest not in (None, "")
+            else rolling_accounting_digest
+        )
+        evaluated_rows = (
+            int(evaluation.get("evaluated_rows", len(selected)))
+            if isinstance(evaluation, Mapping)
+            else len(selected)
+        )
+        requested_rows = (
+            int(evaluation.get("requested_rows", len(rows)))
+            if isinstance(evaluation, Mapping)
+            else len(rows)
+        )
+        available_rows = (
+            int(evaluation.get("available_rows", len(selected)))
+            if isinstance(evaluation, Mapping)
+            else len(selected)
+        )
+        evaluation_available = (
+            evaluation.get("accounting_available")
+            if isinstance(evaluation, Mapping)
+            and isinstance(evaluation.get("accounting_available"), bool)
+            else None
+        )
+        evaluation_complete = (
+            evaluation.get("accounting_complete")
+            if isinstance(evaluation, Mapping)
+            and isinstance(evaluation.get("accounting_complete"), bool)
+            else None
+        )
+        evaluation_partial = (
+            evaluation.get("accounting_partial")
+            if isinstance(evaluation, Mapping)
+            and isinstance(evaluation.get("accounting_partial"), bool)
+            else None
+        )
         digest = _rolling_hash(
             {
                 "strategy_version_id": strategy["strategy_version_id"],
@@ -4244,6 +5836,16 @@ class AutonomousResearchProcessor:
                 "available_through": available_through,
                 "actual_coverage_seconds": actual_coverage,
                 "accounting": accounting_digest,
+                "evaluator_source_digest": (
+                    evaluation.get("source_digest")
+                    if isinstance(evaluation, Mapping)
+                    else None
+                ),
+                "evaluator_accounting_digest": (
+                    evaluation.get("accounting_digest")
+                    if isinstance(evaluation, Mapping)
+                    else None
+                ),
             }
         )
         window_id = "rolling-window-" + digest.removeprefix("sha256:")[:40]
@@ -4276,6 +5878,8 @@ class AutonomousResearchProcessor:
             "unrealized_pnl": str(unrealized_pnl),
             "fees": str(fees),
             "costs": str(costs),
+            "slippage": str(costs),
+            "capital_at_risk": str(allocated_capital),
             "drawdown": str(drawdown),
             "completed_outcomes": completed,
             "reliability": str(reliability),
@@ -4289,6 +5893,16 @@ class AutonomousResearchProcessor:
                     if str(row.get("market_id", "")).strip()
                 }
             ),
+            "accounting_complete": (
+                evaluation_complete
+                if evaluation_complete is not None
+                else not partial_accounting
+            ),
+            "accounting_partial": (
+                evaluation_partial
+                if evaluation_partial is not None
+                else partial_accounting
+            ),
             "market_path_keys": sorted(
                 {
                     str(row.get("market_id")).strip()
@@ -4296,6 +5910,41 @@ class AutonomousResearchProcessor:
                     if str(row.get("market_id", "")).strip()
                 }
             ),
+            "accounting_available": (
+                evaluation_available
+                if evaluation_available is not None
+                else not partial_accounting
+            ),
+            "admitted": bool(not partial_accounting and completed > 0),
+            "admission_reasons": (
+                []
+                if not partial_accounting and completed > 0
+                else ["ACCOUNTING_UNAVAILABLE" if partial_accounting else "MINIMUM_OUTCOMES_UNMET"]
+            ),
+            "requested_rows": requested_rows,
+            "available_rows": available_rows,
+            "evaluated_rows": evaluated_rows,
+            "signals": int(evaluation.get("signals", 0)) if isinstance(evaluation, Mapping) else 0,
+            "declined_evaluations": (
+                int(evaluation.get("declined_evaluations", 0))
+                if isinstance(evaluation, Mapping)
+                else 0
+            ),
+            "positions": int(evaluation.get("positions", 0)) if isinstance(evaluation, Mapping) else 0,
+            "openings": int(evaluation.get("openings", 0)) if isinstance(evaluation, Mapping) else 0,
+            "open_positions": (
+                list(evaluation.get("open_positions", ()))[:64]
+                if isinstance(evaluation, Mapping)
+                else []
+            ),
+            "accounting_unavailable_reason": (
+                evaluation.get("accounting_unavailable_reason")
+                if isinstance(evaluation, Mapping) and partial_accounting
+                else None
+            ),
+            "source_digest": source_digest,
+            "accounting_digest": persisted_accounting_digest,
+            "evaluation": dict(evaluation) if isinstance(evaluation, Mapping) else {},
             "paper_only": True,
             "rolling_research": True,
             "measured_at": available_through.isoformat(),
@@ -4319,169 +5968,509 @@ class AutonomousResearchProcessor:
         )
         evidence_rows: list[dict[str, Any]] = []
         pending: list[dict[str, Any]] = []
+        pending_total = 0
         saver = getattr(self.store, "save_strategy_evidence_window", None)
+        cursor_loader = getattr(self.store, "load_rolling_evidence_cursor", None)
+        cursor_saver = getattr(self.store, "save_rolling_evidence_cursor", None)
+        blocker_loader = getattr(self.store, "load_rolling_evidence_blocker", None)
+        blocker_saver = getattr(self.store, "save_rolling_evidence_blocker", None)
+        cursor = cursor_loader() if callable(cursor_loader) else None
         source_cache: dict[str, list[dict[str, Any]]] = {}
-        source_cache_errors: dict[str, str] = {}
+        source_cache_errors: dict[str, tuple[str, str, str]] = {}
         total_rows = 0
+        attempted = 0
+        work_items = _rolling_work_items(strategies)
+        start_index = _rolling_cursor_index(cursor, work_items)
 
         def add_pending(item: Mapping[str, Any]) -> None:
+            nonlocal pending_total
+            pending_total += 1
             if len(pending) < _MAX_ROLLING_QUEUE_RESULTS:
                 entry = dict(item)
                 entry.setdefault("next_job", "rolling-research-evidence")
                 pending.append(entry)
 
-        for strategy in strategies:
+        def work_payload(
+            strategy: Mapping[str, Any],
+            days: int,
+            source: str,
+            *,
+            status: str,
+            reason: str,
+            **extra: Any,
+        ) -> dict[str, Any]:
+            return {
+                "strategy_version_id": strategy.get("strategy_version_id"),
+                "research_trial_id": strategy.get("research_trial_id"),
+                "candidate_id": strategy.get("candidate_id"),
+                "source_class": source,
+                "requested_days": days,
+                "status": status,
+                "reason": reason,
+                **extra,
+            }
+
+        transient_blockers = {
+            "SOURCE_LOAD_FAILED",
+            "EVIDENCE_PERSISTENCE_UNAVAILABLE",
+            "EVIDENCE_PERSISTENCE_FAILED",
+            "INSUFFICIENT_EVIDENCE",
+            "HISTORICAL_DATASET_EMPTY",
+        }
+        def is_terminal_blocker(record: Mapping[str, Any]) -> bool:
+            reason = str(record.get("blocker") or "")
+            payload = record.get("payload")
+            payload = payload if isinstance(payload, Mapping) else {}
+            non_retryable = bool(
+                record.get("non_retryable") or payload.get("non_retryable")
+            )
+            terminal = bool(record.get("terminal") or payload.get("terminal"))
+            if non_retryable or _rolling_reason_is_immutable(reason):
+                return True
+            return terminal and reason not in transient_blockers
+
+        def persist_blocker(
+            strategy: Mapping[str, Any],
+            days: int,
+            source: str,
+            fingerprint: str,
+            reason: str,
+            detail: str = "",
+        ) -> None:
+            # A blocker without source/prerequisite material must not become
+            # durable state; doing so would suppress a later corrected retry.
+            if not str(fingerprint or "").strip():
+                return
+            immutable = _rolling_reason_is_immutable(reason)
+            retryable = not immutable
+            if callable(blocker_saver):
+                try:
+                    blocker_saver(
+                        {
+                            "work_key": _rolling_work_key(strategy, days, source),
+                            "strategy_version_id": strategy.get("strategy_version_id"),
+                            "research_trial_id": strategy.get("research_trial_id"),
+                            "candidate_id": strategy.get("candidate_id"),
+                            "requested_days": days,
+                            "source_class": source,
+                            "prerequisite_fingerprint": fingerprint,
+                            "blocker": reason,
+                            "detail": detail,
+                            "last_attempted_at": current.isoformat(),
+                            "retryable": retryable,
+                            "non_retryable": immutable,
+                            "terminal": immutable,
+                            "next_attempt_at": (
+                                (current + timedelta(minutes=5)).isoformat()
+                                if retryable
+                                else None
+                            ),
+                            "payload": {
+                                "strategy_hash": strategy.get("strategy_hash"),
+                                "dataset_id": strategy.get("dataset_id"),
+                                "dataset_version": strategy.get("dataset_version"),
+                                "retryable": retryable,
+                                "non_retryable": immutable,
+                                "terminal": immutable,
+                                "next_attempt_at": (
+                                    (current + timedelta(minutes=5)).isoformat()
+                                    if retryable
+                                    else None
+                                ),
+                            },
+                        }
+                    )
+                except (TypeError, ValueError, RuntimeError):
+                    pass
+
+        def blocked(
+            strategy: Mapping[str, Any],
+            days: int,
+            source: str,
+            fingerprint: str,
+        ) -> Mapping[str, Any] | None:
+            if not callable(blocker_loader):
+                return None
+            try:
+                record = blocker_loader(
+                    work_key=_rolling_work_key(strategy, days, source),
+                    prerequisite_fingerprint=fingerprint,
+                )
+            except (TypeError, ValueError, RuntimeError):
+                return None
+            if not isinstance(record, Mapping):
+                return None
+            if is_terminal_blocker(record):
+                return record
+            next_attempt = _rolling_timestamp(record.get("next_attempt_at"))
+            if next_attempt is None:
+                payload = record.get("payload")
+                if isinstance(payload, Mapping):
+                    next_attempt = _rolling_timestamp(payload.get("next_attempt_at"))
+            if next_attempt is not None and next_attempt > current:
+                return record
+            return None
+
+
+        for offset in range(len(work_items)):
+            if total_rows >= _MAX_ROLLING_TOTAL_ROWS and attempted:
+                break
+            index = (start_index + offset) % len(work_items) if work_items else 0
+            if not work_items:
+                break
+            strategy, days, source = work_items[index]
+            attempted += 1
             source_payload = dict(strategy)
             source_payload["payload"] = {
                 **dict(strategy.get("provenance") or {}),
                 "strategy_document": strategy.get("strategy_document"),
             }
-            for source in sources:
-                canonical_source = _rolling_source_name(source)
-                try:
-                    binding = _rolling_source_binding(source_payload)
-                    cache_key = _rolling_hash(
-                        {
-                            "source_class": canonical_source,
-                            "dataset_selector": binding,
-                            "strategy_hash": (
-                                str(strategy.get("strategy_hash", ""))
-                                if canonical_source == "PAPER"
-                                else None
-                            ),
-                        }
-                    )
-                except (TypeError, ValueError) as exc:
-                    add_pending(
-                        {
-                            "strategy_version_id": strategy["strategy_version_id"],
-                            "research_trial_id": strategy["research_trial_id"],
-                            "candidate_id": strategy.get("candidate_id"),
-                            "source_class": canonical_source,
-                            "requested_days": [7, 30],
-                            "status": "ERROR",
-                            "reason": "SOURCE_SELECTOR_INVALID",
-                            "error_type": type(exc).__name__,
-                            "error": str(exc)[:256],
-                        }
-                    )
-                    continue
-                rows: list[dict[str, Any]]
-                if cache_key in source_cache_errors:
-                    add_pending(
-                        {
-                            "strategy_version_id": strategy["strategy_version_id"],
-                            "research_trial_id": strategy["research_trial_id"],
-                            "candidate_id": strategy.get("candidate_id"),
-                            "source_class": canonical_source,
-                            "requested_days": [7, 30],
-                            "status": "ERROR",
-                            "reason": "SOURCE_LOAD_FAILED",
-                            "error": source_cache_errors[cache_key],
-                        }
-                    )
-                    continue
-                if cache_key not in source_cache:
-                    try:
-                        source_cache[cache_key] = self._rolling_source_rows(
-                            source_payload, canonical_source, current
-                        )
-                    except (TypeError, ValueError) as exc:
-                        source_cache_errors[cache_key] = (
-                            f"{type(exc).__name__}: {str(exc)[:256]}"
-                        )
-                        add_pending(
-                            {
-                                "strategy_version_id": strategy["strategy_version_id"],
-                                "research_trial_id": strategy["research_trial_id"],
-                                "candidate_id": strategy.get("candidate_id"),
-                                "source_class": canonical_source,
-                                "requested_days": [7, 30],
-                                "status": "ERROR",
-                                "reason": "SOURCE_LOAD_FAILED",
-                                "error": source_cache_errors[cache_key],
-                            }
-                        )
-                        continue
-                rows = source_cache[cache_key]
-                remaining = max(0, _MAX_ROLLING_TOTAL_ROWS - total_rows)
-                bounded_rows = list(rows[:remaining])
-                accounting_rejections = sorted(
+            work_key = _rolling_work_key(strategy, days, source)
+            try:
+                pre_fingerprint = _rolling_prerequisite_fingerprint(strategy, source)
+            except (TypeError, ValueError, RuntimeError):
+                pre_fingerprint = _rolling_hash(
                     {
-                        str(row.get("_rolling_accounting_rejection"))
-                        for row in bounded_rows
-                        if row.get("_rolling_accounting_rejection")
+                        "strategy_version_id": strategy.get("strategy_version_id"),
+                        "research_trial_id": strategy.get("research_trial_id"),
+                        "candidate_id": strategy.get("candidate_id"),
+                        "source_class": source,
                     }
                 )
-                for rejection in accounting_rejections:
+            # Source-free fingerprints are not sufficient to suppress a row
+            # blocker: corrected source/prerequisite state must be loaded and
+            # retried before an immutable decision can be reused.
+            try:
+                binding = _rolling_source_binding(source_payload)
+                cache_key = _rolling_hash(
+                    {
+                        "source_class": source,
+                        "dataset_selector": binding,
+                        "strategy_hash": strategy.get("strategy_hash"),
+                    }
+                )
+            except (TypeError, ValueError) as exc:
+                reason = _rolling_source_exception_reason(exc)
+                if reason == "SOURCE_LOAD_FAILED":
+                    reason = "SOURCE_SELECTOR_INVALID"
+                immutable = _rolling_reason_is_immutable(reason)
+                fingerprint = _rolling_hash({"pre": pre_fingerprint, "reason": reason})
+                persist_blocker(strategy, days, source, fingerprint, reason, str(exc))
+                add_pending(
+                    work_payload(
+                        strategy,
+                        days,
+                        source,
+                        status="BLOCKED",
+                        reason=reason,
+                        terminal=immutable,
+                        retryable=not immutable,
+                        next_attempt_at=(
+                            None
+                            if immutable
+                            else (current + timedelta(minutes=5)).isoformat()
+                        ),
+                    )
+                )
+                cache_key = ""
+                rows = None
+            else:
+                if cache_key in source_cache_errors:
+                    reason, error, fingerprint = source_cache_errors[cache_key]
+                    immutable = _rolling_reason_is_immutable(reason)
+                    # This is an in-memory duplicate from the current tick;
+                    # its preflight fingerprint remains attached for durable
+                    # retry and blocker correlation.
                     add_pending(
-                        {
-                            "strategy_version_id": strategy["strategy_version_id"],
-                            "research_trial_id": strategy["research_trial_id"],
-                            "candidate_id": strategy.get("candidate_id"),
-                            "source_class": canonical_source,
-                            "requested_days": [7, 30],
-                            "status": "ERROR",
-                            "reason": rejection,
-                        }
-                    )
-                total_rows += len(bounded_rows)
-                for days in (7, 30):
-                    evidence = self._rolling_evidence_record(
-                        strategy, bounded_rows, canonical_source, days, current
-                    )
-                    if evidence is None:
-                        add_pending(
-                            {
-                                "strategy_version_id": strategy["strategy_version_id"],
-                                "research_trial_id": strategy["research_trial_id"],
-                                "candidate_id": strategy.get("candidate_id"),
-                                "source_class": canonical_source,
-                                "requested_days": days,
-                                "status": "SCHEDULED",
-                                "reason": (
-                                    "HISTORICAL_DATASET_EMPTY"
-                                    if canonical_source == "HISTORICAL"
-                                    else "INSUFFICIENT_EVIDENCE"
-                                ),
-                            }
+                        work_payload(
+                            strategy,
+                            days,
+                            source,
+                            status="BLOCKED",
+                            reason=reason,
+                            error=error,
+                            blocker_fingerprint=fingerprint,
+                            terminal=immutable,
+                            retryable=not immutable,
+                            next_attempt_at=(
+                                None
+                                if immutable
+                                else (current + timedelta(minutes=5)).isoformat()
+                            ),
                         )
-                        continue
-                    if not callable(saver):
-                        add_pending(
-                            {
-                                "strategy_version_id": strategy["strategy_version_id"],
-                                "research_trial_id": strategy["research_trial_id"],
-                                "candidate_id": strategy.get("candidate_id"),
-                                "source_class": canonical_source,
-                                "requested_days": days,
-                                "status": "ERROR",
-                                "reason": "EVIDENCE_PERSISTENCE_UNAVAILABLE",
-                            }
-                        )
-                        continue
+                    )
+                    rows = None
+                elif cache_key not in source_cache:
                     try:
-                        saver(evidence)
-                    except (TypeError, ValueError) as exc:
-                        add_pending(
+                        if source == "PAPER":
+                            self._ensure_rolling_paper_observation(strategy, current)
+                        source_cache[cache_key] = self._rolling_source_rows(
+                            source_payload, source, current
+                        )
+                    except Exception as exc:
+                        error = f"{type(exc).__name__}: {str(exc)[:256]}"
+                        reason = _rolling_source_exception_reason(exc)
+                        immutable = _rolling_reason_is_immutable(reason)
+                        # A preflight fingerprint still authenticates the
+                        # immutable request and source binding when no rows
+                        # can be loaded.  Include the normalized error so a
+                        # corrected prerequisite receives a new blocker key.
+                        fingerprint = _rolling_hash(
                             {
-                                "strategy_version_id": strategy["strategy_version_id"],
-                                "research_trial_id": strategy["research_trial_id"],
-                                "candidate_id": strategy.get("candidate_id"),
-                                "source_class": canonical_source,
-                                "requested_days": days,
-                                "status": "ERROR",
-                                "reason": "EVIDENCE_PERSISTENCE_FAILED",
-                                "error_type": type(exc).__name__,
+                                "pre": pre_fingerprint,
+                                "reason": reason,
                                 "error": str(exc)[:256],
                             }
                         )
-                        continue
-                    evidence_rows.append(evidence)
-                if total_rows >= _MAX_ROLLING_TOTAL_ROWS:
-                    break
-            if total_rows >= _MAX_ROLLING_TOTAL_ROWS:
-                break
+                        persist_blocker(
+                            strategy,
+                            days,
+                            source,
+                            fingerprint,
+                            reason,
+                            error,
+                        )
+                        source_cache_errors[cache_key] = (reason, error, fingerprint)
+                        add_pending(
+                            work_payload(
+                                strategy,
+                                days,
+                                source,
+                                status="BLOCKED",
+                                reason=reason,
+                                error=error,
+                                blocker_fingerprint=fingerprint,
+                                terminal=immutable,
+                                retryable=not immutable,
+                                next_attempt_at=(
+                                    None
+                                    if immutable
+                                    else (current + timedelta(minutes=5)).isoformat()
+                                ),
+                            )
+                        )
+                        rows = None
+                    else:
+                        rows = source_cache[cache_key]
+                else:
+                    rows = source_cache[cache_key]
+            if rows is not None:
+                window_rows, timestamp_rejections = _rolling_window_rows(
+                    rows,
+                    days,
+                    current,
+                )
+                remaining = max(0, _MAX_ROLLING_TOTAL_ROWS - total_rows)
+                bounded_rows = list(window_rows[:remaining]) if remaining else []
+                total_rows += len(bounded_rows)
+                for timestamp_reason in timestamp_rejections:
+                    add_pending(
+                        work_payload(
+                            strategy,
+                            days,
+                            source,
+                            status="PARTIAL" if bounded_rows else "DEFERRED",
+                            reason=timestamp_reason,
+                            rejected_rows=True,
+                            next_attempt_at=(current + timedelta(minutes=5)).isoformat(),
+                        )
+                    )
+                try:
+                    fingerprint = _rolling_prerequisite_fingerprint(
+                        strategy, source, source_rows=rows
+                    )
+                except (TypeError, ValueError, RuntimeError):
+                    fingerprint = ""
+                prior_blocker = (
+                    blocked(strategy, days, source, fingerprint)
+                    if fingerprint
+                    else None
+                )
+                if prior_blocker is not None:
+                    prior_terminal = is_terminal_blocker(prior_blocker)
+                    add_pending(
+                        work_payload(
+                            strategy,
+                            days,
+                            source,
+                            status="BLOCKED",
+                            reason=str(prior_blocker.get("blocker") or "BLOCKED"),
+                            blocker_fingerprint=fingerprint,
+                            terminal=prior_terminal,
+                            retryable=not prior_terminal,
+                            next_attempt_at=prior_blocker.get("next_attempt_at"),
+                        )
+                    )
+                else:
+                    evaluation = self._rolling_canonical_evaluation(
+                        strategy, bounded_rows, source
+                    )
+                    recorded_book = any(
+                        isinstance(_rolling_snapshot_view(row).get(name), Mapping)
+                        for row in bounded_rows
+                        if isinstance(row, Mapping)
+                        for name in ("order_book", "yes_order_book", "no_order_book")
+                    )
+                    canonical_required = source in {"HISTORICAL", "REPLAY"} or (
+                        source == "LIVE" and recorded_book
+                    )
+                    canonical_reason: str | None = None
+                    if canonical_required:
+                        if not isinstance(evaluation, Mapping) or not evaluation.get("evaluator"):
+                            canonical_reason = "CANONICAL_EVALUATION_UNAVAILABLE"
+                        elif evaluation.get("accounting_available") is not True:
+                            raw_reason = str(
+                                evaluation.get("accounting_unavailable_reason", "")
+                            ).strip().upper()
+                            canonical_reason = (
+                                "PNL_UNAVAILABLE"
+                                if "PNL" in raw_reason
+                                else raw_reason or "PNL_UNAVAILABLE"
+                            )
+                        if canonical_reason:
+                            persist_blocker(
+                                strategy,
+                                days,
+                                source,
+                                fingerprint,
+                                canonical_reason,
+                            )
+                            add_pending(
+                                work_payload(
+                                    strategy,
+                                    days,
+                                    source,
+                                    status="PARTIAL",
+                                    reason=canonical_reason,
+                                    blocker_fingerprint=fingerprint,
+                                    terminal=False,
+                                    retryable=True,
+                                    next_attempt_at=(current + timedelta(minutes=5)).isoformat(),
+                                )
+                            )
+                    evidence = self._rolling_evidence_record(
+                        strategy,
+                        bounded_rows,
+                        source,
+                        days,
+                        current,
+                        evaluation=evaluation,
+                    )
+                    rejection_reasons = sorted(
+                        {
+                            str(row.get("_rolling_accounting_rejection"))
+                            for row in bounded_rows
+                            if row.get("_rolling_accounting_rejection")
+                        }
+                    )
+                    for rejection in rejection_reasons:
+                        rejection_immutable = _rolling_reason_is_immutable(rejection)
+                        # Persist before attempting the evidence save.  A row
+                        # can be rejected without yielding an evidence record,
+                        # and the exact reason must still reach operator state.
+                        persist_blocker(
+                            strategy,
+                            days,
+                            source,
+                            fingerprint,
+                            rejection,
+                        )
+                        add_pending(
+                            work_payload(
+                                strategy,
+                                days,
+                                source,
+                                status="PARTIAL" if evidence is not None else "BLOCKED",
+                                reason=rejection,
+                                blocker_fingerprint=fingerprint,
+                                terminal=rejection_immutable,
+                                retryable=not rejection_immutable,
+                                next_attempt_at=(
+                                    None
+                                    if rejection_immutable
+                                    else (current + timedelta(minutes=5)).isoformat()
+                                ),
+                            )
+                        )
+                    if evidence is None:
+                        reason = (
+                            canonical_reason
+                            or (
+                                "HISTORICAL_DATASET_EMPTY"
+                                if not bounded_rows and source == "HISTORICAL"
+                                else "INSUFFICIENT_EVIDENCE"
+                            )
+                        )
+                        add_pending(
+                            work_payload(
+                                strategy,
+                                days,
+                                source,
+                                status="DEFERRED",
+                                reason=reason,
+                                blocker_fingerprint=fingerprint,
+                                terminal=False,
+                                retryable=True,
+                                next_attempt_at=(
+                                    current + timedelta(minutes=5)
+                                ).isoformat(),
+                            )
+                        )
+                    elif not callable(saver):
+                        persist_blocker(
+                            strategy,
+                            days,
+                            source,
+                            fingerprint,
+                            "EVIDENCE_PERSISTENCE_UNAVAILABLE",
+                        )
+                        add_pending(
+                            work_payload(
+                                strategy,
+                                days,
+                                source,
+                                status="BLOCKED",
+                                reason="EVIDENCE_PERSISTENCE_UNAVAILABLE",
+                                blocker_fingerprint=fingerprint,
+                                terminal=False,
+                                retryable=True,
+                                next_attempt_at=(current + timedelta(minutes=5)).isoformat(),
+                            )
+                        )
+                    else:
+                        try:
+                            saver(evidence)
+                        except (TypeError, ValueError, RuntimeError) as exc:
+                            reason = "EVIDENCE_PERSISTENCE_FAILED"
+                            persist_blocker(
+                                strategy, days, source, fingerprint, reason, str(exc)
+                            )
+                            add_pending(
+                                work_payload(
+                                    strategy,
+                                    days,
+                                    source,
+                                    status="BLOCKED",
+                                    reason=reason,
+                                    error=str(exc)[:256],
+                                    blocker_fingerprint=fingerprint,
+                                    terminal=False,
+                                    retryable=True,
+                                    next_attempt_at=(
+                                        current + timedelta(minutes=5)
+                                    ).isoformat(),
+                                )
+                            )
+                        else:
+                            evidence_rows.append(evidence)
+            next_item = work_items[(index + 1) % len(work_items)]
+            cursor_record = _rolling_cursor_record(cursor, (strategy, days, source), next_item, current)
+            cursor = cursor_record
+            if callable(cursor_saver):
+                try:
+                    cursor_saver(cursor_record)
+                except (TypeError, ValueError, RuntimeError):
+                    pass
         if not strategies:
             proposal_items: tuple[Any, ...] = ()
             proposal_error: str | None = None
@@ -4505,6 +6494,19 @@ class AutonomousResearchProcessor:
             if proposal_error is not None:
                 fallback["error"] = proposal_error
             add_pending(fallback)
+        # Review identity must describe the complete current discovery set.  Do
+        # not query append-only ACCEPTED enrollments here: superseded versions
+        # are historical lineage, not members of this refresh's strategy set.
+        enrolled_strategy_version_ids = tuple(
+            sorted(
+                {
+                    str(item.get("strategy_version_id", "")).strip()
+                    for item in documents
+                    if isinstance(item, Mapping)
+                    and str(item.get("strategy_version_id", "")).strip()
+                }
+            )
+        )
         state = _rolling_state_payload(
             status="SCHEDULED" if pending else "READY",
             scheduled_at=current.isoformat(),
@@ -4516,7 +6518,71 @@ class AutonomousResearchProcessor:
             source_classes=sources,
             requested_window_days=(7, 30),
             source_rows_total=total_rows,
+            pending_total=pending_total,
+            enrolled_strategy_version_ids=enrolled_strategy_version_ids,
         )
+        state["rolling_cursor"] = (
+            _rolling_bound_cursor_state(cursor)
+            if isinstance(cursor, Mapping)
+            else {}
+        )
+        state["requested_work_items"] = len(work_items)
+        state["attempted_work_items"] = attempted
+        state["last_attempted_tuple"] = {
+            key: state["rolling_cursor"].get(key)
+            for key in (
+                "last_strategy_version_id",
+                "last_research_trial_id",
+                "last_candidate_id",
+                "last_requested_days",
+                "last_source_class",
+            )
+        }
+        state["next_durable_work"] = {
+            key: state["rolling_cursor"].get(key)
+            for key in (
+                "next_strategy_version_id",
+                "next_research_trial_id",
+                "next_candidate_id",
+                "next_requested_days",
+                "next_source_class",
+            )
+        }
+        state["available_evidence_windows"] = len(evidence_rows)
+        state["admitted_evidence_windows"] = sum(
+            1 for item in evidence_rows if item.get("admitted") is True
+        )
+        state["measured_counters"] = {
+            name: sum(int(item.get(name, 0) or 0) for item in evidence_rows)
+            for name in (
+                "requested_rows",
+                "available_rows",
+                "evaluated_rows",
+                "signals",
+                "declined_evaluations",
+                "positions",
+                "openings",
+                "completed_outcomes",
+            )
+        }
+        blocker_lister = getattr(self.store, "list_rolling_evidence_blockers", None)
+        try:
+            blockers = (
+                blocker_lister(limit=_MAX_ROLLING_QUEUE_RESULTS)
+                if callable(blocker_lister)
+                else []
+            )
+        except (TypeError, ValueError, RuntimeError):
+            blockers = []
+        state["terminal_blockers"] = [
+            _rolling_state_result(item)
+            for item in blockers
+            if isinstance(item, Mapping)
+        ]
+        # ``set_operator_job`` is also consumed by Hermes adapters.  Bound the
+        # final payload after cursor/counter details are attached, while the
+        # explicit ``*_total`` counters retain exact work cardinality.
+        state = _rolling_bound_operator_state(state)
         setter = getattr(self.store, "set_operator_job", None)
         if callable(setter):
             setter("rolling-research-evidence", "SCHEDULED" if pending else "COMPLETED", state, resumable=True)
@@ -4702,12 +6768,144 @@ class AutonomousResearchProcessor:
             and not _rolling_campaign_bound(row)
         )
         risk = self._rolling_risk_binding(policy)
-        # subtract every historical allocation on each rotation.
-        active_obligations = Decimal("0")
+        accounting_loader = getattr(self.store, "canary_risk_accounting", None)
+        accounting_available = callable(accounting_loader)
+        accounting_unavailable_reason = ""
+        accounting_legacy_compatibility = not accounting_available
+        accounting_fail_closed = False
+        accounting: Mapping[str, Any] = {}
+        if accounting_available:
+            try:
+                raw_accounting = accounting_loader(now=current)
+            except Exception:
+                accounting_available = False
+                accounting_fail_closed = True
+                accounting_unavailable_reason = "CANARY_RISK_ACCOUNTING_UNAVAILABLE"
+            else:
+                if isinstance(raw_accounting, Mapping):
+                    accounting = raw_accounting
+                else:
+                    accounting_available = False
+                    accounting_fail_closed = True
+                    accounting_unavailable_reason = "CANARY_RISK_ACCOUNTING_INVALID"
+        else:
+            # AxiomStore implements this method.  Keep only an explicitly
+            # marked compatibility path for tiny legacy test doubles; it is
+            # never presented as production accounting availability.
+            accounting_unavailable_reason = "CANARY_RISK_ACCOUNTING_UNAVAILABLE"
+
+        previous_allocations: dict[str, Decimal] = {}
+        if isinstance(previous, Mapping):
+            prior_members = previous.get("members", previous.get("selected_members", ()))
+            if isinstance(prior_members, (list, tuple)):
+                for raw_member in prior_members:
+                    if not isinstance(raw_member, Mapping):
+                        continue
+                    strategy_id = str(raw_member.get("strategy_version_id", "")).strip()
+                    allocation = _rolling_number(raw_member.get("allocation"))
+                    if strategy_id and allocation > 0:
+                        previous_allocations[strategy_id] = allocation
+
+        reserved_raw = accounting.get("rolling_strategy_reserved_usd")
+        reserved_by_strategy: dict[str, Decimal] = {}
+        reservations_invalid = not (
+            "rolling_global_reserved_usd" in accounting
+            and "rolling_strategy_reserved_usd" in accounting
+            and isinstance(reserved_raw, Mapping)
+        )
+        detail_total = Decimal("0")
+        if isinstance(reserved_raw, Mapping):
+            for raw_strategy_id, raw_reserved in reserved_raw.items():
+                strategy_id = str(raw_strategy_id).strip()
+                if not strategy_id or isinstance(raw_reserved, bool):
+                    reservations_invalid = True
+                    continue
+                try:
+                    reserved = Decimal(str(raw_reserved))
+                except (InvalidOperation, TypeError, ValueError):
+                    reservations_invalid = True
+                    continue
+                if not reserved.is_finite() or reserved < 0:
+                    reservations_invalid = True
+                    continue
+                detail_total += reserved
+                if reserved > 0:
+                    reserved_by_strategy[strategy_id] = reserved
+        raw_global_reserved = accounting.get("rolling_global_reserved_usd")
+        global_reserved = Decimal("0")
+        if isinstance(raw_global_reserved, bool) or raw_global_reserved is None:
+            reservations_invalid = True
+        else:
+            try:
+                global_reserved = Decimal(str(raw_global_reserved))
+            except (InvalidOperation, TypeError, ValueError):
+                reservations_invalid = True
+            else:
+                if not global_reserved.is_finite() or global_reserved < 0:
+                    reservations_invalid = True
+                    global_reserved = Decimal("0")
+        if reservations_invalid or detail_total != global_reserved:
+            accounting_fail_closed = True
+            accounting_available = False
+            accounting_unavailable_reason = "ROLLING_STRATEGY_RESERVATIONS_UNAVAILABLE"
+        active_obligations = max(Decimal("0"), global_reserved)
+        if active_obligations <= 0 and reserved_by_strategy:
+            active_obligations = sum(reserved_by_strategy.values(), Decimal("0"))
+        uncovered_obligations = sum(
+            (
+                max(
+                    Decimal("0"),
+                    reserved - previous_allocations.get(strategy_id, Decimal("0")),
+                )
+                for strategy_id, reserved in reserved_by_strategy.items()
+            ),
+            Decimal("0"),
+        )
+        if accounting_fail_closed:
+            # Unknown external obligations reserve the entire global budget;
+            # this forces OBSERVE and prevents any new allocation.
+            uncovered_obligations = max(
+                uncovered_obligations,
+                max(Decimal("0"), _rolling_number(risk.get("global_budget"))),
+            )
+            active_obligations = max(active_obligations, uncovered_obligations)
         risk["active_obligations"] = str(active_obligations)
-        available_budget = max(Decimal("0"), _rolling_number(risk.get("global_budget")))
+        risk["runtime_active_obligations"] = str(active_obligations)
+        risk["uncovered_obligations"] = str(uncovered_obligations)
+        risk["external_obligations"] = str(uncovered_obligations)
+        risk["rolling_strategy_reserved_usd"] = {
+            strategy_id: str(reserved)
+            for strategy_id, reserved in sorted(reserved_by_strategy.items())
+        }
+        risk["runtime_accounting_available"] = accounting_available
+        risk["runtime_accounting_metadata"] = {
+            "source": "canary_risk_accounting",
+            "available": accounting_available,
+            **(
+                {"unavailable_reason": accounting_unavailable_reason}
+                if not accounting_available
+                else {}
+            ),
+            **(
+                {"compatibility": "legacy_unavailable"}
+                if accounting_legacy_compatibility
+                else {}
+            ),
+        }
+        risk["runtime_accounting_legacy_compatibility"] = accounting_legacy_compatibility
+        if not accounting_available:
+            risk["runtime_accounting_unavailable_reason"] = accounting_unavailable_reason
+        global_budget = max(Decimal("0"), _rolling_number(risk.get("global_budget")))
+        if accounting_fail_closed:
+            uncovered_obligations = global_budget
+            active_obligations = max(active_obligations, uncovered_obligations)
+            risk["active_obligations"] = str(active_obligations)
+            risk["runtime_active_obligations"] = str(active_obligations)
+            risk["uncovered_obligations"] = str(uncovered_obligations)
+            risk["external_obligations"] = str(uncovered_obligations)
+        available_budget = max(Decimal("0"), global_budget - uncovered_obligations)
         risk["available_budget"] = str(available_budget)
-        effective_policy = replace(policy, global_budget=available_budget, config_hash=policy.config_hash)
+        effective_policy = replace(policy, global_budget=global_budget, config_hash=policy.config_hash)
         evaluation_previous = previous
         if bypass_due and isinstance(previous, Mapping):
             # The pure evaluator has its own cadence guard.  Adjust only the
@@ -4719,14 +6917,68 @@ class AutonomousResearchProcessor:
                 current,
                 selected_at or current,
             ).isoformat()
+        def uncovered_for_members(rows: Sequence[Any]) -> Decimal:
+            if accounting_fail_closed:
+                return global_budget
+            allocations_by_strategy: dict[str, Decimal] = {}
+            for row in rows:
+                strategy_id = str(getattr(row, "strategy_version_id", "")).strip()
+                allocation = _rolling_number(getattr(row, "allocation", "0"))
+                if strategy_id and allocation > 0:
+                    allocations_by_strategy[strategy_id] = allocation
+            return sum(
+                (
+                    max(
+                        Decimal("0"),
+                        reserved - allocations_by_strategy.get(strategy_id, Decimal("0")),
+                    )
+                    for strategy_id, reserved in reserved_by_strategy.items()
+                ),
+                Decimal("0"),
+            )
+
+        def force_accounting_observe(selection: Any) -> Any:
+            if not accounting_fail_closed:
+                return selection
+            reason = REASON_EXTERNAL_OBLIGATIONS_EXCEED_BUDGET
+            members = tuple(
+                member.with_status("OBSERVE", reason, allocation=Decimal("0"), action="OBSERVE")
+                for member in selection.members
+            )
+            return replace(
+                selection,
+                status="OBSERVE",
+                members=members,
+                reasons=tuple(dict.fromkeys((*selection.reasons, reason))),
+            )
+
         decision = evaluate_rolling_selection(
             effective_policy,
             evidence_rows,
             evaluation_previous,
             current,
+            external_obligations=uncovered_obligations,
         )
         if initialization_transition:
             decision = _rolling_initialization_observe(decision, refreshed)
+        decision = force_accounting_observe(decision)
+        recomputed_uncovered = uncovered_for_members(decision.members)
+        if recomputed_uncovered != uncovered_obligations:
+            uncovered_obligations = recomputed_uncovered
+            decision = evaluate_rolling_selection(
+                effective_policy,
+                evidence_rows,
+                evaluation_previous,
+                current,
+                external_obligations=uncovered_obligations,
+            )
+            if initialization_transition:
+                decision = _rolling_initialization_observe(decision, refreshed)
+        else:
+            uncovered_obligations = recomputed_uncovered
+        risk["uncovered_obligations"] = str(uncovered_obligations)
+        risk["external_obligations"] = str(uncovered_obligations)
+        risk["available_budget"] = str(max(Decimal("0"), global_budget - uncovered_obligations))
         prior_event_history = (
             list(prior_state.get("event_history", []))
             if isinstance(prior_state, Mapping) and isinstance(prior_state.get("event_history"), list)
@@ -4796,6 +7048,22 @@ class AutonomousResearchProcessor:
             "risk_config_hash": risk["risk_config_hash"],
             "active_risk_config_hash": risk["risk_config_hash"],
             "global_budget": risk["global_budget"],
+            "active_obligations": risk["active_obligations"],
+            "runtime_active_obligations": risk["runtime_active_obligations"],
+            "uncovered_obligations": risk["uncovered_obligations"],
+            "external_obligations": risk["external_obligations"],
+            "available_budget": risk["available_budget"],
+            "runtime_accounting_available": risk["runtime_accounting_available"],
+            "runtime_accounting_metadata": risk["runtime_accounting_metadata"],
+            **(
+                {
+                    "runtime_accounting_unavailable_reason": risk[
+                        "runtime_accounting_unavailable_reason"
+                    ]
+                }
+                if not risk["runtime_accounting_available"]
+                else {}
+            ),
             "selected_at": current.isoformat(),
             "review_due_at": decision.review_due_at.isoformat() if decision.review_due_at else current.isoformat(),
             "status": decision.status,
@@ -4831,6 +7099,22 @@ class AutonomousResearchProcessor:
             "review_due_at": selection["review_due_at"],
             "reviewed_at": current.isoformat(),
             "status": decision.status,
+            "active_obligations": risk["active_obligations"],
+            "runtime_active_obligations": risk["runtime_active_obligations"],
+            "uncovered_obligations": risk["uncovered_obligations"],
+            "external_obligations": risk["external_obligations"],
+            "available_budget": risk["available_budget"],
+            "runtime_accounting_available": risk["runtime_accounting_available"],
+            "runtime_accounting_metadata": risk["runtime_accounting_metadata"],
+            **(
+                {
+                    "runtime_accounting_unavailable_reason": risk[
+                        "runtime_accounting_unavailable_reason"
+                    ]
+                }
+                if not risk["runtime_accounting_available"]
+                else {}
+            ),
             "reasons": list(decision.reasons),
             "event_history": event_history,
             "removed_member_evidence_history": dict(decision.removed_member_evidence_history),
@@ -4867,6 +7151,11 @@ class AutonomousResearchProcessor:
             if isinstance(committed, Mapping)
             else {**selection, "members": members}
         )
+        if not risk["runtime_accounting_available"]:
+            committed_selection.setdefault(
+                "runtime_accounting_unavailable_reason",
+                risk["runtime_accounting_unavailable_reason"],
+            )
         committed_selection.setdefault(
             "last_membership_change_at",
             selection["last_membership_change_at"],
@@ -4887,6 +7176,20 @@ class AutonomousResearchProcessor:
                 for member in members
                 if str(member.get("status", "")).upper() in {"ACTIVE", "PAPER", "REDUCE"}
                 and _rolling_number(member.get("allocation")) > 0
+            ),
+            "active_obligations": risk["active_obligations"],
+            "runtime_active_obligations": risk["runtime_active_obligations"],
+            "uncovered_obligations": risk["uncovered_obligations"],
+            "external_obligations": risk["external_obligations"],
+            "available_budget": risk["available_budget"],
+            **(
+                {
+                    "runtime_accounting_unavailable_reason": risk[
+                        "runtime_accounting_unavailable_reason"
+                    ]
+                }
+                if not risk["runtime_accounting_available"]
+                else {}
             ),
             "policy": policy.as_dict(),
             "risk_binding": risk,
@@ -4909,7 +7212,16 @@ class AutonomousResearchProcessor:
         risk = self._rolling_risk_binding(policy)
         members = list(current.get("members", ())) if isinstance(current, Mapping) else []
         pending = review.get("pending", []) if isinstance(review, Mapping) else []
-        return {
+        runtime_accounting_reason = (
+            review.get("runtime_accounting_unavailable_reason")
+            if isinstance(review, Mapping)
+            else None
+        )
+        if not runtime_accounting_reason and isinstance(current, Mapping):
+            runtime_accounting_reason = current.get("runtime_accounting_unavailable_reason")
+        if runtime_accounting_reason:
+            risk["runtime_accounting_unavailable_reason"] = runtime_accounting_reason
+        state = {
             "controller_status": str(review.get("status", "COLD_START") if isinstance(review, Mapping) else "COLD_START"),
             "portfolio_selection_id": current.get("portfolio_selection_id") if isinstance(current, Mapping) else None,
             "last_membership_change_at": (
@@ -4938,8 +7250,31 @@ class AutonomousResearchProcessor:
             "global_limits_usage": {
                 "global_budget": risk["global_budget"],
                 "allocated": str(sum((_rolling_number(member.get("allocation")) for member in members), Decimal("0"))),
-                "active_obligations": risk.get("active_obligations", "0"),
-                "available_budget": risk.get("available_budget", risk["global_budget"]),
+                "active_obligations": (
+                    review.get("active_obligations", risk.get("active_obligations", "0"))
+                    if isinstance(review, Mapping)
+                    else risk.get("active_obligations", "0")
+                ),
+                "runtime_active_obligations": (
+                    review.get("runtime_active_obligations", risk.get("runtime_active_obligations", "0"))
+                    if isinstance(review, Mapping)
+                    else risk.get("runtime_active_obligations", "0")
+                ),
+                "uncovered_obligations": (
+                    review.get("uncovered_obligations", "0")
+                    if isinstance(review, Mapping)
+                    else "0"
+                ),
+                "external_obligations": (
+                    review.get("external_obligations", "0")
+                    if isinstance(review, Mapping)
+                    else "0"
+                ),
+                "available_budget": (
+                    review.get("available_budget", risk.get("available_budget", risk["global_budget"]))
+                    if isinstance(review, Mapping)
+                    else risk.get("available_budget", risk["global_budget"])
+                ),
             },
             "event_history": review.get("event_history", []) if isinstance(review, Mapping) else [],
             "removed_member_evidence_history": review.get("removed_member_evidence_history", {}) if isinstance(review, Mapping) else {},
@@ -4953,6 +7288,9 @@ class AutonomousResearchProcessor:
             "rolling_review_identity": review.get("rolling_review_identity") if isinstance(review, Mapping) else None,
             "paper_only": True,
         }
+        if runtime_accounting_reason:
+            state["runtime_accounting_unavailable_reason"] = runtime_accounting_reason
+        return state
 
     def active_portfolio_selection(self) -> Mapping[str, Any] | None:
         loader = getattr(self.store, "load_current_portfolio_selection", None)
@@ -8131,20 +10469,32 @@ class AutonomousResearchProcessor:
             or intent.allowed_markets
         ):
             return None
-        spec = registry.get("forward-" + candidate_id)
-        if spec is None or str(spec.experiment_id) != "forward-" + candidate_id:
+        spec_candidates: list[Any] = []
+        legacy_spec = registry.get("forward-" + candidate_id)
+        if legacy_spec is not None:
+            spec_candidates.append(legacy_spec)
+        spec_candidates.extend(
+            item
+            for item in registry.list()
+            if str(getattr(item, "experiment_id", "")).startswith("forward-" + candidate_id + "-")
+        )
+        spec = None
+        for candidate_spec in spec_candidates:
+            config = candidate_spec.config if isinstance(candidate_spec.config, Mapping) else {}
+            if (
+                str(config.get("candidate_id", "")).strip() == candidate_id
+                and str(config.get("plan_id", "")).strip() == plan.plan_id
+                and str(config.get("plan_hash", "")).strip() == plan.plan_hash
+                and config.get("observation_intent") is True
+                and config.get("market_authority_required") is True
+                and candidate_spec.allowed_markets
+                and len(candidate_spec.allowed_markets) <= PAPER_MARKET_AUTHORITY_CAP
+            ):
+                spec = candidate_spec
+                break
+        if spec is None:
             return None
         config = spec.config if isinstance(spec.config, Mapping) else {}
-        if (
-            str(config.get("candidate_id", "")).strip() != candidate_id
-            or str(config.get("plan_id", "")).strip() != plan.plan_id
-            or str(config.get("plan_hash", "")).strip() != plan.plan_hash
-            or config.get("observation_intent") is not True
-            or config.get("market_authority_required") is not True
-            or not spec.allowed_markets
-            or len(spec.allowed_markets) > PAPER_MARKET_AUTHORITY_CAP
-        ):
-            return None
         expected_scope = _scope_binding(plan)
         for name, expected in expected_scope.items():
             if _canonical_binding(intent_config.get(name)) != _canonical_binding(expected):
@@ -8275,11 +10625,35 @@ class AutonomousResearchProcessor:
         if attempts >= _MAX_AUTOMATIC_REASSESSMENTS:
             return None
         body = dict(payload)
+        materialized_config = _canonical_forward_config(spec.config)
+        materialized_risk = dict(spec.risk_limits)
+        materialized_config_hash = _hash_document(
+            {"config": materialized_config, "risk_limits": materialized_risk}
+        )
+        materialized_frozen_hash = hashlib.sha256(
+            "|".join(
+                (
+                    spec.strategy_hash,
+                    spec.model_hash,
+                    materialized_config_hash,
+                )
+            ).encode("utf-8")
+        ).hexdigest()
+        for key, value in (
+            ("frozen", True),
+            ("strategy_hash", spec.strategy_hash),
+            ("model_hash", spec.model_hash),
+            ("config_hash", materialized_config_hash),
+            ("frozen_hash", materialized_frozen_hash),
+            ("forward_config", materialized_config),
+            ("risk_snapshot", materialized_risk),
+        ):
+            body.setdefault(key, value)
         body.update(
             {
                 "paper_forward_started": True,
                 "forward_test_id": spec.experiment_id,
-                "forward_config": dict(spec.config),
+                "forward_config": materialized_config,
                 "registration_timestamp": spec.registration_timestamp.isoformat(),
                 "forward_evidence": _compact_evidence(evidence),
                 "forward_evidence_identity": evidence_identity,
@@ -8909,6 +11283,7 @@ class AutonomousResearchProcessor:
             config = {
                 "execution": "paper_only",
                 "market_authority_required": False,
+                "rolling_observation": True,
             }
             risk_limits = {"max_position_fraction": 0.05}
         config.update(
@@ -8931,6 +11306,16 @@ class AutonomousResearchProcessor:
                 },
                 "exit_policy": dict(plan.exit_policy),
                 "research_mode": plan.research_mode,
+                "paper_assumptions": {
+                    "fees": {
+                        "model": "proportional",
+                        "fee_bps": str(plan.assumptions.get("fee_bps", 10)),
+                    },
+                    "slippage": {
+                        "model": "proportional",
+                        "slippage_bps": str(plan.assumptions.get("slippage_bps", 5)),
+                    },
+                },
             }
         )
         intent = ForwardTestRegistry(self.store).register_observation_intent(
@@ -10827,6 +13212,16 @@ class AutonomousResearchProcessor:
             }
             forward_config["exit_policy"] = dict(plan.exit_policy)
             forward_config["research_mode"] = plan.research_mode
+            forward_config["paper_assumptions"] = {
+                "fees": {
+                    "model": "proportional",
+                    "fee_bps": str(plan.assumptions.get("fee_bps", 10)),
+                },
+                "slippage": {
+                    "model": "proportional",
+                    "slippage_bps": str(plan.assumptions.get("slippage_bps", 5)),
+                },
+            }
             strategy_version_id = "strategy-version-" + _rolling_hash(
                 {"strategy_hash": rolling_strategy_hash, "candidate_id": candidate_id}
             ).removeprefix("sha256:")[:40]

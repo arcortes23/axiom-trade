@@ -110,6 +110,7 @@ REASON_NO_NEW_EVIDENCE = "NO_NEW_EVIDENCE"
 REASON_FUTURE_EVIDENCE = "FUTURE_EVIDENCE"
 REASON_CAPACITY = "CAPACITY_LIMIT"
 REASON_EXPERIMENTAL_DISABLED = "EXPERIMENTAL_ALLOCATION_DISABLED"
+REASON_EXTERNAL_OBLIGATIONS_EXCEED_BUDGET = "EXTERNAL_OBLIGATIONS_EXCEED_GLOBAL_BUDGET"
 
 _ACTIVE_STATUSES = frozenset({"ACTIVE", "PAPER", "REDUCE"})
 _REMOVED_STATUSES = frozenset({"REMOVED", "RETIRED"})
@@ -796,6 +797,17 @@ class RollingEvidence:
     paper_sizing: Decimal | None = None
     fee_costs: Decimal | None = None
     slippage_costs: Decimal | None = None
+    # Source and evaluator provenance are immutable parts of one evidence
+    # identity. ``None`` preserves compatibility with pre-provenance rows;
+    # newly produced rows populate these fields explicitly.
+    source_digest: str | None = None
+    accounting_digest: str | None = None
+    accounting_available: bool | None = None
+    accounting_complete: bool | None = None
+    accounting_partial: bool | None = None
+    requested_rows: int | None = None
+    available_rows: int | None = None
+    evaluated_rows: int | None = None
     def __post_init__(self) -> None:
         object.__setattr__(self, "strategy_version_id", _text(self.strategy_version_id, "strategy_version_id"))
         object.__setattr__(self, "evidence_window_id", _text(self.evidence_window_id, "evidence_window_id"))
@@ -865,6 +877,30 @@ class RollingEvidence:
             raise TypeError("hard_failure must be a bool")
         object.__setattr__(self, "hard_failure", self.hard_failure)
         object.__setattr__(self, "failure_reason", _text(self.failure_reason, "failure_reason", max_length=MAX_REASON_LENGTH, required=False))
+        source_digest = _text(self.source_digest, "source_digest", max_length=256, required=False)
+        accounting_digest = _text(
+            self.accounting_digest,
+            "accounting_digest",
+            max_length=256,
+            required=False,
+        )
+        object.__setattr__(self, "source_digest", source_digest or None)
+        object.__setattr__(self, "accounting_digest", accounting_digest or None)
+        for name in ("accounting_available", "accounting_complete", "accounting_partial"):
+            value = getattr(self, name)
+            if value is not None and not isinstance(value, bool):
+                raise TypeError(f"{name} must be bool or None")
+            object.__setattr__(self, name, value)
+        for name in ("requested_rows", "available_rows", "evaluated_rows"):
+            value = getattr(self, name)
+            if value is not None:
+                object.__setattr__(self, name, _integer(value, name, minimum=0))
+        if (
+            self.requested_rows is not None
+            and self.available_rows is not None
+            and self.available_rows > self.requested_rows
+        ):
+            raise ValueError("available_rows must not exceed requested_rows")
         # Evidence identity is always derived from immutable content.  A caller
         # supplied digest is metadata only; never allow it to override the
         # canonical digest used for selection and persistence.
@@ -884,6 +920,14 @@ class RollingEvidence:
             "observation_completeness": self.observation_completeness,
             "source_class": self.source_class,
             "paper_sizing": self.paper_sizing,
+            "source_digest": self.source_digest,
+            "accounting_digest": self.accounting_digest,
+            "accounting_available": self.accounting_available,
+            "accounting_complete": self.accounting_complete,
+            "accounting_partial": self.accounting_partial,
+            "requested_rows": self.requested_rows,
+            "available_rows": self.available_rows,
+            "evaluated_rows": self.evaluated_rows,
             "fee_assumption": self.fee_assumption,
             "slippage_assumption": self.slippage_assumption,
             "allocated_capital_net_return": self.allocated_capital_net_return,
@@ -960,6 +1004,19 @@ class RollingEvidence:
             failures.append("source_class")
         if self.available_from is None or self.available_through is None:
             failures.append("available_range")
+        if self.accounting_available is False:
+            failures.append("accounting_unavailable")
+        if self.accounting_complete is False:
+            failures.append("accounting_incomplete")
+        if self.accounting_partial is True:
+            failures.append("accounting_partial")
+        # A record claiming complete accounting must carry both immutable
+        # provenance digests.  Legacy rows leave the flags unset and continue
+        # through the compatibility path above.
+        if self.accounting_available is True and not self.source_digest:
+            failures.append("source_digest")
+        if self.accounting_available is True and not self.accounting_digest:
+            failures.append("accounting_digest")
         return tuple(failures)
 
     def score(self, policy: RollingAdmissionPolicy, *, overlap_penalty: Decimal = ZERO) -> Decimal:
@@ -1004,6 +1061,14 @@ class RollingEvidence:
             "failure_reason": self.failure_reason,
             "evidence_digest": self.evidence_digest,
             "overlap_key": self.overlap_key,
+            "source_digest": self.source_digest,
+            "accounting_digest": self.accounting_digest,
+            "accounting_available": self.accounting_available,
+            "accounting_complete": self.accounting_complete,
+            "accounting_partial": self.accounting_partial,
+            "requested_rows": self.requested_rows,
+            "available_rows": self.available_rows,
+            "evaluated_rows": self.evaluated_rows,
         })
 
     to_dict = as_dict
@@ -1096,6 +1161,14 @@ class RollingEvidence:
             drawdown=row.get("drawdown", 0),
             completed_outcomes=row.get("completed_outcomes", row.get("outcomes", 0)),
             reliability=row.get("reliability", 0),
+            source_digest=row.get("source_digest"),
+            accounting_digest=row.get("accounting_digest"),
+            accounting_available=row.get("accounting_available"),
+            accounting_complete=row.get("accounting_complete"),
+            accounting_partial=row.get("accounting_partial"),
+            requested_rows=row.get("requested_rows"),
+            available_rows=row.get("available_rows"),
+            evaluated_rows=row.get("evaluated_rows"),
             execution_feasibility=row.get("execution_feasibility", row.get("execution_feasible")),
             evidence_digest=row.get("evidence_digest", row.get("digest", "")),
             overlap_key=row.get("overlap_key"),
@@ -1636,7 +1709,32 @@ def _member_from_evidence(
     )
 
 
-def _allocate(members: Sequence[RollingSelectionMember], policy: RollingAdmissionPolicy) -> tuple[RollingSelectionMember, ...]:
+def _observe_budget_member(
+    member: RollingSelectionMember,
+    reason: str,
+) -> RollingSelectionMember:
+    return RollingSelectionMember(
+        strategy_version_id=member.strategy_version_id,
+        candidate_id=member.candidate_id,
+        research_trial_id=member.research_trial_id,
+        allocation=ZERO,
+        status="OBSERVE",
+        action="OBSERVE",
+        score=member.score,
+        reason=reason,
+        evidence_window_id=member.evidence_window_id,
+        overlap_key=member.overlap_key,
+        evidence_digest=member.evidence_digest,
+        position_management_state=member.position_management_state,
+    )
+
+
+def _allocate(
+    members: Sequence[RollingSelectionMember],
+    policy: RollingAdmissionPolicy,
+    external_obligations: Decimal = ZERO,
+) -> tuple[RollingSelectionMember, ...]:
+    external = _nonnegative(external_obligations, "external_obligations", default=ZERO)
     if not members:
         return ()
     budget = policy.global_budget
@@ -1644,8 +1742,11 @@ def _allocate(members: Sequence[RollingSelectionMember], policy: RollingAdmissio
         (member.allocation for member in members if member.allocation > ZERO),
         ZERO,
     )
-    if reserved_total > budget:
-        raise ValueError("CURRENT_ALLOCATION_EXCEEDS_GLOBAL_BUDGET")
+    if reserved_total + external > budget:
+        return tuple(
+            _observe_budget_member(member, REASON_EXTERNAL_OBLIGATIONS_EXCEED_BUDGET)
+            for member in members
+        )
     # Experimental allocation is a deliberate opt-in.  In the default paper-only
     # mode newly selected rows already have zero allocation; existing allocations
     # remain untouched so ordinary-loss retention does not close positions.
@@ -1659,7 +1760,7 @@ def _allocate(members: Sequence[RollingSelectionMember], policy: RollingAdmissio
         for member in members
         if member.status in {"ACTIVE", "PAPER"} and member.allocation <= ZERO
     )
-    remaining = budget - reserved_total
+    remaining = budget - external - reserved_total
     allocations: dict[str, Decimal] = {}
     if fundable and remaining > ZERO:
         share = remaining / Decimal(len(fundable))
@@ -1736,6 +1837,7 @@ def evaluate_rolling_selection(
     evidence: Sequence[RollingEvidence | Mapping[str, Any]] | Mapping[str, Any],
     current_selection: RollingSelection | RollingSelectionDecision | Mapping[str, Any] | None,
     now: datetime,
+    external_obligations: Decimal = ZERO,
 ) -> RollingSelectionDecision:
     """Evaluate a rolling selection without mutating any input.
 
@@ -1747,6 +1849,7 @@ def evaluate_rolling_selection(
     admission = _coerce_policy(policy)
     review_time = _utc(now, "now", required=True)
     assert review_time is not None
+    external = _nonnegative(external_obligations, "external_obligations", default=ZERO)
     records = _coerce_evidence(evidence)
     previous = _coerce_selection(current_selection)
     future_records = tuple(
@@ -1797,6 +1900,15 @@ def evaluate_rolling_selection(
         )
     )
     hard_failure_strategy_ids = frozenset(item.strategy_version_id for item in hard_failures)
+    accounting_quality_failure_strategy_ids = frozenset(
+        item.strategy_version_id
+        for item in latest_records
+        if (
+            item.accounting_available is False
+            or item.accounting_complete is False
+            or item.accounting_partial is True
+        )
+    )
 
     old_by_id: dict[str, RollingSelectionMember] = {}
     removed_history: dict[str, RollingSelectionMember] = {}
@@ -1825,6 +1937,7 @@ def evaluate_rolling_selection(
         and previous.review_due_at is not None
         and review_time < previous.review_due_at
         and not hard_failure_strategy_ids
+        and not accounting_quality_failure_strategy_ids
     ):
         retained = tuple(
             member
@@ -1832,6 +1945,24 @@ def evaluate_rolling_selection(
             else member.with_status(status, member.reason)
             for member in previous.members[: admission.max_members]
         )
+        retained_total = sum(
+            (member.allocation for member in retained if member.allocation > ZERO),
+            ZERO,
+        )
+        if retained_total + external > admission.global_budget:
+            retained = tuple(
+                _observe_budget_member(member, REASON_EXTERNAL_OBLIGATIONS_EXCEED_BUDGET)
+                for member in retained
+            )
+            return _decision(
+                admission,
+                status="OBSERVE",
+                members=retained,
+                reasons=("REVIEW_NOT_DUE", REASON_EXTERNAL_OBLIGATIONS_EXCEED_BUDGET),
+                now=review_time,
+                last_membership_change_at=previous.last_membership_change_at or previous.selected_at,
+                removed_member_evidence_history=previous.removed_member_evidence_history,
+            )
         return _decision(
             admission,
             status="PAPER" if retained else "OBSERVE",
@@ -2076,7 +2207,19 @@ def evaluate_rolling_selection(
                 break
             if item.strategy_version_id not in {member.strategy_version_id for member in ordered_members}:
                 ordered_members.append(item)
-    final_members = _allocate(ordered_members, admission)
+    retained_total = sum(
+        (member.allocation for member in ordered_members if member.allocation > ZERO),
+        ZERO,
+    )
+    budget_overflow = retained_total + external > admission.global_budget
+    if budget_overflow:
+        final_members = tuple(
+            _observe_budget_member(member, REASON_EXTERNAL_OBLIGATIONS_EXCEED_BUDGET)
+            for member in ordered_members
+        )
+        reasons.append(REASON_EXTERNAL_OBLIGATIONS_EXCEED_BUDGET)
+    else:
+        final_members = _allocate(ordered_members, admission, external)
     if final_members and any(member.status in {"PAPER", "ACTIVE", "REDUCE"} for member in final_members):
         status = "ACTIVE" if admission.experimental_allocation_enabled else "PAPER"
     elif final_members and any(member.status == "PAUSED" for member in final_members):
@@ -2125,6 +2268,7 @@ __all__ = [
     "REASON_COOLDOWN",
     "REASON_ELIGIBLE",
     "REASON_EXPERIMENTAL_DISABLED",
+    "REASON_EXTERNAL_OBLIGATIONS_EXCEED_BUDGET",
     "REASON_HARD_FAILURE",
     "REASON_LOW_EVIDENCE",
     "REASON_FUTURE_EVIDENCE",

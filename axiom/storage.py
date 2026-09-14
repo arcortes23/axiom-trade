@@ -1147,6 +1147,43 @@ class AxiomStore:
             );
             CREATE INDEX IF NOT EXISTS idx_portfolio_review_state_updated
                 ON portfolio_review_state(updated_at DESC);
+            CREATE TABLE IF NOT EXISTS rolling_evidence_cursor (
+                cursor_id TEXT PRIMARY KEY CHECK(cursor_id = 'current'),
+                last_strategy_version_id TEXT,
+                last_research_trial_id TEXT,
+                last_candidate_id TEXT,
+                last_requested_days INTEGER,
+                last_source_class TEXT,
+                next_strategy_version_id TEXT,
+                next_research_trial_id TEXT,
+                next_candidate_id TEXT,
+                next_requested_days INTEGER,
+                next_source_class TEXT,
+                attempt_timestamps_json TEXT NOT NULL DEFAULT '{}',
+                attempts_json TEXT NOT NULL DEFAULT '{}',
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS rolling_evidence_blockers (
+                blocker_id TEXT PRIMARY KEY,
+                work_key TEXT NOT NULL,
+                strategy_version_id TEXT NOT NULL,
+                research_trial_id TEXT,
+                candidate_id TEXT,
+                requested_days INTEGER NOT NULL,
+                source_class TEXT NOT NULL,
+                prerequisite_fingerprint TEXT NOT NULL,
+                blocker TEXT NOT NULL,
+                detail TEXT NOT NULL DEFAULT '',
+                first_seen_at TEXT NOT NULL,
+                last_attempted_at TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 1 CHECK(attempts >= 1),
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                UNIQUE(work_key, prerequisite_fingerprint)
+            );
+            CREATE INDEX IF NOT EXISTS idx_rolling_evidence_blockers_work
+                ON rolling_evidence_blockers(work_key, last_attempted_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_rolling_evidence_blockers_fingerprint
+                ON rolling_evidence_blockers(prerequisite_fingerprint, last_attempted_at DESC);
             """
         )
         enrollment_columns = {
@@ -7952,6 +7989,11 @@ class AxiomStore:
         if not isinstance(config, Mapping):
             raise ValueError("frozen forward test config must be a mapping")
         public_config: dict[str, Any] = {}
+        audit_lineage_fields = {
+            "risk_config_id",
+            "risk_config_generation",
+            "risk_config_hash",
+        }
         for key, value in config.items():
             normalized = str(key).replace("-", "_").lower()
             if normalized in {"live", "live_execution"}:
@@ -7961,6 +8003,13 @@ class AxiomStore:
             if normalized == "execution":
                 if value not in (None, "paper_only"):
                     raise ValueError("frozen forward tests are paper-only")
+                continue
+            if normalized in audit_lineage_fields:
+                if normalized == "risk_config_generation":
+                    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                        raise ValueError("risk_config_generation must be a positive integer")
+                elif not isinstance(value, str) or not value.strip():
+                    raise ValueError(f"{normalized} must be a non-empty string")
                 continue
             public_config[str(key)] = value
         try:
@@ -9257,6 +9306,231 @@ class AxiomStore:
             item.pop("slippage_costs", None)
             result.append(item)
         return result
+    def load_rolling_evidence_cursor(self) -> dict[str, Any] | None:
+        """Load the durable rolling evidence round-robin boundary."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM rolling_evidence_cursor WHERE cursor_id='current'"
+            ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        for field in ("attempt_timestamps_json", "attempts_json"):
+            raw = result.pop(field, "{}")
+            try:
+                decoded = _load(raw)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                decoded = {}
+            result[field.removesuffix("_json")] = decoded if isinstance(decoded, Mapping) else {}
+        return result
+
+    def save_rolling_evidence_cursor(self, record: Any) -> None:
+        """Persist a restart-safe rolling evidence cursor and attempt telemetry."""
+        data = _rolling_mapping(record, name="rolling_evidence_cursor")
+        attempts = data.get("attempt_timestamps", data.get("attempt_timestamps_json", {}))
+        counts = data.get("attempts", data.get("attempts_json", {}))
+        if isinstance(attempts, str):
+            try:
+                attempts = _load(attempts)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                attempts = {}
+        if isinstance(counts, str):
+            try:
+                counts = _load(counts)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                counts = {}
+        if not isinstance(attempts, Mapping) or not isinstance(counts, Mapping):
+            raise ValueError("rolling evidence cursor attempts must be mappings")
+        attempts = {str(key)[:512]: str(value)[:128] for key, value in list(attempts.items())[:256]}
+        normalized_counts: dict[str, int] = {}
+        for key, value in list(counts.items())[:256]:
+            try:
+                count = int(value)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError("rolling evidence cursor attempt count is invalid") from exc
+            if count < 0:
+                raise ValueError("rolling evidence cursor attempt count is invalid")
+            normalized_counts[str(key)[:512]] = count
+        def optional_text(*names: str) -> str | None:
+            return _rolling_optional_text(data, *names) or None
+        def optional_days(name: str) -> int | None:
+            value = data.get(name)
+            if value in (None, ""):
+                return None
+            parsed = _rolling_nonnegative_integer(value, name=name)
+            if parsed not in {7, 30}:
+                raise ValueError(f"{name} must be 7 or 30")
+            return parsed
+        values = (
+            "current",
+            optional_text("last_strategy_version_id"),
+            optional_text("last_research_trial_id"),
+            optional_text("last_candidate_id"),
+            optional_days("last_requested_days"),
+            optional_text("last_source_class"),
+            optional_text("next_strategy_version_id"),
+            optional_text("next_research_trial_id"),
+            optional_text("next_candidate_id"),
+            optional_days("next_requested_days"),
+            optional_text("next_source_class"),
+            _rolling_dump(attempts),
+            _rolling_dump(normalized_counts),
+            _rolling_timestamp(data.get("updated_at"), name="updated_at", default_now=True),
+        )
+        with self._write_context():
+            self._conn.execute(
+                "INSERT INTO rolling_evidence_cursor("
+                "cursor_id,last_strategy_version_id,last_research_trial_id,last_candidate_id,"
+                "last_requested_days,last_source_class,next_strategy_version_id,"
+                "next_research_trial_id,next_candidate_id,next_requested_days,next_source_class,"
+                "attempt_timestamps_json,attempts_json,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(cursor_id) DO UPDATE SET "
+                "last_strategy_version_id=excluded.last_strategy_version_id,"
+                "last_research_trial_id=excluded.last_research_trial_id,"
+                "last_candidate_id=excluded.last_candidate_id,"
+                "last_requested_days=excluded.last_requested_days,"
+                "last_source_class=excluded.last_source_class,"
+                "next_strategy_version_id=excluded.next_strategy_version_id,"
+                "next_research_trial_id=excluded.next_research_trial_id,"
+                "next_candidate_id=excluded.next_candidate_id,"
+                "next_requested_days=excluded.next_requested_days,"
+                "next_source_class=excluded.next_source_class,"
+                "attempt_timestamps_json=excluded.attempt_timestamps_json,"
+                "attempts_json=excluded.attempts_json,"
+                "updated_at=excluded.updated_at",
+                values,
+            )
+
+    def save_rolling_evidence_blocker(self, record: Any) -> bool:
+        """Persist one terminal prerequisite blocker, deduplicated by fingerprint."""
+        data = _rolling_mapping(record, name="rolling_evidence_blocker")
+        strategy_id = _rolling_required_text(data, "strategy_version_id", name="strategy_version_id")
+        trial_id = _rolling_optional_text(data, "research_trial_id", "trial_id")
+        candidate_id = _rolling_optional_text(data, "candidate_id")
+        requested_days = _rolling_nonnegative_integer(
+            data.get("requested_days", data.get("requested_window_days")),
+            name="requested_days",
+        )
+        if requested_days not in {7, 30}:
+            raise ValueError("requested_days must be 7 or 30")
+        source_class = _rolling_required_text(data, "source_class", name="source_class").upper()
+        fingerprint = _rolling_required_text(
+            data,
+            "prerequisite_fingerprint",
+            "fingerprint",
+            name="prerequisite_fingerprint",
+        )
+        blocker = _rolling_required_text(data, "blocker", "reason", name="blocker")
+        detail = _rolling_optional_text(data, "detail", "error") or ""
+        work_key = _rolling_optional_text(data, "work_key") or _rolling_hash(
+            {
+                "strategy_version_id": strategy_id,
+                "research_trial_id": trial_id,
+                "candidate_id": candidate_id,
+                "requested_days": requested_days,
+                "source_class": source_class,
+            }
+        )
+        blocker_id = "rolling-blocker-" + _rolling_hash(
+            {"work_key": work_key, "prerequisite_fingerprint": fingerprint}
+        ).removeprefix("sha256:")[:48]
+        now = _rolling_timestamp(
+            data.get("last_attempted_at", data.get("created_at")),
+            name="last_attempted_at",
+            default_now=True,
+        )
+        first = _rolling_timestamp(data.get("first_seen_at"), name="first_seen_at", default_now=False) or now
+        try:
+            attempts = int(data.get("attempts", 1))
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("blocker attempts must be an integer") from exc
+        if attempts < 1:
+            raise ValueError("blocker attempts must be positive")
+        payload = data.get("payload", data.get("provenance", {}))
+        payload = payload if isinstance(payload, Mapping) else {}
+        with self._write_context():
+            existing = self._conn.execute(
+                "SELECT attempts,first_seen_at FROM rolling_evidence_blockers "
+                "WHERE blocker_id=?",
+                (blocker_id,),
+            ).fetchone()
+            if existing is not None:
+                attempts = max(attempts, int(existing["attempts"]) + 1)
+                first = existing["first_seen_at"]
+            self._conn.execute(
+                "INSERT INTO rolling_evidence_blockers("
+                "blocker_id,work_key,strategy_version_id,research_trial_id,candidate_id,"
+                "requested_days,source_class,prerequisite_fingerprint,blocker,detail,"
+                "first_seen_at,last_attempted_at,attempts,payload_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(blocker_id) DO UPDATE SET "
+                "detail=excluded.detail,last_attempted_at=excluded.last_attempted_at,"
+                "attempts=excluded.attempts,payload_json=excluded.payload_json",
+                (
+                    blocker_id,
+                    work_key,
+                    strategy_id,
+                    trial_id,
+                    candidate_id,
+                    requested_days,
+                    source_class,
+                    fingerprint,
+                    blocker,
+                    detail[:1024],
+                    first,
+                    now,
+                    attempts,
+                    _rolling_dump(payload),
+                ),
+            )
+        return existing is None
+
+    def load_rolling_evidence_blocker(
+        self,
+        *,
+        work_key: str,
+        prerequisite_fingerprint: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Return the latest blocker for one work tuple."""
+        key = str(work_key).strip()
+        if not key:
+            raise ValueError("work_key is required")
+        query = "SELECT * FROM rolling_evidence_blockers WHERE work_key=?"
+        values: list[Any] = [key]
+        if prerequisite_fingerprint:
+            query += " AND prerequisite_fingerprint=?"
+            values.append(str(prerequisite_fingerprint).strip())
+        query += " ORDER BY last_attempted_at DESC,blocker_id DESC LIMIT 1"
+        with self._lock:
+            row = self._conn.execute(query, values).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        try:
+            payload = _load(result.pop("payload_json", "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            payload = {}
+        result["payload"] = payload if isinstance(payload, Mapping) else {}
+        return result
+
+    def list_rolling_evidence_blockers(self, *, limit: int | None = 100) -> list[dict[str, Any]]:
+        limit_value = _rolling_limit(limit, default=100)
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM rolling_evidence_blockers "
+                "ORDER BY last_attempted_at DESC,blocker_id DESC LIMIT ?",
+                (limit_value,),
+            ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            try:
+                payload = _load(item.pop("payload_json", "{}"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                payload = {}
+            item["payload"] = payload if isinstance(payload, Mapping) else {}
+            result.append(item)
+        return result
+
 
     def _rolling_selection_record(
         self,
@@ -15830,6 +16104,12 @@ def _rolling_mapping(record: Any, *, name: str) -> dict[str, Any]:
         }
     raise TypeError(f"{name} must be a mapping or dataclass")
 
+
+def _rolling_hash(value: Any) -> str:
+    """Hash rolling payloads using the canonical bounded JSON representation."""
+    return "sha256:" + hashlib.sha256(
+        _rolling_dump(value).encode("utf-8")
+    ).hexdigest()
 
 def _rolling_evidence_digest(record: Mapping[str, Any]) -> str:
     """Compute the rolling model's canonical evidence digest."""

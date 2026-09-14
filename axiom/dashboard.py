@@ -2458,7 +2458,18 @@ class DashboardData:
             },
             "allocation_review": {},
             "risk": {},
-            "evidence": {"status": "UNKNOWN"},
+            "evidence": {
+                "status": "UNKNOWN",
+                "requested_windows": 0,
+                "available_windows": 0,
+                "admitted_windows": 0,
+                "measured": {},
+                "monetary": {},
+                "reasons": [],
+                "attribution": [],
+                "cursor": {},
+                "blockers": [],
+            },
             "selection": {"status": "UNKNOWN", "k": 0, "actual_k": 0},
             "signal": {"status": "UNKNOWN"},
             "execution": {"status": "UNKNOWN"},
@@ -2541,6 +2552,33 @@ class DashboardData:
         members = selection.get("members", selection.get("selected_members", []))
         members = members if isinstance(members, (list, tuple)) else []
         evidence_loader = getattr(self.store, "list_strategy_evidence_windows", None)
+        all_evidence_rows: list[Mapping[str, Any]] = []
+        if callable(evidence_loader):
+            try:
+                loaded_evidence = evidence_loader(limit=10_000)
+            except TypeError:
+                try:
+                    loaded_evidence = evidence_loader()
+                except Exception:
+                    loaded_evidence = ()
+            except Exception:
+                loaded_evidence = ()
+            all_evidence_rows = [
+                item for item in (loaded_evidence or ())
+                if isinstance(item, Mapping)
+            ]
+        rolling_cursor = load("load_rolling_evidence_cursor")
+        rolling_cursor = rolling_cursor if isinstance(rolling_cursor, Mapping) else {}
+        rolling_blockers = load("list_rolling_evidence_blockers", limit=32)
+        rolling_blockers = [
+            item for item in (rolling_blockers or ())
+            if isinstance(item, Mapping)
+        ]
+        rolling_worker_state = (
+            worker_payload.get("rolling_portfolio")
+            if isinstance(worker_payload.get("rolling_portfolio"), Mapping)
+            else {}
+        )
         active_rows: list[dict[str, Any]] = []
         evidence_count = 0
         active_member_count = 0
@@ -2679,6 +2717,131 @@ class DashboardData:
                         {},
                     )
             return {}
+        def evidence_field(row: Mapping[str, Any], key: str, default: Any = None) -> Any:
+            value = row.get(key)
+            if value is not None:
+                return value
+            payload = row.get("payload")
+            if isinstance(payload, Mapping) and payload.get(key) is not None:
+                return payload.get(key)
+            return default
+
+        def evidence_number(row: Mapping[str, Any], *keys: str) -> Decimal:
+            for key in keys:
+                value = evidence_field(row, key)
+                if value in (None, ""):
+                    continue
+                try:
+                    parsed = Decimal(str(value))
+                except (TypeError, ValueError, ArithmeticError):
+                    continue
+                if parsed.is_finite():
+                    return parsed
+            return Decimal("0")
+
+        evidence_measured_fields = (
+            "requested_rows",
+            "available_rows",
+            "evaluated_rows",
+            "signals",
+            "declined_evaluations",
+            "positions",
+            "openings",
+            "completed_outcomes",
+        )
+        measured = {
+            key: sum(
+                (
+                    int(evidence_number(row, key))
+                    for row in all_evidence_rows
+                ),
+                0,
+            )
+            for key in evidence_measured_fields
+        }
+        monetary_fields = {
+            "realized_pnl": ("realized_pnl",),
+            "unrealized_pnl": ("unrealized_pnl",),
+            "fees": ("fees", "fee_costs"),
+            "slippage": ("slippage", "slippage_costs", "costs"),
+            "capital_at_risk": ("capital_at_risk", "allocated_capital"),
+        }
+        monetary = {
+            key: sum(
+                (evidence_number(row, *aliases) for row in all_evidence_rows),
+                Decimal("0"),
+            )
+            for key, aliases in monetary_fields.items()
+        }
+        evidence_reasons: list[str] = []
+        for row in all_evidence_rows:
+            reasons = plural(
+                evidence_field(row, "admission_reasons"),
+                evidence_field(row, "reasons", evidence_field(row, "reason")),
+            )
+            unavailable = text(evidence_field(row, "accounting_unavailable_reason"))
+            if unavailable:
+                reasons.append(unavailable)
+            for reason in reasons:
+                if reason not in evidence_reasons:
+                    evidence_reasons.append(reason)
+        evidence_attribution = [
+            {
+                key: evidence_field(row, key)
+                for key in (
+                    "evidence_window_id",
+                    "strategy_version_id",
+                    "research_trial_id",
+                    "candidate_id",
+                    "requested_days",
+                    "source_class",
+                    "evidence_digest",
+                    "source_digest",
+                    "accounting_digest",
+                    "admitted",
+                    "admission_reasons",
+                    "positions",
+                    "open_positions",
+                    "openings",
+                    "completed_outcomes",
+                )
+                if evidence_field(row, key) is not None
+            }
+            for row in recent_chronological(
+                all_evidence_rows,
+                limit=64,
+                timestamp_keys=("available_through", "available_from", "created_at"),
+            )
+        ]
+        rolling_evidence_summary = {
+            # A historical/partial admitted row is informative, but cannot
+            # make the portfolio ready before every active member's exact
+            # evidence window has been verified below.
+            "status": "PARTIAL" if all_evidence_rows else "UNKNOWN",
+            "requested_windows": int(
+                rolling_worker_state.get("requested_work_items", len(all_evidence_rows))
+                or len(all_evidence_rows)
+            ),
+            "available_windows": len(all_evidence_rows),
+            "admitted_windows": sum(
+                1 for row in all_evidence_rows if evidence_field(row, "admitted") is True
+            ),
+            "requested_days": [
+                evidence_field(row, "requested_days")
+                for row in all_evidence_rows
+                if evidence_field(row, "requested_days") is not None
+            ][:128],
+            "available_coverage_seconds": sum(
+                int(evidence_number(row, "actual_coverage_seconds"))
+                for row in all_evidence_rows
+            ),
+            "measured": measured,
+            "monetary": monetary,
+            "reasons": evidence_reasons[:64],
+            "attribution": evidence_attribution,
+            "cursor": dict(rolling_cursor),
+            "blockers": rolling_blockers[:32],
+        }
 
         def evidence_payload(
             row: Mapping[str, Any],
@@ -2750,6 +2913,18 @@ class DashboardData:
                 or persisted_payload.get("source_class")
             )
             normalized_persisted_source = canonical_source(persisted_source_class)
+            def evidence_field(name: str) -> Any:
+                for source in (evidence, persisted_payload, payload, member):
+                    if isinstance(source, Mapping) and name in source:
+                        return source.get(name)
+                return None
+
+            accounting_flags = {
+                "accounting_available": evidence_field("accounting_available"),
+                "accounting_complete": evidence_field("accounting_complete"),
+                "accounting_partial": evidence_field("accounting_partial"),
+                "admitted": evidence_field("admitted"),
+            }
             reasons = plural(
                 member_value(member, payload, "reasons"),
                 member_value(member, payload, "reason"),
@@ -2813,11 +2988,23 @@ class DashboardData:
                     and normalized_persisted_source != normalized_member_source
                 ):
                     blockers.append("evidence_source_class_mismatch")
+            for flag_name, expected_value, blocker_name in (
+                ("accounting_available", True, "accounting_unavailable"),
+                ("accounting_complete", True, "accounting_incomplete"),
+                ("accounting_partial", False, "accounting_partial"),
+                ("admitted", True, "member_not_admitted"),
+            ):
+                if accounting_flags[flag_name] is not expected_value:
+                    blockers.append(blocker_name)
             evidence_valid = bool(evidence) and not blockers
             if evidence_valid:
                 evidence_count += 1
             active_rows.append(
                 {
+                    "accounting_available": accounting_flags["accounting_available"],
+                    "accounting_complete": accounting_flags["accounting_complete"],
+                    "accounting_partial": accounting_flags["accounting_partial"],
+                    "admitted": accounting_flags["admitted"],
                     "strategy_version_id": strategy_id,
                     "research_trial_id": research_trial_id,
                     "candidate_id": candidate_id,
@@ -3228,6 +3415,11 @@ class DashboardData:
             and evidence_count == active_member_count
             and not selection_fence_blockers
         )
+        rolling_evidence_summary["status"] = (
+            "READY"
+            if evidence_ready
+            else ("PARTIAL" if all_evidence_rows else "UNKNOWN")
+        )
         cold_start = []
         if not selection_id or not evidence_ready:
             cold_start = [
@@ -3426,6 +3618,7 @@ class DashboardData:
                 "actionable": sum(
                     1 for row in active_rows if row.get("executable")
                 ),
+                "rolling_evidence": rolling_evidence_summary,
                 "policy": policy_document,
                 "active_policy": dict(active_policy),
                 "reviewed_policy": dict(reviewed_policy),
@@ -3455,12 +3648,27 @@ class DashboardData:
                     "interval_seconds": worker_payload.get(
                         "configured_interval_seconds"
                     ),
+                    "evidence_interval_seconds": worker_payload.get(
+                        "evidence_interval_seconds",
+                        worker_payload.get("configured_interval_seconds"),
+                    ),
+                    "review_interval_seconds": worker_payload.get(
+                        "review_interval_seconds"
+                    ),
                     "blocker": state.get("blocker"),
                 },
                 "evidence": {
-                    "status": "READY" if evidence_ready else "COLD_START",
+                    **rolling_evidence_summary,
+                    "status": (
+                        "READY"
+                        if evidence_ready
+                        else rolling_evidence_summary.get("status", "COLD_START")
+                    ),
                     "actual_coverage": state.get("actual_coverage"),
-                    "available_windows": evidence_count,
+                    "available_windows": rolling_evidence_summary.get(
+                        "available_windows",
+                        evidence_count,
+                    ),
                     "required_windows": active_member_count,
                     "source_classes": sorted(
                         {
@@ -3499,14 +3707,14 @@ class DashboardData:
                         "ready_members",
                         worker_payload.get("ready_members", 0),
                     ),
-                    "cursor": worker_payload.get("rolling_cursor"),
+                    "cursor": dict(rolling_cursor),
                 },
                 "execution": {
                     "status": state.get(
                         "execution_status",
                         worker_payload.get("execution_status", "PAPER_ONLY"),
                     ),
-                    "paper_only": True,
+                    "cursor": dict(rolling_cursor),
                     "live_execution": False,
                     "submissions": worker_payload.get("submissions", []),
                 },
@@ -7962,7 +8170,7 @@ def _dashboard_html(
     const $ = (id) => document.getElementById(id), safe = (v) => String(v ?? "—").replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c])), json = (v) => JSON.stringify(v ?? {}, null, 2);
     const count = (v) => v == null ? "UNKNOWN" : Number.isFinite(Number(v)) ? String(v) : "UNKNOWN", phtDateFormatter = new Intl.DateTimeFormat("en-PH-u-hc-h23", { timeZone:"Asia/Manila", year:"numeric", month:"2-digit", day:"2-digit", hour:"2-digit", minute:"2-digit", second:"2-digit", hourCycle:"h23" }), dateText = (v) => { if(!v || typeof v !== "string" || !/(?:Z|[+-][0-9]{2}:[0-9]{2})$/.test(v)) return "—"; const date = new Date(v); if(Number.isNaN(date.getTime())) return "—"; const parts = Object.fromEntries(phtDateFormatter.formatToParts(date).filter(i => i.type !== "literal").map(i => [i.type, i.value])); return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}:${parts.second} PHT`; }, usd = (v) => { const number=Number(v); return Number.isFinite(number)?`$${number.toFixed(2)}`:"—"; }, arr = (v) => Array.isArray(v) ? v : [];
     const empty = (title,body) => `<div class="empty"><strong>${safe(title)}</strong>${safe(body)}</div>`, statusClass = (v) => { const s=String(v||"").toUpperCase(); return ["READY","RUNNING","ACTIVE","COMPLETE","COMPLETED","HEALTHY","ELIGIBLE","PASSED","PROMOTABLE","A","B"].includes(s)?"good":["DEGRADED","STOPPED","UPDATING","SUBMITTING","UNKNOWN","C"].includes(s)?"warn":["ERROR","STALE","REJECTED","KILLED","BLOCKED","FAIL","INSUFFICIENT","UNAVAILABLE","D","F"].includes(s)?"bad":""; };
-    function readinessSnapshotMarkup(data) { const snapshot=data?.canary&&typeof data.canary==="object"?data.canary:(data||{}),status=String(snapshot.readiness_snapshot_status||"STALE").toUpperCase(),stale=snapshot.readiness_snapshot_stale===true||status==="STALE",label=stale?"READINESS SNAPSHOT STALE":"READINESS SNAPSHOT CURRENT",updated=snapshot.readiness_snapshot_updated_at||data?.readiness_snapshot_updated_at; return `<p class="page-note readiness-snapshot"><span class="badge ${statusClass(stale?"STALE":"CURRENT")}">${label}</span> · Updated ${safe(dateText(updated))}</p>`; }
+    function readinessSnapshotMarkup(data) { const snapshot=data?.canary&&typeof data.canary==="object"?data.canary:(data||{}),status=String(snapshot.readiness_snapshot_status||"STALE").toUpperCase(),current=status==="CURRENT"&&snapshot.readiness_snapshot_stale===false,label=current?"READINESS SNAPSHOT CURRENT":"READINESS SNAPSHOT STALE",updated=snapshot.readiness_snapshot_updated_at||data?.readiness_snapshot_updated_at; return `<p class="page-note readiness-snapshot"><span class="badge ${statusClass(current?"CURRENT":"STALE")}">${label}</span> · Updated ${safe(dateText(updated))}</p>`; }
     let params = new URLSearchParams(location.search); const state = { tab: params.get("tab") || "overview", page: Math.max(1,Number(params.get("page")||1)), page_size: [10,25,50,100].includes(Number(params.get("page_size"))) ? Number(params.get("page_size")) : 25, filter: params.get("filter") || "", sort: params.get("sort") || "", direction: params.get("direction") === "asc" ? "asc" : "desc", selected: params.get("selected") || "", expanded: params.get("expanded") === "1" };
     let operator = {}, current = {}, loadInFlight = false, operatorControlsRendered = false, binanceTestnetMode = false;
     let riskReview = {active:null,draft:null};

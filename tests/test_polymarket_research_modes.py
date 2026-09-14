@@ -198,6 +198,31 @@ class PolymarketResearchModeTests(unittest.TestCase):
         self.assertEqual(result.equity_curve[0]["exit_policy"], policy)
         self.assertEqual(result.equity_curve[0]["holding_period"], 2)
 
+    def test_holding_period_and_explicit_horizon_are_frozen_in_metadata(self) -> None:
+        rows = [_row(index, 0.4 + index * 0.02) for index in range(5)]
+        forwarded = run_prediction_research_mode(
+            rows,
+            _strategy(),
+            mode=PRICE_PROXY_RESEARCH,
+            holding_period=3,
+        )
+        self.assertEqual(forwarded.equity_curve[0]["holding_period"], 3)
+        self.assertEqual(
+            forwarded.equity_curve[0]["exit_policy"]["holding_period"],
+            3,
+        )
+        explicit_horizon = run_prediction_research_mode(
+            rows,
+            _strategy(),
+            mode=PRICE_PROXY_RESEARCH,
+            observation_horizon={"count": 3},
+        )
+        self.assertEqual(explicit_horizon.equity_curve[0]["holding_period"], 3)
+        self.assertEqual(
+            explicit_horizon.equity_curve[0]["exit_policy"]["holding_period"],
+            3,
+        )
+
     def test_research_mode_honors_forwarded_model_document(self) -> None:
         strategy = {
             "version": 1,

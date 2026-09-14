@@ -29,6 +29,7 @@ from .domain import (
     SettlementState,
     TradePrint,
     ensure_utc,
+    parse_timestamp,
     to_record,
     utc_now,
 )
@@ -46,6 +47,9 @@ class _ScopePersistenceValueError(ValueError):
 
 
 _MAX_SCOPE_CURSOR_HISTORY = 256
+# Keep the complete bounded inventory across keyset pages small enough for
+# durable continuation while preventing page-local scope authority.
+_MAX_SCOPE_INVENTORY = 10_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -244,6 +248,10 @@ class PolymarketCollector:
         # The nested continuation is assembled during scope discovery and
         # persisted with the root collector state at the end of the cycle.
         self._scope_inventory_continuation: Mapping[str, Any] | None = None
+        # Resolutions produced for this cycle are the only authority passed to
+        # observation-intent materialization; callers cannot supply market ids
+        # independently of the resolver proof.
+        self._scope_resolutions: dict[str, Mapping[str, Any]] = {}
 
     def collect_once(
         self,
@@ -275,6 +283,7 @@ class PolymarketCollector:
         paper_set = set(paper_ids)
         observation_set = set(observation_intent_ids)
         counters = self._new_counters()
+        self._scope_resolutions = {}
         scope_candidate_ids, scope_candidate_markets, scope_discovered, scope_cursor = (
             self._resolve_market_scopes(
                 started,
@@ -292,6 +301,7 @@ class PolymarketCollector:
             observation_intent_ids,
             scope_candidate_markets,
             counters,
+            scope_resolutions=self._scope_resolutions,
         )
         scope_candidate_set = set(scope_candidate_ids)
         scope_primary_ids = [
@@ -1189,6 +1199,8 @@ class PolymarketCollector:
         candidate_ids: Sequence[str],
         candidate_markets: Mapping[str, Sequence[str]],
         counters: dict[str, Any],
+        *,
+        scope_resolutions: Mapping[str, Any] | None = None,
     ) -> None:
         if not candidate_ids:
             return
@@ -1221,6 +1233,7 @@ class PolymarketCollector:
                     registration_timestamp=observed_at,
                     now=observed_at,
                     candidate_id=candidate_id,
+                    scope_resolution=(scope_resolutions or {}).get(candidate_id),
                 )
             except (TypeError, ValueError):
                 counters["errors"] += 1
@@ -1310,6 +1323,17 @@ class PolymarketCollector:
                 # input.  Keep the candidate scoped so legacy authority cannot
                 # leak into scheduling while the next cycle rebases.
                 return scope_candidates, {}, {}, next_cursor
+            if callable(getattr(self.provider, "market_page", None)):
+                coverage = (
+                    str(self._scope_inventory_continuation.get("coverage_status", "")).upper()
+                    if isinstance(self._scope_inventory_continuation, Mapping)
+                    else ""
+                )
+                if coverage != "COMPLETE":
+                    # A page-local match is not scope authority.  Wait until
+                    # every bounded keyset page has been accumulated before
+                    # invoking the resolver or persisting a proof.
+                    return scope_candidates, {}, {}, next_cursor
         else:
             current_records, snapshots, next_cursor = [], {}, carry_cursor
         # Resolver limits are independently bounded from the scheduler's
@@ -1355,6 +1379,9 @@ class PolymarketCollector:
                 continue
             matched = self._scope_result_market_ids(result)
             candidate_markets[candidate_id] = matched
+            proof = result.as_dict() if hasattr(result, "as_dict") and callable(result.as_dict) else result
+            if isinstance(proof, Mapping):
+                self._scope_resolutions[candidate_id] = proof
         return scope_candidates, candidate_markets, snapshots, next_cursor
 
     @staticmethod
@@ -1678,6 +1705,61 @@ class PolymarketCollector:
             value = getattr(page, name, default)
         return default if value is _UNSET else value
 
+    @staticmethod
+    def _scope_snapshot_from_record(
+        record: Mapping[str, Any],
+        observed_at: datetime,
+    ) -> PredictionMarketSnapshot | None:
+        """Rehydrate a bounded discovery record after a process restart."""
+        market_id = str(record.get("market_id", "")).strip()
+        if not market_id:
+            return None
+        timestamp = parse_timestamp(
+            record.get("provider_timestamp", record.get("observed_at"))
+        ) or ensure_utc(observed_at)
+        settlement_raw = record.get("settlement", record.get("outcome", "open"))
+        try:
+            settlement = settlement_raw if isinstance(settlement_raw, SettlementState) else SettlementState(
+                str(settlement_raw).strip().lower()
+            )
+        except (TypeError, ValueError):
+            settlement = SettlementState.UNKNOWN
+        tags = record.get("tags", record.get("tag", ()))
+        if isinstance(tags, str):
+            tags = (tags,)
+        elif not isinstance(tags, (list, tuple)):
+            tags = ()
+        try:
+            return PredictionMarketSnapshot(
+                timestamp=timestamp,
+                market_id=market_id,
+                question=str(record.get("question") or market_id),
+                yes_bid=record.get("yes_bid"),
+                yes_ask=record.get("yes_ask"),
+                yes_mid=record.get("yes_mid", record.get("price")),
+                no_bid=record.get("no_bid"),
+                no_ask=record.get("no_ask"),
+                no_mid=record.get("no_mid"),
+                volume=record.get("volume"),
+                liquidity=record.get("liquidity"),
+                expiry=parse_timestamp(record.get("expiry")),
+                settlement=settlement,
+                category=record.get("category"),
+                tags=tuple(str(tag) for tag in tags),
+                source=str(record.get("source") or ""),
+                yes_token_id=record.get("yes_token_id"),
+                no_token_id=record.get("no_token_id"),
+                condition_id=record.get("condition_id") or None,
+                provider_timestamp=parse_timestamp(record.get("provider_timestamp")),
+                active=record.get("active"),
+                closed=record.get("closed"),
+                archived=record.get("archived"),
+                accepting_orders=record.get("accepting_orders"),
+                enable_order_book=record.get("enable_order_book"),
+            )
+        except (TypeError, ValueError):
+            return None
+
     def _discover_scope_inventory(
         self,
         observed_at: datetime,
@@ -1773,6 +1855,15 @@ class PolymarketCollector:
                     base_state.get("seen_cursors", ()),
                 )
             )
+            inventory_records_by_id: dict[str, dict[str, Any]] = {}
+            prior_inventory = base_state.get("inventory_records", ())
+            if isinstance(prior_inventory, (list, tuple)):
+                for raw_record in prior_inventory:
+                    if not isinstance(raw_record, Mapping):
+                        continue
+                    market_id = str(raw_record.get("market_id", "")).strip()
+                    if market_id and market_id not in inventory_records_by_id:
+                        inventory_records_by_id[market_id] = dict(raw_record)
             cursor_history_exhausted = False
             if current_cursor is not None and current_cursor not in cursor_history:
                 if len(cursor_history) >= _MAX_SCOPE_CURSOR_HISTORY:
@@ -1882,6 +1973,28 @@ class PolymarketCollector:
             if cursor_history_exhausted:
                 persist_query_reset("CURSOR_HISTORY_EXHAUSTED")
                 return [], {}, None
+            if current_cursor is not None and len(inventory_records_by_id) >= _MAX_SCOPE_INVENTORY:
+                # The existing continuation is retained for restart, but a
+                # cursor still outstanding means this is not complete scope
+                # authority and must never be resolved page-locally.
+                self._scope_inventory_continuation = {
+                    **base_state,
+                    "after_cursor": current_cursor,
+                    "opaque_cursor": current_cursor,
+                    "cursor": current_cursor,
+                    "coverage_status": "BUDGET_EXHAUSTED",
+                    "inventory_records": list(inventory_records_by_id.values()),
+                    "seen_market_ids": sorted(inventory_records_by_id),
+                    "updated_at": observed_at.isoformat(),
+                }
+                return list(inventory_records_by_id.values()), {
+                    market_id: snapshot
+                    for market_id, snapshot in (
+                        (record.get("market_id"), self._scope_snapshot_from_record(record, observed_at))
+                        for record in inventory_records_by_id.values()
+                    )
+                    if isinstance(market_id, str) and snapshot is not None
+                }, current_cursor
 
 
             try:
@@ -2058,18 +2171,23 @@ class PolymarketCollector:
                 cursor_history.append(next_cursor)
             provider_fingerprint = provided_fingerprint or stored_provider_fingerprint
             page_fingerprint = provider_fingerprint or expected_fingerprint
-            seen_ids = {
+            seen_ids = set(inventory_records_by_id)
+            seen_ids.update(
                 str(item).strip()
                 for item in base_state.get("seen_market_ids", ())
                 if str(item).strip()
-            }
+            )
             new_snapshots: list[PredictionMarketSnapshot] = []
             cross_page_duplicates = 0
+            cap_reached = False
             for item in valid:
                 market_id = str(item.market_id).strip()
                 if market_id in seen_ids:
                     cross_page_duplicates += 1
                     continue
+                if len(seen_ids) >= _MAX_SCOPE_INVENTORY:
+                    cap_reached = True
+                    break
                 seen_ids.add(market_id)
                 new_snapshots.append(item)
             duplicate_count += cross_page_duplicates
@@ -2077,11 +2195,23 @@ class PolymarketCollector:
             if supplied_unique is not _UNSET and not seen_ids:
                 unique_count = self._scope_count(supplied_unique, unique_count)
             if next_cursor is None:
-                coverage_status = "PARTIAL" if explicit_status == "PARTIAL" or malformed_count else "COMPLETE"
-            elif explicit_status in {"PARTIAL", "BUDGET_EXHAUSTED"}:
-                coverage_status = explicit_status
+                coverage_status = (
+                    "PARTIAL"
+                    if explicit_status in {"PARTIAL", "BUDGET_EXHAUSTED"} or malformed_count
+                    else "COMPLETE"
+                )
+            elif cap_reached or explicit_status in {"PARTIAL", "BUDGET_EXHAUSTED"}:
+                coverage_status = explicit_status if explicit_status in {"PARTIAL", "BUDGET_EXHAUSTED"} else "BUDGET_EXHAUSTED"
             else:
                 coverage_status = "BUDGET_EXHAUSTED"
+            page_records = [
+                self._scope_market_record(item, observed_at, provider)
+                for item in new_snapshots
+            ]
+            for record in page_records:
+                market_id = str(record.get("market_id", "")).strip()
+                if market_id:
+                    inventory_records_by_id[market_id] = record
             cumulative_raw = self._scope_count(base_state.get("cumulative_raw_count")) + raw_count
             cumulative_unique = self._scope_count(base_state.get("cumulative_unique_count")) + unique_count
             cumulative_duplicate = self._scope_count(base_state.get("cumulative_duplicate_count")) + duplicate_count
@@ -2126,7 +2256,7 @@ class PolymarketCollector:
                 "cumulative_raw_count": cumulative_raw,
                 "cumulative_unique_count": cumulative_unique,
                 "cumulative_duplicate_count": cumulative_duplicate,
-                "seen_market_ids": sorted(seen_ids)[:10000],
+                "seen_market_ids": sorted(seen_ids)[:_MAX_SCOPE_INVENTORY],
                 "seen_cursor_history": (
                     list(cursor_history) if next_cursor is not None else []
                 ),
@@ -2138,6 +2268,8 @@ class PolymarketCollector:
                 "last_page_at": observed_at.isoformat(),
                 "first_page_at": base_state.get("first_page_at", observed_at.isoformat()),
             }
+            if coverage_status != "COMPLETE":
+                continuation["inventory_records"] = list(inventory_records_by_id.values())[:_MAX_SCOPE_INVENTORY]
             if page_error_reason is not None:
                 continuation["error_reason"] = page_error_reason
             self._scope_inventory_continuation = continuation
@@ -2146,10 +2278,13 @@ class PolymarketCollector:
                 for item in new_snapshots
                 if str(item.market_id).strip()
             }
-            records = [
-                self._scope_market_record(item, observed_at, provider)
-                for item in new_snapshots
-            ]
+            if coverage_status == "COMPLETE":
+                for market_id, record in inventory_records_by_id.items():
+                    if market_id not in record_by_id:
+                        snapshot = self._scope_snapshot_from_record(record, observed_at)
+                        if snapshot is not None:
+                            record_by_id[market_id] = snapshot
+            records = list(inventory_records_by_id.values())
             return records, record_by_id, next_cursor
 
         if callable(method_page) and self.config.discovery_budget_per_cycle <= 0:
