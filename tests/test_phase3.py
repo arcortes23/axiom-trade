@@ -1129,14 +1129,24 @@ class Phase3PaperAndRiskTests(unittest.TestCase):
             self.assertAlmostEqual(fills[0].quantity * 0.41, 100.0, places=6)
             self.assertGreater(fills[0].slippage, 0.0)
 
-    def test_observation_intent_is_idempotent_and_rejects_binding_conflicts(self) -> None:
+    def test_observation_intent_identity_coexists_per_candidate_and_materializes(self) -> None:
         config = {
             "strategy_document": {"id": "strategy"},
             "model_document": {"id": "model"},
+            "rolling_research": True,
         }
         with AxiomStore(":memory:") as store:
             registry = ForwardTestRegistry(store)
             first = registry.register_observation_intent(
+                strategy=_BuyStrategy(),
+                model={"id": "model"},
+                config=config,
+                registration_timestamp=T0,
+                candidate_id="candidate-a",
+                strategy_version_id="sv-a",
+                research_trial_id="trial-a",
+            )
+            same = registry.register_observation_intent(
                 strategy=_BuyStrategy(),
                 model={"id": "model"},
                 config=config,
@@ -1151,20 +1161,56 @@ class Phase3PaperAndRiskTests(unittest.TestCase):
                 config=config,
                 registration_timestamp=T0,
                 candidate_id="candidate-a",
-                strategy_version_id="sv-a",
-                research_trial_id="trial-a",
+                strategy_version_id="sv-b",
+                research_trial_id="trial-b",
             )
-            self.assertEqual(first.as_record(), second.as_record())
-            with self.assertRaisesRegex(ValueError, "strategy_version_id"):
-                registry.register_observation_intent(
-                    strategy=_BuyStrategy(),
-                    model={"id": "model"},
-                    config=config,
-                    registration_timestamp=T0,
-                    candidate_id="candidate-a",
-                    strategy_version_id="sv-conflict",
-                    research_trial_id="trial-a",
-                )
+            self.assertEqual(first.as_record(), same.as_record())
+            self.assertNotEqual(first.experiment_id, second.experiment_id)
+            self.assertEqual(
+                {item.experiment_id for item in registry.list_observation_intents()},
+                {first.experiment_id, second.experiment_id},
+            )
+
+            first_materialized = registry.materialize_observation_intent(
+                first,
+                allowed_markets=("market-a",),
+                registration_timestamp=T0,
+                now=T0,
+                candidate_id="candidate-a",
+            )
+            second_materialized = registry.materialize_observation_intent(
+                second,
+                allowed_markets=("market-b",),
+                registration_timestamp=T0,
+                now=T0,
+                candidate_id="candidate-a",
+            )
+            self.assertNotEqual(
+                first_materialized.experiment_id,
+                second_materialized.experiment_id,
+            )
+            self.assertEqual(
+                (
+                    first_materialized.config["strategy_version_id"],
+                    first_materialized.config["research_trial_id"],
+                ),
+                ("sv-a", "trial-a"),
+            )
+            self.assertEqual(
+                (
+                    second_materialized.config["strategy_version_id"],
+                    second_materialized.config["research_trial_id"],
+                ),
+                ("sv-b", "trial-b"),
+            )
+            self.assertEqual(
+                registry.get(first_materialized.experiment_id).as_record(),
+                first_materialized.as_record(),
+            )
+            self.assertEqual(
+                registry.get(second_materialized.experiment_id).as_record(),
+                second_materialized.as_record(),
+            )
 
     def test_rule_scope_materialization_requires_matching_resolution_proof(self) -> None:
         scope = normalize_market_scope(

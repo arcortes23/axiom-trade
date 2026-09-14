@@ -686,29 +686,10 @@ class ForwardTestRegistry:
             else "observation-intent-"
             + hashlib.sha256(_canonical(identity_material).encode("utf-8")).hexdigest()[:24]
         )
-        # The deterministic id changes when provenance changes, but reusing a
-        # candidate with different frozen identity must still fail closed.
-        for existing in self.list_observation_intents():
-            existing_config = (
-                existing.config if isinstance(existing.config, Mapping) else {}
-            )
-            if str(existing_config.get("candidate_id", "")).strip() != identifier:
-                continue
-            for key in (
-                "strategy_version_id",
-                "research_trial_id",
-                "source_strategy_hash",
-                "rolling_strategy_hash",
-            ):
-                if str(existing_config.get(key, "")).strip() != str(
-                    intent_config.get(key, "")
-                ).strip():
-                    raise ValueError(f"observation intent {key} conflicts")
-            for key in ("dataset_selector", "scope", "market_scope"):
-                existing_value = existing_config.get(key)
-                expected_value = intent_config.get(key)
-                if _canonical(existing_value) != _canonical(expected_value):
-                    raise ValueError(f"observation intent {key} conflicts")
+        # The deterministic id changes when provenance changes; exact identities
+        # for one candidate intentionally coexist under their digest IDs.  Any
+        # actual identifier collision remains rejected by ``freeze`` and the
+        # immutable store persistence layer.
         return self.freeze(
             strategy=strategy,
             model=model,
