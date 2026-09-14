@@ -1018,6 +1018,23 @@ class AxiomStore:
             );
             CREATE INDEX IF NOT EXISTS idx_research_trials_strategy_created
                 ON research_trials(strategy_version_id, created_at DESC, research_trial_id DESC);
+            CREATE TABLE IF NOT EXISTS rolling_strategy_enrollments (
+                enrollment_id TEXT PRIMARY KEY,
+                candidate_id TEXT NOT NULL,
+                strategy_version_id TEXT,
+                research_trial_id TEXT,
+                status TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                provenance_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                CHECK(length(enrollment_id) BETWEEN 1 AND 256),
+                CHECK(length(candidate_id) BETWEEN 1 AND 256),
+                CHECK(status IN ('ACCEPTED','EXCLUDED'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_rolling_enrollments_candidate
+                ON rolling_strategy_enrollments(candidate_id, created_at DESC, enrollment_id);
+            CREATE INDEX IF NOT EXISTS idx_rolling_enrollments_status
+                ON rolling_strategy_enrollments(status, created_at DESC, enrollment_id);
             CREATE TABLE IF NOT EXISTS admission_policies (
                 policy_id TEXT NOT NULL,
                 version TEXT NOT NULL,
@@ -7565,6 +7582,29 @@ class AxiomStore:
                 (key, encoded, _now_iso()),
             )
 
+    def compare_and_set_operator_config(
+        self,
+        config_key: str,
+        expected: Any,
+        value: Any,
+    ) -> bool:
+        """Atomically replace one operator config value when it is unchanged."""
+        key = str(config_key).strip()
+        if not key:
+            raise ValueError("config_key is required")
+        encoded_expected = _dump(expected)
+        encoded_value = _dump(value)
+        if len(encoded_value) > 16_384:
+            raise ValueError("operator config value is too large")
+        with self.transaction(immediate=True):
+            cursor = self._conn.execute(
+                "UPDATE operator_config SET value_json=?,updated_at=? "
+                "WHERE config_key=? AND value_json=?",
+                (encoded_value, _now_iso(), key, encoded_expected),
+            )
+            return cursor.rowcount == 1
+
+
     def get_operator_job(self, job_name: str) -> dict[str, Any] | None:
         name = str(job_name).strip()
         if not name:
@@ -8491,6 +8531,55 @@ class AxiomStore:
                 values,
             )
 
+    def load_strategy_version(self, strategy_version_id: str) -> dict[str, Any] | None:
+        identifier = str(strategy_version_id).strip()
+        if not identifier:
+            raise ValueError("strategy_version_id is required")
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM strategy_versions WHERE strategy_version_id=?",
+                (identifier,),
+            ).fetchone()
+        if row is None:
+            return None
+        payload = _load(row["payload_json"])
+        result = dict(payload) if isinstance(payload, Mapping) else {}
+        result.update(
+            {
+                "strategy_version_id": row["strategy_version_id"],
+                "strategy_id": row["strategy_id"],
+                "version": row["version"],
+                "code_hash": row["code_hash"],
+                "config_hash": row["config_hash"],
+                "created_at": _parse_datetime(row["created_at"]),
+            }
+        )
+        return result
+
+    def list_strategy_versions(
+        self,
+        *,
+        strategy_id: str | None = None,
+        limit: int | None = 100,
+    ) -> list[dict[str, Any]]:
+        limit_value = _rolling_limit(limit, default=100)
+        if strategy_id is None:
+            query = "SELECT strategy_version_id FROM strategy_versions ORDER BY created_at,strategy_version_id LIMIT ?"
+            values: tuple[Any, ...] = (limit_value,)
+        else:
+            query = (
+                "SELECT strategy_version_id FROM strategy_versions WHERE strategy_id=? "
+                "ORDER BY created_at,strategy_version_id LIMIT ?"
+            )
+            values = (str(strategy_id).strip(), limit_value)
+        with self._lock:
+            rows = self._conn.execute(query, values).fetchall()
+        return [
+            record
+            for row in rows
+            if (record := self.load_strategy_version(str(row["strategy_version_id"]))) is not None
+        ]
+
     def save_research_trial(self, record: Any) -> None:
         data = _rolling_mapping(record, name="research_trial")
         identifier = _rolling_required_text(
@@ -8545,6 +8634,176 @@ class AxiomStore:
                 ") VALUES (?,?,?,?,?)",
                 (identifier, strategy_version_id, status, payload_json, created_at),
             )
+    def load_research_trial(self, research_trial_id: str) -> dict[str, Any] | None:
+        identifier = str(research_trial_id).strip()
+        if not identifier:
+            raise ValueError("research_trial_id is required")
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM research_trials WHERE research_trial_id=?",
+                (identifier,),
+            ).fetchone()
+        if row is None:
+            return None
+        payload = _load(row["payload_json"])
+        result = dict(payload) if isinstance(payload, Mapping) else {}
+        result.update(
+            {
+                "research_trial_id": row["research_trial_id"],
+                "trial_id": row["research_trial_id"],
+                "strategy_version_id": row["strategy_version_id"],
+                "status": row["status"],
+                "created_at": _parse_datetime(row["created_at"]),
+            }
+        )
+        return result
+
+    def list_research_trials(
+        self,
+        *,
+        strategy_version_id: str | None = None,
+        limit: int | None = 100,
+    ) -> list[dict[str, Any]]:
+        limit_value = _rolling_limit(limit, default=100)
+        if strategy_version_id is None:
+            query = "SELECT research_trial_id FROM research_trials ORDER BY created_at,research_trial_id LIMIT ?"
+            values: tuple[Any, ...] = (limit_value,)
+        else:
+            query = (
+                "SELECT research_trial_id FROM research_trials WHERE strategy_version_id=? "
+                "ORDER BY created_at,research_trial_id LIMIT ?"
+            )
+            values = (str(strategy_version_id).strip(), limit_value)
+        with self._lock:
+            rows = self._conn.execute(query, values).fetchall()
+        return [
+            record
+            for row in rows
+            if (record := self.load_research_trial(str(row["research_trial_id"]))) is not None
+        ]
+
+
+    def save_rolling_enrollment(self, record: Any) -> bool:
+        """Persist one immutable legacy-to-rolling enrollment decision.
+
+        Enrollment decisions are deliberately separate from legacy strategy and
+        lifecycle rows.  An excluded source therefore remains auditable without
+        becoming a rolling strategy/version or changing its predecessor.
+        """
+        data = _rolling_mapping(record, name="rolling_enrollment")
+        candidate_id = _rolling_required_text(data, "candidate_id", "source_candidate_id", name="candidate_id")
+        strategy_version_id = _rolling_optional_text(data, "strategy_version_id")
+        research_trial_id = _rolling_optional_text(data, "research_trial_id", "trial_id")
+        status = _rolling_required_text(data, "status", name="status").upper()
+        if status not in {"ACCEPTED", "EXCLUDED"}:
+            raise ValueError("rolling enrollment status must be ACCEPTED or EXCLUDED")
+        if status == "ACCEPTED" and (not strategy_version_id or not research_trial_id):
+            raise ValueError("accepted rolling enrollment requires strategy and trial identities")
+        reason = _rolling_required_text(data, "reason", "reason_code", name="reason")
+        if len(reason) > 512:
+            raise ValueError("rolling enrollment reason exceeds 512 characters")
+        provenance = data.get("provenance", data.get("provenance_json", {}))
+        if isinstance(provenance, str):
+            try:
+                provenance = _load(provenance)
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise ValueError("rolling enrollment provenance must be JSON") from exc
+        if not isinstance(provenance, Mapping):
+            raise ValueError("rolling enrollment provenance must be a mapping")
+        provenance = dict(provenance)
+        created_at = _rolling_timestamp(data.get("created_at"), name="created_at", default_now=True)
+        identity = {
+            "candidate_id": candidate_id,
+            "strategy_version_id": strategy_version_id or None,
+            "research_trial_id": research_trial_id or None,
+            "status": status,
+            "reason": reason,
+            "provenance": provenance,
+        }
+        enrollment_id = _rolling_optional_text(data, "enrollment_id")
+        if not enrollment_id:
+            enrollment_id = "rolling-enrollment-" + hashlib.sha256(
+                _rolling_dump(identity).encode("utf-8")
+            ).hexdigest()[:48]
+        payload_json = _rolling_dump(provenance)
+        values = (
+            enrollment_id,
+            candidate_id,
+            strategy_version_id or None,
+            research_trial_id or None,
+            status,
+            reason,
+            payload_json,
+            created_at,
+        )
+        with self._write_context():
+            existing = self._conn.execute(
+                "SELECT * FROM rolling_strategy_enrollments WHERE enrollment_id=?",
+                (enrollment_id,),
+            ).fetchone()
+            if existing is not None:
+                expected = (
+                    existing["candidate_id"],
+                    existing["strategy_version_id"],
+                    existing["research_trial_id"],
+                    existing["status"],
+                    existing["reason"],
+                    existing["provenance_json"],
+                )
+                if expected != values[1:7]:
+                    raise ValueError("rolling enrollment identity conflict")
+                return False
+            self._conn.execute(
+                "INSERT INTO rolling_strategy_enrollments("
+                "enrollment_id,candidate_id,strategy_version_id,research_trial_id,status,reason,"
+                "provenance_json,created_at) VALUES (?,?,?,?,?,?,?,?)",
+                values,
+            )
+        return True
+
+    def load_rolling_enrollment(self, enrollment_id: str) -> dict[str, Any] | None:
+        identifier = str(enrollment_id).strip()
+        if not identifier:
+            raise ValueError("enrollment_id is required")
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM rolling_strategy_enrollments WHERE enrollment_id=?",
+                (identifier,),
+            ).fetchone()
+        return _rolling_enrollment_record(row)
+
+    def list_rolling_enrollments(
+        self,
+        *,
+        candidate_id: str | None = None,
+        status: str | None = None,
+        limit: int | None = 100,
+    ) -> list[dict[str, Any]]:
+        limit_value = _rolling_limit(limit, default=100)
+        clauses: list[str] = []
+        values: list[Any] = []
+        if candidate_id is not None:
+            clauses.append("candidate_id=?")
+            values.append(str(candidate_id).strip())
+        if status is not None:
+            status_value = str(status).strip().upper()
+            if status_value not in {"ACCEPTED", "EXCLUDED"}:
+                raise ValueError("status must be ACCEPTED or EXCLUDED")
+            clauses.append("status=?")
+            values.append(status_value)
+        query = "SELECT * FROM rolling_strategy_enrollments"
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY created_at,enrollment_id LIMIT ?"
+        values.append(limit_value)
+        with self._lock:
+            rows = self._conn.execute(query, values).fetchall()
+        return [_rolling_enrollment_record(row) for row in rows if row is not None]
+
+    # Compatibility names used by application services.
+    save_rolling_strategy_enrollment = save_rolling_enrollment
+    load_rolling_strategy_enrollment = load_rolling_enrollment
+    list_rolling_strategy_enrollments = list_rolling_enrollments
 
     def save_admission_policy(self, record: Any) -> None:
         data = _rolling_mapping(record, name="admission_policy")
@@ -15480,6 +15739,22 @@ def _level_records(value: Any) -> tuple[OrderBookLevel, ...]:
         if isinstance(item, Mapping):
             result.append(OrderBookLevel(float(item["price"]), float(item["size"])))
     return tuple(result)
+def _rolling_enrollment_record(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    provenance = _load(row["provenance_json"])
+    return {
+        "enrollment_id": row["enrollment_id"],
+        "candidate_id": row["candidate_id"],
+        "source_candidate_id": row["candidate_id"],
+        "strategy_version_id": row["strategy_version_id"],
+        "research_trial_id": row["research_trial_id"],
+        "status": row["status"],
+        "reason": row["reason"],
+        "provenance": provenance if isinstance(provenance, Mapping) else {},
+        "created_at": _parse_datetime(row["created_at"]),
+    }
+
 def _rolling_mapping(record: Any, *, name: str) -> dict[str, Any]:
     if isinstance(record, Mapping):
         return {str(key): value for key, value in record.items()}

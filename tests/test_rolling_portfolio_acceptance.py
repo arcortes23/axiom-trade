@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import threading
+from typing import Mapping
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -19,7 +20,7 @@ from axiom.canary_settings import CanarySettingsService
 from axiom.data import InMemoryPredictionProvider
 from axiom.dashboard import DashboardData
 from axiom.node import NodeConfig, ResearchNode
-from axiom.operator import OperatorControlPlane
+from axiom.operator import OperatorControlError, OperatorControlPlane
 from axiom.rolling_portfolio import RollingAdmissionPolicy, RollingEvidence, evaluate_rolling_selection
 from axiom.experiment_plan import normalize_market_scope
 from axiom.storage import AxiomStore
@@ -1574,7 +1575,24 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
             )
             payload = DashboardData(store=store, clock=lambda: NOW).rolling_portfolio_data()
             self.assertIsInstance(payload, dict)
-            for key in ("controller_status", "k", "actual_k", "actionable", "policy", "risk", "active_rows", "global_limits", "event_history", "next_jobs", "cold_start_requirements"):
+            for key in (
+                "controller_status",
+                "k",
+                "actual_k",
+                "actionable",
+                "policy",
+                "active_policy",
+                "reviewed_policy",
+                "proposed_policy",
+                "policy_review",
+                "allocation_review",
+                "risk",
+                "active_rows",
+                "global_limits",
+                "event_history",
+                "next_jobs",
+                "cold_start_requirements",
+            ):
                 self.assertIn(key, payload)
             self.assertLessEqual(len(payload["active_rows"]), 10)
             self.assertFalse(payload.get("live_execution", True))
@@ -1737,6 +1755,127 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
                 self.assertTrue(worker_state["payload"]["scheduled"])
                 self.assertEqual(worker_state["payload"]["next_work"], "review_rolling_portfolio")
 
+    def test_operator_review_creates_bounded_non_active_draft(self) -> None:
+        with self._store("rolling-policy-review.sqlite3") as store:
+            settings = self._activate_isolated_risk_settings(
+                store,
+                max_orders=20,
+                max_all_in_buy_usd="1.00",
+            )
+            active_policy = _policy(
+                "policy-active-review",
+                version="v1",
+                config_hash="sha256:active-review",
+                max_members=1,
+                global_budget="2.00",
+            )
+            store.save_admission_policy(active_policy.as_dict())
+            store.set_operator_config("rolling_admission_policy_active", active_policy.as_dict())
+            store.set_operator_job(
+                "rolling_admission_policy_active",
+                "ACTIVE",
+                active_policy.as_dict(),
+                resumable=True,
+                timestamp=NOW,
+            )
+            before_job = store.get_operator_job("rolling_admission_policy_active")
+            before_selection = store.load_current_portfolio_selection()
+            binding = settings.snapshot(now=NOW)
+            operator = OperatorControlPlane(store, settings_service=settings)
+
+            reviewed = operator.review_rolling_admission_policy(
+                _policy(
+                    "policy-proposed-review",
+                    version="v2",
+                    config_hash="sha256:proposed-review",
+                    max_members=2,
+                    global_budget="2.00",
+                ).as_dict(),
+                actor="reviewer",
+                expected_risk_config_id=str(binding["config_id"]),
+                expected_risk_config_generation=int(binding["generation"]),
+                expected_risk_config_hash=str(binding["config_hash"]),
+            )
+
+            draft = reviewed["draft"]
+            self.assertEqual(reviewed["status"], "REVIEWED")
+            self.assertTrue(str(draft["draft_id"]).startswith("rolling-draft:"))
+            self.assertTrue(str(draft["draft_version"]).startswith("draft-"))
+            self.assertTrue(draft["paper_only"])
+            self.assertFalse(draft["live_execution"])
+            allocation = reviewed["allocation_review"]
+            self.assertTrue(allocation["within_active_caps"])
+            self.assertEqual(allocation["max_active_strategies"], 2)
+            self.assertEqual(allocation["max_open_positions"], 3)
+            self.assertLessEqual(
+                Decimal(str(allocation["global_budget_usd"])),
+                Decimal(str(allocation["budget_cap_usd"])),
+            )
+            with self.assertRaises(OperatorControlError) as over_cap:
+                operator.review_rolling_admission_policy(
+                    _policy(
+                        "policy-over-cap-review",
+                        version="v1",
+                        config_hash="sha256:over-cap-review",
+                        max_members=1,
+                        global_budget="4.00",
+                    ).as_dict(),
+                    actor="reviewer",
+                )
+            self.assertEqual(
+                str(over_cap.exception),
+                "ROLLING_POLICY_BUDGET_EXCEEDS_ACTIVE_CAP",
+            )
+
+            self.assertEqual(store.load_current_portfolio_selection(), before_selection)
+            self.assertEqual(
+                store.get_operator_job("rolling_admission_policy_active"),
+                before_job,
+            )
+
+    def test_operator_activation_rejects_stale_risk_binding(self) -> None:
+        with self._store("rolling-policy-stale-review.sqlite3") as store:
+            settings = self._activate_isolated_risk_settings(store)
+            policy = _policy(
+                "policy-stale-review",
+                version="v1",
+                config_hash="sha256:stale-review",
+                max_members=1,
+                global_budget="2.00",
+            )
+            operator = OperatorControlPlane(store, settings_service=settings)
+            initial_binding = settings.snapshot(now=NOW)
+            reviewed = operator.review_rolling_admission_policy(
+                policy.as_dict(),
+                actor="reviewer",
+                expected_risk_config_id=str(initial_binding["config_id"]),
+                expected_risk_config_generation=int(initial_binding["generation"]),
+                expected_risk_config_hash=str(initial_binding["config_hash"]),
+            )
+            draft = reviewed["draft"]
+            settings_snapshot = settings.snapshot(now=NOW)
+            effective_limits = settings_snapshot["effective_limits"]
+            replacement = settings.save_draft(
+                {"max_orders_per_day": int(effective_limits["max_submitted_orders_per_day"])},
+                "rolling-stale-change",
+                expected_generation=int(settings_snapshot["generation"]),
+            )
+            settings.activate_draft(
+                replacement["config_id"],
+                "rolling-stale-change",
+                expected_generation=int(settings_snapshot["generation"]),
+            )
+            with self.assertRaises(OperatorControlError) as context:
+                operator.activate_rolling_admission_policy(
+                    draft_id=str(draft["draft_id"]),
+                    draft_version=str(draft["draft_version"]),
+                    actor="activator",
+                    expected_risk_config_id=str(initial_binding["config_id"]),
+                    expected_risk_config_generation=int(initial_binding["generation"]),
+                    expected_risk_config_hash=str(initial_binding["config_hash"]),
+                )
+            self.assertEqual(str(context.exception), "ROLLING_POLICY_REVIEW_STALE")
+
     def test_operator_review_activation_binds_processor_to_custom_immutable_policy(self) -> None:
         with self._store("rolling-policy-activation.sqlite3") as store:
             settings = self._activate_isolated_risk_settings(store)
@@ -1745,7 +1884,7 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
                 version="v7",
                 config_hash="sha256:immutable-admission-v7",
                 max_members=1,
-                global_budget="4.00",
+                global_budget="3.00",
                 experimental_allocation_enabled=True,
             )
             self._seed_artifacts(store, policy, ("sv-policy-custom",), evidence=[_evidence("sv-policy-custom")])
@@ -1777,6 +1916,116 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
             self.assertEqual(active["payload"]["policy_id"], policy.policy_id)
             self.assertEqual(active["payload"]["version"], policy.version)
             self.assertEqual(active["payload"]["config_hash"], policy.config_hash)
+    def test_metadata_only_policy_envelope_fails_closed_in_operator_and_dashboard(self) -> None:
+        with self._store("rolling-policy-metadata-only.sqlite3") as store:
+            settings = self._activate_isolated_risk_settings(store)
+            metadata_only = {
+                "policy_id": "metadata-only",
+                "version": "v1",
+                "policy_version": "v1",
+                "config_hash": "sha256:metadata-only",
+                "global_budget": "999.00",
+                "max_members": 99,
+                "status": "ACTIVE",
+            }
+            store.set_operator_config("rolling_admission_policy_active", metadata_only)
+            operator = OperatorControlPlane(store, settings_service=settings)
+            with self.assertRaises(OperatorControlError) as context:
+                operator.review_rolling_admission_policy(
+                    _policy("proposed-after-metadata-only", global_budget="1.00").as_dict(),
+                    actor="reviewer",
+                )
+            self.assertEqual(str(context.exception), "ROLLING_POLICY_IMMUTABLE_NOT_FOUND")
+            dashboard = DashboardData(store=store, clock=lambda: NOW).rolling_portfolio_data()
+            self.assertEqual(dashboard["policy"], {})
+            self.assertIsNone(dashboard["policy_review"]["active"]["global_budget"])
+            self.assertIn(
+                "active_immutable_policy_unavailable",
+                dashboard["selection"]["blockers"],
+            )
+
+    def test_review_does_not_establish_active_authority_without_activation(self) -> None:
+        with self._store("rolling-policy-no-authority.sqlite3") as store:
+            settings = self._activate_isolated_risk_settings(store)
+            operator = OperatorControlPlane(store, settings_service=settings)
+            reviewed = operator.review_rolling_admission_policy(
+                _policy("policy-reviewed-no-authority", global_budget="1.00").as_dict(),
+                actor="reviewer",
+            )
+            self.assertEqual(reviewed["status"], "REVIEWED")
+            self.assertIsNone(
+                store.get_operator_config("rolling_admission_policy_active", None)
+            )
+
+    def test_activation_review_failure_keeps_prior_active_policy_unchanged(self) -> None:
+        with self._store("rolling-policy-activation-rollback.sqlite3") as store:
+            settings = self._activate_isolated_risk_settings(store)
+            binding = settings.snapshot(now=NOW)
+            prior = _policy(
+                "policy-prior-rollback",
+                version="v1",
+                config_hash="sha256:prior-rollback",
+                global_budget="1.00",
+            )
+            proposed = _policy(
+                "policy-proposed-rollback",
+                version="v2",
+                config_hash="sha256:proposed-rollback",
+                global_budget="1.00",
+            )
+            self._seed_artifacts(store, prior, ())
+            self._seed_artifacts(store, proposed, ())
+            prior_active = {
+                **prior.as_dict(),
+                "risk_config_id": binding["config_id"],
+                "risk_config_generation": binding["generation"],
+                "risk_config_hash": binding["config_hash"],
+                "status": "ACTIVE",
+                "paper_only": True,
+            }
+            store.set_operator_config("rolling_admission_policy_active", prior_active)
+            operator = OperatorControlPlane(store, settings_service=settings)
+            reviewed = operator.review_rolling_admission_policy(
+                proposed.as_dict(),
+                actor="reviewer",
+            )
+            before = store.get_operator_config("rolling_admission_policy_active", None)
+            with patch.object(
+                operator._research_processor,
+                "review_rolling_portfolio",
+                return_value={},
+            ):
+                with self.assertRaises(OperatorControlError) as context:
+                    operator.activate_rolling_admission_policy(
+                        draft_id=str(reviewed["draft"]["draft_id"]),
+                        draft_version=str(reviewed["draft"]["draft_version"]),
+                        actor="activator",
+                    )
+            self.assertEqual(str(context.exception), "ROLLING_POLICY_SELECTION_REQUIRED")
+            self.assertEqual(
+                store.get_operator_config("rolling_admission_policy_active", None),
+                before,
+            )
+
+    def test_rolling_activation_action_identity_includes_derived_policy_target(self) -> None:
+        with self._store("rolling-policy-action-target.sqlite3") as store:
+            operator = OperatorControlPlane(store)
+            result = operator.execute(
+                "rolling.admission.activate",
+                confirm="ACTIVATE ROLLING ADMISSION POLICY",
+                payload={
+                    "policy_id": "policy-target",
+                    "policy_version": "v1",
+                    "draft_id": "rolling-draft:target",
+                    "draft_version": "draft-target",
+                },
+            )
+            self.assertFalse(result["ok"])
+            state = store.get_operator_config("operator_action_state", {})
+            actions = state.get("actions", []) if isinstance(state, dict) else []
+            self.assertEqual(len(actions), 1)
+            self.assertEqual(actions[0]["target"], "rolling-draft:target:draft-target")
+
 
     def test_processor_restart_preserves_cooldown_anchor_until_day_seven_replacement(self) -> None:
         path = self.path / "rolling-cooldown-restart.sqlite3"
@@ -2166,3 +2415,246 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
         self.assertTrue(
             any(token in reason for token in ("COMPLETENESS", "COVERAGE", "EVIDENCE"))
         )
+    def test_values_only_review_derives_new_immutable_policy_identity(self) -> None:
+        with self._store("rolling-policy-values-only-identity.sqlite3") as store:
+            settings = self._activate_isolated_risk_settings(
+                store, max_all_in_buy_usd="1.00"
+            )
+            active = _policy(
+                "policy-active-values-only",
+                version="v1",
+                global_budget="1.00",
+            )
+            self._seed_artifacts(store, active, ())
+            store.set_operator_config(
+                "rolling_admission_policy_active",
+                {**active.as_dict(), "status": "ACTIVE"},
+            )
+            operator = OperatorControlPlane(store, settings_service=settings)
+            reviewed = operator.review_rolling_admission_policy(
+                {"global_budget": "0.50"}, actor="reviewer"
+            )
+            proposed = reviewed["draft"]
+            self.assertNotEqual(proposed["policy_id"], active.policy_id)
+            self.assertNotEqual(proposed["version"], active.version)
+            self.assertEqual(proposed["global_budget"], "0.50")
+            persisted = store.load_admission_policy(
+                str(proposed["policy_id"]), str(proposed["version"])
+            )
+            self.assertIsNotNone(persisted)
+            self.assertEqual(persisted["config_hash"], proposed["config_hash"])
+            self.assertEqual(
+                store.get_operator_config("rolling_admission_policy_active", None)[
+                    "policy_id"
+                ],
+                active.policy_id,
+            )
+    def test_two_changed_values_only_reviews_before_activation_get_distinct_deterministic_identities(self) -> None:
+        with self._store("rolling-policy-values-only-before-activation.sqlite3") as store:
+            settings = self._activate_isolated_risk_settings(store, max_all_in_buy_usd="1.00")
+            default = _policy(
+                "rolling-default",
+                version="rolling-admission-v1",
+                global_budget="0.25",
+            )
+            store.save_admission_policy(default.as_dict())
+            operator = OperatorControlPlane(store, settings_service=settings)
+
+            first = operator.review_rolling_admission_policy(
+                {"global_budget": "0.50"},
+                actor="reviewer",
+            )
+            second = operator.review_rolling_admission_policy(
+                {"global_budget": "0.40"},
+                actor="reviewer",
+            )
+            first_draft = first["draft"]
+            second_draft = second["draft"]
+            self.assertNotEqual(first_draft["policy_id"], "rolling-default")
+            self.assertNotEqual(second_draft["policy_id"], "rolling-default")
+            self.assertNotEqual(
+                (first_draft["policy_id"], first_draft["version"]),
+                (second_draft["policy_id"], second_draft["version"]),
+            )
+            for draft in (first_draft, second_draft):
+                persisted = store.load_admission_policy(
+                    str(draft["policy_id"]),
+                    str(draft["version"]),
+                )
+                self.assertIsNotNone(persisted)
+                self.assertEqual(persisted["config_hash"], draft["config_hash"])
+            repeated = operator.review_rolling_admission_policy(
+                {"global_budget": "0.50"},
+                actor="reviewer",
+            )["draft"]
+            self.assertEqual(
+                (repeated["policy_id"], repeated["version"]),
+                (first_draft["policy_id"], first_draft["version"]),
+            )
+            self.assertIsNone(
+                store.get_operator_config("rolling_admission_policy_active", None)
+            )
+    def test_values_only_default_reviews_follow_final_budget_and_risk_binding(self) -> None:
+        with self._store("rolling-policy-values-only-cap-reductions.sqlite3") as store:
+            settings = self._activate_isolated_risk_settings(
+                store,
+                max_all_in_buy_usd="5.00",
+            )
+            active = _policy(
+                "rolling-default",
+                version="rolling-admission-v1",
+                global_budget="10.00",
+            )
+            self._seed_artifacts(store, active, ())
+            store.set_operator_config(
+                "rolling_admission_policy_active",
+                {**active.as_dict(), "status": "ACTIVE"},
+            )
+            operator = OperatorControlPlane(store, settings_service=settings)
+
+            first = operator.review_rolling_admission_policy({}, actor="reviewer")["draft"]
+            self.assertEqual(first["global_budget"], "5.00")
+
+            first_binding = settings.snapshot(now=NOW)
+            first_settings_draft = settings.save_draft(
+                {"max_all_in_buy_usd": "2.00", "max_positions": 1},
+                "reviewer",
+                expected_generation=int(first_binding["generation"]),
+            )
+            settings.activate_draft(
+                first_settings_draft["config_id"],
+                "reviewer",
+                int(first_binding["generation"]),
+            )
+            second = operator.review_rolling_admission_policy({}, actor="reviewer")["draft"]
+            self.assertEqual(second["global_budget"], "2.00")
+
+            second_binding = settings.snapshot(now=NOW)
+            second_settings_draft = settings.save_draft(
+                {"max_all_in_buy_usd": "1.00"},
+                "reviewer",
+                expected_generation=int(second_binding["generation"]),
+            )
+            settings.activate_draft(
+                second_settings_draft["config_id"],
+                "reviewer",
+                int(second_binding["generation"]),
+            )
+            third = operator.review_rolling_admission_policy({}, actor="reviewer")["draft"]
+            self.assertEqual(third["global_budget"], "1.00")
+            self.assertNotEqual(
+                (first["policy_id"], first["version"]),
+                (second["policy_id"], second["version"]),
+            )
+            self.assertNotEqual(
+                (second["policy_id"], second["version"]),
+                (third["policy_id"], third["version"]),
+            )
+            for draft in (first, second, third):
+                self.assertIsNotNone(
+                    store.load_admission_policy(
+                        str(draft["policy_id"]),
+                        str(draft["version"]),
+                    )
+                )
+
+            repeated = operator.review_rolling_admission_policy({}, actor="reviewer")["draft"]
+            self.assertEqual(
+                (repeated["policy_id"], repeated["version"]),
+                (third["policy_id"], third["version"]),
+            )
+
+
+
+    def test_rolling_identity_validation_precedes_action_idempotency(self) -> None:
+        with self._store("rolling-policy-identity-preflight.sqlite3") as store:
+            settings = self._activate_isolated_risk_settings(store)
+            active = _policy("policy-preflight-active", global_budget="1.00")
+            self._seed_artifacts(store, active, ())
+            store.set_operator_config(
+                "rolling_admission_policy_active",
+                {**active.as_dict(), "status": "ACTIVE"},
+            )
+            operator = OperatorControlPlane(store, settings_service=settings)
+            reviewed = operator.execute(
+                "rolling.admission.review",
+                target="caller-target",
+                confirm="REVIEW ROLLING ADMISSION POLICY",
+                payload={"values": {"global_budget": "0.50"}},
+            )
+            self.assertTrue(reviewed["ok"])
+            state = store.get_operator_config("operator_action_state", {})
+            actions = state.get("actions", []) if isinstance(state, Mapping) else []
+            self.assertEqual(len(actions), 1)
+            self.assertTrue(str(actions[0]["target"]).startswith("values:"))
+            rejected = operator.execute(
+                "rolling.admission.activate",
+                target="ignored",
+                confirm="ACTIVATE ROLLING ADMISSION POLICY",
+                payload={"policy_id": "partial-only"},
+            )
+            self.assertFalse(rejected["ok"])
+            self.assertEqual(rejected["reason"], "ROLLING_POLICY_IDENTITY_REQUIRED")
+            state = store.get_operator_config("operator_action_state", {})
+            actions = state.get("actions", []) if isinstance(state, Mapping) else []
+            self.assertEqual(len(actions), 1)
+
+    def test_nested_policy_identity_conflict_fails_before_persistence(self) -> None:
+        with self._store("rolling-policy-nested-conflict.sqlite3") as store:
+            settings = self._activate_isolated_risk_settings(store)
+            operator = OperatorControlPlane(store, settings_service=settings)
+            conflicting = _policy(
+                "policy-outer-conflict",
+                version="v1",
+                config_hash="sha256:outer-conflict",
+            ).as_dict()
+            conflicting["policy"] = _policy(
+                "policy-inner-conflict",
+                version="v1",
+                config_hash="sha256:inner-conflict",
+            ).as_dict()
+            with self.assertRaises(OperatorControlError) as context:
+                operator.review_rolling_admission_policy(
+                    conflicting, actor="reviewer"
+                )
+            self.assertEqual(context.exception.code, "ROLLING_POLICY_IDENTITY_INVALID")
+            self.assertIsNone(
+                store.get_operator_config("rolling_admission_policy_review", None)
+            )
+            self.assertIsNone(
+                store.load_admission_policy("policy-outer-conflict", "v1")
+            )
+
+    def test_malformed_review_does_not_block_valid_active_dashboard_projection(self) -> None:
+        with self._store("rolling-policy-dashboard-reviewed-malformed.sqlite3") as store:
+            active = _policy("policy-dashboard-active", version="v1")
+            self._seed_artifacts(store, active, ())
+            store.set_operator_config(
+                "rolling_admission_policy_active",
+                {**active.as_dict(), "status": "ACTIVE"},
+            )
+            store.set_operator_config(
+                "rolling_admission_policy_review",
+                {"policy_id": "malformed-reviewed", "status": "REVIEWED"},
+            )
+            data = DashboardData(store=store, clock=lambda: NOW).rolling_portfolio_data()
+            self.assertEqual(
+                data["policy_review"]["active"]["policy_id"], active.policy_id
+            )
+            blockers = data["selection"]["blockers"]
+            self.assertFalse(any(str(reason).startswith("reviewed_") for reason in blockers))
+
+    def test_dashboard_fails_closed_on_nested_active_policy_identity_conflict(self) -> None:
+        with self._store("rolling-policy-dashboard-nested-conflict.sqlite3") as store:
+            active = _policy("policy-dashboard-outer", version="v1")
+            self._seed_artifacts(store, active, ())
+            nested = _policy("policy-dashboard-inner", version="v1").as_dict()
+            envelope = {**active.as_dict(), "status": "ACTIVE", "policy": nested}
+            store.set_operator_config("rolling_admission_policy_active", envelope)
+            data = DashboardData(store=store, clock=lambda: NOW).rolling_portfolio_data()
+            self.assertEqual(data["policy"], {})
+            self.assertIsNone(data["policy_review"]["active"]["policy_id"])
+            self.assertIn(
+                "active_immutable_policy_identity_invalid",
+                data["selection"]["blockers"],
+            )

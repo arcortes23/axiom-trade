@@ -5982,6 +5982,50 @@ class CanaryService:
         config_id, generation, _ = self._settings_identity()
         return config_id, generation
     @staticmethod
+    def _rolling_policy_identity_aliases(source: Mapping[str, Any]) -> dict[str, str]:
+        """Normalize every policy identity alias in an envelope and its payload."""
+        sources: list[Mapping[str, Any]] = []
+        pending: list[Mapping[str, Any]] = [source]
+        seen: set[int] = set()
+        while pending:
+            current = pending.pop()
+            marker = id(current)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            sources.append(current)
+            for name in ("policy", "policy_config", "admission_policy"):
+                nested = current.get(name)
+                if isinstance(nested, Mapping):
+                    pending.append(nested)
+
+        aliases = {
+            "policy_id": ("policy_id", "id", "admission_policy_id"),
+            "version": ("version", "policy_version", "admission_policy_version"),
+            "config_hash": (
+                "config_hash",
+                "policy_hash",
+                "admission_policy_hash",
+            ),
+        }
+        result: dict[str, str] = {}
+        for canonical, names in aliases.items():
+            values: list[str] = []
+            for current in sources:
+                for name in names:
+                    if name not in current:
+                        continue
+                    raw = current.get(name)
+                    text = str(raw).strip() if raw is not None else ""
+                    if not text:
+                        raise CanaryBlocked("ROLLING_SELECTION_STALE")
+                    values.append(text)
+            if len(set(values)) > 1:
+                raise CanaryBlocked("ROLLING_SELECTION_STALE")
+            result[canonical] = values[0] if values else ""
+        return result
+
+    @staticmethod
     def _rolling_identity_value(source: Mapping[str, Any], *names: str) -> str:
         for name in names:
             value = source.get(name)
@@ -6012,43 +6056,21 @@ class CanaryService:
             raise CanaryBlocked("ROLLING_SELECTION_STALE") from exc
         if not isinstance(active, Mapping):
             raise CanaryBlocked("ROLLING_SELECTION_STALE")
-        active_policy = active.get("policy")
-        active_policy = active_policy if isinstance(active_policy, Mapping) else {}
-        active_policy_id = self._rolling_identity_value(
-            active,
-            "policy_id",
-            "id",
-        ) or self._rolling_identity_value(active_policy, "policy_id", "id")
-        active_policy_version = self._rolling_identity_value(
-            active,
-            "policy_version",
-            "version",
-        ) or self._rolling_identity_value(active_policy, "policy_version", "version")
-        active_policy_hash = self._rolling_identity_value(
-            active,
-            "policy_hash",
-            "config_hash",
-        ) or self._rolling_identity_value(
-            active_policy,
-            "policy_hash",
-            "config_hash",
-        )
+        try:
+            active_identity = self._rolling_policy_identity_aliases(active)
+            selection_identity = self._rolling_policy_identity_aliases(selection)
+        except CanaryBlocked:
+            # Identity conflicts are checked before loading the immutable
+            # document or consulting risk and selection state.
+            raise
+        active_policy_id = active_identity["policy_id"]
+        active_policy_version = active_identity["version"]
+        active_policy_hash = active_identity["config_hash"]
         if not active_policy_id or not active_policy_version or not active_policy_hash:
             raise CanaryBlocked("ROLLING_SELECTION_STALE")
-        selection_policy_id = self._rolling_identity_value(
-            selection, "policy_id", "admission_policy_id"
-        )
-        selection_policy_version = self._rolling_identity_value(
-            selection, "policy_version", "admission_policy_version"
-        )
-        selection_policy_hash = self._rolling_identity_value(
-            selection, "policy_hash", "config_hash"
-        )
-        policy_config = selection.get("policy_config")
-        if not selection_policy_hash and isinstance(policy_config, Mapping):
-            selection_policy_hash = self._rolling_identity_value(
-                policy_config, "policy_hash", "config_hash"
-            )
+        selection_policy_id = selection_identity["policy_id"]
+        selection_policy_version = selection_identity["version"]
+        selection_policy_hash = selection_identity["config_hash"]
         persisted_loader = getattr(self.store, "load_admission_policy", None)
         persisted = None
         if callable(persisted_loader) and selection_policy_id and selection_policy_version:

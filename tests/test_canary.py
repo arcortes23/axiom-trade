@@ -493,6 +493,38 @@ class CanaryTests(unittest.TestCase):
         )
         self.service.clock = lambda: expanded_at
 
+    def test_rolling_selection_fence_rejects_conflicting_nested_identity_before_persistence(self):
+        active = {
+            "policy_id": "rolling-policy:armed",
+            "version": "policy-v1",
+            "policy_version": "policy-v1",
+            "config_hash": "sha256:armed",
+            "status": "ACTIVE",
+        }
+        self.store.set_operator_config("rolling_admission_policy_active", active)
+        selection = {
+            "status": "READY",
+            "armed": True,
+            "policy_id": "rolling-policy:armed",
+            "policy_version": "policy-v1",
+            "policy_hash": "sha256:armed",
+            "policy_config": {
+                "policy_id": "rolling-policy:other",
+                "version": "policy-v1",
+                "config_hash": "sha256:armed",
+            },
+        }
+        with patch.object(
+            self.store,
+            "load_admission_policy",
+            side_effect=AssertionError("nested identity must fence first"),
+        ) as persisted_loader:
+            self.assertBlocked(
+                "ROLLING_SELECTION_STALE",
+                lambda: self.service.validate_rolling_selection_fence(selection),
+            )
+        persisted_loader.assert_not_called()
+
     def test_direct_submit_rejects_over_cap_scope_before_venue(self):
         self.arm()
         self._ensure_direct_signal("direct-over-cap")

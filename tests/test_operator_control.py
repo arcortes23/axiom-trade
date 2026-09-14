@@ -1483,6 +1483,64 @@ class OperatorControlTests(unittest.TestCase):
                 )
                 self.assertEqual(result["reason"], "CANARY_GENERATION_REQUIRED")
         self.assertEqual(self.control.risk_settings_snapshot()["config_id"], initial["config_id"])
+    def test_settings_activation_action_target_uses_exact_config_identity(self) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+        calls: list[str] = []
+        first_result: list[dict[str, object]] = []
+
+        def activate(config_id: str, **_: object) -> dict[str, object]:
+            calls.append(config_id)
+            if config_id == "cfg-first":
+                entered.set()
+                self.assertTrue(release.wait(5))
+            return {"config_id": config_id}
+
+        payload = {
+            "config_id": "cfg-first",
+            "expected_generation": 1,
+            "actor": "operator",
+        }
+        with patch.object(self.control, "activate_risk_settings_draft", side_effect=activate):
+            worker = threading.Thread(
+                target=lambda: first_result.append(
+                    self.control.execute(
+                        "risk.settings.activate_draft",
+                        confirm="ACTIVATE RISK SETTINGS DRAFT",
+                        payload=payload,
+                    )
+                )
+            )
+            worker.start()
+            self.assertTrue(entered.wait(5))
+
+            duplicate = self.control.execute(
+                "canary.settings.activate_draft",
+                confirm="ACTIVATE RISK SETTINGS DRAFT",
+                payload=payload,
+            )
+            self.assertFalse(duplicate["ok"])
+            self.assertEqual(duplicate["reason"], "ACTION_ALREADY_RUNNING")
+            self.assertEqual(duplicate["target"], "cfg-first:1")
+
+            distinct = self.control.execute(
+                "risk.settings.activate_draft",
+                confirm="ACTIVATE RISK SETTINGS DRAFT",
+                payload={
+                    "config_id": "cfg-second",
+                    "expected_generation": 1,
+                    "actor": "operator",
+                },
+            )
+            self.assertTrue(distinct["ok"])
+            self.assertEqual(distinct["target"], "cfg-second:1")
+            release.set()
+            worker.join(timeout=5)
+
+        self.assertFalse(worker.is_alive())
+        self.assertTrue(first_result[0]["ok"])
+        self.assertEqual(calls, ["cfg-first", "cfg-second"])
+
 
     def test_enable_rejects_missing_future_and_stale_connectivity_readiness(self) -> None:
         settings = self.control.risk_settings_snapshot()

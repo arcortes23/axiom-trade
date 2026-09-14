@@ -210,6 +210,7 @@ class ForwardPaperEngine:
             storage_namespace=storage_namespace,
             execution_mode=execution_mode,
         )
+        self.portfolio = portfolio or Portfolio(spec.bankroll)
         loaded_state = store.load_paper_state(self._run_id)
         self._state_version = int(loaded_state.get("state_version", 0)) if loaded_state is not None else -1
         raw_state = loaded_state.get("state", {}) if loaded_state is not None else {}
@@ -226,10 +227,10 @@ class ForwardPaperEngine:
             self._processed = set()
             self._cursor = {}
             self._source_cursor = {}
+            self._observation_open_by_market = {}
             self._settled = set()
             self._settlement_by_market = {}
             self._signal_history = {}
-            self.portfolio = portfolio or Portfolio(spec.bankroll)
             self.risk = risk or RiskEngine(
                 RiskLimits(**dict(spec.risk_limits)),
                 initial_equity=spec.bankroll,
@@ -251,6 +252,12 @@ class ForwardPaperEngine:
             for key, value in dict(self._state.get("cursor_by_market", {})).items()
             if (parsed := parse_timestamp(value)) is not None
         }
+        raw_open_times = self._state.get("observation_open_by_market", {})
+        self._observation_open_by_market: dict[str, datetime] = {
+            str(key): parsed
+            for key, value in raw_open_times.items()
+            if (parsed := parse_timestamp(value)) is not None
+        } if isinstance(raw_open_times, Mapping) else {}
         raw_source_cursors = self._state.get("source_cursor_by_market", {})
         self._source_cursor: dict[str, tuple[datetime, str]] = {
             str(key): (parsed, str(value.get("snapshot_id")).strip())
@@ -270,7 +277,17 @@ class ForwardPaperEngine:
             for key, value in stored_history.items()
             if isinstance(value, (list, tuple))
         } if isinstance(stored_history, Mapping) else {}
-        self.portfolio = portfolio or Portfolio(spec.bankroll)
+        for market_id, history in self._signal_history.items():
+            if market_id in self._observation_open_by_market:
+                continue
+            history_times = (
+                stamp
+                for item in history
+                if (stamp := _observation_timestamp(item)) is not None
+            )
+            first = next(iter(sorted(history_times)), None)
+            if first is not None:
+                self._observation_open_by_market[market_id] = first
         if risk is None:
             self.risk = RiskEngine(RiskLimits(**dict(spec.risk_limits)), initial_equity=spec.bankroll)
         else:
@@ -639,6 +656,11 @@ class ForwardPaperEngine:
                         and _explicit_book_timestamp(_raw_observation_book(raw, "yes"))
                         and _explicit_book_timestamp(_raw_observation_book(raw, "no"))
                     )
+            previous_cursor = self._cursor.get(market_id)
+            previous_source_cursor = self._source_cursor.get(market_id)
+            previous_open_timestamp = self._observation_open_by_market.get(market_id)
+            was_settled = market_id in self._settled
+            previous_settlement = self._settlement_by_market.get(market_id)
             if (
                 model_evaluation is not None
                 and model_evaluation.probability is None
@@ -651,10 +673,6 @@ class ForwardPaperEngine:
                 observation["model_evaluation"]["reason_code"] = model_evaluation.reason_code
             price = _reference_price(observation, yes_book, no_book)
             missing_execution_quote = price is None and not terminal
-            previous_cursor = self._cursor.get(market_id)
-            previous_source_cursor = self._source_cursor.get(market_id)
-            was_settled = market_id in self._settled
-            previous_settlement = self._settlement_by_market.get(market_id)
             fill = None
             fill_saved = False
             settlement_saved = False
@@ -679,6 +697,9 @@ class ForwardPaperEngine:
                         observation,
                     )
                     if inserted_observation:
+                        current_open = self._observation_open_by_market.get(market_id)
+                        if current_open is None or stamp < current_open:
+                            self._observation_open_by_market[market_id] = stamp
                         if replay_missing_book:
                             fill = None
                             execution_event = {
@@ -762,6 +783,16 @@ class ForwardPaperEngine:
                                 fills=self._stored_fills_for_market(market_id),
                             )
                             if ledger is not None:
+                                open_timestamp = self._observation_open_by_market.get(market_id)
+                                if open_timestamp is not None:
+                                    open_iso = open_timestamp.isoformat()
+                                    ledger.update(
+                                        {
+                                            "observation_open_timestamp": open_iso,
+                                            "available_from": open_iso,
+                                            "coverage_from": open_iso,
+                                        }
+                                    )
                                 self.store.save_paper_bet_ledger(
                                     ledger["bet_id"],
                                     self._run_id,
@@ -802,6 +833,10 @@ class ForwardPaperEngine:
                     self._source_cursor.pop(market_id, None)
                 else:
                     self._source_cursor[market_id] = previous_source_cursor
+                if previous_open_timestamp is None:
+                    self._observation_open_by_market.pop(market_id, None)
+                else:
+                    self._observation_open_by_market[market_id] = previous_open_timestamp
                 if not was_settled:
                     self._settled.discard(market_id)
                 if previous_settlement is None:
@@ -1075,6 +1110,10 @@ class ForwardPaperEngine:
                 "execution_strategy_id": self._execution_strategy_id,
                 "processed_observations": sorted(self._processed),
                 "cursor_by_market": {key: value.isoformat() for key, value in sorted(self._cursor.items())},
+                "observation_open_by_market": {
+                    key: value.isoformat()
+                    for key, value in sorted(self._observation_open_by_market.items())
+                },
                 "source_cursor_by_market": {
                     key: {"timestamp": value[0].isoformat(), "snapshot_id": value[1]}
                     for key, value in sorted(self._source_cursor.items())

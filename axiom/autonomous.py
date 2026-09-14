@@ -13,7 +13,7 @@ import hashlib
 import json
 import math
 import re
-from itertools import product
+from itertools import islice, product
 from statistics import mean
 from typing import Any, Callable, Iterable, Mapping, NoReturn, Sequence
 
@@ -41,7 +41,7 @@ from .rolling_portfolio import (
     evaluate_rolling_selection,
 )
 from .strategy.signals import evaluate_model_document_probability
-from .experiment_plan import AUTONOMOUS_BUDGET_ID, ExperimentPlan, ExperimentPlanError, MAX_PLAN_VARIANTS
+from .experiment_plan import AUTONOMOUS_BUDGET_ID, ExperimentPlan, ExperimentPlanError, MAX_PLAN_VARIANTS, normalize_market_scope
 
 
 _MAX_QUEUE_RESULT_ITEMS = 64
@@ -49,6 +49,12 @@ _MAX_DATASET_ROWS = 100_000
 _MAX_FORWARD_ROWS = 100_000
 _MAX_LEGACY_RECOVERY_ITEMS = 64
 _MAX_ROLLING_STRATEGIES = 128
+_MAX_ROLLING_DISCOVERY_SCAN = 2_048
+_ROLLING_DISCOVERY_PAGE = 64
+_ROLLING_MATURE_STAGES = frozenset({"FROZEN", "PAPER_FORWARD", "PAPER_PROMOTABLE"})
+_ROLLING_ENROLLMENT_MODES = frozenset({"RESEARCH", "OBSERVATION"})
+_ROLLING_MAX_PROVENANCE_BYTES = 8_192
+_ROLLING_MAX_PROVENANCE_DEPTH = 5
 # Historical rolling evidence is preflighted before JSON decoding.  The fixed
 # 16 MiB/25,000-row boundary keeps immutable source material bounded while
 # the source-row projection below remains deterministic.
@@ -72,6 +78,7 @@ _ROLLING_STATE_RESULT_KEYS = (
     "requested_days",
     "status",
     "reason",
+    "next_job",
     "actual_coverage_seconds",
     "observation_completeness",
     "realized_pnl",
@@ -347,6 +354,65 @@ def _binding_value(value: Any) -> str | None:
     return text or None
 
 
+def _rolling_identity_values(
+    value: Any,
+    *names: str,
+    max_depth: int = _ROLLING_MAX_PROVENANCE_DEPTH,
+) -> tuple[set[str], bool]:
+    """Collect bounded immutable identity fields and report truncation."""
+    values: set[str] = set()
+    pending: list[tuple[Any, int]] = [(value, 0)]
+    seen: set[int] = set()
+    truncated = False
+    visited = 0
+    wanted = frozenset(names)
+    while pending:
+        item, depth = pending.pop()
+        if isinstance(item, Mapping):
+            marker = id(item)
+            if marker in seen:
+                truncated = True
+                continue
+            seen.add(marker)
+            visited += 1
+            if visited > 512:
+                truncated = True
+                break
+            for name in wanted:
+                candidate = _binding_value(item.get(name))
+                if candidate:
+                    values.add(candidate)
+            children = list(item.values())
+            if depth >= max_depth:
+                if any(isinstance(child, (Mapping, list, tuple)) for child in children):
+                    truncated = True
+                continue
+            pending.extend((child, depth + 1) for child in children[:128])
+            if len(children) > 128:
+                truncated = True
+        elif isinstance(item, (list, tuple)):
+            if depth >= max_depth:
+                if item:
+                    truncated = True
+                continue
+            pending.extend((child, depth + 1) for child in item[:128])
+            if len(item) > 128:
+                truncated = True
+    return values, truncated
+
+
+def _rolling_candidate_values(value: Any) -> tuple[set[str], bool]:
+    return _rolling_identity_values(value, "candidate_id", "candidate", "strategy_candidate_id")
+
+
+def _rolling_payload_without_created_at(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the complete immutable payload identity for retry comparisons."""
+    return {
+        str(key): child
+        for key, child in value.items()
+        if str(key) != "created_at"
+    }
+
 def _scope_binding(plan: ExperimentPlan) -> dict[str, Any]:
     """Return the canonical, recomputed authority carried by every worker artifact."""
     return {
@@ -408,6 +474,128 @@ def _rolling_timestamp(value: Any) -> datetime | None:
 
 def _rolling_hash(value: Any) -> str:
     return "sha256:" + hashlib.sha256(_canonical_binding(value).encode("utf-8")).hexdigest()
+def _rolling_provenance_hash(value: Any) -> str:
+    try:
+        encoded = _canonical_binding(value)
+    except (TypeError, ValueError, OverflowError, RecursionError):
+        encoded = repr(value)
+    return "sha256:" + hashlib.sha256(encoded.encode("utf-8", "replace")).hexdigest()
+
+
+def _rolling_provenance_compact(value: Any, depth: int = 0) -> Any:
+    if depth >= _ROLLING_MAX_PROVENANCE_DEPTH:
+        return {
+            "omitted": True,
+            "reason": "DEPTH_LIMIT",
+            "sha256": _rolling_provenance_hash(value),
+        }
+    if isinstance(value, Mapping):
+        items = sorted(value.items(), key=lambda pair: str(pair[0]))
+        result = {
+            str(key): _rolling_provenance_compact(child, depth + 1)
+            for key, child in items[:64]
+        }
+        if len(items) > 64:
+            result["_omitted_fields"] = [
+                str(key) for key, _ in items[64:128]
+            ]
+            result["_truncated"] = True
+        return result
+    if isinstance(value, (list, tuple)):
+        result = [_rolling_provenance_compact(child, depth + 1) for child in value[:64]]
+        if len(value) > 64:
+            result.append(
+                {
+                    "omitted": True,
+                    "reason": "ITEM_LIMIT",
+                    "sha256": _rolling_provenance_hash(value[64:]),
+                }
+            )
+        return result
+    if isinstance(value, str):
+        if len(value) <= 1024:
+            return value
+        return {
+            "omitted": True,
+            "reason": "STRING_LIMIT",
+            "sha256": _rolling_provenance_hash(value),
+            "preview": value[:256],
+        }
+    if isinstance(value, (int, float, bool)) or value is None:
+        return value
+    return str(value)[:1024]
+
+
+def _rolling_provenance_bound(value: Mapping[str, Any]) -> dict[str, Any]:
+    compacted = _rolling_provenance_compact(value)
+    encoded = _canonical_binding(compacted)
+    if len(encoded.encode("utf-8")) <= _ROLLING_MAX_PROVENANCE_BYTES:
+        return dict(compacted) if isinstance(compacted, Mapping) else {"value": compacted}
+    source_hash = _rolling_provenance_hash(value)
+    output: dict[str, Any] = {
+        "provenance_schema": "axiom-rolling-provenance-v1",
+        "provenance_truncated": True,
+        "provenance_sha256": source_hash,
+        "provenance_original_bytes": len(encoded.encode("utf-8")),
+        "provenance_omitted_fields": [],
+    }
+    priority = (
+        "candidate_id",
+        "rolling_research",
+        "research_mode",
+        "mode",
+        "predecessor_candidate_id",
+        "source_candidate_id",
+        "source_trial_id",
+        "research_trial_id",
+        "predecessor_strategy_id",
+        "predecessor_strategy_version",
+        "source_config_hash",
+        "market_scope",
+        "market_scope_hash",
+        "market_scope_version",
+        "scope",
+        "dataset_selector",
+        "dataset_id",
+        "dataset_version",
+        "original_rejection",
+        "original_economic_outcome",
+        "entry_policy",
+        "exit_policy",
+    )
+    keys = list(compacted) if isinstance(compacted, Mapping) else []
+    ordered_keys = list(dict.fromkeys([*priority, *sorted(keys)]))
+    for key in ordered_keys:
+        if key not in compacted:
+            continue
+        candidate = dict(output)
+        candidate[key] = compacted[key]
+        if len(_canonical_binding(candidate).encode("utf-8")) <= _ROLLING_MAX_PROVENANCE_BYTES:
+            output[key] = compacted[key]
+            continue
+        output["provenance_omitted_fields"].append(str(key))
+    if len(_canonical_binding(output).encode("utf-8")) > _ROLLING_MAX_PROVENANCE_BYTES:
+        output["provenance_omitted_fields"] = output["provenance_omitted_fields"][:32]
+    while len(_canonical_binding(output).encode("utf-8")) > _ROLLING_MAX_PROVENANCE_BYTES:
+        removable = next(
+            (
+                key
+                for key in reversed(list(output))
+                if key not in {
+                    "provenance_schema",
+                    "provenance_truncated",
+                    "provenance_sha256",
+                    "provenance_original_bytes",
+                }
+            ),
+            None,
+        )
+        if removable is None:
+            break
+        output.pop(removable, None)
+    return output
+
+
 def _rolling_state_ids(values: Iterable[Any]) -> list[str]:
     """Project identifiers for durable state without retaining the full lineage."""
     result: list[str] = []
@@ -435,7 +623,13 @@ def _rolling_state_result(value: Any) -> dict[str, Any]:
         if key not in value:
             continue
         item = value[key]
-        if isinstance(item, (str, int, float, bool)) or item is None:
+        if key == "requested_days" and isinstance(item, (list, tuple)):
+            result[key] = [
+                int(day)
+                for day in item[:2]
+                if isinstance(day, int) and not isinstance(day, bool)
+            ]
+        elif isinstance(item, (str, int, float, bool)) or item is None:
             result[key] = item if not isinstance(item, str) else item[:_MAX_ROLLING_STATE_ID_LENGTH]
         else:
             result[key] = str(item)[:_MAX_ROLLING_STATE_ID_LENGTH]
@@ -493,6 +687,13 @@ def _rolling_state_payload(
         "evidence_windows_truncated": truncated["evidence_windows"],
         "evidence_window_count": evidence_total,
         "pending": pending_sample,
+        "next_jobs": sorted(
+            {
+                str(item.get("next_job")).strip()
+                for item in pending
+                if str(item.get("next_job", "")).strip()
+            }
+        ),
         "pending_total": pending_total,
         "pending_truncated": truncated["pending"],
         "source_rows_total": source_rows_total,
@@ -560,7 +761,6 @@ def _rolling_hermes_payload(
         "source_classes": list(sources),
         "requested_window_days": [7, 30],
         "paper_only": True,
-        "available_at": current.isoformat(),
     }
     while len(_canonical_binding(payload).encode("utf-8")) >= _MAX_ROLLING_HERMES_PAYLOAD_BYTES:
         fields = [field for field in _ROLLING_HERMES_ID_FIELDS if payload[field]]
@@ -572,7 +772,6 @@ def _rolling_hermes_payload(
                 "source_classes": list(sources),
                 "requested_window_days": [7, 30],
                 "paper_only": True,
-                "available_at": current.isoformat(),
             }
             break
         field = max(fields, key=lambda name: (len(payload[name]), name))
@@ -580,23 +779,6 @@ def _rolling_hermes_payload(
     return payload
 
 
-def _rolling_price(row: Mapping[str, Any]) -> Decimal | None:
-    payload = row.get("payload")
-    candidates: list[Any] = [row.get(name) for name in (
-        "yes_mid", "mid", "price", "yes_price", "mark", "close", "last_price",
-    )]
-    if isinstance(payload, Mapping):
-        candidates.extend(payload.get(name) for name in (
-            "yes_mid", "mid", "price", "yes_price", "mark", "close", "last_price",
-        ))
-        book = payload.get("order_book") or payload.get("yes_order_book")
-        if isinstance(book, Mapping):
-            candidates.extend(book.get(name) for name in ("mid", "price", "best_bid", "best_ask"))
-    for candidate in candidates:
-        value = _rolling_number(candidate, Decimal("-1"))
-        if Decimal("0") <= value <= Decimal("1"):
-            return value
-    return None
 
 
 def _rolling_row_time(row: Mapping[str, Any]) -> datetime | None:
@@ -646,78 +828,23 @@ _ROLLING_SOURCE_QUERY_TYPES: Mapping[str, tuple[str, ...]] = {
     "REPLAY": ("HISTORICAL",),
     "LIVE": ("FORWARD_COLLECTED",),
 }
-_ROLLING_TERMINAL_VALUES = frozenset(
-    {
-        "RESOLVED",
-        "RESOLVED_YES",
-        "RESOLVED_NO",
-        "VOID",
-        "SETTLED",
-        "CLOSED",
-        "EXPIRED",
-        "FINAL",
-        "COMPLETE",
-        "COMPLETED",
-        "TERMINAL",
-    }
-)
 
 
-def _rolling_terminal_outcome(row: Mapping[str, Any]) -> bool:
-    view = _rolling_snapshot_view(row)
-    semantic_fields = (
-        "settlement_state",
-        "settlement_status",
-        "settlement",
-        "resolution",
-        "resolution_state",
-        "resolution_status",
-        "resolved",
-        "resolved_status",
-        "settled",
-        "terminal",
-        "outcome",
-    )
-    explicit_booleans = [
-        view[name]
-        for name in semantic_fields
-        if isinstance(view.get(name), bool)
-    ]
-    if explicit_booleans:
-        return any(explicit_booleans)
-    for name in (*semantic_fields, "status", "state"):
-        value = view.get(name)
-        if isinstance(value, str):
-            normalized = value.strip().upper().replace("-", "_").replace(" ", "_")
-            if normalized in _ROLLING_TERMINAL_VALUES and (
-                normalized not in {"CLOSED", "EXPIRED"} or name in semantic_fields
-            ):
-                return True
-    return False
-
-
-def _rolling_market_key(row: Mapping[str, Any]) -> str:
-    view = _rolling_snapshot_view(row)
-    for name in (
-        "market_id",
-        "condition_id",
-        "event_id",
-        "token_id",
-        "symbol",
-        "market",
-    ):
-        value = view.get(name)
-        if value is not None and str(value).strip():
-            return str(value).strip()
-    # A scope-bound historical stream may omit a row-level market id.  Keep
-    # those rows on one path; never manufacture adjacency across known markets.
-    return "__unknown_market__"
 
 
 def _rolling_source_binding(record: Mapping[str, Any]) -> dict[str, Any]:
     """Extract one exact selector/scope binding and reject contradictions."""
     containers: list[Mapping[str, Any]] = [record]
-    for name in ("payload", "provenance", "strategy_document", "strategy"):
+    for name in (
+        "payload",
+        "provenance",
+        "strategy_document",
+        "strategy",
+        "accounting",
+        "canonical_accounting",
+        "strategy_accounting",
+        "resolved_bet",
+    ):
         child = record.get(name)
         if isinstance(child, Mapping):
             containers.append(child)
@@ -744,23 +871,14 @@ def _rolling_source_binding(record: Mapping[str, Any]) -> dict[str, Any]:
         "candidate_id",
         "research_trial_id",
         "trial_id",
+        "strategy_hash",
+        "source_strategy_hash",
+        "rolling_strategy_hash",
+        "strategy_version_id",
+        "experiment_id",
     )
     binding: dict[str, Any] = {}
-    direct_fields = {
-        "dataset_id",
-        "dataset_version",
-        "market_scope",
-        "scope",
-        "market_scope_hash",
-        "market_scope_version",
-        "scope_hash",
-        "scope_version",
-        "market_id",
-        "market_ids",
-        "candidate_id",
-        "research_trial_id",
-        "trial_id",
-    }
+    direct_fields = set(fields)
     for field in fields:
         values: list[Any] = []
         for selector in selectors:
@@ -769,6 +887,15 @@ def _rolling_source_binding(record: Mapping[str, Any]) -> dict[str, Any]:
                 values.append(value)
         for container in containers:
             if field in direct_fields:
+                # Dataset aliases are read from dataset_selector above.  A
+                # nested strategy document's DSL ``version`` is not a
+                # dataset version.
+                if field == "version" and (
+                    container is not record
+                    or "strategy_version_id" in container
+                    or "strategy_hash" in container
+                ):
+                    continue
                 value = container.get(field)
                 if value is not None and value != "":
                     values.append(value)
@@ -786,6 +913,75 @@ def _rolling_source_binding(record: Mapping[str, Any]) -> dict[str, Any]:
             raise ValueError("conflicting rolling dataset/scope selector: research_trial_id")
         binding.setdefault("research_trial_id", binding["trial_id"])
     return binding
+
+
+_ROLLING_SOURCE_BINDING_FIELDS = (
+    "dataset_id",
+    "dataset_version",
+    "version",
+    "strategy_hash",
+    "strategy_version_id",
+    "research_trial_id",
+    "candidate_id",
+)
+
+
+def _rolling_source_job_binding(
+    record: Mapping[str, Any],
+    source: str,
+    *,
+    experiment_id: str | None = None,
+) -> dict[str, Any]:
+    """Require the immutable identity carried by a standard source loader."""
+    binding = _rolling_source_binding(record)
+    expected: dict[str, Any] = {}
+    for field in ("strategy_hash", "strategy_version_id", "research_trial_id", "candidate_id"):
+        value = _binding_value(binding.get(field))
+        if value is None:
+            value = _binding_value(record.get(field))
+        if value is None:
+            raise ValueError(f"{source}_SOURCE_BINDING_REQUIRED")
+        expected[field] = value
+    if source in {"HISTORICAL", "REPLAY"}:
+        dataset_id = _binding_value(binding.get("dataset_id"))
+        dataset_version = _binding_value(binding.get("dataset_version", binding.get("version")))
+        if dataset_id is None or dataset_version is None:
+            raise ValueError(f"{source}_DATASET_BINDING_REQUIRED")
+        expected["dataset_id"] = dataset_id
+        expected["dataset_version"] = dataset_version
+    if experiment_id is not None:
+        expected["experiment_id"] = experiment_id
+    return expected
+
+
+def _rolling_inject_source_binding(
+    raw: Mapping[str, Any],
+    expected: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Inject absent row duplicates while rejecting contradictory lineage."""
+    row = dict(raw)
+    try:
+        current = _rolling_source_binding(row)
+    except (TypeError, ValueError):
+        row["_rolling_accounting_rejection"] = "SOURCE_BINDING_CONFLICT"
+        return row
+    for field in _ROLLING_SOURCE_BINDING_FIELDS:
+        expected_value = _binding_value(expected.get(field))
+        if expected_value is None:
+            continue
+        actual_value = _binding_value(current.get(field))
+        if actual_value is not None and actual_value != expected_value:
+            row["_rolling_accounting_rejection"] = "SOURCE_BINDING_CONFLICT"
+            return row
+        row.setdefault(field, expected_value)
+    expected_experiment = _binding_value(expected.get("experiment_id"))
+    if expected_experiment is not None:
+        actual_experiment = _binding_value(current.get("experiment_id"))
+        if actual_experiment is not None and actual_experiment != expected_experiment:
+            row["_rolling_accounting_rejection"] = "PAPER_EXPERIMENT_BINDING_CONFLICT"
+            return row
+        row.setdefault("experiment_id", expected_experiment)
+    return row
 
 
 
@@ -913,18 +1109,46 @@ def _rolling_document_is_marked(value: Mapping[str, Any], provenance: Mapping[st
 
 
 def _rolling_campaign_bound(value: Mapping[str, Any]) -> bool:
-    containers = [value]
-    for field_name in ("payload", "strategy_document", "strategy", "canonical_strategy", "provenance"):
-        nested = value.get(field_name)
-        if isinstance(nested, Mapping):
-            containers.append(nested)
-    for item in containers:
-        if any(str(item.get(name, "")).strip() for name in ("campaign_id", "campaign_trial_id", "campaign_configuration_id")):
+    """Reject campaign lineage wherever it appears in a persisted document."""
+    seen: set[int] = set()
+    visited = 0
+
+    def visit(item: Any, depth: int = 0) -> bool:
+        nonlocal visited
+        if depth > _ROLLING_MAX_PROVENANCE_DEPTH:
+            return True
+        if isinstance(item, (list, tuple)):
+            if len(item) > 128:
+                return True
+            return any(visit(child, depth + 1) for child in item)
+        if not isinstance(item, Mapping):
+            return False
+        marker = id(item)
+        if marker in seen:
+            return True
+        seen.add(marker)
+        visited += 1
+        if visited > 512:
+            return True
+        if any(
+            str(item.get(name, "")).strip()
+            for name in ("campaign_id", "campaign_trial_id", "campaign_configuration_id")
+        ):
             return True
         protocol = item.get("campaign_protocol")
-        if isinstance(protocol, Mapping) or str(item.get("source", "")).strip().lower() in {"axiom-finite-campaign", "finite-campaign"}:
+        if (
+            isinstance(protocol, Mapping)
+            or (protocol is not None and str(protocol).strip())
+            or str(item.get("source", "")).strip().lower()
+            in {"axiom-finite-campaign", "finite-campaign"}
+        ):
             return True
-    return False
+        children = list(item.values())
+        if len(children) > 128:
+            return True
+        return any(visit(child, depth + 1) for child in children)
+
+    return visit(value)
 
 
 def _rolling_snapshot_view(row: Mapping[str, Any]) -> dict[str, Any]:
@@ -944,52 +1168,6 @@ def _rolling_snapshot_view(row: Mapping[str, Any]) -> dict[str, Any]:
     return result
 
 
-def _rolling_observation_interval(
-    row: Mapping[str, Any],
-    *,
-    previous_timestamp: datetime | None = None,
-    next_timestamp: datetime | None = None,
-) -> tuple[datetime, datetime] | None:
-    """Return an explicit or bounded interval for one point observation.
-
-    Persisted point snapshots commonly carry only one timestamp.  A point is
-    not itself evidence coverage, so use an explicit duration when present or
-    the adjacent deterministic sample interval.  A lone point remains
-    ineligible rather than claiming zero or synthetic coverage.
-    """
-    view = _rolling_snapshot_view(row)
-    start = _rolling_timestamp(
-        view.get("observation_start", view.get("interval_start", view.get("started_at")))
-    )
-    end = _rolling_timestamp(
-        view.get("observation_end", view.get("interval_end", view.get("completed_at")))
-    )
-    if start is not None and end is not None:
-        if end < start:
-            return None
-        if end > start:
-            return start, end
-    point = _rolling_row_time(view) or start or end
-    if point is None:
-        return None
-    for field_name in (
-        "observation_interval_seconds",
-        "interval_seconds",
-        "window_seconds",
-        "duration_seconds",
-    ):
-        raw_duration = _rolling_number(view.get(field_name), Decimal("0"))
-        if raw_duration <= Decimal("0"):
-            continue
-        bounded = min(raw_duration, Decimal(30 * 86400))
-        microseconds = int(bounded * Decimal(1_000_000))
-        if microseconds > 0:
-            return point, point + timedelta(microseconds=microseconds)
-    if next_timestamp is not None and next_timestamp > point:
-        return point, next_timestamp
-    if previous_timestamp is not None and previous_timestamp < point:
-        return previous_timestamp, point
-    return None
 
 
 def _rolling_overlap_key(rows: Sequence[Mapping[str, Any]]) -> str:
@@ -1733,191 +1911,697 @@ class AutonomousResearchProcessor:
 
     # Rolling portfolio -------------------------------------------------
     def _rolling_strategy_documents(self) -> tuple[dict[str, Any], ...]:
-        """Discover immutable declarative strategy definitions without campaigns."""
-        found: dict[str, dict[str, Any]] = {}
+        """Discover mature legacy candidates and validate them for rolling research.
 
-        def add(value: Any, provenance: Mapping[str, Any] | None = None) -> None:
-            if not isinstance(value, Mapping):
+        Legacy strategy rows are never promoted in place.  They are joined to
+        their current lifecycle row by the canonical candidate id, then copied
+        into an application-owned rolling identity.  Every rejected join is
+        recorded as an immutable enrollment decision.
+        """
+        found: dict[str, dict[str, Any]] = {}
+        enrollment_saver = getattr(self.store, "save_rolling_enrollment", None)
+
+        def decode(value: Any) -> Mapping[str, Any]:
+            if isinstance(value, Mapping):
+                return value
+            if isinstance(value, str):
+                try:
+                    parsed = json.loads(value)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    return {}
+                return parsed if isinstance(parsed, Mapping) else {}
+            return {}
+
+        def compact(value: Any, depth: int = 0) -> Any:
+            return _rolling_provenance_compact(value, depth)
+
+        def candidate_id(row: Mapping[str, Any], payload: Mapping[str, Any]) -> str | None:
+            values: set[str] = set()
+            truncated = False
+            for source in (row, payload):
+                found_values, source_truncated = _rolling_candidate_values(source)
+                values.update(found_values)
+                truncated = truncated or source_truncated
+            if truncated or len(values) != 1:
+                return None
+            return sorted(values)[0]
+
+        def source_value(payload: Mapping[str, Any], *names: str) -> str | None:
+            for name in names:
+                value = _binding_value(payload.get(name))
+                if value:
+                    return value
+            for name in ("provenance", "forward_evidence", "result", "outcome", "config"):
+                child = payload.get(name)
+                if isinstance(child, Mapping):
+                    value = source_value(child, *names)
+                    if value:
+                        return value
+            return None
+
+        def provenance(
+            *,
+            candidate: str,
+            payload: Mapping[str, Any],
+            strategy_row: Mapping[str, Any],
+            scope: Mapping[str, Any],
+            entry: Mapping[str, Any],
+            exit_policy: Mapping[str, Any],
+        ) -> dict[str, Any]:
+            original_rejection = {
+                key: compact(payload[key])
+                for key in (
+                    "rejection_reason",
+                    "reason",
+                    "reason_code",
+                    "status",
+                )
+                if key in payload
+            }
+            original_economic = {
+                key: compact(payload[key])
+                for key in (
+                    "economic_result",
+                    "economic_outcome",
+                    "result",
+                    "outcome",
+                    "validation",
+                    "forward_evidence",
+                    "metrics",
+                    "net_return",
+                    "realized_pnl",
+                    "unrealized_pnl",
+                )
+                if key in payload
+            }
+            result = {
+                "rolling_research": True,
+                "research_mode": "RESEARCH",
+                "predecessor_candidate_id": candidate,
+                "source_candidate_id": candidate,
+                "source_trial_id": source_value(
+                    payload,
+                    "research_trial_id",
+                    "trial_id",
+                    "source_trial_id",
+                    "forward_test_id",
+                    "experiment_id",
+                    "plan_id",
+                ),
+                "source_config_hash": source_value(
+                    payload,
+                    "config_hash",
+                    "source_config_hash",
+                ),
+                "predecessor_strategy_id": _binding_value(strategy_row.get("strategy_id")),
+                "predecessor_strategy_version": _binding_value(strategy_row.get("version")),
+                "scope": compact(scope),
+                "entry_policy": compact(entry),
+                "exit_policy": compact(exit_policy),
+                "original_economic_outcome": original_economic,
+                "original_rejection": original_rejection,
+            }
+            return _rolling_provenance_bound(result)
+
+        def decision(
+            *,
+            candidate: str,
+            status: str,
+            reason: str,
+            origin: Mapping[str, Any],
+            strategy_version_id: str | None = None,
+            research_trial_id: str | None = None,
+        ) -> None:
+            if not callable(enrollment_saver):
                 return
-            if _rolling_campaign_bound(value) or not _rolling_document_is_marked(value, provenance):
+            record = {
+                "candidate_id": candidate,
+                "strategy_version_id": strategy_version_id,
+                "research_trial_id": research_trial_id,
+                "status": status,
+                "reason": reason,
+                "provenance": _rolling_provenance_bound(origin),
+            }
+            try:
+                enrollment_saver(record)
+            except (TypeError, ValueError, RuntimeError):
+                # A corrupt legacy row must not prevent other candidates from
+                # being discovered.  The immutable source remains untouched.
                 return
-            source = value.get("strategy_document", value.get("strategy"))
+
+        def validate_join(
+            strategy_row: Mapping[str, Any],
+            lifecycle_row: Mapping[str, Any],
+        ) -> dict[str, Any] | None:
+            strategy_payload = decode(strategy_row.get("strategy_payload"))
+            lifecycle_payload = decode(lifecycle_row.get("candidate_payload"))
+            row_candidate = _binding_value(lifecycle_row.get("candidate_id"))
+            lifecycle_candidates, lifecycle_truncated = _rolling_candidate_values(
+                {"candidate_id": row_candidate, "payload": lifecycle_payload}
+            )
+            if lifecycle_truncated or len(lifecycle_candidates) != 1:
+                if row_candidate:
+                    decision(
+                        candidate=row_candidate,
+                        status="EXCLUDED",
+                        reason="CANDIDATE_IDENTITY_MISMATCH",
+                        origin={
+                            "rolling_research": True,
+                            "predecessor_candidate_id": row_candidate,
+                            "source_candidate_id": sorted(lifecycle_candidates),
+                        },
+                    )
+                return None
+            candidate = sorted(lifecycle_candidates)[0]
+            strategy_candidates, strategy_truncated = _rolling_candidate_values(strategy_payload)
+            if strategy_truncated or (strategy_candidates and strategy_candidates != {candidate}):
+                decision(
+                    candidate=candidate,
+                    status="EXCLUDED",
+                    reason="CANDIDATE_IDENTITY_MISMATCH",
+                    origin={
+                        "rolling_research": True,
+                        "predecessor_candidate_id": candidate,
+                        "source_candidate_id": sorted(strategy_candidates),
+                        "source_trial_id": source_value(
+                            lifecycle_payload,
+                            "research_trial_id",
+                            "trial_id",
+                            "source_trial_id",
+                            "forward_test_id",
+                            "experiment_id",
+                            "plan_id",
+                        ),
+                        "original_economic_outcome": {
+                            key: compact(lifecycle_payload[key])
+                            for key in ("result", "outcome", "economic_result", "economic_outcome")
+                            if key in lifecycle_payload
+                        },
+                        "original_rejection": {
+                            key: compact(lifecycle_payload[key])
+                            for key in ("rejection_reason", "reason", "reason_code", "status")
+                            if key in lifecycle_payload
+                        },
+                    },
+                )
+                return None
+            base_origin = {
+                "rolling_research": True,
+                "predecessor_candidate_id": candidate,
+                "source_candidate_id": candidate,
+                "source_trial_id": source_value(
+                    lifecycle_payload,
+                    "research_trial_id",
+                    "trial_id",
+                    "source_trial_id",
+                    "forward_test_id",
+                    "experiment_id",
+                    "plan_id",
+                ),
+                "source_config_hash": source_value(
+                    lifecycle_payload,
+                    "config_hash",
+                    "source_config_hash",
+                ),
+                "source_strategy_hash": source_value(
+                    lifecycle_payload,
+                    "source_strategy_hash",
+                    "strategy_hash",
+                ),
+                "rolling_strategy_hash": source_value(
+                    lifecycle_payload,
+                    "rolling_strategy_hash",
+                ),
+                "predecessor_strategy_id": _binding_value(strategy_row.get("strategy_id")),
+                "predecessor_strategy_version": _binding_value(strategy_row.get("version")),
+                "original_economic_outcome": {
+                    key: compact(lifecycle_payload[key])
+                    for key in (
+                        "economic_result",
+                        "economic_outcome",
+                        "result",
+                        "outcome",
+                        "validation",
+                        "forward_evidence",
+                        "metrics",
+                        "net_return",
+                        "realized_pnl",
+                        "unrealized_pnl",
+                    )
+                    if key in lifecycle_payload
+                },
+                "original_rejection": {
+                    key: compact(lifecycle_payload[key])
+                    for key in ("rejection_reason", "reason", "reason_code", "status")
+                    if key in lifecycle_payload
+                },
+            }
+            if _rolling_campaign_bound(strategy_payload) or _rolling_campaign_bound(lifecycle_payload):
+                decision(
+                    candidate=candidate,
+                    status="EXCLUDED",
+                    reason="CAMPAIGN_BOUND",
+                    origin={**base_origin, "campaign_excluded": True},
+                )
+                return None
+            stage = str(lifecycle_row.get("stage", "")).strip().upper()
+            if stage not in _ROLLING_MATURE_STAGES:
+                decision(
+                    candidate=candidate,
+                    status="EXCLUDED",
+                    reason="LIFECYCLE_NOT_MATURE",
+                    origin={**base_origin, "lifecycle_stage": stage},
+                )
+                return None
+            source_candidates = (
+                strategy_payload.get("strategy_document"),
+                strategy_payload.get("strategy"),
+                strategy_payload.get("payload"),
+                lifecycle_payload.get("strategy_document"),
+                lifecycle_payload.get("strategy"),
+            )
+            source = next(
+                (
+                    value
+                    for value in source_candidates
+                    if isinstance(value, Mapping)
+                ),
+                None,
+            )
+            if not isinstance(source, Mapping) and any(
+                key in strategy_payload
+                for key in ("family", "template", "market_type", "parameters")
+            ):
+                # ``save_strategy`` persists the DSL document directly,
+                # whereas rolling-generated rows carry it under
+                # ``strategy_document``.  Both are immutable definitions.
+                source = strategy_payload
             if not isinstance(source, Mapping):
-                source = value.get("canonical_strategy")
-            if not isinstance(source, Mapping):
-                return
+                decision(
+                    candidate=candidate,
+                    status="EXCLUDED",
+                    reason="STRATEGY_DEFINITION_MISSING",
+                    origin=base_origin,
+                )
+                return None
             try:
                 definition = load_strategy(source)
-            except Exception:
-                return
+            except (TypeError, ValueError, RuntimeError) as exc:
+                decision(
+                    candidate=candidate,
+                    status="EXCLUDED",
+                    reason="STRATEGY_DSL_INVALID",
+                    origin={**base_origin, "error": str(exc)[:256]},
+                )
+                return None
+            scope_value = lifecycle_payload.get("market_scope", lifecycle_payload.get("scope"))
+            if not isinstance(scope_value, Mapping):
+                plan = lifecycle_payload.get("experiment_plan")
+                scope_value = plan.get("market_scope") if isinstance(plan, Mapping) else None
+            if not isinstance(scope_value, Mapping):
+                decision(
+                    candidate=candidate,
+                    status="EXCLUDED",
+                    reason="SCOPE_INVALID",
+                    origin=base_origin,
+                )
+                return None
+            try:
+                scope_policy = normalize_market_scope(scope_value)
+            except (TypeError, ValueError, ExperimentPlanError) as exc:
+                decision(
+                    candidate=candidate,
+                    status="EXCLUDED",
+                    reason="SCOPE_INVALID",
+                    origin={**base_origin, "error": str(exc)[:256]},
+                )
+                return None
+            supplied_hash = source_value(lifecycle_payload, "market_scope_hash", "scope_hash")
+            supplied_version = source_value(lifecycle_payload, "market_scope_version", "scope_version")
+            if supplied_hash and supplied_hash != scope_policy.scope_hash:
+                decision(candidate=candidate, status="EXCLUDED", reason="SCOPE_IDENTITY_MISMATCH", origin=base_origin)
+                return None
+            if supplied_version and supplied_version != scope_policy.scope_version:
+                decision(candidate=candidate, status="EXCLUDED", reason="SCOPE_IDENTITY_MISMATCH", origin=base_origin)
+                return None
+            plan = lifecycle_payload.get("experiment_plan")
+            plan = plan if isinstance(plan, Mapping) else {}
+            dataset_selector_value = lifecycle_payload.get("dataset_selector")
+            if not isinstance(dataset_selector_value, Mapping):
+                dataset_selector_value = plan.get("dataset_selector")
+            dataset_selector = (
+                dict(dataset_selector_value)
+                if isinstance(dataset_selector_value, Mapping)
+                else {}
+            )
+            for field_name in ("dataset_id", "dataset_version"):
+                selector_names = (
+                    ("dataset_version", "version")
+                    if field_name == "dataset_version"
+                    else ("dataset_id",)
+                )
+                direct_value = lifecycle_payload.get(field_name)
+                plan_value = plan.get(field_name)
+                selector_values = [
+                    dataset_selector.get(name)
+                    for name in selector_names
+                    if dataset_selector.get(name) is not None
+                    and str(dataset_selector.get(name)).strip()
+                ]
+                values = [
+                    value
+                    for value in (direct_value, plan_value, *selector_values)
+                    if value is not None and str(value).strip()
+                ]
+                if len({_canonical_binding(value) for value in values}) > 1:
+                    decision(
+                        candidate=candidate,
+                        status="EXCLUDED",
+                        reason="DATASET_SELECTOR_IDENTITY_MISMATCH",
+                        origin=base_origin,
+                    )
+                    return None
+                if values:
+                    dataset_selector[field_name] = values[0]
+            entry_value = lifecycle_payload.get("entry_policy", lifecycle_payload.get("entry"))
+            if entry_value is None:
+                entry_value = plan.get("entry_policy", plan.get("entry"))
+            if entry_value is None:
+                entry_value = {"type": "strategy_signal", "family": definition.family}
+            if isinstance(entry_value, str):
+                entry_value = {"type": entry_value}
+            if not isinstance(entry_value, Mapping) or not str(
+                entry_value.get("type", entry_value.get("kind", ""))
+            ).strip():
+                decision(candidate=candidate, status="EXCLUDED", reason="ENTRY_POLICY_INVALID", origin=base_origin)
+                return None
+            exit_value = lifecycle_payload.get("exit_policy", lifecycle_payload.get("exit"))
+            if exit_value is None:
+                exit_value = plan.get("exit_policy", plan.get("exit"))
+            if exit_value is None:
+                exit_value = {"type": "fixed_holding_period", "holding_period": 1}
+            if isinstance(exit_value, str):
+                exit_value = {"type": exit_value}
+            if not isinstance(exit_value, Mapping):
+                decision(candidate=candidate, status="EXCLUDED", reason="EXIT_POLICY_INVALID", origin=base_origin)
+                return None
+            exit_kind = str(exit_value.get("type", exit_value.get("kind", ""))).strip().lower()
+            if exit_kind != "fixed_holding_period":
+                decision(candidate=candidate, status="EXCLUDED", reason="EXIT_POLICY_INVALID", origin=base_origin)
+                return None
+            raw_period = exit_value.get(
+                "holding_period",
+                exit_value.get("bars", exit_value.get("observations", 1)),
+            )
+            try:
+                holding_period = int(raw_period)
+            except (TypeError, ValueError, OverflowError):
+                holding_period = 0
+            if isinstance(raw_period, bool) or holding_period < 1 or holding_period > 10_000:
+                decision(candidate=candidate, status="EXCLUDED", reason="EXIT_POLICY_INVALID", origin=base_origin)
+                return None
+            mode_value = source_value(lifecycle_payload, "enrollment_mode", "research_mode", "mode")
+            mode = str(mode_value or "").strip().upper().replace("-", "_")
+            if mode in {"LIVE", "CANARY", "EXECUTION", "TRADING"}:
+                decision(candidate=candidate, status="EXCLUDED", reason="ENROLLMENT_MODE_NOT_ALLOWED", origin=base_origin)
+                return None
+            origin = provenance(
+                candidate=candidate,
+                payload=lifecycle_payload,
+                strategy_row=strategy_row,
+                scope=scope_policy.as_dict(),
+                entry=dict(entry_value),
+                exit_policy={**dict(exit_value), "holding_period": holding_period},
+            )
+            origin["market_scope"] = scope_policy.as_dict()
+            origin["market_scope_hash"] = scope_policy.scope_hash
+            origin["market_scope_version"] = scope_policy.scope_version
+            if dataset_selector:
+                origin["dataset_selector"] = compact(dataset_selector)
+                for field_name in ("dataset_id", "dataset_version"):
+                    origin[field_name] = dataset_selector[field_name]
             document = definition.to_dict()
-            # Candidate ids are lineage, not part of the immutable definition.
             document.pop("strategy_id", None)
-            key = _rolling_hash(document)
-            item = {
-                "strategy_document": document,
-                "strategy_id": definition.id,
-                "version": str(definition.version),
-                "strategy_hash": key,
-                "config_hash": _rolling_hash(
-                    {
-                        "market_type": document.get("market_type"),
-                        "family": document.get("family"),
-                        "parameters": document.get("parameters", {}),
-                        "operations": document.get("operations", []),
-                        "paper_assumptions": dict(COMMON_PAPER_ASSUMPTIONS),
-                    }
-                ),
-            }
-            if isinstance(provenance, Mapping):
-                origin = dict(provenance)
-            else:
-                origin = {}
-            nested_plan = value.get("experiment_plan")
-            nested_plan = nested_plan if isinstance(nested_plan, Mapping) else {}
-            for field_name in (
-                "dataset_id",
-                "dataset_version",
-                "dataset_selector",
-                "market_scope",
-                "market_scope_hash",
-                "market_scope_version",
+            strategy_hash = _rolling_hash(document)
+            config_hash = source_value(lifecycle_payload, "config_hash", "source_config_hash")
+            computed_strategy_version_id = "strategy-version-" + _rolling_hash(
+                {"strategy_hash": strategy_hash, "candidate_id": candidate}
+            ).removeprefix("sha256:")[:40]
+            declared_strategy_version_id = _binding_value(
+                lifecycle_payload.get("strategy_version_id")
+            )
+            if (
+                declared_strategy_version_id is not None
+                and declared_strategy_version_id != computed_strategy_version_id
             ):
-                field_value = value.get(field_name, nested_plan.get(field_name))
-                if field_value is not None:
-                    origin.setdefault(field_name, field_value)
-            if origin:
-                item["provenance"] = origin
-            prior = found.get(key)
-            if prior is None:
-                found[key] = item
-            elif isinstance(prior.get("provenance"), Mapping) and isinstance(provenance, Mapping):
-                merged = dict(prior["provenance"])
-                merged.update({str(k): v for k, v in provenance.items() if v is not None})
-                prior["provenance"] = merged
+                decision(
+                    candidate=candidate,
+                    status="EXCLUDED",
+                    reason="STRATEGY_VERSION_IDENTITY_MISMATCH",
+                    origin=base_origin,
+                    strategy_version_id=declared_strategy_version_id,
+                )
+                return None
+            strategy_version_id = declared_strategy_version_id or computed_strategy_version_id
+            trial_identity = {
+                "candidate_id": candidate,
+                "strategy_version_id": strategy_version_id,
+                "source_trial_id": origin.get("source_trial_id"),
+                "source_config_hash": config_hash,
+            }
+            computed_research_trial_id = "research-trial-" + _rolling_hash(
+                trial_identity
+            ).removeprefix("sha256:")[:40]
+            research_trial_id = (
+                _binding_value(lifecycle_payload.get("research_trial_id"))
+                or _binding_value(lifecycle_payload.get("trial_id"))
+                or computed_research_trial_id
+            )
+            origin["source_config_hash"] = config_hash
+            origin["source_strategy_hash"] = (
+                base_origin.get("source_strategy_hash") or strategy_hash
+            )
+            origin["rolling_strategy_hash"] = strategy_hash
+            origin["research_trial_id"] = research_trial_id
+            origin["mode"] = "OBSERVATION" if stage == "PAPER_FORWARD" else "RESEARCH"
+            origin = _rolling_provenance_bound(origin)
+            return {
+                "strategy_document": document,
+                "strategy_id": _binding_value(strategy_row.get("strategy_id")) or definition.id,
+                "version": str(strategy_row.get("version") or definition.version),
+                "strategy_hash": strategy_hash,
+                "config_hash": config_hash,
+                "candidate_id": candidate,
+                "strategy_version_id": strategy_version_id,
+                "research_trial_id": research_trial_id,
+                "source_strategy_hash": origin.get("source_strategy_hash"),
+                "rolling_strategy_hash": strategy_hash,
+                "provenance": origin,
+                "enrollment_id": "rolling-enrollment-" + _rolling_hash(
+                    {
+                        "candidate_id": candidate,
+                        "strategy_version_id": strategy_version_id,
+                        "research_trial_id": research_trial_id,
+                    }
+                ).removeprefix("sha256:")[:48],
+            }
 
         connection = getattr(self.store, "connection", None)
         execute = getattr(connection, "execute", None)
-        read_budget = _MAX_ROLLING_STRATEGIES
+        rows: list[Mapping[str, Any]] = []
+        legacy_query_completed = False
+        if callable(execute):
+            scan_remaining = _MAX_ROLLING_DISCOVERY_SCAN
+            cursor: tuple[Any, ...] | None = None
+            mature_stages = tuple(sorted(_ROLLING_MATURE_STAGES))
+            while scan_remaining > 0:
+                placeholders = ",".join("?" for _ in mature_stages)
+                where = f" WHERE UPPER(COALESCE(c.stage,'')) IN ({placeholders})"
+                params: list[Any] = list(mature_stages)
+                if cursor is not None:
+                    where += (
+                        " AND (c.updated_at > ? OR "
+                        "(c.updated_at = ? AND c.candidate_id > ?) OR "
+                        "(c.updated_at = ? AND c.candidate_id = ? AND s.strategy_id > ?) OR "
+                        "(c.updated_at = ? AND c.candidate_id = ? AND s.strategy_id = ? AND s.version > ?))"
+                    )
+                    params.extend(
+                        [
+                            cursor[0],
+                            cursor[0],
+                            cursor[1],
+                            cursor[0],
+                            cursor[1],
+                            cursor[2],
+                            cursor[0],
+                            cursor[1],
+                            cursor[2],
+                            cursor[3],
+                        ]
+                    )
+                params.append(min(_ROLLING_DISCOVERY_PAGE, scan_remaining))
+                try:
+                    queried = execute(
+                        "SELECT s.strategy_id,s.version,s.payload_json AS strategy_payload,"
+                        "c.candidate_id,c.stage,c.payload_json AS candidate_payload,c.updated_at "
+                        "FROM strategies AS s JOIN candidate_lifecycle AS c "
+                        "ON c.candidate_id=s.strategy_id OR "
+                        "c.candidate_id=CASE WHEN json_valid(s.payload_json) "
+                        "THEN json_extract(s.payload_json,'$.candidate_id') ELSE NULL END "
+                        f"{where} "
+                        "ORDER BY c.updated_at,c.candidate_id,s.strategy_id,s.version LIMIT ?",
+                        tuple(params),
+                    ).fetchall()
+                except Exception:
+                    rows = []
+                    break
+                legacy_query_completed = True
+                batch = [dict(row) for row in queried or ()]
+                if not batch:
+                    break
+                rows.extend(batch)
+                scan_remaining -= len(batch)
+                last = batch[-1]
+                next_cursor = (
+                    last.get("updated_at"),
+                    str(last.get("candidate_id", "")),
+                    str(last.get("strategy_id", "")),
+                    str(last.get("version", "")),
+                )
+                if cursor is not None and next_cursor <= cursor:
+                    break
+                cursor = next_cursor
+                if len(batch) < _ROLLING_DISCOVERY_PAGE:
+                    break
+        if not rows and not legacy_query_completed:
+            strategy_lister = getattr(self.store, "list_strategies", None)
+            lifecycle_lister = getattr(self.store, "load_candidate_lifecycle", None)
+            if callable(strategy_lister) and callable(lifecycle_lister):
+                def bounded_legacy_rows(loader: Callable[..., Any]) -> tuple[Any, ...]:
+                    """Call only adapters that expose an explicit bounded limit."""
+                    try:
+                        values = loader(limit=_MAX_ROLLING_DISCOVERY_SCAN)
+                    except TypeError as exc:
+                        raise ValueError(
+                            "ROLLING_DISCOVERY_BOUNDED_SOURCE_UNAVAILABLE"
+                        ) from exc
+                    if isinstance(values, Mapping):
+                        values = values.get("records", values.get("rows", (values,)))
+                    if values is None or isinstance(values, (str, bytes)):
+                        return ()
+                    try:
+                        return tuple(islice(values, _MAX_ROLLING_DISCOVERY_SCAN))
+                    except TypeError:
+                        return ()
 
-        def bounded_sql(query: str, values: Sequence[Any] = ()) -> tuple[Any, ...]:
-            nonlocal read_budget
-            if not callable(execute) or read_budget <= 0:
-                return ()
-            requested = read_budget
+                try:
+                    strategy_rows = bounded_legacy_rows(strategy_lister)
+                    lifecycle_rows = bounded_legacy_rows(lifecycle_lister)
+                except ValueError as exc:
+                    if str(exc) == "ROLLING_DISCOVERY_BOUNDED_SOURCE_UNAVAILABLE":
+                        raise
+                    strategy_rows, lifecycle_rows = (), ()
+                except (TypeError, RuntimeError):
+                    strategy_rows, lifecycle_rows = (), ()
+                lifecycle_by_id = {
+                    str(item.get("candidate_id")).strip(): item
+                    for item in lifecycle_rows
+                    if (
+                        isinstance(item, Mapping)
+                        and str(item.get("candidate_id", "")).strip()
+                        and str(item.get("stage", "")).strip().upper() in _ROLLING_MATURE_STAGES
+                    )
+                }
+                for item in strategy_rows:
+                    if len(rows) >= _MAX_ROLLING_DISCOVERY_SCAN:
+                        break
+                    if not isinstance(item, Mapping):
+                        continue
+                    strategy_payload = item.get("strategy", item.get("payload", {}))
+                    strategy_id = str(item.get("strategy_id", "")).strip()
+                    payload_candidates, _ = _rolling_candidate_values(decode(strategy_payload))
+                    candidate_keys = [strategy_id, str(item.get("candidate_id", "")).strip()]
+                    candidate_keys.extend(sorted(payload_candidates))
+                    lifecycle = next(
+                        (lifecycle_by_id.get(key) for key in candidate_keys if key and lifecycle_by_id.get(key)),
+                        None,
+                    )
+                    if lifecycle is None:
+                        continue
+                    rows.append(
+                        {
+                            "strategy_id": strategy_id,
+                            "version": item.get("version"),
+                            "strategy_payload": strategy_payload,
+                            "candidate_id": lifecycle.get("candidate_id"),
+                            "stage": lifecycle.get("stage"),
+                            "candidate_payload": lifecycle.get("payload"),
+                        }
+                    )
+        for row in rows[:_MAX_ROLLING_DISCOVERY_SCAN]:
+            item = validate_join(row, row)
+            if item is not None:
+                found[item["strategy_hash"] + ":" + str(item["candidate_id"])] = item
+
+        # Existing application-owned rolling rows survive a restart even when
+        # the legacy source has been compacted or removed.
+        if callable(execute):
             try:
-                fetched = execute(
-                    query + " LIMIT ?",
-                    (*tuple(values), requested),
+                modern_rows = execute(
+                    "SELECT payload_json,strategy_version_id FROM strategy_versions "
+                    "ORDER BY created_at,strategy_version_id LIMIT ?",
+                    (_MAX_ROLLING_STRATEGIES,),
                 ).fetchall()
             except Exception:
-                return ()
-            rows = tuple(fetched or ())[:requested]
-            read_budget -= len(rows)
-            return rows
-
-        for row in bounded_sql(
-            "SELECT payload_json,strategy_version_id "
-            "FROM strategy_versions ORDER BY created_at,strategy_version_id"
-        ):
-            try:
-                payload = (
-                    json.loads(row["payload_json"])
-                    if isinstance(row["payload_json"], str)
-                    else row["payload_json"]
-                )
-            except Exception:
-                payload = {}
-            add(payload, {"strategy_version_id": row["strategy_version_id"]})
-
-        # Legacy strategy rows are read directly with the same shared budget.
-        # Calling list_strategies() here would materialize the complete table
-        # before the Python-side rolling cap could take effect.
-        for row in bounded_sql(
-            "SELECT strategy_id,version,payload_json,created_at "
-            "FROM strategies ORDER BY created_at,strategy_id,version"
-        ):
-            try:
-                payload = (
-                    json.loads(row["payload_json"])
-                    if isinstance(row["payload_json"], str)
-                    else row["payload_json"]
-                )
-            except Exception:
-                payload = {}
-            add(
-                payload,
-                {
-                    "strategy_id": row["strategy_id"],
-                    "source": "strategy_store",
-                },
-            )
-
-        # Custom stores without an exposed connection can still provide a
-        # bounded accessor; unbounded list-only adapters are intentionally
-        # ignored rather than trusted to enforce this boundary.
-        lister = getattr(self.store, "list_strategies", None)
-        if not callable(execute) and callable(lister) and read_budget > 0:
-            try:
-                rows = lister(limit=read_budget)
-            except Exception:
-                rows = ()
-            rows = tuple(rows or ())[:read_budget]
-            read_budget -= len(rows)
-            for row in rows:
-                payload = (
-                    row.get("strategy", row.get("payload", row))
-                    if isinstance(row, Mapping)
-                    else row
-                )
-                add(
-                    payload,
-                    {
-                        "strategy_id": row.get("strategy_id")
-                        if isinstance(row, Mapping)
-                        else None,
-                        "source": "strategy_store",
-                    },
-                )
-
-        lifecycle_loader = getattr(self.store, "load_candidate_lifecycle", None)
-        if callable(lifecycle_loader) and read_budget > 0:
-            try:
-                rows = lifecycle_loader(limit=read_budget)
-            except Exception:
-                rows = ()
-            rows = tuple(rows or ())[:read_budget]
-            read_budget -= len(rows)
-            for row in rows:
-                payload = row.get("payload") if isinstance(row, Mapping) else None
-                if isinstance(payload, Mapping):
-                    add(
-                        payload,
-                        {
-                            "candidate_id": row.get("candidate_id"),
-                            "plan_id": payload.get("plan_id"),
-                            "dataset_id": payload.get("dataset_id"),
-                            "dataset_version": payload.get("dataset_version"),
-                            "dataset_selector": payload.get("dataset_selector"),
-                            "market_scope": payload.get("market_scope"),
-                            "market_scope_hash": payload.get("market_scope_hash"),
-                            "market_scope_version": payload.get("market_scope_version"),
-                            "source": "candidate_lifecycle",
-                        },
+                modern_rows = ()
+            for row in modern_rows or ():
+                payload = decode(row["payload_json"])
+                provenance = payload.get("provenance")
+                provenance = dict(provenance) if isinstance(provenance, Mapping) else {}
+                if not _rolling_document_is_marked(payload, provenance):
+                    continue
+                source = payload.get("strategy_document", payload.get("canonical_strategy"))
+                if not isinstance(source, Mapping) or _rolling_campaign_bound(payload):
+                    continue
+                canonical_candidates, canonical_truncated = _rolling_candidate_values(provenance)
+                payload_candidates, payload_truncated = _rolling_candidate_values(payload)
+                if (
+                    canonical_truncated
+                    or payload_truncated
+                    or (
+                        payload_candidates
+                        and canonical_candidates
+                        and payload_candidates != canonical_candidates
                     )
-
-        queue_lister = getattr(self.store, "list_research_items", None)
-        if callable(queue_lister) and read_budget > 0:
-            try:
-                rows = queue_lister(limit=read_budget)
-            except Exception:
-                rows = ()
-            rows = tuple(rows or ())[:read_budget]
-            read_budget -= len(rows)
-            for row in rows:
-                payload = row.get("payload") if isinstance(row, Mapping) else None
-                add(payload, {"source": "research_queue"})
-        ordered = sorted(found.values(), key=lambda item: (str(item.get("strategy_hash", "")), str(item.get("strategy_id", ""))))
+                ):
+                    continue
+                candidates = canonical_candidates or payload_candidates
+                if len(candidates) != 1:
+                    continue
+                try:
+                    definition = load_strategy(source)
+                except (TypeError, ValueError, RuntimeError):
+                    continue
+                item = dict(payload)
+                item["strategy_document"] = definition.to_dict()
+                item["strategy_version_id"] = row["strategy_version_id"]
+                item["provenance"] = _rolling_provenance_bound(provenance)
+                item["candidate_id"] = sorted(candidates)[0]
+                item.setdefault("research_trial_id", provenance.get("research_trial_id"))
+                item.setdefault("strategy_hash", _rolling_hash(item["strategy_document"]))
+                item["_strategy_version_existing"] = True
+                if item.get("research_trial_id"):
+                    found.setdefault(
+                        str(item["strategy_hash"]) + ":" + str(item["candidate_id"]),
+                        item,
+                    )
+        ordered = sorted(
+            found.values(),
+            key=lambda item: (
+                str(item.get("strategy_hash", "")),
+                str(item.get("candidate_id", "")),
+            ),
+        )
         return tuple(ordered[:_MAX_ROLLING_STRATEGIES])
 
     def _rolling_persist_strategy_lineage(
@@ -1927,55 +2611,121 @@ class AutonomousResearchProcessor:
     ) -> tuple[dict[str, Any], ...]:
         saver = getattr(self.store, "save_strategy_version", None)
         trial_saver = getattr(self.store, "save_research_trial", None)
+        enrollment_saver = getattr(self.store, "save_rolling_enrollment", None)
         persisted: list[dict[str, Any]] = []
         for item in documents:
             document = dict(item["strategy_document"])
             strategy_hash = str(item["strategy_hash"])
-            strategy_version_id = "strategy-version-" + strategy_hash.removeprefix("sha256:")[:40]
-            provenance = {
-                **dict(item.get("provenance") or {}),
-                "rolling_research": True,
-                "research_mode": "ROLLING_RESEARCH",
-            }
+            candidate_id = str(item.get("candidate_id") or "").strip() or None
+            strategy_version_id = str(item.get("strategy_version_id") or "").strip()
+            if not strategy_version_id:
+                identity = {"strategy_hash": strategy_hash, "candidate_id": candidate_id}
+                strategy_version_id = "strategy-version-" + _rolling_hash(identity).removeprefix("sha256:")[:40]
+            provenance = _rolling_provenance_bound(
+                {
+                    **dict(item.get("provenance") or {}),
+                    "rolling_research": True,
+                    "research_mode": "ROLLING_RESEARCH",
+                    "candidate_id": candidate_id,
+                    "source_candidate_id": candidate_id,
+                }
+            )
+            enrollment_mode = str(provenance.get("mode", "RESEARCH")).strip().upper()
+            if enrollment_mode not in _ROLLING_ENROLLMENT_MODES:
+                enrollment_mode = "RESEARCH"
             record = {
                 "strategy_version_id": strategy_version_id,
                 "strategy_id": str(item.get("strategy_id", "")).strip() or str(document.get("family", "strategy")),
                 "version": str(item.get("version", "1")),
                 "code_hash": strategy_hash,
+                "strategy_hash": strategy_hash,
                 "config_hash": str(item.get("config_hash", strategy_hash)),
                 "created_at": now.isoformat(),
                 "strategy_document": document,
                 "canonical_strategy": document,
-                "strategy_hash": strategy_hash,
+                "enrollment_mode": enrollment_mode,
                 "provenance": provenance,
+                "candidate_id": candidate_id,
+                "execution_scope": "OBSERVATION",
+                "research_only": True,
                 "paper_only": True,
             }
-            if callable(saver):
-                try:
-                    saver(record)
-                except (TypeError, ValueError):
-                    pass
-            trial_id = str(provenance.get("research_trial_id") or "").strip() or "research-trial:" + strategy_version_id
+            trial_id = str(item.get("research_trial_id") or provenance.get("research_trial_id") or "").strip()
+            if not trial_id:
+                trial_identity = {
+                    "strategy_version_id": strategy_version_id,
+                    "candidate_id": candidate_id,
+                    "source_trial_id": provenance.get("source_trial_id"),
+                    "source_config_hash": provenance.get("source_config_hash"),
+                }
+                trial_id = "research-trial-" + _rolling_hash(trial_identity).removeprefix("sha256:")[:40]
             trial = {
                 "research_trial_id": trial_id,
                 "trial_id": trial_id,
                 "strategy_version_id": strategy_version_id,
+                "candidate_id": candidate_id,
                 "status": "SCHEDULED",
                 "created_at": now.isoformat(),
                 "trial_kind": "ROLLING_RESEARCH",
                 "strategy_hash": strategy_hash,
-                "source_classes": ["HISTORICAL", "REPLAY", "PAPER", "LIVE"],
+                "enrollment_mode": enrollment_mode,
                 "requested_window_days": [7, 30],
                 "rolling_research": True,
+                "execution_scope": "OBSERVATION",
+                "research_only": True,
                 "paper_only": True,
                 "payload": {"strategy_document": document, "provenance": provenance},
             }
-            if callable(trial_saver):
+            def immutable_match(existing: Any, expected: Mapping[str, Any]) -> bool:
+                if not isinstance(existing, Mapping):
+                    return False
+                return _canonical_binding(
+                    _rolling_payload_without_created_at(existing)
+                ) == _canonical_binding(
+                    _rolling_payload_without_created_at(expected)
+                )
+
+            try:
+                if callable(saver) and not item.get("_strategy_version_existing"):
+                    try:
+                        saver(record)
+                    except ValueError as exc:
+                        loader = getattr(self.store, "load_strategy_version", None)
+                        existing = loader(strategy_version_id) if callable(loader) else None
+                        if not immutable_match(existing, record):
+                            raise exc
+                if callable(trial_saver):
+                    try:
+                        trial_saver(trial)
+                    except ValueError as exc:
+                        loader = getattr(self.store, "load_research_trial", None)
+                        existing = loader(trial_id) if callable(loader) else None
+                        if not immutable_match(existing, trial):
+                            raise exc
+            except (TypeError, ValueError, RuntimeError):
+                # Persistence failures are retryable.  Do not create a
+                # terminal EXCLUDED enrollment while lineage may be partial:
+                # the next pass can reconcile exact immutable identities and
+                # insert ACCEPTED under the same deterministic enrollment id.
+                continue
+            if callable(enrollment_saver) and candidate_id:
                 try:
-                    trial_saver(trial)
-                except (TypeError, ValueError):
+                    enrollment_saver(
+                        {
+                            "enrollment_id": item.get("enrollment_id"),
+                            "candidate_id": candidate_id,
+                            "strategy_version_id": strategy_version_id,
+                            "research_trial_id": trial_id,
+                            "status": "ACCEPTED",
+                            "reason": "MATURE_NONCAMPAIGN_RESEARCH",
+                            "provenance": provenance,
+                        }
+                    )
+                except (TypeError, ValueError, RuntimeError):
+                    # The strategy and trial are still immutable and linked;
+                    # a retry can repair only the enrollment projection.
                     pass
-            persisted.append({**record, "research_trial_id": trial_id, "candidate_id": provenance.get("candidate_id")})
+            persisted.append({**record, "research_trial_id": trial_id, "candidate_id": candidate_id})
         return tuple(persisted)
 
     def _load_rolling_historical_dataset(
@@ -1997,15 +2747,37 @@ class AutonomousResearchProcessor:
         try:
             payload_row = execute(
                 "SELECT LENGTH(CAST(payload_json AS BLOB)) AS payload_bytes,"
+                "CASE WHEN json_valid(payload_json) THEN json_type(payload_json) END AS payload_type,"
                 "json_extract(CASE WHEN json_valid(metadata_json) THEN metadata_json ELSE '{}' END,"
                 "'$.row_count') AS metadata_row_count,"
                 "json_array_length(CASE WHEN json_valid(payload_json) THEN payload_json ELSE '[]' END) "
-                "AS payload_row_count "
+                "AS payload_row_count,"
+                "CASE WHEN json_valid(payload_json) "
+                "AND json_type(payload_json,'$.records')='array' "
+                "THEN json_array_length(json_extract(payload_json,'$.records')) END "
+                "AS records_row_count,"
+                "CASE WHEN json_valid(payload_json) "
+                "AND json_type(payload_json,'$.rows')='array' "
+                "THEN json_array_length(json_extract(payload_json,'$.rows')) END "
+                "AS rows_row_count,"
+                "json_array_length(CASE WHEN json_valid(metadata_json) "
+                "AND json_type(metadata_json,'$.records')='array' "
+                "THEN json_extract(metadata_json,'$.records') ELSE '[]' END) "
+                "AS metadata_records_row_count,"
+                "json_array_length(CASE WHEN json_valid(metadata_json) "
+                "AND json_type(metadata_json,'$.rows')='array' "
+                "THEN json_extract(metadata_json,'$.rows') ELSE '[]' END) "
+                "AS metadata_rows_row_count "
                 "FROM datasets WHERE dataset_id=? AND version=? LIMIT 1",
                 (str(dataset_id), str(dataset_version)),
             ).fetchone()
             catalog_row = execute(
-                "SELECT row_count FROM dataset_catalog "
+                "SELECT row_count,"
+                "json_array_length(CASE WHEN json_valid(metadata_json) "
+                "AND json_type(metadata_json,'$.market_versions')='array' "
+                "THEN json_extract(metadata_json,'$.market_versions') ELSE '[]' END) "
+                "AS market_versions_count "
+                "FROM dataset_catalog "
                 "WHERE dataset_id=? AND dataset_version=? LIMIT 1",
                 (str(dataset_id), str(dataset_version)),
             ).fetchone()
@@ -2025,27 +2797,432 @@ class AutonomousResearchProcessor:
                 raise ValueError(f"{field} is invalid")
             return parsed
 
+        if payload_row is None and catalog_row is None:
+            raise ValueError("HISTORICAL_DATASET_METADATA_MISSING")
+        payload_rows: int | None = None
+        metadata_rows: int | None = None
         if payload_row is not None:
             payload_bytes = integer(payload_row["payload_bytes"], "payload_bytes")
+            payload_type = str(payload_row["payload_type"] or "").strip().lower()
             metadata_rows = integer(
                 payload_row["metadata_row_count"],
                 "metadata_row_count",
             )
-            payload_rows = integer(
+            root_rows = integer(
                 payload_row["payload_row_count"],
                 "payload_row_count",
             )
+            records_rows = integer(
+                payload_row["records_row_count"],
+                "records_row_count",
+            )
+            rows_rows = integer(
+                payload_row["rows_row_count"],
+                "rows_row_count",
+            )
+            metadata_records_rows = integer(
+                payload_row["metadata_records_row_count"],
+                "metadata_records_row_count",
+            )
+            metadata_rows_rows = integer(
+                payload_row["metadata_rows_row_count"],
+                "metadata_rows_row_count",
+            )
             if payload_bytes is None or payload_bytes > _MAX_ROLLING_DATASET_PAYLOAD_BYTES:
                 raise ValueError("HISTORICAL_DATASET_PAYLOAD_TOO_LARGE")
-            for row_count in (metadata_rows, payload_rows):
+            for row_count in (
+                metadata_rows,
+                root_rows,
+                records_rows,
+                rows_rows,
+                metadata_records_rows,
+                metadata_rows_rows,
+            ):
                 if row_count is not None and row_count > _MAX_ROLLING_SOURCE_ROWS:
                     raise ValueError("HISTORICAL_DATASET_ROW_COUNT_TOO_LARGE")
+            if payload_type == "array":
+                payload_rows = root_rows
+            elif payload_type == "object":
+                shaped = [
+                    value
+                    for value in (records_rows, rows_rows)
+                    if value is not None
+                ]
+                if records_rows is not None and rows_rows is not None and records_rows != rows_rows:
+                    raise ValueError("HISTORICAL_DATASET_ROW_COUNT_MISMATCH")
+                payload_rows = shaped[0] if shaped else None
+            if (
+                payload_rows is None
+                and metadata_rows is None
+                and catalog_row is None
+            ):
+                raise ValueError("HISTORICAL_DATASET_ROW_COUNT_UNAVAILABLE")
+            if (
+                payload_rows is not None
+                and metadata_rows is not None
+                and payload_rows != metadata_rows
+            ):
+                raise ValueError("HISTORICAL_DATASET_ROW_COUNT_MISMATCH")
 
         if catalog_row is not None:
             catalog_rows = integer(catalog_row["row_count"], "catalog_row_count")
-            if catalog_rows is None or catalog_rows > _MAX_ROLLING_SOURCE_ROWS:
+            market_versions = integer(
+                catalog_row["market_versions_count"],
+                "market_versions_count",
+            )
+            if catalog_rows is None:
+                raise ValueError("HISTORICAL_DATASET_ROW_COUNT_UNAVAILABLE")
+            if (
+                catalog_rows > _MAX_ROLLING_SOURCE_ROWS
+                or market_versions is not None
+                and market_versions > _MAX_ROLLING_SOURCE_ROWS
+            ):
                 raise ValueError("HISTORICAL_DATASET_ROW_COUNT_TOO_LARGE")
+            if payload_rows is not None and catalog_rows != payload_rows:
+                raise ValueError("HISTORICAL_DATASET_ROW_COUNT_MISMATCH")
         return self.store.load_dataset(dataset_id, dataset_version)
+
+    def _rolling_accounting_projection(
+        self,
+        row: Mapping[str, Any],
+        strategy: Mapping[str, Any],
+    ) -> Mapping[str, Any] | None:
+        """Return validated explicit strategy accounting, never infer it from prices."""
+        view = _rolling_snapshot_view(row)
+        quality = str(
+            view.get("research_quality", view.get("quality", view.get("source_type", "")))
+        ).strip().upper().replace("-", "_")
+
+        def reject(reason: str, metric: str | None = None) -> None:
+            row["_rolling_accounting_rejection"] = reason
+            if metric:
+                row["_rolling_accounting_metric"] = metric
+
+        if quality in {"PRICE_PROXY", "PRICE_PROXY_RESEARCH", "PRICE_REPLAY"}:
+            reject("PRICE_PROXY_ACCOUNTING_UNAVAILABLE")
+            return None
+
+        accounting: Mapping[str, Any] | None = None
+        for name in ("canonical_accounting", "strategy_accounting", "accounting"):
+            value = view.get(name)
+            if isinstance(value, Mapping):
+                accounting = value
+                break
+
+        # ForwardPaperEngine persists one canonical resolved-bet payload rather
+        # than a second accounting wrapper.  It is accepted only after the
+        # PAPER loader has proved the immutable experiment/spec binding.
+        paper_experiment = _binding_value(row.get("_paper_experiment_id"))
+        if accounting is None and paper_experiment:
+            resolved = view.get("resolved_bet")
+            if not isinstance(resolved, Mapping) and {
+                "net_pnl",
+                "capital_at_risk",
+                "resolution",
+            }.issubset(view):
+                resolved = view
+            if isinstance(resolved, Mapping):
+                resolved_experiment = _binding_value(
+                    resolved.get("experiment_id", view.get("experiment_id"))
+                )
+                resolution = str(resolved.get("resolution", "")).strip().lower()
+                if (
+                    resolved_experiment != paper_experiment
+                    or resolved.get("closed") is not True
+                    or resolution
+                    not in {"resolved_yes", "resolved_no", "void"}
+                ):
+                    reject("PAPER_RESOLVED_BET_BINDING_INVALID")
+                    return None
+
+                def decimal_value(value: Any) -> Decimal | None:
+                    if value is None or isinstance(value, bool):
+                        return None
+                    try:
+                        parsed = Decimal(str(value))
+                    except (InvalidOperation, TypeError, ValueError, OverflowError):
+                        return None
+                    return parsed if parsed.is_finite() else None
+
+                def first_timestamp(*names: str) -> datetime | None:
+                    for name in names:
+                        timestamp = _rolling_timestamp(resolved.get(name))
+                        if timestamp is None:
+                            timestamp = _rolling_timestamp(view.get(name))
+                        if timestamp is not None:
+                            return timestamp
+                    return None
+
+                shortage = resolved.get("accounting_shortage")
+                if shortage:
+                    shortage_fields = (
+                        shortage.get("fields")
+                        if isinstance(shortage, Mapping)
+                        else ()
+                    )
+                    reject(
+                        "PAPER_RESOLVED_BET_ACCOUNTING_INCOMPLETE",
+                        str(next(iter(shortage_fields), "accounting")),
+                    )
+                    return None
+                net_pnl = decimal_value(resolved.get("net_pnl"))
+                capital = decimal_value(resolved.get("capital_at_risk"))
+                fees_value = decimal_value(resolved.get("fees"))
+                slippage_value = decimal_value(resolved.get("slippage"))
+                if net_pnl is None:
+                    reject("ACCOUNTING_METRIC_MISSING", "realized_pnl")
+                    return None
+                if capital is None:
+                    reject("ACCOUNTING_METRIC_MISSING", "allocated_capital")
+                    return None
+                if fees_value is None:
+                    reject("ACCOUNTING_METRIC_MISSING", "fees")
+                    return None
+                if slippage_value is None:
+                    reject("ACCOUNTING_METRIC_MISSING", "costs")
+                    return None
+                if capital <= Decimal("0"):
+                    reject("ACCOUNTING_METRIC_NONPOSITIVE", "allocated_capital")
+                    return None
+                drawdown = min(
+                    Decimal("1"),
+                    max(Decimal("0"), -net_pnl / capital),
+                )
+                if "drawdown" in resolved:
+                    supplied_drawdown = decimal_value(resolved.get("drawdown"))
+                    if supplied_drawdown is None:
+                        reject("ACCOUNTING_METRIC_INVALID", "drawdown")
+                        return None
+                    if supplied_drawdown != drawdown:
+                        reject("PAPER_RESOLVED_BET_DRAWDOWN_CONFLICT", "drawdown")
+                        return None
+                if "unrealized_pnl" in resolved:
+                    supplied_unrealized = decimal_value(resolved.get("unrealized_pnl"))
+                    if supplied_unrealized is None:
+                        reject("ACCOUNTING_METRIC_INVALID", "unrealized_pnl")
+                        return None
+                    if supplied_unrealized != Decimal("0"):
+                        reject(
+                            "PAPER_RESOLVED_BET_UNREALIZED_NONZERO",
+                            "unrealized_pnl",
+                        )
+                        return None
+                for name, expected in (
+                    ("allocated_capital", capital),
+                    ("allocated_capital_net_return", net_pnl),
+                    ("realized_pnl", net_pnl),
+                    ("fees", fees_value),
+                    ("costs", slippage_value),
+                ):
+                    if name not in resolved:
+                        continue
+                    supplied = decimal_value(resolved.get(name))
+                    if supplied is None:
+                        reject("ACCOUNTING_METRIC_INVALID", name)
+                        return None
+                    if supplied != expected:
+                        reject("PAPER_RESOLVED_BET_ACCOUNTING_CONFLICT", name)
+                        return None
+                for name in ("completed_outcomes", "reliability"):
+                    if name not in resolved:
+                        continue
+                    supplied = decimal_value(resolved.get(name))
+                    if supplied is None:
+                        reject("ACCOUNTING_METRIC_INVALID", name)
+                        return None
+                    if supplied != Decimal("1"):
+                        reject("PAPER_RESOLVED_BET_CONTRACT_CONFLICT", name)
+                        return None
+                expected_outcome = (
+                    "yes"
+                    if resolution == "resolved_yes"
+                    else "no"
+                    if resolution == "resolved_no"
+                    else None
+                )
+                supplied_winner = _binding_value(resolved.get("winning_outcome"))
+                if (
+                    expected_outcome is not None
+                    and supplied_winner is not None
+                    and supplied_winner.lower() != expected_outcome
+                ):
+                    reject("PAPER_RESOLVED_BET_CONTRACT_CONFLICT", "winning_outcome")
+                    return None
+                available_from = first_timestamp(
+                    "observation_open_timestamp",
+                    "observation_opened_at",
+                    "open_timestamp",
+                    "opened_at",
+                    "observation_timestamp",
+                    "observation_at",
+                    "available_from",
+                    "coverage_from",
+                    "window_start",
+                    "timestamp",
+                )
+                available_through = first_timestamp(
+                    "resolved_at",
+                    "available_through",
+                    "coverage_through",
+                    "window_end",
+                )
+                if available_from is None:
+                    reject("ACCOUNTING_COVERAGE_MISSING", "observation_open_timestamp")
+                    return None
+                if available_through is None:
+                    reject("ACCOUNTING_COVERAGE_MISSING", "resolved_at")
+                    return None
+                if available_from > available_through:
+                    reject("ACCOUNTING_COVERAGE_INVALID", "observation_open_timestamp")
+                    return None
+                accounting = dict(resolved)
+                accounting.update(
+                    {
+                        "allocated_capital": capital,
+                        "allocated_capital_net_return": net_pnl,
+                        "realized_pnl": net_pnl,
+                        "unrealized_pnl": Decimal("0"),
+                        "fees": fees_value,
+                        "costs": slippage_value,
+                        "completed_outcomes": Decimal("1"),
+                        "reliability": Decimal("1"),
+                        "drawdown": drawdown,
+                        "available_from": available_from.isoformat(),
+                        "available_through": available_through.isoformat(),
+                    }
+                )
+
+        if accounting is None:
+            reject("ACCOUNTING_MISSING")
+            return None
+
+        try:
+            binding = _rolling_source_binding(view)
+        except (TypeError, ValueError):
+            reject("SOURCE_BINDING_CONFLICT")
+            return None
+        expected_binding = _rolling_source_binding(strategy)
+        expected_candidate = _binding_value(
+            strategy.get("candidate_id")
+            or expected_binding.get("candidate_id")
+            or expected_binding.get("source_candidate_id")
+        )
+        expected_trial = _binding_value(
+            strategy.get("research_trial_id")
+            or expected_binding.get("research_trial_id")
+            or expected_binding.get("trial_id")
+        )
+        expected_strategy_version = _binding_value(
+            strategy.get("strategy_version_id")
+            or expected_binding.get("strategy_version_id")
+        )
+        expected_strategy_hash = _binding_value(
+            strategy.get("strategy_hash")
+            or expected_binding.get("strategy_hash")
+        )
+        row_candidate = _binding_value(binding.get("candidate_id"))
+        row_trial = _binding_value(binding.get("research_trial_id", binding.get("trial_id")))
+        row_strategy_version = _binding_value(binding.get("strategy_version_id"))
+        row_strategy_hash = _binding_value(binding.get("strategy_hash"))
+        if (
+            not expected_candidate
+            or not expected_trial
+            or not expected_strategy_version
+            or not expected_strategy_hash
+            or row_candidate != expected_candidate
+            or row_trial != expected_trial
+            or row_strategy_version != expected_strategy_version
+            or row_strategy_hash != expected_strategy_hash
+        ):
+            reject("SOURCE_BINDING_MISMATCH")
+            return None
+        if paper_experiment:
+            if _binding_value(binding.get("experiment_id")) != paper_experiment:
+                reject("PAPER_EXPERIMENT_BINDING_MISMATCH")
+                return None
+            row_strategy = _binding_value(view.get("strategy_id"))
+            if row_strategy and row_strategy != expected_strategy_hash:
+                reject("PAPER_STRATEGY_BINDING_MISMATCH")
+                return None
+
+        def value_for(*names: str) -> tuple[str | None, Any]:
+            for name in names:
+                if name in accounting:
+                    return name, accounting[name]
+            return None, None
+
+        def parse_metric(name: str, raw: Any, *, nonnegative: bool = False, ratio: bool = False) -> Any:
+            if raw is None or isinstance(raw, bool) or isinstance(raw, (Mapping, list, tuple, set, frozenset)):
+                reject("ACCOUNTING_METRIC_TYPE_INVALID", name)
+                return None
+            try:
+                parsed = Decimal(str(raw))
+            except (InvalidOperation, TypeError, ValueError, OverflowError):
+                reject("ACCOUNTING_METRIC_MALFORMED", name)
+                return None
+            if not parsed.is_finite():
+                reject("ACCOUNTING_METRIC_NONFINITE", name)
+                return None
+            if nonnegative and parsed < 0:
+                reject("ACCOUNTING_METRIC_NEGATIVE_IMPOSSIBLE", name)
+                return None
+            if ratio and (parsed < 0 or parsed > 1):
+                reject("ACCOUNTING_METRIC_OUT_OF_RANGE", name)
+                return None
+            if name == "completed_outcomes" and parsed != parsed.to_integral_value():
+                reject("ACCOUNTING_METRIC_MALFORMED", name)
+                return None
+            return parsed
+
+        metric_aliases: dict[str, tuple[str, ...]] = {
+            "allocated_capital": ("allocated_capital", "allocated_capital_usd", "paper_size", "paper_sizing"),
+            "net_return": ("allocated_capital_net_return", "net_return"),
+            "realized_pnl": ("realized_pnl",),
+            "unrealized_pnl": ("unrealized_pnl",),
+            "fees": ("fees", "fee_costs"),
+            "costs": ("costs", "slippage_costs"),
+            "drawdown": ("drawdown",),
+            "completed_outcomes": ("completed_outcomes", "outcomes"),
+            "reliability": ("reliability",),
+        }
+        parsed_metrics: dict[str, Decimal] = {}
+        for metric_name, aliases in metric_aliases.items():
+            alias, raw = value_for(*aliases)
+            if alias is None:
+                reject("ACCOUNTING_METRIC_MISSING", metric_name)
+                return None
+            parsed = parse_metric(
+                metric_name,
+                raw,
+                nonnegative=metric_name
+                in {"allocated_capital", "fees", "costs", "drawdown", "completed_outcomes", "reliability"},
+                ratio=metric_name in {"drawdown", "reliability"},
+            )
+            if parsed is None:
+                return None
+            parsed_metrics[metric_name] = parsed
+        if parsed_metrics["completed_outcomes"] < 0:
+            reject("ACCOUNTING_METRIC_NEGATIVE_IMPOSSIBLE", "completed_outcomes")
+            return None
+        result = dict(accounting)
+        for metric_name, parsed in parsed_metrics.items():
+            result[metric_name] = parsed
+        result["_timestamp"] = _rolling_row_time(view)
+        result["_available_from"] = _rolling_timestamp(
+            view.get("available_from", view.get("coverage_from", view.get("window_start")))
+            or accounting.get("available_from", accounting.get("coverage_from"))
+        )
+        result["_available_through"] = _rolling_timestamp(
+            view.get("available_through", view.get("coverage_through", view.get("window_end")))
+            or accounting.get("available_through", accounting.get("coverage_through"))
+        )
+        if result["_available_from"] is None or result["_available_through"] is None:
+            reject("ACCOUNTING_COVERAGE_MISSING")
+            return None
+        if result["_available_through"] < result["_available_from"]:
+            reject("ACCOUNTING_COVERAGE_INVALID")
+            return None
+        return result
 
     def _rolling_source_rows(
         self,
@@ -2057,22 +3234,34 @@ class AutonomousResearchProcessor:
         if source not in _ROLLING_SOURCE_TYPES:
             raise ValueError(f"unsupported rolling source class: {source_class}")
         persisted_source = _rolling_persisted_source_class(source)
+        try:
+            source_binding = _rolling_source_job_binding(record, source)
+        except ValueError as exc:
+            if str(exc) == "HISTORICAL_DATASET_BINDING_REQUIRED":
+                raise ValueError("HISTORICAL_SELECTOR_REQUIRED") from exc
+            raise
         binding = _rolling_source_binding(record)
-        dataset_id = str(binding.get("dataset_id", "")).strip()
-        dataset_version = str(
-            binding.get("dataset_version", binding.get("version", ""))
-        ).strip()
+        dataset_id = str(source_binding.get("dataset_id", "")).strip()
+        dataset_version = str(source_binding.get("dataset_version", "")).strip()
+        strategy_hash = _binding_value(source_binding.get("strategy_hash"))
+        expected_candidate = _binding_value(source_binding.get("candidate_id"))
+        expected_trial = _binding_value(source_binding.get("research_trial_id"))
+        expected_strategy_version = _binding_value(
+            source_binding.get("strategy_version_id")
+        )
         rows: list[dict[str, Any]] = []
         if source == "HISTORICAL":
             # Historical evidence is valid only for an explicit immutable
             # selector.  Never substitute the newest or first catalog entry.
-            if not dataset_id or not dataset_version:
-                raise ValueError("HISTORICAL_SELECTOR_REQUIRED")
             loaded = self._load_rolling_historical_dataset(dataset_id, dataset_version)
             if isinstance(loaded, Mapping):
                 loaded = loaded.get("records", loaded.get("rows", ()))
             if isinstance(loaded, Sequence) and not isinstance(loaded, (str, bytes)):
-                rows = [dict(item) for item in loaded if isinstance(item, Mapping)]
+                rows = [
+                    _rolling_inject_source_binding(item, source_binding)
+                    for item in loaded
+                    if isinstance(item, Mapping)
+                ]
         elif source in {"REPLAY", "LIVE"}:
             loader = getattr(self.store, "load_polymarket_snapshots", None)
             if callable(loader):
@@ -2080,71 +3269,224 @@ class AutonomousResearchProcessor:
                 for source_value in persisted_types:
                     # The storage boundary accepts only persisted source types;
                     # the requested rolling class remains canonical below.
-                    values = loader(source_type=source_value, limit=_MAX_FORWARD_ROWS)
+                    # The storage boundary accepts only persisted source
+                    # types; the requested rolling class remains canonical.
+                    loader_binding_proven = True
+                    try:
+                        values = loader(
+                            source_type=source_value,
+                            dataset_id=dataset_id or None,
+                            dataset_version=dataset_version or None,
+                            strategy_version_id=source_binding["strategy_version_id"],
+                            research_trial_id=source_binding["research_trial_id"],
+                            candidate_id=source_binding["candidate_id"],
+                            limit=_MAX_FORWARD_ROWS,
+                        )
+                    except TypeError:
+                        loader_binding_proven = False
+                        values = loader(source_type=source_value, limit=_MAX_FORWARD_ROWS)
                     if isinstance(values, Mapping):
                         values = values.get("records", values.get("rows", ()))
-                    rows.extend(dict(item) for item in values or () if isinstance(item, Mapping))
+                    for item_index, item in enumerate(values or ()):
+                        if item_index >= _MAX_FORWARD_ROWS:
+                            break
+                        if not isinstance(item, Mapping):
+                            continue
+                        if not loader_binding_proven and source in {"REPLAY", "LIVE"}:
+                            try:
+                                row_binding = _rolling_source_binding(item)
+                            except (TypeError, ValueError):
+                                row_binding = {}
+                                rejection = "SOURCE_BINDING_CONFLICT"
+                            else:
+                                required_fields = (
+                                    "strategy_hash",
+                                    "strategy_version_id",
+                                    "research_trial_id",
+                                    "candidate_id",
+                                )
+                                missing = any(
+                                    _binding_value(row_binding.get(field)) is None
+                                    for field in required_fields
+                                )
+                                conflict = any(
+                                    (
+                                        _binding_value(row_binding.get(field)) is not None
+                                        and _binding_value(row_binding.get(field))
+                                        != _binding_value(source_binding.get(field))
+                                    )
+                                    for field in required_fields
+                                )
+                                rejection = (
+                                    "SOURCE_BINDING_CONFLICT"
+                                    if conflict
+                                    else "SOURCE_BINDING_UNPROVEN"
+                                    if missing
+                                    else None
+                                )
+                            if rejection is not None:
+                                row = dict(item)
+                                row["_rolling_accounting_rejection"] = rejection
+                                rows.append(row)
+                                continue
+                            if source == "REPLAY":
+                                row_dataset = _binding_value(
+                                    row_binding.get("dataset_id")
+                                )
+                                row_version = _binding_value(
+                                    row_binding.get(
+                                        "dataset_version",
+                                        row_binding.get("version"),
+                                    )
+                                )
+                                if row_dataset != dataset_id or row_version != dataset_version:
+                                    row = dict(item)
+                                    row["_rolling_accounting_rejection"] = (
+                                        "SOURCE_BINDING_CONFLICT"
+                                    )
+                                    rows.append(row)
+                                    continue
+                        rows.append(_rolling_inject_source_binding(item, source_binding))
         elif source == "PAPER":
-            registry = ForwardTestRegistry(self.store)
-            strategy_hash = _binding_value(record.get("strategy_hash"))
-            expected_candidate = _binding_value(binding.get("candidate_id"))
-            expected_trial = _binding_value(
-                binding.get("research_trial_id", binding.get("trial_id"))
-            )
-            if not strategy_hash or not expected_candidate or not expected_trial:
-                raise ValueError("PAPER_BINDING_REQUIRED")
+            registry_loader = getattr(self.store, "load_forward_tests", None)
+            if not callable(registry_loader):
+                raise ValueError("PAPER_REGISTRY_UNAVAILABLE")
             try:
-                specs = registry.list()
+                try:
+                    spec_values = registry_loader(limit=_MAX_ROLLING_SOURCE_ROWS)
+                    if isinstance(spec_values, Mapping):
+                        spec_values = spec_values.get("records", spec_values.get("rows", ()))
+                    specs: list[Any] = []
+                    for spec in spec_values or ():
+                        if len(specs) >= _MAX_ROLLING_SOURCE_ROWS:
+                            break
+                        specs.append(spec)
+                except TypeError:
+                    # An adapter without an explicit bounded parameter cannot
+                    # safely be used for rolling discovery.
+                    specs = []
             except Exception as exc:
                 raise ValueError("PAPER_REGISTRY_UNAVAILABLE") from exc
+            matched_spec = False
             for spec in specs:
-                if str(spec.strategy_hash).strip() != strategy_hash:
+                if not isinstance(spec, Mapping):
                     continue
-                experiment_id = _binding_value(spec.experiment_id)
-                config = spec.config if isinstance(spec.config, Mapping) else {}
-                spec_binding = _rolling_source_binding({"payload": config})
+                spec_strategy_hash = _binding_value(spec.get("strategy_hash"))
+                experiment_id = _binding_value(spec.get("experiment_id"))
+                config = spec.get("config")
+                config = config if isinstance(config, Mapping) else {}
+                source_strategy_hash = _binding_value(
+                    config.get("source_strategy_hash")
+                ) or spec_strategy_hash
+                rolling_strategy_hash = _binding_value(
+                    config.get("rolling_strategy_hash")
+                ) or spec_strategy_hash
+                if (
+                    source_strategy_hash != spec_strategy_hash
+                    or rolling_strategy_hash != strategy_hash
+                ):
+                    continue
+                try:
+                    spec_binding = _rolling_source_binding(
+                        {"payload": config, "strategy_hash": spec_strategy_hash}
+                    )
+                except (TypeError, ValueError):
+                    continue
                 spec_candidate = _binding_value(spec_binding.get("candidate_id"))
                 spec_trial = _binding_value(
                     spec_binding.get("research_trial_id", spec_binding.get("trial_id"))
+                )
+                spec_strategy_version = _binding_value(
+                    spec_binding.get("strategy_version_id")
                 )
                 if (
                     not experiment_id
                     or spec_candidate != expected_candidate
                     or spec_trial != expected_trial
+                    or spec_strategy_version != expected_strategy_version
                 ):
-                    raise ValueError("PAPER_SPEC_BINDING_MISMATCH")
-                for method_name in (
-                    "list_paper_observations",
-                    "list_paper_execution_events",
-                    "list_paper_bet_ledger",
-                ):
-                    loader = getattr(self.store, method_name, None)
-                    if not callable(loader):
+                    continue
+                matched_spec = True
+                loader = getattr(self.store, "list_paper_bet_ledger", None)
+                if not callable(loader):
+                    continue
+                try:
+                    values = loader(experiment_id, limit=_MAX_ROLLING_SOURCE_ROWS)
+                except Exception as exc:
+                    raise ValueError("PAPER_SOURCE_UNAVAILABLE") from exc
+                row_binding = {
+                    **source_binding,
+                    "experiment_id": experiment_id,
+                }
+                for item_index, item in enumerate(values or ()):
+                    if item_index >= _MAX_ROLLING_SOURCE_ROWS:
+                        break
+                    if not isinstance(item, Mapping):
                         continue
-                    try:
-                        values = loader(experiment_id, limit=_MAX_ROLLING_SOURCE_ROWS)
-                    except Exception as exc:
-                        raise ValueError("PAPER_SOURCE_UNAVAILABLE") from exc
-                    for item in values or ():
-                        if not isinstance(item, Mapping):
-                            continue
-                        row = _rolling_snapshot_view(item)
-                        # The loader's experiment predicate is part of the
-                        # binding, but retain the row identity check so custom
-                        # stores cannot smuggle another experiment's payload.
-                        if _binding_value(row.get("experiment_id")) != experiment_id:
-                            raise ValueError("PAPER_EXPERIMENT_BINDING_UNPROVEN")
-                        row_binding = _rolling_source_binding(item)
-                        row_candidate = _binding_value(row_binding.get("candidate_id"))
-                        row_trial = _binding_value(
-                            row_binding.get("research_trial_id", row_binding.get("trial_id"))
-                        )
-                        if row_candidate and row_candidate != expected_candidate:
-                            raise ValueError("PAPER_CANDIDATE_BINDING_MISMATCH")
-                        if row_trial and row_trial != expected_trial:
-                            raise ValueError("PAPER_TRIAL_BINDING_MISMATCH")
-                        row["_paper_experiment_id"] = experiment_id
+                    raw_view = _rolling_snapshot_view(item)
+                    raw_strategy_values = (
+                        item.get("strategy_hash"),
+                        item.get("strategy_id"),
+                        raw_view.get("strategy_hash"),
+                        raw_view.get("strategy_id"),
+                    )
+                    allowed_hashes = {strategy_hash, spec_strategy_hash}
+                    if any(
+                        _binding_value(value) is not None
+                        and _binding_value(value) not in allowed_hashes
+                        for value in raw_strategy_values
+                    ):
+                        rejected = dict(item)
+                        rejected["_rolling_accounting_rejection"] = "PAPER_STRATEGY_BINDING_CONFLICT"
+                        rows.append(rejected)
+                        continue
+                    raw_source_values = (
+                        item.get("source_strategy_hash"),
+                        raw_view.get("source_strategy_hash"),
+                    )
+                    if any(
+                        _binding_value(value) is not None
+                        and _binding_value(value) != spec_strategy_hash
+                        for value in raw_source_values
+                    ):
+                        rejected = dict(item)
+                        rejected["_rolling_accounting_rejection"] = "PAPER_SOURCE_STRATEGY_BINDING_CONFLICT"
+                        rows.append(rejected)
+                        continue
+                    translated_item = dict(item)
+                    translated_item["strategy_hash"] = strategy_hash
+                    translated_item["source_strategy_hash"] = spec_strategy_hash
+                    translated_item["rolling_strategy_hash"] = strategy_hash
+                    raw_payload = translated_item.get("payload")
+                    if isinstance(raw_payload, Mapping):
+                        translated_payload = dict(raw_payload)
+                        translated_payload["strategy_hash"] = strategy_hash
+                        translated_payload["source_strategy_hash"] = spec_strategy_hash
+                        translated_payload["rolling_strategy_hash"] = strategy_hash
+                        translated_item["payload"] = translated_payload
+                    row = _rolling_inject_source_binding(translated_item, row_binding)
+                    if row.get("_rolling_accounting_rejection"):
                         rows.append(row)
+                        continue
+                    row_view = _rolling_snapshot_view(row)
+                    if (
+                        _binding_value(item.get("experiment_id")) is not None
+                        and _binding_value(item.get("experiment_id")) != experiment_id
+                    ):
+                        row["_rolling_accounting_rejection"] = "PAPER_EXPERIMENT_BINDING_CONFLICT"
+                        rows.append(row)
+                        continue
+                    row_strategy = _binding_value(
+                        row_view.get("strategy_hash", row_view.get("strategy_id"))
+                    )
+                    if row_strategy and row_strategy != strategy_hash:
+                        row["_rolling_accounting_rejection"] = "PAPER_STRATEGY_BINDING_CONFLICT"
+                        rows.append(row)
+                        continue
+                    row["_paper_experiment_id"] = experiment_id
+                    rows.append(row)
+            if not matched_spec:
+                raise ValueError("PAPER_SPEC_BINDING_MISMATCH")
         resolved_scope_market_ids = _rolling_rule_scope_market_ids(
             self.store,
             record,
@@ -2170,45 +3512,71 @@ class AutonomousResearchProcessor:
                 continue
             if _rolling_campaign_bound(row):
                 continue
-            for field_name in ("dataset_id", "dataset_version", "version"):
-                expected = binding.get(field_name)
-                if expected is None or expected == "":
-                    continue
-                actual = row.get(field_name)
-                if actual is not None and actual != "" and _canonical_binding(actual) != _canonical_binding(expected):
-                    break
-            else:
-                scope = binding.get("market_scope", binding.get("scope"))
-                scope = scope if isinstance(scope, Mapping) else {}
-                if resolved_scope_market_ids is not None:
-                    expected_markets = resolved_scope_market_ids
-                else:
-                    expected_markets = scope.get(
-                        "market_ids",
-                        scope.get(
-                            "markets",
-                            binding.get("market_ids", binding.get("market_id", ())),
-                        ),
-                    )
-                    if isinstance(expected_markets, str):
-                        expected_markets = (expected_markets,)
-                    expected_markets = {
-                        str(item).strip()
-                        for item in (expected_markets or ())
-                        if str(item).strip()
-                    }
-                if resolved_scope_market_ids is not None and not expected_markets:
-                    continue
-                if expected_markets:
-                    actual_market = str(row.get("market_id", "")).strip()
-                    if actual_market not in expected_markets:
-                        continue
+            if row.get("_rolling_accounting_rejection"):
                 row["source_class"] = persisted_source
                 row["source_type"] = persisted_source
                 row["requested_source_class"] = source
                 row["requested_source_type"] = source
-                if _rolling_row_time(row) is not None:
+                normalized.append(row)
+                continue
+            accounting = self._rolling_accounting_projection(row, record)
+            if accounting is None:
+                if row.get("_rolling_accounting_rejection"):
+                    row["source_class"] = persisted_source
+                    row["source_type"] = persisted_source
+                    row["requested_source_class"] = source
+                    row["requested_source_type"] = source
                     normalized.append(row)
+                continue
+            row["_rolling_accounting"] = dict(accounting)
+            binding_conflict = False
+            for field_name in ("dataset_id", "dataset_version", "version"):
+                expected = source_binding.get(field_name)
+                if expected is None or expected == "":
+                    continue
+                actual = row.get(field_name)
+                if actual is not None and actual != "" and _canonical_binding(actual) != _canonical_binding(expected):
+                    binding_conflict = True
+                    break
+            if binding_conflict:
+                row["_rolling_accounting_rejection"] = "SOURCE_BINDING_CONFLICT"
+                row["source_class"] = persisted_source
+                row["source_type"] = persisted_source
+                row["requested_source_class"] = source
+                row["requested_source_type"] = source
+                normalized.append(row)
+                continue
+            scope = binding.get("market_scope", binding.get("scope"))
+            scope = scope if isinstance(scope, Mapping) else {}
+            if resolved_scope_market_ids is not None:
+                expected_markets = resolved_scope_market_ids
+            else:
+                expected_markets = scope.get(
+                    "market_ids",
+                    scope.get(
+                        "markets",
+                        binding.get("market_ids", binding.get("market_id", ())),
+                    ),
+                )
+                if isinstance(expected_markets, str):
+                    expected_markets = (expected_markets,)
+                expected_markets = {
+                    str(item).strip()
+                    for item in (expected_markets or ())
+                    if str(item).strip()
+                }
+            if resolved_scope_market_ids is not None and not expected_markets:
+                continue
+            if expected_markets:
+                actual_market = str(row.get("market_id", "")).strip()
+                if actual_market not in expected_markets:
+                    continue
+            row["source_class"] = persisted_source
+            row["source_type"] = persisted_source
+            row["requested_source_class"] = source
+            row["requested_source_type"] = source
+            if _rolling_row_time(row) is not None:
+                normalized.append(row)
         normalized.sort(
             key=lambda row: (
                 _rolling_row_time(row) or datetime.min.replace(tzinfo=timezone.utc),
@@ -2226,215 +3594,150 @@ class AutonomousResearchProcessor:
         days: int,
         now: datetime,
     ) -> dict[str, Any] | None:
+        """Aggregate explicit strategy accounting; prices are never PnL input."""
         if days not in {7, 30} or not rows:
             return None
         requested_source = _rolling_source_name(source_class)
         persisted_source = _rolling_persisted_source_class(requested_source)
-        normalized = [_rolling_snapshot_view(row) for row in rows if isinstance(row, Mapping)]
-        stamped = [(row, _rolling_row_time(row)) for row in normalized]
-        stamped = [(row, stamp) for row, stamp in stamped if stamp is not None]
-        if not stamped:
+        projected: list[tuple[Mapping[str, Any], Mapping[str, Any]]] = []
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            accounting = row.get("_rolling_accounting")
+            if not isinstance(accounting, Mapping):
+                accounting = self._rolling_accounting_projection(row, strategy)
+            if isinstance(accounting, Mapping):
+                projected.append((row, accounting))
+        if not projected:
             return None
-        stream_through = max(stamp for _, stamp in stamped)
+        stream_through = max(
+            accounting["_available_through"]
+            for _row, accounting in projected
+            if isinstance(accounting.get("_available_through"), datetime)
+        )
         requested_start = stream_through - timedelta(days=days)
-        window_rows = [
-            (row, stamp)
-            for row, stamp in stamped
-            if requested_start <= stamp <= stream_through
+        selected = [
+            (row, accounting)
+            for row, accounting in projected
+            if accounting["_available_through"] >= requested_start
+            and accounting["_available_from"] <= stream_through
         ]
-        if not window_rows:
+        if not selected:
             return None
+        intervals: list[tuple[datetime, datetime]] = []
+        for _row, accounting in selected:
+            start = max(requested_start, accounting["_available_from"])
+            end = min(stream_through, accounting["_available_through"])
+            if end >= start:
+                intervals.append((start, end))
+        if not intervals:
+            return None
+        intervals.sort()
+        merged: list[tuple[datetime, datetime]] = []
+        for start, end in intervals:
+            if not merged or start > merged[-1][1]:
+                merged.append((start, end))
+            elif end > merged[-1][1]:
+                merged[-1] = (merged[-1][0], end)
+        actual_coverage = sum(int((end - start).total_seconds()) for start, end in merged)
+        available_from = min(start for start, _end in intervals)
+        available_through = max(end for _start, end in intervals)
 
-        paths: dict[str, list[tuple[Mapping[str, Any], datetime]]] = {}
-        for row, stamp in window_rows:
-            paths.setdefault(_rolling_market_key(row), []).append((row, stamp))
-        for path_rows in paths.values():
-            path_rows.sort(
-                key=lambda item: (
-                    item[1],
-                    str(item[0].get("snapshot_id", item[0].get("observation_id", ""))),
-                )
-            )
+        def metric(accounting: Mapping[str, Any], *names: str) -> Decimal:
+            for name in names:
+                if accounting.get(name) is not None:
+                    return Decimal(str(accounting[name]))
+            raise ValueError("validated accounting metric is missing")
 
-        path_intervals: dict[str, list[tuple[datetime, datetime]]] = {}
-        path_rates: list[Decimal] = []
-        path_pnls: list[tuple[Decimal, bool]] = []
-        path_drawdowns: list[Decimal] = []
-        path_price_rows: dict[str, list[tuple[datetime, Decimal]]] = {}
-        document = (
-            strategy.get("strategy_document")
-            if isinstance(strategy.get("strategy_document"), Mapping)
-            else {}
+        net_return = sum(
+            (
+                metric(accounting, "allocated_capital_net_return", "net_return")
+                for _row, accounting in selected
+            ),
+            Decimal("0"),
         )
-        family = str(document.get("family", "")).strip().lower()
-        mean_reversion = family in {"mean_reversion", "mean-reversion", "dip", "rsi", "lottery_ticket", "tails"}
-        for path, path_rows in paths.items():
-            intervals: list[tuple[datetime, datetime]] = []
-            prices: list[tuple[datetime, Decimal]] = []
-            path_rate = Decimal("0")
-            previous_price: Decimal | None = None
-            for index, (row, _stamp) in enumerate(path_rows):
-                interval = _rolling_observation_interval(
-                    row,
-                    previous_timestamp=(
-                        path_rows[index - 1][1] if index > 0 else None
-                    ),
-                    next_timestamp=(
-                        path_rows[index + 1][1]
-                        if index + 1 < len(path_rows)
-                        else None
-                    ),
-                )
-                complete = row.get(
-                    "observation_complete",
-                    row.get("complete", row.get("is_complete", True)),
-                )
-                if interval is not None and complete is not False:
-                    start, end = interval
-                    intervals.append(
-                        (max(start, requested_start), min(end, stream_through))
-                    )
-                price = _rolling_price(row)
-                if price is not None:
-                    prices.append((_stamp, price))
-                    if previous_price is not None:
-                        step = price - previous_price
-                        path_rate += -step if mean_reversion else step
-                    previous_price = price
-            intervals = [(start, end) for start, end in intervals if end >= start]
-            if intervals:
-                intervals.sort()
-                merged: list[tuple[datetime, datetime]] = []
-                for start, end in intervals:
-                    if not merged or start > merged[-1][1]:
-                        merged.append((start, end))
-                    elif end > merged[-1][1]:
-                        merged[-1] = (merged[-1][0], end)
-                path_intervals[path] = merged
-                path_rates.append(path_rate)
-                path_pnls.append(
-                    (
-                        Decimal("100") * path_rate,
-                        _rolling_terminal_outcome(path_rows[-1][0]),
-                    )
-                )
-                path_price_rows[path] = prices
-                equity = Decimal("100")
-                peak = equity
-                drawdown = Decimal("0")
-                for (_previous_stamp, previous_price), (_stamp, price) in zip(prices, prices[1:]):
-                    step = price - previous_price
-                    equity += Decimal("100") * (-step if mean_reversion else step)
-                    peak = max(peak, equity)
-                    if peak > Decimal("0"):
-                        drawdown = max(drawdown, (peak - equity) / peak)
-                path_drawdowns.append(drawdown)
-        if not path_rates:
+        realized_pnl = sum((metric(accounting, "realized_pnl") for _row, accounting in selected), Decimal("0"))
+        unrealized_pnl = sum((metric(accounting, "unrealized_pnl") for _row, accounting in selected), Decimal("0"))
+        fees = sum((metric(accounting, "fees", "fee_costs") for _row, accounting in selected), Decimal("0"))
+        costs = sum((metric(accounting, "costs", "slippage_costs") for _row, accounting in selected), Decimal("0"))
+        if min(fees, costs) < Decimal("0"):
             return None
-
-        all_intervals = [
-            interval
-            for intervals in path_intervals.values()
-            for interval in intervals
+        if not any(
+            accounting.get("allocated_capital_net_return") is not None
+            or accounting.get("net_return") is not None
+            for _row, accounting in selected
+        ):
+            net_return = realized_pnl + unrealized_pnl - fees - costs
+        completed_values = [
+            metric(accounting, "completed_outcomes")
+            for _row, accounting in selected
+            if accounting.get("completed_outcomes") is not None
         ]
-        if not all_intervals:
+        completed = sum(int(value) for value in completed_values if value == value.to_integral_value())
+        if any(value != value.to_integral_value() or value < 0 for value in completed_values):
             return None
-        all_intervals.sort()
-        merged_intervals: list[tuple[datetime, datetime]] = []
-        for start, end in all_intervals:
-            if not merged_intervals or start > merged_intervals[-1][1]:
-                merged_intervals.append((start, end))
-            elif end > merged_intervals[-1][1]:
-                merged_intervals[-1] = (merged_intervals[-1][0], end)
-        actual_coverage = sum(
-            int((end - start).total_seconds()) for start, end in merged_intervals
-        )
-        available_from = min(start for start, _end in all_intervals)
-        available_through = max(end for _start, end in all_intervals)
-        gross_rate = sum(path_rates, Decimal("0")) / Decimal(len(path_rates))
-        sizing = Decimal("100")
-        fee_rate = Decimal("0.001")
-        slippage_rate = Decimal("0.0005")
-        generated_fees = sizing * fee_rate
-        generated_costs = sizing * slippage_rate
-        persisted_fees = sum(
-            (
-                _rolling_number(row.get("fees", row.get("fee_costs")))
-                for row, _ in window_rows
-                if row.get("fees", row.get("fee_costs")) is not None
-            ),
-            Decimal("0"),
-        )
-        persisted_costs = sum(
-            (
-                _rolling_number(row.get("costs", row.get("slippage_costs")))
-                for row, _ in window_rows
-                if row.get("costs", row.get("slippage_costs")) is not None
-            ),
-            Decimal("0"),
-        )
-        fees = persisted_fees if persisted_fees > Decimal("0") else generated_fees
-        costs = persisted_costs if persisted_costs > Decimal("0") else generated_costs
-        net_return = sizing * gross_rate - fees - costs
-        path_count = len(path_pnls)
-        per_path_cost = (fees + costs) / Decimal(path_count) if path_count else Decimal("0")
-        realized_pnl = sum(
-            (
-                path_pnl / Decimal(path_count) - per_path_cost
-                for path_pnl, terminal in path_pnls
-                if terminal
-            ),
-            Decimal("0"),
-        )
-        unrealized_pnl = sum(
-            (
-                path_pnl / Decimal(path_count) - per_path_cost
-                for path_pnl, terminal in path_pnls
-                if not terminal
-            ),
-            Decimal("0"),
-        )
-        completed = sum(1 for _path_pnl, terminal in path_pnls if terminal)
+        reliability_values = [
+            metric(accounting, "reliability")
+            for _row, accounting in selected
+            if accounting.get("reliability") is not None
+        ]
+        if any(value < Decimal("0") or value > Decimal("1") for value in reliability_values):
+            return None
         reliability = (
-            Decimal(completed) / Decimal(path_count) if path_count else Decimal("0")
+            sum(reliability_values, Decimal("0")) / Decimal(len(reliability_values))
+            if reliability_values
+            else Decimal("0")
         )
-        overlap_key = _rolling_overlap_key([row for row, _ in window_rows])
+        drawdowns = [
+            metric(accounting, "drawdown")
+            for _row, accounting in selected
+            if accounting.get("drawdown") is not None
+        ]
+        if any(value < Decimal("0") or value > Decimal("1") for value in drawdowns):
+            return None
+        drawdown = max(drawdowns, default=Decimal("0"))
+        allocated_capital = sum(
+            (metric(accounting, "allocated_capital", "paper_sizing", "paper_size") for _row, accounting in selected),
+            Decimal("0"),
+        )
+        feasibility: Any = ""
+        for _row, accounting in selected:
+            if accounting.get("execution_feasibility") is not None:
+                feasibility = accounting["execution_feasibility"]
+                if isinstance(feasibility, bool):
+                    feasibility = str(feasibility)
+                if str(feasibility).strip().upper() in {"FALSE", "NO", "INFEASIBLE"} or feasibility is False:
+                    feasibility = "False"
+                    break
+        provenance = strategy.get("provenance") if isinstance(strategy.get("provenance"), Mapping) else {}
+        candidate_id = str(strategy.get("candidate_id") or provenance.get("candidate_id") or "").strip() or None
+        trial_id = str(strategy.get("research_trial_id") or provenance.get("research_trial_id") or "").strip() or None
         source_binding = _rolling_source_binding(strategy)
-        provenance = (
-            strategy.get("provenance")
-            if isinstance(strategy.get("provenance"), Mapping)
-            else {}
-        )
-        candidate_id = str(
-            strategy.get("candidate_id") or provenance.get("candidate_id") or ""
-        ).strip() or None
-        trial_id = str(
-            strategy.get("research_trial_id") or provenance.get("research_trial_id") or ""
-        ).strip() or None
-
-        def metric_inputs(row: Mapping[str, Any]) -> dict[str, Any]:
-            names = (
-                "settlement",
-                "settlement_state",
-                "settlement_status",
-                "resolution",
-                "resolution_state",
-                "resolution_status",
-                "resolved",
-                "resolved_status",
-                "settled",
-                "terminal",
-                "outcome",
-                "status",
-                "state",
-                "observation_complete",
-                "complete",
-                "is_complete",
-                "observation_completeness",
-                "reliability",
-            )
-            return {name: row.get(name) for name in names if name in row}
-
+        accounting_digest = [
+            {
+                "identity": str(
+                    row.get("accounting_id", row.get("ledger_id", row.get("observation_id", "")))
+                ),
+                "from": accounting["_available_from"],
+                "through": accounting["_available_through"],
+                "metrics": {
+                    key: accounting.get(key)
+                    for key in (
+                        "allocated_capital_net_return",
+                        "net_return",
+                        "realized_pnl",
+                        "unrealized_pnl",
+                        "fees",
+                        "costs",
+                        "completed_outcomes",
+                        "reliability",
+                        "drawdown",
+                    )
+                    if accounting.get(key) is not None
+                },
+            }
+            for row, accounting in selected
+        ]
         digest = _rolling_hash(
             {
                 "strategy_version_id": strategy["strategy_version_id"],
@@ -2442,47 +3745,12 @@ class AutonomousResearchProcessor:
                 "candidate_id": candidate_id,
                 "source_class": persisted_source,
                 "requested_source_class": requested_source,
-                "requested_source_type": requested_source,
                 "source_binding": source_binding,
                 "requested_days": days,
                 "available_from": available_from,
                 "available_through": available_through,
                 "actual_coverage_seconds": actual_coverage,
-                "market_paths": {
-                    path: [
-                        {
-                            "identity": str(
-                                row.get(
-                                    "snapshot_id",
-                                    row.get("observation_id", row.get("timestamp", index)),
-                                )
-                            ),
-                            "time": stamp,
-                            "price": _rolling_price(row),
-                            "terminal": _rolling_terminal_outcome(row),
-                            "inputs": metric_inputs(row),
-                        }
-                        for index, (row, stamp) in enumerate(paths[path])
-                    ]
-                    for path in sorted(paths)
-                },
-                "reliability": reliability,
-                "completed_outcomes": completed,
-                "observation_completeness": (
-                    min(
-                        (
-                            _rolling_number(
-                                row.get(
-                                    "observation_completeness",
-                                    row.get("completeness", 1),
-                                ),
-                                Decimal("1"),
-                            )
-                            for row, _ in window_rows
-                        ),
-                        default=Decimal("0"),
-                    )
-                ),
+                "accounting": accounting_digest,
             }
         )
         window_id = "rolling-window-" + digest.removeprefix("sha256:")[:40]
@@ -2503,36 +3771,40 @@ class AutonomousResearchProcessor:
             "actual_coverage_seconds": actual_coverage,
             "observation_completeness": str(completeness),
             "source_class": persisted_source,
-            "requested_source_class": requested_source,
-            "requested_source_type": requested_source,
-            "dataset_selector": source_binding,
             "paper_sizing_assumptions": {
                 "currency": "USD",
-                "allocated_capital": str(sizing),
-                "sizing_model": "fixed",
+                "allocated_capital": str(allocated_capital),
+                "sizing_model": "canonical_accounting",
             },
-            "paper_fee_assumptions": {"fee_rate": str(fee_rate), "fee_bps": "10"},
-            "paper_slippage_assumptions": {
-                "slippage_rate": str(slippage_rate),
-                "slippage_bps": "5",
-            },
+            "paper_fee_assumptions": {"fee_rate": "0", "fee_bps": "0"},
+            "paper_slippage_assumptions": {"slippage_rate": "0", "slippage_bps": "0"},
             "allocated_capital_net_return": str(net_return),
             "realized_pnl": str(realized_pnl),
             "unrealized_pnl": str(unrealized_pnl),
             "fees": str(fees),
             "costs": str(costs),
-            "drawdown": str(max(path_drawdowns, default=Decimal("0"))),
+            "drawdown": str(drawdown),
             "completed_outcomes": completed,
             "reliability": str(reliability),
-            "execution_feasibility": "TRUE",
+            "execution_feasibility": feasibility,
             "evidence_digest": "",
-            "overlap_key": overlap_key,
-            "market_path_count": len(path_rates),
-            "market_path_keys": sorted(path_price_rows),
+            "overlap_key": _rolling_overlap_key([row for row, _accounting in selected]),
+            "market_path_count": len(
+                {
+                    str(row.get("market_id")).strip()
+                    for row, _accounting in selected
+                    if str(row.get("market_id", "")).strip()
+                }
+            ),
+            "market_path_keys": sorted(
+                {
+                    str(row.get("market_id")).strip()
+                    for row, _accounting in selected
+                    if str(row.get("market_id", "")).strip()
+                }
+            ),
             "paper_only": True,
             "rolling_research": True,
-            # The stream's immutable end is the measurement anchor.  Using
-            # ``now`` here would make a retry of the same window conflict.
             "measured_at": available_through.isoformat(),
         }
         record["evidence_digest"] = RollingEvidence.from_mapping(record).evidence_digest
@@ -2545,9 +3817,11 @@ class AutonomousResearchProcessor:
         strategies = self._rolling_persist_strategy_lineage(documents, current)
         sources = ("HISTORICAL", "REPLAY", "PAPER", "LIVE")
         queue_payload = _rolling_hermes_payload(strategies, sources, current)
+        queue_identity = dict(queue_payload)
+        queue_identity.pop("available_at", None)
         queue_item = self.bus.submit_review_request(
             queue_payload,
-            dedupe_key="rolling-research:" + _rolling_hash(queue_payload),
+            dedupe_key="rolling-research:" + _rolling_hash(queue_identity),
             available_at=current,
         )
         evidence_rows: list[dict[str, Any]] = []
@@ -2559,7 +3833,9 @@ class AutonomousResearchProcessor:
 
         def add_pending(item: Mapping[str, Any]) -> None:
             if len(pending) < _MAX_ROLLING_QUEUE_RESULTS:
-                pending.append(dict(item))
+                entry = dict(item)
+                entry.setdefault("next_job", "rolling-research-evidence")
+                pending.append(entry)
 
         for strategy in strategies:
             source_payload = dict(strategy)
@@ -2637,6 +3913,25 @@ class AutonomousResearchProcessor:
                 rows = source_cache[cache_key]
                 remaining = max(0, _MAX_ROLLING_TOTAL_ROWS - total_rows)
                 bounded_rows = list(rows[:remaining])
+                accounting_rejections = sorted(
+                    {
+                        str(row.get("_rolling_accounting_rejection"))
+                        for row in bounded_rows
+                        if row.get("_rolling_accounting_rejection")
+                    }
+                )
+                for rejection in accounting_rejections:
+                    add_pending(
+                        {
+                            "strategy_version_id": strategy["strategy_version_id"],
+                            "research_trial_id": strategy["research_trial_id"],
+                            "candidate_id": strategy.get("candidate_id"),
+                            "source_class": canonical_source,
+                            "requested_days": [7, 30],
+                            "status": "ERROR",
+                            "reason": rejection,
+                        }
+                    )
                 total_rows += len(bounded_rows)
                 for days in (7, 30):
                     evidence = self._rolling_evidence_record(
@@ -2695,13 +3990,28 @@ class AutonomousResearchProcessor:
             if total_rows >= _MAX_ROLLING_TOTAL_ROWS:
                 break
         if not strategies:
-            pending.append({
+            proposal_items: tuple[Any, ...] = ()
+            proposal_error: str | None = None
+            try:
+                proposal_items = tuple(self._enqueue_predeclared_from_persisted_scope(current) or ())
+            except (AutonomousResearchError, ResearchBusPermissionError, TypeError, ValueError, RuntimeError) as exc:
+                proposal_error = f"{type(exc).__name__}: {str(exc)[:256]}"
+            fallback = {
                 "strategy_version_id": None,
                 "source_class": "ALL",
                 "requested_days": [7, 30],
-                "status": "SCHEDULED",
-                "reason": "NO_STRATEGY_DEFINITIONS",
-            })
+                "status": "SCHEDULED" if proposal_error is None else "ERROR",
+                "reason": "NO_STRATEGY_DEFINITIONS" if proposal_error is None else "PROPOSAL_PATH_FAILED",
+                "next_job": "predeclared_starting_set",
+                "proposal_queue_item_ids": [
+                    str(item.item_id)
+                    for item in proposal_items
+                    if getattr(item, "item_id", None)
+                ],
+            }
+            if proposal_error is not None:
+                fallback["error"] = proposal_error
+            add_pending(fallback)
         state = _rolling_state_payload(
             status="SCHEDULED" if pending else "READY",
             scheduled_at=current.isoformat(),
@@ -8897,6 +10207,10 @@ class AutonomousResearchProcessor:
                 plan,
                 strict=generation > 0 and plan.market_type is MarketType.PREDICTION,
             )
+            strategy_hash = _content_hash(strategy.to_dict())
+            rolling_strategy_document = dict(strategy.to_dict())
+            rolling_strategy_document.pop("strategy_id", None)
+            rolling_strategy_hash = _rolling_hash(rolling_strategy_document)
             if plan.market_type is MarketType.CRYPTO_SPOT:
                 # Crypto autonomous candidates are historical research only.
                 # They are deliberately never registered with ForwardTestRegistry.
@@ -8934,10 +10248,26 @@ class AutonomousResearchProcessor:
             }
             forward_config["exit_policy"] = dict(plan.exit_policy)
             forward_config["research_mode"] = plan.research_mode
+            strategy_version_id = "strategy-version-" + _rolling_hash(
+                {"strategy_hash": rolling_strategy_hash, "candidate_id": candidate_id}
+            ).removeprefix("sha256:")[:40]
+            research_trial_id = "research-trial-" + _rolling_hash(
+                {
+                    "candidate_id": candidate_id,
+                    "strategy_version_id": strategy_version_id,
+                    "source_config_hash": plan.plan_hash,
+                }
+            ).removeprefix("sha256:")[:40]
+            forward_config["strategy_version_id"] = strategy_version_id
+            forward_config["research_trial_id"] = research_trial_id
+            forward_config["candidate_id"] = candidate_id
+            forward_config["plan_id"] = plan.plan_id
+            forward_config["strategy_hash"] = strategy_hash
+            forward_config["source_strategy_hash"] = strategy_hash
+            forward_config["rolling_strategy_hash"] = rolling_strategy_hash
             if plan.market_type is not MarketType.CRYPTO_SPOT:
                 forward_config = _canonical_forward_config(forward_config)
             config_hash = _hash_document({"config": forward_config, "risk_limits": risk_snapshot})
-            strategy_hash = _content_hash(strategy.to_dict())
             model_hash = _content_hash(model_document)
             frozen_hash = hashlib.sha256("|".join((strategy_hash, model_hash, config_hash)).encode("utf-8")).hexdigest()
             candidate = self.lifecycle.advance(
@@ -8948,6 +10278,10 @@ class AutonomousResearchProcessor:
                     **base,
                     "frozen": True,
                     "strategy_hash": strategy_hash,
+                    "source_strategy_hash": strategy_hash,
+                    "rolling_strategy_hash": rolling_strategy_hash,
+                    "strategy_version_id": strategy_version_id,
+                    "research_trial_id": research_trial_id,
                     "model_hash": model_hash,
                     "config_hash": config_hash,
                     "frozen_hash": frozen_hash,
@@ -9021,7 +10355,6 @@ class AutonomousResearchProcessor:
                     "research_only": True,
                     "paper_only": True,
                 }
-
             registry = ForwardTestRegistry(self.store)
             spec = registry.register_forward_test(
                 strategy=strategy.to_dict(),
@@ -9033,6 +10366,8 @@ class AutonomousResearchProcessor:
                 allowed_markets=allowed_markets,
                 risk_limits=risk_snapshot,
                 experiment_id="forward-" + candidate_id,
+                strategy_version_id=strategy_version_id,
+                research_trial_id=research_trial_id,
             )
             candidate = self.lifecycle.advance(
                 candidate_id,
@@ -9604,6 +10939,13 @@ class AutonomousResearchProcessor:
         spec = ForwardTestRegistry(self.store).get(forward_id)
         if spec is None:
             raise ValueError(f"missing forward test {forward_id}")
+        spec_config = spec.config if isinstance(spec.config, Mapping) else {}
+        try:
+            paper_lineage = _rolling_source_binding(
+                {"payload": spec_config, "strategy_hash": spec.strategy_hash}
+            )
+        except (TypeError, ValueError):
+            paper_lineage = {}
         observations = self.store.list_paper_observations(forward_id, limit=_MAX_FORWARD_ROWS)
         fills: list[Fill] = []
         try:
@@ -9633,33 +10975,202 @@ class AutonomousResearchProcessor:
         fills_by_market: dict[str, list[Fill]] = {}
         for fill in fills:
             fills_by_market.setdefault(str(fill.market_id or fill.symbol), []).append(fill)
+        observation_open_by_market: dict[str, datetime] = {}
+        for observation in observations:
+            if not isinstance(observation, Mapping):
+                continue
+            observation_payload = observation.get("payload")
+            observation_payload = (
+                observation_payload
+                if isinstance(observation_payload, Mapping)
+                else {}
+            )
+            observation_market = str(
+                observation.get(
+                    "market_id",
+                    observation_payload.get("market_id", ""),
+                )
+            ).strip()
+            observation_time = _rolling_timestamp(
+                observation.get("timestamp")
+                or observation_payload.get("timestamp")
+                or observation.get("observed_at")
+                or observation_payload.get("observed_at")
+            )
+            if observation_market and observation_time is not None:
+                previous = observation_open_by_market.get(observation_market)
+                if previous is None or observation_time < previous:
+                    observation_open_by_market[observation_market] = observation_time
+
+        def complete_resolved_ledger(
+            source_ledger: Mapping[str, Any],
+            market: str,
+        ) -> dict[str, Any]:
+            ledger = dict(source_ledger)
+            rolling_hash = _binding_value(paper_lineage.get("rolling_strategy_hash"))
+            source_hash = _binding_value(
+                paper_lineage.get("source_strategy_hash")
+            ) or _binding_value(spec.strategy_hash)
+            if rolling_hash is not None:
+                ledger["strategy_hash"] = rolling_hash
+                ledger["rolling_strategy_hash"] = rolling_hash
+            elif source_hash is not None:
+                ledger["strategy_hash"] = source_hash
+            if source_hash is not None:
+                ledger["source_strategy_hash"] = source_hash
+            for field in (
+                "strategy_version_id",
+                "research_trial_id",
+                "candidate_id",
+                "plan_id",
+            ):
+                value = paper_lineage.get(field)
+                if value is not None:
+                    ledger[field] = value
+            shortages: list[str] = []
+            for field in ("net_pnl", "fees", "slippage", "capital_at_risk"):
+                value = ledger.get(field)
+                if value is None or not _is_finite_number(value):
+                    shortages.append(field)
+            resolved_time = _rolling_timestamp(ledger.get("resolved_at"))
+            if resolved_time is None:
+                shortages.append("resolved_at")
+            source_open_time = next(
+                (
+                    stamp
+                    for name in (
+                        "observation_open_timestamp",
+                        "observation_opened_at",
+                        "open_timestamp",
+                        "opened_at",
+                        "observation_timestamp",
+                        "observation_at",
+                        "available_from",
+                        "coverage_from",
+                        "window_start",
+                    )
+                    if (stamp := _rolling_timestamp(ledger.get(name))) is not None
+                ),
+                None,
+            )
+            if (
+                source_open_time is not None
+                and resolved_time is not None
+                and source_open_time > resolved_time
+            ):
+                shortages.append("observation_open_timestamp_after_resolved_at")
+            open_time = observation_open_by_market.get(market) or source_open_time
+            if open_time is None:
+                market_fills = fills_by_market.get(market, ())
+                if market_fills:
+                    open_time = min(ensure_utc(fill.timestamp) for fill in market_fills)
+            if open_time is None:
+                shortages.append("observation_open_timestamp")
+            elif resolved_time is not None and open_time > resolved_time:
+                shortages.append("observation_open_timestamp_after_resolved_at")
+            if shortages:
+                ledger["accounting_shortage"] = {
+                    "code": "PAPER_RESOLVED_BET_ACCOUNTING_INCOMPLETE",
+                    "fields": sorted(set(shortages)),
+                }
+                return ledger
+            capital = Decimal(str(ledger["capital_at_risk"]))
+            net_pnl = Decimal(str(ledger["net_pnl"]))
+            if not capital.is_finite() or capital <= Decimal("0"):
+                ledger["accounting_shortage"] = {
+                    "code": "PAPER_RESOLVED_BET_ACCOUNTING_INCOMPLETE",
+                    "fields": ["capital_at_risk_nonpositive"],
+                }
+                return ledger
+            drawdown = min(Decimal("1"), max(Decimal("0"), -net_pnl / capital))
+            ledger.pop("accounting_shortage", None)
+            ledger.update(
+                {
+                    "allocated_capital": ledger["capital_at_risk"],
+                    "allocated_capital_net_return": ledger["net_pnl"],
+                    "realized_pnl": ledger["net_pnl"],
+                    "unrealized_pnl": 0.0,
+                    "costs": ledger["slippage"],
+                    "completed_outcomes": 1,
+                    # Reliability means the settlement/accounting contract
+                    # completed, never that this bet was profitable.
+                    "reliability": 1.0,
+                    "drawdown": float(drawdown),
+                    "observation_open_timestamp": open_time.isoformat(),
+                    "available_from": open_time.isoformat(),
+                    "coverage_from": open_time.isoformat(),
+                    "available_through": resolved_time.isoformat(),
+                    "coverage_through": resolved_time.isoformat(),
+                }
+            )
+            return ledger
         ledger_by_market: dict[str, Mapping[str, Any]] = {}
         for row in ledger_records:
+            if not isinstance(row, Mapping):
+                continue
             market_id = str(row.get("market_id", "")).strip()
-            ledger = row.get("payload")
-            if market_id and isinstance(ledger, Mapping):
-                ledger_by_market[market_id] = ledger
+            source_ledger = row.get("payload")
+            if not market_id or not isinstance(source_ledger, Mapping):
+                continue
+            ledger = dict(source_ledger)
+            for field in ("bet_id", "outcome", "resolution", "resolved_at"):
+                if field not in ledger and row.get(field) is not None:
+                    value = row.get(field)
+                    ledger[field] = value.isoformat() if isinstance(value, datetime) else value
+            ledger = complete_resolved_ledger(ledger, market_id)
+            ledger_by_market[market_id] = ledger
+            resolved_time = _rolling_timestamp(ledger.get("resolved_at"))
+            if (
+                ledger.get("bet_id")
+                and ledger.get("outcome")
+                and ledger.get("resolution")
+                and resolved_time is not None
+            ):
+                self.store.save_paper_bet_ledger(
+                    str(ledger["bet_id"]),
+                    forward_id,
+                    market_id,
+                    spec.strategy_hash,
+                    str(ledger["outcome"]),
+                    str(ledger["resolution"]),
+                    resolved_time,
+                    ledger,
+                )
         for market_id, resolution in terminal_by_market.items():
             if market_id in ledger_by_market:
+                continue
+            resolved_at = next(
+                (
+                    stamp
+                    for row in observations
+                    if isinstance(row, Mapping)
+                    and isinstance(row.get("payload"), Mapping)
+                    and str(
+                        row.get("market_id", row["payload"].get("market_id", ""))
+                    ).strip()
+                    == market_id
+                    and _settlement_name(row["payload"].get("settlement")) == resolution
+                    if (stamp := _rolling_timestamp(
+                        row.get("timestamp")
+                        or row["payload"].get("timestamp")
+                        or row.get("observed_at")
+                        or row["payload"].get("observed_at")
+                    )) is not None
+                ),
+                None,
+            )
+            if resolved_at is None:
                 continue
             ledger = build_resolved_bet(
                 experiment_id=forward_id,
                 market_id=market_id,
                 strategy_id=spec.strategy_hash,
                 settlement=resolution,
-                resolved_at=next(
-                    (
-                        row["timestamp"]
-                        for row in observations
-                        if str(row.get("market_id", "")) == market_id
-                        and isinstance(row.get("payload"), Mapping)
-                        and _settlement_name(row["payload"].get("settlement")) == resolution
-                    ),
-                    now,
-                ),
+                resolved_at=resolved_at,
                 fills=fills_by_market.get(market_id, ()),
             )
             if ledger is not None:
+                ledger = complete_resolved_ledger(ledger, market_id)
                 self.store.save_paper_bet_ledger(
                     ledger["bet_id"],
                     forward_id,

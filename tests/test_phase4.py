@@ -1005,6 +1005,11 @@ class Phase4AutonomousLoopTests(unittest.TestCase):
             spec = ForwardTestRegistry(store).freeze(
                 strategy=strategy,
                 model={"field": "model_probability"},
+                config={
+                    "candidate_id": "candidate-same-market",
+                    "strategy_version_id": "strategy-version-same-market",
+                    "research_trial_id": "trial-same-market",
+                },
                 start_timestamp=T0,
                 allowed_markets=("same-market",),
             )
@@ -1021,7 +1026,22 @@ class Phase4AutonomousLoopTests(unittest.TestCase):
                 ],
                 now=start + timedelta(minutes=2),
             )
-            evidence = _forward_evidence(store, spec, now=start + timedelta(days=1))
+            producer_ledger = store.list_paper_bet_ledger(spec.experiment_id)
+            self.assertEqual(len(producer_ledger), 1)
+            self.assertEqual(
+                producer_ledger[0]["payload"]["observation_open_timestamp"],
+                start.isoformat(),
+            )
+            self.assertEqual(producer_ledger[0]["payload"]["available_from"], start.isoformat())
+            # A delayed ledger write must retain the observation/open boundary,
+            # never use the storage insertion timestamp as coverage start.
+            delayed = start + timedelta(days=3)
+            with store.transaction():
+                store.connection.execute(
+                    "UPDATE paper_bet_ledger SET created_at=?,updated_at=?",
+                    (delayed.isoformat(), delayed.isoformat()),
+                )
+            evidence = _forward_evidence(store, spec, now=delayed)
             ledger = store.list_paper_bet_ledger(spec.experiment_id)
             self.assertEqual(cycle.fills_inserted, 2)
             self.assertEqual(evidence["fills"], 2)
@@ -1031,7 +1051,24 @@ class Phase4AutonomousLoopTests(unittest.TestCase):
             self.assertEqual(evidence["resolved_positions"], 1)
             self.assertEqual(len(ledger), 1)
             self.assertEqual(ledger[0]["payload"]["fills"], 2)
-
+            delayed_ledger = ledger[0]
+            self.assertEqual(delayed_ledger["payload"]["observation_open_timestamp"], start.isoformat())
+            self.assertEqual(delayed_ledger["payload"]["available_from"], start.isoformat())
+            self.assertNotEqual(delayed_ledger["payload"]["available_from"], delayed.isoformat())
+            rolling_record = {
+                "strategy_hash": spec.strategy_hash,
+                "strategy_version_id": "strategy-version-same-market",
+                "research_trial_id": "trial-same-market",
+                "candidate_id": "candidate-same-market",
+            }
+            rolling_rows = AutonomousResearchProcessor(store, clock=lambda: delayed)._rolling_source_rows(
+                rolling_record,
+                "PAPER",
+                delayed,
+            )
+            self.assertEqual(len(rolling_rows), 1)
+            self.assertEqual(rolling_rows[0]["_rolling_accounting"]["_available_from"], start)
+            self.assertEqual(rolling_rows[0]["_rolling_accounting"]["_available_through"], start + timedelta(minutes=2))
     def test_unresolved_fills_are_excluded_from_expectancy(self) -> None:
         with AxiomStore(":memory:") as store:
             strategy = _BuyEverySnapshot()

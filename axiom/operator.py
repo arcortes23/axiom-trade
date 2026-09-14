@@ -8,7 +8,9 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from decimal import Decimal
+import hashlib
 import ipaddress
+import json
 import os
 from pathlib import Path
 import re
@@ -826,32 +828,126 @@ def _safe_value(value: Any, *, depth: int = 0) -> Any:
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value if not isinstance(value, str) or len(value) <= 1024 else value[:1021] + "..."
     return str(value)[:1024]
+_ROLLING_POLICY_ID_ALIASES = ("policy_id", "id", "draft_id")
+_ROLLING_POLICY_VERSION_ALIASES = ("version", "policy_version", "draft_version")
+_ROLLING_POLICY_HASH_ALIASES = ("config_hash", "policy_hash", "draft_hash")
+
+
+def _rolling_identity_field(
+    source: Mapping[str, Any],
+    aliases: tuple[str, ...],
+    *,
+    required: bool,
+) -> str:
+    values: list[str] = []
+    for alias in aliases:
+        if alias not in source:
+            continue
+        raw = source.get(alias)
+        text = str(raw).strip() if raw is not None else ""
+        if not text:
+            raise OperatorControlError("ROLLING_POLICY_IDENTITY_REQUIRED")
+        values.append(text)
+    if values and len(set(values)) != 1:
+        raise OperatorControlError("ROLLING_POLICY_IDENTITY_AMBIGUOUS")
+    if required and not values:
+        raise OperatorControlError("ROLLING_POLICY_IDENTITY_REQUIRED")
+    return values[0] if values else ""
+
+
 def _rolling_policy_identity(
     value: Any,
     *,
     require_hash: bool = True,
 ) -> dict[str, str]:
-    """Normalize a persisted rolling-policy identity without version fallbacks."""
+    """Normalize a policy envelope and fail closed on nested identity conflicts."""
     if not isinstance(value, Mapping):
         raise OperatorControlError("ROLLING_POLICY_IDENTITY_REQUIRED")
-    policy_id_value = str(value.get("policy_id") or "").strip()
-    id_alias = str(value.get("id") or "").strip()
-    if policy_id_value and id_alias and policy_id_value != id_alias:
-        raise OperatorControlError("ROLLING_POLICY_IDENTITY_AMBIGUOUS")
-    policy_id = policy_id_value or id_alias
-    version = str(value.get("version") or "").strip()
-    policy_version = str(value.get("policy_version") or "").strip()
-    if version and policy_version and version != policy_version:
-        raise OperatorControlError("ROLLING_POLICY_IDENTITY_AMBIGUOUS")
-    version = version or policy_version
-    config_hash = str(value.get("config_hash") or "").strip()
-    if not policy_id or not version or (require_hash and not config_hash):
+
+    def fields(source: Mapping[str, Any]) -> dict[str, str]:
+        id_aliases = (
+            ("policy_id", "id")
+            if any(alias in source for alias in ("policy_id", "id"))
+            else ("draft_id",)
+        )
+        version_aliases = (
+            ("version", "policy_version")
+            if any(alias in source for alias in ("version", "policy_version"))
+            else ("draft_version",)
+        )
+        hash_aliases = (
+            ("config_hash", "policy_hash")
+            if any(alias in source for alias in ("config_hash", "policy_hash"))
+            else ("draft_hash",)
+        )
+        return {
+            "policy_id": _rolling_identity_field(
+                source, id_aliases, required=False
+            ),
+            "version": _rolling_identity_field(
+                source, version_aliases, required=False
+            ),
+            "config_hash": _rolling_identity_field(
+                source, hash_aliases, required=False
+            ),
+        }
+
+    outer = fields(value)
+    nested_raw = value.get("policy")
+    if isinstance(nested_raw, RollingAdmissionPolicy):
+        nested: Mapping[str, Any] = nested_raw.as_dict()
+    elif isinstance(nested_raw, Mapping):
+        nested = nested_raw
+    elif nested_raw is None:
+        nested = {}
+    else:
         raise OperatorControlError("ROLLING_POLICY_IDENTITY_REQUIRED")
-    return {
-        "policy_id": policy_id,
-        "version": version,
-        "config_hash": config_hash,
+    inner = fields(nested)
+    for name in ("policy_id", "version", "config_hash"):
+        if outer[name] and inner[name] and outer[name] != inner[name]:
+            raise OperatorControlError("ROLLING_POLICY_IDENTITY_AMBIGUOUS")
+    result = {
+        name: outer[name] or inner[name]
+        for name in ("policy_id", "version", "config_hash")
     }
+    if not result["policy_id"] or not result["version"]:
+        raise OperatorControlError("ROLLING_POLICY_IDENTITY_REQUIRED")
+    if require_hash and not result["config_hash"]:
+        raise OperatorControlError("ROLLING_POLICY_IDENTITY_REQUIRED")
+    return result
+
+
+def _rolling_identity_present(value: Mapping[str, Any]) -> bool:
+    if any(alias in value for alias in (
+        *_ROLLING_POLICY_ID_ALIASES,
+        *_ROLLING_POLICY_VERSION_ALIASES,
+        *_ROLLING_POLICY_HASH_ALIASES,
+    )):
+        return True
+    nested = value.get("policy")
+    return isinstance(nested, Mapping) and _rolling_identity_present(nested)
+
+
+def _rolling_review_target(value: Mapping[str, Any]) -> str:
+    """Return one canonical review target before action idempotency begins."""
+    if "policy" in value and "values" in value:
+        raise OperatorControlError("ROLLING_POLICY_INPUT_AMBIGUOUS")
+    source_key = "policy" if "policy" in value else "values"
+    source = value.get(source_key)
+    source = {} if source is None else source
+    if not isinstance(source, Mapping):
+        raise OperatorControlError("ROLLING_POLICY_REQUIRED")
+    if source_key == "policy" or _rolling_identity_present(source):
+        identity = _rolling_policy_identity(source)
+        return f"{identity['policy_id']}:{identity['version']}"
+    return "values:" + hashlib.sha256(
+        json.dumps(
+            _safe_value(source),
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()
 def _rolling_text(value: Any) -> str:
     return str(value).strip() if value is not None else ""
 
@@ -1633,127 +1729,438 @@ class OperatorControlPlane:
             "active_risk_config_hash": config_hash,
         }
 
+    def _rolling_active_policy_document(self) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Return the active envelope and its exact immutable policy document."""
+        loader = getattr(self.store, "get_operator_config", None)
+        missing = object()
+        active_raw = loader("rolling_admission_policy_active", missing) if callable(loader) else missing
+        if active_raw is missing:
+            return {}, {}
+        if not isinstance(active_raw, Mapping):
+            raise OperatorControlError("ROLLING_POLICY_IMMUTABLE_REQUIRED")
+        active = dict(active_raw)
+        if not active:
+            return {}, {}
+        identity_source = dict(active)
+        try:
+            expected_identity = _rolling_policy_identity(identity_source)
+        except OperatorControlError as exc:
+            raise OperatorControlError(
+                "ROLLING_POLICY_IMMUTABLE_REQUIRED", str(exc)
+            ) from exc
+        policy_loader = getattr(self.store, "load_admission_policy", None)
+        if not callable(policy_loader):
+            raise OperatorControlError("ROLLING_POLICY_IMMUTABLE_UNAVAILABLE")
+        try:
+            loaded = policy_loader(
+                expected_identity["policy_id"],
+                expected_identity["version"],
+            )
+        except Exception as exc:
+            raise OperatorControlError("ROLLING_POLICY_IMMUTABLE_LOAD_FAILED") from exc
+        if not isinstance(loaded, Mapping):
+            raise OperatorControlError("ROLLING_POLICY_IMMUTABLE_NOT_FOUND")
+        try:
+            persisted_identity = _rolling_policy_identity(loaded)
+        except OperatorControlError as exc:
+            raise OperatorControlError("ROLLING_POLICY_IMMUTABLE_INVALID", str(exc)) from exc
+        if persisted_identity != expected_identity:
+            raise OperatorControlError("ROLLING_POLICY_IMMUTABLE_MISMATCH")
+        return active, dict(loaded)
+
+    @staticmethod
+    def _rolling_canonical_hash(value: Mapping[str, Any]) -> str:
+        return hashlib.sha256(
+            json.dumps(
+                _safe_value(value),
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
+    @staticmethod
+    def _rolling_fence_hash(value: Mapping[str, Any]) -> str:
+        """Hash the complete persisted pointer, without bounded projection."""
+        return hashlib.sha256(
+            json.dumps(
+                value,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
+
+    def _rolling_effective_limits(self) -> dict[str, Any]:
+        """Expose the exact active canary limits used for draft feasibility."""
+        snapshot = self.risk_settings_snapshot()
+        effective = snapshot.get("effective_limits") if isinstance(snapshot, Mapping) else {}
+        if not isinstance(effective, Mapping):
+            effective = snapshot.get("active_limits", {}) if isinstance(snapshot, Mapping) else {}
+        if not isinstance(effective, Mapping):
+            raise OperatorControlError("ACTIVE_RISK_CONFIG_REQUIRED")
+
+        def first(*names: str) -> Any:
+            for name in names:
+                value = effective.get(name)
+                if value is not None and value != "":
+                    return value
+            return None
+
+        result = {
+            "max_submitted_orders_per_day": first(
+                "max_submitted_orders_per_day", "max_orders_per_day"
+            ),
+            "max_all_in_buy_usd": first("max_all_in_buy_usd", "target_notional_usd"),
+            "max_gross_daily_buy_usd": first(
+                "max_gross_daily_buy_usd", "gross_daily_buy_usd"
+            ),
+            "max_aggregate_open_cost_usd": first(
+                "max_aggregate_open_cost_usd", "aggregate_open_cost_usd"
+            ),
+            "max_aggregate_exposure_usd": first(
+                "max_aggregate_exposure_usd", "max_exposure_usd", "aggregate_exposure_usd"
+            ),
+            "max_positions": first("max_positions", "max_open_positions"),
+            "per_market_buy_cap_usd": first("per_market_buy_cap_usd"),
+            "per_event_buy_cap_usd": first("per_event_buy_cap_usd"),
+            "cumulative_buy_cap_usd": first("cumulative_buy_cap_usd"),
+        }
+        required = (
+            "max_submitted_orders_per_day",
+            "max_all_in_buy_usd",
+            "max_gross_daily_buy_usd",
+            "max_aggregate_open_cost_usd",
+            "max_aggregate_exposure_usd",
+            "max_positions",
+        )
+        if any(result[name] is None for name in required):
+            raise OperatorControlError("ACTIVE_RISK_LIMITS_UNAVAILABLE")
+        return result
+
+    @staticmethod
+    def _rolling_budget_cap(limits: Mapping[str, Any]) -> Decimal:
+        """Compute a single portfolio budget cap from independent active fences."""
+        try:
+            all_in = Decimal(str(limits["max_all_in_buy_usd"]))
+            gross = Decimal(str(limits["max_gross_daily_buy_usd"]))
+            exposure = Decimal(str(limits["max_aggregate_exposure_usd"]))
+            open_positions = int(limits["max_positions"])
+            submissions = int(limits["max_submitted_orders_per_day"])
+        except (ArithmeticError, TypeError, ValueError, KeyError) as exc:
+            raise OperatorControlError("ACTIVE_RISK_LIMITS_INVALID") from exc
+        if (
+            all_in < 0
+            or gross < 0
+            or exposure < 0
+            or open_positions < 0
+            or submissions < 0
+        ):
+            raise OperatorControlError("ACTIVE_RISK_LIMITS_INVALID")
+        candidates = [gross, exposure, all_in * open_positions, all_in * submissions]
+        for field in (
+            "max_aggregate_open_cost_usd",
+            "per_market_buy_cap_usd",
+            "per_event_buy_cap_usd",
+            "cumulative_buy_cap_usd",
+        ):
+            value = limits.get(field)
+            if value not in (None, ""):
+                try:
+                    candidates.append(Decimal(str(value)))
+                except (ArithmeticError, TypeError, ValueError) as exc:
+                    raise OperatorControlError("ACTIVE_RISK_LIMITS_INVALID") from exc
+        cap = min(candidates, default=Decimal("0"))
+        if not cap.is_finite() or cap < 0:
+            raise OperatorControlError("ACTIVE_RISK_LIMITS_INVALID")
+        return cap
+
+    def _rolling_venue_feasibility(
+        self,
+        *,
+        all_in_buy: Decimal,
+    ) -> dict[str, Any]:
+        """Project persisted venue-minimum evidence without performing transport."""
+        getter = getattr(self.store, "get_operator_config", None)
+        connectivity = getter(CANARY_CONNECTIVITY_CONFIG_KEY, {}) if callable(getter) else {}
+        failures: list[str] = []
+        if isinstance(connectivity, Mapping):
+            failure_values = connectivity.get("failure_codes", connectivity.get("failures", ()))
+            if isinstance(failure_values, str):
+                failure_values = (failure_values,)
+            if isinstance(failure_values, (list, tuple, set, frozenset)):
+                for value in failure_values:
+                    code = str(value).strip().upper()
+                    if code in _CONNECTIVITY_FAILURE_CODES and code not in failures:
+                        failures.append(code)
+            diagnostics = connectivity.get("diagnostics")
+            if isinstance(diagnostics, Mapping):
+                for key in ("market", "order_book", "venue"):
+                    details = diagnostics.get(key)
+                    if not isinstance(details, Mapping):
+                        continue
+                    nested_failures = details.get("failure_codes", details.get("failures", ()))
+                    if isinstance(nested_failures, str):
+                        nested_failures = (nested_failures,)
+                    if isinstance(nested_failures, (list, tuple, set, frozenset)):
+                        for value in nested_failures:
+                            code = str(value).strip().upper()
+                            if code in _CONNECTIVITY_FAILURE_CODES and code not in failures:
+                                failures.append(code)
+        minimum: Decimal | None = None
+        if isinstance(connectivity, Mapping):
+            for key in (
+                "venue_minimum_notional_usd",
+                "venue_minimum_notional",
+                "minimum_notional_usd",
+                "minimum_notional",
+                "min_notional",
+            ):
+                raw_minimum = connectivity.get(key)
+                try:
+                    candidate = Decimal(str(raw_minimum))
+                except (ArithmeticError, TypeError, ValueError):
+                    continue
+                if candidate.is_finite() and candidate >= 0:
+                    minimum = candidate
+                    break
+            diagnostics = connectivity.get("diagnostics")
+            if minimum is None and isinstance(diagnostics, Mapping):
+                for key in ("market", "order_book", "venue"):
+                    details = diagnostics.get(key)
+                    if not isinstance(details, Mapping):
+                        continue
+                    for field in (
+                        "venue_minimum_notional_usd",
+                        "venue_minimum_notional",
+                        "minimum_notional_usd",
+                        "minimum_notional",
+                        "min_notional",
+                    ):
+                        raw_minimum = details.get(field)
+                        try:
+                            candidate = Decimal(str(raw_minimum))
+                        except (ArithmeticError, TypeError, ValueError):
+                            continue
+                        if candidate.is_finite() and candidate >= 0:
+                            minimum = candidate
+                            break
+                    if minimum is not None:
+                        break
+        if "VENUE_MINIMUM_EXCEEDS_CANARY_TARGET" in failures:
+            feasible: bool | None = False
+            status = "BLOCKED"
+        elif minimum is None:
+            feasible = None
+            status = "UNKNOWN"
+        else:
+            feasible = minimum <= all_in_buy
+            status = "FEASIBLE" if feasible else "BLOCKED"
+        return {
+            "status": status,
+            "feasible": feasible,
+            "minimum_notional_usd": (
+                format(minimum, "f") if minimum is not None else None
+            ),
+            "checked_at": connectivity.get("checked_at")
+            if isinstance(connectivity, Mapping)
+            else None,
+            "failure_codes": failures[:16],
+        }
+
     def review_rolling_admission_policy(
         self,
         values: Mapping[str, Any] | None = None,
         *,
         actor: str = "operator",
+        expected_risk_config_id: Any | None = None,
+        expected_risk_config_generation: Any | None = None,
+        expected_risk_config_hash: Any | None = None,
     ) -> dict[str, Any]:
-        """Persist an immutable policy review tied to the current active risk."""
+        """Create a non-active, internally identified rolling allocation draft."""
         if values is not None and not isinstance(values, Mapping):
             raise OperatorControlError("ROLLING_POLICY_REQUIRED")
-        raw = dict(values or {})
         actor_value = _safe_identifier(actor, "actor")
         binding = self._rolling_risk_binding()
-        base = dict(raw)
-        nested = base.get("policy")
-        nested_mapping = (
-            nested.as_dict()
-            if isinstance(nested, RollingAdmissionPolicy)
-            else nested
-            if isinstance(nested, Mapping)
-            else {}
-        )
-        if nested_mapping:
-            # Nested policy documents are the custom-policy source of truth.
-            # Flatten them before parsing so stale outer aliases cannot create
-            # an identity conflict or be persisted beside the canonical shape.
-            policy_input = {key: value for key, value in base.items() if key != "policy"}
-            policy_input.update(dict(nested_mapping))
-            policy_input.pop("policy", None)
-            for canonical, aliases in (
-                ("policy_id", ("policy_id", "id")),
-                ("version", ("version", "policy_version")),
-                ("config_hash", ("config_hash",)),
-            ):
-                selected = next(
-                    (
-                        nested_mapping.get(alias)
-                        for alias in aliases
-                        if nested_mapping.get(alias) is not None
-                        and str(nested_mapping.get(alias)).strip()
-                    ),
-                    None,
-                )
-                if selected is None:
-                    selected = next(
-                        (
-                            base.get(alias)
-                            for alias in aliases
-                            if base.get(alias) is not None and str(base.get(alias)).strip()
-                        ),
-                        None,
-                    )
-                for alias in aliases:
-                    policy_input.pop(alias, None)
-                if selected is not None:
-                    policy_input[canonical] = selected
+        expected_binding = {
+            "risk_config_id": expected_risk_config_id,
+            "risk_config_generation": expected_risk_config_generation,
+            "risk_config_hash": expected_risk_config_hash,
+        }
+        for name, expected in expected_binding.items():
+            if expected is not None and str(expected).strip() != str(binding[name]):
+                raise OperatorControlError("ROLLING_POLICY_REVIEW_STALE")
+
+        active_envelope, active_document = self._rolling_active_policy_document()
+        raw = dict(values or {})
+        if _rolling_identity_present(raw):
+            try:
+                input_identity = _rolling_policy_identity(raw)
+            except OperatorControlError as exc:
+                raise OperatorControlError(
+                    "ROLLING_POLICY_IDENTITY_INVALID", str(exc)
+                ) from exc
         else:
-            policy_input = dict(base)
-            policy_input.pop("policy", None)
-        for canonical, aliases in (
-            ("policy_id", ("policy_id", "id")),
-            ("version", ("version", "policy_version")),
-            ("config_hash", ("config_hash",)),
-        ):
-            selected = next(
-                (
-                    policy_input.get(alias)
-                    for alias in aliases
-                    if policy_input.get(alias) is not None
-                    and str(policy_input.get(alias)).strip()
-                ),
-                None,
-            )
-            for alias in aliases:
+            input_identity = {}
+        nested = raw.get("policy")
+        if isinstance(nested, RollingAdmissionPolicy):
+            nested = nested.as_dict()
+        nested = dict(nested) if isinstance(nested, Mapping) else {}
+        policy_input = dict(active_document) if active_document else {}
+        policy_input.update({key: value for key, value in raw.items() if key != "policy"})
+        policy_input.update(nested)
+        policy_input.pop("policy", None)
+        if input_identity:
+            policy_input["policy_id"] = input_identity["policy_id"]
+            policy_input["version"] = input_identity["version"]
+            policy_input["config_hash"] = input_identity["config_hash"]
+        else:
+            # Values-only reviews are application-owned immutable documents.  Do
+            # not reuse the built-in default identity (or a prior active
+            # identity), even before the first activation.  The final identity
+            # is derived below, after policy validation and budget clamping.
+            for alias in (
+                *_ROLLING_POLICY_ID_ALIASES,
+                *_ROLLING_POLICY_VERSION_ALIASES,
+                *_ROLLING_POLICY_HASH_ALIASES,
+            ):
                 policy_input.pop(alias, None)
-            if selected is not None:
-                policy_input[canonical] = selected
-        if not str(policy_input.get("policy_id") or "").strip():
-            policy_input["policy_id"] = "rolling-default"
-        if not str(policy_input.get("version") or policy_input.get("policy_version") or "").strip():
-            policy_input["version"] = "rolling-admission-v1"
+            policy_input["policy_id"] = "rolling-values"
+            policy_input["version"] = "rolling-policy-values-v0"
+            policy_input.pop("config_hash", None)
         try:
             policy = RollingAdmissionPolicy.from_mapping(policy_input)
         except (TypeError, ValueError) as exc:
             raise OperatorControlError("ROLLING_POLICY_INVALID", str(exc)) from exc
+
+        limits = self._rolling_effective_limits()
+        budget_cap = self._rolling_budget_cap(limits)
+        requested_budget = _rolling_decimal(policy.global_budget)
+        if requested_budget is None:
+            raise OperatorControlError("ROLLING_POLICY_BUDGET_INVALID")
+        if requested_budget > budget_cap:
+            if values is None or (
+                "global_budget" not in raw and "global_budget" not in nested
+            ):
+                requested_budget = budget_cap
+            else:
+                raise OperatorControlError("ROLLING_POLICY_BUDGET_EXCEEDS_ACTIVE_CAP")
+        # Canonicalize the one portfolio-wide budget in the immutable policy row.
+        policy_input["global_budget"] = format(requested_budget, "f")
+        try:
+            policy = RollingAdmissionPolicy.from_mapping(policy_input)
+        except (TypeError, ValueError) as exc:
+            raise OperatorControlError("ROLLING_POLICY_INVALID", str(exc)) from exc
+        if not input_identity:
+            canonical_values = policy.as_dict()
+            for alias in (
+                *_ROLLING_POLICY_ID_ALIASES,
+                *_ROLLING_POLICY_VERSION_ALIASES,
+                *_ROLLING_POLICY_HASH_ALIASES,
+            ):
+                canonical_values.pop(alias, None)
+            identity_digest = hashlib.sha256(
+                json.dumps(
+                    _safe_value(
+                        {
+                            "policy": canonical_values,
+                            "risk_binding": binding,
+                        }
+                    ),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=True,
+                    default=str,
+                ).encode("utf-8")
+            ).hexdigest()
+            policy_input["policy_id"] = "rolling-policy:" + identity_digest[:32]
+            policy_input["version"] = "policy-" + identity_digest[32:]
+            policy_input.pop("config_hash", None)
+            try:
+                policy = RollingAdmissionPolicy.from_mapping(policy_input)
+            except (TypeError, ValueError) as exc:
+                raise OperatorControlError("ROLLING_POLICY_INVALID", str(exc)) from exc
+
+        active_identity: dict[str, str] = {}
+        if active_envelope:
+            try:
+                active_identity = _rolling_policy_identity(active_envelope)
+            except OperatorControlError:
+                active_identity = {}
+        selected = (
+            self.store.load_current_portfolio_selection()
+            if callable(getattr(self.store, "load_current_portfolio_selection", None))
+            else None
+        )
+        selected_id = (
+            _rolling_text(selected.get("portfolio_selection_id") or selected.get("selection_id"))
+            if isinstance(selected, Mapping)
+            else ""
+        )
+        allocation = {
+            "global_budget_usd": format(policy.global_budget, "f"),
+            "budget_cap_usd": format(budget_cap, "f"),
+            "within_active_caps": True,
+            "max_active_strategies": policy.max_members,
+            "max_open_positions": int(limits["max_positions"]),
+            "active_submissions_per_day": int(limits["max_submitted_orders_per_day"]),
+            "active_per_buy_usd": str(limits["max_all_in_buy_usd"]),
+            "active_daily_buy_usd": str(limits["max_gross_daily_buy_usd"]),
+            "active_open_exposure_usd": str(limits["max_aggregate_exposure_usd"]),
+            "active_per_market_buy_usd": limits["per_market_buy_cap_usd"],
+            "active_per_event_buy_usd": limits["per_event_buy_cap_usd"],
+            "active_cumulative_buy_usd": limits["cumulative_buy_cap_usd"],
+            "venue_minimum_feasibility": self._rolling_venue_feasibility(
+                all_in_buy=Decimal(str(limits["max_all_in_buy_usd"]))
+            ),
+            "selection_id": selected_id or None,
+        }
+        draft_id = "rolling-draft:" + uuid.uuid4().hex
+        draft_version = "draft-" + uuid.uuid4().hex[:16]
         reviewed_at = utc_now().isoformat()
         policy_document = policy.as_dict()
+        draft_hash = self._rolling_canonical_hash(
+            {
+                "draft_id": draft_id,
+                "draft_version": draft_version,
+                "policy": policy_document,
+                "binding": binding,
+                "allocation": allocation,
+            }
+        )
         document = {
             **policy_document,
             **binding,
+            "policy": policy_document,
+            "draft_id": draft_id,
+            "draft_version": draft_version,
+            "draft_hash": draft_hash,
+            "allocation_review": allocation,
+            "reviewed_active_policy_id": active_identity.get("policy_id"),
+            "reviewed_active_policy_version": active_identity.get("version"),
+            "reviewed_active_policy_hash": active_identity.get("config_hash"),
+            "reviewed_selection_id": selected_id or None,
             "reviewed_at": reviewed_at,
             "reviewed_by": actor_value,
             "review_status": "REVIEWED",
+            "status": "REVIEWED",
             "paper_only": True,
+            "live_execution": False,
         }
-        # Admission policy rows are immutable.  Persist only the canonical
-        # policy document; review/risk metadata belongs to operator config and
-        # must not make a pre-seeded policy look like a different identity.
+        # The policy row is append-only.  The operator pointer may move to the
+        # newest draft, but prior immutable identities remain addressable.
         self.store.save_admission_policy(policy_document)
-        self.store.set_operator_config(
-            "rolling_admission_policy_review",
-            {
-                "policy_id": policy.policy_id,
-                "version": policy.version,
-                "policy_version": policy.version,
-                "config_hash": policy.config_hash,
-                **binding,
-                "reviewed_at": reviewed_at,
-                "reviewed_by": actor_value,
-                "status": "REVIEWED",
-                "paper_only": True,
-            },
-        )
-        processor_review = getattr(self._research_processor, "review_rolling_portfolio", None)
-        result = (
-            processor_review(now=utc_now(), force=True)
-            if callable(processor_review)
-            else self.rolling_portfolio_state()
-        )
+        self.store.set_operator_config("rolling_admission_policy_review", document)
+        draft_projection = _safe_value(document)
+        if isinstance(draft_projection, Mapping):
+            draft_projection = dict(draft_projection)
+            draft_projection.update({"paper_only": True, "live_execution": False})
         return {
             "policy": _safe_value(document),
-            "review": _safe_value(result) if isinstance(result, Mapping) else {},
+            "draft": draft_projection,
+            "allocation_review": _safe_value(allocation),
+            "review": _safe_value(self.rolling_portfolio_state()),
             "status": "REVIEWED",
             "paper_only": True,
             "live_execution": False,
@@ -1761,78 +2168,241 @@ class OperatorControlPlane:
 
     def activate_rolling_admission_policy(
         self,
-        policy_id: Any,
-        policy_version: Any,
+        policy_id: Any = None,
+        policy_version: Any = None,
         *,
         actor: str = "operator",
+        draft_id: Any | None = None,
+        draft_version: Any | None = None,
+        expected_risk_config_id: Any | None = None,
+        expected_risk_config_generation: Any | None = None,
+        expected_risk_config_hash: Any | None = None,
     ) -> dict[str, Any]:
-        """Activate only a previously reviewed immutable policy/risk binding."""
-        policy_value = _safe_identifier(policy_id, "policy ID")
-        version_value = _safe_identifier(policy_version, "policy version")
+        """Activate a reviewed policy only after its exact selection is committed."""
         actor_value = _safe_identifier(actor, "actor")
-        binding = self._rolling_risk_binding()
         reviewed = self.store.get_operator_config("rolling_admission_policy_review", {})
         if not isinstance(reviewed, Mapping):
             raise OperatorControlError("ROLLING_POLICY_REVIEW_REQUIRED")
+        reviewed = dict(reviewed)
         try:
             reviewed_identity = _rolling_policy_identity(reviewed)
         except OperatorControlError as exc:
             raise OperatorControlError("ROLLING_POLICY_REVIEW_INVALID", str(exc)) from exc
+        reviewed_draft_id = _rolling_text(reviewed.get("draft_id"))
+        reviewed_draft_version = _rolling_text(reviewed.get("draft_version"))
+        if (policy_id is None) != (policy_version is None):
+            raise OperatorControlError("ROLLING_POLICY_IDENTITY_REQUIRED")
+        if policy_id is not None and (
+            not str(policy_id).strip() or not str(policy_version).strip()
+        ):
+            raise OperatorControlError("ROLLING_POLICY_IDENTITY_REQUIRED")
+        if (draft_id is None) != (draft_version is None):
+            raise OperatorControlError("ROLLING_POLICY_IDENTITY_REQUIRED")
+        if draft_id is not None and (
+            not str(draft_id).strip() or not str(draft_version).strip()
+        ):
+            raise OperatorControlError("ROLLING_POLICY_IDENTITY_REQUIRED")
+        if draft_id is not None and _safe_identifier(draft_id, "rolling draft ID") != reviewed_draft_id:
+            raise OperatorControlError("ROLLING_POLICY_REVIEW_STALE")
+        if draft_version is not None and _safe_identifier(draft_version, "rolling draft version") != reviewed_draft_version:
+            raise OperatorControlError("ROLLING_POLICY_REVIEW_STALE")
+        policy_value = (
+            _safe_identifier(policy_id, "policy ID")
+            if policy_id is not None and str(policy_id).strip()
+            else reviewed_identity["policy_id"]
+        )
+        version_value = (
+            _safe_identifier(policy_version, "policy version")
+            if policy_version is not None and str(policy_version).strip()
+            else reviewed_identity["version"]
+        )
         if (
             reviewed_identity["policy_id"] != policy_value
             or reviewed_identity["version"] != version_value
-            or str(reviewed.get("status") or reviewed.get("review_status") or "").upper()
-            != "REVIEWED"
-            or any(reviewed.get(key) != binding.get(key) for key in binding)
+            or str(reviewed.get("status") or reviewed.get("review_status") or "").upper() != "REVIEWED"
+            or not reviewed_draft_id
+            or not reviewed_draft_version
         ):
             raise OperatorControlError("ROLLING_POLICY_REVIEW_STALE")
-        policy = self.store.load_admission_policy(policy_value, version_value)
+        binding = self._rolling_risk_binding()
+        for name, expected in (
+            ("risk_config_id", expected_risk_config_id),
+            ("risk_config_generation", expected_risk_config_generation),
+            ("risk_config_hash", expected_risk_config_hash),
+        ):
+            if expected is not None and str(expected).strip() != str(binding[name]):
+                raise OperatorControlError("ROLLING_POLICY_REVIEW_STALE")
+        for key in binding:
+            if str(reviewed.get(key, "")).strip() != str(binding.get(key, "")).strip():
+                raise OperatorControlError("ROLLING_POLICY_REVIEW_STALE")
+
+        active_envelope, _ = self._rolling_active_policy_document()
+        for key, expected in (
+            ("reviewed_active_policy_id", "policy_id"),
+            ("reviewed_active_policy_version", "version"),
+            ("reviewed_active_policy_hash", "config_hash"),
+        ):
+            recorded = _rolling_text(reviewed.get(key))
+            current = ""
+            if active_envelope:
+                try:
+                    current = _rolling_policy_identity(active_envelope).get(expected, "")
+                except OperatorControlError:
+                    current = ""
+            if recorded != current:
+                raise OperatorControlError("ROLLING_POLICY_REVIEW_STALE")
+
+        policy_loader = getattr(self.store, "load_admission_policy", None)
+        if not callable(policy_loader):
+            raise OperatorControlError("ROLLING_POLICY_IMMUTABLE_UNAVAILABLE")
+        try:
+            policy = policy_loader(policy_value, version_value)
+        except Exception as exc:
+            raise OperatorControlError("ROLLING_POLICY_IMMUTABLE_LOAD_FAILED") from exc
         if not isinstance(policy, Mapping):
-            raise OperatorControlError("ROLLING_POLICY_NOT_FOUND")
+            raise OperatorControlError("ROLLING_POLICY_IMMUTABLE_NOT_FOUND")
         try:
             persisted_identity = _rolling_policy_identity(policy)
         except OperatorControlError as exc:
-            raise OperatorControlError("ROLLING_POLICY_INVALID", str(exc)) from exc
+            raise OperatorControlError("ROLLING_POLICY_IMMUTABLE_INVALID", str(exc)) from exc
         if persisted_identity != reviewed_identity:
             raise OperatorControlError("ROLLING_POLICY_REVIEW_STALE")
-        reviewed_at = str(reviewed.get("reviewed_at") or "").strip()
+        reviewed_at = _rolling_text(reviewed.get("reviewed_at"))
         if not reviewed_at:
             raise OperatorControlError("ROLLING_POLICY_REVIEW_INVALID")
-        active_at = utc_now().isoformat()
-        active = {
-            "policy_id": persisted_identity["policy_id"],
-            "version": persisted_identity["version"],
-            "policy_version": persisted_identity["version"],
-            "config_hash": persisted_identity["config_hash"],
-            **binding,
-            "reviewed_at": reviewed_at,
-            "active_at": active_at,
-            # Preserve the pre-cutover names for read-only clients while
-            # keeping the canonical identity above singular and exact.
-            "activated_at": active_at,
-            "activated_by": actor_value,
-            "status": "ACTIVE",
-            "paper_only": True,
-        }
-        self.store.set_operator_config("rolling_admission_policy_active", active)
-        job_saver = getattr(self.store, "set_operator_job", None)
-        if callable(job_saver):
-            try:
-                job_saver(
-                    "rolling_admission_policy_active",
-                    "ACTIVE",
-                    active,
-                    resumable=True,
+        allocation = reviewed.get("allocation_review")
+        if not isinstance(allocation, Mapping) or allocation.get("within_active_caps") is not True:
+            raise OperatorControlError("ROLLING_POLICY_REVIEW_INVALID")
+
+        reviewed_hash = self._rolling_fence_hash(reviewed)
+        active_snapshot = dict(active_envelope)
+        transaction = getattr(self.store, "transaction", None)
+        if not callable(transaction):
+            raise OperatorControlError("ROLLING_POLICY_TRANSACTION_UNAVAILABLE")
+        try:
+            with transaction(immediate=True):
+                current_review = self.store.get_operator_config(
+                    "rolling_admission_policy_review",
+                    {},
                 )
-            except TypeError:
-                job_saver("rolling_admission_policy_active", "ACTIVE", active)
+                if (
+                    not isinstance(current_review, Mapping)
+                    or self._rolling_fence_hash(dict(current_review)) != reviewed_hash
+                ):
+                    raise OperatorControlError("ROLLING_POLICY_REVIEW_STALE")
+                current_active_raw = self.store.get_operator_config(
+                    "rolling_admission_policy_active",
+                    None,
+                )
+                current_active = (
+                    dict(current_active_raw)
+                    if isinstance(current_active_raw, Mapping)
+                    else {}
+                )
+                if self._rolling_fence_hash(current_active) != self._rolling_fence_hash(active_snapshot):
+                    raise OperatorControlError("ROLLING_POLICY_REVIEW_STALE")
+                current_binding = self._rolling_risk_binding()
+                if any(
+                    str(current_binding.get(key, "")) != str(binding.get(key, ""))
+                    for key in binding
+                ):
+                    raise OperatorControlError("ROLLING_POLICY_REVIEW_STALE")
+                current_policy = policy_loader(policy_value, version_value)
+                if not isinstance(current_policy, Mapping):
+                    raise OperatorControlError("ROLLING_POLICY_IMMUTABLE_NOT_FOUND")
+                if _rolling_policy_identity(current_policy) != persisted_identity:
+                    raise OperatorControlError("ROLLING_POLICY_IMMUTABLE_MISMATCH")
+                active_at = utc_now().isoformat()
+                active = {
+                    "policy": _safe_value(current_policy),
+                    "policy_id": persisted_identity["policy_id"],
+                    "version": persisted_identity["version"],
+                    "policy_version": persisted_identity["version"],
+                    "config_hash": persisted_identity["config_hash"],
+                    **binding,
+                    "draft_id": reviewed_draft_id,
+                    "draft_version": reviewed_draft_version,
+                    "draft_hash": reviewed.get("draft_hash"),
+                    "reviewed_at": reviewed_at,
+                    "active_at": active_at,
+                    "activated_at": active_at,
+                    "activated_by": actor_value,
+                    "status": "ACTIVE",
+                    "paper_only": True,
+                    "live_execution": False,
+                }
+                cas = getattr(self.store, "compare_and_set_operator_config", None)
+                if callable(cas) and active_snapshot:
+                    if not cas("rolling_admission_policy_active", active_snapshot, active):
+                        raise OperatorControlError("ROLLING_POLICY_REVIEW_STALE")
+                else:
+                    self.store.set_operator_config("rolling_admission_policy_active", active)
+                try:
+                    self._research_processor.review_rolling_portfolio(
+                        now=utc_now(),
+                        force=True,
+                    )
+                except OperatorControlError:
+                    raise
+                except Exception as exc:
+                    raise OperatorControlError(
+                        "ROLLING_POLICY_REVIEW_FAILED",
+                        type(exc).__name__,
+                    ) from exc
+                selection_loader = getattr(self.store, "load_current_portfolio_selection", None)
+                selection = selection_loader() if callable(selection_loader) else None
+                if not isinstance(selection, Mapping):
+                    raise OperatorControlError("ROLLING_POLICY_SELECTION_REQUIRED")
+                if (
+                    _rolling_text(selection.get("policy_id") or selection.get("admission_policy_id"))
+                    != persisted_identity["policy_id"]
+                    or _rolling_text(
+                        selection.get("policy_version") or selection.get("admission_policy_version")
+                    )
+                    != persisted_identity["version"]
+                ):
+                    raise OperatorControlError("ROLLING_POLICY_SELECTION_STALE")
+                selected_policy_source = selection.get("policy_config")
+                selected_policy_source = (
+                    selected_policy_source
+                    if isinstance(selected_policy_source, Mapping)
+                    else selection
+                )
+                selected_policy_hash = _rolling_text(
+                    selected_policy_source.get("config_hash")
+                    or selected_policy_source.get("policy_hash")
+                )
+                if selected_policy_hash != persisted_identity["config_hash"]:
+                    raise OperatorControlError("ROLLING_POLICY_SELECTION_STALE")
+                selected_policy = policy_loader(
+                    persisted_identity["policy_id"],
+                    persisted_identity["version"],
+                )
+                if (
+                    not isinstance(selected_policy, Mapping)
+                    or _rolling_policy_identity(selected_policy) != persisted_identity
+                ):
+                    raise OperatorControlError("ROLLING_POLICY_SELECTION_STALE")
+                job_saver = getattr(self.store, "set_operator_job", None)
+                if callable(job_saver):
+                    try:
+                        job_saver("rolling_admission_policy_active", "ACTIVE", active, resumable=True)
+                    except TypeError:
+                        job_saver("rolling_admission_policy_active", "ACTIVE", active)
+        except OperatorControlError:
+            raise
+        except Exception as exc:
+            raise OperatorControlError("ROLLING_POLICY_ACTIVATION_FAILED", type(exc).__name__) from exc
         return {
             "policy": _safe_value(policy),
-            "active": active,
+            "active": _safe_value(active),
+            "draft_id": reviewed_draft_id,
+            "draft_version": reviewed_draft_version,
             "status": "ACTIVE",
             "paper_only": True,
             "live_execution": False,
         }
+
 
     def _cached_pid_matches_node(self, pid: int) -> bool:
         """Bound the Windows CIM/process identity work used by status reads."""
@@ -2778,19 +3348,6 @@ class OperatorControlPlane:
         action_id: str | None = None
         try:
             self._enforce_action_fence(action_value)
-            if action_value in _ALLOWED_ACTIONS:
-                action_id, duplicate = self._begin_action(action_value, target_value)
-                if duplicate is not None:
-                    return {
-                        "ok": False,
-                        "action": requested_action_value,
-                        "target": target_value,
-                        "action_id": action_id,
-                        "action_status": "RUNNING",
-                        "reason": "ACTION_ALREADY_RUNNING",
-                        "paper_only": True,
-                        "live_execution": False,
-                    }
             if action_value not in _ALLOWED_ACTIONS:
                 raise OperatorControlError("ACTION_NOT_ALLOWED")
             if action_value in {"canary.settings.save_draft", "risk.settings.save_draft"}:
@@ -2806,28 +3363,88 @@ class OperatorControlPlane:
                     raise OperatorControlError("UNSUPPORTED_RISK_SETTINGS_FIELDS")
                 if not isinstance(action_payload.get("config_id"), str):
                     raise OperatorControlError("RISK_SETTINGS_CONFIG_REQUIRED")
-                _safe_identifier(action_payload["config_id"], "risk settings config ID")
-                _positive_generation(
+                config_id_value = _safe_identifier(
+                    action_payload["config_id"],
+                    "risk settings config ID",
+                )
+                generation_value = _positive_generation(
                     action_payload.get("expected_generation"),
                     "RISK_SETTINGS_GENERATION_REQUIRED",
                 )
+                # The config identity is the action target.  This keeps
+                # concurrent activation attempts for different drafts
+                # independent while exact retries still deduplicate.
+                target_value = f"{config_id_value}:{generation_value}"
             elif action_value == "rolling.admission.review":
-                allowed = {"policy", "values", "actor"}
+                allowed = {
+                    "policy",
+                    "values",
+                    "actor",
+                    "expected_risk_config_id",
+                    "expected_risk_config_generation",
+                    "expected_risk_config_hash",
+                }
                 if set(action_payload) - allowed:
                     raise OperatorControlError("UNSUPPORTED_ROLLING_POLICY_FIELDS")
                 policy_values = action_payload.get("policy", action_payload.get("values"))
                 if policy_values is not None and not isinstance(policy_values, Mapping):
                     raise OperatorControlError("ROLLING_POLICY_REQUIRED")
+                target_value = _rolling_review_target(action_payload)
+                if action_payload.get("expected_risk_config_generation") is not None:
+                    _positive_generation(
+                        action_payload["expected_risk_config_generation"],
+                        "ROLLING_RISK_GENERATION_REQUIRED",
+                    )
             elif action_value == "rolling.admission.activate":
-                allowed = {"policy_id", "policy_version", "actor"}
+                allowed = {
+                    "policy_id",
+                    "policy_version",
+                    "draft_id",
+                    "draft_version",
+                    "actor",
+                    "expected_risk_config_id",
+                    "expected_risk_config_generation",
+                    "expected_risk_config_hash",
+                }
                 if set(action_payload) - allowed:
                     raise OperatorControlError("UNSUPPORTED_ROLLING_POLICY_FIELDS")
-                if not isinstance(action_payload.get("policy_id"), str):
-                    raise OperatorControlError("ROLLING_POLICY_ID_REQUIRED")
-                if not isinstance(action_payload.get("policy_version"), str):
-                    raise OperatorControlError("ROLLING_POLICY_VERSION_REQUIRED")
-                _safe_identifier(action_payload["policy_id"], "policy ID")
-                _safe_identifier(action_payload["policy_version"], "policy version")
+                policy_fields_present = (
+                    "policy_id" in action_payload or "policy_version" in action_payload
+                )
+                draft_fields_present = (
+                    "draft_id" in action_payload or "draft_version" in action_payload
+                )
+                has_policy_identity = bool(
+                    isinstance(action_payload.get("policy_id"), str)
+                    and action_payload["policy_id"].strip()
+                ) and bool(
+                    isinstance(action_payload.get("policy_version"), str)
+                    and action_payload["policy_version"].strip()
+                )
+                has_draft_identity = bool(
+                    isinstance(action_payload.get("draft_id"), str)
+                    and action_payload["draft_id"].strip()
+                ) and bool(
+                    isinstance(action_payload.get("draft_version"), str)
+                    and action_payload["draft_version"].strip()
+                )
+                if (
+                    (policy_fields_present and not has_policy_identity)
+                    or (draft_fields_present and not has_draft_identity)
+                    or (not has_policy_identity and not has_draft_identity)
+                ):
+                    raise OperatorControlError("ROLLING_POLICY_IDENTITY_REQUIRED")
+                if has_policy_identity:
+                    _safe_identifier(action_payload["policy_id"], "policy ID")
+                    _safe_identifier(action_payload["policy_version"], "policy version")
+                if has_draft_identity:
+                    _safe_identifier(action_payload["draft_id"], "rolling draft ID")
+                    _safe_identifier(action_payload["draft_version"], "rolling draft version")
+                if action_payload.get("expected_risk_config_generation") is not None:
+                    _positive_generation(
+                        action_payload["expected_risk_config_generation"],
+                        "ROLLING_RISK_GENERATION_REQUIRED",
+                    )
             if action_value == RECOVERY_ACTION:
                 allowed = {"event_id", "signal_id", "exchange_order_id"}
                 if set(action_payload) - allowed:
@@ -2859,15 +3476,15 @@ class OperatorControlPlane:
                 and confirm != expected
             ):
                 raise OperatorControlError("EXACT_CONFIRMATION_REQUIRED")
-            if action_value in {"canary.settings.activate_draft", "risk.settings.activate_draft"}:
-                target_value = _safe_identifier(
-                    action_payload.get("config_id"),
-                    "risk settings config ID",
-                )
             if action_value == "rolling.admission.activate":
-                target_value = (
-                    f"{action_payload['policy_id']}:{action_payload['policy_version']}"
-                )
+                if has_draft_identity:
+                    target_value = (
+                        f"{action_payload['draft_id']}:{action_payload['draft_version']}"
+                    )
+                else:
+                    target_value = (
+                        f"{action_payload['policy_id']}:{action_payload['policy_version']}"
+                    )
             if action_value in {"canary.eligibility.verify", "canary.eligibility.mark", "canary.generate_signal", "canary.arm"}:
                 target_value = _safe_identifier(target_value, "candidate ID")
             elif action_value == "canary.enable_auto":
@@ -2898,6 +3515,19 @@ class OperatorControlPlane:
                     if confirm != exact_confirmation:
                         raise OperatorControlError("EXACT_CONFIRMATION_REQUIRED")
                     target_value = f"{venue_name}:{config_id}:{expected_generation}"
+            if action_value in _ALLOWED_ACTIONS:
+                action_id, duplicate = self._begin_action(action_value, target_value)
+                if duplicate is not None:
+                    return {
+                        "ok": False,
+                        "action": requested_action_value,
+                        "target": target_value,
+                        "action_id": action_id,
+                        "action_status": "RUNNING",
+                        "reason": "ACTION_ALREADY_RUNNING",
+                        "paper_only": True,
+                        "live_execution": False,
+                    }
             if action_value == "node.restart":
                 result = {"node": self.restart_node()}
             elif action_value == "bootstrap.start":
@@ -2930,14 +3560,26 @@ class OperatorControlPlane:
                     "rolling_policy": self.review_rolling_admission_policy(
                         action_payload.get("policy", action_payload.get("values")),
                         actor=action_payload.get("actor", "operator"),
+                        expected_risk_config_id=action_payload.get("expected_risk_config_id"),
+                        expected_risk_config_generation=action_payload.get(
+                            "expected_risk_config_generation"
+                        ),
+                        expected_risk_config_hash=action_payload.get("expected_risk_config_hash"),
                     )
                 }
             elif action_value == "rolling.admission.activate":
                 result = {
                     "rolling_policy": self.activate_rolling_admission_policy(
-                        action_payload["policy_id"],
-                        action_payload["policy_version"],
+                        action_payload.get("policy_id"),
+                        action_payload.get("policy_version"),
                         actor=action_payload.get("actor", "operator"),
+                        draft_id=action_payload.get("draft_id"),
+                        draft_version=action_payload.get("draft_version"),
+                        expected_risk_config_id=action_payload.get("expected_risk_config_id"),
+                        expected_risk_config_generation=action_payload.get(
+                            "expected_risk_config_generation"
+                        ),
+                        expected_risk_config_hash=action_payload.get("expected_risk_config_hash"),
                     )
                 }
             elif action_value == RECOVERY_ACTION:

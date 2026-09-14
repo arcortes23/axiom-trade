@@ -24,7 +24,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread
 from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import parse_qs, unquote, urlparse
-from .operator import CANARY_CONNECTIVITY_CONFIG_KEY, OperatorControlPlane, _stored_connectivity_projection
+from .operator import (
+    CANARY_CONNECTIVITY_CONFIG_KEY,
+    OperatorControlError,
+    OperatorControlPlane,
+    _rolling_policy_identity,
+    _stored_connectivity_projection,
+)
 
 _CLIENT_DISCONNECT_ERRORS = (BrokenPipeError, ConnectionAbortedError, ConnectionResetError)
 _LOGGER = logging.getLogger(__name__)
@@ -103,6 +109,28 @@ _CANARY_USAGE_FIELDS = (
     "external_flow_usd",
 )
 _PAPER_FORWARD_STAGES = frozenset({"PAPER_FORWARD", "PAPER_PROMOTABLE"})
+_ROLLING_REVIEW_HTTP_FIELDS = frozenset(
+    {
+        "policy",
+        "values",
+        "actor",
+        "expected_risk_config_id",
+        "expected_risk_config_generation",
+        "expected_risk_config_hash",
+    }
+)
+_ROLLING_ACTIVATE_HTTP_FIELDS = frozenset(
+    {
+        "policy_id",
+        "policy_version",
+        "draft_id",
+        "draft_version",
+        "actor",
+        "expected_risk_config_id",
+        "expected_risk_config_generation",
+        "expected_risk_config_hash",
+    }
+)
 _BINANCE_HTTP_FORBIDDEN_ACTIONS = frozenset({"EXECUTION_PROBE", "RECONCILE_PROBE"})
 _MARKET_SCOPE_FUNNEL_STAGES = (
     "historically_qualified",
@@ -2420,8 +2448,16 @@ class DashboardData:
             "policy": {},
             "active_policy": {},
             "reviewed_policy": {},
+            "proposed_policy": {},
+            "policy_review": {
+                "status": "NOT_REVIEWED",
+                "active": {},
+                "proposed": {},
+                "caps": {},
+                "allocation": {},
+            },
+            "allocation_review": {},
             "risk": {},
-            "controller": {"status": "UNKNOWN"},
             "evidence": {"status": "UNKNOWN"},
             "selection": {"status": "UNKNOWN", "k": 0, "actual_k": 0},
             "signal": {"status": "UNKNOWN"},
@@ -2868,9 +2904,44 @@ class DashboardData:
         state = dict(review_state)
         policy = state.get("policy") if isinstance(state.get("policy"), Mapping) else {}
         active_policy = load("get_operator_config", "rolling_admission_policy_active", {})
-        active_policy = active_policy if isinstance(active_policy, Mapping) else {}
+        active_policy = dict(active_policy) if isinstance(active_policy, Mapping) else {}
         reviewed_policy = load("get_operator_config", "rolling_admission_policy_review", {})
-        reviewed_policy = reviewed_policy if isinstance(reviewed_policy, Mapping) else {}
+        reviewed_policy = dict(reviewed_policy) if isinstance(reviewed_policy, Mapping) else {}
+
+        def immutable_policy_document(
+            envelope: Mapping[str, Any],
+        ) -> tuple[dict[str, Any], str | None]:
+            if not envelope:
+                return {}, None
+            try:
+                expected_identity = _rolling_policy_identity(envelope)
+            except OperatorControlError as exc:
+                return {}, (
+                    "immutable_policy_identity_missing"
+                    if exc.code == "ROLLING_POLICY_IDENTITY_REQUIRED"
+                    else "immutable_policy_identity_invalid"
+                )
+            loaded = load(
+                "load_admission_policy",
+                expected_identity["policy_id"],
+                expected_identity["version"],
+            )
+            if not isinstance(loaded, Mapping):
+                return {}, "immutable_policy_unavailable"
+            try:
+                loaded_identity = _rolling_policy_identity(loaded)
+            except OperatorControlError:
+                return {}, "immutable_policy_invalid"
+            if loaded_identity != expected_identity:
+                return {}, "immutable_policy_mismatch"
+            return dict(loaded), None
+
+        active_policy_document, active_policy_error = immutable_policy_document(active_policy)
+        reviewed_policy_document, reviewed_policy_error = immutable_policy_document(reviewed_policy)
+        if active_policy_document:
+            active_policy = {**active_policy, "policy": dict(active_policy_document)}
+        if reviewed_policy_document:
+            reviewed_policy = {**reviewed_policy, "policy": dict(reviewed_policy_document)}
         risk = self.risk_settings_data()
         effective_limits = (
             risk.get("effective_limits")
@@ -2953,24 +3024,23 @@ class DashboardData:
                     return normalized
             return None
 
-        active_policy_document = (
-            active_policy.get("policy")
-            if isinstance(active_policy.get("policy"), Mapping)
-            else {}
-        )
-        active_policy_id = rolling_identity(
-            active_policy, "policy_id", "id"
-        ) or rolling_identity(active_policy_document, "policy_id", "id")
-        active_policy_version = rolling_identity(
-            active_policy, "policy_version", "version"
-        ) or rolling_identity(
-            active_policy_document, "policy_version", "version"
-        )
-        active_policy_hash = rolling_identity(
-            active_policy, "policy_hash", "config_hash"
-        ) or rolling_identity(
-            active_policy_document, "policy_hash", "config_hash"
-        )
+        active_policy_document = dict(active_policy_document)
+        if active_policy_error:
+            active_policy_id = None
+            active_policy_version = None
+            active_policy_hash = None
+        else:
+            try:
+                active_identity = _rolling_policy_identity(active_policy)
+            except OperatorControlError:
+                active_policy_id = None
+                active_policy_version = None
+                active_policy_hash = None
+                active_policy_error = active_policy_error or "immutable_policy_identity_invalid"
+            else:
+                active_policy_id = active_identity["policy_id"]
+                active_policy_version = active_identity["version"]
+                active_policy_hash = active_identity["config_hash"]
         selection_policy_id = rolling_identity(
             selection, "policy_id", "admission_policy_id"
         )
@@ -2993,6 +3063,8 @@ class DashboardData:
         def fence_blocker(reason: str) -> None:
             if reason not in selection_fence_blockers:
                 selection_fence_blockers.append(reason)
+        if active_policy_error:
+            fence_blocker(f"active_{active_policy_error}")
 
         if not active_policy_id:
             fence_blocker("active_policy_id_unavailable")
@@ -3026,9 +3098,13 @@ class DashboardData:
                 persisted_policy = loaded_policy
             else:
                 fence_blocker("persisted_policy_unavailable")
-        persisted_policy_hash = rolling_identity(
-            persisted_policy, "config_hash", "policy_hash"
-        )
+        persisted_policy_identity: dict[str, str] = {}
+        if persisted_policy:
+            try:
+                persisted_policy_identity = _rolling_policy_identity(persisted_policy)
+            except OperatorControlError:
+                fence_blocker("persisted_policy_identity_invalid")
+        persisted_policy_hash = persisted_policy_identity.get("config_hash")
         if not selection_policy_hash and persisted_policy_hash:
             selection_policy_hash = persisted_policy_hash
         if not selection_policy_hash:
@@ -3194,7 +3270,7 @@ class DashboardData:
             ):
                 if key in source and source.get(key) is not None:
                     risk_binding.setdefault(key, source.get(key))
-        policy_document = dict(policy) if policy else dict(active_policy)
+        policy_document = dict(active_policy_document)
         policy_id = selection_policy_id or active_policy_id
         policy_version = selection_policy_version or active_policy_version
         policy_hash = selection_policy_hash or active_policy_hash
@@ -3246,9 +3322,95 @@ class DashboardData:
         if next_jobs is None:
             next_jobs = []
 
+        def policy_summary(
+            source: Mapping[str, Any],
+            document: Mapping[str, Any],
+        ) -> dict[str, Any]:
+            document = document if isinstance(document, Mapping) else {}
+            return {
+                "policy_id": rolling_identity(document, "policy_id", "id"),
+                "version": rolling_identity(document, "version", "policy_version"),
+                "config_hash": rolling_identity(document, "config_hash", "policy_hash"),
+                "global_budget": document.get("global_budget"),
+                "max_active_strategies": document.get(
+                    "max_members",
+                    document.get("max_k"),
+                ),
+                "status": source.get("status") or source.get("review_status"),
+            }
+
+        active_summary = policy_summary(active_policy, active_policy_document)
+        proposed_summary = policy_summary(reviewed_policy, reviewed_policy_document)
+
+        current_binding = {
+            "risk_config_id": current_risk.get("risk_config_id"),
+            "risk_config_generation": current_risk.get("risk_config_generation"),
+            "risk_config_hash": current_risk.get("risk_config_hash"),
+        }
+        proposed_binding = {
+            "risk_config_id": reviewed_policy.get("risk_config_id"),
+            "risk_config_generation": reviewed_policy.get("risk_config_generation"),
+            "risk_config_hash": reviewed_policy.get("risk_config_hash"),
+        }
+        binding_present = all(value not in (None, "") for value in proposed_binding.values())
+        binding_matches = binding_present and all(
+            str(proposed_binding[name]) == str(current_binding[name])
+            for name in proposed_binding
+        )
+        proposed_status = str(
+            reviewed_policy.get("status")
+            or reviewed_policy.get("review_status")
+            or "NOT_REVIEWED"
+        ).upper()
+        if active_policy_error or reviewed_policy_error:
+            proposed_status = "STALE"
+        if proposed_status == "REVIEWED" and not binding_matches:
+            proposed_status = "STALE"
+        allocation_review = reviewed_policy.get("allocation_review")
+        allocation_review = (
+            dict(allocation_review) if isinstance(allocation_review, Mapping) else {}
+        )
+        caps = {
+            "submissions_per_day": effective_limits.get("max_submitted_orders_per_day"),
+            "per_buy_usd": effective_limits.get("max_all_in_buy_usd"),
+            "daily_buy_usd": effective_limits.get("max_gross_daily_buy_usd"),
+            "open_exposure_usd": effective_limits.get("max_aggregate_exposure_usd"),
+            "max_open_positions": effective_limits.get("max_positions"),
+            "per_market_buy_usd": effective_limits.get("per_market_buy_cap_usd"),
+            "per_event_buy_usd": effective_limits.get("per_event_buy_cap_usd"),
+            "cumulative_buy_usd": effective_limits.get("cumulative_buy_cap_usd"),
+        }
+        policy_review = {
+            "status": proposed_status,
+            "active": active_summary,
+            "proposed": {
+                **proposed_summary,
+                "draft_id": reviewed_policy.get("draft_id"),
+                "draft_version": reviewed_policy.get("draft_version"),
+                "draft_hash": reviewed_policy.get("draft_hash"),
+            },
+            "caps": caps,
+            "allocation": allocation_review,
+            "canary_binding": current_binding,
+            "proposed_canary_binding": proposed_binding,
+            "active_vs_proposed": {
+                "active_policy_id": active_summary.get("policy_id"),
+                "active_policy_version": active_summary.get("version"),
+                "active_global_budget": active_summary.get("global_budget"),
+                "proposed_policy_id": proposed_summary.get("policy_id"),
+                "proposed_policy_version": proposed_summary.get("version"),
+                "proposed_global_budget": proposed_summary.get("global_budget"),
+                "requires_explicit_activation": True,
+            },
+            "paper_only": True,
+            "live_execution": False,
+        }
+
         return _bounded_value(
             {
                 "status": status,
+                "paper_only": True,
+                "live_execution": False,
                 "controller_status": worker_status,
                 "k": selected_k,
                 "actual": actual_k,
@@ -3259,6 +3421,11 @@ class DashboardData:
                 "policy": policy_document,
                 "active_policy": dict(active_policy),
                 "reviewed_policy": dict(reviewed_policy),
+                "proposed_policy": dict(reviewed_policy),
+                "policy_review": policy_review,
+                "allocation_review": allocation_review,
+                "next_jobs": next_jobs,
+                "cold_start_requirements": cold_start,
                 "policy_identity": {
                     "policy_id": policy_id,
                     "version": policy_version,
@@ -3345,12 +3512,8 @@ class DashboardData:
                 "reason_history": reason_history,
                 "admission_reason_history": admission_reason_history,
                 "replacement_reason_history": replacement_reason_history,
-                "next_jobs": next_jobs,
                 "selection_blockers": selection_fence_blockers[:32],
-                "cold_start_requirements": cold_start,
                 "risk_binding": risk_binding,
-                "paper_only": True,
-                "live_execution": False,
             }
         )
 
@@ -7781,7 +7944,7 @@ def _dashboard_html(
     <article id="candidate-detail" class="panel"><div class="section-title"><h2>Candidate detail</h2><span class="muted">historical → forward → lifecycle</span></div><div class="empty">Select a candidate to inspect evidence.</div></article>
     <section id="view-hermes" class="view"><article class="panel"><div class="section-title"><h2>Hermes / research loop</h2><span class="badge">research only · no canary control</span></div><div id="hermes-summary"></div><div class="filters"><input id="hermes-filter" placeholder="Filter queue" aria-label="Filter Hermes queue"><select id="hermes-status"><option value="">All statuses</option><option>PENDING</option><option>TESTING</option><option>COMPLETED</option><option>ACCEPTED</option><option>REJECTED</option><option>FAILED</option><option>ERROR</option></select><select id="hermes-size"><option>25</option><option>50</option><option>100</option></select></div><div id="hermes-table" class="scroll"></div><div id="hermes-pager" class="pager"></div><div id="hermes-detail"></div></article></section>
     <section id="view-portfolio" class="view"><article class="panel"><div class="section-title"><h2>Paper Portfolio</h2><span class="badge warn">paper-only · no live execution</span></div><div class="filters"><input id="paper-filter" placeholder="Filter paper records" aria-label="Filter paper records"><select id="paper-status"><option value="">All statuses</option><option>OPEN</option><option>CLOSED</option><option>RESOLVED</option><option>UNKNOWN</option></select><select id="paper-size"><option>25</option><option>50</option><option>100</option></select></div><div id="portfolio-summary"></div><div id="portfolio-states" class="scroll"></div><div id="paper-pager" class="pager"></div></article></section>
-    <section id="view-rolling-portfolio" class="view"><article class="panel"><div class="section-title"><h2>Rolling Portfolio</h2><span id="rolling-status" class="badge warn">paper-only · no live execution</span></div><div id="rolling-summary"></div><div id="rolling-members" class="scroll"></div><div id="rolling-reasons"></div><div id="rolling-jobs"></div><p class="page-note">Rolling membership is append-only and each displayed member is bound to its persisted strategy, research trial, candidate, and exact evidence window. Missing lineage remains non-executable.</p></article></section>
+    <section id="view-rolling-portfolio" class="view"><article class="panel"><div class="section-title"><h2>Rolling Portfolio</h2><span id="rolling-status" class="badge warn">paper-only · no live execution</span></div><div id="rolling-action-result" class="page-note"></div><div id="rolling-summary"></div><div id="rolling-policy-controls"></div><div id="rolling-members" class="scroll"></div><div id="rolling-reasons"></div><div id="rolling-jobs"></div><p class="page-note">Rolling membership is append-only and each displayed member is bound to its persisted strategy, research trial, candidate, and exact evidence window. Missing lineage remains non-executable. Policy/allocation review is a non-active draft; activation is separate, deliberate, and remains paper-only.</p></article></section>
     <section id="view-canary" class="view"><article class="panel" style="border-color:var(--red)"><div class="section-title"><h2>REAL CANARY MONEY</h2><span class="badge bad">PRODUCTION LIVE TRADING: DISABLED</span></div><div id="canary-action-result" class="page-note"></div><div id="canary-readiness-snapshot"></div><div id="canary-controls"></div><div id="risk-settings"></div><div id="canary-connectivity"></div><div id="canary-summary"></div><div id="canary-trades" class="scroll"></div><p class="notice">Autonomous canary is independent from paper research. No secrets are stored or displayed. It remains prediction-only, bounded by active settings, and killable from this console.</p></article></section>
     <article id="canary-recovery-form" class="panel"><div class="section-title"><h2>UNKNOWN ENTRY RECOVERY</h2><span class="badge warn">READ-ONLY · PRODUCTION PROFILE</span></div><p class="page-note">Attach only an operator-supplied canonical exchange order ID. This does not post, retry, activate, or release an entry.</p><div class="three-col"><label>Event ID<input id="canary-recovery-event" autocomplete="off"></label><label>Signal ID<input id="canary-recovery-signal" autocomplete="off"></label><label>Canonical exchange order ID<input id="canary-recovery-order" autocomplete="off"></label></div><label>Exact confirmation<input id="canary-recovery-confirm" placeholder="RECOVER UNKNOWN ENTRY" autocomplete="off"></label><p class="page-note"><button id="canary-recovery-submit" class="link">Recover and reconcile</button> <span id="canary-recovery-result"></span></p></article>
     <section id="view-binance-canary" class="view binance-view"><article class="panel" style="border-color:var(--amber)"><div class="section-title"><h2>BINANCE SPOT CANARY</h2><span class="badge warn">DEVELOPMENT / PAPER|TESTNET</span></div><p class="page-note">Separate from the Polymarket canary. <strong>POLYMARKET TRANSPORT: DISABLED</strong> · Binance Spot only · no implicit control-plane construction.</p><div id="binance-action-result" class="page-note"></div><div id="binance-identity"></div><div id="binance-connectivity"></div><div id="binance-qualification"></div><div id="binance-risk"></div><div id="binance-controls"></div><div id="binance-records" class="scroll"></div><details><summary>Full Binance projection and identifiers</summary><pre id="binance-raw"></pre></details><p class="notice">Credentials are never displayed. Connectivity checks are read-only; order validation is an explicit test action. No browser action can place an order.</p></article></section>
@@ -7795,10 +7958,12 @@ def _dashboard_html(
     let params = new URLSearchParams(location.search); const state = { tab: params.get("tab") || "overview", page: Math.max(1,Number(params.get("page")||1)), page_size: [10,25,50,100].includes(Number(params.get("page_size"))) ? Number(params.get("page_size")) : 25, filter: params.get("filter") || "", sort: params.get("sort") || "", direction: params.get("direction") === "asc" ? "asc" : "desc", selected: params.get("selected") || "", expanded: params.get("expanded") === "1" };
     let operator = {}, current = {}, loadInFlight = false, operatorControlsRendered = false, binanceTestnetMode = false;
     let riskReview = {active:null,draft:null};
+    let rollingReview = {active:{},proposed:{},caps:{},allocation:{},canary_binding:{}};
     const controlToken = document.querySelector('meta[name="axiom-control-token"]')?.content || "";
     function controlButton(action,label,target="",confirmation="",payload=null) { const encodedPayload=payload&&typeof payload==="object"&&!Array.isArray(payload)?JSON.stringify(payload):""; return `<button class="link control-action" data-control-action="${safe(action)}" data-control-target="${safe(target)}" data-control-confirm="${safe(confirmation)}" data-control-payload="${safe(encodedPayload)}">${safe(label)}</button>`; }
     function isCanaryAction(action) { return String(action||"").startsWith("canary."); }
-    function actionResultNode(action) { return $(isCanaryAction(action)?"canary-action-result":"control-result"); }
+    function isRollingAction(action) { const value=String(action||""); return value.startsWith("rolling.")||value.startsWith("admission_policy."); }
+    function actionResultNode(action) { return $(isCanaryAction(action)?"canary-action-result":isRollingAction(action)?"rolling-action-result":"control-result"); }
     function actionResultMessage(action,message) { const node=actionResultNode(action); if(node)node.textContent=message||""; }
     async function controlPost(action,target="",confirmation="",extra={}) {
       const payload={action,target,...(extra&&typeof extra==="object"?{payload:extra}: {})}; if(confirmation)payload.confirm=confirmation;
@@ -7872,10 +8037,16 @@ def _dashboard_html(
     async function loadCandidate(id,eventPage=1,persist=true) { state.selected=id; state.expanded=true; if(persist)saveState(true); try { const q=new URLSearchParams({page:String(eventPage),page_size:String(state.page_size)}),candidateResponse=await fetch(`/api/v2/candidates/${encodeURIComponent(id)}`,{cache:"no-store"}),r=await fetch(`/api/v2/candidates/${encodeURIComponent(id)}/events?${q}`,{cache:"no-store"}),candidate=candidateResponse.ok?await candidateResponse.json():{},d=await r.json(); const checks=[["Historical gates",candidate.historical_gates||"NOT_PASSED"],["Historical data integrity",candidate.historical_data_integrity||"FAIL"],["Historical execution fidelity",candidate.historical_execution_fidelity||"UNKNOWN"],["Canary data quality",candidate.canary_data_quality_gate||"NOT PASSED"],["Production evidence",candidate.production_evidence||"INSUFFICIENT"],["Micro-live canary",candidate.canary_status||"NOT_ELIGIBLE"],["Paper forward status",candidate.paper_forward_status||"NOT_STARTED"],["Paper promotable",candidate.paper_promotable_status||"NOT_YET"]]; const markup=`<div class="key-value"><span class="key">Candidate</span><strong>${safe(candidate.candidate_id||id)}</strong></div><div class="three-col">${checks.map(([label,value])=>`<div class="key-value"><span class="key">${safe(label)}</span><strong><span class="badge ${statusClass(value)}">${safe(value)}</span></strong></div>`).join("")}</div>${arr(d.items).length?`<table><thead><tr><th>Time</th><th>Stage</th><th>Reason</th></tr></thead><tbody>${arr(d.items).map(i=>`<tr><td>${safe(dateText(i.created_at||i.timestamp))}</td><td><span class="badge">${safe(i.stage||i.to_stage)}</span></td><td>${safe(i.reason||i.message)}</td></tr>`).join("")}</tbody></table>`:empty("No lifecycle events","No persisted lifecycle evidence exists for this candidate.")}<div id="candidate-events-pager" class="pager"></div>`; $("detail").innerHTML=markup; if(state.tab==="candidates")$("dataset-detail").innerHTML=markup; if($("candidate-events-pager")){const total=Number(d.total)||0,page=Number(d.page)||1,size=Number(d.page_size)||state.page_size,pages=Number(d.pages)||0,start=total?(page-1)*size+1:0,end=Math.min(page*size,total); $("candidate-events-pager").innerHTML=`<span>Showing ${start}–${end} of ${total}</span><span><button data-page="${page-1}" ${page<=1?"disabled":""}>Previous</button> <button data-page="${page+1}" ${!pages||page>=pages?"disabled":""}>Next</button></span>`; $("candidate-events-pager").querySelectorAll("button").forEach(b=>b.addEventListener("click",()=>loadCandidate(id,Number(b.dataset.page),false)));} } catch(e) { $("detail").innerHTML=empty("Candidate detail unavailable",e.message); } }
     function renderPaper(data) { const p=operator.paper_portfolio||{}; $("portfolio-summary").innerHTML=`<div class="card-grid"><div class="panel"><div class="metric">${p.state_count?Number(p.total_equity||0).toFixed(2):"—"}</div><div class="metric-label">paper equity</div></div><div class="panel"><div class="metric">${p.state_count?Number(p.total_pnl||0).toFixed(2):"—"}</div><div class="metric-label">paper P/L</div></div><div class="panel"><div class="metric">${count(data.total)}</div><div class="metric-label">paper records</div></div><div class="panel"><div class="metric">${p.state_count?`${(Number(p.win_rate||0)*100).toFixed(1)}%`:"—"}</div><div class="metric-label">win rate</div></div></div>`; $("portfolio-states").innerHTML=arr(data.items).length?`<table><thead><tr><th>${sortButton("timestamp","Time")}</th><th>${sortButton("record_type","Type")}</th><th>Experiment</th><th>Market</th><th>Status</th><th>Details</th></tr></thead><tbody>${arr(data.items).map(i=>`<tr><td>${safe(dateText(i.timestamp||i.created_at||i.updated_at))}</td><td>${safe(i.record_type)}</td><td>${safe(i.experiment_id)}</td><td>${safe(i.market_id||i.symbol)}</td><td><span class="badge ${statusClass(i.status)}">${safe(i.status)}</span></td><td><details><summary>view</summary><pre>${safe(json(i))}</pre></details></td></tr>`).join("")}</tbody></table>`:empty("Waiting for PAPER_FORWARD","Paper portfolio initializes only after a candidate enters PAPER_FORWARD and observations are persisted."); pager("paper",data); bindTable(); }
     function renderRollingPortfolio(data) {
-      const status=String(data?.status||"UNKNOWN").toUpperCase(), identity=data?.policy_identity||{}, rows=arr(data?.active_rows), cold=arr(data?.cold_start_requirements);
+      const status=String(data?.status||"UNKNOWN").toUpperCase(), identity=data?.policy_identity||{}, rows=arr(data?.active_rows), cold=arr(data?.cold_start_requirements), review=data?.policy_review&&typeof data.policy_review==="object"?data.policy_review:{}, active=review.active||{}, proposed=review.proposed||{}, caps=review.caps||{}, allocation=review.allocation||{};
+      rollingReview={active,proposed,caps,allocation,canary_binding:review.canary_binding||{}};
       const badge=$("rolling-status"); if(badge){badge.textContent=status==="COLD_START"?"COLD_START · requirements pending":`${status} · paper-only`;badge.className=`badge ${statusClass(status)}`;}
-      $("rolling-summary").innerHTML=`<div class="three-col"><div class="key-value"><span class="key">Controller</span><strong>${safe(status)}</strong></div><div class="key-value"><span class="key">Selected / active K</span><strong>${safe(data?.k)} / ${safe(data?.actual_k)}</strong></div><div class="key-value"><span class="key">Policy</span><strong>${safe(identity.policy_id)} / ${safe(identity.version)}</strong></div><div class="key-value"><span class="key">Policy hash</span><strong>${safe(identity.config_hash)}</strong></div><div class="key-value"><span class="key">Effective limits</span><strong>${safe(json(data?.global_limits||{}))}</strong></div><div class="key-value"><span class="key">Rolling risk usage (reserved/open capital)</span><strong>${safe(json(data?.rolling_usage||data?.global_limits_usage||{}))}</strong></div></div>`;
-      $("rolling-members").innerHTML=rows.length?`<table><thead><tr><th>Strategy version</th><th>Research trial</th><th>Candidate</th><th>Evidence window</th><th>Evidence digest</th><th>Status</th><th>Allocation</th><th>Coverage</th><th>Reason</th></tr></thead><tbody>${rows.map(row=>`<tr><td>${safe(row.strategy_version_id)}</td><td>${safe(row.research_trial_id)}</td><td>${safe(row.candidate_id)}</td><td>${safe(row.evidence_window_id)}</td><td>${safe(row.evidence_digest)}</td><td><span class="badge ${statusClass(row.executable?"ACTIVE":"BLOCKED")}">${safe(row.executable?"EXECUTABLE":"NON-EXECUTABLE")}</span></td><td>${safe(row.allocation)}</td><td>${safe(row.actual_coverage_seconds)}</td><td>${safe(arr(row.reasons).join(", ")||row.reason||arr(row.blockers).join(", "))}</td></tr>`).join("")}</tbody></table>`:empty("No executable rolling members","COLD_START: persist exact member lineage and evidence before selecting K members.");
+      $("rolling-summary").innerHTML=`<div class="three-col"><div class="key-value"><span class="key">Controller</span><strong>${safe(status)}</strong></div><div class="key-value"><span class="key">Selected / active K</span><strong>${safe(data?.k)} / ${safe(data?.actual_k)}</strong></div><div class="key-value"><span class="key">Active policy</span><strong>${safe(active.policy_id||identity.active_policy_id)} / ${safe(active.version||identity.active_policy_version)}</strong></div><div class="key-value"><span class="key">Active budget</span><strong>${safe(active.global_budget??"—")}</strong></div><div class="key-value"><span class="key">Policy hash</span><strong>${safe(active.config_hash||identity.active_policy_hash||identity.config_hash)}</strong></div><div class="key-value"><span class="key">Effective risk caps</span><strong>${safe(json(caps))}</strong></div></div>`;
+      const draftStatus=String(review.status||"NOT_REVIEWED").toUpperCase(), venue=allocation.venue_minimum_feasibility||{};
+      const draftControls=draftStatus==="REVIEWED"&&proposed.draft_id&&proposed.draft_version
+        ? `<button class="link rolling-policy-action" data-rolling-action="activate" data-draft-id="${safe(proposed.draft_id)}" data-draft-version="${safe(proposed.draft_version)}" data-risk-id="${safe(review.canary_binding?.risk_config_id)}" data-risk-generation="${safe(review.canary_binding?.risk_config_generation)}" data-risk-hash="${safe(review.canary_binding?.risk_config_hash)}">Review and activate this draft</button>`
+        : "";
+      $("rolling-policy-controls").innerHTML=`<article class="panel"><div class="section-title"><h3>POLICY / ALLOCATION REVIEW</h3><span class="badge ${statusClass(draftStatus)}">${safe(draftStatus)}</span></div><p class="page-note">Active policy and canary settings remain authoritative. Review creates a non-active immutable draft; activation is a separate deliberate operation and never enables canary execution.</p><div class="three-col"><label class="key-value"><span class="key">Proposed portfolio budget (USD)</span><input id="rolling-budget" aria-label="Proposed portfolio budget" inputmode="decimal" value="${safe(proposed.global_budget??allocation.global_budget_usd??active.global_budget??"0.00")}"></label><div class="key-value"><span class="key">Max active strategies</span><strong>${safe(proposed.max_active_strategies??allocation.max_active_strategies??"—")}</strong></div><div class="key-value"><span class="key">Max open positions</span><strong>${safe(caps.max_open_positions??allocation.max_open_positions??"—")}</strong></div><div class="key-value"><span class="key">Submissions/day</span><strong>${safe(caps.submissions_per_day??allocation.active_submissions_per_day??"—")}</strong></div><div class="key-value"><span class="key">Per-buy / daily buy</span><strong>${safe(caps.per_buy_usd??allocation.active_per_buy_usd??"—")} / ${safe(caps.daily_buy_usd??allocation.active_daily_buy_usd??"—")}</strong></div><div class="key-value"><span class="key">Exposure / venue minimum</span><strong>${safe(caps.open_exposure_usd??allocation.active_open_exposure_usd??"—")} / ${safe(venue.status||"UNKNOWN")}</strong></div></div><p class="page-note"><button class="link rolling-policy-action" data-rolling-action="review" data-risk-id="${safe(review.canary_binding?.risk_config_id)}" data-risk-generation="${safe(review.canary_binding?.risk_config_generation)}" data-risk-hash="${safe(review.canary_binding?.risk_config_hash)}">Review proposed allocation</button>${draftControls?` · ${draftControls}`:""}</p>${proposed.draft_id?`<p class="page-note">Draft identity generated internally: ${safe(proposed.draft_id)} / ${safe(proposed.draft_version)} · bound canary config ${safe(review.proposed_canary_binding?.risk_config_id)} generation ${safe(review.proposed_canary_binding?.risk_config_generation)}.</p>`:""}</article>`;
+      $("rolling-members").innerHTML=rows.length?`<table><thead><tr><th>Strategy version</th><th>Research trial</th><th>Candidate</th><th>Evidence window</th><th>Evidence digest</th><th>Status</th><th>Allocation</th><th>Coverage</th><th>Reason</th></tr></thead><tbody>${rows.map(row=>`<tr><td>${safe(row.strategy_version_id)}</td><td>${safe(row.research_trial_id)}</td><td>${safe(row.candidate_id)}</td><td>${safe(row.evidence_window_id)}</td><td>${safe(row.evidence_digest)}</td><td><span class="badge ${statusClass(row.executable?"ACTIVE":"BLOCKED")}">${safe(row.executable?"EXECUTABLE":"NON-EXECUTABLE")}</span></td><td>${safe(row.allocation)}</td><td>${safe(row.actual_coverage_seconds)}</td><td>${safe(arr(row.reasons).join(", ")||row.reason||arr(row.blockers).join(", ")||"—")}</td></tr>`).join("")}</tbody></table>`:empty("No active rolling members","No persisted active rolling selection is available.");
       $("rolling-reasons").innerHTML=`<article class="panel"><div class="section-title"><h3>Admission / replacement history</h3><span class="badge">${arr(data?.reason_history).length} retained</span></div>${arr(data?.reason_history).length?`<pre>${safe(json(arr(data.reason_history).slice(-32)))}</pre>`:empty("No rolling review history","Admission and replacement reasons are retained after members leave active K.")}</article>${cold.length?`<article class="panel"><div class="section-title"><h3>Cold-start requirements</h3><span class="badge warn">BLOCKED</span></div><ul>${cold.slice(0,16).map(item=>`<li>${safe(researchFeedValue(item))}</li>`).join("")}</ul></article>`:""}`;
       const jobs=data?.next_jobs; $("rolling-jobs").innerHTML=jobs&&((Array.isArray(jobs)&&jobs.length)||(typeof jobs==="object"&&Object.keys(jobs).length))?`<article class="panel"><div class="section-title"><h3>Next rolling jobs</h3><span class="badge">durable</span></div><pre>${safe(json(jobs))}</pre></article>`:empty("No next rolling jobs","The durable worker has not persisted a next action.");
     }
@@ -8398,6 +8569,39 @@ def _dashboard_html(
     };
     document.addEventListener("click",async event=>{const button=event.target.closest?.(".binance-action");if(!button)return;const action=button.dataset.binanceAction||"",payload={};if(!binanceTestnetMode&&(action==="ENABLE"||action==="RESUME"))payload.confirmation=$("binance-confirm")?.value||"";if(action==="ORDER_VALIDATION_TEST"&&!binanceTestnetMode){payload.symbol=$("binance-order-symbol")?.value||"";payload.price=$("binance-order-price")?.value||"";payload.quantity=$("binance-order-quantity")?.value||"";}await binanceControlPost(action,payload);});
     document.addEventListener("click",async event=>{
+      const button=event.target.closest?.(".rolling-policy-action");
+      if(!button||button.disabled)return;
+      button.disabled=true;
+      let rollingAction="rolling.admission.review";
+      try {
+        const action=button.dataset.rollingAction==="activate"?"rolling.admission.activate":"rolling.admission.review"; rollingAction=action; const binding=rollingReview.canary_binding||{},payload={expected_risk_config_id:binding.risk_config_id,expected_risk_config_generation:binding.risk_config_generation,expected_risk_config_hash:binding.risk_config_hash};
+        let confirmation="";
+        if(action==="rolling.admission.review"){
+          confirmation="REVIEW ROLLING ADMISSION POLICY";
+          const budget=$("rolling-budget")?.value;
+          if(budget!==undefined&&budget!=="")payload.values={global_budget:budget};
+        } else {
+          confirmation="ACTIVATE ROLLING ADMISSION POLICY";
+          if(!rollingReview.proposed?.draft_id||!rollingReview.proposed?.draft_version){
+            actionResultMessage(action,"rolling.admission.activate blocked: no internally generated reviewed draft");
+            return;
+          }
+          payload.draft_id=rollingReview.proposed.draft_id;
+          payload.draft_version=rollingReview.proposed.draft_version;
+        }
+        const typed=window.prompt(`Type ${confirmation} to continue`);
+        if(typed!==confirmation){
+          actionResultMessage(action,`${action} cancelled: exact confirmation required`);
+          return;
+        }
+        await controlPost(action,action==="rolling.admission.activate"?`${payload.draft_id}:${payload.draft_version}`:"rolling-admission",confirmation,payload);
+      } catch(error) {
+        actionResultMessage(rollingAction,`rolling policy action failed: ${error.message}`);
+      } finally {
+        button.disabled=false;
+      }
+    });
+    document.addEventListener("click",async event=>{
       const button=event.target.closest?.(".control-action");
       if(!button||button.disabled)return;
       button.disabled=true;
@@ -8688,6 +8892,7 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             status = 200 if result.get("ok") is not False else (503 if reason.endswith(("UNAVAILABLE", "TIMEOUT", "FAILED")) else 400)
             self._send(status, result)
             return
+        action_name = str(body.get("action") or "").strip()
         allowed_fields = {
             "action",
             "target",
@@ -8698,24 +8903,53 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             "config_id",
             "expected_generation",
             "venue",
+            *_ROLLING_REVIEW_HTTP_FIELDS,
+            *_ROLLING_ACTIVATE_HTTP_FIELDS,
         }
         if set(body) - allowed_fields:
             self._send(400, {"error": "unsupported control fields"})
             return
         payload = body.get("payload")
-        flat_payload = {
-            name: body[name]
-            for name in ("values", "actor", "config_id", "expected_generation", "venue")
-            if name in body
-        }
         if payload is not None and not isinstance(payload, Mapping):
             self._send(400, {"error": "control payload must be an object"})
             return
+        rolling_review_actions = {
+            "rolling.admission.review",
+            "rolling.policy.review",
+            "admission_policy.review",
+        }
+        rolling_activate_actions = {
+            "rolling.admission.activate",
+            "rolling.policy.activate",
+            "admission_policy.activate",
+        }
+        rolling_fields = (
+            _ROLLING_REVIEW_HTTP_FIELDS | _ROLLING_ACTIVATE_HTTP_FIELDS
+        ) - {"values", "actor"}
+        if action_name not in rolling_review_actions | rolling_activate_actions:
+            if set(body) & rolling_fields:
+                self._send(400, {"error": "rolling fields require a rolling action"})
+                return
+        flat_fields = {
+            "values",
+            "actor",
+            "config_id",
+            "expected_generation",
+            "venue",
+        }
+        if action_name in rolling_review_actions:
+            flat_fields |= _ROLLING_REVIEW_HTTP_FIELDS
+        elif action_name in rolling_activate_actions:
+            flat_fields |= _ROLLING_ACTIVATE_HTTP_FIELDS
+        flat_payload = {
+            name: body[name]
+            for name in flat_fields
+            if name in body
+        }
         if payload is not None and flat_payload:
             self._send(400, {"error": "control payload must be nested"})
             return
         action_payload = dict(payload) if isinstance(payload, Mapping) else flat_payload
-        action_name = str(body.get("action") or "").strip()
         payload_actions = {
             "canary.settings.save_draft",
             "risk.settings.save_draft",
@@ -8723,6 +8957,8 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             "risk.settings.activate_draft",
             "canary.enable_auto",
             "canary.recover_entry",
+            *rolling_review_actions,
+            *rolling_activate_actions,
         }
         if action_payload and action_name not in payload_actions:
             self._send(400, {"error": "action does not accept a payload"})
