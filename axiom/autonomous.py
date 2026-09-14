@@ -19,7 +19,13 @@ from typing import Any, Callable, Iterable, Mapping, NoReturn, Sequence
 
 from .backtest import CryptoBacktester
 from .backtest.prediction import run_prediction_research_mode
-from .forward import COMMON_PAPER_ASSUMPTIONS, ForwardTestRegistry, _canonical_forward_config, _content_hash
+from .forward import (
+    COMMON_PAPER_ASSUMPTIONS,
+    ForwardTestRegistry,
+    _canonical_forward_config,
+    _content_hash,
+    _normalized_strategy_document,
+)
 from .director import compact_report, validate_hermes_proposal
 from .domain import Fill, MarketType, ResearchQuality, SettlementState, ensure_utc, parse_timestamp, utc_now
 from .evaluation import split_dataset

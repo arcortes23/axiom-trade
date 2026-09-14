@@ -13,6 +13,7 @@ from unittest.mock import Mock, patch
 from pathlib import Path
 from typing import Any
 
+from axiom.autonomous import AutonomousResearchProcessor
 from axiom.collector import CollectionCycle, CollectorConfig, PolymarketCollector
 from axiom.data import InMemoryPredictionProvider
 from axiom.data.polymarket import MarketDiscoveryPage
@@ -1511,6 +1512,65 @@ class MutationSchedulingTests(unittest.TestCase):
                 ["sv-initialization"],
             )
             self.assertEqual(promoted_selection["members"][0]["allocation"], "0")
+    def test_rolling_observation_materializes_supported_strategy_identity(self) -> None:
+        document = _rolling_initialization_document()
+        strategy_document = dict(document["strategy_document"])
+        strategy_document["family"] = "probability_mispricing"
+        document["strategy_document"] = strategy_document
+        document.pop("strategy_hash", None)
+        document["market_scope"] = {
+            "schema_version": "1",
+            "mode": "EXACT_MARKETS",
+            "instrument": "POLYMARKET",
+            "categories": [],
+            "market_ids": ["market-initialization"],
+            "filters": {},
+            "regime_restrictions": {},
+            "provenance": "canonical",
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            db = str(Path(directory) / "rolling-observation.sqlite")
+            with AxiomStore(db) as store:
+                processor = AutonomousResearchProcessor(store, clock=lambda: T0)
+                result = processor._ensure_rolling_paper_observation(
+                    document,
+                    T0,
+                    market_ids=("market-initialization",),
+                )
+                registry = ForwardTestRegistry(store)
+                intents = registry.list_observation_intents()
+                materialized = [
+                    spec for spec in registry.list() if spec.allowed_markets
+                ]
+
+                self.assertEqual(result["candidate_id"], "candidate-initialization")
+                self.assertEqual(len(intents), 1)
+                self.assertEqual(intents[0].experiment_id, result["intent_id"])
+                self.assertEqual(len(materialized), 1)
+                spec = materialized[0]
+                self.assertEqual(
+                    {
+                        key: spec.config[key]
+                        for key in (
+                            "candidate_id",
+                            "strategy_version_id",
+                            "research_trial_id",
+                        )
+                    },
+                    {
+                        "candidate_id": "candidate-initialization",
+                        "strategy_version_id": "sv-initialization",
+                        "research_trial_id": "trial-initialization",
+                    },
+                )
+                self.assertTrue(spec.config["market_authority_required"])
+                self.assertEqual(spec.allowed_markets, ("market-initialization",))
+                self.assertEqual(
+                    spec.config["strategy_document"]["family"],
+                    "probability_mispricing",
+                )
+
     def test_rolling_initialization_commit_rolls_back_and_restart_retries_once(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             db = str(Path(directory) / "rolling-initialization-atomic.sqlite")
