@@ -30,7 +30,12 @@ from axiom.domain import (
     Side,
     TradePrint,
 )
-from axiom.forward import COMMON_PAPER_ASSUMPTIONS, ForwardTestRegistry
+from axiom.forward import (
+    COMMON_PAPER_ASSUMPTIONS,
+    ForwardTestRegistry,
+    _content_hash,
+    _normalized_strategy_document,
+)
 from axiom.lifecycle import CandidateLifecycleManager, CandidateStage, PromotionCriteria
 from axiom.mutations import DeterministicMutationEngine, ExperimentBudget
 from axiom.node import NodeConfig, ResearchNode
@@ -1135,6 +1140,7 @@ class Phase3PaperAndRiskTests(unittest.TestCase):
             "model_document": {"id": "model"},
             "rolling_research": True,
         }
+        strategy_hash = _content_hash(_normalized_strategy_document(_BuyStrategy()))
         with AxiomStore(":memory:") as store:
             registry = ForwardTestRegistry(store)
             first = registry.register_observation_intent(
@@ -1145,6 +1151,8 @@ class Phase3PaperAndRiskTests(unittest.TestCase):
                 candidate_id="candidate-a",
                 strategy_version_id="sv-a",
                 research_trial_id="trial-a",
+                source_strategy_hash=strategy_hash,
+                rolling_strategy_hash=strategy_hash,
             )
             same = registry.register_observation_intent(
                 strategy=_BuyStrategy(),
@@ -1154,6 +1162,8 @@ class Phase3PaperAndRiskTests(unittest.TestCase):
                 candidate_id="candidate-a",
                 strategy_version_id="sv-a",
                 research_trial_id="trial-a",
+                source_strategy_hash=strategy_hash,
+                rolling_strategy_hash=strategy_hash,
             )
             second = registry.register_observation_intent(
                 strategy=_BuyStrategy(),
@@ -1163,6 +1173,8 @@ class Phase3PaperAndRiskTests(unittest.TestCase):
                 candidate_id="candidate-a",
                 strategy_version_id="sv-b",
                 research_trial_id="trial-b",
+                source_strategy_hash=strategy_hash,
+                rolling_strategy_hash=strategy_hash,
             )
             self.assertEqual(first.as_record(), same.as_record())
             self.assertNotEqual(first.experiment_id, second.experiment_id)
