@@ -739,8 +739,15 @@ def _validate_rule_based_resolution(
         or len(inventory_ids) > 1_000
     ):
         raise SmokeBlocked("rule-based scope resolution inventory binding is malformed")
-    order_token = _binding_text(current_set.get("order_token"))
-    expected_order_token = "sha256:" + hashlib.sha256(
+    legacy_order_token = _binding_text(current_set.get("order_token"))
+    inventory_digest = _binding_text(current_set.get("inventory_digest"))
+    if (
+        legacy_order_token is not None
+        and inventory_digest is not None
+        and legacy_order_token != inventory_digest
+    ):
+        raise SmokeBlocked("rule-based scope resolution inventory binding is conflicting")
+    expected_inventory_digest = "sha256:" + hashlib.sha256(
         json.dumps(
             {"market_ids": list(inventory_ids)},
             sort_keys=True,
@@ -749,7 +756,7 @@ def _validate_rule_based_resolution(
             allow_nan=False,
         ).encode("utf-8")
     ).hexdigest()
-    if order_token != expected_order_token:
+    if (inventory_digest or legacy_order_token) != expected_inventory_digest:
         raise SmokeBlocked("rule-based scope resolution inventory binding is mismatched")
 
     inventory_loader = getattr(store, "tracked_polymarket_markets", None)

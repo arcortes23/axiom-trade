@@ -78,6 +78,35 @@ def _first(mapping: Mapping[str, Any], *names: str) -> Any:
     return None
 
 
+def _normalize_inventory_provenance(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Canonicalize the one legacy inventory binding path.
+
+    ``order_token`` was emitted by an earlier exact-scope release.  It is
+    accepted only under ``provenance.current_market_set`` and is rewritten to
+    the public, non-executable ``inventory_digest`` name.  Other order/token
+    fields remain untouched so their normal private-field validation still
+    rejects them.
+    """
+    result = dict(value)
+    current_set = result.get("current_market_set")
+    if not isinstance(current_set, Mapping):
+        return result
+    normalized_set = dict(current_set)
+    legacy = normalized_set.get("order_token")
+    inventory = normalized_set.get("inventory_digest")
+    if (
+        legacy not in (None, "")
+        and inventory not in (None, "")
+        and _text(legacy) != _text(inventory)
+    ):
+        raise ValueError("current_market_set order_token and inventory_digest conflict")
+    if inventory in (None, "") and legacy not in (None, ""):
+        normalized_set["inventory_digest"] = legacy
+    normalized_set.pop("order_token", None)
+    result["current_market_set"] = normalized_set
+    return result
+
+
 def _nested(mapping: Mapping[str, Any], *names: str) -> Any:
     value = _first(mapping, *names)
     if value is not None:
@@ -315,6 +344,7 @@ class MarketScopeResolution(MappingABC[str, Any]):
         provenance = _plain(self.provenance)
         if not isinstance(policy, Mapping) or not isinstance(provenance, Mapping):
             raise TypeError("policy and provenance must be mappings")
+        provenance = _normalize_inventory_provenance(provenance)
         matched: list[CurrentMarket] = []
         for item in self.matched_markets:
             matched.append(item if isinstance(item, CurrentMarket) else CurrentMarket.from_mapping(item))
@@ -773,7 +803,7 @@ def resolve_market_scope(
         **provenance,
         "current_market_set": {
             "market_ids": ordered_market_ids,
-            "order_token": "sha256:" + hashlib.sha256(_canonical(set_material).encode("utf-8")).hexdigest(),
+            "inventory_digest": "sha256:" + hashlib.sha256(_canonical(set_material).encode("utf-8")).hexdigest(),
         },
     }
     matched: list[CurrentMarket] = []

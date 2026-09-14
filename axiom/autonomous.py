@@ -4693,7 +4693,7 @@ class AutonomousResearchProcessor:
             if (
                 str(existing.strategy_hash).strip() != expected_strategy_hash
                 or str(existing.model_hash).strip() != expected_model_hash
-                or _canonical(existing_canonical) != _canonical(expected_config)
+                or _canonical_binding(existing_canonical) != _canonical_binding(expected_config)
             ):
                 continue
             intent = existing

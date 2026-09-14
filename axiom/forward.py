@@ -142,9 +142,41 @@ def _validate_forward_config(config: Mapping[str, Any]) -> None:
         _validate_payload(public)
     except (ResearchBusPermissionError, TypeError, ValueError) as exc:
         raise ValueError("forward test config contains forbidden private or execution fields") from exc
+
+def _normalize_inventory_binding(config: dict[str, Any]) -> None:
+    """Normalize the one legacy inventory binding path before bus validation."""
+    resolution = config.get("scope_resolution")
+    if not isinstance(resolution, Mapping):
+        return
+    provenance = resolution.get("provenance")
+    if not isinstance(provenance, Mapping):
+        return
+    current_set = provenance.get("current_market_set")
+    if not isinstance(current_set, Mapping):
+        return
+    normalized_set = dict(current_set)
+    legacy = normalized_set.get("order_token")
+    inventory = normalized_set.get("inventory_digest")
+    if (
+        legacy not in (None, "")
+        and inventory not in (None, "")
+        and str(legacy).strip() != str(inventory).strip()
+    ):
+        raise ValueError("current_market_set order_token and inventory_digest conflict")
+    if inventory in (None, "") and legacy not in (None, ""):
+        normalized_set["inventory_digest"] = legacy
+    normalized_set.pop("order_token", None)
+    normalized_provenance = dict(provenance)
+    normalized_provenance["current_market_set"] = normalized_set
+    normalized_resolution = dict(resolution)
+    normalized_resolution["provenance"] = normalized_provenance
+    config["scope_resolution"] = normalized_resolution
+
+
 def _canonical_scope_config(config: Mapping[str, Any]) -> dict[str, Any]:
     """Validate and canonicalize both accepted scope aliases."""
     result = dict(config)
+    _normalize_inventory_binding(result)
     supplied_scope = result.get("scope")
     supplied_market_scope = result.get("market_scope")
     if supplied_scope is not None and supplied_market_scope is not None:

@@ -33,6 +33,7 @@ from axiom.domain import (
 from axiom.forward import (
     COMMON_PAPER_ASSUMPTIONS,
     ForwardTestRegistry,
+    _canonical_scope_config,
     _content_hash,
     _normalized_strategy_document,
 )
@@ -1277,6 +1278,45 @@ class Phase3PaperAndRiskTests(unittest.TestCase):
             )
             self.assertEqual(materialized.allowed_markets, ("market-1",))
             self.assertTrue(materialized.config["market_authority_required"])
+
+    def test_inventory_digest_is_canonical_and_legacy_exact_binding_migrates(self) -> None:
+        scope, _, _ = _canonical_prediction_scope(market_ids=("market-a",))
+        resolution = resolve_market_scope(
+            "candidate-inventory-digest",
+            {"market_scope": scope},
+            [_scope_market_record("market-a")],
+            resolved_at=T0,
+        )
+        current_set = resolution.provenance["current_market_set"]
+        self.assertIn("inventory_digest", current_set)
+        self.assertNotIn("order_token", current_set)
+        self.assertNotIn("order_digest", current_set)
+
+        legacy_resolution = resolution.as_dict()
+        legacy_provenance = dict(legacy_resolution["provenance"])
+        legacy_set = dict(legacy_provenance["current_market_set"])
+        inventory_digest = legacy_set.pop("inventory_digest")
+        legacy_set["order_token"] = inventory_digest
+        legacy_provenance["current_market_set"] = legacy_set
+        legacy_resolution["provenance"] = legacy_provenance
+        normalized = _canonical_scope_config(
+            {"market_scope": scope, "scope_resolution": legacy_resolution}
+        )
+        normalized_set = normalized["scope_resolution"]["provenance"]["current_market_set"]
+        self.assertEqual(normalized_set["inventory_digest"], inventory_digest)
+        self.assertNotIn("order_token", normalized_set)
+        self.assertNotIn("order_digest", normalized_set)
+
+        conflicting_set = dict(legacy_set)
+        conflicting_set["inventory_digest"] = "sha256:conflict"
+        conflicting_provenance = dict(legacy_provenance)
+        conflicting_provenance["current_market_set"] = conflicting_set
+        conflicting_resolution = dict(legacy_resolution)
+        conflicting_resolution["provenance"] = conflicting_provenance
+        with self.assertRaisesRegex(ValueError, "order_token and inventory_digest conflict"):
+            _canonical_scope_config(
+                {"market_scope": scope, "scope_resolution": conflicting_resolution}
+            )
 
     def test_legacy_paper_state_without_binding_is_migrated(self) -> None:
         with AxiomStore(":memory:") as store:
