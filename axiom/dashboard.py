@@ -3029,6 +3029,14 @@ class DashboardData:
             active_policy_id = None
             active_policy_version = None
             active_policy_hash = None
+        elif not active_policy:
+            # No active pointer is a valid pre-activation state.  Keep the
+            # active projection empty and let selection fences describe the
+            # resulting lack of active authority; it must not stale an
+            # otherwise valid, explicitly reviewed proposal.
+            active_policy_id = None
+            active_policy_version = None
+            active_policy_hash = None
         else:
             try:
                 active_identity = _rolling_policy_identity(active_policy)

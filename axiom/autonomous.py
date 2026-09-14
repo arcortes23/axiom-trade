@@ -695,6 +695,197 @@ def _rolling_state_result(value: Any) -> dict[str, Any]:
         else:
             result[key] = str(item)[:_MAX_ROLLING_STATE_ID_LENGTH]
     return result
+def _rolling_refresh_identity(
+    strategies: Sequence[Mapping[str, Any]],
+    evidence_rows: Sequence[Mapping[str, Any]],
+    pending: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Build an exact, bounded identity for one rolling refresh.
+
+    The operator payload intentionally keeps only samples of the refresh
+    material.  The identity is computed from the complete bounded inputs
+    before those samples are projected, so a restart can distinguish a real
+    enrollment/evidence/shortage transition from the same daily state.
+    Timestamps used only for scheduling are excluded from shortage identity.
+    """
+
+    def strategy_identity(item: Mapping[str, Any]) -> dict[str, Any]:
+        return {
+            "strategy_version_id": str(item.get("strategy_version_id", "")).strip(),
+            "research_trial_id": str(item.get("research_trial_id", "")).strip() or None,
+            "candidate_id": str(item.get("candidate_id", "")).strip() or None,
+            "strategy_hash": str(item.get("strategy_hash", "")).strip() or None,
+            "config_hash": str(item.get("config_hash", "")).strip() or None,
+            "version": str(item.get("version", "")).strip() or None,
+        }
+
+    def evidence_identity(item: Mapping[str, Any]) -> dict[str, Any]:
+        digest = str(item.get("evidence_digest", "")).strip()
+        if not digest:
+            digest = _rolling_hash(
+                {
+                    str(key): value
+                    for key, value in item.items()
+                    if str(key) not in {"created_at", "measured_at"}
+                }
+            )
+        return {
+            "strategy_version_id": str(item.get("strategy_version_id", "")).strip(),
+            "research_trial_id": str(item.get("research_trial_id", "")).strip() or None,
+            "candidate_id": str(item.get("candidate_id", "")).strip() or None,
+            "evidence_window_id": str(item.get("evidence_window_id", "")).strip(),
+            "source_class": str(item.get("source_class", "")).strip().upper(),
+            "requested_days": item.get("requested_days"),
+            "evidence_digest": digest,
+        }
+
+    def shortage_identity(item: Mapping[str, Any]) -> dict[str, Any]:
+        # Queue scheduling timestamps are not evidence or shortage identity.
+        # Keep every other field so changing a retry reason or its next work is
+        # observed exactly rather than relying on a lossy sample projection.
+        return {
+            str(key): value
+            for key, value in item.items()
+            if str(key) not in {"available_at", "scheduled_at", "created_at"}
+        }
+
+    strategy_values = sorted(
+        (strategy_identity(item) for item in strategies if isinstance(item, Mapping)),
+        key=_canonical_binding,
+    )
+    evidence_values = sorted(
+        (evidence_identity(item) for item in evidence_rows if isinstance(item, Mapping)),
+        key=_canonical_binding,
+    )
+    shortage_values = sorted(
+        (shortage_identity(item) for item in pending if isinstance(item, Mapping)),
+        key=_canonical_binding,
+    )
+    material = {
+        "schema_version": "rolling-refresh-identity-v1",
+        "strategies": strategy_values,
+        "evidence": evidence_values,
+        "shortages": shortage_values,
+    }
+    strategy_digest = _rolling_hash(strategy_values)
+    evidence_digest = _rolling_hash(evidence_values)
+    shortage_digest = _rolling_hash(shortage_values)
+    return {
+        "schema_version": material["schema_version"],
+        "digest": _rolling_hash(material),
+        "strategy_digest": strategy_digest,
+        "evidence_digest": evidence_digest,
+        "shortage_digest": shortage_digest,
+        "strategy_versions_total": len(strategy_values),
+        "research_trials_total": sum(
+            1 for item in strategy_values if item.get("research_trial_id")
+        ),
+        "evidence_windows_total": len(evidence_values),
+        "pending_total": len(shortage_values),
+        "strategy_versions": _rolling_state_ids(
+            item.get("strategy_version_id") for item in strategy_values
+        ),
+        "research_trials": _rolling_state_ids(
+            item.get("research_trial_id") for item in strategy_values
+        ),
+        "evidence_windows": _rolling_state_ids(
+            item.get("evidence_window_id") for item in evidence_values
+        ),
+    }
+
+
+def _rolling_prior_initialization_review(
+    prior_state: Mapping[str, Any] | None,
+    previous_selection: Mapping[str, Any] | None,
+) -> bool:
+    """Recognize a persisted no-definition review without guessing from emptiness."""
+
+    records: tuple[Mapping[str, Any], ...] = tuple(
+        item for item in (prior_state, previous_selection) if isinstance(item, Mapping)
+    )
+    for record in records:
+        identity = record.get("refresh_identity")
+        if isinstance(identity, Mapping):
+            try:
+                if int(identity.get("strategy_versions_total", -1)) == 0:
+                    return True
+            except (TypeError, ValueError):
+                pass
+        for raw_reason in record.get("reasons", ()):
+            if str(raw_reason).strip().upper() == "NO_STRATEGY_DEFINITIONS":
+                return True
+        pending = record.get("pending", ())
+        if isinstance(pending, (list, tuple)):
+            if any(
+                isinstance(item, Mapping)
+                and str(item.get("reason", "")).strip().upper()
+                == "NO_STRATEGY_DEFINITIONS"
+                for item in pending
+            ):
+                return True
+        history = record.get("event_history", ())
+        if isinstance(history, (list, tuple)) and history:
+            latest = history[-1]
+            if isinstance(latest, Mapping):
+                if str(latest.get("reason", "")).strip().upper() == "NO_STRATEGY_DEFINITIONS":
+                    return True
+                if any(
+                    str(reason).strip().upper() == "NO_STRATEGY_DEFINITIONS"
+                    for reason in latest.get("reasons", ())
+                ):
+                    return True
+    return False
+
+
+def _rolling_initialization_observe(
+    decision: Any,
+    refreshed: Mapping[str, Any],
+) -> Any:
+    """Turn an initialization transition into a paper-only OBSERVE outcome."""
+
+    strategy_ids = {
+        str(value).strip()
+        for value in refreshed.get("strategy_versions", ())
+        if str(value).strip()
+    }
+    pending_reasons: dict[str, list[str]] = {}
+    pending = refreshed.get("pending", ())
+    if isinstance(pending, (list, tuple)):
+        for item in pending:
+            if not isinstance(item, Mapping):
+                continue
+            strategy_id = str(item.get("strategy_version_id", "")).strip()
+            reason = str(item.get("reason", "")).strip() or str(item.get("status", "")).strip()
+            if strategy_id and reason:
+                pending_reasons.setdefault(strategy_id, []).append(reason)
+                strategy_ids.add(strategy_id)
+
+    member_reasons: dict[str, str] = {}
+    for member in decision.members:
+        strategy_id = str(member.strategy_version_id).strip()
+        if strategy_id:
+            member_reasons[strategy_id] = (
+                str(member.reason).strip() or "INITIALIZATION_OBSERVE"
+            )
+
+    reasons = ["INITIALIZATION_OBSERVE"]
+    reasons.extend(str(reason) for reason in decision.reasons)
+    for strategy_id in sorted(strategy_ids):
+        shortage = pending_reasons.get(strategy_id)
+        reason = (
+            member_reasons.get(strategy_id)
+            or (shortage[0] if shortage else None)
+            or "INITIALIZATION_OBSERVE"
+        )
+        reasons.append(f"{strategy_id}:{reason}")
+    return replace(
+        decision,
+        status="OBSERVE",
+        members=(),
+        reasons=tuple(dict.fromkeys(reasons)),
+    )
+
+
 
 
 def _rolling_state_payload(
@@ -729,6 +920,7 @@ def _rolling_state_payload(
         "pending": pending_total > len(pending_sample),
         "source_rows": source_rows_total >= _MAX_ROLLING_TOTAL_ROWS,
     }
+    refresh_identity = _rolling_refresh_identity(strategies, evidence_rows, pending)
     state: dict[str, Any] = {
         "status": status,
         "scheduled_at": scheduled_at,
@@ -763,6 +955,8 @@ def _rolling_state_payload(
         "requested_window_days": list(requested_window_days),
         "paper_only": True,
         "truncated": any(truncated.values()),
+        "refresh_identity": refresh_identity,
+        "rolling_review_identity": str(refresh_identity["digest"]),
     }
     while len(_canonical_binding(state).encode("utf-8")) > _MAX_ROLLING_STATE_PAYLOAD_BYTES:
         removable = next(
@@ -4437,14 +4631,52 @@ class AutonomousResearchProcessor:
 
     def review_rolling_portfolio(self, now: datetime | None = None, force: bool = False) -> Mapping[str, Any]:
         """Review only persisted rolling evidence and commit an append-only selection."""
-        current = ensure_utc(now or self.clock())
-        refreshed = self.refresh_rolling_evidence(current)
+        requested_now = ensure_utc(now or self.clock())
+        refreshed = self.refresh_rolling_evidence(requested_now)
         policy = self._rolling_policy()
         previous = self.active_portfolio_selection()
         review_state_loader = getattr(self.store, "load_portfolio_review_state", None)
         prior_state = review_state_loader() if callable(review_state_loader) else None
+        effective_now = requested_now
+        if isinstance(previous, Mapping):
+            previous_selected_at = _rolling_timestamp(previous.get("selected_at"))
+            if previous_selected_at is not None and previous_selected_at > effective_now:
+                effective_now = previous_selected_at
+        current = effective_now
+        current_identity = (
+            refreshed.get("refresh_identity")
+            if isinstance(refreshed.get("refresh_identity"), Mapping)
+            else {}
+        )
+        prior_identity = (
+            prior_state.get("refresh_identity")
+            if isinstance(prior_state, Mapping)
+            and isinstance(prior_state.get("refresh_identity"), Mapping)
+            else {}
+        )
+        prior_initialization = _rolling_prior_initialization_review(prior_state, previous)
+        try:
+            current_strategy_total = int(current_identity.get("strategy_versions_total", -1))
+        except (TypeError, ValueError):
+            current_strategy_total = -1
+        prior_digest = str(
+            prior_identity.get("digest")
+            if prior_identity
+            else (prior_state.get("rolling_review_identity") if isinstance(prior_state, Mapping) else "")
+        ).strip()
+        current_digest = str(current_identity.get("digest", "")).strip()
+        refresh_changed = bool(prior_digest and current_digest and prior_digest != current_digest)
+        if not prior_identity and isinstance(prior_state, Mapping):
+            prior_pending = prior_state.get("pending")
+            current_pending = refreshed.get("pending")
+            if isinstance(prior_pending, (list, tuple)) and isinstance(current_pending, (list, tuple)):
+                refresh_changed = _rolling_hash(prior_pending) != _rolling_hash(current_pending)
+        initialization_transition = prior_initialization and (
+            current_strategy_total > 0 or refresh_changed
+        )
         due = _rolling_timestamp(prior_state.get("review_due_at")) if isinstance(prior_state, Mapping) else None
-        if not force and due is not None and current < due and previous is not None:
+        bypass_due = bool(force or initialization_transition)
+        if not bypass_due and due is not None and current < due and previous is not None:
             return self.rolling_portfolio_state()
         lister = getattr(self.store, "list_strategy_evidence_windows", None)
         if callable(lister):
@@ -4470,15 +4702,31 @@ class AutonomousResearchProcessor:
             and not _rolling_campaign_bound(row)
         )
         risk = self._rolling_risk_binding(policy)
-        # Selection history is immutable lineage, not live capital.  Real
-        # obligations are enforced by storage reservations/commit fences; do not
         # subtract every historical allocation on each rotation.
         active_obligations = Decimal("0")
         risk["active_obligations"] = str(active_obligations)
         available_budget = max(Decimal("0"), _rolling_number(risk.get("global_budget")))
         risk["available_budget"] = str(available_budget)
         effective_policy = replace(policy, global_budget=available_budget, config_hash=policy.config_hash)
-        decision = evaluate_rolling_selection(effective_policy, evidence_rows, previous, current)
+        evaluation_previous = previous
+        if bypass_due and isinstance(previous, Mapping):
+            # The pure evaluator has its own cadence guard.  Adjust only the
+            # in-memory input for this one material/explicit review, while
+            # preserving RollingSelection's selected_at/review_due_at ordering.
+            evaluation_previous = dict(previous)
+            selected_at = _rolling_timestamp(evaluation_previous.get("selected_at"))
+            evaluation_previous["review_due_at"] = max(
+                current,
+                selected_at or current,
+            ).isoformat()
+        decision = evaluate_rolling_selection(
+            effective_policy,
+            evidence_rows,
+            evaluation_previous,
+            current,
+        )
+        if initialization_transition:
+            decision = _rolling_initialization_observe(decision, refreshed)
         prior_event_history = (
             list(prior_state.get("event_history", []))
             if isinstance(prior_state, Mapping) and isinstance(prior_state.get("event_history"), list)
@@ -4531,6 +4779,7 @@ class AutonomousResearchProcessor:
             "policy": policy.config_hash,
             "risk": risk,
             "at": current,
+            "refresh_identity": current_identity.get("digest"),
             "members": members,
             "removed_members": removed_members,
             "status": decision.status,
@@ -4576,9 +4825,43 @@ class AutonomousResearchProcessor:
             for member in members
         ]
         committer = getattr(self.store, "commit_portfolio_selection", None)
-        committed = None
-        if callable(committer):
-            committed = committer(selection, members)
+        state_saver = getattr(self.store, "save_portfolio_review_state", None)
+        review_payload = {
+            "portfolio_selection_id": selection_id,
+            "review_due_at": selection["review_due_at"],
+            "reviewed_at": current.isoformat(),
+            "status": decision.status,
+            "reasons": list(decision.reasons),
+            "event_history": event_history,
+            "removed_member_evidence_history": dict(decision.removed_member_evidence_history),
+            "last_membership_change_at": selection["last_membership_change_at"],
+            "pending": refreshed.get("pending", []),
+            "next_jobs": refreshed.get("next_jobs", []),
+            "refresh_identity": current_identity,
+            "rolling_review_identity": current_identity.get("digest"),
+            "initialization_transition": initialization_transition,
+            "updated_at": current.isoformat(),
+        }
+        def persist_selection_and_review() -> Mapping[str, Any] | None:
+            committed_value: Mapping[str, Any] | None = None
+            if callable(committer):
+                committed_result = committer(selection, members)
+                if isinstance(committed_result, Mapping):
+                    committed_value = committed_result
+            if callable(state_saver):
+                state_saver(review_payload)
+            return committed_value
+
+        transaction_factory = getattr(self.store, "transaction", None)
+        if callable(transaction_factory):
+            try:
+                transaction_context = transaction_factory(immediate=True)
+            except TypeError:
+                transaction_context = transaction_factory()
+            with transaction_context:
+                committed = persist_selection_and_review()
+        else:
+            committed = persist_selection_and_review()
         committed_selection = (
             dict(committed)
             if isinstance(committed, Mapping)
@@ -4610,21 +4893,12 @@ class AutonomousResearchProcessor:
             "reasons": list(decision.reasons),
             "pending": refreshed.get("pending", []),
             "cold_start_requirements": refreshed.get("pending", []),
+            "next_jobs": refreshed.get("next_jobs", []),
+            "refresh_identity": current_identity,
+            "rolling_review_identity": current_identity.get("digest"),
+            "initialization_transition": initialization_transition,
             "paper_only": True,
         }
-        state_saver = getattr(self.store, "save_portfolio_review_state", None)
-        if callable(state_saver):
-            state_saver({
-                "portfolio_selection_id": selection_id,
-                "review_due_at": selection["review_due_at"],
-                "reviewed_at": current.isoformat(),
-                "status": decision.status,
-                "event_history": event_history,
-                "removed_member_evidence_history": dict(decision.removed_member_evidence_history),
-                "last_membership_change_at": selection["last_membership_change_at"],
-                "pending": refreshed.get("pending", []),
-                "updated_at": current.isoformat(),
-            })
         return state
 
     def rolling_portfolio_state(self) -> Mapping[str, Any]:
@@ -4669,8 +4943,14 @@ class AutonomousResearchProcessor:
             },
             "event_history": review.get("event_history", []) if isinstance(review, Mapping) else [],
             "removed_member_evidence_history": review.get("removed_member_evidence_history", {}) if isinstance(review, Mapping) else {},
-            "next_jobs": [{"job_name": "rolling-research-evidence", "status": "SCHEDULED" if pending else "COMPLETED"}],
+            "next_jobs": (
+                review.get("next_jobs")
+                if isinstance(review, Mapping) and isinstance(review.get("next_jobs"), list)
+                else [{"job_name": "rolling-research-evidence", "status": "SCHEDULED" if pending else "COMPLETED"}]
+            ),
             "cold_start_requirements": pending,
+            "refresh_identity": review.get("refresh_identity", {}) if isinstance(review, Mapping) else {},
+            "rolling_review_identity": review.get("rolling_review_identity") if isinstance(review, Mapping) else None,
             "paper_only": True,
         }
 

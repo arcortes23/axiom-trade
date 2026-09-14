@@ -33,6 +33,7 @@ from axiom.node import (
     _HistoricalRequestBudget,
     normalized_execution_profile,
 )
+from axiom.rolling_portfolio import RollingEvidence
 from axiom.storage import AxiomStore
 from axiom.strategy import validate_strategy
 
@@ -40,6 +41,30 @@ from axiom.strategy import validate_strategy
 
 UTC = timezone.utc
 T0 = datetime(2026, 1, 1, tzinfo=UTC)
+def _rolling_initialization_document() -> dict[str, object]:
+    strategy_document = {
+        "version": 1,
+        "market_type": "prediction",
+        "family": "initialization-test",
+        "parameters": {"threshold": 0.05},
+        "operations": [],
+        "probability_model": "fixed",
+        "resolution_aware": True,
+        "resolution_inputs": ["expiry", "settlement"],
+    }
+    return {
+        "strategy_version_id": "sv-initialization",
+        "strategy_id": "initialization-test",
+        "version": "1",
+        "strategy_hash": "sha256:initialization-test",
+        "config_hash": "config:initialization-test",
+        "candidate_id": "candidate-initialization",
+        "research_trial_id": "trial-initialization",
+        "strategy_document": strategy_document,
+        "provenance": {"candidate_id": "candidate-initialization"},
+    }
+
+
 
 def _save_attested_polymarket_dataset(
     store: AxiomStore,
@@ -1337,6 +1362,267 @@ class MutationSchedulingTests(unittest.TestCase):
                     auto_state["payload"]["blocker"],
                     "AUTONOMOUS_CANARY_DISABLED",
                 )
+    def test_rolling_tick_reviews_new_enrollment_before_daily_due_once(self) -> None:
+        class StopAfterOneWait(threading.Event):
+            def wait(self, timeout: float | None = None) -> bool:
+                self.set()
+                return True
+
+        with tempfile.TemporaryDirectory() as directory:
+            db = str(Path(directory) / "rolling-initialization.sqlite")
+            enrolled = False
+            strategy_document = {
+                "version": 1,
+                "market_type": "prediction",
+                "family": "initialization-test",
+                "parameters": {"threshold": 0.05},
+                "operations": [],
+                "probability_model": "fixed",
+                "resolution_aware": True,
+                "resolution_inputs": ["expiry", "settlement"],
+            }
+            rolling_document = {
+                "strategy_version_id": "sv-initialization",
+                "strategy_id": "initialization-test",
+                "version": "1",
+                "strategy_hash": "sha256:initialization-test",
+                "config_hash": "config:initialization-test",
+                "candidate_id": "candidate-initialization",
+                "research_trial_id": "trial-initialization",
+                "strategy_document": strategy_document,
+                "provenance": {"candidate_id": "candidate-initialization"},
+            }
+
+            def run_tick(at: datetime) -> tuple[dict[str, Any], dict[str, Any], int]:
+                with AxiomStore(db) as store:
+                    node = ResearchNode(
+                        NodeConfig(
+                            db,
+                            mutation_enabled=False,
+                            crypto_enabled=False,
+                            rolling_review_interval_seconds=86400,
+                        ),
+                        provider=InMemoryPredictionProvider([]),
+                        store=store,
+                        clock=lambda: at,
+                    )
+                    processor = node.research_processor
+                    processor._rolling_strategy_documents = (  # type: ignore[method-assign]
+                        lambda: (rolling_document,) if enrolled else ()
+                    )
+                    processor._rolling_source_rows = lambda *_args: []  # type: ignore[method-assign]
+                    node.stop_event = StopAfterOneWait()
+                    node._rolling_portfolio_worker_loop()
+                    review = store.load_portfolio_review_state()
+                    selection = store.load_current_portfolio_selection()
+                    self.assertIsNotNone(review)
+                    self.assertIsNotNone(selection)
+                    assert review is not None
+                    assert selection is not None
+                    return review, selection, len(store.list_portfolio_selections(limit=32))
+
+            first_review, first_selection, first_count = run_tick(T0)
+            self.assertEqual(first_selection["members"], [])
+            self.assertEqual(first_review["status"], "OBSERVE")
+            self.assertTrue(
+                any(
+                    item.get("reason") == "NO_STRATEGY_DEFINITIONS"
+                    for item in first_review["pending"]
+                )
+            )
+            self.assertEqual(first_review["refresh_identity"]["strategy_versions_total"], 0)
+            first_due = first_review["review_due_at"]
+            self.assertEqual(first_count, 1)
+
+            enrolled = True
+            second_review, second_selection, second_count = run_tick(
+                T0 + timedelta(hours=1)
+            )
+            self.assertIn("rolling-research-evidence", second_review["next_jobs"])
+            self.assertEqual(second_selection["members"], [])
+            self.assertEqual(second_review["status"], "OBSERVE")
+            self.assertEqual(
+                second_review["refresh_identity"]["strategy_versions_total"], 1
+            )
+            self.assertNotEqual(second_review["review_due_at"], first_due)
+            self.assertEqual(second_count, 2)
+            self.assertNotIn(
+                "NO_STRATEGY_DEFINITIONS",
+                {item.get("reason") for item in second_review["pending"]},
+            )
+            self.assertTrue(
+                any(
+                    str(reason).startswith("sv-initialization:")
+                    for reason in second_review["reasons"]
+                )
+            )
+            third_review, third_selection, third_count = run_tick(
+                T0 + timedelta(hours=1)
+            )
+            self.assertEqual(third_selection["portfolio_selection_id"], second_selection["portfolio_selection_id"])
+            self.assertEqual(third_review["event_history"], second_review["event_history"])
+            self.assertEqual(third_count, second_count)
+
+            with AxiomStore(db) as store:
+                for days in (7, 30):
+                    evidence = RollingEvidence(
+                        strategy_version_id="sv-initialization",
+                        evidence_window_id=f"window-initialization-{days}",
+                        candidate_id="candidate-initialization",
+                        research_trial_id="trial-initialization",
+                        available_from=T0 - timedelta(days=days),
+                        available_through=T0,
+                        requested_days=days,
+                        actual_coverage_seconds=days * 86400,
+                        observation_completeness="1",
+                        source_class="HISTORICAL",
+                        paper_sizing="10",
+                        allocated_capital_net_return="8",
+                        realized_pnl="8",
+                        completed_outcomes=12,
+                        reliability="0.90",
+                        execution_feasibility="TRUE",
+                        overlap_key="overlap:initialization",
+                    ).as_dict()
+                    evidence["rolling_research"] = True
+                    store.save_strategy_evidence_window(evidence)
+            promoted_review, promoted_selection, promoted_count = run_tick(
+                T0 + timedelta(days=2)
+            )
+            self.assertEqual(promoted_review["status"], "PAPER")
+            self.assertEqual(promoted_count, 3)
+            self.assertEqual(
+                [item["strategy_version_id"] for item in promoted_selection["members"]],
+                ["sv-initialization"],
+            )
+            self.assertEqual(promoted_selection["members"][0]["allocation"], "0")
+    def test_rolling_initialization_commit_rolls_back_and_restart_retries_once(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = str(Path(directory) / "rolling-initialization-atomic.sqlite")
+            enrolled = False
+            with AxiomStore(db) as store:
+                node = ResearchNode(
+                    NodeConfig(
+                        db,
+                        mutation_enabled=False,
+                        crypto_enabled=False,
+                        rolling_review_interval_seconds=86400,
+                    ),
+                    provider=InMemoryPredictionProvider([]),
+                    store=store,
+                    clock=lambda: T0,
+                )
+                processor = node.research_processor
+                processor._rolling_strategy_documents = (  # type: ignore[method-assign]
+                    lambda: (_rolling_initialization_document(),) if enrolled else ()
+                )
+                processor._rolling_source_rows = lambda *_args: []  # type: ignore[method-assign]
+                initial = processor.review_rolling_portfolio(now=T0)
+                initial_selection = store.load_current_portfolio_selection()
+                self.assertIsNotNone(initial_selection)
+                assert initial_selection is not None
+                initial_id = initial_selection["portfolio_selection_id"]
+                self.assertEqual(initial["initialization_transition"], False)
+
+                enrolled = True
+                before_count = len(store.list_portfolio_selections(limit=32))
+                with patch.object(
+                    store,
+                    "save_portfolio_review_state",
+                    side_effect=RuntimeError("injected review-state failure"),
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "injected review-state failure"):
+                        processor.review_rolling_portfolio(
+                            now=T0 + timedelta(hours=1)
+                        )
+                self.assertEqual(
+                    len(store.list_portfolio_selections(limit=32)),
+                    before_count,
+                )
+                rolled_back_selection = store.load_current_portfolio_selection()
+                rolled_back_review = store.load_portfolio_review_state()
+                self.assertIsNotNone(rolled_back_selection)
+                self.assertIsNotNone(rolled_back_review)
+                assert rolled_back_selection is not None
+                assert rolled_back_review is not None
+                self.assertEqual(
+                    rolled_back_selection["portfolio_selection_id"], initial_id
+                )
+                self.assertEqual(
+                    rolled_back_review["refresh_identity"]["strategy_versions_total"],
+                    0,
+                )
+
+                retry = processor.review_rolling_portfolio(
+                    now=T0 + timedelta(hours=1)
+                )
+                self.assertTrue(retry["initialization_transition"])
+                self.assertEqual(retry["selection"]["members"], [])
+                self.assertEqual(len(store.list_portfolio_selections(limit=32)), 2)
+
+                restarted = ResearchNode(
+                    NodeConfig(
+                        db,
+                        mutation_enabled=False,
+                        crypto_enabled=False,
+                        rolling_review_interval_seconds=86400,
+                    ),
+                    provider=InMemoryPredictionProvider([]),
+                    store=store,
+                    clock=lambda: T0 + timedelta(hours=1),
+                )
+                restarted_processor = restarted.research_processor
+                restarted_processor._rolling_strategy_documents = (  # type: ignore[method-assign]
+                    lambda: (_rolling_initialization_document(),)
+                )
+                restarted_processor._rolling_source_rows = lambda *_args: []  # type: ignore[method-assign]
+                restarted_result = restarted_processor.review_rolling_portfolio(
+                    now=T0 + timedelta(hours=1)
+                )
+                self.assertEqual(
+                    restarted_result["portfolio_selection_id"],
+                    retry["portfolio_selection_id"],
+                )
+                self.assertEqual(restarted_result["event_history"], retry["event_history"])
+                self.assertEqual(len(store.list_portfolio_selections(limit=32)), 2)
+
+    def test_rolling_review_clock_rollback_keeps_committed_timestamps_monotonic(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = str(Path(directory) / "rolling-initialization-clock-rollback.sqlite")
+            with AxiomStore(db) as store:
+                node = ResearchNode(
+                    NodeConfig(
+                        db,
+                        mutation_enabled=False,
+                        crypto_enabled=False,
+                        rolling_review_interval_seconds=86400,
+                    ),
+                    provider=InMemoryPredictionProvider([]),
+                    store=store,
+                    clock=lambda: T0 + timedelta(days=2),
+                )
+                processor = node.research_processor
+                processor._rolling_strategy_documents = lambda: ()  # type: ignore[method-assign]
+                processor._rolling_source_rows = lambda *_args: []  # type: ignore[method-assign]
+                future = T0 + timedelta(days=2)
+                processor.review_rolling_portfolio(now=future, force=True)
+                rolled_back = processor.review_rolling_portfolio(now=T0, force=True)
+                selection = store.load_current_portfolio_selection()
+                review = store.load_portfolio_review_state()
+                self.assertIsNotNone(selection)
+                self.assertIsNotNone(review)
+                assert selection is not None
+                assert review is not None
+                self.assertEqual(selection["selected_at"], future.isoformat())
+                self.assertEqual(selection["review_due_at"], (future + timedelta(days=1)).isoformat())
+                self.assertEqual(review["reviewed_at"], future.isoformat())
+                self.assertEqual(rolled_back["selection"]["selected_at"], future.isoformat())
+                self.assertGreaterEqual(
+                    datetime.fromisoformat(review["review_due_at"]),
+                    datetime.fromisoformat(review["reviewed_at"]),
+                )
+
+                self.assertEqual(review["event_history"][-1]["at"], future.isoformat())
 
     def test_persisted_autonomous_fatal_survives_restart_while_research_runs(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

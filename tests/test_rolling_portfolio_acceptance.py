@@ -21,7 +21,12 @@ from axiom.data import InMemoryPredictionProvider
 from axiom.dashboard import DashboardData
 from axiom.node import NodeConfig, ResearchNode
 from axiom.operator import OperatorControlError, OperatorControlPlane
-from axiom.rolling_portfolio import RollingAdmissionPolicy, RollingEvidence, evaluate_rolling_selection
+from axiom.rolling_portfolio import (
+    RollingAdmissionPolicy,
+    RollingEvidence,
+    default_rolling_admission_policy,
+    evaluate_rolling_selection,
+)
 from axiom.experiment_plan import normalize_market_scope
 from axiom.storage import AxiomStore
 
@@ -1596,6 +1601,119 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
                 self.assertIn(key, payload)
             self.assertLessEqual(len(payload["active_rows"]), 10)
             self.assertFalse(payload.get("live_execution", True))
+
+    def test_dashboard_projects_persisted_reviewed_values_only_draft_without_active_policy(self) -> None:
+        path = self.path / "rolling-dashboard-reviewed-values.sqlite3"
+        with AxiomStore(str(path)) as store:
+            settings = self._activate_isolated_risk_settings(store)
+            default_policy = default_rolling_admission_policy()
+            store.save_admission_policy(default_policy.as_dict())
+            binding = settings.snapshot(now=NOW)
+            selection = {
+                "portfolio_selection_id": "selection-rolling-default",
+                "policy_id": default_policy.policy_id,
+                "policy_version": default_policy.version,
+                "risk_config_id": binding["config_id"],
+                "risk_config_generation": binding["generation"],
+                "risk_config_hash": binding["config_hash"],
+                "selected_at": NOW.isoformat(),
+                "review_due_at": (NOW + timedelta(days=1)).isoformat(),
+                "k": 0,
+                "global_budget": "0",
+                "members": [],
+            }
+            store.commit_portfolio_selection(selection, [])
+            operator = OperatorControlPlane(store, settings_service=settings)
+            reviewed = operator.review_rolling_admission_policy(
+                {},
+                actor="production-reviewer",
+                expected_risk_config_id=binding["config_id"],
+                expected_risk_config_generation=binding["generation"],
+                expected_risk_config_hash=binding["config_hash"],
+            )
+            persisted_review = store.get_operator_config(
+                "rolling_admission_policy_review",
+                None,
+            )
+            self.assertIsInstance(persisted_review, dict)
+            self.assertIsNone(
+                store.get_operator_config("rolling_admission_policy_active", None)
+            )
+            assert isinstance(persisted_review, dict)
+            draft = reviewed["draft"]
+            dashboard = DashboardData(
+                store=store,
+                settings_service=settings,
+                clock=lambda: NOW,
+            ).rolling_portfolio_data()
+
+            self.assertEqual(dashboard["policy_review"]["status"], "REVIEWED")
+            self.assertEqual(dashboard["active_policy"], {})
+            self.assertEqual(dashboard["policy"], {})
+            proposed = dashboard["policy_review"]["proposed"]
+            self.assertEqual(proposed["policy_id"], persisted_review["policy_id"])
+            self.assertEqual(proposed["version"], persisted_review["version"])
+            self.assertEqual(proposed["config_hash"], persisted_review["config_hash"])
+            self.assertEqual(proposed["draft_id"], draft["draft_id"])
+            self.assertEqual(proposed["draft_version"], draft["draft_version"])
+            self.assertEqual(
+                dashboard["policy_review"]["proposed_canary_binding"]["risk_config_id"],
+                dashboard["policy_review"]["canary_binding"]["risk_config_id"],
+            )
+            self.assertEqual(
+                str(
+                    dashboard["policy_review"]["proposed_canary_binding"][
+                        "risk_config_generation"
+                    ]
+                ),
+                str(
+                    dashboard["policy_review"]["canary_binding"][
+                        "risk_config_generation"
+                    ]
+                ),
+            )
+            self.assertEqual(
+                dashboard["policy_review"]["proposed_canary_binding"]["risk_config_hash"],
+                dashboard["policy_review"]["canary_binding"]["risk_config_hash"],
+            )
+            self.assertTrue(
+                dashboard["policy_review"]["active_vs_proposed"][
+                    "requires_explicit_activation"
+                ]
+            )
+            self.assertEqual(dashboard["selection"]["policy_id"], "rolling-default")
+            self.assertIn("active_policy_id_unavailable", dashboard["selection"]["blockers"])
+            self.assertNotIn("reviewed_immutable_policy_unavailable", dashboard["selection"]["blockers"])
+            self.assertTrue(dashboard["paper_only"])
+            self.assertFalse(dashboard["live_execution"])
+
+            changed = settings.save_draft(
+                {"max_orders_per_day": 19},
+                "production-risk-change",
+                expected_generation=int(binding["generation"]),
+            )
+            settings.activate_draft(
+                changed["config_id"],
+                "production-risk-change",
+                expected_generation=int(binding["generation"]),
+            )
+            stale_risk = DashboardData(
+                store=store,
+                settings_service=settings,
+                clock=lambda: NOW,
+            ).rolling_portfolio_data()
+            self.assertEqual(stale_risk["policy_review"]["status"], "STALE")
+
+            store.set_operator_config(
+                "rolling_admission_policy_review",
+                {**persisted_review, "policy_id": "forged-policy-id"},
+            )
+            stale_identity = DashboardData(
+                store=store,
+                settings_service=settings,
+                clock=lambda: NOW,
+            ).rolling_portfolio_data()
+            self.assertEqual(stale_identity["policy_review"]["status"], "STALE")
 
 
     def test_actual_rolling_worker_reconciles_fill_and_paused_replaced_exit_lineage(self) -> None:
