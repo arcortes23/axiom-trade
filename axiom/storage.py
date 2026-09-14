@@ -1025,10 +1025,13 @@ class AxiomStore:
                 research_trial_id TEXT,
                 status TEXT NOT NULL,
                 reason TEXT NOT NULL,
+                validation_version TEXT NOT NULL DEFAULT 'rolling-enrollment-v1',
+                predecessor_enrollment_id TEXT,
                 provenance_json TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL,
                 CHECK(length(enrollment_id) BETWEEN 1 AND 256),
                 CHECK(length(candidate_id) BETWEEN 1 AND 256),
+                CHECK(length(validation_version) BETWEEN 1 AND 128),
                 CHECK(status IN ('ACCEPTED','EXCLUDED'))
             );
             CREATE INDEX IF NOT EXISTS idx_rolling_enrollments_candidate
@@ -1145,6 +1148,26 @@ class AxiomStore:
             CREATE INDEX IF NOT EXISTS idx_portfolio_review_state_updated
                 ON portfolio_review_state(updated_at DESC);
             """
+        )
+        enrollment_columns = {
+            str(row["name"])
+            for row in self._conn.execute(
+                "PRAGMA table_info(rolling_strategy_enrollments)"
+            ).fetchall()
+        }
+        # Existing exclusions are immutable historical attempts.  Backfill
+        # them as v1 so the corrected validator can append a v2 successor.
+        for name, definition in (
+            ("validation_version", "TEXT NOT NULL DEFAULT 'rolling-enrollment-v1'"),
+            ("predecessor_enrollment_id", "TEXT"),
+        ):
+            if name not in enrollment_columns:
+                self._conn.execute(
+                    f"ALTER TABLE rolling_strategy_enrollments ADD COLUMN {name} {definition}"
+                )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_rolling_enrollments_candidate_version "
+            "ON rolling_strategy_enrollments(candidate_id, validation_version, created_at DESC, enrollment_id)"
         )
         evidence_columns = {
             str(row["name"])
@@ -8681,14 +8704,13 @@ class AxiomStore:
             for row in rows
             if (record := self.load_research_trial(str(row["research_trial_id"]))) is not None
         ]
-
-
     def save_rolling_enrollment(self, record: Any) -> bool:
-        """Persist one immutable legacy-to-rolling enrollment decision.
+        """Persist one immutable versioned rolling enrollment decision.
 
-        Enrollment decisions are deliberately separate from legacy strategy and
-        lifecycle rows.  An excluded source therefore remains auditable without
-        becoming a rolling strategy/version or changing its predecessor.
+        A validation fix is a new application attempt, not an update to its
+        predecessor.  The attempt version and optional predecessor link are
+        therefore first-class columns while the source decision remains
+        append-only.
         """
         data = _rolling_mapping(record, name="rolling_enrollment")
         candidate_id = _rolling_required_text(data, "candidate_id", "source_candidate_id", name="candidate_id")
@@ -8702,6 +8724,30 @@ class AxiomStore:
         reason = _rolling_required_text(data, "reason", "reason_code", name="reason")
         if len(reason) > 512:
             raise ValueError("rolling enrollment reason exceeds 512 characters")
+        version_fields = [
+            name
+            for name in ("validation_version", "attempt_version")
+            if name in data
+        ]
+        if version_fields:
+            version_values: list[str] = []
+            for name in version_fields:
+                value = _rolling_optional_text(data, name)
+                if not value:
+                    raise ValueError(f"{name} must not be blank")
+                version_values.append(value)
+            if len(set(version_values)) != 1:
+                raise ValueError("validation_version and attempt_version must agree")
+            validation_version = version_values[0]
+        else:
+            validation_version = "rolling-enrollment-v1"
+        predecessor_enrollment_id = _rolling_optional_text(
+            data,
+            "predecessor_enrollment_id",
+            "predecessor_id",
+        )
+        if predecessor_enrollment_id == _rolling_optional_text(data, "enrollment_id"):
+            raise ValueError("rolling enrollment cannot precede itself")
         provenance = data.get("provenance", data.get("provenance_json", {}))
         if isinstance(provenance, str):
             try:
@@ -8718,7 +8764,7 @@ class AxiomStore:
             "research_trial_id": research_trial_id or None,
             "status": status,
             "reason": reason,
-            "provenance": provenance,
+            "validation_version": validation_version,
         }
         enrollment_id = _rolling_optional_text(data, "enrollment_id")
         if not enrollment_id:
@@ -8733,10 +8779,24 @@ class AxiomStore:
             research_trial_id or None,
             status,
             reason,
+            validation_version,
+            predecessor_enrollment_id,
             payload_json,
             created_at,
         )
         with self._write_context():
+            if predecessor_enrollment_id:
+                predecessor = self._conn.execute(
+                    "SELECT candidate_id,status FROM rolling_strategy_enrollments "
+                    "WHERE enrollment_id=?",
+                    (predecessor_enrollment_id,),
+                ).fetchone()
+                if predecessor is None:
+                    raise ValueError("rolling enrollment predecessor does not exist")
+                if str(predecessor["candidate_id"]) != candidate_id:
+                    raise ValueError("rolling enrollment predecessor candidate mismatch")
+                if str(predecessor["status"]).strip().upper() != "EXCLUDED":
+                    raise ValueError("rolling enrollment predecessor must be EXCLUDED")
             existing = self._conn.execute(
                 "SELECT * FROM rolling_strategy_enrollments WHERE enrollment_id=?",
                 (enrollment_id,),
@@ -8748,15 +8808,18 @@ class AxiomStore:
                     existing["research_trial_id"],
                     existing["status"],
                     existing["reason"],
+                    existing["validation_version"],
+                    existing["predecessor_enrollment_id"],
                     existing["provenance_json"],
                 )
-                if expected != values[1:7]:
+                if expected != values[1:9]:
                     raise ValueError("rolling enrollment identity conflict")
                 return False
             self._conn.execute(
                 "INSERT INTO rolling_strategy_enrollments("
                 "enrollment_id,candidate_id,strategy_version_id,research_trial_id,status,reason,"
-                "provenance_json,created_at) VALUES (?,?,?,?,?,?,?,?)",
+                "validation_version,predecessor_enrollment_id,provenance_json,created_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)",
                 values,
             )
         return True
@@ -8794,7 +8857,7 @@ class AxiomStore:
         query = "SELECT * FROM rolling_strategy_enrollments"
         if clauses:
             query += " WHERE " + " AND ".join(clauses)
-        query += " ORDER BY created_at,enrollment_id LIMIT ?"
+        query += " ORDER BY created_at DESC,enrollment_id DESC LIMIT ?"
         values.append(limit_value)
         with self._lock:
             rows = self._conn.execute(query, values).fetchall()
@@ -15751,6 +15814,8 @@ def _rolling_enrollment_record(row: sqlite3.Row | None) -> dict[str, Any] | None
         "research_trial_id": row["research_trial_id"],
         "status": row["status"],
         "reason": row["reason"],
+        "validation_version": row["validation_version"],
+        "predecessor_enrollment_id": row["predecessor_enrollment_id"],
         "provenance": provenance if isinstance(provenance, Mapping) else {},
         "created_at": _parse_datetime(row["created_at"]),
     }

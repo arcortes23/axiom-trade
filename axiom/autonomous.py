@@ -53,8 +53,29 @@ _MAX_ROLLING_DISCOVERY_SCAN = 2_048
 _ROLLING_DISCOVERY_PAGE = 64
 _ROLLING_MATURE_STAGES = frozenset({"FROZEN", "PAPER_FORWARD", "PAPER_PROMOTABLE"})
 _ROLLING_ENROLLMENT_MODES = frozenset({"RESEARCH", "OBSERVATION"})
+_ROLLING_ENROLLMENT_VALIDATION_VERSION = "rolling-enrollment-v2"
 _ROLLING_MAX_PROVENANCE_BYTES = 8_192
 _ROLLING_MAX_PROVENANCE_DEPTH = 5
+# These fields are observations/manifests, not authoritative candidate
+# identity.  In particular, a frozen dataset attestation may contain a large
+# constituent binding array whose candidate ids are unrelated to its owner.
+_ROLLING_NON_AUTHORITATIVE_ARRAY_KEYS = frozenset(
+    {
+        "attestation",
+        "attestations",
+        "dataset_attestation",
+        "dataset_attestations",
+        "constituent_bindings",
+        "constituents",
+        "observation",
+        "observations",
+        "observation_rows",
+        "rows",
+        "snapshots",
+        "bindings",
+        "market_bindings",
+    }
+)
 # Historical rolling evidence is preflighted before JSON decoding.  The fixed
 # 16 MiB/25,000-row boundary keeps immutable source material bounded while
 # the source-row projection below remains deterministic.
@@ -359,15 +380,23 @@ def _rolling_identity_values(
     *names: str,
     max_depth: int = _ROLLING_MAX_PROVENANCE_DEPTH,
 ) -> tuple[set[str], bool]:
-    """Collect bounded immutable identity fields and report truncation."""
+    """Collect candidate identity from bounded authoritative containers.
+
+    Lifecycle payloads carry both identity/provenance and large observation
+    manifests.  Walking every value makes an attestation's constituent list
+    look like candidate identity and exhausts the traversal budget.  Mapping
+    containers remain recursively inspectable for strict conflict detection;
+    known bulk arrays are deliberately opaque because they are not identity
+    authority.
+    """
     values: set[str] = set()
-    pending: list[tuple[Any, int]] = [(value, 0)]
+    pending: list[tuple[Any, int, str | None]] = [(value, 0, None)]
     seen: set[int] = set()
     truncated = False
     visited = 0
     wanted = frozenset(names)
     while pending:
-        item, depth = pending.pop()
+        item, depth, parent_key = pending.pop()
         if isinstance(item, Mapping):
             marker = id(item)
             if marker in seen:
@@ -379,23 +408,52 @@ def _rolling_identity_values(
                 truncated = True
                 break
             for name in wanted:
-                candidate = _binding_value(item.get(name))
+                raw = item.get(name)
+                # Structured identity fields are ambiguous, not absent.  A
+                # mapping/list must never be silently ignored and allow the
+                # remaining scalar candidate id to pass validation.
+                if isinstance(raw, (Mapping, list, tuple)):
+                    truncated = True
+                    continue
+                candidate = _binding_value(raw)
                 if candidate:
                     values.add(candidate)
-            children = list(item.values())
             if depth >= max_depth:
-                if any(isinstance(child, (Mapping, list, tuple)) for child in children):
+                # Only traversable mappings/sequences make this node
+                # truncated; opaque bulk arrays do not consume the budget.
+                if any(
+                    isinstance(child, Mapping)
+                    or (
+                        isinstance(child, (list, tuple))
+                        and str(key).strip().lower() not in _ROLLING_NON_AUTHORITATIVE_ARRAY_KEYS
+                    )
+                    for key, child in item.items()
+                ):
                     truncated = True
                 continue
-            pending.extend((child, depth + 1) for child in children[:128])
-            if len(children) > 128:
+            children = list(item.items())
+            if len(children) > 512:
                 truncated = True
+                children = children[:512]
+            for key, child in reversed(children):
+                key_name = str(key).strip().lower()
+                if isinstance(child, (list, tuple)):
+                    if key_name in _ROLLING_NON_AUTHORITATIVE_ARRAY_KEYS:
+                        continue
+                    if len(child) > 128:
+                        truncated = True
+                    pending.append((child, depth + 1, key_name))
+                elif isinstance(child, Mapping):
+                    pending.append((child, depth + 1, key_name))
         elif isinstance(item, (list, tuple)):
-            if depth >= max_depth:
+            if parent_key in _ROLLING_NON_AUTHORITATIVE_ARRAY_KEYS:
+                continue
+            if depth > max_depth:
                 if item:
                     truncated = True
                 continue
-            pending.extend((child, depth + 1) for child in item[:128])
+            for child in reversed(item[:128]):
+                pending.append((child, depth + 1, parent_key))
             if len(item) > 128:
                 truncated = True
     return values, truncated
@@ -544,6 +602,8 @@ def _rolling_provenance_bound(value: Mapping[str, Any]) -> dict[str, Any]:
         "rolling_research",
         "research_mode",
         "mode",
+        "validation_version",
+        "predecessor_enrollment_id",
         "predecessor_candidate_id",
         "source_candidate_id",
         "source_trial_id",
@@ -558,6 +618,7 @@ def _rolling_provenance_bound(value: Mapping[str, Any]) -> dict[str, Any]:
         "dataset_selector",
         "dataset_id",
         "dataset_version",
+        "predecessor_provenance",
         "original_rejection",
         "original_economic_outcome",
         "entry_policy",
@@ -1085,7 +1146,6 @@ def _rolling_rule_scope_market_ids(
         for market in matched
         if (market_id := _binding_value(getattr(market, "market_id", None)))
     }
-
 def _rolling_document_is_marked(value: Mapping[str, Any], provenance: Mapping[str, Any] | None = None) -> bool:
     containers = [value]
     if isinstance(provenance, Mapping):
@@ -1106,32 +1166,20 @@ def _rolling_document_is_marked(value: Mapping[str, Any], provenance: Mapping[st
         if str(item.get("source", "")).strip().lower() == "rolling":
             return True
     return False
-
-
 def _rolling_campaign_bound(value: Mapping[str, Any]) -> bool:
-    """Reject campaign lineage wherever it appears in a persisted document."""
+    """Reject campaign lineage while bounding unrelated bulk observations.
+
+    ``experiment_plan`` is an authoritative campaign container and is checked
+    before any general traversal.  Large attestation/observation arrays are
+    not campaign authority; treating their length as a campaign marker would
+    incorrectly reject otherwise valid frozen candidates.
+    """
     seen: set[int] = set()
     visited = 0
 
-    def visit(item: Any, depth: int = 0) -> bool:
-        nonlocal visited
-        if depth > _ROLLING_MAX_PROVENANCE_DEPTH:
-            return True
-        if isinstance(item, (list, tuple)):
-            if len(item) > 128:
-                return True
-            return any(visit(child, depth + 1) for child in item)
-        if not isinstance(item, Mapping):
-            return False
-        marker = id(item)
-        if marker in seen:
-            return True
-        seen.add(marker)
-        visited += 1
-        if visited > 512:
-            return True
+    def direct_marker(item: Mapping[str, Any]) -> bool:
         if any(
-            str(item.get(name, "")).strip()
+            _binding_value(item.get(name))
             for name in ("campaign_id", "campaign_trial_id", "campaign_configuration_id")
         ):
             return True
@@ -1143,10 +1191,49 @@ def _rolling_campaign_bound(value: Mapping[str, Any]) -> bool:
             in {"axiom-finite-campaign", "finite-campaign"}
         ):
             return True
-        children = list(item.values())
-        if len(children) > 128:
+        return False
+
+    def visit(item: Any, depth: int = 0, parent_key: str | None = None) -> bool:
+        nonlocal visited
+        if isinstance(item, (list, tuple)):
+            if parent_key in _ROLLING_NON_AUTHORITATIVE_ARRAY_KEYS:
+                return False
+            if depth > _ROLLING_MAX_PROVENANCE_DEPTH:
+                return True
+            if len(item) > 128:
+                # Unknown bulk arrays remain fail-closed.  Known observation
+                # arrays are handled above and are intentionally ignored.
+                return True
+            return any(visit(child, depth + 1, parent_key) for child in item)
+        if not isinstance(item, Mapping):
+            return False
+        marker = id(item)
+        if marker in seen:
             return True
-        return any(visit(child, depth + 1) for child in children)
+        seen.add(marker)
+        visited += 1
+        if visited > 512 or depth > _ROLLING_MAX_PROVENANCE_DEPTH:
+            return True
+        if direct_marker(item):
+            return True
+        # Check this authoritative container first.  This prevents a large
+        # unrelated field encountered earlier in insertion order from hiding
+        # a campaign marker nested in the plan.
+        plan = item.get("experiment_plan")
+        if isinstance(plan, Mapping) and visit(plan, depth + 1, "experiment_plan"):
+            return True
+        children = list(item.items())
+        if len(children) > 512:
+            return True
+        for key, child in children:
+            key_name = str(key).strip().lower()
+            if key_name == "experiment_plan":
+                continue
+            if isinstance(child, (list, tuple)) and key_name in _ROLLING_NON_AUTHORITATIVE_ARRAY_KEYS:
+                continue
+            if visit(child, depth + 1, key_name):
+                return True
+        return False
 
     return visit(value)
 
@@ -2022,6 +2109,165 @@ class AutonomousResearchProcessor:
                 "original_rejection": original_rejection,
             }
             return _rolling_provenance_bound(result)
+        def origin_base(
+            *,
+            candidate: str,
+            payload: Mapping[str, Any],
+            strategy_row: Mapping[str, Any],
+        ) -> dict[str, Any]:
+            original_provenance = (
+                compact(payload["provenance"])
+                if "provenance" in payload
+                else {}
+            )
+            return {
+                "rolling_research": True,
+                "predecessor_candidate_id": candidate,
+                "source_candidate_id": candidate,
+                "source_trial_id": source_value(
+                    payload,
+                    "research_trial_id",
+                    "trial_id",
+                    "source_trial_id",
+                    "forward_test_id",
+                    "experiment_id",
+                    "plan_id",
+                ),
+                "source_config_hash": source_value(
+                    payload,
+                    "config_hash",
+                    "source_config_hash",
+                ),
+                "source_strategy_hash": source_value(
+                    payload,
+                    "source_strategy_hash",
+                    "strategy_hash",
+                ),
+                "rolling_strategy_hash": source_value(
+                    payload,
+                    "rolling_strategy_hash",
+                ),
+                "predecessor_strategy_id": _binding_value(strategy_row.get("strategy_id")),
+                "predecessor_strategy_version": _binding_value(strategy_row.get("version")),
+                "original_provenance": original_provenance,
+                "original_economic_outcome": {
+                    key: compact(payload[key])
+                    for key in (
+                        "economic_result",
+                        "economic_outcome",
+                        "result",
+                        "outcome",
+                        "validation",
+                        "forward_evidence",
+                        "metrics",
+                        "net_return",
+                        "realized_pnl",
+                        "unrealized_pnl",
+                    )
+                    if key in payload
+                },
+                "original_rejection": {
+                    key: compact(payload[key])
+                    for key in ("rejection_reason", "reason", "reason_code", "status")
+                    if key in payload
+                },
+            }
+
+        def campaign_markers(*sources: Mapping[str, Any]) -> dict[str, Any]:
+            marker_names = (
+                "campaign_id",
+                "campaign_trial_id",
+                "campaign_configuration_id",
+                "campaign_protocol",
+            )
+            markers: dict[str, Any] = {}
+            seen: set[int] = set()
+            visited = 0
+
+            def visit(item: Any, depth: int = 0, parent_key: str | None = None) -> None:
+                nonlocal visited
+                if isinstance(item, (list, tuple)):
+                    if parent_key in _ROLLING_NON_AUTHORITATIVE_ARRAY_KEYS:
+                        return
+                    if depth > _ROLLING_MAX_PROVENANCE_DEPTH or len(item) > 128:
+                        return
+                    for child in item:
+                        visit(child, depth + 1, parent_key)
+                    return
+                if not isinstance(item, Mapping):
+                    return
+                marker = id(item)
+                if marker in seen:
+                    return
+                seen.add(marker)
+                visited += 1
+                if visited > 512 or depth > _ROLLING_MAX_PROVENANCE_DEPTH:
+                    return
+                plan = item.get("experiment_plan")
+                if isinstance(plan, Mapping):
+                    visit(plan, depth + 1, "experiment_plan")
+                for name in marker_names:
+                    if name in item and name not in markers:
+                        markers[name] = compact(item[name])
+                source = str(item.get("source", "")).strip().lower()
+                if source in {"axiom-finite-campaign", "finite-campaign"}:
+                    markers.setdefault("source", item.get("source"))
+                for key, child in item.items():
+                    key_name = str(key).strip().lower()
+                    if key_name == "experiment_plan":
+                        continue
+                    if (
+                        isinstance(child, (list, tuple))
+                        and key_name in _ROLLING_NON_AUTHORITATIVE_ARRAY_KEYS
+                    ):
+                        continue
+                    visit(child, depth + 1, key_name)
+
+            for source in sources:
+                visit(source)
+            return markers
+
+        enrollment_lister = getattr(self.store, "list_rolling_enrollments", None)
+
+        def predecessor_for(candidate: str) -> tuple[str | None, Mapping[str, Any] | None]:
+            if not callable(enrollment_lister):
+                return None, None
+            try:
+                records = enrollment_lister(candidate_id=candidate, limit=256)
+            except (TypeError, ValueError, RuntimeError):
+                return None, None
+            if not isinstance(records, (list, tuple)):
+                return None, None
+            for prior in records:
+                if not isinstance(prior, Mapping):
+                    continue
+                prior_id = _binding_value(prior.get("enrollment_id"))
+                prior_version = _binding_value(prior.get("validation_version"))
+                if (
+                    prior_id
+                    and str(prior.get("status", "")).strip().upper() == "EXCLUDED"
+                    and prior_version != _ROLLING_ENROLLMENT_VALIDATION_VERSION
+                ):
+                    return prior_id, prior
+            return None, None
+
+        def enrollment_identity(
+            *,
+            candidate: str,
+            status: str,
+            reason: str,
+            strategy_version_id: str | None,
+            research_trial_id: str | None,
+        ) -> str:
+            material = {
+                "candidate_id": candidate,
+                "validation_version": _ROLLING_ENROLLMENT_VALIDATION_VERSION,
+                "strategy_version_id": strategy_version_id,
+                "research_trial_id": research_trial_id,
+                "status": status,
+                "reason": reason,
+            }
+            return "rolling-enrollment-" + _rolling_hash(material).removeprefix("sha256:")[:48]
 
         def decision(
             *,
@@ -2034,13 +2280,31 @@ class AutonomousResearchProcessor:
         ) -> None:
             if not callable(enrollment_saver):
                 return
+            normalized_status = str(status).strip().upper()
+            predecessor_id, predecessor = predecessor_for(candidate)
+            bounded_origin = dict(origin)
+            bounded_origin["validation_version"] = _ROLLING_ENROLLMENT_VALIDATION_VERSION
+            if predecessor_id:
+                bounded_origin["predecessor_enrollment_id"] = predecessor_id
+                prior_provenance = predecessor.get("provenance") if isinstance(predecessor, Mapping) else None
+                if isinstance(prior_provenance, Mapping):
+                    bounded_origin["predecessor_provenance"] = _rolling_provenance_bound(prior_provenance)
             record = {
+                "enrollment_id": enrollment_identity(
+                    candidate=candidate,
+                    status=normalized_status,
+                    reason=reason,
+                    strategy_version_id=strategy_version_id,
+                    research_trial_id=research_trial_id,
+                ),
                 "candidate_id": candidate,
                 "strategy_version_id": strategy_version_id,
                 "research_trial_id": research_trial_id,
-                "status": status,
+                "status": normalized_status,
                 "reason": reason,
-                "provenance": _rolling_provenance_bound(origin),
+                "validation_version": _ROLLING_ENROLLMENT_VALIDATION_VERSION,
+                "predecessor_enrollment_id": predecessor_id,
+                "provenance": _rolling_provenance_bound(bounded_origin),
             }
             try:
                 enrollment_saver(record)
@@ -2056,6 +2320,33 @@ class AutonomousResearchProcessor:
             strategy_payload = decode(strategy_row.get("strategy_payload"))
             lifecycle_payload = decode(lifecycle_row.get("candidate_payload"))
             row_candidate = _binding_value(lifecycle_row.get("candidate_id"))
+            # Campaign provenance is authoritative and must win before the
+            # general identity walk.  Otherwise a large unrelated attestation
+            # can mask the required CAMPAIGN_BOUND exclusion.
+            if _rolling_campaign_bound(strategy_payload) or _rolling_campaign_bound(lifecycle_payload):
+                campaign_candidates, _ = _rolling_candidate_values(
+                    {"candidate_id": row_candidate, "payload": lifecycle_payload}
+                )
+                campaign_candidate = row_candidate or (
+                    sorted(campaign_candidates)[0] if len(campaign_candidates) == 1 else None
+                )
+                if campaign_candidate:
+                    campaign_origin = origin_base(
+                        candidate=campaign_candidate,
+                        payload=lifecycle_payload,
+                        strategy_row=strategy_row,
+                    )
+                    markers = campaign_markers(strategy_payload, lifecycle_payload)
+                    campaign_origin.update(markers)
+                    campaign_origin["campaign_markers"] = dict(markers)
+                    campaign_origin["campaign_excluded"] = True
+                    decision(
+                        candidate=campaign_candidate,
+                        status="EXCLUDED",
+                        reason="CAMPAIGN_BOUND",
+                        origin=campaign_origin,
+                    )
+                return None
             lifecycle_candidates, lifecycle_truncated = _rolling_candidate_values(
                 {"candidate_id": row_candidate, "payload": lifecycle_payload}
             )
@@ -2105,65 +2396,11 @@ class AutonomousResearchProcessor:
                     },
                 )
                 return None
-            base_origin = {
-                "rolling_research": True,
-                "predecessor_candidate_id": candidate,
-                "source_candidate_id": candidate,
-                "source_trial_id": source_value(
-                    lifecycle_payload,
-                    "research_trial_id",
-                    "trial_id",
-                    "source_trial_id",
-                    "forward_test_id",
-                    "experiment_id",
-                    "plan_id",
-                ),
-                "source_config_hash": source_value(
-                    lifecycle_payload,
-                    "config_hash",
-                    "source_config_hash",
-                ),
-                "source_strategy_hash": source_value(
-                    lifecycle_payload,
-                    "source_strategy_hash",
-                    "strategy_hash",
-                ),
-                "rolling_strategy_hash": source_value(
-                    lifecycle_payload,
-                    "rolling_strategy_hash",
-                ),
-                "predecessor_strategy_id": _binding_value(strategy_row.get("strategy_id")),
-                "predecessor_strategy_version": _binding_value(strategy_row.get("version")),
-                "original_economic_outcome": {
-                    key: compact(lifecycle_payload[key])
-                    for key in (
-                        "economic_result",
-                        "economic_outcome",
-                        "result",
-                        "outcome",
-                        "validation",
-                        "forward_evidence",
-                        "metrics",
-                        "net_return",
-                        "realized_pnl",
-                        "unrealized_pnl",
-                    )
-                    if key in lifecycle_payload
-                },
-                "original_rejection": {
-                    key: compact(lifecycle_payload[key])
-                    for key in ("rejection_reason", "reason", "reason_code", "status")
-                    if key in lifecycle_payload
-                },
-            }
-            if _rolling_campaign_bound(strategy_payload) or _rolling_campaign_bound(lifecycle_payload):
-                decision(
-                    candidate=candidate,
-                    status="EXCLUDED",
-                    reason="CAMPAIGN_BOUND",
-                    origin={**base_origin, "campaign_excluded": True},
-                )
-                return None
+            base_origin = origin_base(
+                candidate=candidate,
+                payload=lifecycle_payload,
+                strategy_row=strategy_row,
+            )
             stage = str(lifecycle_row.get("stage", "")).strip().upper()
             if stage not in _ROLLING_MATURE_STAGES:
                 decision(
@@ -2223,7 +2460,11 @@ class AutonomousResearchProcessor:
                     candidate=candidate,
                     status="EXCLUDED",
                     reason="SCOPE_INVALID",
-                    origin=base_origin,
+                    origin={
+                        **base_origin,
+                        "next_action": "PERSIST_EXPLICIT_MARKET_SCOPE_AND_SCOPE_IDENTITY",
+                        "next_work": "PERSIST_EXPLICIT_MARKET_SCOPE_AND_SCOPE_IDENTITY",
+                    },
                 )
                 return None
             try:
@@ -2233,16 +2474,39 @@ class AutonomousResearchProcessor:
                     candidate=candidate,
                     status="EXCLUDED",
                     reason="SCOPE_INVALID",
-                    origin={**base_origin, "error": str(exc)[:256]},
+                    origin={
+                        **base_origin,
+                        "error": str(exc)[:256],
+                        "next_action": "REPAIR_EXPLICIT_MARKET_SCOPE_AND_SCOPE_IDENTITY",
+                        "next_work": "REPAIR_EXPLICIT_MARKET_SCOPE_AND_SCOPE_IDENTITY",
+                    },
                 )
                 return None
             supplied_hash = source_value(lifecycle_payload, "market_scope_hash", "scope_hash")
             supplied_version = source_value(lifecycle_payload, "market_scope_version", "scope_version")
             if supplied_hash and supplied_hash != scope_policy.scope_hash:
-                decision(candidate=candidate, status="EXCLUDED", reason="SCOPE_IDENTITY_MISMATCH", origin=base_origin)
+                decision(
+                    candidate=candidate,
+                    status="EXCLUDED",
+                    reason="SCOPE_IDENTITY_MISMATCH",
+                    origin={
+                        **base_origin,
+                        "next_action": "REPAIR_MARKET_SCOPE_IDENTITY",
+                        "next_work": "REPAIR_MARKET_SCOPE_IDENTITY",
+                    },
+                )
                 return None
             if supplied_version and supplied_version != scope_policy.scope_version:
-                decision(candidate=candidate, status="EXCLUDED", reason="SCOPE_IDENTITY_MISMATCH", origin=base_origin)
+                decision(
+                    candidate=candidate,
+                    status="EXCLUDED",
+                    reason="SCOPE_IDENTITY_MISMATCH",
+                    origin={
+                        **base_origin,
+                        "next_action": "REPAIR_MARKET_SCOPE_IDENTITY",
+                        "next_work": "REPAIR_MARKET_SCOPE_IDENTITY",
+                    },
+                )
                 return None
             plan = lifecycle_payload.get("experiment_plan")
             plan = plan if isinstance(plan, Mapping) else {}
@@ -2383,6 +2647,7 @@ class AutonomousResearchProcessor:
             )
             origin["rolling_strategy_hash"] = strategy_hash
             origin["research_trial_id"] = research_trial_id
+            origin["validation_version"] = _ROLLING_ENROLLMENT_VALIDATION_VERSION
             origin["mode"] = "OBSERVATION" if stage == "PAPER_FORWARD" else "RESEARCH"
             origin = _rolling_provenance_bound(origin)
             return {
@@ -2396,14 +2661,15 @@ class AutonomousResearchProcessor:
                 "research_trial_id": research_trial_id,
                 "source_strategy_hash": origin.get("source_strategy_hash"),
                 "rolling_strategy_hash": strategy_hash,
+                "validation_version": _ROLLING_ENROLLMENT_VALIDATION_VERSION,
                 "provenance": origin,
-                "enrollment_id": "rolling-enrollment-" + _rolling_hash(
-                    {
-                        "candidate_id": candidate,
-                        "strategy_version_id": strategy_version_id,
-                        "research_trial_id": research_trial_id,
-                    }
-                ).removeprefix("sha256:")[:48],
+                "enrollment_id": enrollment_identity(
+                    candidate=candidate,
+                    status="ACCEPTED",
+                    reason="MATURE_NONCAMPAIGN_RESEARCH",
+                    strategy_version_id=strategy_version_id,
+                    research_trial_id=research_trial_id,
+                ),
             }
 
         connection = getattr(self.store, "connection", None)
@@ -2612,6 +2878,29 @@ class AutonomousResearchProcessor:
         saver = getattr(self.store, "save_strategy_version", None)
         trial_saver = getattr(self.store, "save_research_trial", None)
         enrollment_saver = getattr(self.store, "save_rolling_enrollment", None)
+        enrollment_lister = getattr(self.store, "list_rolling_enrollments", None)
+
+        def predecessor_for(candidate: str) -> tuple[str | None, Mapping[str, Any] | None]:
+            if not callable(enrollment_lister):
+                return None, None
+            try:
+                records = enrollment_lister(candidate_id=candidate, limit=256)
+            except (TypeError, ValueError, RuntimeError):
+                return None, None
+            if not isinstance(records, (list, tuple)):
+                return None, None
+            for prior in records:
+                if not isinstance(prior, Mapping):
+                    continue
+                prior_id = _binding_value(prior.get("enrollment_id"))
+                prior_version = _binding_value(prior.get("validation_version"))
+                if (
+                    prior_id
+                    and str(prior.get("status", "")).strip().upper() == "EXCLUDED"
+                    and prior_version != _ROLLING_ENROLLMENT_VALIDATION_VERSION
+                ):
+                    return prior_id, prior
+            return None, None
         persisted: list[dict[str, Any]] = []
         for item in documents:
             document = dict(item["strategy_document"])
@@ -2709,6 +2998,14 @@ class AutonomousResearchProcessor:
                 # insert ACCEPTED under the same deterministic enrollment id.
                 continue
             if callable(enrollment_saver) and candidate_id:
+                predecessor_id, predecessor = predecessor_for(candidate_id)
+                accepted_provenance = dict(provenance)
+                accepted_provenance["validation_version"] = _ROLLING_ENROLLMENT_VALIDATION_VERSION
+                if predecessor_id:
+                    accepted_provenance["predecessor_enrollment_id"] = predecessor_id
+                    prior_provenance = predecessor.get("provenance") if isinstance(predecessor, Mapping) else None
+                    if isinstance(prior_provenance, Mapping):
+                        accepted_provenance["predecessor_provenance"] = _rolling_provenance_bound(prior_provenance)
                 try:
                     enrollment_saver(
                         {
@@ -2718,7 +3015,9 @@ class AutonomousResearchProcessor:
                             "research_trial_id": trial_id,
                             "status": "ACCEPTED",
                             "reason": "MATURE_NONCAMPAIGN_RESEARCH",
-                            "provenance": provenance,
+                            "validation_version": _ROLLING_ENROLLMENT_VALIDATION_VERSION,
+                            "predecessor_enrollment_id": predecessor_id,
+                            "provenance": _rolling_provenance_bound(accepted_provenance),
                         }
                     )
                 except (TypeError, ValueError, RuntimeError):

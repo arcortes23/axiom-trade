@@ -598,6 +598,297 @@ class TestRollingPortfolio(unittest.TestCase):
         self.assertEqual(len(documents), 1)
         self.assertEqual(documents[0]["candidate_id"], candidate_id)
         self.assertEqual(adapter.calls, [("strategy", 2048), ("candidate", 2048)])
+    def test_production_shaped_enrollment_is_bounded_versioned_and_idempotent(self) -> None:
+        strategy_template = {
+            "version": 1,
+            "market_type": "prediction",
+            "family": "probability_mispricing",
+            "parameters": {"threshold": 0.05},
+            "operations": [],
+            "probability_model": "fixed",
+            "resolution_aware": True,
+            "resolution_inputs": ["expiry", "settlement"],
+        }
+        scope = normalize_market_scope(
+            {
+                "schema_version": "1",
+                "mode": "EXACT_MARKETS",
+                "instrument": "POLYMARKET",
+                "categories": [],
+                "market_ids": ["market-production"],
+                "filters": {},
+                "regime_restrictions": {},
+                "provenance": "canonical",
+            }
+        ).as_dict()
+        bulk = [
+            {"candidate_id": f"unrelated-{index}", "snapshot_id": "x" * 128}
+            for index in range(1000)
+        ]
+
+        def seed(
+            store: AxiomStore,
+            candidate_id: str,
+            *,
+            stage: str = "FROZEN",
+            payload_extra: dict[str, object] | None = None,
+        ) -> None:
+            strategy = {**strategy_template, "strategy_id": candidate_id}
+            store.save_strategy(candidate_id, strategy, version="1")
+            payload: dict[str, object] = {
+                "candidate_id": candidate_id,
+                "strategy_document": strategy,
+                "market_scope": scope,
+                "dataset_attestation": {
+                    "dataset_id": "production-shaped",
+                    "dataset_version": "v1",
+                    "constituent_bindings": bulk,
+                },
+            }
+            payload.update(payload_extra or {})
+            store.save_candidate_lifecycle(candidate_id, "IDEA", payload, timestamp=NOW)
+            store.save_candidate_lifecycle(
+                candidate_id,
+                stage,
+                payload,
+                from_stage="IDEA",
+                timestamp=NOW,
+            )
+
+        with _store(self.tmp_path) as store:
+            seed(store, "candidate-valid")
+            seed(
+                store,
+                "candidate-conflict",
+                payload_extra={"identity": {"candidate_id": "candidate-foreign"}},
+            )
+            seed(
+                store,
+                "candidate-ambiguous",
+                payload_extra={"identity": {"candidate_id": ["candidate-ambiguous"]}},
+            )
+            seed(
+                store,
+                "candidate-campaign",
+                payload_extra={
+                    "experiment_plan": {
+                        "campaign_id": "campaign-production",
+                        "campaign_trial_id": "trial-production",
+                        "campaign_configuration_id": "config-production",
+                        "campaign_protocol": {
+                            "schema_version": "campaign-v1",
+                            "protocol_hash": "hash-production",
+                        },
+                    },
+                    "economic_outcome": {"net_return": "0.12", "completed": 3},
+                    "rejection_reason": "legacy campaign rejection",
+                    "provenance": {
+                        "source": "legacy-campaign",
+                        "attestation_id": "attestation-production",
+                    },
+                }
+            )
+            seed(
+                store,
+                "candidate-paper-missing-scope",
+                stage="PAPER_FORWARD",
+                payload_extra={"market_scope": None},
+            )
+            store.save_rolling_enrollment(
+                {
+                    "enrollment_id": "legacy-excluded-candidate-valid",
+                    "candidate_id": "candidate-valid",
+                    "status": "EXCLUDED",
+                    "reason": "CANDIDATE_IDENTITY_MISMATCH",
+                    "validation_version": "rolling-enrollment-v1",
+                    "provenance": {
+                        "candidate_id": "candidate-valid",
+                        "legacy": True,
+                    },
+                }
+            )
+            processor = AutonomousResearchProcessor.__new__(AutonomousResearchProcessor)
+            processor.store = store
+            documents = processor._rolling_strategy_documents()
+            self.assertEqual(
+                {item["candidate_id"] for item in documents},
+                {"candidate-valid"},
+            )
+            self.assertEqual(
+                {
+                    (item["candidate_id"], item["reason"])
+                    for item in store.list_rolling_enrollments()
+                    if item["validation_version"] == "rolling-enrollment-v2"
+                },
+                {
+                    ("candidate-ambiguous", "CANDIDATE_IDENTITY_MISMATCH"),
+                    ("candidate-campaign", "CAMPAIGN_BOUND"),
+                    ("candidate-conflict", "CANDIDATE_IDENTITY_MISMATCH"),
+                    ("candidate-paper-missing-scope", "SCOPE_INVALID"),
+                },
+            )
+            missing_scope = next(
+                item
+                for item in store.list_rolling_enrollments()
+                if item["candidate_id"] == "candidate-paper-missing-scope"
+            )
+            self.assertEqual(
+                missing_scope["provenance"]["next_work"],
+                "PERSIST_EXPLICIT_MARKET_SCOPE_AND_SCOPE_IDENTITY",
+            )
+            campaign = next(
+                item
+                for item in store.list_rolling_enrollments()
+                if item["candidate_id"] == "candidate-campaign"
+            )
+            campaign_provenance = campaign["provenance"]
+            self.assertEqual(campaign_provenance["campaign_id"], "campaign-production")
+            self.assertEqual(campaign_provenance["campaign_trial_id"], "trial-production")
+            self.assertEqual(
+                campaign_provenance["campaign_configuration_id"],
+                "config-production",
+            )
+            self.assertEqual(
+                campaign_provenance["campaign_protocol"],
+                {
+                    "schema_version": "campaign-v1",
+                    "protocol_hash": "hash-production",
+                },
+            )
+            self.assertEqual(
+                campaign_provenance["original_economic_outcome"],
+                {"economic_outcome": {"net_return": "0.12", "completed": 3}},
+            )
+            self.assertEqual(
+                campaign_provenance["original_rejection"],
+                {"rejection_reason": "legacy campaign rejection"},
+            )
+            self.assertEqual(
+                campaign_provenance["original_provenance"],
+                {
+                    "source": "legacy-campaign",
+                    "attestation_id": "attestation-production",
+                },
+            )
+            persisted = processor._rolling_persist_strategy_lineage(documents, NOW)
+            self.assertEqual(len(persisted), 1)
+            accepted = store.list_rolling_enrollments(
+                candidate_id="candidate-valid",
+                status="ACCEPTED",
+            )
+            self.assertEqual(len(accepted), 1)
+            self.assertEqual(accepted[0]["validation_version"], "rolling-enrollment-v2")
+            self.assertEqual(
+                accepted[0]["predecessor_enrollment_id"],
+                "legacy-excluded-candidate-valid",
+            )
+            self.assertEqual(
+                store.load_rolling_enrollment("legacy-excluded-candidate-valid")["status"],
+                "EXCLUDED",
+            )
+            before = len(store.list_rolling_enrollments())
+            rerun_documents = processor._rolling_strategy_documents()
+            processor._rolling_persist_strategy_lineage(rerun_documents, NOW)
+            self.assertEqual(len(store.list_rolling_enrollments()), before)
+            self.assertEqual(
+                store.connection.execute(
+                    "SELECT COUNT(*) FROM strategy_versions WHERE strategy_version_id LIKE 'strategy-version-%'"
+                ).fetchone()[0],
+                1,
+            )
+            self.assertEqual(
+                store.connection.execute(
+                    "SELECT COUNT(*) FROM research_trials WHERE research_trial_id LIKE 'research-trial-%'"
+                ).fetchone()[0],
+                1,
+            )
+    def test_rolling_enrollment_requires_nonblank_version_and_valid_predecessor(self) -> None:
+        with _store(self.tmp_path) as store:
+            base = {
+                "enrollment_id": "excluded-base",
+                "candidate_id": "candidate-base",
+                "status": "EXCLUDED",
+                "reason": "LEGACY_REJECTION",
+                "created_at": NOW.isoformat(),
+            }
+            with self.assertRaises(ValueError):
+                store.save_rolling_enrollment({**base, "validation_version": " "})
+            with self.assertRaises(ValueError):
+                store.save_rolling_enrollment({**base, "attempt_version": "\t"})
+            store.save_rolling_enrollment(base)
+            self.assertEqual(
+                store.load_rolling_enrollment("excluded-base")["validation_version"],
+                "rolling-enrollment-v1",
+            )
+
+            with self.assertRaises(ValueError):
+                store.save_rolling_enrollment(
+                    {
+                        **base,
+                        "enrollment_id": "dangling-successor",
+                        "validation_version": "rolling-enrollment-v2",
+                        "predecessor_enrollment_id": "missing",
+                    }
+                )
+            with self.assertRaises(ValueError):
+                store.save_rolling_enrollment(
+                    {
+                        **base,
+                        "enrollment_id": "mismatched-successor",
+                        "candidate_id": "candidate-other",
+                        "validation_version": "rolling-enrollment-v2",
+                        "predecessor_enrollment_id": "excluded-base",
+                    }
+                )
+            store.save_rolling_enrollment(
+                {
+                    **base,
+                    "enrollment_id": "accepted-base",
+                    "candidate_id": "candidate-base",
+                    "status": "ACCEPTED",
+                    "strategy_version_id": "strategy-version-accepted-base",
+                    "research_trial_id": "research-trial-accepted-base",
+                }
+            )
+            with self.assertRaises(ValueError):
+                store.save_rolling_enrollment(
+                    {
+                        **base,
+                        "enrollment_id": "accepted-successor",
+                        "validation_version": "rolling-enrollment-v2",
+                        "predecessor_enrollment_id": "accepted-base",
+                    }
+                )
+            with self.assertRaises(ValueError):
+                store.save_rolling_enrollment(
+                    {
+                        **base,
+                        "enrollment_id": "self-successor",
+                        "validation_version": "rolling-enrollment-v2",
+                        "predecessor_enrollment_id": "self-successor",
+                    }
+                )
+            self.assertEqual(len(store.list_rolling_enrollments()), 2)
+
+    def test_rolling_predecessor_lookup_is_latest_and_bounded(self) -> None:
+        with _store(self.tmp_path) as store:
+            for index in range(300):
+                store.save_rolling_enrollment(
+                    {
+                        "enrollment_id": f"excluded-{index:03d}",
+                        "candidate_id": "candidate-latest",
+                        "status": "EXCLUDED",
+                        "reason": "LEGACY_REJECTION",
+                        "created_at": (NOW + timedelta(seconds=index)).isoformat(),
+                    }
+                )
+            newest = store.list_rolling_enrollments(
+                candidate_id="candidate-latest",
+                status="EXCLUDED",
+                limit=1,
+            )
+            self.assertEqual([item["enrollment_id"] for item in newest], ["excluded-299"])
+
     def test_strategy_trial_policy_and_evidence_rows_are_immutable(self) -> None:
         self.assertEqual(default_rolling_admission_policy().requested_window_days, (7, 30))
         with _store(self.tmp_path) as store:
