@@ -105,6 +105,11 @@ class _BuyStrategy:
         return {"side": "buy", "quantity": 1.0}
     def to_dict(self) -> dict[str, str]:
         return {"id": "strategy"}
+class _ChangedBuyStrategy(_BuyStrategy):
+    def to_dict(self) -> dict[str, str]:
+        return {"id": "changed-strategy"}
+
+
 class _StaticCryptoProvider:
     provider_name = "test-crypto"
 
@@ -1155,6 +1160,31 @@ class Phase3PaperAndRiskTests(unittest.TestCase):
                 source_strategy_hash=strategy_hash,
                 rolling_strategy_hash=strategy_hash,
             )
+            with self.assertRaisesRegex(ValueError, "config strategy_document does not match frozen strategy"):
+                registry.register_observation_intent(
+                    strategy=_ChangedBuyStrategy(),
+                    model={"id": "model"},
+                    config=config,
+                    registration_timestamp=T0,
+                    candidate_id="candidate-a",
+                    strategy_version_id="sv-a",
+                    research_trial_id="trial-a",
+                    source_strategy_hash=strategy_hash,
+                    rolling_strategy_hash=strategy_hash,
+                )
+            with self.assertRaisesRegex(ValueError, "config model_document does not match frozen model"):
+                registry.register_observation_intent(
+                    strategy=_BuyStrategy(),
+                    model={"id": "changed-model"},
+                    config=config,
+                    registration_timestamp=T0,
+                    candidate_id="candidate-a",
+                    strategy_version_id="sv-a",
+                    research_trial_id="trial-a",
+                    source_strategy_hash=strategy_hash,
+                    rolling_strategy_hash=strategy_hash,
+                )
+
             same = registry.register_observation_intent(
                 strategy=_BuyStrategy(),
                 model={"id": "model"},

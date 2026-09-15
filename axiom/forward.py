@@ -524,15 +524,7 @@ class ForwardTestRegistry:
         risk_config_generation: int | None = None,
         risk_config_hash: str | None = None,
     ) -> ForwardTestSpec:
-        config_document = config.get("strategy_document") if isinstance(config, Mapping) else None
-        config_model_document = config.get("model_document") if isinstance(config, Mapping) else None
-        if isinstance(config_document, Mapping) and _content_hash(_normalized_strategy_document(config_document)) != _content_hash(_normalized_strategy_document(strategy)):
-            raise ValueError("config strategy_document does not match frozen strategy")
-        model_source = getattr(model, "document", model)
-        if isinstance(config_model_document, Mapping) and _content_hash(config_model_document) != _content_hash(model_source):
-            raise ValueError("config model_document does not match frozen model")
-        strategy_value = config_document if isinstance(config_document, Mapping) else strategy
-        model_value = config_model_document if isinstance(config_model_document, Mapping) else model_source
+        strategy_value, model_value = _frozen_runtime_documents(strategy, model, config)
         strategy_hash = _content_hash(_normalized_strategy_document(strategy_value))
         model_hash = _content_hash(model_value)
         config_record = dict(config or {})
@@ -682,29 +674,19 @@ class ForwardTestRegistry:
             source_model_document, Mapping
         ):
             intent_config["model_document"] = dict(source_model_document)
+        _frozen_runtime_documents(strategy, model, intent_config)
         if scope_resolution is not None:
             proof = _scope_resolution_mapping(scope_resolution)
             if proof is None:
                 raise ValueError("scope_resolution must be a mapping or immutable resolution")
             intent_config.setdefault("scope_resolution", dict(proof))
-        # ``freeze`` computes the canonical strategy hash.  A supplied
-        # rolling hash is an assertion about that exact document, never an
-        # alternate execution identity.
-        computed_strategy_hash = _content_hash(
-            _normalized_strategy_document(
-                intent_config.get("strategy_document")
-                if isinstance(intent_config.get("strategy_document"), Mapping)
-                else strategy
-            )
-        )
+        # Hash the supplied runtime objects after validating them against the
+        # immutable documents carried by the intent config.
+        computed_strategy_hash = _content_hash(_normalized_strategy_document(strategy))
         if rolling_strategy_hash is not None and str(rolling_strategy_hash).strip() != computed_strategy_hash:
             raise ValueError("rolling_strategy_hash does not match strategy")
         normalized_config = _canonical_forward_config(intent_config)
-        computed_model_hash = _content_hash(
-            intent_config.get("model_document")
-            if isinstance(intent_config.get("model_document"), Mapping)
-            else getattr(model, "document", model)
-        )
+        computed_model_hash = _content_hash(getattr(model, "document", model))
         normalized_risk_limits = dict(risk_limits or {})
         identity_material = {
             "candidate_id": identifier,
@@ -927,6 +909,32 @@ class ForwardTestRegistry:
             ResearchQuality(record["quality"]),
             start_timestamp,
         )
+def _frozen_runtime_documents(
+    strategy: Any,
+    model: Any,
+    config: Mapping[str, Any] | None,
+) -> tuple[Any, Any]:
+    """Validate runtime documents against configured frozen documents."""
+    config_document = config.get("strategy_document") if isinstance(config, Mapping) else None
+    config_model_document = config.get("model_document") if isinstance(config, Mapping) else None
+    if (
+        isinstance(config_document, Mapping)
+        and _content_hash(_normalized_strategy_document(config_document))
+        != _content_hash(_normalized_strategy_document(strategy))
+    ):
+        raise ValueError("config strategy_document does not match frozen strategy")
+    model_source = getattr(model, "document", model)
+    if (
+        isinstance(config_model_document, Mapping)
+        and _content_hash(config_model_document) != _content_hash(model_source)
+    ):
+        raise ValueError("config model_document does not match frozen model")
+    return (
+        config_document if isinstance(config_document, Mapping) else strategy,
+        config_model_document if isinstance(config_model_document, Mapping) else model_source,
+    )
+
+
 def _normalized_strategy_document(value: Any) -> Any:
     if isinstance(value, Mapping):
         try:
