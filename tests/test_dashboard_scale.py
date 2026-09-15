@@ -128,6 +128,57 @@ class DashboardScaleFixtureTests(unittest.TestCase):
             finally:
                 store.connection.set_trace_callback(None)
                 store.close()
+    def test_dashboard_summary_latest_timestamps_use_created_at_indexes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database_path = Path(temporary_directory) / "dashboard-latest.sqlite3"
+            store = AxiomStore(str(database_path))
+            try:
+                newest = "2026-01-03T00:00:00+00:00"
+                older = "2026-01-01T00:00:00+00:00"
+                # Insert the newest row first so a physical-row shortcut would
+                # return the wrong timestamp.
+                with store.transaction():
+                    store.connection.executemany(
+                        "INSERT INTO datasets("
+                        "dataset_id,version,payload_json,metadata_json,quality,created_at"
+                        ") VALUES (?,?,?,?,?,?)",
+                        [
+                            ("newest-dataset", "v1", "{}", "{}", "GOOD", newest),
+                            ("older-dataset", "v1", "{}", "{}", "GOOD", older),
+                        ],
+                    )
+                    store.connection.executemany(
+                        "INSERT INTO experiments("
+                        "experiment_id,strategy_id,payload_json,created_at"
+                        ") VALUES (?,?,?,?)",
+                        [
+                            ("newest-experiment", "strategy", "{}", newest),
+                            ("older-experiment", "strategy", "{}", older),
+                        ],
+                    )
+
+                for table, index in (
+                    ("datasets", "idx_datasets_created"),
+                    ("experiments", "idx_experiments_created"),
+                ):
+                    plan = store.connection.execute(
+                        f"EXPLAIN QUERY PLAN SELECT created_at FROM {table} "
+                        "ORDER BY created_at DESC LIMIT 1"
+                    ).fetchall()
+                    details = " ".join(str(row[3]) for row in plan)
+                    self.assertIn(f"USING COVERING INDEX {index}", details)
+
+                summary = store.dashboard_summary()
+                self.assertEqual(summary["latest_dataset"], datetime.fromisoformat(newest))
+                self.assertEqual(summary["latest_experiment"], datetime.fromisoformat(newest))
+
+                started = time.perf_counter()
+                status = DashboardData(store=store, clock=lambda: T0).status_data()
+                self.assertLess(time.perf_counter() - started, 1.0)
+                self.assertEqual(status["summary"]["latest_dataset"], datetime.fromisoformat(newest))
+                self.assertEqual(status["summary"]["latest_experiment"], datetime.fromisoformat(newest))
+            finally:
+                store.close()
     def test_dashboard_count_projection_initialization_releases_write_lock(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             database_path = Path(temporary_directory) / "dashboard-count-lock.sqlite3"

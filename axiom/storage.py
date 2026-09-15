@@ -455,6 +455,8 @@ class AxiomStore:
                     created_at TEXT NOT NULL,
                     PRIMARY KEY (dataset_id, version)
                 );
+                CREATE INDEX IF NOT EXISTS idx_datasets_created
+                    ON datasets(created_at);
                 CREATE TABLE IF NOT EXISTS dataset_catalog (
                     dataset_id TEXT NOT NULL,
                     dataset_version TEXT NOT NULL,
@@ -573,6 +575,8 @@ class AxiomStore:
                     payload_json TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE INDEX IF NOT EXISTS idx_experiments_created
+                    ON experiments(created_at);
                 CREATE TABLE IF NOT EXISTS fills (
                     fill_id TEXT PRIMARY KEY,
                     order_id TEXT NOT NULL,
