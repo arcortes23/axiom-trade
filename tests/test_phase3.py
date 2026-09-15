@@ -1233,6 +1233,28 @@ class Phase3PaperAndRiskTests(unittest.TestCase):
                 now=T0,
                 candidate_id="candidate-a",
             )
+            first_materialized_retry = registry.materialize_observation_intent(
+                first,
+                allowed_markets=("market-a",),
+                registration_timestamp=T0 + timedelta(days=1),
+                now=T0 + timedelta(days=1),
+                candidate_id="candidate-a",
+            )
+            self.assertEqual(
+                first_materialized.as_record(),
+                first_materialized_retry.as_record(),
+            )
+            different_markets = registry.materialize_observation_intent(
+                first,
+                allowed_markets=("market-c",),
+                registration_timestamp=T0 + timedelta(days=1),
+                now=T0 + timedelta(days=1),
+                candidate_id="candidate-a",
+            )
+            self.assertNotEqual(
+                first_materialized.experiment_id,
+                different_markets.experiment_id,
+            )
             second_materialized = registry.materialize_observation_intent(
                 second,
                 allowed_markets=("market-b",),

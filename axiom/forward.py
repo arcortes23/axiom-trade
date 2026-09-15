@@ -847,6 +847,33 @@ class ForwardTestRegistry:
         else:
             # Keep the original collector/legacy identity unchanged.
             experiment_id = "forward-" + source_candidate
+
+        strategy_value, model_value = _frozen_runtime_documents(
+            strategy_document,
+            model_document,
+            source_config,
+        )
+        strategy_hash = _content_hash(_normalized_strategy_document(strategy_value))
+        model_hash = _content_hash(model_value)
+        canonical_config = _canonical_forward_config(source_config)
+        expected_bankroll = float(source.bankroll)
+        expected_risk_limits = dict(source.risk_limits)
+        existing = self.get(experiment_id)
+        if existing is not None:
+            exact_identity = (
+                str(existing.strategy_hash).strip() == strategy_hash
+                and str(existing.model_hash).strip() == model_hash
+                and _canonical(existing.config) == _canonical(canonical_config)
+                and float(existing.bankroll) == expected_bankroll
+                and _canonical(existing.risk_limits) == _canonical(expected_risk_limits)
+                and tuple(existing.allowed_markets) == markets
+            )
+            if exact_identity:
+                # Registration/start timestamps are operational metadata, not
+                # part of a materialized intent's deterministic identity.
+                return existing
+            raise ValueError(f"forward test is frozen: {experiment_id}")
+
         return self.register_forward_test(
             strategy=dict(strategy_document),
             model=dict(model_document),
@@ -855,7 +882,7 @@ class ForwardTestRegistry:
             config=source_config,
             bankroll=source.bankroll,
             allowed_markets=markets,
-            risk_limits=dict(source.risk_limits),
+            risk_limits=expected_risk_limits,
             experiment_id=experiment_id,
         )
 
