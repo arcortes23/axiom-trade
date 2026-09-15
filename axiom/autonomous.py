@@ -4901,6 +4901,7 @@ class AutonomousResearchProcessor:
             except Exception as exc:
                 raise ValueError("PAPER_REGISTRY_UNAVAILABLE") from exc
             matched_spec = False
+            pending_intent = False
             for spec in specs:
                 if not isinstance(spec, Mapping):
                     continue
@@ -4908,20 +4909,27 @@ class AutonomousResearchProcessor:
                 experiment_id = _binding_value(spec.get("experiment_id"))
                 config = spec.get("config")
                 config = config if isinstance(config, Mapping) else {}
-                # An observation intent is not a PAPER source.  It becomes
-                # eligible only after immutable current-market authority has
-                # been materialized; never let an unscoped intent match an
-                # otherwise identical rolling lineage.
-                if bool(config.get("observation_intent")) and (
-                    config.get("market_authority_required") is not True
-                    or not isinstance(spec.get("allowed_markets"), (list, tuple))
-                    or not tuple(
+                allowed_markets = (
+                    tuple(
                         str(item).strip()
                         for item in spec.get("allowed_markets", ())
                         if str(item).strip()
                     )
-                ):
-                    continue
+                    if isinstance(spec.get("allowed_markets"), (list, tuple))
+                    else ()
+                )
+                is_observation_intent = bool(config.get("observation_intent"))
+                is_materialized_intent = (
+                    config.get("market_authority_required") is True
+                    and bool(allowed_markets)
+                )
+                # An observation intent is not a PAPER source.  Record an
+                # exact unmaterialized intent separately so callers can retry
+                # once current market authority is available; never load its
+                # ledger as if it were executable paper work.
+                is_unmaterialized_intent = (
+                    is_observation_intent and not is_materialized_intent
+                )
                 source_strategy_hash = _binding_value(
                     config.get("source_strategy_hash")
                 ) or spec_strategy_hash
@@ -4952,6 +4960,9 @@ class AutonomousResearchProcessor:
                     or spec_trial != expected_trial
                     or spec_strategy_version != expected_strategy_version
                 ):
+                    continue
+                if is_unmaterialized_intent:
+                    pending_intent = True
                     continue
                 matched_spec = True
                 loader = getattr(self.store, "list_paper_bet_ledger", None)
@@ -5057,6 +5068,8 @@ class AutonomousResearchProcessor:
                     row["_paper_experiment_id"] = experiment_id
                     rows.append(row)
             if not matched_spec:
+                if pending_intent:
+                    raise ValueError("PAPER_MARKET_AUTHORITY_PENDING")
                 raise ValueError("PAPER_SPEC_BINDING_MISMATCH")
         resolved_scope_market_ids = _rolling_rule_scope_market_ids(
             self.store,

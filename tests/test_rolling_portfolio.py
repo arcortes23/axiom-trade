@@ -607,6 +607,65 @@ class TestRollingPortfolio(unittest.TestCase):
             (2, 2, 2),
         )
 
+    def test_paper_loader_marks_exact_unmaterialized_intent_pending_then_matches_materialized_spec(self) -> None:
+        strategy_hash = "sha256:strategy-alpha"
+        record = {
+            "strategy_hash": strategy_hash,
+            "strategy_version_id": "strategy-version-alpha",
+            "research_trial_id": "research-trial-alpha",
+            "candidate_id": "candidate-alpha",
+        }
+        intent_config = {
+            "observation_intent": True,
+            "market_authority_required": False,
+            "candidate_id": "candidate-alpha",
+            "strategy_version_id": "strategy-version-alpha",
+            "research_trial_id": "research-trial-alpha",
+            "source_strategy_hash": strategy_hash,
+            "rolling_strategy_hash": strategy_hash,
+        }
+        pending = {
+            "experiment_id": "observation-intent-alpha",
+            "strategy_hash": strategy_hash,
+            "model_hash": "sha256:model",
+            "config": intent_config,
+            "allowed_markets": [],
+            "risk_limits": {},
+            "quality": "PAPER_FORWARD",
+        }
+        materialized = {
+            **pending,
+            "experiment_id": "forward-alpha",
+            "config": {
+                **intent_config,
+                "market_authority_required": True,
+            },
+            "allowed_markets": ["m1"],
+        }
+
+        class PaperStore:
+            def __init__(self) -> None:
+                self.specs = [pending]
+                self.ledger_calls: list[str] = []
+
+            def load_forward_tests(self, *, limit: int = 1000):
+                return list(self.specs)
+
+            def list_paper_bet_ledger(self, experiment_id: str, *, limit: int = 1000):
+                self.ledger_calls.append(experiment_id)
+                return []
+
+        processor = AutonomousResearchProcessor.__new__(AutonomousResearchProcessor)
+        store = PaperStore()
+        processor.store = store
+        with self.assertRaisesRegex(ValueError, "PAPER_MARKET_AUTHORITY_PENDING"):
+            processor._rolling_source_rows(record, "PAPER", NOW)
+        self.assertEqual(store.ledger_calls, [])
+
+        store.specs = [materialized]
+        self.assertEqual(processor._rolling_source_rows(record, "PAPER", NOW), [])
+        self.assertEqual(store.ledger_calls, ["forward-alpha"])
+
     def test_paper_loader_rejects_foreign_identity_in_nested_accounting_ledger(self) -> None:
         strategy_hash = "sha256:strategy-alpha"
         record = {

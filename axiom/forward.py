@@ -700,17 +700,19 @@ class ForwardTestRegistry:
         if rolling_strategy_hash is not None and str(rolling_strategy_hash).strip() != computed_strategy_hash:
             raise ValueError("rolling_strategy_hash does not match strategy")
         normalized_config = _canonical_forward_config(intent_config)
+        computed_model_hash = _content_hash(
+            intent_config.get("model_document")
+            if isinstance(intent_config.get("model_document"), Mapping)
+            else getattr(model, "document", model)
+        )
+        normalized_risk_limits = dict(risk_limits or {})
         identity_material = {
             "candidate_id": identifier,
             "strategy_hash": computed_strategy_hash,
-            "model_hash": _content_hash(
-                intent_config.get("model_document")
-                if isinstance(intent_config.get("model_document"), Mapping)
-                else getattr(model, "document", model)
-            ),
+            "model_hash": computed_model_hash,
             "config": normalized_config,
             "bankroll": float(bankroll),
-            "risk_limits": dict(risk_limits or {}),
+            "risk_limits": normalized_risk_limits,
         }
         experiment_id = (
             "observation-intent-" + identifier
@@ -718,18 +720,41 @@ class ForwardTestRegistry:
             else "observation-intent-"
             + hashlib.sha256(_canonical(identity_material).encode("utf-8")).hexdigest()[:24]
         )
-        # The deterministic id changes when provenance changes; exact identities
-        # for one candidate intentionally coexist under their digest IDs.  Any
-        # actual identifier collision remains rejected by ``freeze`` and the
-        # immutable store persistence layer.
+        existing = self.get(experiment_id)
+        if existing is not None:
+            existing_config = dict(existing.config)
+            if (
+                "paper_assumptions_explicit" not in normalized_config
+                and existing_config.get("paper_assumptions_explicit") is True
+            ):
+                # Older observation intents were canonicalized twice during
+                # persistence, which added this marker after identity hashing.
+                existing_config.pop("paper_assumptions_explicit", None)
+            exact_identity = (
+                str(existing.strategy_hash).strip() == computed_strategy_hash
+                and str(existing.model_hash).strip() == computed_model_hash
+                and _canonical(existing_config) == _canonical(normalized_config)
+                and float(existing.bankroll) == identity_material["bankroll"]
+                and _canonical(existing.risk_limits) == _canonical(normalized_risk_limits)
+                and not existing.allowed_markets
+            )
+            if exact_identity:
+                # Registration/start timestamps are operational metadata, not
+                # part of an observation intent's deterministic identity.
+                return existing
+            raise ValueError(f"forward test is frozen: {experiment_id}")
+        # The deterministic id changes when provenance changes; exact
+        # identities for one candidate intentionally coexist under their digest
+        # IDs.  Any actual identifier collision remains rejected by ``freeze``
+        # and the immutable store persistence layer.
         return self.freeze(
             strategy=strategy,
             model=model,
-            config=normalized_config,
+            config=intent_config,
             start_timestamp=registration_timestamp or utc_now(),
             bankroll=bankroll,
             allowed_markets=(),
-            risk_limits=risk_limits,
+            risk_limits=normalized_risk_limits,
             experiment_id=experiment_id,
         )
 

@@ -1166,6 +1166,18 @@ class Phase3PaperAndRiskTests(unittest.TestCase):
                 source_strategy_hash=strategy_hash,
                 rolling_strategy_hash=strategy_hash,
             )
+            later = registry.register_observation_intent(
+                strategy=_BuyStrategy(),
+                model={"id": "model"},
+                config=config,
+                registration_timestamp=T0 + timedelta(days=1),
+                candidate_id="candidate-a",
+                strategy_version_id="sv-a",
+                research_trial_id="trial-a",
+                source_strategy_hash=strategy_hash,
+                rolling_strategy_hash=strategy_hash,
+            )
+            self.assertEqual(first.as_record(), later.as_record())
             second = registry.register_observation_intent(
                 strategy=_BuyStrategy(),
                 model={"id": "model"},
