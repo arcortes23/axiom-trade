@@ -71,6 +71,7 @@ _CANARY_DECIMAL_LIMITS = {
     "cumulative_buy_cap_usd",
 }
 _MAX_EVIDENCE_SCAN_ROWS = 100_000
+_DASHBOARD_COUNT_PROJECTION_VERSION = 1
 _QUEUE_RELEASE_BATCH = 256
 _QUEUE_LINEAGE_LIMIT = 256
 _DEFAULT_HERMES_JOB_ID = "f1d27bf8c27a"
@@ -266,6 +267,10 @@ class AxiomStore:
         foreign_keys = int(self._conn.execute("PRAGMA foreign_keys").fetchone()[0])
         if foreign_keys != 1:
             raise sqlite3.OperationalError("SQLite foreign_keys pragma was not enabled")
+        self._conn.execute("PRAGMA recursive_triggers=ON")
+        recursive_triggers = int(self._conn.execute("PRAGMA recursive_triggers").fetchone()[0])
+        if recursive_triggers != 1:
+            raise sqlite3.OperationalError("SQLite recursive_triggers pragma was not enabled")
         self._conn.execute(f"PRAGMA busy_timeout={self._sqlite_busy_timeout_ms}")
         busy_timeout = int(self._conn.execute("PRAGMA busy_timeout").fetchone()[0])
         if busy_timeout != self._sqlite_busy_timeout_ms:
@@ -929,6 +934,7 @@ class AxiomStore:
             self._initialize_canary_risk_schema()
             self._initialize_rolling_portfolio_schema()
             self._create_dataset_attestation_triggers()
+            self._initialize_dashboard_count_projection()
     def _migrate_market_tables(self) -> None:
         """Upgrade pre-versioned market tables without discarding records."""
         for table, primary_key, index_name in (
@@ -6417,6 +6423,106 @@ class AxiomStore:
     ensure_dataset_integrity = verify_dataset_integrity_attestation
     load_dataset_attestation = load_dataset_integrity_attestation
     save_dataset_attestation = save_dataset_integrity_attestation
+
+    def _initialize_dashboard_count_projection(self) -> None:
+        """Maintain exact counts for payload-bearing dashboard tables."""
+        trigger_sql = (
+            (
+                "bars_dashboard_row_count_insert",
+                "CREATE TRIGGER bars_dashboard_row_count_insert "
+                "AFTER INSERT ON bars BEGIN "
+                "UPDATE dashboard_row_counts SET row_count=row_count+1 "
+                "WHERE table_name='bars'; END",
+            ),
+            (
+                "bars_dashboard_row_count_delete",
+                "CREATE TRIGGER bars_dashboard_row_count_delete "
+                "AFTER DELETE ON bars BEGIN "
+                "UPDATE dashboard_row_counts SET row_count=row_count-1 "
+                "WHERE table_name='bars'; END",
+            ),
+            (
+                "polymarket_trades_dashboard_row_count_insert",
+                "CREATE TRIGGER polymarket_trades_dashboard_row_count_insert "
+                "AFTER INSERT ON polymarket_trades BEGIN "
+                "UPDATE dashboard_row_counts SET row_count=row_count+1 "
+                "WHERE table_name='polymarket_trades'; END",
+            ),
+            (
+                "polymarket_trades_dashboard_row_count_delete",
+                "CREATE TRIGGER polymarket_trades_dashboard_row_count_delete "
+                "AFTER DELETE ON polymarket_trades BEGIN "
+                "UPDATE dashboard_row_counts SET row_count=row_count-1 "
+                "WHERE table_name='polymarket_trades'; END",
+            ),
+        )
+        if not self._conn.in_transaction:
+            self._conn.execute("BEGIN IMMEDIATE")
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS dashboard_row_counts ("
+            "table_name TEXT PRIMARY KEY,"
+            "row_count INTEGER NOT NULL CHECK(row_count >= 0),"
+            f"projection_version INTEGER NOT NULL DEFAULT {_DASHBOARD_COUNT_PROJECTION_VERSION})"
+        )
+        columns = {
+            str(row["name"])
+            for row in self._conn.execute(
+                "PRAGMA table_info(dashboard_row_counts)"
+            ).fetchall()
+        }
+        if "projection_version" not in columns:
+            self._conn.execute(
+                "ALTER TABLE dashboard_row_counts ADD COLUMN "
+                "projection_version INTEGER NOT NULL DEFAULT 0"
+            )
+        required_tables = {"bars", "polymarket_trades"}
+        existing_rows = {
+            str(row["table_name"]): int(row["projection_version"])
+            for row in self._conn.execute(
+                "SELECT table_name,projection_version FROM dashboard_row_counts "
+                "WHERE table_name IN ('bars','polymarket_trades')"
+            ).fetchall()
+        }
+        existing_trigger_sql = {
+            str(row["name"]): " ".join(str(row["sql"] or "").split()).lower()
+            for row in self._conn.execute(
+                "SELECT name,sql FROM sqlite_master WHERE type='trigger' "
+                "AND name IN (?,?,?,?)",
+                tuple(name for name, _ in trigger_sql),
+            ).fetchall()
+        }
+        expected_trigger_sql = {
+            name: " ".join(statement.split()).lower()
+            for name, statement in trigger_sql
+        }
+        needs_reconcile = (
+            set(existing_rows) != required_tables
+            or any(
+                version != _DASHBOARD_COUNT_PROJECTION_VERSION
+                for version in existing_rows.values()
+            )
+            or existing_trigger_sql != expected_trigger_sql
+        )
+        if not needs_reconcile:
+            return
+        for name, _ in trigger_sql:
+            self._conn.execute(f"DROP TRIGGER IF EXISTS {name}")
+        self._conn.execute(
+            "DELETE FROM dashboard_row_counts "
+            "WHERE table_name IN ('bars','polymarket_trades')"
+        )
+        self._conn.execute(
+            "INSERT INTO dashboard_row_counts(table_name,row_count,projection_version) "
+            "SELECT 'bars',COUNT(*),? FROM bars",
+            (_DASHBOARD_COUNT_PROJECTION_VERSION,),
+        )
+        self._conn.execute(
+            "INSERT INTO dashboard_row_counts(table_name,row_count,projection_version) "
+            "SELECT 'polymarket_trades',COUNT(*),? FROM polymarket_trades",
+            (_DASHBOARD_COUNT_PROJECTION_VERSION,),
+        )
+        for _, statement in trigger_sql:
+            self._conn.execute(statement)
 
     def _create_dataset_attestation_triggers(self) -> None:
         """Stale attestations when either catalog identity or payload identity changes."""
@@ -16593,9 +16699,10 @@ class AxiomStore:
         count_tables = (
             ("dataset_catalog", "dataset_catalog", None),
             ("polymarket_snapshots", "polymarket_snapshots", "idx_polymarket_snapshots_dashboard"),
-            # Trades are append-only; scanning their payload-bearing table for COUNT(*) makes
-            # a cold dashboard read proportional to the full historical tape.
-            ("polymarket_trades", "polymarket_trades", "__append_only_rowid__"),
+            # Keep the exact trade count in a tiny trigger-maintained
+            # projection; scanning its payload-bearing table makes a cold
+            # dashboard read proportional to the full historical tape.
+            ("polymarket_trades", "polymarket_trades", "__dashboard_row_count__"),
             ("collection_errors", "collection_errors", "idx_collection_errors_observed"),
             ("collection_cycles", "collection_cycles", "idx_collection_cycles_time"),
             ("research_queue", "research_queue", None),
@@ -16667,10 +16774,15 @@ class AxiomStore:
         with self._lock:
             counts = {}
             for table, label, index in count_tables:
-                if index == "__append_only_rowid__":
+                if index == "__dashboard_row_count__":
                     count_row = self._conn.execute(
-                        f"SELECT COALESCE(MAX(rowid),0) AS n FROM {table}"
+                        "SELECT row_count AS n FROM dashboard_row_counts WHERE table_name=?",
+                        (table,),
                     ).fetchone()
+                    if count_row is None:
+                        raise sqlite3.OperationalError(
+                            f"missing dashboard row count for {table}"
+                        )
                 else:
                     source = table if index is None else f"{table} INDEXED BY {index}"
                     count_row = self._conn.execute(
@@ -16778,7 +16890,20 @@ class AxiomStore:
                 ("dataset_bootstrap_state", "dataset_bootstrap_state"),
                 ("historical_regime_labels", "historical_regime_labels"),
             ):
-                result[label] = int(self._conn.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()["n"])
+                if table in {"bars", "polymarket_trades"}:
+                    row = self._conn.execute(
+                        "SELECT row_count FROM dashboard_row_counts WHERE table_name=?",
+                        (table,),
+                    ).fetchone()
+                    if row is None:
+                        raise sqlite3.OperationalError(
+                            f"missing dashboard row count for {table}"
+                        )
+                else:
+                    row = self._conn.execute(
+                        f"SELECT COUNT(*) AS row_count FROM {table}"
+                    ).fetchone()
+                result[label] = int(row["row_count"])
 
 
             for table, label in (("datasets", "latest_dataset"), ("experiments", "latest_experiment"), ("reports", "latest_report")):

@@ -73,6 +73,322 @@ class DashboardScaleFixtureTests(unittest.TestCase):
             finally:
                 writer.close()
                 store.close()
+    def test_dashboard_summary_counts_payload_tables_without_scanning(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database_path = Path(temporary_directory) / "dashboard-summary.sqlite3"
+            store = AxiomStore(str(database_path))
+            try:
+                for index in range(3):
+                    store.save_polymarket_trade(
+                        "summary-market",
+                        {
+                            "trade_id": f"summary-trade-{index}",
+                            "timestamp": (T0 + timedelta(seconds=index)).isoformat(),
+                        },
+                        trade_key=f"summary-trade-{index}",
+                    )
+                with store.transaction():
+                    store.connection.execute(
+                        "INSERT INTO bars(symbol,timestamp,payload_json,dataset_id,dataset_version,created_at) "
+                        "VALUES (?,?,?,?,?,?)",
+                        (
+                            "summary-symbol",
+                            T0.isoformat(),
+                            "{}",
+                            "summary-dataset",
+                            "v1",
+                            T0.isoformat(),
+                        ),
+                    )
+
+                statements: list[str] = []
+                store.connection.set_trace_callback(statements.append)
+                try:
+                    summary = store.dashboard_summary()
+                finally:
+                    store.connection.set_trace_callback(None)
+
+                self.assertEqual(summary["bars"], 1)
+                self.assertEqual(summary["polymarket_trades"], 3)
+                projection_queries = [
+                    statement
+                    for statement in statements
+                    if "FROM dashboard_row_counts" in statement
+                ]
+                self.assertEqual(len(projection_queries), 2)
+                self.assertTrue(
+                    all("SELECT row_count" in statement for statement in projection_queries)
+                )
+                self.assertFalse(
+                    any(
+                        "FROM bars" in statement or "FROM polymarket_trades" in statement
+                        for statement in statements
+                    )
+                )
+            finally:
+                store.connection.set_trace_callback(None)
+                store.close()
+    def test_dashboard_count_projection_handles_holes_writes_deletes_and_reopen(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database_path = Path(temporary_directory) / "dashboard-count-projection.sqlite3"
+            raw = sqlite3.connect(str(database_path))
+            raw.execute(
+                "CREATE TABLE bars("
+                "symbol TEXT NOT NULL,timestamp TEXT NOT NULL,payload_json TEXT NOT NULL,"
+                "dataset_id TEXT NOT NULL DEFAULT '',dataset_version TEXT NOT NULL DEFAULT '',"
+                "created_at TEXT NOT NULL,"
+                "PRIMARY KEY(symbol,timestamp,dataset_id,dataset_version))"
+            )
+            raw.executemany(
+                "INSERT INTO bars(rowid,symbol,timestamp,payload_json,dataset_id,dataset_version,created_at) "
+                "VALUES (?,?,?,?,?,?,?)",
+                [
+                    (1, "hole-symbol", "2026-01-01T00:00:00+00:00", "{}", "", "", T0.isoformat()),
+                    (3, "hole-symbol", "2026-01-01T00:01:00+00:00", "{}", "", "", T0.isoformat()),
+                ],
+            )
+            raw.commit()
+            raw.close()
+
+            store = AxiomStore(str(database_path))
+            try:
+                self.assertEqual(store.dashboard_summary()["bars"], 2)
+                with store.transaction():
+                    store.connection.execute(
+                        "INSERT INTO bars(symbol,timestamp,payload_json,dataset_id,dataset_version,created_at) "
+                        "VALUES (?,?,?,?,?,?)",
+                        (
+                            "hole-symbol",
+                            "2026-01-01T00:02:00+00:00",
+                            "{}",
+                            "",
+                            "",
+                            T0.isoformat(),
+                        ),
+                    )
+                self.assertEqual(store.dashboard_summary()["bars"], 3)
+                with store.transaction():
+                    store.connection.execute("DELETE FROM bars WHERE rowid=3")
+                self.assertEqual(store.dashboard_summary()["bars"], 2)
+
+                store.save_polymarket_trade(
+                    "projection-market",
+                    {"trade_id": "projection-trade", "timestamp": T0.isoformat()},
+                    trade_key="projection-trade",
+                )
+                self.assertEqual(store.dashboard_summary()["polymarket_trades"], 1)
+                with store.transaction():
+                    store.connection.execute(
+                        "DELETE FROM polymarket_trades WHERE trade_key=?",
+                        ("projection-market|projection-trade",),
+                    )
+                self.assertEqual(store.dashboard_summary()["polymarket_trades"], 0)
+            finally:
+                store.close()
+
+            reopened_connection = sqlite3.connect(str(database_path))
+            initialization_statements: list[str] = []
+            reopened_connection.set_trace_callback(initialization_statements.append)
+            reopened = AxiomStore(connection=reopened_connection)
+            try:
+                self.assertEqual(reopened.dashboard_summary()["bars"], 2)
+                self.assertEqual(reopened.dashboard_summary()["polymarket_trades"], 0)
+                self.assertFalse(
+                    any(
+                        "COUNT(*) FROM bars" in statement
+                        or "COUNT(*) FROM polymarket_trades" in statement
+                        for statement in initialization_statements
+                    )
+                )
+            finally:
+                reopened.close()
+    def test_dashboard_count_projection_repairs_missing_row_on_reopen(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database_path = Path(temporary_directory) / "dashboard-count-repair.sqlite3"
+            store = AxiomStore(str(database_path))
+            try:
+                with store.transaction():
+                    store.connection.execute(
+                        "INSERT INTO bars(symbol,timestamp,payload_json,dataset_id,dataset_version,created_at) "
+                        "VALUES (?,?,?,?,?,?)",
+                        (
+                            "repair-symbol",
+                            T0.isoformat(),
+                            "{}",
+                            "",
+                            "",
+                            T0.isoformat(),
+                        ),
+                    )
+            finally:
+                store.close()
+
+            raw = sqlite3.connect(str(database_path))
+            raw.execute(
+                "DELETE FROM dashboard_row_counts WHERE table_name='bars'"
+            )
+            raw.commit()
+            raw.close()
+
+            repaired = AxiomStore(str(database_path))
+            try:
+                self.assertEqual(repaired.dashboard_summary()["bars"], 1)
+                self.assertEqual(
+                    repaired.connection.execute(
+                        "SELECT row_count FROM dashboard_row_counts WHERE table_name='bars'"
+                    ).fetchone()[0],
+                    1,
+                )
+            finally:
+                repaired.close()
+    def test_dashboard_count_projection_repairs_outdated_version_and_trigger(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database_path = Path(temporary_directory) / "dashboard-count-version.sqlite3"
+            store = AxiomStore(str(database_path))
+            try:
+                with store.transaction():
+                    store.connection.execute(
+                        "INSERT INTO bars(symbol,timestamp,payload_json,dataset_id,dataset_version,created_at) "
+                        "VALUES (?,?,?,?,?,?)",
+                        (
+                            "version-symbol",
+                            T0.isoformat(),
+                            "{}",
+                            "",
+                            "",
+                            T0.isoformat(),
+                        ),
+                    )
+            finally:
+                store.close()
+
+            raw = sqlite3.connect(str(database_path))
+            raw.execute(
+                "UPDATE dashboard_row_counts SET row_count=99,projection_version=0"
+            )
+            raw.execute("DROP TRIGGER bars_dashboard_row_count_insert")
+            raw.commit()
+            raw.close()
+
+            repaired = AxiomStore(str(database_path))
+            try:
+                self.assertEqual(repaired.dashboard_summary()["bars"], 1)
+                self.assertEqual(
+                    tuple(
+                        repaired.connection.execute(
+                            "SELECT row_count,projection_version FROM dashboard_row_counts "
+                            "WHERE table_name='bars'"
+                        ).fetchone()
+                    ),
+                    (1, 1),
+                )
+                self.assertIsNotNone(
+                    repaired.connection.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type='trigger' "
+                        "AND name='bars_dashboard_row_count_insert'"
+                    ).fetchone()
+                )
+            finally:
+                repaired.close()
+
+
+    def test_dashboard_count_projection_handles_replace_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database_path = Path(temporary_directory) / "dashboard-count-replace.sqlite3"
+            store = AxiomStore(str(database_path))
+            try:
+                self.assertEqual(
+                    store.connection.execute("PRAGMA recursive_triggers").fetchone()[0],
+                    1,
+                )
+                with store.transaction():
+                    store.connection.execute(
+                        "INSERT INTO bars(symbol,timestamp,payload_json,dataset_id,dataset_version,created_at) "
+                        "VALUES (?,?,?,?,?,?)",
+                        (
+                            "replace-symbol",
+                            T0.isoformat(),
+                            '{"value":1}',
+                            "",
+                            "",
+                            T0.isoformat(),
+                        ),
+                    )
+                store.save_polymarket_trade(
+                    "replace-market",
+                    {"trade_id": "replace-trade", "timestamp": T0.isoformat(), "value": 1},
+                    trade_key="replace-trade",
+                )
+                with store.transaction():
+                    store.connection.execute(
+                        "INSERT OR REPLACE INTO bars("
+                        "symbol,timestamp,payload_json,dataset_id,dataset_version,created_at"
+                        ") VALUES (?,?,?,?,?,?)",
+                        (
+                            "replace-symbol",
+                            T0.isoformat(),
+                            '{"value":2}',
+                            "",
+                            "",
+                            T0.isoformat(),
+                        ),
+                    )
+                    store.connection.execute(
+                        "INSERT OR REPLACE INTO polymarket_trades("
+                        "trade_key,market_id,timestamp,payload_json,created_at"
+                        ") VALUES (?,?,?,?,?)",
+                        (
+                            "replace-market|replace-trade",
+                            "replace-market",
+                            T0.isoformat(),
+                            '{"trade_id":"replace-trade","value":2}',
+                            T0.isoformat(),
+                        ),
+                    )
+                self.assertEqual(store.dashboard_summary()["bars"], 1)
+                self.assertEqual(store.dashboard_summary()["polymarket_trades"], 1)
+            finally:
+                store.close()
+
+
+    def test_dashboard_count_projection_is_exact_after_legacy_bar_migration(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database_path = Path(temporary_directory) / "dashboard-count-migration.sqlite3"
+            raw = sqlite3.connect(str(database_path))
+            raw.execute(
+                "CREATE TABLE bars("
+                "symbol TEXT NOT NULL,timestamp TEXT NOT NULL,payload_json TEXT NOT NULL,"
+                "PRIMARY KEY(symbol,timestamp))"
+            )
+            raw.executemany(
+                "INSERT INTO bars(rowid,symbol,timestamp,payload_json) VALUES (?,?,?,?)",
+                [
+                    (1, "legacy-symbol", "2026-01-01T00:00:00+00:00", "{}"),
+                    (3, "legacy-symbol", "2026-01-01T00:01:00+00:00", "{}"),
+                ],
+            )
+            raw.commit()
+            raw.close()
+
+            store = AxiomStore(str(database_path))
+            try:
+                self.assertEqual(store.dashboard_summary()["bars"], 2)
+                self.assertEqual(
+                    store.connection.execute(
+                        "SELECT row_count FROM dashboard_row_counts WHERE table_name='bars'"
+                    ).fetchone()[0],
+                    2,
+                )
+            finally:
+                store.close()
+
+            reopened = AxiomStore(str(database_path))
+            try:
+                self.assertEqual(reopened.dashboard_summary()["bars"], 2)
+            finally:
+                reopened.close()
+
+
     def test_dataset_page_does_not_scan_unreturned_metadata_payloads(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             database_path = Path(temporary_directory) / "dashboard-dataset-page.sqlite3"
