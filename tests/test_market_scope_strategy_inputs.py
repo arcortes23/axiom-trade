@@ -74,6 +74,52 @@ class MarketScopeStrategyInputTests(unittest.TestCase):
         self.assertTrue(all(record["market_id"] in {"a", "b"} for record in backtest.equity_curve))
         self.assertTrue(all(record["reason_code"] for record in backtest.equity_curve))
 
+    def test_explicit_market_scope_with_no_rows_stays_warming_up(self) -> None:
+        evaluation = evaluate_signal_evaluation(
+            prediction_strategy("momentum", lookback=1),
+            {
+                "market_id": "target-market",
+                "observations": [snapshot("other-market", T0, 0.95)],
+            },
+        )
+        self.assertEqual(evaluation.reason_code, WARMING_UP)
+        self.assertEqual(evaluation.score, 0.0)
+
+    def test_prediction_lookback_missing_market_price_is_input_missing(self) -> None:
+        missing_price = snapshot("a", T0 + timedelta(minutes=1), 0.50)
+        missing_price["yes_mid"] = None
+        missing_price.pop("yes_ask")
+        evaluation = evaluate_signal_evaluation(
+            prediction_strategy("momentum", lookback=1),
+            {"market_id": "a", "observations": [snapshot("a", T0, 0.40), missing_price]},
+        )
+        self.assertEqual(evaluation.reason_code, MODEL_INPUT_MISSING)
+        self.assertEqual(evaluation.score, 0.0)
+
+    def test_missing_market_price_cannot_be_a_zero_edge(self) -> None:
+        missing_price = snapshot("a", T0, 0.40, model=0.40)
+        missing_price["yes_mid"] = None
+        missing_price.pop("yes_ask")
+        evaluation = evaluate_signal_evaluation(
+            prediction_strategy("probability_mispricing", threshold=0.05),
+            {"market_id": "a", "observations": [missing_price]},
+        )
+        self.assertEqual(evaluation.reason_code, MODEL_INPUT_MISSING)
+        self.assertEqual(evaluation.score, 0.0)
+
+    def test_global_model_sequence_keeps_filtered_observation_identity(self) -> None:
+        rows = [
+            snapshot("a", T0 + timedelta(minutes=1), 0.40),
+            snapshot("b", T0, 0.60),
+        ]
+        evaluation = evaluate_signal_evaluation(
+            prediction_strategy("probability_mispricing", threshold=0.05),
+            {"market_id": "b", "observations": rows, "probabilities": [0.10, 0.80]},
+        )
+        self.assertEqual(evaluation.reason_code, SIGNAL_PRODUCED)
+        self.assertEqual(evaluation.evidence["model"]["probability"], 0.80)
+        self.assertGreater(evaluation.score, 0.0)
+
     def test_declared_lookbacks_are_enforced(self) -> None:
         rows = [snapshot("a", T0, 0.40)]
         prediction = evaluate_signal_evaluation(prediction_strategy("momentum", lookback=2), {"observations": rows})

@@ -1724,6 +1724,31 @@ class TestRollingPortfolio(unittest.TestCase):
         self.assertNotIn("research_trial_id", rows[0])
         self.assertFalse(rows[0]["_rolling_lineage_proven"])
         self.assertNotIn("_rolling_accounting", rows[0])
+    def test_historical_preflight_checks_length_before_sqlite_json(self) -> None:
+        with AxiomStore(":memory:") as store:
+            store.connection.execute(
+                "INSERT INTO datasets(dataset_id,version,payload_json,metadata_json,quality,created_at) "
+                "VALUES (?,?,?,?,?,?)",
+                ("oversized", "v1", "[]", "{}", "HIGH", NOW.isoformat()),
+            )
+            store.connection.commit()
+            json_calls: list[object] = []
+
+            def forbidden_json(value: object) -> int:
+                json_calls.append(value)
+                raise AssertionError("JSON1 must not inspect an oversized payload")
+
+            store.connection.create_function("json_valid", 1, forbidden_json)
+            processor = AutonomousResearchProcessor.__new__(AutonomousResearchProcessor)
+            processor.store = store
+            with patch(
+                "axiom.autonomous._MAX_ROLLING_DATASET_PAYLOAD_BYTES",
+                1,
+            ), self.assertRaisesRegex(
+                ValueError, "HISTORICAL_DATASET_PAYLOAD_TOO_LARGE"
+            ):
+                processor._load_rolling_historical_dataset("oversized", "v1")
+            self.assertEqual(json_calls, [])
 
     def test_paper_loader_requires_exact_registry_lineage_for_resolved_bet(self) -> None:
         strategy_hash = "sha256:strategy-alpha"
@@ -1886,6 +1911,44 @@ class TestRollingPortfolio(unittest.TestCase):
         )
         self.assertIsNone(processor._rolling_accounting_projection(proxy, expected))
         self.assertEqual(proxy["_rolling_accounting_rejection"], "PRICE_PROXY_ACCOUNTING_UNAVAILABLE")
+    def test_accounting_rejects_negative_nonnegative_metrics_as_row_blockers(self) -> None:
+        expected = {
+            "strategy_hash": "sha256:strategy-alpha",
+            "strategy_version_id": "strategy-version-alpha",
+            "research_trial_id": "research-trial-alpha",
+            "candidate_id": "candidate-alpha",
+        }
+        accounting = {
+            "allocated_capital": "10",
+            "net_return": "-1",
+            "realized_pnl": "-1",
+            "unrealized_pnl": "0",
+            "fees": "0",
+            "costs": "0",
+            "drawdown": "0",
+            "completed_outcomes": 1,
+            "reliability": "1",
+        }
+        processor = AutonomousResearchProcessor.__new__(AutonomousResearchProcessor)
+        for metric in ("allocated_capital", "fees", "costs"):
+            with self.subTest(metric=metric):
+                row = _rolling_inject_source_binding(
+                    {
+                        "timestamp": NOW.isoformat(),
+                        "available_from": (NOW - timedelta(days=7)).isoformat(),
+                        "available_through": NOW.isoformat(),
+                        "accounting": {**accounting, metric: "-1"},
+                    },
+                    expected,
+                )
+                self.assertIsNone(
+                    processor._rolling_accounting_projection(row, expected)
+                )
+                self.assertEqual(
+                    row["_rolling_accounting_rejection"],
+                    "ACCOUNTING_METRIC_NEGATIVE_IMPOSSIBLE",
+                )
+                self.assertEqual(row["_rolling_accounting_metric"], metric)
 
     def test_paper_resolved_bet_projection_requires_exact_experiment_binding(self) -> None:
         expected = {

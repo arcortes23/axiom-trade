@@ -239,6 +239,14 @@ def _quality(snapshots: Sequence[Any]) -> SimulationQuality:
         return SimulationQuality.LOW
     return SimulationQuality.HIGH if liquidity * 2 >= len(snapshots) else SimulationQuality.MEDIUM
 
+def _reason_counts(curve: Sequence[Mapping[str, Any]]) -> dict[str, int]:
+    """Count every canonical curve observation reason deterministically."""
+    counts: dict[str, int] = {}
+    for observation in curve:
+        reason_code = str(observation.get("reason_code", ""))
+        counts[reason_code] = counts.get(reason_code, 0) + 1
+    return dict(sorted(counts.items()))
+
 
 def _outcome(value: Any) -> str:
     if isinstance(value, SettlementState):
@@ -292,10 +300,15 @@ def _coerce_book(
         return tuple(sorted(result, key=lambda level: level.price, reverse=reverse))
 
     bids, asks = levels(value.get("bids"), reverse=True), levels(value.get("asks"), reverse=False)
-    if not bids and not asks:
+    # A strict replay retains an observed empty book as an execution gap.  A
+    # completely absent/invalid book remains missing and is rejected by the
+    # paired-book validator.
+    if not bids and not asks and not require_timestamp:
         return None
     raw_timestamp = parse_timestamp(value.get("timestamp"))
     if require_timestamp and raw_timestamp is None:
+        return None
+    if not bids and not asks and not ("bids" in value or "asks" in value):
         return None
     try:
         return OrderBookSnapshot(
@@ -313,6 +326,23 @@ def _raw_book(row: Any, outcome: str) -> Any:
     if outcome == "yes":
         return _value(row, "order_book", _value(row, "yes_order_book"))
     return _value(row, "no_order_book")
+
+def _strict_paired_books(
+    row: Any,
+    timestamp: datetime,
+) -> tuple[OrderBookSnapshot, OrderBookSnapshot] | None:
+    """Return both timestamped outcome books, including empty-depth books."""
+    yes_book = _coerce_book(
+        _raw_book(row, "yes"),
+        timestamp,
+        require_timestamp=True,
+    )
+    no_book = _coerce_book(
+        _raw_book(row, "no"),
+        timestamp,
+        require_timestamp=True,
+    )
+    return (yes_book, no_book) if yes_book is not None and no_book is not None else None
 
 
 def _proxy_quote(row: Any, outcome: str, side: Side) -> float | None:
@@ -356,6 +386,8 @@ def _validate_metadata_timestamps(row: Any, timestamp: datetime, market_id: str)
             raise ValueError(
                 f"prediction research {name} is future-dated for {market_id}"
             )
+
+
 def _validate_replay_rows(rows: Sequence[Any]) -> None:
     if not rows:
         return
@@ -373,16 +405,53 @@ def _validate_replay_rows(rows: Sequence[Any]) -> None:
         if prior is not None and timestamp < prior:
             raise ValueError(f"recorded replay chronology is not monotonic for {market_id}")
         seen_market_timestamps[market_id] = timestamp
-        yes_raw = _raw_book(row, "yes")
-        no_raw = _raw_book(row, "no")
-        yes_book = _coerce_book(yes_raw, timestamp, require_timestamp=True)
-        no_book = _coerce_book(no_raw, timestamp, require_timestamp=True)
-        terminal = _outcome(_value(row, "settlement", "open")) in {"resolved_yes", "resolved_no", "void"}
-        if not terminal and (yes_book is None or no_book is None):
-            raise ValueError(f"recorded replay row {index} requires observed YES and NO order books")
-        for name, book in (("yes", yes_book), ("no", no_book)):
-            if book is not None and ensure_utc(book.timestamp) > timestamp:
-                raise ValueError(f"recorded replay {name} book is future-dated for {market_id}")
+        terminal_values = {
+            "resolved_yes",
+            "resolved_no",
+            "void",
+            "resolved",
+            "closed",
+            "final",
+            "completed",
+            "settled",
+            "expired",
+            "cancelled",
+            "canceled",
+        }
+        terminal = any(
+            _outcome(_value(row, name, "")) in terminal_values
+            for name in ("settlement", "resolution", "status")
+        ) or any(
+            _value(row, name, False) is True
+            for name in ("closed", "terminal", "is_terminal")
+        )
+        paired_books = _strict_paired_books(row, timestamp)
+        # Nonterminal replay is a paired-book mode: both timestamped outcome
+        # books must be present, while either side may have empty depth.
+        # Terminal settlement may legitimately arrive without books; validate
+        # any individually supplied terminal book when it is timestamped.
+        if paired_books is None and not terminal:
+            raise ValueError(
+                f"REPLAY_BOOK_REQUIRED: recorded replay row {index} "
+                "requires timestamped YES and NO order books"
+            )
+        if paired_books is not None:
+            books_to_validate: list[tuple[str, OrderBookSnapshot]] = list(
+                zip(("yes", "no"), paired_books)
+            )
+        else:
+            books_to_validate = []
+            for name in ("yes", "no"):
+                book = _coerce_book(
+                    _raw_book(row, name),
+                    timestamp,
+                    require_timestamp=True,
+                )
+                if book is not None:
+                    books_to_validate.append((name, book))
+        for name, book in books_to_validate:
+            if ensure_utc(book.timestamp) > timestamp:
+                raise ValueError(f"prediction research {name} book is future-dated for {market_id}")
         source_type = str(_value(row, "source_type", "")).strip().upper()
         if source_type == "PAPER_FORWARD":
             raise ValueError("retrospective recorded replay cannot use PAPER_FORWARD rows")
@@ -609,7 +678,7 @@ class PredictionMarketBacktester:
         labels: list[SimulationQuality] = []
         history_by_market: dict[str, list[Any]] = {}
         proxy_pending: dict[str, list[dict[str, Any]]] = {}
-        proxy_fills: list[dict[str, Any]] = []
+        proxy_fills_by_market: dict[str, list[dict[str, Any]]] = {}
         market_observation_index: dict[str, int] = {}
         evaluator_invoked = False
         evaluator_completed = False
@@ -891,15 +960,15 @@ class PredictionMarketBacktester:
                         remaining_pending.append(pending)
                         continue
                     proxy_executed = True
-                    proxy_fills.append(
+                    proxy_fills_by_market.setdefault(market_id, []).append(
                         {
+                            "market_id": market_id,
                             "timestamp": timestamp,
                             "decision_timestamp": pending["decision_timestamp"],
                             "execution_kind": pending["kind"],
                             "raw_execution_price": quote,
                             "assumed_execution_price": modeled_price,
                             "fee_bps": self.fee_bps,
-                            "slippage_bps": self.slippage_bps,
                             "assumption_version": PRICE_PROXY_ASSUMPTIONS_VERSION,
                             "quote_gap_observations": pending["gap_observations"],
                         }
@@ -1223,7 +1292,7 @@ class PredictionMarketBacktester:
                         }
                         if mode is PredictionResearchMode.RECORDED_BOOK_REPLAY
                         else {
-                            "raw_execution": tuple(proxy_fills[-8:]),
+                            "raw_execution": tuple(proxy_fills_by_market.get(market_id, ())[-8:]),
                             "assumed_execution": True,
                         }
                         if mode is PredictionResearchMode.PRICE_PROXY_RESEARCH
@@ -1284,6 +1353,9 @@ class PredictionMarketBacktester:
                 "evaluator_prerequisite": None,
             },
         )
+        evaluation_metrics = metrics.get("evaluation")
+        if isinstance(evaluation_metrics, dict):
+            evaluation_metrics["reason_counts"] = _reason_counts(curve)
         if mode is PredictionResearchMode.PRICE_PROXY_RESEARCH:
             resolved_quality = ResearchQuality.PRICE_PROXY
         elif mode is PredictionResearchMode.RECORDED_BOOK_REPLAY:

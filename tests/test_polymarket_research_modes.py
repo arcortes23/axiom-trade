@@ -104,7 +104,7 @@ class PolymarketResearchModeTests(unittest.TestCase):
         self.assertTrue(all(row["research_mode"] == "RECORDED_BOOK_REPLAY" for row in result.equity_curve))
         self.assertTrue(result.fills)
         self.assertTrue(result.equity_curve[0]["execution_evidence"]["raw_book_observed"])
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(ValueError, "REPLAY_BOOK_REQUIRED"):
             PredictionMarketBacktester().run(
                 [_row(0, 0.4), _row(1, 0.6)],
                 _strategy(),
@@ -145,6 +145,22 @@ class PolymarketResearchModeTests(unittest.TestCase):
             self.assertEqual(fills[1].metadata["assumption_version"], "price-proxy-v1")
             self.assertEqual(fills[0].metadata["holding_observations"], 1)
             self.assertEqual(fills[1].metadata["holding_observations"], 1)
+
+        for observation in result.equity_curve:
+            raw_events = observation["execution_evidence"]["raw_execution"]
+            self.assertTrue(
+                all(event["market_id"] == observation["market_id"] for event in raw_events)
+            )
+        market_b_row = next(
+            row
+            for row in result.equity_curve
+            if row["market_id"] == "market-b"
+            and row["execution_evidence"]["raw_execution"]
+        )
+        self.assertEqual(
+            {event["market_id"] for event in market_b_row["execution_evidence"]["raw_execution"]},
+            {"market-b"},
+        )
 
     def test_proxy_holds_pending_execution_across_missing_future_quote(self) -> None:
         missing = _row(2, 0.62)

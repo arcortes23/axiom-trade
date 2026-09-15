@@ -71,6 +71,9 @@ _CANARY_DECIMAL_LIMITS = {
     "cumulative_buy_cap_usd",
 }
 _MAX_EVIDENCE_SCAN_ROWS = 100_000
+_MAX_DATASET_PAYLOAD_BYTES = 16 * 1024 * 1024
+_MAX_DATASET_MANIFEST_ROWS = 25_000
+_MAX_DATASET_MISSING_RANGES = 25_000
 _DASHBOARD_COUNT_PROJECTION_VERSION = 1
 _QUEUE_RELEASE_BATCH = 256
 _QUEUE_LINEAGE_LIMIT = 256
@@ -5443,7 +5446,9 @@ class AxiomStore:
             raise TypeError("save_dataset requires records and a version")
         dataset_id, version = str(dataset_id), str(version)
         payload = _dump(records)
+        _preflight_dataset_payload(payload, name="dataset")
         metadata_json = _dump(dict(metadata or {}))
+        _preflight_dataset_payload(metadata_json, name="dataset metadata")
         quality_value = _enum_value(quality)
         def operation() -> None:
             with self._write_context():
@@ -5474,6 +5479,7 @@ class AxiomStore:
                     (str(dataset_id), str(version)),
                 ).fetchone()
         if row is not None:
+            _preflight_dataset_payload(row["payload_json"], name="dataset")
             return _load(row["payload_json"])
         catalog = self.load_dataset_catalog(str(dataset_id), version)
         return self._catalog_records(catalog) if catalog is not None else None
@@ -5492,6 +5498,8 @@ class AxiomStore:
                     (str(dataset_id), str(version)),
                 ).fetchone()
         if row is not None:
+            _preflight_dataset_payload(row["payload_json"], name="dataset")
+            _preflight_dataset_payload(row["metadata_json"], name="dataset metadata")
             return {
                 "dataset_id": row["dataset_id"],
                 "version": row["version"],
@@ -5524,6 +5532,8 @@ class AxiomStore:
             ).fetchall()
         if rows:
             row = rows[0]
+            _preflight_dataset_payload(row["payload_json"], name="dataset")
+            _preflight_dataset_payload(row["metadata_json"], name="dataset metadata")
             return {
                 "dataset_id": row["dataset_id"],
                 "version": row["version"],
@@ -5599,13 +5609,36 @@ class AxiomStore:
             raise ValueError("dataset source_type must be HISTORICAL or FORWARD_COLLECTED")
         if not snapshot_value:
             raise ValueError("dataset catalog snapshot_id is required")
-        if isinstance(row_count, bool) or not isinstance(row_count, int) or row_count < 0:
+        if (
+            isinstance(row_count, bool)
+            or not isinstance(row_count, int)
+            or row_count < 0
+        ):
             raise ValueError("dataset catalog row_count must be a non-negative integer")
         completeness_value = float(completeness)
         if not math.isfinite(completeness_value) or not 0.0 <= completeness_value <= 1.0:
             raise ValueError("dataset catalog completeness must be in [0, 1]")
-        metadata_json = _dump(dict(metadata or {}))
-        missing_json = _dump(list(missing_ranges))
+        metadata_value = dict(metadata or {})
+        for key in ("snapshot_manifest", "manifest"):
+            candidate = metadata_value.get(key)
+            if (
+                isinstance(candidate, Sequence)
+                and not isinstance(candidate, (str, bytes))
+                and len(candidate) > _MAX_DATASET_MANIFEST_ROWS
+            ):
+                raise ValueError(
+                    f"dataset catalog manifest exceeds {_MAX_DATASET_MANIFEST_ROWS} entries"
+                )
+        missing_values = list(islice(missing_ranges, _MAX_DATASET_MISSING_RANGES + 1))
+        if len(missing_values) > _MAX_DATASET_MISSING_RANGES:
+            raise ValueError(
+                "dataset catalog missing ranges exceed "
+                f"{_MAX_DATASET_MISSING_RANGES} entries"
+            )
+        metadata_json = _dump(metadata_value)
+        missing_json = _dump(missing_values)
+        _preflight_dataset_payload(metadata_json, name="dataset catalog metadata")
+        _preflight_dataset_payload(missing_json, name="dataset catalog missing ranges")
         created_iso = _iso(created_at or utc_now())
         updated_iso = _iso(updated_at or created_at or utc_now())
         values = (
@@ -7633,6 +7666,54 @@ class AxiomStore:
             }
             for row in rows
         ]
+    def load_polymarket_snapshots_by_ids(
+        self,
+        snapshot_ids: Sequence[str],
+        *,
+        source_type: str | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        """Load an exact bounded snapshot projection keyed by snapshot ID."""
+        identifiers = tuple(
+            dict.fromkeys(str(item).strip() for item in snapshot_ids if str(item).strip())
+        )
+        if len(identifiers) > _MAX_DATASET_MANIFEST_ROWS:
+            raise ValueError(
+                f"snapshot id batch exceeds {_MAX_DATASET_MANIFEST_ROWS} entries"
+            )
+        if not identifiers:
+            return {}
+        source_value = (
+            _polymarket_source_type(source_type) if source_type is not None else None
+        )
+        result: dict[str, dict[str, Any]] = {}
+        for offset in range(0, len(identifiers), 256):
+            batch = identifiers[offset : offset + 256]
+            placeholders = ",".join("?" for _ in batch)
+            query = (
+                "SELECT snapshot_id,market_id,source_timestamp,observed_at,"
+                "payload_json,quality,source_type "
+                "FROM polymarket_snapshots "
+                f"WHERE snapshot_id IN ({placeholders})"
+            )
+            values: list[Any] = list(batch)
+            if source_value is not None:
+                query += " AND source_type=?"
+                values.append(source_value)
+            with self._lock:
+                rows = self._conn.execute(query, values).fetchall()
+            for row in rows:
+                _preflight_dataset_payload(row["payload_json"], name="snapshot")
+                result[str(row["snapshot_id"])] = {
+                    "snapshot_id": row["snapshot_id"],
+                    "market_id": row["market_id"],
+                    "source_timestamp": _parse_datetime(row["source_timestamp"]),
+                    "observed_at": _parse_datetime(row["observed_at"]),
+                    "payload": _load(row["payload_json"]),
+                    "quality": row["quality"],
+                    "source_type": str(row["source_type"]).upper(),
+                }
+        return result
+
     def load_latest_polymarket_snapshots(
         self,
         market_ids: Sequence[str] | None = None,
@@ -9414,9 +9495,12 @@ class AxiomStore:
             "source_class",
             name="source_class",
         )
-        if source_class.upper() not in _ROLLING_EVIDENCE_SOURCE_CLASSES:
-            raise ValueError("unsupported rolling evidence source_class")
-        source_class = source_class.upper()
+        requested_source_class = _rolling_evidence_requested_source_class(
+            data.get("requested_source_class", source_class)
+        )
+        source_class = _rolling_evidence_persisted_source_class(
+            requested_source_class
+        )
         assumption_fields = (
             ("paper_sizing_assumptions", ("paper_sizing",), "paper_sizing"),
             (
@@ -9575,6 +9659,16 @@ class AxiomStore:
                 monetary_payload.append(None)
                 monetary.append("0")
                 continue
+            if (
+                field_name in {"fees", "costs"}
+                and raw is not None
+                and not (
+                    isinstance(raw, str)
+                    and raw.strip().lower()
+                    in {"none", "null", "unavailable", "unknown", "n/a"}
+                )
+            ):
+                _rolling_decimal(raw, name=field_name, nonnegative=True)
             normalized = (
                 _rolling_nullable_decimal_text(raw, name=field_name)
                 if v2_provenance
@@ -9644,6 +9738,7 @@ class AxiomStore:
                 "actual_coverage_seconds": actual_coverage_seconds,
                 "observation_completeness": observation_completeness,
                 "source_class": source_class,
+                "requested_source_class": requested_source_class,
                 "paper_sizing_assumptions": assumptions[0],
                 "paper_fee_assumptions": assumptions[1],
                 "paper_slippage_assumptions": assumptions[2],
@@ -9739,25 +9834,35 @@ class AxiomStore:
                     raise ValueError("supersedes_evidence_id cannot reference itself")
                 predecessor = self._conn.execute(
                     "SELECT strategy_version_id,candidate_id,research_trial_id,"
-                    "requested_days,source_class "
+                    "requested_days,source_class,payload_json "
                     "FROM strategy_evidence_windows WHERE evidence_window_id=?",
                     (supersedes_evidence_id,),
                 ).fetchone()
                 if predecessor is None:
                     raise ValueError("supersedes_evidence_id predecessor does not exist")
+                predecessor_source = predecessor["source_class"]
+                try:
+                    predecessor_payload = _load(predecessor["payload_json"])
+                except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                    raise ValueError("supersedes_evidence_id predecessor is invalid") from exc
+                if isinstance(predecessor_payload, Mapping):
+                    predecessor_source = predecessor_payload.get(
+                        "requested_source_class",
+                        predecessor_source,
+                    )
                 predecessor_identity = (
                     predecessor["strategy_version_id"],
                     predecessor["candidate_id"],
                     predecessor["research_trial_id"],
                     int(predecessor["requested_days"]),
-                    str(predecessor["source_class"]).strip().upper(),
+                    _rolling_evidence_requested_source_class(predecessor_source),
                 )
                 current_identity = (
                     strategy_version_id,
                     candidate_id,
                     research_trial_id,
                     requested_days_value,
-                    source_class,
+                    requested_source_class,
                 )
                 if predecessor_identity != current_identity:
                     raise ValueError("supersedes_evidence_id predecessor identity mismatch")
@@ -17386,6 +17491,7 @@ def _dataset_catalog_dashboard_record(row: sqlite3.Row) -> dict[str, Any]:
 
 
 def _dataset_catalog_record(row: sqlite3.Row) -> dict[str, Any]:
+    _preflight_dataset_catalog_payload(row)
     metadata = _load(row["metadata_json"])
     missing_ranges = _load(row["missing_ranges_json"])
     return {
@@ -17442,6 +17548,27 @@ def _pagination_args(page: int, page_size: int) -> tuple[int, int]:
     if isinstance(page_size, bool) or not isinstance(page_size, int) or page_size not in _PAGINATION_PAGE_SIZES:
         raise ValueError(f"page_size must be one of {_PAGINATION_PAGE_SIZES}")
     return int(page), int(page_size)
+def _rolling_evidence_requested_source_class(value: Any) -> str:
+    normalized = str(_enum_value(value) or value or "").strip().upper()
+    normalized = normalized.replace("-", "_").replace(" ", "_")
+    aliases = {
+        "HISTORICAL": "HISTORICAL",
+        "PRICE_PROXY": "HISTORICAL",
+        "PAPER": "PAPER",
+        "LIVE": "LIVE",
+        "FORWARD_COLLECTED": "LIVE",
+        "REPLAY": "REPLAY",
+        "REPLAY_SIMULATED": "REPLAY",
+        "ORDER_BOOK_SIMULATED": "REPLAY",
+    }
+    source = aliases.get(normalized)
+    if source is None:
+        raise ValueError(f"unsupported rolling evidence source_class: {value}")
+    return source
+
+
+def _rolling_evidence_persisted_source_class(value: str) -> str:
+    return "FORWARD_COLLECTED" if value in {"REPLAY", "LIVE"} else value
 
 
 def _pagination_shape(requested_page: int, page_size: int, total: int) -> tuple[int, int]:
@@ -17497,6 +17624,163 @@ def _jsonable(value: Any) -> Any:
     if isinstance(value, set):
         return sorted(_jsonable(item) for item in value)
     return value
+
+
+def _json_array_count(value: Any, *, limit: int) -> int | None:
+    """Count a top-level JSON array without materializing its elements."""
+    if not isinstance(value, str) or isinstance(limit, bool) or limit < 0:
+        return None
+    text = value
+    index = 0
+    while index < len(text) and text[index].isspace():
+        index += 1
+    if index >= len(text) or text[index] != "[":
+        return None
+    stack = ["["]
+    items = 0
+    saw_value = False
+    index += 1
+    while index < len(text):
+        char = text[index]
+        if char.isspace():
+            index += 1
+            continue
+        if char == '"':
+            if len(stack) == 1:
+                saw_value = True
+            index += 1
+            escaped = False
+            while index < len(text):
+                char = text[index]
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    break
+                index += 1
+            if index >= len(text) or text[index] != '"':
+                return None
+            index += 1
+            continue
+        if char in "[{":
+            if len(stack) == 1:
+                saw_value = True
+            stack.append(char)
+            index += 1
+            continue
+        if char in "]}":
+            if not stack:
+                return None
+            opener = stack[-1]
+            if (char == "]" and opener != "[") or (char == "}" and opener != "{"):
+                return None
+            if len(stack) == 1:
+                if not saw_value:
+                    return 0 if items == 0 else None
+                return items + 1
+            stack.pop()
+            index += 1
+            continue
+        if char == "," and len(stack) == 1:
+            if not saw_value:
+                return None
+            items += 1
+            if items > limit:
+                return items
+            saw_value = False
+            index += 1
+            continue
+        if len(stack) == 1:
+            saw_value = True
+        index += 1
+    return None
+
+
+def _json_array_count_for_key(
+    value: Any,
+    keys: Sequence[str],
+    *,
+    limit: int,
+) -> int | None:
+    if not isinstance(value, str):
+        return None
+    key_markers = {f'"{key}"' for key in keys}
+    index = 0
+    best_count: int | None = None
+    while index < len(value):
+        if value[index] != '"':
+            index += 1
+            continue
+        start = index
+        index += 1
+        escaped = False
+        while index < len(value):
+            char = value[index]
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                break
+            index += 1
+        if index >= len(value) or value[index] != '"':
+            return best_count
+        marker = value[start : index + 1]
+        index += 1
+        cursor = index
+        while cursor < len(value) and value[cursor].isspace():
+            cursor += 1
+        if marker in key_markers and cursor < len(value) and value[cursor] == ":":
+            cursor += 1
+            while cursor < len(value) and value[cursor].isspace():
+                cursor += 1
+            count = _json_array_count(value[cursor:], limit=limit)
+            if count is not None:
+                if count > limit:
+                    return count
+                best_count = max(best_count or 0, count)
+        continue
+    return best_count
+
+
+def _preflight_dataset_payload(value: Any, *, name: str) -> None:
+    if not isinstance(value, str):
+        raise ValueError(f"{name} payload is invalid")
+    if len(value.encode("utf-8")) > _MAX_DATASET_PAYLOAD_BYTES:
+        raise ValueError(f"{name} payload exceeds {_MAX_DATASET_PAYLOAD_BYTES} bytes")
+
+
+def _preflight_dataset_catalog_payload(row: sqlite3.Row) -> None:
+    metadata_json = row["metadata_json"]
+    missing_json = row["missing_ranges_json"]
+    _preflight_dataset_payload(metadata_json, name="dataset catalog metadata")
+    _preflight_dataset_payload(missing_json, name="dataset catalog missing ranges")
+    manifest_count = _json_array_count_for_key(
+        metadata_json,
+        ("snapshot_manifest", "manifest"),
+        limit=_MAX_DATASET_MANIFEST_ROWS,
+    )
+    if (
+        manifest_count is not None
+        and manifest_count > _MAX_DATASET_MANIFEST_ROWS
+    ):
+        raise ValueError(
+            f"dataset catalog manifest exceeds {_MAX_DATASET_MANIFEST_ROWS} entries"
+        )
+    missing_count = _json_array_count(
+        missing_json,
+        limit=_MAX_DATASET_MISSING_RANGES,
+    )
+    if (
+        missing_count is not None
+        and missing_count > _MAX_DATASET_MISSING_RANGES
+    ):
+        raise ValueError(
+            "dataset catalog missing ranges exceed "
+            f"{_MAX_DATASET_MISSING_RANGES} entries"
+        )
+
 
 
 def _dump(value: Any) -> str:

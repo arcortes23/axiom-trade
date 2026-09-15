@@ -37,7 +37,13 @@ from .mutations import DeterministicMutationEngine, ExperimentBudget
 from .research_bus import DurableResearchBus, ResearchBusPermissionError, ResearchQueueItem, ResearchQueueStatus
 from .robustness import bootstrap_confidence_interval, minimum_sample_check, neighboring_parameter_stability
 
-from .storage import AxiomStore, _PAPER_POSITION_PROJECTION_LIMIT
+from .storage import (
+    AxiomStore,
+    _PAPER_POSITION_PROJECTION_LIMIT,
+    _dataset_catalog_record,
+    _json_array_count,
+    _json_array_count_for_key,
+)
 from .data_quality import evaluate_prediction_data_quality, persisted_quality_fields
 from .strategy import StrategyDefinition, load_strategy
 from .rolling_portfolio import (
@@ -174,8 +180,7 @@ _ROLLING_IMMUTABLE_SOURCE_BLOCKERS = frozenset(
         "HISTORICAL_DATASET_ROW_COUNT_TOO_LARGE",
         "HISTORICAL_DATASET_ROW_COUNT_MISMATCH",
         "HISTORICAL_DATASET_ROW_COUNT_UNAVAILABLE",
-        "REPLAY_SOURCE_BINDING_REQUIRED",
-        "REPLAY_DATASET_BINDING_REQUIRED",
+        "REPLAY_DATASET_UNAVAILABLE",
         "LIVE_SOURCE_BINDING_REQUIRED",
         "SOURCE_LOADER_UNAVAILABLE",
         "SOURCE_LOADER_UNSUPPORTED",
@@ -2082,10 +2087,264 @@ def _rolling_source_name(value: Any) -> str:
 
 _ROLLING_PERSISTED_SOURCE_CLASSES: Mapping[str, str] = {
     "HISTORICAL": "HISTORICAL",
-    "REPLAY": "HISTORICAL",
+    # Storage's persisted source taxonomy uses FORWARD_COLLECTED for the
+    # immutable recorded-book catalog; REPLAY remains the requested class in
+    # operator/work-item state and input manifests.
+    "REPLAY": "FORWARD_COLLECTED",
     "PAPER": "PAPER",
     "LIVE": "FORWARD_COLLECTED",
 }
+_ROLLING_REPLAY_DATASET_ID = "Polymarket-recorded-book-replay"
+_ROLLING_REPLAY_MAX_CATALOGS = 256
+_ROLLING_INPUT_MANIFEST_MARKETS = 128
+_ROLLING_INPUT_MANIFEST_ROWS = 25_000
+
+
+def _rolling_book_mapping(row: Mapping[str, Any], side: str) -> Mapping[str, Any] | None:
+    """Return one side of a recorded book without interpreting depth levels."""
+    view = _rolling_snapshot_view(row)
+    names = (
+        ("yes_order_book", "order_book", "book_yes")
+        if side == "yes"
+        else ("no_order_book", "book_no")
+    )
+    for name in names:
+        value = view.get(name)
+        if isinstance(value, Mapping):
+            if name == "order_book":
+                for nested_name in (
+                    side,
+                    side.upper(),
+                    f"{side}_order_book",
+                    f"{side.upper()}_ORDER_BOOK",
+                ):
+                    nested = value.get(nested_name)
+                    if isinstance(nested, Mapping):
+                        return nested
+                if side == "yes":
+                    return value
+            else:
+                return value
+    books = view.get("order_books", view.get("books"))
+    if isinstance(books, Mapping):
+        for name in (side, side.upper(), f"{side}_order_book"):
+            value = books.get(name)
+            if isinstance(value, Mapping):
+                return value
+    return None
+
+
+def _rolling_book_timestamp(book: Mapping[str, Any]) -> datetime | None:
+    for name in ("source_timestamp", "timestamp", "provider_timestamp", "observed_at"):
+        if name in book:
+            return _rolling_timestamp(book.get(name))
+    return None
+
+
+def _rolling_has_paired_timestamped_books(row: Mapping[str, Any]) -> bool:
+    """Require timestamped YES and NO mappings, but not executable levels."""
+    yes = _rolling_book_mapping(row, "yes")
+    no = _rolling_book_mapping(row, "no")
+    return (
+        yes is not None
+        and no is not None
+        and _rolling_book_timestamp(yes) is not None
+        and _rolling_book_timestamp(no) is not None
+    )
+
+
+def _rolling_replay_row_terminal(row: Mapping[str, Any]) -> bool:
+    view = _rolling_snapshot_view(row)
+    terminal_values = {
+        "RESOLVED_YES",
+        "RESOLVED_NO",
+        "VOID",
+        "RESOLVED",
+        "CLOSED",
+        "FINAL",
+        "COMPLETED",
+        "SETTLED",
+        "EXPIRED",
+        "CANCELLED",
+        "CANCELED",
+    }
+    for name in ("settlement", "resolution", "status"):
+        value = str(view.get(name, "")).strip().upper().replace("-", "_")
+        if value in terminal_values:
+            return True
+    return any(view.get(name) is True for name in ("closed", "terminal", "is_terminal"))
+
+
+def _rolling_publisher_source_record_hash(record: Mapping[str, Any]) -> str:
+    payload = record.get("payload")
+    if not isinstance(payload, Mapping):
+        raise ValueError("source snapshot payload is missing")
+    snapshot_id = str(record.get("snapshot_id", "")).strip()
+    market_id = str(record.get("market_id", "")).strip()
+    source_timestamp = record.get("source_timestamp")
+    observed_at = record.get("observed_at")
+    if (
+        not snapshot_id
+        or not market_id
+        or _rolling_timestamp(source_timestamp) is None
+        or _rolling_timestamp(observed_at) is None
+    ):
+        raise ValueError("source snapshot identity is incomplete")
+    return _rolling_hash(
+        {
+            "snapshot_id": snapshot_id,
+            "market_id": market_id,
+            "source_timestamp": source_timestamp,
+            "observed_at": observed_at,
+            "payload": payload,
+        }
+    )
+
+def _rolling_market_scope_ids(binding: Mapping[str, Any]) -> set[str]:
+    scope = binding.get("market_scope", binding.get("scope"))
+    if isinstance(scope, Mapping):
+        values = scope.get("market_ids", scope.get("markets", ()))
+    else:
+        values = binding.get("market_ids", binding.get("market_id", ()))
+    if isinstance(values, str):
+        values = (values,)
+    return {
+        str(value).strip()
+        for value in (values or ())
+        if str(value).strip()
+    }
+
+
+def _rolling_input_manifest(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    source: str,
+    dataset_id: str | None = None,
+    dataset_version: str | None = None,
+) -> dict[str, Any]:
+    """Build bounded deterministic coverage/gap evidence for selected rows."""
+    market_rows: dict[str, list[Mapping[str, Any]]] = {}
+    exclusions: dict[str, int] = {}
+    for row in rows[:_ROLLING_INPUT_MANIFEST_ROWS]:
+        if not isinstance(row, Mapping):
+            exclusions["NON_MAPPING"] = exclusions.get("NON_MAPPING", 0) + 1
+            continue
+        view = _rolling_snapshot_view(row)
+        market_id = str(view.get("market_id", "")).strip() or "<missing>"
+        market_rows.setdefault(market_id, []).append(row)
+        reason = row.get("_rolling_source_rejection") or row.get(
+            "_rolling_accounting_rejection"
+        )
+        if reason:
+            key = str(reason)
+            exclusions[key] = exclusions.get(key, 0) + 1
+    paths: list[dict[str, Any]] = []
+    total_gaps = 0
+    max_gap = 0
+    for market_id in sorted(market_rows)[:_ROLLING_INPUT_MANIFEST_MARKETS]:
+        values = market_rows[market_id]
+        stamps = sorted(
+            stamp
+            for stamp in (
+                _rolling_row_time(_rolling_snapshot_view(row)) for row in values
+            )
+            if stamp is not None
+        )
+        market_gaps = 0
+        for row in values:
+            if (
+                source == "REPLAY"
+                and not _rolling_replay_row_terminal(row)
+                and not _rolling_has_paired_timestamped_books(row)
+            ):
+                market_gaps += 1
+        gaps = [
+            int((right - left).total_seconds())
+            for left, right in zip(stamps, stamps[1:])
+            if right >= left
+        ]
+        path_max_gap = max(gaps, default=0)
+        total_gaps += market_gaps
+        max_gap = max(max_gap, path_max_gap)
+        paths.append(
+            {
+                "market_id": market_id,
+                "first_timestamp": stamps[0].isoformat() if stamps else None,
+                "last_timestamp": stamps[-1].isoformat() if stamps else None,
+                "rows": len(values),
+                "gap_count": market_gaps,
+                "max_gap_seconds": path_max_gap,
+            }
+        )
+    valid_count = sum(
+        1
+        for row in rows
+        if isinstance(row, Mapping)
+        and not row.get("_rolling_source_rejection")
+        and not row.get("_rolling_accounting_rejection")
+        and _rolling_row_time(_rolling_snapshot_view(row)) is not None
+    )
+    row_count = len(rows)
+    return {
+        "dataset_id": dataset_id,
+        "dataset_version": dataset_version,
+        "mode": (
+            "RECORDED_BOOK_REPLAY"
+            if source == "REPLAY"
+            else "PRICE_PROXY_RESEARCH"
+            if source == "HISTORICAL"
+            else str(source)
+        ),
+        "source_class": source,
+        "market_paths": paths,
+        "first_timestamp": (
+            min(
+                (
+                    _rolling_row_time(_rolling_snapshot_view(row))
+                    for row in rows
+                    if isinstance(row, Mapping)
+                    and _rolling_row_time(_rolling_snapshot_view(row)) is not None
+                ),
+                default=None,
+            ).isoformat()
+            if any(
+                isinstance(row, Mapping)
+                and _rolling_row_time(_rolling_snapshot_view(row)) is not None
+                for row in rows
+            )
+            else None
+        ),
+        "last_timestamp": (
+            max(
+                (
+                    _rolling_row_time(_rolling_snapshot_view(row))
+                    for row in rows
+                    if isinstance(row, Mapping)
+                    and _rolling_row_time(_rolling_snapshot_view(row)) is not None
+                ),
+                default=None,
+            ).isoformat()
+            if any(
+                isinstance(row, Mapping)
+                and _rolling_row_time(_rolling_snapshot_view(row)) is not None
+                for row in rows
+            )
+            else None
+        ),
+        "rows": row_count,
+        "valid_rows": valid_count,
+        "gap_count": total_gaps,
+        "max_gap_seconds": max_gap,
+        "exclusion_counts": dict(sorted(exclusions.items())),
+        "blocker_counts": dict(sorted(exclusions.items())),
+        "completeness": (
+            str(Decimal(valid_count) / Decimal(row_count))
+            if row_count
+            else "0"
+        ),
+        "partial": bool(valid_count != row_count or total_gaps),
+        "truncated": len(rows) > _ROLLING_INPUT_MANIFEST_ROWS,
+    }
 
 
 def _rolling_persisted_source_class(value: Any) -> str:
@@ -2096,14 +2355,15 @@ def _rolling_persisted_source_class(value: Any) -> str:
 
 _ROLLING_SOURCE_TYPES: Mapping[str, frozenset[str]] = {
     "HISTORICAL": frozenset({"HISTORICAL", "PRICE_PROXY"}),
-    "REPLAY": frozenset({"REPLAY", "REPLAY_SIMULATED", "ORDER_BOOK_SIMULATED", "HISTORICAL"}),
+    "REPLAY": frozenset(
+        {"REPLAY", "REPLAY_SIMULATED", "ORDER_BOOK_SIMULATED", "FORWARD_COLLECTED"}
+    ),
     "PAPER": frozenset({"PAPER", "PAPER_FORWARD", "FORWARD_PAPER"}),
     "LIVE": frozenset({"LIVE", "FORWARD_COLLECTED"}),
 }
 _ROLLING_SOURCE_QUERY_TYPES: Mapping[str, tuple[str, ...]] = {
-    # Storage persists only these source types.  Keep the public rolling class
-    # in evidence while translating only the query boundary.
-    "REPLAY": ("HISTORICAL",),
+    # Storage persists only forward snapshots.  REPLAY is loaded from its
+    # immutable catalog below, never from the historical snapshot table.
     "LIVE": ("FORWARD_COLLECTED",),
 }
 
@@ -2230,7 +2490,7 @@ def _rolling_source_job_binding(
         if value is None:
             raise ValueError(f"{source}_SOURCE_BINDING_REQUIRED")
         expected[field] = value
-    if source in {"HISTORICAL", "REPLAY"}:
+    if source == "HISTORICAL":
         dataset_id = _binding_value(binding.get("dataset_id"))
         dataset_version = _binding_value(binding.get("dataset_version", binding.get("version")))
         if dataset_id is None or dataset_version is None:
@@ -3903,6 +4163,20 @@ class AutonomousResearchProcessor:
                 return None
             plan = lifecycle_payload.get("experiment_plan")
             plan = plan if isinstance(plan, Mapping) else {}
+            model_document_value: Any = None
+            model_document_present = False
+            for model_owner in (lifecycle_payload, strategy_payload, plan):
+                if "model_document" not in model_owner:
+                    continue
+                model_document_present = True
+                model_document_value = model_owner.get("model_document")
+                if isinstance(model_document_value, Mapping):
+                    break
+            model_document = (
+                dict(model_document_value)
+                if model_document_present and isinstance(model_document_value, Mapping)
+                else None
+            )
             dataset_selector_value = lifecycle_payload.get("dataset_selector")
             if not isinstance(dataset_selector_value, Mapping):
                 dataset_selector_value = plan.get("dataset_selector")
@@ -4045,6 +4319,7 @@ class AutonomousResearchProcessor:
             origin = _rolling_provenance_bound(origin)
             return {
                 "strategy_document": document,
+                "model_document": model_document,
                 "strategy_id": _binding_value(strategy_row.get("strategy_id")) or definition.id,
                 "version": str(strategy_row.get("version") or definition.version),
                 "strategy_hash": strategy_hash,
@@ -4345,6 +4620,11 @@ class AutonomousResearchProcessor:
                 "config_hash": str(item.get("config_hash", strategy_hash)),
                 "created_at": now.isoformat(),
                 "strategy_document": document,
+                "model_document": (
+                    dict(item["model_document"])
+                    if isinstance(item.get("model_document"), Mapping)
+                    else None
+                ),
                 "canonical_strategy": document,
                 "enrollment_mode": enrollment_mode,
                 "provenance": provenance,
@@ -4378,15 +4658,32 @@ class AutonomousResearchProcessor:
                 "execution_scope": "OBSERVATION",
                 "research_only": True,
                 "paper_only": True,
-                "payload": {"strategy_document": document, "provenance": provenance},
+                "payload": {
+                    "strategy_document": document,
+                    "model_document": (
+                        dict(item["model_document"])
+                        if isinstance(item.get("model_document"), Mapping)
+                        else None
+                    ),
+                    "provenance": provenance,
+                },
             }
             def immutable_match(existing: Any, expected: Mapping[str, Any]) -> bool:
                 if not isinstance(existing, Mapping):
                     return False
-                return _canonical_binding(
-                    _rolling_payload_without_created_at(existing)
-                ) == _canonical_binding(
-                    _rolling_payload_without_created_at(expected)
+
+                def comparable(value: Mapping[str, Any]) -> Mapping[str, Any]:
+                    payload = dict(_rolling_payload_without_created_at(value))
+                    payload.setdefault("model_document", None)
+                    nested = payload.get("payload")
+                    if isinstance(nested, Mapping):
+                        nested_payload = dict(nested)
+                        nested_payload.setdefault("model_document", None)
+                        payload["payload"] = nested_payload
+                    return payload
+
+                return _canonical_binding(comparable(existing)) == _canonical_binding(
+                    comparable(expected)
                 )
 
             try:
@@ -4459,38 +4756,15 @@ class AutonomousResearchProcessor:
         if not callable(execute):
             raise ValueError("HISTORICAL_DATASET_PREFLIGHT_UNAVAILABLE")
         try:
-            payload_row = execute(
+            payload_lengths = execute(
                 "SELECT LENGTH(CAST(payload_json AS BLOB)) AS payload_bytes,"
-                "CASE WHEN json_valid(payload_json) THEN json_type(payload_json) END AS payload_type,"
-                "json_extract(CASE WHEN json_valid(metadata_json) THEN metadata_json ELSE '{}' END,"
-                "'$.row_count') AS metadata_row_count,"
-                "json_array_length(CASE WHEN json_valid(payload_json) THEN payload_json ELSE '[]' END) "
-                "AS payload_row_count,"
-                "CASE WHEN json_valid(payload_json) "
-                "AND json_type(payload_json,'$.records')='array' "
-                "THEN json_array_length(json_extract(payload_json,'$.records')) END "
-                "AS records_row_count,"
-                "CASE WHEN json_valid(payload_json) "
-                "AND json_type(payload_json,'$.rows')='array' "
-                "THEN json_array_length(json_extract(payload_json,'$.rows')) END "
-                "AS rows_row_count,"
-                "json_array_length(CASE WHEN json_valid(metadata_json) "
-                "AND json_type(metadata_json,'$.records')='array' "
-                "THEN json_extract(metadata_json,'$.records') ELSE '[]' END) "
-                "AS metadata_records_row_count,"
-                "json_array_length(CASE WHEN json_valid(metadata_json) "
-                "AND json_type(metadata_json,'$.rows')='array' "
-                "THEN json_extract(metadata_json,'$.rows') ELSE '[]' END) "
-                "AS metadata_rows_row_count "
+                "LENGTH(CAST(metadata_json AS BLOB)) AS metadata_bytes "
                 "FROM datasets WHERE dataset_id=? AND version=? LIMIT 1",
                 (str(dataset_id), str(dataset_version)),
             ).fetchone()
-            catalog_row = execute(
-                "SELECT row_count,"
-                "json_array_length(CASE WHEN json_valid(metadata_json) "
-                "AND json_type(metadata_json,'$.market_versions')='array' "
-                "THEN json_extract(metadata_json,'$.market_versions') ELSE '[]' END) "
-                "AS market_versions_count "
+            catalog_lengths = execute(
+                "SELECT LENGTH(CAST(metadata_json AS BLOB)) AS metadata_bytes,"
+                "LENGTH(CAST(missing_ranges_json AS BLOB)) AS missing_ranges_bytes "
                 "FROM dataset_catalog "
                 "WHERE dataset_id=? AND dataset_version=? LIMIT 1",
                 (str(dataset_id), str(dataset_version)),
@@ -4510,6 +4784,81 @@ class AutonomousResearchProcessor:
             if parsed < 0:
                 raise ValueError(f"{field} is invalid")
             return parsed
+
+        if payload_lengths is None and catalog_lengths is None:
+            raise ValueError("HISTORICAL_DATASET_METADATA_MISSING")
+
+        def check_length(row: Any, field: str) -> None:
+            if row is None:
+                return
+            size = integer(row[field], field)
+            if size is None or size > _MAX_ROLLING_DATASET_PAYLOAD_BYTES:
+                raise ValueError("HISTORICAL_DATASET_PAYLOAD_TOO_LARGE")
+
+        check_length(payload_lengths, "payload_bytes")
+        check_length(payload_lengths, "metadata_bytes")
+        check_length(catalog_lengths, "metadata_bytes")
+        check_length(catalog_lengths, "missing_ranges_bytes")
+
+        try:
+            payload_row = (
+                execute(
+                    "SELECT LENGTH(CAST(payload_json AS BLOB)) AS payload_bytes,"
+                    "CASE WHEN json_valid(payload_json) THEN json_type(payload_json) END AS payload_type,"
+                    "json_extract(CASE WHEN json_valid(metadata_json) THEN metadata_json ELSE '{}' END,"
+                    "'$.row_count') AS metadata_row_count,"
+                    "json_array_length(CASE WHEN json_valid(payload_json) THEN payload_json ELSE '[]' END) "
+                    "AS payload_row_count,"
+                    "CASE WHEN json_valid(payload_json) "
+                    "AND json_type(payload_json,'$.records')='array' "
+                    "THEN json_array_length(json_extract(payload_json,'$.records')) END "
+                    "AS records_row_count,"
+                    "CASE WHEN json_valid(payload_json) "
+                    "AND json_type(payload_json,'$.rows')='array' "
+                    "THEN json_array_length(json_extract(payload_json,'$.rows')) END "
+                    "AS rows_row_count,"
+                    "json_array_length(CASE WHEN json_valid(metadata_json) "
+                    "AND json_type(metadata_json,'$.records')='array' "
+                    "THEN json_extract(metadata_json,'$.records') ELSE '[]' END) "
+                    "AS metadata_records_row_count,"
+                    "json_array_length(CASE WHEN json_valid(metadata_json) "
+                    "AND json_type(metadata_json,'$.rows')='array' "
+                    "THEN json_extract(metadata_json,'$.rows') ELSE '[]' END) "
+                    "AS metadata_rows_row_count "
+                    "FROM datasets WHERE dataset_id=? AND version=? LIMIT 1",
+                    (str(dataset_id), str(dataset_version)),
+                ).fetchone()
+                if payload_lengths is not None
+                else None
+            )
+            catalog_row = (
+                execute(
+                    "SELECT row_count,"
+                    "json_array_length(CASE WHEN json_valid(metadata_json) "
+                    "AND json_type(metadata_json,'$.market_versions')='array' "
+                    "THEN json_extract(metadata_json,'$.market_versions') ELSE '[]' END) "
+                    "AS market_versions_count,"
+                    "json_array_length(CASE WHEN json_valid(metadata_json) "
+                    "AND json_type(metadata_json,'$.snapshot_manifest')='array' "
+                    "THEN json_extract(metadata_json,'$.snapshot_manifest') ELSE '[]' END) "
+                    "AS snapshot_manifest_count,"
+                    "json_array_length(CASE WHEN json_valid(metadata_json) "
+                    "AND json_type(metadata_json,'$.manifest')='array' "
+                    "THEN json_extract(metadata_json,'$.manifest') ELSE '[]' END) "
+                    "AS manifest_count,"
+                    "json_array_length(CASE WHEN json_valid(missing_ranges_json) "
+                    "AND json_type(missing_ranges_json)='array' "
+                    "THEN missing_ranges_json ELSE '[]' END) "
+                    "AS missing_ranges_count "
+                    "FROM dataset_catalog "
+                    "WHERE dataset_id=? AND dataset_version=? LIMIT 1",
+                    (str(dataset_id), str(dataset_version)),
+                ).fetchone()
+                if catalog_lengths is not None
+                else None
+            )
+        except Exception as exc:
+            raise ValueError("HISTORICAL_DATASET_PREFLIGHT_FAILED") from exc
 
         if payload_row is None and catalog_row is None:
             raise ValueError("HISTORICAL_DATASET_METADATA_MISSING")
@@ -4580,16 +4929,20 @@ class AutonomousResearchProcessor:
 
         if catalog_row is not None:
             catalog_rows = integer(catalog_row["row_count"], "catalog_row_count")
-            market_versions = integer(
-                catalog_row["market_versions_count"],
-                "market_versions_count",
-            )
+            catalog_counts = [
+                integer(catalog_row[field], field)
+                for field in (
+                    "market_versions_count",
+                    "snapshot_manifest_count",
+                    "manifest_count",
+                    "missing_ranges_count",
+                )
+            ]
             if catalog_rows is None:
                 raise ValueError("HISTORICAL_DATASET_ROW_COUNT_UNAVAILABLE")
-            if (
-                catalog_rows > _MAX_ROLLING_SOURCE_ROWS
-                or market_versions is not None
-                and market_versions > _MAX_ROLLING_SOURCE_ROWS
+            if catalog_rows > _MAX_ROLLING_SOURCE_ROWS or any(
+                count is not None and count > _MAX_ROLLING_SOURCE_ROWS
+                for count in catalog_counts
             ):
                 raise ValueError("HISTORICAL_DATASET_ROW_COUNT_TOO_LARGE")
             if payload_rows is not None and catalog_rows != payload_rows:
@@ -4711,8 +5064,17 @@ class AutonomousResearchProcessor:
                 if slippage_value is None:
                     reject("ACCOUNTING_METRIC_MISSING", "costs")
                     return None
-                if capital <= Decimal("0"):
+                if capital < Decimal("0"):
+                    reject("ACCOUNTING_METRIC_NEGATIVE_IMPOSSIBLE", "allocated_capital")
+                    return None
+                if capital == Decimal("0"):
                     reject("ACCOUNTING_METRIC_NONPOSITIVE", "allocated_capital")
+                    return None
+                if fees_value < Decimal("0"):
+                    reject("ACCOUNTING_METRIC_NEGATIVE_IMPOSSIBLE", "fees")
+                    return None
+                if slippage_value < Decimal("0"):
+                    reject("ACCOUNTING_METRIC_NEGATIVE_IMPOSSIBLE", "costs")
                     return None
                 drawdown = min(
                     Decimal("1"),
@@ -4896,7 +5258,7 @@ class AutonomousResearchProcessor:
             if nonnegative and parsed < 0:
                 reject("ACCOUNTING_METRIC_NEGATIVE_IMPOSSIBLE", name)
                 return None
-            if ratio and (parsed < 0 or parsed > 1):
+            if ratio and parsed > 1:
                 reject("ACCOUNTING_METRIC_OUT_OF_RANGE", name)
                 return None
             if name == "completed_outcomes" and parsed != parsed.to_integral_value():
@@ -4953,6 +5315,365 @@ class AutonomousResearchProcessor:
             reject("ACCOUNTING_COVERAGE_INVALID")
             return None
         return result
+    def _rolling_replay_catalog_rows(
+        self,
+        record: Mapping[str, Any],
+        now: datetime,
+    ) -> tuple[list[dict[str, Any]], Mapping[str, Any]]:
+        """Select one exact immutable recorded-book catalog and its rows."""
+        connection = getattr(self.store, "connection", None)
+        execute = getattr(connection, "execute", None)
+        if not callable(execute):
+            raise ValueError("REPLAY_DATASET_UNAVAILABLE")
+        try:
+            descriptors = execute(
+                "SELECT dataset_version,row_count,"
+                "LENGTH(CAST(metadata_json AS BLOB)) AS metadata_bytes,"
+                "LENGTH(CAST(missing_ranges_json AS BLOB)) AS missing_ranges_bytes "
+                "FROM dataset_catalog "
+                "WHERE dataset_id=? AND source_type=? "
+                "ORDER BY updated_at DESC,dataset_id,dataset_version LIMIT ?",
+                (
+                    _ROLLING_REPLAY_DATASET_ID,
+                    "FORWARD_COLLECTED",
+                    _ROLLING_REPLAY_MAX_CATALOGS,
+                ),
+            ).fetchall()
+        except Exception as exc:
+            raise ValueError("REPLAY_DATASET_UNAVAILABLE") from exc
+
+        catalogs: list[Mapping[str, Any]] = []
+        for descriptor in descriptors:
+            version = str(descriptor["dataset_version"] or "").strip()
+            expected_count = descriptor["row_count"]
+            if (
+                not version
+                or isinstance(expected_count, bool)
+                or not isinstance(expected_count, int)
+                or expected_count < 0
+                or expected_count > _ROLLING_INPUT_MANIFEST_ROWS
+            ):
+                continue
+            try:
+                metadata_bytes = int(descriptor["metadata_bytes"])
+                missing_ranges_bytes = int(descriptor["missing_ranges_bytes"])
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if (
+                metadata_bytes < 0
+                or missing_ranges_bytes < 0
+                or metadata_bytes > _MAX_ROLLING_DATASET_PAYLOAD_BYTES
+                or missing_ranges_bytes > _MAX_ROLLING_DATASET_PAYLOAD_BYTES
+            ):
+                continue
+            try:
+                raw_catalog = execute(
+                    "SELECT * FROM dataset_catalog "
+                    "WHERE dataset_id=? AND dataset_version=? LIMIT 1",
+                    (_ROLLING_REPLAY_DATASET_ID, version),
+                ).fetchone()
+                if raw_catalog is None:
+                    continue
+                metadata_json = raw_catalog["metadata_json"]
+                missing_json = raw_catalog["missing_ranges_json"]
+                manifest_count = _json_array_count_for_key(
+                    metadata_json,
+                    ("snapshot_manifest", "manifest"),
+                    limit=_ROLLING_INPUT_MANIFEST_ROWS,
+                )
+                missing_count = _json_array_count(
+                    missing_json,
+                    limit=_ROLLING_INPUT_MANIFEST_ROWS,
+                )
+                if (
+                    manifest_count is not None
+                    and manifest_count > _ROLLING_INPUT_MANIFEST_ROWS
+                ) or (
+                    missing_count is not None
+                    and missing_count > _ROLLING_INPUT_MANIFEST_ROWS
+                ):
+                    continue
+                catalogs.append(_dataset_catalog_record(raw_catalog))
+            except Exception:
+                continue
+        if not catalogs:
+            raise ValueError("REPLAY_DATASET_UNAVAILABLE")
+        binding = _rolling_source_binding(record)
+        requested_id = _binding_value(binding.get("dataset_id"))
+        requested_version = _binding_value(
+            binding.get("dataset_version", binding.get("version"))
+        )
+        pinned_version = (
+            requested_version
+            if requested_id == _ROLLING_REPLAY_DATASET_ID
+            else None
+        )
+        scope_ids = _rolling_market_scope_ids(binding)
+        candidates: list[tuple[tuple[Any, ...], Mapping[str, Any], list[dict[str, Any]]]] = []
+
+        def catalog_rows(catalog: Mapping[str, Any]) -> list[dict[str, Any]] | None:
+            metadata = catalog.get("metadata")
+            if not isinstance(metadata, Mapping):
+                return None
+            if str(catalog.get("dataset_id", "")).strip() != _ROLLING_REPLAY_DATASET_ID:
+                return None
+            if str(catalog.get("source_type", "")).strip().upper() != "FORWARD_COLLECTED":
+                return None
+            if str(metadata.get("research_mode", "")).strip().upper().replace("-", "_") != "RECORDED_BOOK_REPLAY":
+                return None
+            try:
+                complete = float(catalog.get("completeness"))
+            except (TypeError, ValueError, OverflowError):
+                return None
+            if not math.isfinite(complete) or complete != 1.0:
+                return None
+            missing_ranges = catalog.get("missing_ranges", ())
+            if not isinstance(missing_ranges, Sequence) or isinstance(missing_ranges, (str, bytes)):
+                return None
+            if len(missing_ranges) > _ROLLING_INPUT_MANIFEST_ROWS:
+                return None
+            if any(
+                not isinstance(item, Mapping) or not _rolling_replay_row_terminal(item)
+                for item in missing_ranges
+            ):
+                return None
+            manifest = metadata.get("snapshot_manifest", metadata.get("manifest"))
+            if not isinstance(manifest, Sequence) or isinstance(manifest, (str, bytes)):
+                return None
+            if len(manifest) > _ROLLING_INPUT_MANIFEST_ROWS:
+                return None
+            if any(not isinstance(item, Mapping) for item in manifest):
+                return None
+            expected_count = catalog.get("row_count")
+            if (
+                isinstance(expected_count, bool)
+                or not isinstance(expected_count, int)
+                or expected_count < 0
+                or expected_count > _ROLLING_INPUT_MANIFEST_ROWS
+            ):
+                return None
+            dataset_version = str(catalog.get("dataset_version", catalog.get("version", ""))).strip()
+            if not re.fullmatch(r"sha256:[0-9a-f]{64}", dataset_version):
+                return None
+            try:
+                dataset_lengths = execute(
+                    "SELECT LENGTH(CAST(payload_json AS BLOB)) AS payload_bytes,"
+                    "LENGTH(CAST(metadata_json AS BLOB)) AS metadata_bytes "
+                    "FROM datasets WHERE dataset_id=? AND version=? LIMIT 1",
+                    (_ROLLING_REPLAY_DATASET_ID, dataset_version),
+                ).fetchone()
+                if dataset_lengths is None:
+                    return None
+                payload_bytes = int(dataset_lengths["payload_bytes"])
+                metadata_bytes = int(dataset_lengths["metadata_bytes"])
+            except Exception:
+                return None
+            if (
+                payload_bytes < 0
+                or metadata_bytes < 0
+                or payload_bytes > _MAX_ROLLING_DATASET_PAYLOAD_BYTES
+                or metadata_bytes > _MAX_ROLLING_DATASET_PAYLOAD_BYTES
+            ):
+                return None
+            try:
+                dataset_row = execute(
+                    "SELECT payload_json FROM datasets "
+                    "WHERE dataset_id=? AND version=? LIMIT 1",
+                    (_ROLLING_REPLAY_DATASET_ID, dataset_version),
+                ).fetchone()
+                payload_json = (
+                    dataset_row["payload_json"] if dataset_row is not None else None
+                )
+                root_count = _json_array_count(
+                    payload_json,
+                    limit=_ROLLING_INPUT_MANIFEST_ROWS,
+                )
+                records_count = _json_array_count_for_key(
+                    payload_json,
+                    ("records", "rows"),
+                    limit=_ROLLING_INPUT_MANIFEST_ROWS,
+                )
+                if any(
+                    count is not None and count > _ROLLING_INPUT_MANIFEST_ROWS
+                    for count in (root_count, records_count)
+                ):
+                    return None
+                values = json.loads(payload_json) if isinstance(payload_json, str) else None
+            except Exception:
+                return None
+            if isinstance(values, Mapping):
+                values = values.get("records", values.get("rows", ()))
+            if not isinstance(values, Sequence) or isinstance(values, (str, bytes)):
+                return None
+            if len(values) > _ROLLING_INPUT_MANIFEST_ROWS:
+                return None
+            rows = [dict(value) for value in values if isinstance(value, Mapping)]
+            if len(rows) != len(values) or len(rows) != len(manifest):
+                return None
+            if expected_count != len(rows):
+                return None
+            source_loader = getattr(
+                self.store,
+                "load_polymarket_snapshots_by_ids",
+                None,
+            )
+            if not callable(source_loader):
+                return None
+            source_ids = tuple(
+                str(item["snapshot_id"]).strip() for item in manifest
+            )
+            try:
+                source_values = source_loader(
+                    source_ids,
+                    source_type="FORWARD_COLLECTED",
+                )
+            except Exception:
+                return None
+            if isinstance(source_values, Mapping):
+                source_by_id = dict(source_values)
+            elif isinstance(source_values, Sequence) and not isinstance(
+                source_values,
+                (str, bytes),
+            ):
+                source_by_id = {
+                    str(item.get("snapshot_id", "")).strip(): item
+                    for item in source_values
+                    if isinstance(item, Mapping)
+                }
+            else:
+                return None
+            if set(source_by_id) != set(source_ids):
+                return None
+            for row, expected in zip(rows, manifest):
+                snapshot_id = str(
+                    row.get("source_snapshot_id", row.get("snapshot_id", ""))
+                ).strip()
+                expected_snapshot_id = str(expected.get("snapshot_id", "")).strip()
+                source_record = source_by_id.get(expected_snapshot_id)
+                if not isinstance(source_record, Mapping):
+                    return None
+                source_hash = str(row.get("source_record_hash", "")).strip()
+                expected_hash = str(expected.get("source_record_hash", "")).strip()
+                market_id = str(row.get("market_id", "")).strip()
+                expected_market = str(expected.get("market_id", "")).strip()
+                row_time = _rolling_timestamp(
+                    row.get("source_timestamp", row.get("timestamp"))
+                )
+                manifest_time = _rolling_timestamp(expected.get("source_timestamp"))
+                source_time = _rolling_timestamp(source_record.get("source_timestamp"))
+                try:
+                    recomputed_hash = _rolling_publisher_source_record_hash(
+                        source_record
+                    )
+                except (TypeError, ValueError, ArithmeticError):
+                    return None
+                if (
+                    not snapshot_id
+                    or snapshot_id != expected_snapshot_id
+                    or str(source_record.get("snapshot_id", "")).strip()
+                    != expected_snapshot_id
+                    or str(source_record.get("source_type", "")).strip().upper()
+                    != "FORWARD_COLLECTED"
+                    or not re.fullmatch(r"sha256:[0-9a-f]{64}", source_hash)
+                    or source_hash != expected_hash
+                    or source_hash != recomputed_hash
+                    or not market_id
+                    or market_id != expected_market
+                    or str(source_record.get("market_id", "")).strip() != expected_market
+                    or row_time is None
+                    or manifest_time is None
+                    or source_time is None
+                    or row_time != manifest_time
+                    or source_time != manifest_time
+                ):
+                    return None
+                if str(row.get("source_type", "")).strip().upper() != "FORWARD_COLLECTED":
+                    return None
+            cutoff = metadata.get("exact_cutoff", metadata.get("cutoff"))
+            cutoff_stamp = _rolling_timestamp(cutoff)
+            if cutoff_stamp is None:
+                return None
+            expected_version = _rolling_hash(
+                {
+                    "dataset_id": _ROLLING_REPLAY_DATASET_ID,
+                    "research_mode": "RECORDED_BOOK_REPLAY",
+                    "cutoff": cutoff_stamp,
+                    "manifest": list(manifest),
+                    "rows": rows,
+                }
+            )
+            if expected_version != dataset_version:
+                return None
+            return rows
+
+        for catalog in catalogs[:_ROLLING_REPLAY_MAX_CATALOGS]:
+            if not isinstance(catalog, Mapping):
+                continue
+            version = _binding_value(catalog.get("dataset_version", catalog.get("version")))
+            if pinned_version is not None and version != pinned_version:
+                continue
+            rows = catalog_rows(catalog)
+            if rows is None:
+                continue
+            metadata = catalog.get("metadata")
+            assert isinstance(metadata, Mapping)
+            markets = {
+                str(row.get("market_id", "")).strip()
+                for row in rows
+                if str(row.get("market_id", "")).strip()
+            }
+            overlap = len(scope_ids & markets) if scope_ids else 0
+            scope_complete = bool(scope_ids) and scope_ids.issubset(markets)
+            stamps = [
+                stamp
+                for stamp in (
+                    _rolling_timestamp(row.get("source_timestamp", row.get("timestamp")))
+                    for row in rows
+                )
+                if stamp is not None
+            ]
+            first = min(stamps) if stamps else None
+            last = max(stamps) if stamps else None
+            required_start = ensure_utc(now) - timedelta(days=30)
+            lookback_sufficient = bool(first is not None and first <= required_start and last is not None and last <= ensure_utc(now))
+            coverage_seconds = (
+                int((last - first).total_seconds())
+                if first is not None and last is not None and last >= first
+                else 0
+            )
+            availability = _rolling_timestamp(
+                metadata.get("available_through", metadata.get("exact_cutoff"))
+            ) or _rolling_timestamp(catalog.get("updated_at"))
+            manifest_digest = _rolling_hash(list(metadata.get("snapshot_manifest", metadata.get("manifest", ()))))
+            tie_digest = _rolling_hash(
+                {"manifest": manifest_digest, "dataset_version": version}
+            )
+            rank = (
+                1 if scope_complete else 0,
+                overlap,
+                1 if lookback_sufficient else 0,
+                coverage_seconds,
+                availability or datetime.min.replace(tzinfo=timezone.utc),
+                tie_digest,
+                str(version or ""),
+            )
+            candidates.append((rank, catalog, rows))
+        if not candidates:
+            raise ValueError("REPLAY_DATASET_UNAVAILABLE")
+        _rank, selected_catalog, selected_rows = max(candidates, key=lambda item: item[0])
+        selected_id = str(selected_catalog.get("dataset_id", _ROLLING_REPLAY_DATASET_ID))
+        selected_version = str(
+            selected_catalog.get("dataset_version", selected_catalog.get("version", ""))
+        )
+        for row in selected_rows:
+            row["_rolling_replay_catalog"] = {
+                "dataset_id": selected_id,
+                "dataset_version": selected_version,
+                "research_mode": "RECORDED_BOOK_REPLAY",
+            }
+            row.setdefault("dataset_id", selected_id)
+            row.setdefault("dataset_version", selected_version)
+        return selected_rows, selected_catalog
 
     def _ensure_rolling_paper_observation(
         self,
@@ -4971,7 +5692,15 @@ class AutonomousResearchProcessor:
         registry = ForwardTestRegistry(self.store)
         model_document = strategy.get("model_document")
         if not isinstance(model_document, Mapping):
-            model_document = strategy_document.get("model_document", strategy_document.get("model", {}))
+            raise ValueError("MODEL_INPUT_MISSING")
+        if "probability" in model_document or "yes_probability" in model_document:
+            if evaluate_model_document_probability(model_document, {}) is None:
+                raise ValueError("MODEL_INPUT_INVALID")
+        elif not (
+            isinstance(model_document.get("field"), str)
+            and model_document["field"].strip()
+        ):
+            raise ValueError("MODEL_INPUT_MISSING")
         source_binding = _rolling_source_binding(strategy)
         scope = source_binding.get("market_scope", source_binding.get("scope", {}))
         scope = scope if isinstance(scope, Mapping) else {}
@@ -5010,9 +5739,10 @@ class AutonomousResearchProcessor:
             "source_strategy_hash": strategy.get("strategy_hash"),
             "rolling_strategy_hash": strategy.get("strategy_hash"),
             "strategy_document": dict(strategy_document),
-            "model_document": dict(model_document) if isinstance(model_document, Mapping) else {},
+            "model_document": (
+                dict(model_document) if isinstance(model_document, Mapping) else None
+            ),
             "dataset_selector": selector,
-            "dataset_id": selector.get("dataset_id"),
             "dataset_version": selector.get("dataset_version"),
             "market_scope": dict(scope),
             "rolling_research": True,
@@ -5191,7 +5921,32 @@ class AutonomousResearchProcessor:
                     else:
                         checked["_rolling_lineage_proven"] = True
                         rows.append(checked)
-        elif source in {"REPLAY", "LIVE"}:
+        elif source == "REPLAY":
+            replay_rows, _replay_catalog = self._rolling_replay_catalog_rows(
+                record, now
+            )
+            # The strategy's historical dataset selector is not replay
+            # identity.  Catalog identity is carried by each exact row and
+            # checked against the immutable manifest above.
+            replay_binding = {
+                key: value
+                for key, value in source_binding.items()
+                if key not in {"dataset_id", "dataset_version"}
+            }
+            for item in replay_rows[:_MAX_FORWARD_ROWS]:
+                row = dict(item)
+                row["_rolling_lineage_proven"] = False
+                if (
+                    not _rolling_replay_row_terminal(row)
+                    and not _rolling_has_paired_timestamped_books(row)
+                ):
+                    row["_rolling_source_rejection"] = "REPLAY_BOOK_REQUIRED"
+                    row["_rolling_accounting_rejection"] = "REPLAY_BOOK_REQUIRED"
+                checked = _rolling_inject_source_binding(row, replay_binding)
+                if checked.get("_rolling_accounting_rejection"):
+                    checked["_rolling_lineage_proven"] = False
+                rows.append(checked)
+        elif source == "LIVE":
             loader = getattr(self.store, "load_polymarket_snapshots", None)
             if not callable(loader):
                 raise ValueError("SOURCE_LOADER_UNAVAILABLE")
@@ -5212,6 +5967,14 @@ class AutonomousResearchProcessor:
                     if item_index >= _MAX_FORWARD_ROWS:
                         break
                     if not isinstance(item, Mapping):
+                        continue
+                    if (
+                        str(_rolling_snapshot_view(item).get("research_mode", ""))
+                        .strip()
+                        .upper()
+                        .replace("-", "_")
+                        == "RECORDED_BOOK_REPLAY"
+                    ):
                         continue
                     try:
                         row_binding = _rolling_source_binding(item)
@@ -5261,18 +6024,6 @@ class AutonomousResearchProcessor:
                         )
                         for field in required_fields
                     )
-                    if source == "REPLAY":
-                        row_dataset = _binding_value(row_binding.get("dataset_id"))
-                        row_version = _binding_value(
-                            row_binding.get("dataset_version", row_binding.get("version"))
-                        )
-                        if (
-                            row_dataset is not None
-                            and row_dataset != dataset_id
-                            or row_version is not None
-                            and row_version != dataset_version
-                        ):
-                            conflict = True
                     checked = _rolling_inject_source_binding(item, source_binding)
                     if conflict or checked.get("_rolling_accounting_rejection"):
                         checked["_rolling_lineage_proven"] = False
@@ -5285,7 +6036,7 @@ class AutonomousResearchProcessor:
                         )
                         rows.append(checked)
                     elif missing:
-                        # Raw replay/live observations are evaluator inputs even
+                        # Raw live observations are evaluator inputs even
                         # when their strategy lineage has not been attributed.
                         row = dict(item)
                         row["_rolling_lineage_proven"] = False
@@ -5498,10 +6249,18 @@ class AutonomousResearchProcessor:
                 continue
             row = _rolling_snapshot_view(raw)
             if row.get("_rolling_accounting_rejection"):
+                if source == "REPLAY":
+                    replay_scope = (
+                        set(resolved_scope_market_ids)
+                        if resolved_scope_market_ids is not None
+                        else _rolling_market_scope_ids(binding)
+                    )
+                    if replay_scope and str(row.get("market_id", "")).strip() not in replay_scope:
+                        continue
                 # Rejected source rows remain observable even when their
                 # nested payload declares an incompatible source class.
                 row["source_class"] = persisted_source
-                row["source_type"] = persisted_source
+                row.setdefault("source_type", persisted_source)
                 row["requested_source_class"] = source
                 row["requested_source_type"] = source
                 normalized.append(row)
@@ -5527,15 +6286,9 @@ class AutonomousResearchProcessor:
             if not str(row.get("market_id", "")).strip():
                 row["_rolling_source_rejection"] = "SOURCE_MARKET_ID_MISSING"
                 row["_rolling_accounting_rejection"] = "SOURCE_MARKET_ID_MISSING"
-            if source == "REPLAY" and not any(
-                isinstance(row.get(name), Mapping)
-                for name in ("order_book", "yes_order_book", "no_order_book")
-            ):
-                row["_rolling_source_rejection"] = "REPLAY_BOOK_REQUIRED"
-                row["_rolling_accounting_rejection"] = "REPLAY_BOOK_REQUIRED"
             if row.get("_rolling_source_rejection"):
                 row["source_class"] = persisted_source
-                row["source_type"] = persisted_source
+                row.setdefault("source_type", persisted_source)
                 row["requested_source_class"] = source
                 row["requested_source_type"] = source
                 normalized.append(row)
@@ -5560,7 +6313,7 @@ class AutonomousResearchProcessor:
                 if accounting is None:
                     if row.get("_rolling_accounting_rejection"):
                         row["source_class"] = persisted_source
-                        row["source_type"] = persisted_source
+                        row.setdefault("source_type", persisted_source)
                         row["requested_source_class"] = source
                         row["requested_source_type"] = source
                         normalized.append(row)
@@ -5578,7 +6331,7 @@ class AutonomousResearchProcessor:
             if binding_conflict:
                 row["_rolling_accounting_rejection"] = "SOURCE_BINDING_CONFLICT"
                 row["source_class"] = persisted_source
-                row["source_type"] = persisted_source
+                row.setdefault("source_type", persisted_source)
                 row["requested_source_class"] = source
                 row["requested_source_type"] = source
                 normalized.append(row)
@@ -5609,7 +6362,7 @@ class AutonomousResearchProcessor:
                 if actual_market not in expected_markets:
                     continue
             row["source_class"] = persisted_source
-            row["source_type"] = persisted_source
+            row.setdefault("source_type", persisted_source)
             row["requested_source_class"] = source
             row["requested_source_type"] = source
             if _rolling_row_time(row) is not None:
@@ -5662,7 +6415,36 @@ class AutonomousResearchProcessor:
             "implied_probability",
         )
         valid_rows: list[dict[str, Any]] = []
+        if requested_source == "REPLAY" and any(
+            isinstance(raw, Mapping)
+            and not _rolling_replay_row_terminal(raw)
+            and not _rolling_has_paired_timestamped_books(raw)
+            for raw in rows
+        ):
+            # A non-terminal gap invalidates the requested replay window; do
+            # not salvage a smaller price-only subset.
+            return None
+        if requested_source == "LIVE":
+            live_book_rows = [
+                raw
+                for raw in rows
+                if isinstance(raw, Mapping)
+                and not raw.get("_rolling_source_rejection")
+                and not raw.get("_rolling_accounting_rejection")
+                and has_book(raw)
+            ]
+            if live_book_rows and any(
+                not _rolling_has_paired_timestamped_books(raw)
+                for raw in live_book_rows
+            ):
+                return None
         expected_binding = _rolling_source_binding(strategy)
+        if requested_source == "REPLAY":
+            expected_binding = {
+                key: value
+                for key, value in expected_binding.items()
+                if key not in {"dataset_id", "dataset_version", "version"}
+            }
         for raw in rows:
             if not isinstance(raw, Mapping):
                 continue
@@ -5713,9 +6495,13 @@ class AutonomousResearchProcessor:
                 continue
             if not str(view.get("market_id", "")).strip():
                 continue
-            if requested_source == "REPLAY" and not has_book(raw):
-                # Replay is evidence of observed execution only.  A row
-                # without a recorded book must never fall back to prices.
+            if (
+                requested_source == "REPLAY"
+                and not _rolling_replay_row_terminal(raw)
+                and not _rolling_has_paired_timestamped_books(raw)
+            ):
+                # Terminal settlement rows may omit books and still reach the
+                # evaluator; only non-terminal replay requires paired books.
                 continue
             if not (
                 has_book(raw)
@@ -5743,14 +6529,17 @@ class AutonomousResearchProcessor:
                 return None
         mode = (
             "RECORDED_BOOK_REPLAY"
-            if requested_source == "REPLAY" or any(has_book(row) for row in valid_rows)
-            else "PRICE_PROXY_RESEARCH"
+            if requested_source == "REPLAY"
+            else (
+                "RECORDED_BOOK_REPLAY"
+                if requested_source == "LIVE"
+                and any(has_book(row) for row in valid_rows)
+                else "PRICE_PROXY_RESEARCH"
+            )
         )
         source_digest = _rolling_hash(valid_rows)
         document = strategy.get("strategy_document", strategy.get("canonical_strategy"))
         model_document = strategy.get("model_document")
-        if not isinstance(model_document, Mapping) and isinstance(document, Mapping):
-            model_document = document.get("model_document", document.get("model"))
 
         def run_identity(material: Mapping[str, Any]) -> str:
             return (
@@ -5819,7 +6608,19 @@ class AutonomousResearchProcessor:
                 "accounting_partial": True,
                 "accounting_unavailable_reason": "STRATEGY_DOCUMENT_REQUIRED",
             }
+        model_error: str | None = None
+        if not isinstance(model_document, Mapping):
+            model_error = "MODEL_INPUT_MISSING"
+        elif "probability" in model_document or "yes_probability" in model_document:
+            if evaluate_model_document_probability(model_document, {}) is None:
+                model_error = "MODEL_INPUT_INVALID"
+        else:
+            field_name = model_document.get("field")
+            if not isinstance(field_name, str) or not field_name.strip():
+                model_error = "MODEL_INPUT_MISSING"
         try:
+            if model_error is not None:
+                raise ValueError(model_error)
             definition = load_strategy(document)
             result = run_prediction_research_mode(
                 valid_rows,
@@ -5840,7 +6641,9 @@ class AutonomousResearchProcessor:
                 "diagnostic_summary_count": 1,
                 "evaluator_name": None,
                 "evaluator_error": error,
-                "evaluator_prerequisite": None,
+                "evaluator_prerequisite": (
+                    error if error in {"MODEL_INPUT_MISSING", "MODEL_INPUT_INVALID"} else None
+                ),
             }
             portfolio_accounting = {
                 "accounting_available": False,
@@ -6142,23 +6945,14 @@ class AutonomousResearchProcessor:
             return None
         requested_source = _rolling_source_name(source_class)
         persisted_source = _rolling_persisted_source_class(requested_source)
-        recorded_book = any(
-            isinstance(_rolling_snapshot_view(row).get(name), Mapping)
-            for row in rows
-            if isinstance(row, Mapping)
-            for name in ("order_book", "yes_order_book", "no_order_book")
-        )
         if requested_source == "REPLAY" and any(
             isinstance(row, Mapping)
-            and not row.get("_rolling_source_rejection")
-            and not row.get("_rolling_accounting_rejection")
-            and not any(
-                isinstance(_rolling_snapshot_view(row).get(name), Mapping)
-                for name in ("order_book", "yes_order_book", "no_order_book")
-            )
+            and not _rolling_replay_row_terminal(row)
+            and not _rolling_has_paired_timestamped_books(row)
             for row in rows
         ):
-            # A replay window cannot be represented by a price-only row.
+            # Do not salvage a smaller replay subset from an incomplete
+            # window; missing non-terminal paired books is a hard blocker.
             return None
         canonical_required = requested_source in {"HISTORICAL", "REPLAY", "LIVE"}
         # PAPER is the sole exact-account-ledger source.  Every other source,
@@ -6662,6 +7456,29 @@ class AutonomousResearchProcessor:
             "evaluated_observations",
             canonical_evaluation.get("evaluated_observations", 0),
         )
+        dataset_id = _binding_value(source_binding.get("dataset_id"))
+        dataset_version = _binding_value(
+            source_binding.get("dataset_version", source_binding.get("version"))
+        )
+        if requested_source == "REPLAY":
+            for row in rows:
+                catalog_binding = (
+                    row.get("_rolling_replay_catalog")
+                    if isinstance(row, Mapping)
+                    else None
+                )
+                if isinstance(catalog_binding, Mapping):
+                    dataset_id = _binding_value(catalog_binding.get("dataset_id"))
+                    dataset_version = _binding_value(
+                        catalog_binding.get("dataset_version")
+                    )
+                    break
+        input_manifest = _rolling_input_manifest(
+            rows,
+            source=requested_source,
+            dataset_id=dataset_id,
+            dataset_version=dataset_version,
+        )
         signal_count = evaluation_map.get(
             "signal_count", canonical_evaluation.get("signal_count", 0)
         )
@@ -6782,6 +7599,7 @@ class AutonomousResearchProcessor:
             "actual_coverage_seconds": actual_coverage,
             "source_digest": source_digest,
             "accounting_digest": accounting_digest,
+            "input_manifest": input_manifest,
         }
         evidence_digest = _rolling_hash(evidence_identity)
         window_id = (
@@ -6858,7 +7676,7 @@ class AutonomousResearchProcessor:
 
         active_prior = (
             latest.get(str(strategy.get("strategy_version_id")), {})
-            .get(persisted_source, {})
+            .get(requested_source, {})
             .get(days)
         )
         if active_prior is not None:
@@ -6963,6 +7781,7 @@ class AutonomousResearchProcessor:
             ),
             "source_class": persisted_source,
             "requested_source_class": requested_source,
+            "input_manifest": input_manifest,
             "paper_sizing_assumptions": {
                 "currency": "USD",
                 "allocated_capital": (
@@ -7434,11 +8253,10 @@ class AutonomousResearchProcessor:
                     )
                     replay_book_blocked = (
                         source == "REPLAY"
-                        and "REPLAY_BOOK_REQUIRED" in rejection_reasons
-                        and not any(
+                        and any(
                             isinstance(row, Mapping)
-                            and not row.get("_rolling_source_rejection")
-                            and not row.get("_rolling_accounting_rejection")
+                            and not _rolling_replay_row_terminal(row)
+                            and not _rolling_has_paired_timestamped_books(row)
                             for row in bounded_rows
                         )
                     )

@@ -62,6 +62,7 @@ def _rolling_initialization_document() -> dict[str, object]:
         "candidate_id": "candidate-initialization",
         "research_trial_id": "trial-initialization",
         "strategy_document": strategy_document,
+        "model_document": {"probability": 0.5},
         "provenance": {"candidate_id": "candidate-initialization"},
     }
 
@@ -1391,6 +1392,7 @@ class MutationSchedulingTests(unittest.TestCase):
                 "candidate_id": "candidate-initialization",
                 "research_trial_id": "trial-initialization",
                 "strategy_document": strategy_document,
+                "model_document": {"probability": 0.5},
                 "provenance": {"candidate_id": "candidate-initialization"},
             }
 

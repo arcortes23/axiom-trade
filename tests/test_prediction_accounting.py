@@ -118,6 +118,75 @@ class PredictionAccountingTests(unittest.TestCase):
         )
         self.assertEqual({fill.market_id for fill in result.fills}, {"market-1"})
 
+    def test_evaluation_reason_counts_are_derived_from_every_curve_observation(self) -> None:
+        result = PredictionMarketBacktester().run(
+            [
+                _price_row(0, "market-1", 0.40),
+                _price_row(1, "market-1", 0.60),
+                _price_row(2, "market-1", 0.62),
+            ],
+            _strategy(),
+            mode=PRICE_PROXY_RESEARCH,
+        )
+        expected: dict[str, int] = {}
+        for observation in result.equity_curve:
+            reason_code = observation["reason_code"]
+            expected[reason_code] = expected.get(reason_code, 0) + 1
+        evaluation = result.metrics["evaluation"]
+        self.assertEqual(evaluation["reason_counts"], dict(sorted(expected.items())))
+        self.assertEqual(sum(evaluation["reason_counts"].values()), len(result.equity_curve))
+        self.assertEqual(sum(evaluation["reason_counts"].values()), evaluation["evaluated_observations"])
+
+    def test_recorded_replay_end_gap_keeps_position_and_marks_without_exit_fill(self) -> None:
+        rows = [_book_row(0, 0.40), _book_row(1, 0.60), _book_row(2, 0.62)]
+        yes_book = rows[-1]["order_book"]
+        assert isinstance(yes_book, dict)
+        yes_book["bids"] = []
+        result = PredictionMarketBacktester(
+            initial_cash=100.0,
+            fee_bps=0.0,
+            slippage_bps=0.0,
+            allocation=0.50,
+        ).run(
+            rows,
+            _strategy(),
+            mode=RECORDED_BOOK_REPLAY,
+            holding_period=1,
+            exit_policy={"type": "fixed_holding_period", "holding_period": 1},
+        )
+        accounting = result.metrics["portfolio_accounting"]
+        self.assertEqual([fill.metadata["execution_kind"] for fill in result.fills], ["entry"])
+        self.assertEqual(accounting["completed_round_trips"], 0)
+        self.assertEqual(accounting["closing_fills"], 0)
+        self.assertEqual(accounting["open_positions"], ["market-1"])
+        self.assertGreater(accounting["unrealized_pnl"], 0.0)
+        self.assertEqual(accounting["net_pnl"], accounting["realized_pnl"] + accounting["unrealized_pnl"])
+
+    def test_recorded_replay_terminal_settlement_changes_cash_without_closing_fill(self) -> None:
+        rows = [_book_row(0, 0.40), _book_row(1, 0.60), _price_row(2, "market-1", 0.62)]
+        rows[-1]["settlement"] = "resolved_yes"
+        result = PredictionMarketBacktester(
+            initial_cash=100.0,
+            fee_bps=0.0,
+            slippage_bps=0.0,
+            allocation=0.50,
+        ).run(
+            rows,
+            _strategy(),
+            mode=RECORDED_BOOK_REPLAY,
+            holding_period=1,
+            exit_policy={"type": "fixed_holding_period", "holding_period": 1},
+        )
+        accounting = result.metrics["portfolio_accounting"]
+        self.assertEqual([fill.metadata["execution_kind"] for fill in result.fills], ["entry"])
+        self.assertEqual(result.unresolved, ())
+        self.assertEqual(result.outcomes, {"market-1": "resolved_yes"})
+        self.assertEqual(accounting["completed_round_trips"], 0)
+        self.assertEqual(accounting["closing_fills"], 0)
+        self.assertEqual(accounting["open_positions"], [])
+        self.assertGreater(accounting["cash"], 100.0 - accounting["allocated_capital"])
+        self.assertEqual(accounting["net_pnl"], accounting["realized_pnl"])
+
     def test_mapping_order_books_preserve_condition_identity(self) -> None:
         result = PredictionMarketBacktester().run(
             [_book_row(0, 0.40), _book_row(1, 0.60)],

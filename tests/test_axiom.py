@@ -32,7 +32,7 @@ from axiom.domain import (
 from axiom.evaluation import evaluate_scores, split_dataset, walk_forward_splits
 from axiom.evolution import EvolutionEngine
 from axiom.forward import ForwardTestRegistry
-from axiom.storage import AxiomStore
+from axiom.storage import AxiomStore, _json_array_count, _json_array_count_for_key
 from axiom.research import run_crypto_research, run_prediction_research
 from axiom.probability import BaseRateModel, BetaBelief, CryptoPriceTargetModel, ProbabilityModelRegistry
 from axiom.hermes import CandidateMessage, Hermes, HermesPermissions, HermesValidationError
@@ -431,6 +431,34 @@ class DataEvaluationAndProductTests(unittest.TestCase):
             store.save_fill(second_fill, fill_id="unique-part-2")
             self.assertEqual(store.load_fill("unique"), stored_fill)
             self.assertEqual(len(store.load_fills(order_id="unique")), 2)
+    def test_dataset_preflight_counts_nested_objects_and_escaped_strings(self) -> None:
+        rows = [
+            {
+                "id": index,
+                "nested": {"values": [index, index + 1], "object": {"comma": ","}},
+                "text": 'quoted "comma, bracket ]" and slash \\\\',
+            }
+            for index in range(3)
+        ]
+        payload = json.dumps(rows, separators=(",", ":"))
+        self.assertEqual(_json_array_count(payload, limit=10), 3)
+        wrapped = json.dumps(
+            {
+                "records": rows,
+                "description": 'the text contains "records": [1, 2]',
+                "rows": rows[:2],
+            },
+            separators=(",", ":"),
+        )
+        self.assertEqual(
+            _json_array_count_for_key(wrapped, ("records",), limit=10),
+            3,
+        )
+    def test_storage_persists_large_dataset_without_global_row_limit(self) -> None:
+        rows = [{"value": index} for index in range(100_001)]
+        with AxiomStore(":memory:") as store:
+            store.save_dataset("large", "v1", rows)
+            self.assertEqual(store.load_dataset("large", "v1"), rows)
     def test_storage_versions_and_transaction_rollback_are_atomic(self) -> None:
         first = OHLCVBar(T0, 100.0, 101.0, 99.0, 100.5, 10.0)
         second = OHLCVBar(T0 + timedelta(days=1), 100.5, 103.0, 100.0, 102.0, 12.0)

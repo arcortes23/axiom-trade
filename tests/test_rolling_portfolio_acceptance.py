@@ -16,6 +16,7 @@ from unittest.mock import patch
 from axiom.autonomous import (
     AutonomousResearchError,
     AutonomousResearchProcessor,
+    _rolling_hash,
     _rolling_overlap_key,
     _rolling_window_rows,
 )
@@ -717,7 +718,6 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
         ):
             state = processor.refresh_rolling_evidence(now=NOW)
         return processor, strategy, state
-
     def _refresh_raw_replay(
         self,
         store: AxiomStore,
@@ -727,20 +727,90 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
     ) -> tuple[AutonomousResearchProcessor, dict[str, object], Mapping[str, object]]:
         strategy = _raw_application_strategy(strategy_version_id)
         store.save_admission_policy(_policy().as_dict())
+        replay_rows: list[dict[str, object]] = []
+        manifest: list[dict[str, object]] = []
         for index, row in enumerate(rows):
             timestamp = row.get("timestamp")
             market_id = str(row.get("market_id", "")).strip()
             if not isinstance(timestamp, datetime) or not market_id:
                 raise AssertionError("replay fixture requires market and timestamp")
+            snapshot_id = f"raw-replay-{market_id}-{index}"
+            publisher_payload = dict(row)
+            publisher_payload["research_mode"] = "RECORDED_BOOK_REPLAY"
+            publisher_payload["source_type"] = "FORWARD_COLLECTED"
             store.save_polymarket_snapshot(
-                f"raw-replay-{market_id}-{index}",
+                snapshot_id,
                 market_id,
                 timestamp,
                 timestamp,
-                dict(row),
-                quality=PRICE_PROXY_RESEARCH,
-                source_type="HISTORICAL",
+                publisher_payload,
+                source_type="FORWARD_COLLECTED",
             )
+            source_record_hash = _rolling_hash(
+                {
+                    "snapshot_id": snapshot_id,
+                    "market_id": market_id,
+                    "source_timestamp": timestamp,
+                    "observed_at": timestamp,
+                    "payload": publisher_payload,
+                }
+            )
+            replay_row = dict(row)
+            replay_row.update(
+                {
+                    "market_id": market_id,
+                    "timestamp": timestamp,
+                    "source_timestamp": timestamp,
+                    "observed_at": timestamp,
+                    "source_type": "FORWARD_COLLECTED",
+                    "source_snapshot_id": snapshot_id,
+                    "source_record_hash": source_record_hash,
+                    "research_mode": "RECORDED_BOOK_REPLAY",
+                }
+            )
+            replay_rows.append(replay_row)
+            manifest.append(
+                {
+                    "snapshot_id": snapshot_id,
+                    "source_record_hash": source_record_hash,
+                    "market_id": market_id,
+                    "source_timestamp": timestamp,
+                }
+            )
+        dataset_id = "Polymarket-recorded-book-replay"
+        dataset_version = _rolling_hash(
+            {
+                "dataset_id": dataset_id,
+                "research_mode": "RECORDED_BOOK_REPLAY",
+                "cutoff": NOW,
+                "manifest": manifest,
+                "rows": replay_rows,
+            }
+        )
+        store.save_dataset(dataset_id, dataset_version, replay_rows)
+        store.save_dataset_catalog(
+            dataset_id,
+            dataset_version,
+            provider="acceptance-fixture",
+            instrument="POLYMARKET",
+            market_type=MarketType.PREDICTION,
+            timeframe="1d",
+            start_timestamp=min(item["source_timestamp"] for item in manifest),
+            end_timestamp=max(item["source_timestamp"] for item in manifest),
+            row_count=len(replay_rows),
+            completeness=1.0,
+            missing_ranges=(),
+            quality="ORDER_BOOK_SIMULATED",
+            source_type="FORWARD_COLLECTED",
+            snapshot_id=f"manifest:{dataset_version}",
+            metadata={
+                "research_mode": "RECORDED_BOOK_REPLAY",
+                "exact_cutoff": NOW,
+                "snapshot_manifest": manifest,
+            },
+            created_at=NOW,
+            updated_at=NOW,
+        )
         processor = AutonomousResearchProcessor(store, clock=lambda: NOW)
         with patch.object(
             processor,
@@ -915,10 +985,10 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
 
 
 
-    def test_public_refresh_routes_timestamped_books_to_recorded_replay(self) -> None:
+    def test_public_refresh_historical_books_remain_price_proxy(self) -> None:
         raw_rows = [
             _raw_application_row(0, 0.40, book=True),
-            _raw_application_row(1, 0.60, book=True),
+            _raw_application_row(1, 0.40, book=True),
             _raw_application_row(2, 0.60, book=True),
         ]
         with self._store("raw-book-routing.sqlite3") as store:
@@ -930,9 +1000,15 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
             historical_calls = [
                 call
                 for call in evaluator.call_args_list
-                if call.kwargs.get("mode") == RECORDED_BOOK_REPLAY
+                if call.kwargs.get("mode") == PRICE_PROXY_RESEARCH
             ]
             self.assertTrue(historical_calls)
+            self.assertFalse(
+                any(
+                    call.kwargs.get("mode") == RECORDED_BOOK_REPLAY
+                    for call in evaluator.call_args_list
+                )
+            )
             stored = store.list_strategy_evidence_windows(
                 strategy["strategy_version_id"],
                 limit=64,
@@ -959,6 +1035,58 @@ class RollingPortfolioAcceptanceTests(unittest.TestCase):
             )
             self.assertTrue(evidence["evaluator_invoked"])
             self.assertTrue(evidence["evaluator_completed"])
+            self.assertEqual(evidence["loaded_rows"], 3)
+            self.assertEqual(evidence["valid_input_rows"], 3)
+            self.assertEqual(evidence["evaluated_observations"], 3)
+            self.assertEqual(evidence["signal_count"], 3)
+            self.assertGreater(Decimal(str(evidence["realized_pnl"])), Decimal("0"))
+    def test_public_refresh_explicit_replay_uses_recorded_book_catalog(self) -> None:
+        raw_rows = [
+            _raw_application_row(0, 0.40, book=True),
+            _raw_application_row(1, 0.60, book=True),
+            _raw_application_row(2, 0.60, book=True),
+        ]
+        with self._store("raw-explicit-replay.sqlite3") as store:
+            with patch(
+                "axiom.autonomous.run_prediction_research_mode",
+                wraps=run_prediction_research_mode,
+            ) as evaluator:
+                _processor, strategy, state = self._refresh_raw_replay(store, raw_rows)
+            replay_calls = [
+                call
+                for call in evaluator.call_args_list
+                if call.kwargs.get("mode") == RECORDED_BOOK_REPLAY
+            ]
+            self.assertTrue(replay_calls)
+            produced = [
+                item
+                for item in state["evidence_windows"]
+                if item["strategy_version_id"] == strategy["strategy_version_id"]
+                and item.get("evaluation_version") == "rolling-evaluation:v2"
+            ]
+            self.assertTrue(produced)
+            evidence = next(
+                item
+                for item in store.list_strategy_evidence_windows(
+                    strategy["strategy_version_id"], limit=64
+                )
+                if item["evidence_window_id"] == produced[0]["evidence_window_id"]
+            )
+            manifest = evidence["input_manifest"]
+            catalog = store.list_dataset_catalog(
+                source_type="FORWARD_COLLECTED",
+                market_type=MarketType.PREDICTION,
+                limit=8,
+            )[0]
+            self.assertEqual(manifest["dataset_id"], catalog["dataset_id"])
+            self.assertEqual(manifest["dataset_version"], catalog["dataset_version"])
+            self.assertEqual(
+                manifest["dataset_id"], "Polymarket-recorded-book-replay"
+            )
+            self.assertEqual(manifest["mode"], RECORDED_BOOK_REPLAY)
+            self.assertEqual(manifest["gap_count"], 0)
+            self.assertEqual(len(manifest["market_paths"]), 1)
+
             self.assertEqual(evidence["loaded_rows"], 3)
             self.assertEqual(evidence["valid_input_rows"], 3)
             self.assertEqual(evidence["evaluated_observations"], 3)

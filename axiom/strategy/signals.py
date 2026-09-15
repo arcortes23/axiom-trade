@@ -192,12 +192,21 @@ def _ordered_prediction_snapshots(data: Any) -> list[Any]:
             str(_snapshot_value(item, "market_id", "")),
         ),
     )
-    # Signal histories are per market.  When a caller supplies a mixed batch,
-    # retain only the current market rather than stitching unrelated events.
-    current_market = _snapshot_value(ordered[-1], "market_id", None)
+    # A caller-provided market scope is authoritative, including when it has no
+    # matching observations.  Returning the unfiltered batch here would make a
+    # missing market silently evaluate whichever market happened to be latest.
+    requested_market = None
     if isinstance(data, Mapping):
-        current_market = data.get("market_id", current_market)
-    current_market = str(current_market or "").strip()
+        requested_market = str(data.get("market_id") or "").strip()
+    if requested_market:
+        return [
+            item for item in ordered
+            if str(_snapshot_value(item, "market_id", "")).strip() == requested_market
+        ]
+    # Signal histories are per market.  Without an explicit scope, retain only
+    # the market represented by the latest observation rather than stitching
+    # unrelated events together.
+    current_market = str(_snapshot_value(ordered[-1], "market_id", "") or "").strip()
     if current_market:
         same_market = [
             item for item in ordered
@@ -206,6 +215,43 @@ def _ordered_prediction_snapshots(data: Any) -> list[Any]:
         if same_market:
             ordered = same_market
     return ordered
+
+
+def _observation_index(data: Any, item: Any) -> int | None:
+    """Return an item's position in the unfiltered input rows.
+
+    Top-level probability sequences are row-bound evidence.  Once observations
+    are sorted and scoped to one market, their filtered position is no longer a
+    valid index into that global sequence.
+    """
+    observations = _snapshots(data)
+    for index, candidate in enumerate(observations):
+        if candidate is item:
+            return index
+    identity_keys = ("source_snapshot_id", "snapshot_id", "observation_id")
+    for key in identity_keys:
+        identity = _snapshot_value(item, key)
+        if identity is None:
+            continue
+        for index, candidate in enumerate(observations):
+            if _snapshot_value(candidate, key) == identity:
+                return index
+    return None
+
+
+def _model_sequence_value(
+    values: Sequence[Any],
+    data: Any,
+    item: Any,
+    fallback_index: int,
+) -> Any:
+    index = _observation_index(data, item)
+    if index is None:
+        index = fallback_index
+    try:
+        return values[index]
+    except (IndexError, TypeError):
+        return None
 
 
 def _market_probability(item: Any) -> float | None:
@@ -230,13 +276,21 @@ def _model_probability(data: Any, item: Any, index: int = -1) -> float | None:
                 return probability
         values = data.get("probabilities", data.get("model_probabilities"))
         if isinstance(values, Mapping):
-            market_id = _snapshot_value(item, "market_id")
-            value = values.get(market_id, values.get(str(index)))
+            value = None
+            found = False
+            # Prefer row-bound keys, then the market key, before the numeric
+            # fallback used by older callers.
+            for key in ("source_snapshot_id", "snapshot_id", "observation_id", "market_id"):
+                identity = _snapshot_value(item, key)
+                if identity is not None and identity in values:
+                    value = values[identity]
+                    found = True
+                    break
+            if not found:
+                row_index = _observation_index(data, item)
+                value = values.get(str(index if row_index is None else row_index))
         elif isinstance(values, Sequence) and not isinstance(values, (str, bytes)):
-            try:
-                value = values[index]
-            except IndexError:
-                value = None
+            value = _model_sequence_value(values, data, item, index)
         else:
             value = None
         result = _number(value, math.nan)
@@ -660,12 +714,19 @@ def _model_evidence(data: Any, current: Any, index: int) -> ModelProbabilityEval
             return evaluate_model_probability_evidence(model, current)
         values = data.get("probabilities", data.get("model_probabilities"))
         if isinstance(values, Mapping):
-            value = values.get(_snapshot_value(current, "market_id"), values.get(str(index)))
+            value = None
+            found = False
+            for key in ("source_snapshot_id", "snapshot_id", "observation_id", "market_id"):
+                identity = _snapshot_value(current, key)
+                if identity is not None and identity in values:
+                    value = values[identity]
+                    found = True
+                    break
+            if not found:
+                row_index = _observation_index(data, current)
+                value = values.get(str(index if row_index is None else row_index))
         elif isinstance(values, Sequence) and not isinstance(values, (str, bytes)):
-            try:
-                value = values[index]
-            except IndexError:
-                value = None
+            value = _model_sequence_value(values, data, current, index)
         else:
             value = None
         if value is not None:
@@ -717,18 +778,6 @@ def evaluate_signal_evaluation(
                     INSUFFICIENT_LOOKBACK, evidence,
                 )
     else:
-        snapshots = _ordered_prediction_snapshots(data)
-        if not snapshots:
-            empty_evidence: dict[str, Any] = {"history_count": 0}
-            if definition.family == "momentum":
-                empty_evidence.update(
-                    {
-                        "assessment_type": DIRECTIONAL_OOS_TRADING,
-                        "probability_calibration": PROBABILITY_CALIBRATION_UNKNOWN,
-                    }
-                )
-            return Signal(definition.family, 0.0, "flat", definition.market_type.value, WARMING_UP, empty_evidence)
-        lookback = _declared_lookback(definition.parameters)
         if definition.family == "momentum":
             evidence.update(
                 {
@@ -736,22 +785,50 @@ def evaluate_signal_evaluation(
                     "probability_calibration": PROBABILITY_CALIBRATION_UNKNOWN,
                 }
             )
+        snapshots = _ordered_prediction_snapshots(data)
+        if not snapshots:
+            empty_evidence = dict(evidence)
+            empty_evidence["history_count"] = 0
+            return Signal(definition.family, 0.0, "flat", definition.market_type.value, WARMING_UP, empty_evidence)
+        lookback = _declared_lookback(definition.parameters)
         if definition.family in {"momentum", "mean_reversion"}:
             required = lookback + 1
-            evidence.update({"lookback": lookback, "history_count": len(snapshots), "required": required})
+            raw_lookback = snapshots[-required:]
+            lookback_market_probabilities = [
+                _market_probability(snapshot) for snapshot in raw_lookback
+            ]
+            valid_market_probabilities = [
+                value for value in lookback_market_probabilities if value is not None
+            ]
+            evidence.update(
+                {
+                    "lookback": lookback,
+                    "history_count": len(snapshots),
+                    "required": required,
+                    "market_probability_count": len(valid_market_probabilities),
+                }
+            )
             if len(snapshots) < required:
                 return Signal(
                     definition.family, 0.0, "flat", definition.market_type.value,
                     INSUFFICIENT_LOOKBACK, evidence,
                 )
+            if len(valid_market_probabilities) < required:
+                return Signal(
+                    definition.family, 0.0, "flat", definition.market_type.value,
+                    MODEL_INPUT_MISSING, evidence,
+                )
         current = snapshots[-1]
+        market_probability = _market_probability(current)
+        evidence["market_probability"] = market_probability
         model_evaluation = _model_evidence(data, current, len(snapshots) - 1)
         evidence["model"] = model_evaluation.as_record()
-        if _prediction_requires_model(definition.family) and not model_evaluation.available:
-            return Signal(
-                definition.family, 0.0, "flat", definition.market_type.value,
-                MODEL_INPUT_MISSING, evidence,
-            )
+        if _prediction_requires_model(definition.family):
+            if market_probability is None or not model_evaluation.available:
+                return Signal(
+                    definition.family, 0.0, "flat", definition.market_type.value,
+                    MODEL_INPUT_MISSING, evidence,
+                )
     score = _score_for_definition(definition, data)
     reason = SIGNAL_PRODUCED if abs(score) > 1e-12 else STRATEGY_EVALUATED_DECLINED
     side = "buy" if score > 0 else "sell" if score < 0 else "flat"

@@ -230,6 +230,8 @@ def _canonical_v2_accounting(value: Mapping[str, Any]) -> dict[str, Any]:
                 canonical[field_name],
                 f"portfolio_accounting.{field_name}",
             )
+            if field_name in {"fees", "costs"} and canonical[field_name] < ZERO:
+                raise ValueError(f"portfolio_accounting.{field_name} must be non-negative")
     if "open_positions" in canonical and canonical["open_positions"] is not None:
         positions = canonical["open_positions"]
         if (
@@ -941,6 +943,9 @@ class RollingEvidence:
     actual_coverage_seconds: Decimal = ZERO
     observation_completeness: Decimal = ONE
     source_class: str = ""
+    # Storage may canonicalize this value, but semantic grouping uses the
+    # requested source class carried alongside it.
+    requested_source_class: str = ""
     fee_assumption: Decimal = ZERO
     slippage_assumption: Decimal = ZERO
     allocated_capital_net_return: Decimal | None = ZERO
@@ -1137,7 +1142,22 @@ class RollingEvidence:
             if coverage > boundary:
                 raise ValueError("actual_coverage_seconds must not exceed available range")
         object.__setattr__(self, "actual_coverage_seconds", coverage)
-        object.__setattr__(self, "source_class", _source_class(self.source_class))
+        source_class = _source_class(self.source_class)
+        requested_source_class = _source_class(
+            self.requested_source_class or source_class
+        )
+        object.__setattr__(self, "source_class", source_class)
+        object.__setattr__(self, "requested_source_class", requested_source_class)
+        if v2_provenance:
+            for name, value in (
+                ("fees", self.fees),
+                ("costs", self.costs),
+                ("fee_costs", self.fee_costs),
+                ("slippage_costs", self.slippage_costs),
+            ):
+                parsed = _nullable_decimal(value, name)
+                if parsed is not None and parsed < ZERO:
+                    raise ValueError(f"{name} must be non-negative")
         if v2_provenance and not evaluation_kind:
             # Pre-kind v2 rows are simulation attestations by default.  Actual
             # ledger producers now persist the kind explicitly.
@@ -1440,6 +1460,8 @@ class RollingEvidence:
             "execution_feasibility": self.execution_feasibility,
             "overlap_key": self.overlap_key,
         }
+        if self.requested_source_class != self.source_class:
+            projection["requested_source_class"] = self.requested_source_class
         # A v2 row is identified by evaluator version/run, evaluation kind, or
         # an append-only correction link.  The link itself is immutable
         # provenance and therefore must be digest-bound even when it is the
@@ -1622,6 +1644,7 @@ class RollingEvidence:
             "actual_coverage_seconds": self.actual_coverage_seconds,
             "observation_completeness": self.observation_completeness,
             "source_class": self.source_class,
+            "requested_source_class": self.requested_source_class,
             "paper_sizing": self.paper_sizing,
             "paper_size": self.paper_size,
             "allocated_capital": self.allocated_capital,
@@ -1973,6 +1996,10 @@ class RollingEvidence:
                 row.get("completeness", 1),
             ),
             source_class=row.get("source_class", ""),
+            requested_source_class=row.get(
+                "requested_source_class",
+                row.get("source_class", ""),
+            ),
             paper_sizing=paper_sizing,
             fee_assumption=fee_assumption,
             slippage_assumption=slippage_assumption,
@@ -2423,7 +2450,11 @@ def _latest_windows(
     rows_by_id: dict[str, list[RollingEvidence]] = {}
     for item in evidence:
         candidates.setdefault(
-            (item.strategy_version_id, item.source_class, item.requested_days),
+            (
+                item.strategy_version_id,
+                item.requested_source_class,
+                item.requested_days,
+            ),
             [],
         ).append(item)
         rows_by_id.setdefault(item.evidence_window_id, []).append(item)
@@ -2440,7 +2471,7 @@ def _latest_windows(
     def lineage_identity(item: RollingEvidence) -> tuple[Any, ...]:
         return (
             item.strategy_version_id,
-            item.source_class,
+            item.requested_source_class,
             item.requested_days,
             item.candidate_id,
             item.research_trial_id,
